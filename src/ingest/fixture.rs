@@ -26,7 +26,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 
 use crate::Symbol;
-use crate::dialect::{Fixture, FixtureValue};
+use crate::dialect::{Fixture, FixtureScalarKind, FixtureValue};
 use crate::expr::Expr;
 
 use super::{IngestError, IngestResult};
@@ -167,6 +167,8 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
     };
 
     let mut model_class: Option<Symbol> = None;
+    let mut table_name: Option<Symbol> = None;
+    let mut scalar_kinds: IndexMap<Symbol, IndexMap<Symbol, FixtureScalarKind>> = IndexMap::new();
     let mut ignored: Vec<String> = Vec::new();
     let mut records: IndexMap<Symbol, IndexMap<Symbol, FixtureValue>> = IndexMap::new();
     for (label, fields) in top {
@@ -178,6 +180,13 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
         if label == "_fixture" {
             if let Some(class) = fields.get("model_class").and_then(yaml_scalar_as_string) {
                 model_class = Some(Symbol::from(class.as_str()));
+            }
+            // `_fixture: table_name:` (Shopify's FasterFixtures reads it to
+            // put an STI subclass's rows in the parent's table).
+            if let Some(table) = fields.get("table_name").and_then(yaml_scalar_as_string) {
+                if !table.is_empty() {
+                    table_name = Some(Symbol::from(table.as_str()));
+                }
             }
             match fields.get("ignore") {
                 Some(serde_yaml_ng::Value::Sequence(seq)) => {
@@ -201,6 +210,7 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
             }
         };
         let mut field_map: IndexMap<Symbol, FixtureValue> = IndexMap::new();
+        let mut kinds: IndexMap<Symbol, FixtureScalarKind> = IndexMap::new();
         for (k, v) in fields {
             let k = yaml_scalar_as_string(&k).unwrap_or_default();
             // A hash or array is a value for a JSON or serialized column:
@@ -231,13 +241,22 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
                     FixtureValue::Ruby(super::expr::ingest_ruby_program(&src, &tag_file)?)
                 }
             };
+            if matches!(value, FixtureValue::Scalar(_)) {
+                if let Some(kind) = yaml_scalar_kind(&v) {
+                    kinds.insert(Symbol::from(k.as_str()), kind);
+                }
+            }
             field_map.insert(Symbol::from(k.as_str()), value);
+        }
+        if !kinds.is_empty() {
+            scalar_kinds.insert(Symbol::from(label.as_str()), kinds);
         }
         records.insert(Symbol::from(label.as_str()), field_map);
     }
     // After merging, so a row that merges an ignored one still has its fields.
     for label in &ignored {
         records.shift_remove(&Symbol::from(label.as_str()));
+        scalar_kinds.shift_remove(&Symbol::from(label.as_str()));
     }
 
     Ok(Fixture {
@@ -246,7 +265,23 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
         records,
         preamble,
         model_class,
+        table_name,
+        scalar_kinds,
     })
+}
+
+/// The YAML type of a value that isn't a string (see `Fixture::scalar_kinds`).
+fn yaml_scalar_kind(v: &serde_yaml_ng::Value) -> Option<FixtureScalarKind> {
+    match v {
+        serde_yaml_ng::Value::String(_) => None,
+        serde_yaml_ng::Value::Null => Some(FixtureScalarKind::Null),
+        serde_yaml_ng::Value::Bool(_) => Some(FixtureScalarKind::Bool),
+        serde_yaml_ng::Value::Number(n) if n.is_f64() => Some(FixtureScalarKind::Float),
+        serde_yaml_ng::Value::Number(_) => Some(FixtureScalarKind::Int),
+        serde_yaml_ng::Value::Mapping(_) => Some(FixtureScalarKind::Mapping),
+        serde_yaml_ng::Value::Sequence(_) => Some(FixtureScalarKind::Sequence),
+        serde_yaml_ng::Value::Tagged(t) => yaml_scalar_kind(&t.value),
+    }
 }
 
 enum SlotMatch {

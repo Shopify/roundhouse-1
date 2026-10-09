@@ -17,21 +17,25 @@
 # test that is not transactional loads its fixtures before it runs and
 # invalidates the cache after.
 #
-# FixtureSet.insert groups the sets by their model's connection pool.
-# For each pool, in one `transaction(requires_new: true)` on a connection
-# from that pool (the writer that owns the model), it DELETEs FROM every
-# set's table, inserts the sets' rows, and then caps each primary key
-# sequence at max(pk). The rows here are the test helper's
-# `FixtureLoader.fixture_sets`: [set name, compiled fixture module, model,
-# table]. Each module's `_fixtures_load!` saves its records. Unlike Rails'
-# INSERTs, that save runs the model's callbacks.
+# FixtureSet.insert groups the sets by their model's connection pool
+# (`model_class&.connection_pool`, the model resolved as safe_constantize
+# does, else ActiveRecord::Base's). For each pool, in one
+# `transaction(requires_new: true)` on a connection from that pool (the
+# writer that owns the model), it DELETEs FROM every set's table, inserts
+# the sets' rows, and then caps each key sequence at its column's max.
+# The rows here are the test helper's `FixtureLoader.fixture_sets`: [set
+# name, compiled fixture module, model, table]. Each module's
+# `_fixtures_load!` hands its table rows to `insert_fixture_rows`: as in
+# Rails' insert_fixtures_set, one multi-row INSERT with each value cast
+# by its column's type, so no model is built and no writer, callback or
+# validation runs.
 #
-# A set whose model or rows do not load is refused by name: this tree
-# says `error[fixture_set_not_loaded]` once on stderr, records the set
-# in `TestFixtures.fixture_sets_not_loaded`, and makes each of its
-# fixture accessors raise FixtureSetNotLoaded. The other sets in its
-# pool still load, each in its own savepoint. Rails would raise the
-# load error from every test's setup.
+# A set whose rows do not load is refused by name: this tree says
+# `error[fixture_set_not_loaded]` once on stderr, records the set in
+# `TestFixtures.fixture_sets_not_loaded`, and makes each of its fixture
+# accessors raise FixtureSetNotLoaded. Each table's DELETE and each set's
+# rows run in their own savepoint, so the other sets in the pool still
+# load. Rails would raise the load error from every test's setup.
 #
 # The runner (minitest_runner.rb) calls the hooks below where Rails'
 # before_setup and after_teardown run setup_fixtures and
@@ -53,11 +57,45 @@
 # boot (runtime/database_configuration.rb) requires it; the test helper
 # includes it into TestBase, as rails/test_help.rb does.
 require_relative "active_support_class_attribute"
+require "date"
+require "digest/sha1"
+require "json"
+require "yaml"
+require "zlib"
 
 module ActiveRecord
   module TestFixtures
     # A fixture accessor of a set this tree could not load.
     class FixtureSetNotLoaded < StandardError; end
+
+    # ActiveRecord::Fixture::FixtureError: a row naming a column the
+    # table does not have.
+    class FixtureError < StandardError; end
+
+    # ActiveRecord::FixtureSet::MAX_ID.
+    FIXTURE_MAX_ID = 2**30 - 1
+
+    # Digest::UUID::OID_NAMESPACE.
+    FIXTURE_OID_NAMESPACE = ["6ba7b8129dad11d180b400c04fd430c8"].pack("H*").freeze
+
+    # ActiveModel::Type::Boolean::FALSE_VALUES.
+    FIXTURE_FALSE_VALUES = [false, 0, "0", :"0", "f", :f, "F", :F, "false", :false, "FALSE", :FALSE, "off", :off, "OFF", :OFF].freeze
+
+    # ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid::ACCEPTABLE_UUID.
+    FIXTURE_ACCEPTABLE_UUID = %r{\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z}
+
+    # FasterFixtures' POLYMORPHIC_VALUE.
+    FIXTURE_POLYMORPHIC_VALUE = /^(\S+)\s*\(([^\)]*)\)\s*$/
+
+    # PostgreSQL type name => the cast type `fixture_sql_value` takes.
+    FIXTURE_PG_CAST_TYPES = {
+      "int2" => "integer", "int4" => "integer", "int8" => "integer", "oid" => "integer",
+      "float4" => "float", "float8" => "float", "numeric" => "decimal", "money" => "decimal",
+      "bool" => "boolean", "uuid" => "uuid", "json" => "json", "jsonb" => "jsonb",
+      "timestamp" => "datetime", "timestamptz" => "datetime", "date" => "date",
+      "time" => "time", "timetz" => "time", "bytea" => "binary",
+      "varchar" => "string", "text" => "string", "bpchar" => "string", "citext" => "string", "name" => "string",
+    }.freeze
 
     # Rails' test/fixtures/, which rails/test_help.rb appends to
     # ActiveSupport::TestCase.fixture_paths: the tree's own (this file is
@@ -113,21 +151,161 @@ module ActiveRecord
           next unless Object.const_defined?(mod, false)
           fixtures = Object.const_get(mod, false)
           fixtures.instance_variables.each do |ivar|
-            fixtures.instance_variable_set(ivar, nil) if ivar.start_with?("@__fx_")
+            fixtures.instance_variable_set(ivar, nil) if ivar.start_with?("@__fx_", "@__fxe_")
           end
         end
       end
 
+      # A compiled accessor's cache slot (the compiler's
+      # `fixture_cache_ivar`): `@__fx_<label>`, or for a label that is not
+      # all [A-Za-z0-9_], `@__fxe_` and an escape.
+      def fixture_cache_ivar(label)
+        label = label.to_s
+        return :"@__fx_#{label}" if label.match?(/\A[A-Za-z0-9_]*\z/)
+        slot = +"@__fxe_"
+        label.each_char do |c|
+          slot << (c.match?(/[A-Za-z0-9]/) ? c : (c == "_" ? "__" : "_#{c.ord.to_s(16)}_"))
+        end
+        slot.to_sym
+      end
+
+      # ActiveRecord::FixtureSet.identify.
+      def identify(label, column_type = "integer")
+        if column_type.to_s == "uuid"
+          hash = Digest::SHA1.digest(FIXTURE_OID_NAMESPACE + label.to_s.b)
+          ary = hash.unpack("NnnnnN")
+          ary[2] = (ary[2] & 0x0FFF) | (5 << 12)
+          ary[3] = (ary[3] & 0x3FFF) | 0x8000
+          "%08x-%04x-%04x-%04x-%04x%08x" % ary
+        else
+          Zlib.crc32(label.to_s) % FIXTURE_MAX_ID
+        end
+      end
+
+      # A reference an ERB tag names: the referenced row's id. Under
+      # FasterFixtures an Integer is the id itself.
+      def fixture_reference(value, column_type, integer_passes)
+        return nil if value.nil? || value == false
+        return value if integer_passes && value.is_a?(Integer)
+        text = value.to_s
+        if integer_passes && (md = text.match(/^(\S+)\s*\(([^\)]*)\)\s*$/))
+          text = md[1]
+        end
+        identify(text, column_type)
+      end
+
+      # One set's rows, as Rails' insert_fixtures_set writes them
+      # (build_fixture_sql): every row's timestamps the loader fills with
+      # `now` when it omits them, a FixtureError for a key the table has no
+      # column for, then one INSERT naming every column, DEFAULT where a
+      # row omits one (a single row names only its own), each value cast
+      # by its column's type (`type.serialize`, YAML for a Hash or Array
+      # the cast leaves). `columns` is column => cast type, in table order.
+      #
+      # `columns` is the compiled schema's, which leaves out a model's
+      # `ignored_columns`; Rails and FasterFixtures read the table's
+      # columns from the database (`schema_cache.columns_hash`). So a key
+      # outside `columns` is looked up in the live table: a column there
+      # is cast by its database type, and under FasterFixtures
+      # (`faster_fixtures:`) a key whose `<key>_id` is a live column is
+      # the reference `FixtureSet#table_rows` resolves.
+      def insert_fixture_rows(table, columns, timestamps, rows, faster_fixtures: false)
+        return nil if rows.empty?
+        now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
+        live = nil
+        rows = rows.map do |row|
+          row = row.dup
+          timestamps.each { |column| row[column] = now unless row.key?(column) }
+          unknown = row.keys - columns.keys
+          unless unknown.empty?
+            live ||= fixture_live_columns(table)
+            unknown = resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+          end
+          unless unknown.empty?
+            raise FixtureError, %(table "#{table}" has no columns named #{unknown.map(&:inspect).join(", ")}.)
+          end
+          row
+        end
+        if live
+          extra = rows.flat_map(&:keys).uniq - columns.keys
+          columns = columns.merge(extra.to_h { |name| [name, live.fetch(name)] }) unless extra.empty?
+        end
+        names = columns.keys
+        names = names.select { |name| rows.first.key?(name) } if rows.size == 1
+        sql = +"INSERT INTO #{quote_table_name(table)} "
+        if names.empty?
+          sql << "DEFAULT VALUES"
+        else
+          values = rows.map do |row|
+            "(" + names.map { |name| row.key?(name) ? fixture_sql_value(row[name], columns.fetch(name)) : "DEFAULT" }.join(", ") + ")"
+          end
+          sql << "(#{names.map { |name| quote_identifier(name) }.join(", ")}) VALUES #{values.join(", ")}"
+        end
+        Db.exec(sql)
+        nil
+      end
+
       private
+        # The table's columns in the database, column => cast type, as
+        # `schema_cache.columns_hash` types them (a type this loader has no
+        # cast for keeps its PostgreSQL name and is quoted as text).
+        def fixture_live_columns(table)
+          regclass = quote_string(quote_table_name(table))
+          handle = Db.prepare_uncached(
+            "SELECT string_agg(a.attname || chr(9) || t.typname, chr(10) ORDER BY a.attnum) " \
+            "FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid " \
+            "WHERE a.attrelid = #{regclass}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''"
+          )
+          listing = begin
+            Db.step?(handle) ? Db.column_text_opt(handle, 0) : nil
+          ensure
+            Db.finalize(handle)
+          end
+          listing.to_s.split("\n").to_h do |line|
+            name, type = line.split("\t", 2)
+            [name, FIXTURE_PG_CAST_TYPES.fetch(type, type)]
+          end
+        end
+
+        # The row's keys outside the compiled columns that the live table
+        # answers (FasterFixtures::FixtureSet#table_rows): a live column
+        # stays; under FasterFixtures, `<key>_id` takes the reference (nil
+        # or false drops it, an Integer is the id, `label (Class)` also sets
+        # `<key>_type`, any other label is identified by the column's type).
+        # Answers the keys still unknown.
+        def resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+          unknown.reject do |key|
+            next true if live.key?(key)
+            next false unless faster_fixtures
+            fk_id = "#{key}_id"
+            next false unless live.key?(fk_id)
+            value = row.delete(key)
+            next true unless value
+            row[fk_id] =
+              if value.is_a?(Integer)
+                value
+              elsif !value.respond_to?(:match)
+                raise FixtureError, %(table "#{table}": #{key}: #{value.inspect} is not a fixture label)
+              elsif (md = value.match(FIXTURE_POLYMORPHIC_VALUE))
+                fk_type = "#{key}_type"
+                raise FixtureError, %(table "#{table}" has no column #{fk_type.inspect} for #{key}: #{value.inspect}) unless live.key?(fk_type)
+                row[fk_type] = md[2]
+                identify(md[1], live.fetch(fk_id))
+              else
+                identify(value, live.fetch(fk_id))
+              end
+            true
+          end
+        end
+
         # ActiveRecord::FixtureSet.insert.
         def insert(rows)
           by_pool = {}
           rows.each do |row|
             next if @fixture_sets_not_loaded.key?(row[0])
             pool = attempt(row) do
-              model = Object.const_get(row[2])
               Object.const_get(row[1])
-              model.connection_pool
+              fixture_model_pool(row[2])
             end
             (by_pool[pool] ||= []) << row if pool
           end
@@ -135,18 +313,34 @@ module ActiveRecord
           by_pool.each do |pool, sets|
             begin
               pool.with_connection do |conn|
+                tables = sets.map { |row| row[3] }.uniq
                 conn.transaction(requires_new: true) do
-                  sets.map { |row| row[3] }.uniq.each { |table| Db.exec("DELETE FROM #{quote_table_name(table)}") }
+                  # Each table's DELETE in its own savepoint: a table that
+                  # cannot be cleared refuses only the sets loading it.
+                  failed = {}
+                  tables.each do |table|
+                    begin
+                      conn.transaction(requires_new: true) { Db.exec("DELETE FROM #{quote_table_name(table)}") }
+                    rescue NoMemoryError, SignalException, SystemExit
+                      raise
+                    rescue Exception => error # rubocop:disable Lint/RescueException
+                      failed[table] = error
+                    end
+                  end
                   sets.each do |row|
+                    if (error = failed[row[3]])
+                      not_loaded(row, error)
+                      next
+                    end
                     attempt(row) do
                       conn.transaction(requires_new: true) { Object.const_get(row[1])._fixtures_load! }
                     end
                   end
                 end
-                # Cap primary key sequences to max(pk).
-                sets.each do |row|
-                  next if @fixture_sets_not_loaded.key?(row[0])
-                  reset_pk_sequence(conn, row)
+                # Cap each table's key sequences at the column's max.
+                tables.each do |table|
+                  loaded = sets.find { |row| row[3] == table && !@fixture_sets_not_loaded.key?(row[0]) }
+                  reset_pk_sequences(conn, loaded[0], table) if loaded
                 end
               end
             rescue NoMemoryError, SignalException, SystemExit
@@ -184,24 +378,169 @@ module ActiveRecord
           end
         end
 
-        # PostgreSQL's reset_pk_sequence! (SequenceReset): the sequence
-        # the primary key's default draws from, set to max(pk), or to
-        # its minimum, not yet called, for an empty table. The set's rows
-        # stay loaded when this fails; the error is named.
-        def reset_pk_sequence(conn, row)
-          set, _mod, model, table = row
-          pk = Object.const_get(model).primary_key
-          return unless pk.is_a?(String) || pk.is_a?(Symbol)
-          sequence = conn.select_value("SELECT pg_get_serial_sequence(#{quote_string(quote_table_name(table))}, #{quote_string(pk.to_s)})")
-          return if sequence.nil?
-          max = conn.select_value("SELECT MAX(#{quote_identifier(pk.to_s)}) FROM #{quote_table_name(table)}")
-          min = conn.select_value("SELECT seqmin FROM pg_sequence WHERE seqrelid = #{quote_string(sequence)}::regclass")
-          conn.select_value("SELECT setval(#{quote_string(sequence)}, #{Integer(max || min)}, #{max ? true : false})")
+        # The pool a set inserts through: its model's, the model resolved
+        # as safe_constantize does (a model constant that does not exist
+        # is no model; an error loading it is the set's), else
+        # ActiveRecord::Base's.
+        def fixture_model_pool(name)
+          model = begin
+            Object.const_get(name)
+          rescue NameError => error
+            raise if error.name && !(name.to_s.split("::").include?(error.name.to_s) || error.name.to_s == name.to_s)
+            nil
+          end
+          model.respond_to?(:connection_pool) ? model.connection_pool : ActiveRecord::Base.connection_pool
+        end
+
+        # PostgreSQL's reset_pk_sequence! (SequenceReset), for each key
+        # column of the table (and `id`, which FasterFixtures resets) that
+        # draws from a sequence: set to max(column), or to its minimum,
+        # not yet called, for an empty table. The set's rows stay loaded
+        # when this fails; the error is named.
+        def reset_pk_sequences(conn, set, table)
+          regclass = quote_string(quote_table_name(table))
+          listing = conn.select_value(
+            "SELECT string_agg(a.attname || chr(9) || s.seq, chr(10)) FROM pg_attribute a " \
+            "CROSS JOIN LATERAL (SELECT pg_get_serial_sequence(#{regclass}, a.attname) AS seq) s " \
+            "WHERE a.attrelid = #{regclass}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND s.seq IS NOT NULL " \
+            "AND (a.attname = 'id' OR EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid " \
+            "AND i.indisprimary AND a.attnum = ANY(i.indkey)))"
+          )
+          listing.to_s.split("\n").each do |line|
+            column, sequence = line.split("\t", 2)
+            max = conn.select_value("SELECT MAX(#{quote_identifier(column)}) FROM #{quote_table_name(table)}")
+            min = conn.select_value("SELECT seqmin FROM pg_sequence WHERE seqrelid = #{quote_string(sequence)}::regclass")
+            conn.select_value("SELECT setval(#{quote_string(sequence)}, #{Integer(max || min)}, #{max ? true : false})")
+          end
         rescue NoMemoryError, SignalException, SystemExit
           raise
         rescue Exception => error # rubocop:disable Lint/RescueException
           $stderr.puts "roundhouse: error[fixture_sequence_not_reset]: fixture set `#{set}` (table #{table}): " \
             "#{error.class}: #{error.message.to_s.lines.first.to_s.chomp}"
+        end
+
+        # An ERB value reaches the row as the object the tag produced;
+        # Rails reads the text ERB wrote. Values YAML reads back as
+        # themselves stay; any other object is its `to_s`.
+        def fixture_erb_text(value)
+          case value
+          when nil, true, false, ::Numeric, ::String, ::Hash, ::Array then value
+          else value.to_s
+          end
+        end
+
+        # `type.serialize(value)` for the column's cast type, then the
+        # adapter's quoting, as an SQL literal.
+        def fixture_sql_value(value, type)
+          value = fixture_erb_text(value)
+          case type
+          when "integer"
+            int = case value
+                  when true then 1
+                  when false then 0
+                  when ::String then value.match?(/\A\s*[+-]?\d/) ? value.to_i : nil
+                  when ::Float then value.finite? ? value.to_i : nil
+                  when ::Numeric then value.to_i
+                  end
+            int.nil? ? "NULL" : int.to_s
+          when "float"
+            float = case value
+                    when true then 1.0
+                    when false then 0.0
+                    when "Infinity" then Float::INFINITY
+                    when "-Infinity" then -Float::INFINITY
+                    when "NaN" then Float::NAN
+                    when ::Numeric then value.to_f
+                    when ::String then value.to_f
+                    end
+            if float.nil? then "NULL"
+            elsif float.nan? then "'NaN'"
+            elsif float.infinite? then float.positive? ? "'Infinity'" : "'-Infinity'"
+            else float.to_s
+            end
+          when "decimal"
+            case value
+            when nil then "NULL"
+            when true then "1"
+            when false then "0"
+            when ::Float then value.finite? ? value.to_s : "NULL"
+            when ::Numeric then quote_string(value.to_s)
+            when ::String then quote_string(value[/\A\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/].to_s.strip.then { |n| n.empty? ? "0" : n })
+            else "0"
+            end
+          when "boolean"
+            return "NULL" if value.nil? || value == ""
+            FIXTURE_FALSE_VALUES.include?(value) ? "FALSE" : "TRUE"
+          when "string"
+            text = case value
+                   when nil then nil
+                   when true then "t"
+                   when false then "f"
+                   when ::Hash, ::Array then YAML.dump(value)
+                   else value.to_s
+                   end
+            text.nil? ? "NULL" : quote_string(text)
+          when "json", "jsonb"
+            return "NULL" if value.nil?
+            json = defined?(::ActiveSupport::JSON) && ::ActiveSupport::JSON.respond_to?(:encode) ? ::ActiveSupport::JSON.encode(value) : JSON.generate(value)
+            quote_string(json)
+          when "datetime"
+            time = fixture_time(value)
+            time ? quote_string(time.strftime("%Y-%m-%d %H:%M:%S.%6N")) : "NULL"
+          when "date"
+            date = fixture_date(value)
+            date ? quote_string(date.strftime("%Y-%m-%d")) : "NULL"
+          when "time"
+            time = value.is_a?(::String) ? fixture_time("2000-01-01 " + value.sub(/\A\d{4}-\d\d-\d\d(?:T|\s)/, "")) : fixture_time(value)
+            time ? quote_string(time.strftime("%H:%M:%S.%6N")) : "NULL"
+          when "binary"
+            return "NULL" if value.nil?
+            bytes = case value
+                    when ::Array then (value.pack("C*") rescue YAML.dump(value))
+                    when ::Hash then YAML.dump(value)
+                    else value.to_s
+                    end
+            "'\\x#{bytes.unpack1("H*")}'::bytea"
+          when "uuid"
+            text = value.to_s
+            return "NULL" if value.nil? || !text.match?(FIXTURE_ACCEPTABLE_UUID)
+            uuid = text.delete("{}-").downcase
+            quote_string("#{uuid[0, 8]}-#{uuid[8, 4]}-#{uuid[12, 4]}-#{uuid[16, 4]}-#{uuid[20, 12]}")
+          else
+            value.nil? ? "NULL" : quote_string((value.is_a?(::Hash) || value.is_a?(::Array)) ? YAML.dump(value) : value.to_s)
+          end
+        end
+
+        # ActiveModel::Type::DateTime#cast in UTC (default_timezone :utc):
+        # a string through Date._parse, its offset applied.
+        def fixture_time(value)
+          case value
+          when nil, "" then nil
+          when ::Time then value.getutc
+          when ::String
+            parts = Date._parse(value)
+            year, mon, mday = parts.values_at(:year, :mon, :mday)
+            return nil if year.nil? || (year == 0 && mon == 0 && mday == 0)
+            usec = parts[:sec_fraction] ? (parts[:sec_fraction] * 1_000_000).to_i : 0
+            time = (Time.utc(year, mon, mday, parts[:hour], parts[:min], parts[:sec], usec) rescue nil)
+            return nil unless time
+            parts[:offset] && parts[:offset] != 0 ? time - parts[:offset] : time
+          else
+            value.respond_to?(:to_time) ? value.to_time.getutc : nil
+          end
+        end
+
+        # ActiveModel::Type::Date#cast.
+        def fixture_date(value)
+          case value
+          when nil, "" then nil
+          when ::Date then value
+          when ::Time then value.to_date
+          when ::String
+            year, mon, mday = Date._parse(value, false).values_at(:year, :mon, :mday)
+            return nil if year.nil? || (year == 0 && mon == 0 && mday == 0)
+            Date.new(year, mon, mday) rescue nil
+          end
         end
 
         def quote_table_name(name)
@@ -475,7 +814,7 @@ module ActiveRecord
 
           if labels.include?(f_name)
             @fixture_cache[fs_name][f_name] ||= begin
-              memo = :"@__fx_#{f_name}"
+              memo = TestFixtures.fixture_cache_ivar(f_name)
               fixtures.instance_variable_set(memo, nil) if force_reload && fixtures.instance_variable_defined?(memo)
               fixtures.public_send(f_name)
             end

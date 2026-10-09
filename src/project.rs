@@ -16500,7 +16500,7 @@ mod tests {
             constant.ty = Some(Ty::Class { id: ClassId(Symbol::new("Net::HTTPOK")), args: vec![] });
             match root {
                 0 | 1 => app.fixtures.push(Fixture {
-                    name: Symbol::new("probes"), path: Symbol::new("probes"), model_class: None,
+                    name: Symbol::new("probes"), path: Symbol::new("probes"), model_class: None, table_name: None, scalar_kinds: Default::default(),
                     preamble: if root == 0 { vec![constant.clone()] } else { vec![] },
                     records: if root == 1 {
                         [(Symbol::new("one"), [(Symbol::new("value"), FixtureValue::Ruby(constant))].into_iter().collect())].into_iter().collect()

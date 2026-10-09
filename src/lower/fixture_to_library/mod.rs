@@ -754,3 +754,361 @@ fn rewrite_fixture_call(e: &Expr, fixture_names: &[Symbol]) -> Option<Expr> {
         },
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Raw-row fixture modules: the CRuby PostgreSQL tree.
+
+/// The CRuby PostgreSQL tree's fixture modules. Each loads its set the
+/// way Rails does, as table rows: `_fixtures_load!` hands the set's
+/// column → value rows to `ActiveRecord::TestFixtures.insert_fixture_rows`,
+/// one multi-row INSERT cast per column, so no model is instantiated and
+/// no writer, callback or validation runs (`lower::fixtures::lower_fixture_rows`
+/// resolves the rows). Each label accessor answers `<Model>.find(<id>)`,
+/// memoized until the next load, as Rails' fixture cache does. The other
+/// targets keep `lower_fixtures_to_library_classes`.
+pub fn lower_fixtures_to_raw_row_library_classes(app: &App) -> Vec<LibraryClass> {
+    let dynamic = fixtures_reached_by_variable(app);
+    crate::lower::fixtures::lower_fixture_rows(app)
+        .iter()
+        .map(|set| build_raw_row_fixture_class(set, dynamic.contains(&set.name)))
+        .collect()
+}
+
+fn class_method(owner: &ClassId, name: Symbol, params: Vec<crate::dialect::Param>, body: Expr, signature: Ty) -> MethodDef {
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name,
+        receiver: MethodReceiver::Class,
+        params,
+        body,
+        signature: Some(signature),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+fn build_raw_row_fixture_class(set: &crate::lower::fixtures::RawFixtureSet, wants_by_label: bool) -> LibraryClass {
+    let owner_name = format!("{}Fixtures", camelize(set.name.as_str()));
+    let owner_id = ClassId(Symbol::from(owner_name));
+    let class_ty = Ty::Class { id: set.class.clone(), args: vec![] };
+
+    let finds: Vec<Expr> = set
+        .rows
+        .iter()
+        .map(|row| {
+            let key: Vec<Expr> = row.find_key.iter().map(raw_value_expr).collect();
+            let arg = if set.composite_find {
+                with_ty(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Array { elements: key, style: crate::expr::ArrayStyle::Brackets },
+                    ),
+                    Ty::Array { elem: Box::new(Ty::Untyped) },
+                )
+            } else {
+                key.into_iter().next().unwrap_or_else(crate::lower::typing::nil_lit)
+            };
+            send(Some(class_const(&set.class)), "find", vec![arg], class_ty.clone())
+        })
+        .collect();
+
+    let mut methods: Vec<MethodDef> = set
+        .rows
+        .iter()
+        .zip(&finds)
+        .map(|(row, find)| {
+            class_method(
+                &owner_id,
+                row.label.clone(),
+                Vec::new(),
+                memoized_lookup(&row.label, find),
+                fn_sig(vec![], class_ty.clone()),
+            )
+        })
+        .collect();
+
+    if wants_by_label {
+        let label_var = with_ty(
+            Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("label") }),
+            Ty::Untyped,
+        );
+        let key = send(Some(label_var), "to_s", vec![], Ty::Str);
+        let mut chain = Expr::new(
+            Span::synthetic(),
+            ExprNode::Raise { value: lit_str(format!("no {} fixture named", set.class.0.as_str())) },
+        );
+        for (row, find) in set.rows.iter().zip(&finds).rev() {
+            let cond = send(Some(key.clone()), "==", vec![lit_str(row.label.as_str().to_string())], Ty::Bool);
+            chain = Expr::new(
+                Span::synthetic(),
+                ExprNode::If { cond, then_branch: find.clone(), else_branch: chain },
+            );
+        }
+        methods.push(class_method(
+            &owner_id,
+            Symbol::from("by_label"),
+            vec![crate::dialect::Param {
+                name: Symbol::from("label"),
+                default: None,
+                keyword: false,
+                rest: false,
+                forwarding: false,
+                from_keyword: false,
+                from_kwrest: false,
+            }],
+            chain,
+            fn_sig(vec![(Symbol::from("label"), Ty::Untyped)], class_ty.clone()),
+        ));
+    }
+
+    methods.push(class_method(
+        &owner_id,
+        Symbol::from("_fixtures_load!"),
+        Vec::new(),
+        build_raw_row_load_body(set),
+        fn_sig(vec![], Ty::Nil),
+    ));
+
+    LibraryClass {
+        conditional_definitions: Vec::new(),
+        method_aliases: Vec::new(),
+        top_level_constants: Vec::new(),
+        name: owner_id,
+        is_module: true,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        methods,
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
+    }
+}
+
+/// `_fixtures_load!`: clear the accessors' cache, run the file's ERB
+/// statements, then insert the rows (or raise the set's refusal).
+fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr {
+    let mut exprs: Vec<Expr> = set
+        .rows
+        .iter()
+        .map(|row| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: fixture_cache_ivar(&row.label) },
+                    value: crate::lower::typing::nil_lit(),
+                },
+            )
+        })
+        .collect();
+    exprs.extend(set.preamble.iter().cloned());
+    match (&set.columns, set.errors.first()) {
+        (Some(columns), None) => {
+            let columns_hash = hash_lit(
+                columns
+                    .iter()
+                    .map(|(name, ty)| (lit_str(name.as_str().to_string()), lit_str((*ty).to_string())))
+                    .collect(),
+            );
+            let timestamps = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Array {
+                        elements: set.timestamps.iter().map(|c| lit_str(c.as_str().to_string())).collect(),
+                        style: crate::expr::ArrayStyle::Brackets,
+                    },
+                ),
+                Ty::Array { elem: Box::new(Ty::Str) },
+            );
+            let rows = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Array {
+                        elements: set
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                hash_lit(
+                                    row.values
+                                        .iter()
+                                        .map(|(k, v)| (lit_str(k.as_str().to_string()), raw_value_expr(v)))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                        style: crate::expr::ArrayStyle::Brackets,
+                    },
+                ),
+                Ty::Array { elem: Box::new(Ty::Untyped) },
+            );
+            let mut args = vec![lit_str(set.table.as_str().to_string()), columns_hash, timestamps, rows];
+            if set.rules == crate::lower::fixtures::FixtureRules::FasterFixtures {
+                args.push(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Hash {
+                        entries: vec![(
+                            crate::lower::typing::lit_sym(Symbol::from("faster_fixtures")),
+                            crate::lower::typing::lit_bool(true),
+                        )],
+                        kwargs: true,
+                    },
+                ));
+            }
+            exprs.push(send(Some(test_fixtures_const()), "insert_fixture_rows", args, Ty::Nil));
+        }
+        (_, error) => {
+            let message = error.cloned().unwrap_or_else(|| {
+                format!("roundhouse: fixture set `{}`: table `{}` is not in this tree's schema", set.path, set.table)
+            });
+            exprs.push(Expr::new(Span::synthetic(), ExprNode::Raise { value: lit_str(message) }));
+        }
+    }
+    exprs.push(crate::lower::typing::nil_lit());
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+}
+
+fn test_fixtures_const() -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("TestFixtures")] },
+    )
+}
+
+fn class_const(cls: &ClassId) -> Expr {
+    with_ty(
+        Expr::new(Span::synthetic(), ExprNode::Const { path: vec![cls.0.clone()] }),
+        Ty::Class { id: cls.clone(), args: vec![] },
+    )
+}
+
+fn send(recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true },
+        ),
+        ty,
+    )
+}
+
+fn hash_lit(entries: Vec<(Expr, Expr)>) -> Expr {
+    with_ty(
+        Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }),
+        Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+    )
+}
+
+/// A row value as Ruby: the literal Psych loaded, or the ERB expression.
+fn raw_value_expr(v: &crate::lower::fixtures::RawFixtureValue) -> Expr {
+    use crate::lower::fixtures::RawFixtureValue as V;
+    match v {
+        V::Nil => crate::lower::typing::nil_lit(),
+        V::Bool(b) => crate::lower::typing::lit_bool(*b),
+        V::Int(i) => lit_int(*i),
+        V::BigInt(digits) => with_ty(
+            Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::BigInt { value: digits.clone() } }),
+            Ty::Int,
+        ),
+        V::Float(f) => crate::lower::typing::lit_float(*f),
+        V::Str(s) => lit_str(s.clone()),
+        V::Structured(value) => yaml_value_expr(value),
+        V::Ruby(expr) => expr.clone(),
+        V::RubyReference { value, uuid, integer_passes } => send(
+            Some(test_fixtures_const()),
+            "fixture_reference",
+            vec![
+                value.clone(),
+                lit_str(if *uuid { "uuid" } else { "integer" }.to_string()),
+                crate::lower::typing::lit_bool(*integer_passes),
+            ],
+            Ty::Untyped,
+        ),
+    }
+}
+
+fn yaml_value_expr(v: &serde_yaml_ng::Value) -> Expr {
+    use serde_yaml_ng::Value as Y;
+    match v {
+        Y::Null => crate::lower::typing::nil_lit(),
+        Y::Bool(b) => crate::lower::typing::lit_bool(*b),
+        Y::Number(n) => match (n.as_i64(), n.as_f64()) {
+            (Some(i), _) => lit_int(i),
+            (None, Some(f)) if n.is_f64() && f.is_finite() => crate::lower::typing::lit_float(f),
+            _ => with_ty(
+                Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::BigInt { value: n.to_string() } }),
+                Ty::Int,
+            ),
+        },
+        Y::String(s) => lit_str(s.clone()),
+        Y::Sequence(items) => with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Array {
+                    elements: items.iter().map(yaml_value_expr).collect(),
+                    style: crate::expr::ArrayStyle::Brackets,
+                },
+            ),
+            Ty::Array { elem: Box::new(Ty::Untyped) },
+        ),
+        Y::Mapping(map) => hash_lit(map.iter().map(|(k, v)| (yaml_value_expr(k), yaml_value_expr(v))).collect()),
+        Y::Tagged(t) => yaml_value_expr(&t.value),
+    }
+}
+
+/// `@__fx_<label> = <find> if @__fx_<label>.nil?; @__fx_<label>`: the
+/// shape `emit::ruby::library::apply_fixture_memoization` gives an
+/// integer-keyed accessor, for every key (a uuid, a composite key).
+fn memoized_lookup(label: &Symbol, lookup: &Expr) -> Expr {
+    let slot = fixture_cache_ivar(label);
+    let read = || {
+        let mut e = Expr::new(Span::synthetic(), ExprNode::Ivar { name: slot.clone() });
+        e.ty = lookup.ty.clone();
+        e
+    };
+    let fill = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(read()), "nil?", vec![], Ty::Bool),
+            then_branch: Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: crate::expr::LValue::Ivar { name: slot.clone() }, value: lookup.clone() },
+            ),
+            else_branch: crate::lower::typing::nil_lit(),
+        },
+    );
+    let mut seq = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![fill, read()] });
+    seq.ty = lookup.ty.clone();
+    seq
+}
+
+/// The accessor's cache slot, the same name
+/// `emit::ruby::library::fixture_cache_ivar` gives it (the runtime's
+/// `reset_fixture_accessors` clears both prefixes): `__fx_<label>`, or
+/// for a label that is not all `[A-Za-z0-9_]`, `__fxe_` and an escape.
+fn fixture_cache_ivar(label: &Symbol) -> Symbol {
+    let label = label.as_str();
+    if label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Symbol::from(format!("__fx_{label}"));
+    }
+    let mut slot = String::from("__fxe_");
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            slot.push(c);
+        } else if c == '_' {
+            slot.push_str("__");
+        } else {
+            slot.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
+    Symbol::from(slot)
+}

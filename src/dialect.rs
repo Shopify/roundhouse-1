@@ -2720,9 +2720,40 @@ pub struct Fixture {
     /// `_fixture: model_class:` — the class the rows load, for a set
     /// whose path doesn't name it. `None` derives it from `path`.
     pub model_class: Option<Symbol>,
+    /// `_fixture: table_name:` — the table the rows insert into, for a
+    /// set whose name isn't its table (an STI subclass's rows living in
+    /// the parent's table, a namespaced set with a short table). `None`
+    /// leaves the table to the loader's default rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<Symbol>,
+    /// The YAML type of each value that was not a string: `records` keeps
+    /// every scalar as text, and a raw row insert needs to tell `foo:`
+    /// (nil) from `foo: ""`, `5` from `"5"`, and a hash from its JSON
+    /// text. Sparse: label → field → kind; absent means a YAML string
+    /// (or an ERB value).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub scalar_kinds: IndexMap<Symbol, IndexMap<Symbol, FixtureScalarKind>>,
+}
+
+/// The YAML type of a non-string fixture value (see `Fixture::scalar_kinds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixtureScalarKind {
+    Null,
+    Int,
+    Float,
+    Bool,
+    /// A mapping, kept in `records` as JSON text.
+    Mapping,
+    /// A sequence, kept in `records` as JSON text.
+    Sequence,
 }
 
 impl Fixture {
+    /// The YAML kind of `label.field`; `None` is a string or ERB value.
+    pub fn scalar_kind(&self, label: &Symbol, field: &Symbol) -> Option<FixtureScalarKind> {
+        self.scalar_kinds.get(label).and_then(|fields| fields.get(field)).copied()
+    }
+
     /// The loader and fixture-accessor typing must name the same model.
     pub(crate) fn class_id(&self) -> ClassId {
         let name = match &self.model_class {
