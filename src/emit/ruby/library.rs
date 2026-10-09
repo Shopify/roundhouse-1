@@ -5611,8 +5611,38 @@ fn is_fixture_lookup(body: &Expr) -> bool {
 
 /// `@__fx_<label>` — the cache slot. Prefixed so it cannot collide with
 /// anything the fixture file names.
+///
+/// A fixture label is any YAML key, and an instance variable name is
+/// not: Core's domains.yml labels hosts (`ihatetaxes.myshopify.com`,
+/// `wwwstorefront-api_com`), and `@__fx_wwwstorefront-api_com` parses
+/// as a subtraction, a load-time warning that Core's StrictWarning
+/// raises on, in a file 540 emitted tests require. (The accessor itself
+/// is already `define_singleton_method(:"<label>")`.)
+///
+/// So a label that is not all `[A-Za-z0-9_]` gets its own prefix,
+/// `@__fxe_`, and an escape: ASCII letters and digits stand, `_` is
+/// `__`, and any other character is `_<hex codepoint>_`. The map is
+/// injective: the two prefixes differ at their fifth character, and
+/// the escape decodes left to right (after `_`, a second `_` is the
+/// underscore; a hex digit starts a codepoint ended by `_`). So
+/// `a.b-c` (`@__fxe_a_2e_b_2d_c`) and `a_b_c` (`@__fx_a_b_c`) are two
+/// slots, and so are `a.b` and a label spelled `a_2e_b`.
 fn fixture_cache_ivar(label: &Symbol) -> Symbol {
-    Symbol::from(format!("__fx_{}", label.as_str()))
+    let label = label.as_str();
+    if label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Symbol::from(format!("__fx_{label}"));
+    }
+    let mut slot = String::from("__fxe_");
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            slot.push(c);
+        } else if c == '_' {
+            slot.push_str("__");
+        } else {
+            slot.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
+    Symbol::from(slot)
 }
 
 fn memoized_fixture_body(label: &Symbol, lookup: &Expr) -> Expr {

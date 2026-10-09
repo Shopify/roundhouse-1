@@ -95,7 +95,9 @@ module ActionDispatch
   end
 end
 
-# rack-test's StringIO form; it is the file params carry.
+# rack-test's StringIO form; it is the file params carry. Defined only
+# where the rack-test gem is not loaded (test_helper.rb); a CRuby tree
+# whose Bundler.require loads the gem keeps the gem's own class.
 module Rack
   module Test
     class UploadedFile < ActionDispatch::Http::UploadedFile

@@ -48,11 +48,100 @@ module RoundhouseMinitestAssertions
   def _synchronize(&block)
     Minitest::Test.io_lock.synchronize(&block)
   end
+
+  # mocha/minitest's lifecycle (Mocha::Integration::Minitest::Adapter),
+  # which TestBase wires by hand: mocha_setup first in its setup,
+  # mocha_verify in its teardown, mocha_teardown in that teardown's
+  # ensure. These keep the adapter's conditions on the three calls.
+  #
+  # mocha_verify runs only when the test has passed so far
+  # (`return unless passed?` in the adapter's before_teardown).
+  #
+  # Expectations count as assertions through Mocha's AssertionCounter,
+  # as under the adapter; native Minitest's assertion count includes
+  # them. Mocha 2 (Core's lock: 2.5.0) takes the counter in mocha_verify,
+  # Mocha 3 in mocha_setup; the hook whose arity accepts it gets it.
+  #
+  # mocha_verify and mocha_teardown run only after this test's
+  # mocha_setup. The runner's fixture reset runs before TestBase#setup,
+  # as ActiveRecord::TestFixtures#before_setup runs before the adapter's
+  # before_setup; when the reset raised, there is no Mockery to verify or
+  # tear down, and Mockery.teardown popped a stack nothing had pushed:
+  # every errored row carried a second NoMethodError ("undefined method
+  # 'pop' for nil") from TestBase#teardown.
+  def mocha_setup(*args)
+    super(*__roundhouse_mocha_counter(:mocha_setup, args))
+    @__roundhouse_mocha_set_up = true
+  end
+
+  def mocha_verify(*args)
+    return unless @__roundhouse_mocha_set_up && __roundhouse_passed?
+    super(*__roundhouse_mocha_counter(:mocha_verify, args))
+  end
+
+  def __roundhouse_mocha_counter(hook, args)
+    return args unless args.empty? && Mocha::Hooks.instance_method(hook).arity != 0
+    [Mocha::Integration::AssertionCounter.new(self)]
+  end
+
+  def mocha_teardown(*args)
+    return unless @__roundhouse_mocha_set_up
+    @__roundhouse_mocha_set_up = false
+    super
+  end
+
+  # Minitest::Test#passed?: no failure, error or skip recorded so far.
+  # The runner hands the test its live exception list.
+  attr_writer :__roundhouse_errors
+
+  def __roundhouse_passed?
+    @__roundhouse_errors.nil? || @__roundhouse_errors.empty?
+  end
+end
+
+# The adapter's include hook: an unmet expectation is a Minitest
+# failure, as under mocha/minitest.
+if defined?(Mocha::API)
+  require "mocha/integration/assertion_counter"
+  require "mocha/expectation_error_factory"
+  Mocha::ExpectationErrorFactory.exception_class = Minitest::Assertion
 end
 
 # Prepend to the framework base, not each authored test class. Authored helper
 # methods/overrides and setup/teardown super chains retain their precedence.
 TestBase.prepend(RoundhouseMinitestAssertions)
+
+# Rack's multipart round trip for the rack-test gem's own
+# `Rack::Test::UploadedFile`: rack-test encodes the file as a multipart
+# part and Rails parses it back into an `ActionDispatch::Http::UploadedFile`
+# (the uploaded name, the declared type, the bytes). The harness hands
+# params to the controller directly, so the round trip happens here, on
+# the params tree, Hash values and Array elements alike.
+#
+# Only for the gem's class: where the gem is not loaded, test_helper.rb's
+# own `Rack::Test::UploadedFile` is already an
+# `ActionDispatch::Http::UploadedFile` and passes through unchanged.
+module RoundhouseRackTestUploads
+  def dispatch_request(method, path, params, headers = {}, as = nil)
+    super(method, path, RoundhouseRackTestUploads.multipart(params), headers, as)
+  end
+
+  def self.multipart(value)
+    case value
+    when Hash
+      value.transform_values { |v| multipart(v) }
+    when Array
+      value.map { |v| multipart(v) }
+    else
+      return value if value.is_a?(ActionDispatch::Http::UploadedFile)
+      return value unless defined?(::Rack::Test::UploadedFile) && value.is_a?(::Rack::Test::UploadedFile)
+      bytes = String.new(encoding: Encoding::BINARY)
+      value.append_to(bytes)
+      ActionDispatch::Http::UploadedFile.new(bytes, value.original_filename, value.content_type)
+    end
+  end
+end
+RequestDispatch.prepend(RoundhouseRackTestUploads) if defined?(RequestDispatch) && defined?(ActionDispatch::Http::UploadedFile)
 
 module RoundhouseTestRunner
   # Whether a test file's driver runs: when the file is the program
@@ -65,6 +154,10 @@ module RoundhouseTestRunner
     program = File.expand_path($PROGRAM_NAME)
     program == File.expand_path(file) || !program.end_with?("_test.rb")
   end
+
+  # The emitted tree's root: this file is its test/minitest_runner.rb.
+  TREE = File.expand_path("..", __dir__)
+  BACKTRACE_FRAMES = 12
 
   def self.capture(errors, phase)
     yield
@@ -82,8 +175,52 @@ module RoundhouseTestRunner
       "error"
     end
     original = error.is_a?(Minitest::UnexpectedError) ? error.error : error
+    trace = inner_backtrace(original, caller(1))
     errors << {"phase" => phase, "status" => kind,
-               "class" => original.class.name, "message" => original.message}
+               "class" => original.class.name, "message" => original.message,
+               "site" => site(trace), "backtrace" => trace.first(BACKTRACE_FRAMES).map { |frame| relative(frame) }}
+  end
+
+  # The frames between the raise and this runner: the error's backtrace
+  # without the stack it shares with capture's caller (the runner, the
+  # batch loader, the test file's driver), and without capture's own
+  # frame, which only says that a block was yielded. What remains ends
+  # at the runner's block, which names the phase's call (test.setup,
+  # test.teardown). A backtrace from elsewhere (another thread's, or one
+  # an exception was built with) shares no frames and stays whole.
+  def self.inner_backtrace(error, outer)
+    trace = error.backtrace || []
+    shared = 0
+    shared += 1 while shared < outer.length && shared < trace.length && trace[-1 - shared] == outer[-1 - shared]
+    return trace if shared.zero?
+    inner = trace[0, trace.length - shared]
+    inner = inner[0...-1] if inner.last.to_s.include?("capture'")
+    inner
+  end
+
+  # The first frame inside the emitted tree, relative to its root, as
+  # the batch loader's boot and load rows name theirs; else the first
+  # frame. "" when the error carries no backtrace.
+  def self.site(trace)
+    relative(trace.find { |frame| tree_file(frame) } || trace.first)
+  end
+
+  # A frame with its file relative to the tree root when it is in the
+  # tree; other frames (gems, Ruby's own) as they are.
+  def self.relative(frame)
+    frame = frame.to_s
+    file = tree_file(frame)
+    file ? file + frame[frame.index(/:\d+:/)..] : frame
+  end
+
+  # The frame's file relative to the tree root, or nil outside it. A file
+  # loaded by a relative path (`ruby -Itest test/models/x_test.rb` from
+  # the root) is named relative to the working directory.
+  def self.tree_file(frame)
+    file = frame[/\A(.+?):\d+:/, 1]
+    return nil if file.nil? || file.start_with?("<")
+    full = File.expand_path(file)
+    full.start_with?(TREE + "/") ? full.delete_prefix(TREE + "/") : nil
   end
 
   def self.run_one(klass, name)
@@ -91,6 +228,9 @@ module RoundhouseTestRunner
     test = nil
     capture(errors, "initialize") { test = klass.new }
     if test
+      # Live: a phase's failure is visible to the next (mocha_verify's
+      # passed? check), as Minitest's failures list is.
+      test.__roundhouse_errors = errors
       capture(errors, "setup") do
         yield if block_given?
         test.__roundhouse_setup_fixtures
