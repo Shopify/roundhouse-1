@@ -835,8 +835,7 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize, seen: &
         [(path, methods, dependencies, inner, hook, runs, start, end)] => {
             // `ClassMethods` reopened (or the concern) in another source:
             // the methods it gives are not all in this one.
-            let scope = inner.len().checked_sub(2).and_then(|i| inner.get(i)).map(String::as_str);
-            if let Some(why) = consts::reopened_elsewhere(&full, path, *start, *end, scope) {
+            if let Some(why) = consts::reopened_elsewhere(&full, path, *start, *end) {
                 return (vec![Gives::Unknown(why)], None);
             }
             seen.concerns.push(full.clone());
@@ -1096,9 +1095,7 @@ impl<'pr> Macros<'pr> {
     fn reopened(&self) -> Option<&String> {
         self.reopened
             .get_or_init(|| {
-                let full = self.class.0.as_str();
-                let scope = full.rsplit_once("::").map(|(scope, _)| scope);
-                consts::reopened_elsewhere(full, &self.file, self.class_start, self.class_end, scope)
+                consts::reopened_elsewhere(self.class.0.as_str(), &self.file, self.class_start, self.class_end)
             })
             .as_ref()
     }

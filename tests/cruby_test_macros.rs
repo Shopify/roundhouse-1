@@ -187,7 +187,7 @@ const CONST_LOOP_TEST: &str = r##"class ConstLoopTest < ActiveSupport::TestCase
     end
   end
 
-  CASES = [{ name: :first, mod: StagedChange }.freeze, { name: :second, mod: Reasons }.freeze].freeze
+  CASES = [{ name: :first, mod: StagedChange }.freeze, { name: :second, mod: Comparable }.freeze].freeze
   CASES.each do |c|
     test "case #{c[:name]}" do
       assert_kind_of Module, c[:mod]
@@ -210,14 +210,27 @@ end
 "##;
 
 /// The tests the gaps name: native Minitest runs them, the emitted
-/// program does not.
-const NOT_MODELED: [&str; 4] =
-    ["ConstLoopTest#test_computed_alpha", "ConstLoopTest#test_computed_beta", "MacroTest#test_each_x", "MacroTest#test_each_y"];
+/// program does not. `Reasons.constants` is one: `MacroTest` passes
+/// `Reasons` to a method that may add to it.
+const NOT_MODELED: [&str; 6] = [
+    "ConstLoopTest#test_ALPHA_is_a_reason",
+    "ConstLoopTest#test_BETA_is_a_reason",
+    "ConstLoopTest#test_computed_alpha",
+    "ConstLoopTest#test_computed_beta",
+    "MacroTest#test_each_x",
+    "MacroTest#test_each_y",
+];
 
 /// The loop gaps of a constant (`consts::NOT_LITERAL`, `consts::USED`).
 const NOT_LITERAL: &str =
     "tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run";
 const USED: &str = "tests declared by a loop over a constant a source uses in a way not known to leave it unchanged are not modeled; they will not run";
+/// The loop gaps of `Module#constants` (`consts::REOPENED`,
+/// `consts::MODULE_BODY`) and of a constant not bound once
+/// (`consts::UNCERTAIN`).
+const REOPENED: &str = "tests declared by a loop over the constants of a module changed from outside its body are not modeled; they will not run";
+const MODULE_BODY: &str = "tests declared by a loop over the constants of a module whose body is not one listed as declaring only the constants it shows are not modeled; they will not run";
+const UNCERTAIN: &str = "tests declared by a loop over a constant not assigned once with certainty are not modeled; they will not run";
 
 /// Core's TestTags naming (`_tag:<key>:<value>` per tag) for `test`'s
 /// tags Hash, prepended on ActiveSupport::TestCase's singleton.
@@ -367,6 +380,7 @@ fn test_macros_expand_and_constant_loops_unroll_as_ruby_declares_them() {
     let named = [
         r#"tests declared by a call of the class method `generate_each` are not modeled; they will not run (`MacroTest` line 39: its body does more than declare tests (`names.each { |n| test("each #{n}") { assert n } }`))"#,
         "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`ConstLoopTest` line 41, first test at line 42: Reasons.all)",
+        "tests declared by a loop over the constants of a module changed from outside its body are not modeled; they will not run (`ConstLoopTest` line 14, first test at line 15: `Reasons.constants`: `Reasons` may be changed at `test_permission(Reasons, :alpha, sufficient: [:products, :manage_products, :edit…` (test/models/macro_test.rb line 41, a test source not registered before this one))",
     ];
     for gap in named {
         assert_eq!(gaps.iter().filter(|g| g.contains(gap)).count(), 1, "{gap}\n{gaps:#?}");
@@ -1182,7 +1196,7 @@ end
         &[("app/models/chained.rb", chained), ("test/models/chained_test.rb", test)],
         &["ChainedTest"],
         &|_| true,
-        &["tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`ChainedTest` line 2, first test at line 3: "],
+        &[&format!("{MODULE_BODY} (`ChainedTest` line 2, first test at line 3: `Chained.constants`: its body runs `A = B = :x` (line 2), not listed as adding no constant)")],
     );
     assert_eq!(native.len(), 3, "{native:#?}");
 }
@@ -1675,7 +1689,7 @@ fn outside_changes_to_a_class_or_concern_are_named() {
         &["OutsideTest"],
         &|id| id != "OutsideTest#test_kept",
         &[&format!(
-            "{}the module that defines it is not known (`GenConcern` is changed from outside its body at `GenConcern.class_methods do` (app/models/gen_concern_ext.rb line 1)))",
+            "{}the module that defines it is not known (`GenConcern` may be changed at `GenConcern.class_methods do` (app/models/gen_concern_ext.rb line 1)))",
             call_gap("gen", "OutsideTest", 4)
         )],
     );
@@ -1770,4 +1784,352 @@ end
         )],
     );
     assert_eq!(native.len(), 5, "{native:#?}");
+}
+
+// ---- The allow-list: only uses listed as safe leave a loop to run ---
+
+/// A change through any path that may reach the constant is a gap: a
+/// rooted path through a class that includes its module
+/// (`::Parent::MORE`), one through an alias (`::KAlias::THIRD`), a bare
+/// name in a class whose ancestors have it (`ALL` in `Sub < Parent`,
+/// though the file declares another `ALL`). A constant no use changes
+/// is still unrolled, the alias counted by its own uses.
+#[test]
+fn changes_through_ancestors_aliases_and_rooted_paths_are_gaps() {
+    let kinds = "module Kinds\n  ALL = [:a, :b]\n  MORE = [:m, :n]\n  THIRD = [:x, :y]\n  KEPT = [:k]\nend\n\nKAlias = Kinds\n";
+    let parent = "class Parent\n  include Kinds\nend\n";
+    let sub = "module Other\n  ALL = [:q]\nend\n\nclass Sub < Parent\n  ALL << :c\nend\n";
+    let rooted = "::Parent::MORE << :d\n::KAlias::THIRD << :e\n";
+    let test = r##"class AncTest < ActiveSupport::TestCase
+  Kinds::ALL.each do |k|
+    test "k #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::MORE.each do |k|
+    test "more #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::THIRD.each do |k|
+    test "third #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::KEPT.each do |k|
+    test "kept #{k}" do
+      assert k
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/kinds.rb", kinds),
+            ("app/models/parent.rb", parent),
+            ("app/models/sub.rb", sub),
+            ("app/models/zz_rooted.rb", rooted),
+            ("test/models/anc_test.rb", test),
+        ],
+        &["AncTest"],
+        &|id| !id.contains("#test_kept_"),
+        &[
+            &format!("{USED} (`AncTest` line 2, first test at line 3: `Kinds::ALL`: `ALL << :c` (app/models/sub.rb line 6))"),
+            &format!("{USED} (`AncTest` line 8, first test at line 9: `Kinds::MORE`: `::Parent::MORE << :d` (app/models/zz_rooted.rb line 1))"),
+            &format!("{USED} (`AncTest` line 14, first test at line 15: `Kinds::THIRD`: `::KAlias::THIRD << :e` (app/models/zz_rooted.rb line 2))"),
+        ],
+    );
+    for id in ["AncTest#test_k_c", "AncTest#test_more_d", "AncTest#test_third_e", "AncTest#test_kept_k"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// `Module#constants` is unrolled only for a module whose one body
+/// declares constants by statements listed as adding no other, and whose
+/// every use elsewhere is listed as only reading it (`include`, a method
+/// of its own body that adds none). Any other use is a gap: a compact
+/// `class Mod::X` (in its own file too), `module Mod::X` in a test
+/// helper, `Mod::X ||= …`, `Mod::X, Mod::Y = …`, `Mod.autoload`, the
+/// module kept in a data structure.
+#[test]
+fn constants_added_from_outside_a_module_body_are_gaps() {
+    let modules = [
+        ("app/models/kinds.rb", "module Kinds\n  A = 1\nend\n\nclass Kinds::SameFile\nend\n"),
+        ("app/models/wide.rb", "module Wide\n  W1 = 1\nend\n"),
+        ("app/models/fakes.rb", "module Fakes\n  F1 = 1\nend\n"),
+        ("app/models/modes.rb", "module Modes\n  M1 = 1\nend\n"),
+        ("app/models/levels.rb", "module Levels\n  L1 = 1\nend\n"),
+        ("app/models/lazy.rb", "module Lazy\n  Z1 = 1\nend\n"),
+        ("app/models/held.rb", "module Held\n  H1 = 1\nend\n"),
+        ("app/models/plain.rb", "module Plain\n  P1 = :p1\n  P2 = :p2\n\n  class << self\n    def all\n      [P1, P2]\n    end\n  end\nend\n"),
+        ("app/models/plain_user.rb", "class PlainUser\n  include Plain\n  LIST = Plain.all\nend\n"),
+        ("app/models/zz_extra.rb", "class Wide::Extra\nend\n"),
+        ("app/models/zz_modes.rb", "Modes::M2 ||= 2\n"),
+        ("app/models/zz_levels.rb", "Levels::L2, Levels::L3 = 2, 3\n"),
+        ("app/models/zz_lazy.rb", "Lazy.autoload(:Later, \"/nonexistent/later\")\n"),
+        ("test/support/fakes_fake.rb", "module Fakes::Fake\nend\n"),
+    ];
+    let names = ["Kinds", "Wide", "Fakes", "Modes", "Levels", "Lazy", "Held", "Plain"];
+    let mut test = String::new();
+    for name in names {
+        test.push_str(&format!(
+            "class {name}ConstsTest < ActiveSupport::TestCase\n  HOLDERS = [{{ mod: Held }}.freeze].freeze\n\n  {name}.constants.each do |c|\n    test \"const #{{c}}\" do\n      assert c\n    end\n  end\nend\n\n"
+        ));
+    }
+    let mut files: Vec<(&str, &str)> = modules.to_vec();
+    files.push(("test/models/consts_test.rb", &test));
+    let classes: Vec<String> = names.iter().map(|n| format!("{n}ConstsTest")).collect();
+    let at = |name: &str| names.iter().position(|n| *n == name).unwrap() * 10 + 4;
+    let gap = |name: &str, site: &str| {
+        format!("{REOPENED} (`{name}ConstsTest` line {}, first test at line {}: `{name}.constants`: `{name}` may be changed at {site})", at(name), at(name) + 1)
+    };
+    let native = matches_native(
+        &files,
+        &classes.iter().map(String::as_str).collect::<Vec<_>>(),
+        &|id| !id.starts_with("PlainConstsTest#"),
+        &[
+            &gap("Kinds", "`class Kinds::SameFile` (app/models/kinds.rb line 5)"),
+            &gap("Wide", "`class Wide::Extra` (app/models/zz_extra.rb line 1)"),
+            &gap("Fakes", "`module Fakes::Fake` (test/support/fakes_fake.rb line 1, a test source not registered before this one)"),
+            &gap("Modes", "`Modes::M2 ||= 2` (app/models/zz_modes.rb line 1)"),
+            &gap("Levels", "`Levels::L2, Levels::L3 = 2, 3` (app/models/zz_levels.rb line 1)"),
+            &gap("Lazy", "`Lazy.autoload(:Later, \"/nonexistent/later\")` (app/models/zz_lazy.rb line 1)"),
+            &gap("Held", "`HOLDERS = [{ mod: Held }.freeze].freeze` (test/models/consts_test.rb line 2)"),
+        ],
+    );
+    for id in [
+        "KindsConstsTest#test_const_SameFile",
+        "WideConstsTest#test_const_Extra",
+        "FakesConstsTest#test_const_Fake",
+        "ModesConstsTest#test_const_M2",
+        "LevelsConstsTest#test_const_L3",
+        "LazyConstsTest#test_const_Later",
+        "PlainConstsTest#test_const_P2",
+    ] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A macro module reopened through an alias (`module GM` of `GM =
+/// GenMod`, `GCC.class_methods do` of `GCC = GenConcern`) may define
+/// other methods than its body shows: the calls are gaps.
+#[test]
+fn a_macro_module_reopened_through_an_alias_is_named() {
+    let gen_mod = "module GenMod\n  def gen(k)\n    test(\"gen #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let gen_concern = "module GenConcern\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def cgen(k)\n      test(\"cgen #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+    let aliases = "GM = GenMod\nmodule GM\n  def gen(k)\n    test(\"redef #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n\nGCC = GenConcern\nGCC.class_methods do\n  def cgen(k)\n    test(\"credef #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let test = "class AliasModTest < ActiveSupport::TestCase\n  extend GenMod\n\n  gen(:a)\n\n  test \"kept\" do\n    assert true\n  end\nend\n\nclass AliasConcernTest < ActiveSupport::TestCase\n  include GenConcern\n\n  cgen(:b)\nend\n";
+    let native = matches_native(
+        &[
+            ("app/models/gen_mod.rb", gen_mod),
+            ("app/models/gen_concern.rb", gen_concern),
+            ("app/models/zz_aliases.rb", aliases),
+            ("test/models/alias_reopen_test.rb", test),
+        ],
+        &["AliasModTest", "AliasConcernTest"],
+        &|id| id != "AliasModTest#test_kept",
+        &[
+            &format!("{}the module that defines it is not known (`GenMod` may be changed at `GM = GenMod` (app/models/zz_aliases.rb line 1)))", call_gap("gen", "AliasModTest", 4)),
+            &format!("{}the module that defines it is not known (`GenConcern` may be changed at `GCC = GenConcern` (app/models/zz_aliases.rb line 8)))", call_gap("cgen", "AliasConcernTest", 14)),
+        ],
+    );
+    for id in ["AliasModTest#test_redef_a", "AliasConcernTest#test_credef_b"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A constant bound by a multiple assignment (`X, ALL = …`, `Y,
+/// Kinds::MORE = …` in another module) is not assigned once with
+/// certainty.
+#[test]
+fn a_constant_bound_by_multiple_assignment_is_named() {
+    let kinds = "module Kinds\n  ALL = [:a, :b].freeze\n  X, ALL = 1, [:z].freeze\n  MORE = [:m].freeze\n  SAFE = [:s].freeze\nend\n";
+    let rebind = "module Rebind\n  Y, Kinds::MORE = 1, [:n].freeze\nend\n";
+    let test = r##"class MultiTest < ActiveSupport::TestCase
+  Kinds::ALL.each do |k|
+    test "all #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::MORE.each do |k|
+    test "more #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::SAFE.each do |k|
+    test "safe #{k}" do
+      assert k
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/rebind.rb", rebind), ("test/models/multi_test.rb", test)],
+        &["MultiTest"],
+        &|id| !id.contains("#test_safe_"),
+        &[
+            &format!("{UNCERTAIN} (`MultiTest` line 2, first test at line 3: `Kinds::ALL` is not assigned once, unconditionally, by `Kinds::ALL = …`)"),
+            &format!("{UNCERTAIN} (`MultiTest` line 8, first test at line 9: `Kinds::MORE` is not assigned once, unconditionally, by `Kinds::MORE = …`)"),
+        ],
+    );
+    for id in ["MultiTest#test_all_z", "MultiTest#test_more_n", "MultiTest#test_safe_s"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A String a module evaluates (`module_eval("…")`, a heredoc) that has
+/// the constant's name, and a path through a local (`ref::ALL`), may
+/// change it.
+#[test]
+fn a_constant_named_in_an_evaluated_string_is_named() {
+    let kinds = "module Kinds\n  ALL = [:a, :b]\n  MORE = [:m]\n  EVALED = [:e]\nend\nKinds.module_eval(\"EVALED << :f\")\nKinds.module_eval <<~RUBY\n  MORE << :n\nRUBY\nref = Kinds\nref::ALL << :c\n";
+    let test = r##"class MetaTest < ActiveSupport::TestCase
+  Kinds::ALL.each do |k|
+    test "all #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::MORE.each do |k|
+    test "more #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::EVALED.each do |k|
+    test "evaled #{k}" do
+      assert k
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("test/models/meta_test.rb", test)],
+        &["MetaTest"],
+        &|_| true,
+        &[
+            &format!("{USED} (`MetaTest` line 2, first test at line 3: `Kinds::ALL`: `ref::ALL << :c` (app/models/kinds.rb line 11))"),
+            &format!("{USED} (`MetaTest` line 8, first test at line 9: `Kinds::MORE`: `Kinds.module_eval <<~RUBY` (app/models/kinds.rb line 7))"),
+            &format!("{USED} (`MetaTest` line 14, first test at line 15: `Kinds::EVALED`: `Kinds.module_eval(\"EVALED << :f\")` (app/models/kinds.rb line 6))"),
+        ],
+    );
+    for id in ["MetaTest#test_all_c", "MetaTest#test_more_n", "MetaTest#test_evaled_f"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// `define_method("test_…")` defines a test Minitest runs: in the class
+/// body, in a loop, or in a macro, it is a named gap, not dropped.
+#[test]
+fn define_method_tests_are_named() {
+    let direct = r##"class DmDirectTest < ActiveSupport::TestCase
+  define_method("test_direct") do
+    assert true
+  end
+
+  %i[a b].each do |n|
+    define_method("test_loop_#{n}") do
+      assert true
+    end
+  end
+
+  test "plain" do
+    assert true
+  end
+end
+"##;
+    let macro_test = r##"class DmMacroTest < ActiveSupport::TestCase
+  def self.via_define(n)
+    define_method("test_dm_#{n}") do
+      assert true
+    end
+  end
+
+  via_define :b
+
+  test "plain" do
+    assert true
+  end
+end
+"##;
+    let singleton = r##"class DmSingletonTest < ActiveSupport::TestCase
+  class << self
+    def via_define(n)
+      define_method("test_dm_#{n}") do
+        assert true
+      end
+    end
+  end
+
+  via_define :c
+
+  test "plain" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(
+        &[("test/models/dm_direct_test.rb", direct), ("test/models/dm_macro_test.rb", macro_test), ("test/models/dm_singleton_test.rb", singleton)],
+        &["DmDirectTest", "DmMacroTest", "DmSingletonTest"],
+        &|id| !id.ends_with("#test_plain"),
+        &[
+            "tests declared by `define_method` of a test are not modeled; they will not run (`DmDirectTest` line 2: define_method(\"test_direct\") do)",
+            "(`DmDirectTest` line 6, first test at line 7: ",
+            "(`DmMacroTest` line 8: ",
+            "(`DmSingletonTest` line 10: ",
+        ],
+    );
+    for id in ["DmDirectTest#test_direct", "DmDirectTest#test_loop_b", "DmMacroTest#test_dm_b", "DmSingletonTest#test_dm_c"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A path through a name no source declares is a gem's: it reaches an
+/// app constant only through a module a source mixes into a gem's
+/// (`Minitest::Test.include(ModesHelper)` gives every test class
+/// `ModesHelper::MODES`), and otherwise names none of the app's
+/// (`FixtureFactory::Registry::ClassMethods` is not `GemPathTest::ClassMethods`).
+#[test]
+fn paths_through_gem_modules_reach_what_a_source_mixes_in() {
+    let modes = "MODES = [:top].freeze\n";
+    let helper = "module ModesHelper\n  MODES = [:helper].freeze\nend\n\nMinitest::Test.include(ModesHelper)\n";
+    let test = "class MtModesTest < ActiveSupport::TestCase\n  MODES.each do |m|\n    test \"mode #{m}\" do\n      assert_equal :helper, m\n    end\n  end\nend\n";
+    let native = matches_native(
+        &[("app/models/modes.rb", modes), ("app/models/modes_helper.rb", helper), ("test/models/mt_modes_test.rb", test)],
+        &["MtModesTest"],
+        &|_| true,
+        &["tests declared by a loop over a constant an ancestor of its class may declare are not modeled; they will not run (`MtModesTest` line 2, first test at line 3: `MODES`, looked up past the ancestors of `MtModesTest`: `Minitest::Test` may be changed at `Minitest::Test.include(ModesHelper)` (app/models/modes_helper.rb line 5))"],
+    );
+    assert!(native.contains_key("MtModesTest#test_mode_helper"), "{native:#?}");
+
+    let gen_mod = "module GenMod\n  def gen(k)\n    test(\"gen #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let registry = "module Registered\n  def self.registry\n    FixtureFactory::Registry::ClassMethods\n  end\nend\n";
+    let test = "class GemPathTest < ActiveSupport::TestCase\n  extend GenMod\n\n  gen(:a)\nend\n";
+    let native = matches_native(
+        &[("app/models/gen_mod.rb", gen_mod), ("app/models/registered.rb", registry), ("test/models/gem_path_test.rb", test)],
+        &["GemPathTest"],
+        &|_| false,
+        &[],
+    );
+    assert!(native.contains_key("GemPathTest#test_gen_a"), "{native:#?}");
+}
+
+/// A test class one file declares by two class bodies is one class
+/// whose body is split: it is named, not emitted as two test files (the
+/// second without its superclass or the first's methods).
+#[test]
+fn a_test_class_reopened_in_its_file_is_named() {
+    let test = "class SameFileTest < ActiveSupport::TestCase\n  def helper_value\n    :h\n  end\nend\n\nclass SameFileTest\n  test \"same kept\" do\n    assert_equal :h, helper_value\n  end\nend\n\nclass OtherTest < ActiveSupport::TestCase\n  test \"other\" do\n    assert true\n  end\nend\n";
+    let native = matches_native(
+        &[("test/models/same_file_test.rb", test)],
+        &["SameFileTest", "OtherTest"],
+        &|id| id.starts_with("SameFileTest#"),
+        &["test class `SameFileTest` refused: it is declared by more than one class body in this file, which is not modeled; its tests would not run (`SameFileTest`, lines 1, 7)"],
+    );
+    assert!(native.contains_key("SameFileTest#test_same_kept"), "{native:#?}");
 }

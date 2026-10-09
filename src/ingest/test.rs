@@ -105,7 +105,32 @@ fn ingest_each_test_class(
     file: &str,
 ) -> IngestResult<Vec<TestModule>> {
     let mut out = Vec::new();
-    for class in test_nodes {
+    // A test class the file declares by two class bodies (`class XTest <
+    // ActiveSupport::TestCase … end; class XTest … end`) is one class
+    // whose body is split: each body as a test file of its own would run
+    // without the other's (the second without its superclass).
+    let names: Vec<String> = test_nodes.iter().map(scoped_class_name).collect();
+    let mut reported = crate::det::HashSet::default();
+    for (class, name) in test_nodes.iter().zip(&names) {
+        let bodies: Vec<String> = test_nodes
+            .iter()
+            .zip(&names)
+            .filter(|(_, other)| *other == name)
+            .map(|((_, c), _)| super::sources::line_at(file, c.location().start_offset()).map_or_else(|| "?".into(), |l| l.to_string()))
+            .collect();
+        if bodies.len() > 1 {
+            if reported.insert(name.clone()) {
+                super::survey::unwrap_or_record::<()>(Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!(
+                        "test class `{name}` refused: it is declared by more than one class body in this file, which is not modeled; \
+                         its tests would not run (`{name}`, lines {})",
+                        bodies.join(", ")
+                    ),
+                }))?;
+            }
+            continue;
+        }
         let result = ingest_test_class(class, helper_nodes, file).map_err(|err| match err {
             IngestError::Unsupported { file, message } => IngestError::Unsupported {
                 message: format!("test class `{}` refused: {message}", scoped_class_name(class)),
@@ -333,7 +358,33 @@ pub(super) fn is_generate_test(call: &ruby_prism::CallNode<'_>) -> bool {
     call.receiver().is_none() && call.name().as_slice() == b"generate_test" && call.arguments().is_some()
 }
 
-/// The first test declaration (`test "…"`, `def test_…`, `generate_test`) inside `stmt`,
+/// `define_method("test_…")` (`:test_…`, `"test_#{x}"`, a name made as
+/// it runs) on the class itself: a method Minitest runs when its name
+/// starts with `test_`.
+pub(super) fn defines_test_method(call: &ruby_prism::CallNode<'_>) -> bool {
+    if call.name().as_slice() != b"define_method" || call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+        return false;
+    }
+    let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next()) else { return false };
+    let named = |text: &[u8]| text.starts_with(b"test_") || b"test_".starts_with(text);
+    if let Some(sym) = first.as_symbol_node() {
+        return sym.unescaped().starts_with(b"test_");
+    }
+    if let Some(string) = first.as_string_node() {
+        return string.unescaped().starts_with(b"test_");
+    }
+    let parts = first
+        .as_interpolated_string_node()
+        .map(|n| n.parts())
+        .or_else(|| first.as_interpolated_symbol_node().map(|n| n.parts()));
+    match parts {
+        Some(parts) => parts.iter().next().is_some_and(|p| p.as_string_node().is_none_or(|s| named(s.unescaped()))),
+        None => true,
+    }
+}
+
+/// The first test declaration (`test "…"`, `def test_…`, `generate_test`,
+/// `define_method("test_…")`) inside `stmt`,
 /// a class-body statement ingest does not model (`%w[a b].each do |x|
 /// test "#{x}" do … end end`, or a `test` whose name is not a string
 /// literal), as its offset. Nested classes and method bodies are not
@@ -351,7 +402,7 @@ pub(super) fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     }
     impl<'pr> Visit<'pr> for Find {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            if self.found.is_none() && (is_test_declaration_shape(&node.as_node()) || is_generate_test(node)) {
+            if self.found.is_none() && (is_test_declaration_shape(&node.as_node()) || is_generate_test(node) || defines_test_method(node)) {
                 self.found = Some(node.location().start_offset());
                 return;
             }

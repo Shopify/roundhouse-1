@@ -1698,6 +1698,8 @@ pub(super) fn declare_hidden<'pr>(
         }
     } else if stmt.as_call_node().is_some_and(|c| super::is_generate_test(&c)) {
         Err(not_modeled("TestGenerator's `generate_test`", first_line(stmt)))
+    } else if stmt.as_call_node().is_some_and(|c| super::defines_test_method(&c)) {
+        Err(not_modeled("`define_method` of a test", first_line(stmt)))
     } else if let Some(call) = stmt.as_call_node() {
         let mut out = Vec::new();
         unroll.unroll_loop(&call, &[], &mut out)?.map(|()| out)
@@ -1882,7 +1884,10 @@ pub(super) mod consts {
     pub(in super::super) const NOT_LITERAL: &str = "a loop over a constant whose value is not a literal of frozen values";
     pub(in super::super) const USED: &str = "a loop over a constant a source uses in a way not known to leave it unchanged";
     pub(in super::super) const REOPENED: &str = "a loop over the constants of a module changed from outside its body";
+    pub(in super::super) const MODULE_BODY: &str =
+        "a loop over the constants of a module whose body is not one listed as declaring only the constants it shows";
     pub(in super::super) const ANCESTOR: &str = "a loop over a constant an ancestor of its class may declare";
+    pub(in super::super) const UNCERTAIN: &str = "a loop over a constant not assigned once with certainty";
     pub(in super::super) const LATE_SOURCE: &str = "a loop over a constant a test source not registered before it may declare";
 
     impl ConstCx {
@@ -2023,6 +2028,7 @@ pub(super) mod consts {
             hit = match find(&full) {
                 Found::Namespace => Hit::Namespace(full),
                 Found::Value(decl) if !decl.private => Hit::Decl(decl),
+                Found::Unknown => return uncertain(&full),
                 _ => return None,
             };
         }
@@ -2169,11 +2175,21 @@ pub(super) mod consts {
         }
     }
 
+    /// Refused: `full` is declared by a test source not registered yet,
+    /// or more than once, or not certainly (`X, ALL = …`, `ALL ||= …`,
+    /// in a conditional).
+    fn uncertain<T>(full: &str) -> Option<T> {
+        match late_reason(full) {
+            Some(why) => refuse(LATE_SOURCE, why),
+            None => refuse(UNCERTAIN, format!("`{full}` is not assigned once, unconditionally, by `{full} = …`")),
+        }
+    }
+
     fn top(name: &str) -> Option<Hit> {
         match find(name) {
             Found::Namespace => Some(Hit::Namespace(name.to_string())),
             Found::Value(decl) => Some(Hit::Decl(decl)),
-            Found::Unknown => late_reason(name).and_then(|why| refuse(LATE_SOURCE, why)),
+            Found::Unknown => uncertain(name),
             Found::Missing => None,
         }
     }
@@ -2197,7 +2213,7 @@ pub(super) mod consts {
             let full = format!("{scope}::{name}");
             match find(&full) {
                 Found::Missing => continue,
-                Found::Unknown => return late_reason(&full).and_then(|why| refuse(LATE_SOURCE, why)),
+                Found::Unknown => return uncertain(&full),
                 Found::Namespace => return Some(Hit::Namespace(full)),
                 Found::Value(decl) => return Some(Hit::Decl(decl)),
             }
@@ -2236,7 +2252,7 @@ pub(super) mod consts {
             Hit::Decl(decl) => {
                 let (value, shape) = evaluate_at(&decl.path, decl.start, decl.end, decl.cref.clone(), None, cx.depth + 1)?;
                 let full = decl.names.first()?;
-                unchanged(full, &decl.path, decl.start, decl.cref.last().map(String::as_str), shape)?;
+                unchanged(full, &decl.path, decl.start, shape)?;
                 Some(value)
             }
             Hit::Local(name, stmt, start, end) => {
@@ -2244,7 +2260,7 @@ pub(super) mod consts {
                 let full = format!("{}::{name}", local.class);
                 let local = Local { before: stmt, ..local.clone() };
                 let (value, shape) = evaluate_at(&cx.file, start, end, cx.cref.clone(), Some(local), cx.depth + 1)?;
-                unchanged(&full, &cx.file, start, cx.cref.last().map(String::as_str), shape)?;
+                unchanged(&full, &cx.file, start, shape)?;
                 Some(value)
             }
         }
@@ -2363,18 +2379,21 @@ pub(super) mod consts {
     /// `Module#constants` of `module`: the names its one `module` body
     /// assigns or declares (`class`/`module`), less those it makes
     /// `private_constant`; a set, in no order known here (Ruby lists them
-    /// in the order of its symbol table). `None` unless that body only
-    /// assigns constants, declares namespaces and defines methods, no
-    /// source (its own file included) opens the module again, writes into
-    /// it (`Mod::X =`, `Mod.const_set`) or changes it from outside
-    /// (`Mod.include`, `Mod.send`, …), and Zeitwerk has no directory of
-    /// files for it.
+    /// in the order of its symbol table). Only for a body of statements
+    /// listed as adding no other constant (`body_constants`), a module
+    /// Zeitwerk has no directory of files for, and no use of the module
+    /// anywhere (its own file included) that may add to it
+    /// (`changed_from_outside`): `Mod::X = …`, `class Mod::X`,
+    /// `Mod.const_set`, `Mod.autoload`, `Alias = Mod`, any call not
+    /// listed as only reading it. Else a named gap.
     pub(super) fn module_constants(module: &str) -> Option<Vec<Value>> {
         let last = module.rsplit("::").next()?;
         let decls: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == module)).collect();
-        let [decl] = decls.as_slice() else { return None };
+        let [decl] = decls.as_slice() else {
+            return refuse(MODULE_BODY, format!("`{module}.constants`: `{module}` is not declared by one `module` body"));
+        };
         if !decl.certain || decl.names.len() != 1 || decl.kind != Kind::Module {
-            return None;
+            return refuse(MODULE_BODY, format!("`{module}.constants`: `{module}` is not declared by one `module` body"));
         }
         if let Some(why) = late_reason(module) {
             return refuse(LATE_SOURCE, format!("`{module}.constants`: {why}"));
@@ -2383,72 +2402,148 @@ pub(super) mod consts {
         let mut id = 1;
         while let Some(path) = sources::path_of(FileId(id)) {
             if path.contains(&dir) {
-                return None;
+                return refuse(
+                    REOPENED,
+                    format!("`{module}.constants`: Zeitwerk may load {} into it", sources::relative_path(&path)),
+                );
             }
             id += 1;
         }
-        let writes_into = |text: &str| {
-            text.contains(&format!("{last}.const_set")) || text.contains(&format!("{last}::const_set")) || assigns_into(text, last)
-        };
-        for id in files_with(last, 0) {
-            let Some(path) = sources::path_of(FileId(id)) else { continue };
-            if sources::with_text(&path, writes_into) != Some(false) {
-                return None;
-            }
-        }
-        let (files, late) = late_sources(Some(last));
-        if let Some(i) = late.into_iter().find(|i| files[*i].0.contains(&dir) || writes_into(&files[*i].1)) {
-            return refuse(
-                LATE_SOURCE,
-                format!("`{module}.constants`: {} may add to it, a test source not registered before this one", sources::relative_path(&files[i].0)),
-            );
-        }
-        if let Some(site) = changed_from_outside(module, &decl.path, decl.cref.last().map(String::as_str)) {
-            return refuse(REOPENED, format!("`{module}.constants`: `{module}` {site}"));
-        }
-        sources::with_text(&decl.path, |text| {
+        let body = sources::with_text(&decl.path, |text| {
             let result = ruby_prism::parse(text.as_bytes());
             let root = result.node();
-            let node = node_at(&root, decl.start, decl.end)?;
-            let module_node = node.as_module_node()?;
-            let mut out: Vec<String> = Vec::new();
-            let mut private: Vec<String> = Vec::new();
-            for stmt in module_node.body().map(flatten_statements).unwrap_or_default() {
-                if let Some(write) = stmt.as_constant_write_node() {
-                    // `A = B = :x` writes `B` too; `A = const_set(…)` more.
-                    if writes_constants(&write.value()) {
-                        return None;
-                    }
-                    out.push(constant_id_str(&write.name()).to_string());
-                } else if let Some(path) = stmt.as_module_node().map(|m| m.constant_path()).or_else(|| stmt.as_class_node().map(|c| c.constant_path())) {
-                    match segments(&path) {
-                        Some((segs, false)) if segs.len() == 1 => out.push(segs[0].clone()),
-                        _ => return None,
-                    }
-                } else if stmt.as_def_node().is_some() {
-                } else if let Some(singleton) = stmt.as_singleton_class_node() {
-                    let body = singleton.body().map(flatten_statements).unwrap_or_default();
-                    if !body.iter().all(|s| s.as_def_node().is_some() || is_declaration_call(s)) {
-                        return None;
-                    }
-                } else if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && c.name().as_slice() == b"private_constant") {
-                    for arg in call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
-                        private.push(String::from_utf8(arg.as_symbol_node()?.unescaped().to_vec()).ok()?);
-                    }
-                } else if is_declaration_call(&stmt) && !stmt.as_call_node().is_some_and(|c| c.name().as_slice() == b"include") {
-                } else {
-                    return None;
-                }
+            let node = node_at(&root, decl.start, decl.end).ok_or_else(|| String::from("its body is not found"))?;
+            let module_node = node.as_module_node().ok_or_else(|| String::from("its body is not found"))?;
+            Ok::<_, String>((body_constants(&module_node, text)?, readers(&module_node)))
+        });
+        let (names, readers) = match body {
+            Some(Ok(body)) => body,
+            Some(Err(why)) => return refuse(MODULE_BODY, format!("`{module}.constants`: {why}")),
+            None => return refuse(MODULE_BODY, format!("`{module}.constants`: its source is not read")),
+        };
+        // `Mod.public_reasons`, a method of its own body known to add none.
+        let own = |s: &Site| matches!(&s.used, Use::Call { block: false, .. } if readers.contains(&s.method));
+        let name = module.rsplit("::").next().unwrap_or(module);
+        if let Some(s) = sites_of(name).iter().find(|s| changes(s, Reach::Constants) && !own(s) && relevant(s, module)) {
+            return refuse(REOPENED, format!("`{module}.constants`: `{module}` may be changed at {}", describe_at(&s.path, s.at)));
+        }
+        Some(names.into_iter().map(Value::Sym).collect())
+    }
+
+    /// The methods of the module `module_node` itself (`def self.x`, or in
+    /// `class << self`) whose code adds no constant: none written, no
+    /// `self`, `super` or `const_set`/`eval`/`send`, no call without a
+    /// receiver but one listed as only reading a module.
+    fn readers(module_node: &ruby_prism::ModuleNode<'_>) -> Vec<String> {
+        use ruby_prism::Visit;
+        struct Scan {
+            found: bool,
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                self.found |= node.as_super_node().is_some()
+                    || node.as_forwarding_super_node().is_some()
+                    || node.as_call_node().is_some_and(|c| {
+                        c.receiver().is_none() && !MODULE_READS.contains(&constant_id_str(&c.name()))
+                    });
             }
-            let mut names: Vec<String> = Vec::new();
-            for name in out {
-                if !names.contains(&name) && !private.contains(&name) {
-                    names.push(name);
-                }
+            fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+                self.found |= node.as_self_node().is_some()
+                    || node.as_forwarding_super_node().is_some()
+                    || node.as_call_node().is_some_and(|c| {
+                        c.receiver().is_none() && !MODULE_READS.contains(&constant_id_str(&c.name()))
+                    });
             }
-            Some(names.into_iter().map(Value::Sym).collect())
-        })
-        .flatten()
+        }
+        let body = module_node.body().map(flatten_statements).unwrap_or_default();
+        let mut defs: Vec<ruby_prism::DefNode<'_>> = Vec::new();
+        for stmt in &body {
+            if let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_some_and(|r| r.as_self_node().is_some())) {
+                defs.push(def);
+            }
+            if let Some(singleton) = stmt.as_singleton_class_node().filter(|c| c.expression().as_self_node().is_some()) {
+                let inner = singleton.body().map(flatten_statements).unwrap_or_default();
+                defs.extend(inner.iter().filter_map(|s| s.as_def_node()).filter(|d| d.receiver().is_none()));
+            }
+        }
+        defs.into_iter()
+            .filter(|def| {
+                let Some(code) = def.body() else { return true };
+                let mut scan = Scan { found: false };
+                scan.visit(&code);
+                !scan.found && !writes_constants(&code)
+            })
+            .map(|def| constant_id_str(&def.name()).to_string())
+            .collect()
+    }
+
+    /// Methods Ruby calls on a module as code runs (a constant or method
+    /// added to it, the module included somewhere): one may add
+    /// constants.
+    const HOOKS: &[&str] = &[
+        "included", "extended", "prepended", "inherited", "append_features", "prepend_features", "extend_object",
+        "method_added", "singleton_method_added", "const_added", "const_missing",
+    ];
+
+    /// Modules a module body may `extend` knowing no constant comes of it.
+    const EXTENDS: &[&str] =
+        &["self", "ActiveSupport::Concern", "T::Sig", "T::Helpers", "T::Generic", "Enumerable", "Comparable", "Forwardable"];
+
+    /// The constants the body of `module_node` declares, listed by
+    /// statement: `NAME = value` (no constant written in `value`),
+    /// `class`/`module NAME`, `def` (not a hook), `class << self` of
+    /// those, `private_constant :NAME`, `extend` of a listed module,
+    /// `private`/`sig`/…. Any other statement: why not.
+    fn body_constants(module_node: &ruby_prism::ModuleNode<'_>, text: &str) -> Result<Vec<String>, String> {
+        let line = |n: &Node<'_>| {
+            let start = n.location().start_offset();
+            let line = text[..start].matches('\n').count() + 1;
+            let first = String::from_utf8_lossy(n.location().as_slice()).lines().next().unwrap_or("").trim().to_string();
+            format!("its body runs `{first}` (line {line}), not listed as adding no constant")
+        };
+        let def_ok = |n: &Node<'_>| n.as_def_node().is_some_and(|d| !HOOKS.contains(&constant_id_str(&d.name())));
+        let mut out: Vec<String> = Vec::new();
+        let mut private: Vec<String> = Vec::new();
+        for stmt in module_node.body().map(flatten_statements).unwrap_or_default() {
+            if let Some(write) = stmt.as_constant_write_node() {
+                // `A = B = :x` writes `B` too; `A = const_set(…)` more.
+                if writes_constants(&write.value()) {
+                    return Err(line(&stmt));
+                }
+                out.push(constant_id_str(&write.name()).to_string());
+            } else if let Some(path) = stmt.as_module_node().map(|m| m.constant_path()).or_else(|| stmt.as_class_node().map(|c| c.constant_path())) {
+                match segments(&path) {
+                    Some((segs, false)) if segs.len() == 1 => out.push(segs[0].clone()),
+                    _ => return Err(line(&stmt)),
+                }
+            } else if stmt.as_def_node().is_some() {
+                if !def_ok(&stmt) {
+                    return Err(line(&stmt));
+                }
+            } else if let Some(singleton) = stmt.as_singleton_class_node() {
+                let body = singleton.body().map(flatten_statements).unwrap_or_default();
+                if !singleton.expression().as_self_node().is_some() {
+                    return Err(line(&stmt));
+                }
+                if let Some(bad) = body.iter().find(|s| !(def_ok(s) || declaration_call(s))) {
+                    return Err(line(bad));
+                }
+            } else if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && c.name().as_slice() == b"private_constant") {
+                for arg in call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+                    let Some(sym) = arg.as_symbol_node() else { return Err(line(&stmt)) };
+                    private.push(String::from_utf8_lossy(sym.unescaped()).into_owned());
+                }
+            } else if !declaration_call(&stmt) {
+                return Err(line(&stmt));
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        for name in out {
+            if !names.contains(&name) && !private.contains(&name) {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     /// Does `node` write a constant, or call what may (`const_set`,
@@ -2489,28 +2584,26 @@ pub(super) mod consts {
 
     /// `extend T::Sig`, `private`, `sig { … }`: a call that adds no
     /// constant to the module it is in.
-    fn is_declaration_call(node: &Node<'_>) -> bool {
+    fn declaration_call(node: &Node<'_>) -> bool {
         let Some(call) = node.as_call_node() else { return false };
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         call.receiver().is_none()
             && match constant_id_str(&call.name()) {
-                "extend" | "private" | "public" | "protected" | "module_function" | "private_class_method" => {
+                "extend" => {
                     call.block().is_none()
+                        && !args.is_empty()
+                        && args.iter().all(|a| {
+                            a.as_self_node().is_some()
+                                || segments(a).is_some_and(|(segs, _)| EXTENDS.contains(&segs.join("::").as_str()))
+                        })
                 }
-                "sig" => call.arguments().is_none(),
+                "private" | "public" | "protected" | "module_function" | "private_class_method" | "public_class_method" => {
+                    call.block().is_none()
+                        && args.iter().all(|a| a.as_symbol_node().is_some() || a.as_def_node().is_some_and(|d| !HOOKS.contains(&constant_id_str(&d.name()))))
+                }
+                "sig" => args.is_empty(),
                 _ => false,
             }
-    }
-
-    /// Does `text` write `<module>::NAME = …` (a constant into `module`
-    /// from outside its body)?
-    fn assigns_into(text: &str, module: &str) -> bool {
-        let needle = format!("{module}::");
-        text.match_indices(&needle).any(|(at, _)| {
-            let rest = &text[at + needle.len()..];
-            let name_len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
-            let after = rest[name_len..].trim_start_matches([' ', '\t']);
-            name_len > 0 && after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=~") && !after.starts_with("=>")
-        })
     }
 
     /// `Inventory::AdjustmentReasons` as Zeitwerk's directory for it.
@@ -2684,7 +2777,7 @@ pub(super) mod consts {
         if own.iter().any(|d| !d.certain || d.names.len() > 1 || d.kind != Kind::Module) {
             return Err(format!("`{full}` is not a module declared with certainty"));
         }
-        if let Some(site) = changed_from_outside(full, &own[0].path, own[0].cref.last().map(String::as_str)) {
+        if let Some(site) = changed_from_outside(full, Reach::Methods) {
             return Err(format!("`{full}` {site}"));
         }
         Ok(own
@@ -2801,7 +2894,7 @@ pub(super) mod consts {
     /// module `full` again, or its `ClassMethods`, or changes either from
     /// outside (`X.class_eval`, `X::ClassMethods.define_method`): a
     /// registered source or a test source on disk.
-    pub(in super::super) fn reopened_elsewhere(full: &str, path: &str, start: usize, end: usize, scope: Option<&str>) -> Option<String> {
+    pub(in super::super) fn reopened_elsewhere(full: &str, path: &str, start: usize, end: usize) -> Option<String> {
         let last = full.rsplit("::").next().unwrap_or(full);
         let inside = |d: &Decl| d.path == path && start <= d.start && d.end <= end;
         let late = |p: &str| if is_registered(p) { String::new() } else { ", a test source not registered before this one".into() };
@@ -2823,16 +2916,10 @@ pub(super) mod consts {
             }
         }
         // `X::ClassMethods.define_method(…)`, `X::ClassMethods.include(…)`.
-        let mut sites = with_entry("ClassMethods", |e| e.sites.clone());
-        sites.extend(late_sites("ClassMethods"));
-        let changed = sites.iter().find(|s| {
-            s.qualifier.as_ref().is_some_and(|q| q.last().map(String::as_str) == Some(last))
-                && (REOPENERS.contains(&s.method.as_str()) || super::mutates(&s.method))
-        });
-        if let Some(site) = changed {
-            return Some(format!("`{methods}` is changed from outside its body at {}", describe_at(&site.path, site.at)));
+        if let Some(site) = changed_from_outside(&methods, Reach::Methods) {
+            return Some(format!("`{methods}` {site}"));
         }
-        changed_from_outside(full, path, scope).map(|site| format!("`{full}` {site}"))
+        changed_from_outside(full, Reach::Methods).map(|site| format!("`{full}` {site}"))
     }
 
     /// May `module` (an ancestor) have the constant `name` itself?
@@ -2846,6 +2933,10 @@ pub(super) mod consts {
         #[allow(clippy::type_complexity)]
         static ANCESTRY: RefCell<(Option<String>, u32, HashMap<String, Result<Vec<String>, String>>)> =
             RefCell::new((None, 0, HashMap::new()));
+        /// The scopes whose `ancestors` are being computed, and how many
+        /// times one was asked for again inside (an answer that depends
+        /// on such a cut is not kept).
+        static IN_PROGRESS: RefCell<(Vec<String>, u32)> = const { RefCell::new((Vec::new(), 0)) };
     }
 
     /// The registry: its first path and how many files (ids are dense
@@ -2889,6 +2980,40 @@ pub(super) mod consts {
         }) {
             return found;
         }
+        // Whether a use elsewhere changes a module may turn on the
+        // ancestors of the class it is in, and those on that module's.
+        let cuts = IN_PROGRESS.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.0.iter().any(|s| s == scope) {
+                p.1 += 1;
+                return None;
+            }
+            p.0.push(scope.to_string());
+            Some(p.1)
+        });
+        let Some(cuts) = cuts else {
+            return Err(format!("the ancestors of `{scope}` turn on themselves"));
+        };
+        let found = ancestors_of(scope);
+        let cut = IN_PROGRESS.with(|p| {
+            let mut p = p.borrow_mut();
+            p.0.pop();
+            p.1 != cuts
+        });
+        if cut {
+            return found;
+        }
+        ANCESTRY.with(|a| {
+            let mut a = a.borrow_mut();
+            if a.0 != first || a.1 != count {
+                *a = (first, count, HashMap::new());
+            }
+            a.2.insert(scope.to_string(), found.clone());
+        });
+        found
+    }
+
+    fn ancestors_of(scope: &str) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
         let mut todo: Vec<String> = vec![scope.to_string()];
         let mut seen: HashSet<String> = HashSet::new();
@@ -2910,13 +3035,6 @@ pub(super) mod consts {
                 Err(why) => break Err(why),
             }
         };
-        ANCESTRY.with(|a| {
-            let mut a = a.borrow_mut();
-            if a.0 != first || a.1 != count {
-                *a = (first, count, HashMap::new());
-            }
-            a.2.insert(scope.to_string(), found.clone());
-        });
         found
     }
 
@@ -2945,7 +3063,7 @@ pub(super) mod consts {
         for decl in &own {
             body_ancestors(decl, module, &mut parents)?;
         }
-        if let Some(site) = changed_from_outside(module, own.first().map_or("", |d| d.path.as_str()), own.first().and_then(|d| d.cref.last()).map(String::as_str)) {
+        if let Some(site) = changed_from_outside(module, Reach::Ancestry) {
             return Err(format!("`{module}` {site}"));
         }
         if let Some((_, hook)) = LOAD_HOOKS.iter().find(|(c, _)| *c == module) {
@@ -3367,19 +3485,73 @@ pub(super) mod consts {
     }
 
     /// Some when the constant `full` (whose value starts at `at` of
-    /// `path`, in the scope whose last name is `scope`) is a literal of
-    /// frozen values (`shape`) that every source uses only as its shape
-    /// allows (`Shape::allows`); else records why not.
-    fn unchanged(full: &str, path: &str, at: usize, scope: Option<&str>, shape: Option<Shape>) -> Option<()> {
+    /// `path`) is a literal of frozen values (`shape`) that every source
+    /// uses only as its shape allows (`Shape::allows`), its module's
+    /// uses included (`owner_need`: an alias, `const_get(name)`, an
+    /// evaluated String may reach it); else records why not.
+    fn unchanged(full: &str, path: &str, at: usize, shape: Option<Shape>) -> Option<()> {
         let Some(shape) = shape else {
             return refuse(NOT_LITERAL, format!("`{full}`: {}", describe_at(path, at)));
         };
         let name = full.rsplit("::").next().unwrap_or(full);
-        let (mut sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
+        if let Some(site) = sites_of(name).iter().find(|s| !shape.allows(s.need) && relevant(s, full)) {
+            return refuse(USED, format!("`{full}`: {}", describe_at(&site.path, site.at)));
+        }
+        if let Some((owner, _)) = full.rsplit_once("::") {
+            if let Some(site) = owner_reached(owner, shape, 0) {
+                return refuse(USED, format!("`{full}`, through its module `{owner}`: {}", describe_at(&site.path, site.at)));
+            }
+        }
+        Some(())
+    }
+
+    /// A use of the module `owner` that may reach a constant of it past
+    /// what `shape` allows: by a name not known before it runs, a String
+    /// evaluated, the module passed on. An alias (`KA = Kinds`, assigned
+    /// once with certainty) counts by its own uses.
+    fn owner_reached(owner: &str, shape: Shape, depth: usize) -> Option<Site> {
+        let last = owner.rsplit("::").next().unwrap_or(owner);
+        for site in sites_of(last).into_iter().filter(|s| relevant(s, owner)) {
+            let alias = site.alias.as_ref().filter(|a| depth < MAX_ALIASES && matches!(find(a), Found::Value(d) if d.path == site.path && d.start == site.at));
+            if let Some(alias) = alias {
+                if let Some(found) = owner_reached(alias, shape, depth + 1) {
+                    return Some(found);
+                }
+                continue;
+            }
+            if !shape.allows(owner_need(&site)) {
+                return Some(site);
+            }
+        }
+        None
+    }
+
+    /// How many aliases of an alias `owner_reached` follows.
+    const MAX_ALIASES: usize = 4;
+
+    /// Every mention of `name` in the registered sources and in the test
+    /// sources not registered now.
+    fn sites_of(name: &str) -> Vec<Site> {
+        let mut sites = with_entry(name, |e| e.sites.clone());
         sites.extend(late_sites(name));
-        match sites.iter().find(|s| !shape.allows(s.need) && relevant(s, full, path, scope, &decls)) {
-            Some(site) => refuse(USED, format!("`{full}`: {}", describe_at(&site.path, site.at))),
-            None => Some(()),
+        sites
+    }
+
+    /// What a mention of a module lets code do to the constants in it: a
+    /// name not known before it runs (`const_get(name)`, `send(name)`), a
+    /// String it evaluates, the module bound or passed on (where any of
+    /// those may follow) reach each of them.
+    fn owner_need(site: &Site) -> Need {
+        match &site.used {
+            Use::Read | Use::Mixin | Use::Adds => Need::Always,
+            Use::Assigned | Use::Escapes => Need::Object,
+            Use::Call { block, first } => match (site.method.as_str(), first) {
+                ("const_get" | "const_source_location", Some(None)) => Need::Object,
+                ("const_set" | "remove_const" | "send" | "public_send" | "__send__", Some(None)) => Need::Rebind,
+                (m, Some(_)) if EVALS.contains(&m) => Need::Rebind,
+                (m, None) if EVALS.contains(&m) && !block => Need::Rebind,
+                _ => Need::Always,
+            },
         }
     }
 
@@ -3393,10 +3565,9 @@ pub(super) mod consts {
             Some(class) => format!("{class}::{name}"),
             None => format!("?::{name}"),
         };
-        let scope = class.as_deref().map(|c| c.rsplit("::").next().unwrap_or(c));
         let env = Env { cx: env.cx.as_ref().map(|cx| Rc::new(cx.before(at))), ..env.clone() };
         let shape = quietly(|| shape(value, &env));
-        unchanged(&full, file, value.location().start_offset(), scope, shape).is_some()
+        unchanged(&full, file, value.location().start_offset(), shape).is_some()
     }
 
     /// Where a source mentions a constant's name.
@@ -3405,13 +3576,86 @@ pub(super) mod consts {
         path: String,
         at: usize,
         /// The path written before it (`A::B::` → `["A", "B"]`); `None`
-        /// when that is not a constant path (`self::X`, `x::X`).
+        /// when that is not a constant path (`self::X`, `x::X`, a name
+        /// `const_get` looks up from `self`, a String evaluated).
         qualifier: Option<Vec<String>>,
         rooted: bool,
+        /// The lexical scopes where it is written (full names, outer
+        /// first); `None` when they are not certain (`class << self`, a
+        /// compact `module A::B` inside another scope).
+        cref: Option<Vec<String>>,
         need: Need,
         /// The method called on it (`each`, `<<`, `include`), if any.
         method: String,
+        /// What it does with a module of the name.
+        used: Use,
+        /// `KA = Kinds`: the full name of the constant it is the value of,
+        /// where the lexical scopes are certain.
+        alias: Option<String>,
     }
+
+    /// Where a mention of a module (or class) puts it.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Use {
+        /// `M::X` read, `defined?(M)`, `x.is_a?(M)`, `when M`, `rescue M`,
+        /// a superclass, a Sorbet type, a statement whose value is unused.
+        Read,
+        /// `include M`, `extend M`, `prepend M`.
+        Mixin,
+        /// A constant declared or written in it: `class M::X`, `M::X = 1`,
+        /// `M::X ||= 1`, `M::X, y = …`.
+        Adds,
+        /// The receiver of `Site::method`: with a block, and its first
+        /// argument (`None` for none; `Some(None)` when not a literal
+        /// Symbol or String).
+        Call { block: bool, first: Option<Option<String>> },
+        /// Assigned to a constant or a variable: an alias.
+        Assigned,
+        /// Passed on, returned, an element of a collection, anything else.
+        Escapes,
+    }
+
+    /// How sure a use of a module must be to leave it as its declarations
+    /// say (`changed_from_outside`).
+    #[derive(Clone, Copy, PartialEq)]
+    pub(in super::super) enum Reach {
+        /// Its ancestors: only a call that may reopen it (`REOPENERS`) or
+        /// an alias (through which `class Alias` reopens it) counts; a
+        /// class is called and passed on in many ways that do not.
+        Ancestry,
+        /// The methods it gives: any use but a read, a mixin, a constant
+        /// declared in it or a call of `MODULE_READS` counts.
+        Methods,
+        /// Its constants: a constant declared in it from outside counts too.
+        Constants,
+    }
+
+    /// May this use of a module change it, for `reach`?
+    fn changes(site: &Site, reach: Reach) -> bool {
+        match (&site.used, reach) {
+            (Use::Read | Use::Mixin, _) => false,
+            (Use::Assigned, _) => true,
+            (Use::Adds, r) => r == Reach::Constants,
+            // `remove_const(:M)` of it, or a use not listed.
+            (Use::Escapes, r) => r != Reach::Ancestry || site.need == Need::Rebind,
+            (Use::Call { .. }, Reach::Ancestry) => REOPENERS.contains(&site.method.as_str()),
+            (Use::Call { block, .. }, _) => *block || !MODULE_READS.contains(&site.method.as_str()),
+        }
+    }
+
+    /// Calls on a module that only read it.
+    const MODULE_READS: &[&str] = &[
+        "name", "to_s", "inspect", "constants", "const_get", "const_defined?", "const_source_location", "instance_methods",
+        "public_instance_methods", "instance_method", "public_instance_method", "method_defined?",
+        "public_method_defined?", "private_method_defined?", "ancestors", "included_modules", "include?", "is_a?",
+        "kind_of?", "instance_of?", "respond_to?", "==", "!=", "===", "<", "<=", ">", ">=", "equal?", "eql?", "hash",
+        "frozen?", "module_parent", "module_parent_name",
+    ];
+
+    /// Calls that run code they are given (a String, or a block in the
+    /// receiver's context).
+    const EVALS: &[&str] =
+        &["eval", "class_eval", "module_eval", "instance_eval", "class_exec", "module_exec", "instance_exec"];
 
     /// Methods that change a module from outside its body.
     const REOPENERS: &[&str] = &[
@@ -3660,10 +3904,12 @@ pub(super) mod consts {
         String::from_utf8(bytes).ok()
     }
 
-    /// Every place `text` mentions the constant `name`, or names it in a
-    /// `const_get`/`const_set`/`remove_const` (through `send` too), with
-    /// what the mention may do to its value. A name not known before the
-    /// code runs (`const_get(name)`) is not seen.
+    /// Every place `text` mentions the constant `name`, names it in a
+    /// `const_get`/`const_set`/`remove_const` (through `send` too), or
+    /// has it in a String it evaluates (`module_eval("…")`), with what the
+    /// mention may do to its value and, for a module, where it puts it
+    /// (`module_use`). A name not known before the code runs
+    /// (`Mod.const_get(name)`) is counted at its module (`owner_need`).
     fn scan_uses(text: &str, path: &str, name: &str) -> Vec<Site> {
         use ruby_prism::Visit;
         struct Scan<'a, 'pr> {
@@ -3673,12 +3919,46 @@ pub(super) mod consts {
             /// statement list once, whichever way it is visited).
             parents: Vec<Node<'pr>>,
             pushed: Vec<bool>,
+            /// The `class`/`module` scopes entered: (full name, whether
+            /// Ruby certainly gives it that name, where its body starts).
+            scopes: Vec<(String, bool, usize)>,
+            scoped: Vec<bool>,
             out: Vec<Site>,
         }
         impl<'pr> Scan<'_, 'pr> {
+            /// The lexical scopes at `at`: a `class`'s name and superclass
+            /// are read outside it.
+            fn cref(&self, at: usize) -> Option<Vec<String>> {
+                let mut scopes = self.scopes.as_slice();
+                if scopes.last().is_some_and(|s| at < s.2) {
+                    scopes = &scopes[..scopes.len() - 1];
+                }
+                scopes.iter().all(|s| s.1).then(|| scopes.iter().map(|s| s.0.clone()).collect())
+            }
+            fn push(&mut self, at: usize, qualifier: Option<Vec<String>>, rooted: bool, need: Need, method: String, used: Use) {
+                let cref = if qualifier.is_some() { self.cref(at) } else { None };
+                self.out.push(Site { path: self.path.to_string(), at, qualifier, rooted, cref, need, method, used, alias: None });
+            }
             fn mention(&mut self, node: &Node<'pr>, qualifier: Option<Vec<String>>, rooted: bool) {
                 let (need, method) = classify(&self.parents, node);
-                self.out.push(Site { path: self.path.to_string(), at: node.location().start_offset(), qualifier, rooted, need, method });
+                let used = module_use(&self.parents, node);
+                let at = node.location().start_offset();
+                let alias = self
+                    .parents
+                    .last()
+                    .and_then(|p| p.as_constant_write_node())
+                    .filter(|w| span_of(&w.value()) == span_of(node))
+                    .and_then(|w| {
+                        let name = constant_id_str(&w.name());
+                        Some(match self.cref(at)?.last() {
+                            Some(scope) => format!("{scope}::{name}"),
+                            None => name.to_string(),
+                        })
+                    });
+                self.push(at, qualifier, rooted, need, method, used);
+                if let Some(site) = self.out.last_mut() {
+                    site.alias = alias;
+                }
             }
             /// A declaration's name (`class Levels::ALL`), not a read.
             fn declared(&self, node: &Node<'pr>) -> bool {
@@ -3690,6 +3970,14 @@ pub(super) mod consts {
             fn named(&mut self, call: &ruby_prism::CallNode<'pr>, node: &Node<'pr>) {
                 let mut method = constant_id_str(&call.name()).to_string();
                 let mut args: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if EVALS.contains(&method.as_str()) {
+                    // The code a String gives `eval` is not parsed here.
+                    let named = args.iter().any(|a| string_text(a).is_some_and(|t| has_word(&t, self.name)));
+                    if named {
+                        self.push(node.location().start_offset(), None, false, Need::Rebind, method, Use::Escapes);
+                    }
+                    return;
+                }
                 if matches!(method.as_str(), "send" | "public_send" | "__send__") && !args.is_empty() {
                     let Some(sent) = literal_text(&args[0]) else { return };
                     method = sent;
@@ -3706,41 +3994,141 @@ pub(super) mod consts {
                 if last != self.name {
                     return;
                 }
+                // With no receiver, `self`'s constant: not a lexical one.
                 let (qualifier, rooted) = match (prefix, call.receiver()) {
-                    (Some(prefix), _) => (Some(prefix.trim_start_matches("::").split("::").map(str::to_string).collect()), false),
-                    (None, None) => (Some(Vec::new()), false),
+                    (Some(prefix), Some(r)) if segments(&r).is_some_and(|(s, _)| s == ["Object"]) => {
+                        (Some(prefix.trim_start_matches("::").split("::").map(str::to_string).collect()), true)
+                    }
+                    (Some(_), _) | (None, None) => (None, false),
                     (None, Some(r)) => match segments(&r) {
                         Some((segs, rooted)) => (Some(segs), rooted),
                         None => (None, false),
                     },
                 };
                 if method == "const_get" {
-                    self.mention(node, qualifier, rooted);
+                    let (need, method) = classify(&self.parents, node);
+                    self.push(node.location().start_offset(), qualifier, rooted, need, method, Use::Escapes);
                 } else {
-                    let at = node.location().start_offset();
-                    self.out.push(Site { path: self.path.to_string(), at, qualifier, rooted, need: Need::Rebind, method });
+                    self.push(node.location().start_offset(), qualifier, rooted, Need::Rebind, method, Use::Escapes);
+                }
+            }
+            /// `X, ALL = …`, `rescue => ALL`: the constant bound again.
+            fn target(&mut self, node: &Node<'pr>) {
+                let at = node.location().start_offset();
+                if node.as_constant_target_node().is_some_and(|t| constant_id_str(&t.name()) == self.name) {
+                    self.push(at, Some(Vec::new()), false, Need::Rebind, String::new(), Use::Assigned);
+                }
+                if let Some(t) = node.as_constant_path_target_node().filter(|t| t.name().is_some_and(|n| constant_id_str(&n) == self.name)) {
+                    let (qualifier, rooted) = match t.parent() {
+                        None => (Some(Vec::new()), true),
+                        Some(p) => segments(&p).map_or((None, false), |(segs, rooted)| (Some(segs), rooted)),
+                    };
+                    self.push(at, qualifier, rooted, Need::Rebind, String::new(), Use::Assigned);
                 }
             }
         }
-        impl<'pr> Visit<'pr> for Scan<'_, 'pr> {
-            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
-                if let Some(path) = node.as_constant_path_node() {
-                    if path.name().is_some_and(|n| constant_id_str(&n) == self.name) && !self.declared(&node) {
-                        let (qualifier, rooted) = match path.parent() {
-                            None => (Some(Vec::new()), true),
-                            Some(p) => match segments(&p) {
-                                Some((segs, rooted)) => (Some(segs), rooted),
-                                None => (None, false),
-                            },
-                        };
-                        self.mention(&node, qualifier, rooted);
-                    }
-                } else if let Some(call) = node.as_call_node() {
-                    self.named(&call, &node);
+        /// Nodes prism also visits as a typed field (`CallNode#arguments`,
+        /// `ConstantPathWriteNode#target`), not through
+        /// `visit_branch_node_enter`: each is pushed by its own `visit_…`.
+        fn typed(node: &Node<'_>) -> bool {
+            matches!(
+                node,
+                Node::StatementsNode { .. }
+                    | Node::ArgumentsNode { .. }
+                    | Node::BlockArgumentNode { .. }
+                    | Node::BlockNode { .. }
+                    | Node::ConstantPathNode { .. }
+                    | Node::ElseNode { .. }
+                    | Node::EnsureNode { .. }
+                    | Node::RescueNode { .. }
+                    | Node::SplatNode { .. }
+                    | Node::ParametersNode { .. }
+            )
+        }
+        impl<'pr> Scan<'_, 'pr> {
+            fn constant_path(&mut self, path: &ruby_prism::ConstantPathNode<'pr>) {
+                let node = path.as_node();
+                // `Mod::NAME = …` is a declaration (`Walk`), not a use.
+                let span = span_of(&node);
+                let written = self.parents.last().is_some_and(|w| {
+                    let target = |t: Option<ruby_prism::ConstantPathNode<'_>>| t.is_some_and(|t| span_of(&t.as_node()) == span);
+                    target(w.as_constant_path_write_node().map(|w| w.target()))
+                        || target(w.as_constant_path_or_write_node().map(|w| w.target()))
+                        || target(w.as_constant_path_and_write_node().map(|w| w.target()))
+                        || target(w.as_constant_path_operator_write_node().map(|w| w.target()))
+                });
+                if path.name().is_some_and(|n| constant_id_str(&n) == self.name) && !self.declared(&node) && !written {
+                    let (qualifier, rooted) = match path.parent() {
+                        None => (Some(Vec::new()), true),
+                        Some(p) => match segments(&p) {
+                            Some((segs, rooted)) => (Some(segs), rooted),
+                            None => (None, false),
+                        },
+                    };
+                    self.mention(&node, qualifier, rooted);
                 }
-                // A statement list is pushed by `visit_statements_node`,
-                // which visits it however it is reached.
-                let push = node.as_statements_node().is_none();
+            }
+        }
+        macro_rules! pushed {
+            ($($visit:ident: $ty:ident),* $(,)?) => {
+                $(fn $visit(&mut self, node: &ruby_prism::$ty<'pr>) {
+                    self.parents.push(node.as_node());
+                    ruby_prism::$visit(self, node);
+                    self.parents.pop();
+                })*
+            };
+        }
+        impl<'pr> Visit<'pr> for Scan<'_, 'pr> {
+            pushed!(
+                visit_statements_node: StatementsNode,
+                visit_arguments_node: ArgumentsNode,
+                visit_block_argument_node: BlockArgumentNode,
+                visit_block_node: BlockNode,
+                visit_else_node: ElseNode,
+                visit_ensure_node: EnsureNode,
+                visit_rescue_node: RescueNode,
+                visit_splat_node: SplatNode,
+                visit_parameters_node: ParametersNode,
+            );
+            fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+                self.constant_path(node);
+                self.parents.push(node.as_node());
+                ruby_prism::visit_constant_path_node(self, node);
+                self.parents.pop();
+            }
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                if let Some(call) = node.as_call_node() {
+                    self.named(&call, &node);
+                } else {
+                    self.target(&node);
+                }
+                let scope = node
+                    .as_module_node()
+                    .map(|m| (Some(m.constant_path()), m.body()))
+                    .or_else(|| node.as_class_node().map(|c| (Some(c.constant_path()), c.body())))
+                    .or_else(|| node.as_singleton_class_node().map(|c| (None, c.body())));
+                let scoped = scope.is_some();
+                if let Some((path, body)) = scope {
+                    let outer = self.scopes.last();
+                    let (name, exact) = match path.as_ref().and_then(segments) {
+                        Some((segs, rooted)) => {
+                            let joined = segs.join("::");
+                            match outer {
+                                _ if rooted => (joined, true),
+                                None => (joined, true),
+                                Some((outer, exact, _)) => (format!("{outer}::{joined}"), *exact && segs.len() == 1),
+                            }
+                        }
+                        // `class << self` has its own lookup.
+                        None => (String::from("#<Class>"), false),
+                    };
+                    let body_at = body.map_or(node.location().end_offset(), |b| b.location().start_offset());
+                    self.scopes.push((name, exact, body_at));
+                }
+                self.scoped.push(scoped);
+                // A typed field's node is pushed by its `visit_…`, which
+                // visits it however it is reached.
+                let push = !typed(&node);
                 if push {
                     self.parents.push(node);
                 }
@@ -3750,55 +4138,273 @@ pub(super) mod consts {
                 if self.pushed.pop() == Some(true) {
                     self.parents.pop();
                 }
+                if self.scoped.pop() == Some(true) {
+                    self.scopes.pop();
+                }
             }
             fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
                 if node.as_constant_read_node().is_some_and(|r| constant_id_str(&r.name()) == self.name) && !self.declared(&node) {
                     self.mention(&node, Some(Vec::new()), false);
                 }
-            }
-            fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
-                self.parents.push(node.as_node());
-                ruby_prism::visit_statements_node(self, node);
-                self.parents.pop();
+                self.target(&node);
             }
         }
         if !text.contains(name) {
             return Vec::new();
         }
         let result = ruby_prism::parse(text.as_bytes());
-        let mut scan = Scan { name, path, parents: Vec::new(), pushed: Vec::new(), out: Vec::new() };
+        let mut scan = Scan { name, path, parents: Vec::new(), pushed: Vec::new(), scopes: Vec::new(), scoped: Vec::new(), out: Vec::new() };
         scan.visit(&result.node());
         scan.out
     }
 
-    /// Is the mention `site` possibly of the constant `full` (declared in
-    /// `path`, in the scope whose last name is `scope`)?
-    fn relevant(site: &Site, full: &str, path: &str, scope: Option<&str>, decls: &[Decl]) -> bool {
-        let name = full.rsplit("::").next().unwrap_or(full);
-        let scope = scope.map(|s| s.rsplit("::").next().unwrap_or(s));
-        let Some(qualifier) = &site.qualifier else { return true };
-        if qualifier.is_empty() {
-            if site.rooted {
-                return full == name;
+    /// The text of the String `node` (a heredoc's body too), with the
+    /// source of what it interpolates.
+    fn string_text(node: &Node<'_>) -> Option<String> {
+        if let Some(s) = node.as_string_node() {
+            return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+        }
+        let parts = node.as_interpolated_string_node()?.parts();
+        let mut out = String::new();
+        for part in parts.iter() {
+            match string_text(&part) {
+                Some(t) => out.push_str(&t),
+                None => out.push_str(&String::from_utf8_lossy(part.location().as_slice())),
             }
-            // Unqualified: from inside its scope, from where it is
-            // inherited, or from a file with its own constant of the name.
-            return site.path == path
-                || scope.is_none()
-                || scope.is_some_and(|s| with_any_text(&site.path, |t| t.contains(s)).unwrap_or(true))
-                || !decls.iter().any(|d| d.path == site.path);
+            out.push(' ');
         }
-        let written = format!("{}::{name}", qualifier.join("::"));
-        if site.rooted {
-            return full == written;
+        Some(out)
+    }
+
+    /// Does `text` have `word` with no identifier character beside it?
+    fn has_word(text: &str, word: &str) -> bool {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let bytes = text.as_bytes();
+        text.match_indices(word).any(|(at, _)| {
+            let end = at + word.len();
+            !(at > 0 && ident(bytes[at - 1])) && !(end < bytes.len() && ident(bytes[end]))
+        })
+    }
+
+    /// Calls whose arguments a module is compared or tested against.
+    const TESTS: &[&str] = &[
+        "is_a?", "kind_of?", "instance_of?", "===", "==", "!=", "<", "<=", ">", ">=", "equal?", "eql?", "include?",
+        "assert_kind_of", "assert_instance_of", "refute_kind_of", "refute_instance_of", "assert_equal", "refute_equal",
+        "assert_same", "refute_same",
+    ];
+
+    /// Where the mention `node` (inside `parents`, innermost last) puts a
+    /// module of its name.
+    fn module_use(parents: &[Node<'_>], node: &Node<'_>) -> Use {
+        let span = span_of(node);
+        let Some((parent, outer)) = parents.split_last() else { return Use::Read };
+        if sorbet_type(parents, span) {
+            return Use::Read;
         }
-        let suffix = format!("::{written}");
-        if full == written || full.ends_with(&suffix) {
-            return true;
+        if let Some(path) = parent.as_constant_path_node() {
+            if path.parent().is_some_and(|p| span_of(&p) == span) {
+                let whole = span_of(parent);
+                let target = |t: Option<ruby_prism::ConstantPathNode<'_>>| t.is_some_and(|t| span_of(&t.as_node()) == whole);
+                let declared = outer.last().is_some_and(|g| {
+                    g.as_class_node().is_some_and(|c| span_of(&c.constant_path()) == whole)
+                        || g.as_module_node().is_some_and(|m| span_of(&m.constant_path()) == whole)
+                        || target(g.as_constant_path_write_node().map(|w| w.target()))
+                        || target(g.as_constant_path_or_write_node().map(|w| w.target()))
+                        || target(g.as_constant_path_and_write_node().map(|w| w.target()))
+                        || target(g.as_constant_path_operator_write_node().map(|w| w.target()))
+                });
+                return if declared { Use::Adds } else { Use::Read };
+            }
         }
-        // `Other::ALL` is another constant only when one is declared
-        // under that name; otherwise it may be this one, inherited.
-        !decls.iter().any(|d| d.names.iter().any(|n| n == &written || n.ends_with(&suffix)))
+        if parent.as_constant_path_target_node().is_some() {
+            return Use::Adds;
+        }
+        if let Some(call) = parent.as_call_node() {
+            if call.receiver().is_some_and(|r| span_of(&r) == span) {
+                let first = call.arguments().and_then(|a| a.arguments().iter().next()).map(|a| literal_text(&a));
+                return Use::Call { block: call.block().is_some_and(|b| b.as_block_node().is_some()), first };
+            }
+            return Use::Escapes;
+        }
+        if parent.as_arguments_node().is_some() {
+            if let Some(call) = outer.last().and_then(|g| g.as_call_node()) {
+                let name = constant_id_str(&call.name());
+                if matches!(name, "include" | "extend" | "prepend") {
+                    return Use::Mixin;
+                }
+                if TESTS.contains(&name) {
+                    return Use::Read;
+                }
+            }
+            return Use::Escapes;
+        }
+        if parent.as_class_node().is_some_and(|c| c.superclass().is_some_and(|s| span_of(&s) == span))
+            || parent.as_defined_node().is_some()
+            || parent.as_when_node().is_some()
+            || parent.as_rescue_node().is_some()
+        {
+            return Use::Read;
+        }
+        if let Some(stmts) = parent.as_statements_node() {
+            let last = stmts.body().iter().last().is_some_and(|s| span_of(&s) == span);
+            let unused = outer.last().is_none_or(|h| {
+                h.as_class_node().is_some()
+                    || h.as_module_node().is_some()
+                    || h.as_singleton_class_node().is_some()
+                    || h.as_program_node().is_some()
+                    || h.as_embedded_statements_node().is_some()
+            });
+            return if !last || unused { Use::Read } else { Use::Escapes };
+        }
+        let multi = parent.as_array_node().is_some() && outer.last().is_some_and(|g| g.as_multi_write_node().is_some());
+        if multi
+            || matches!(
+                parent,
+                Node::ConstantWriteNode { .. }
+                    | Node::ConstantOrWriteNode { .. }
+                    | Node::ConstantPathWriteNode { .. }
+                    | Node::ConstantPathOrWriteNode { .. }
+                    | Node::LocalVariableWriteNode { .. }
+                    | Node::LocalVariableOrWriteNode { .. }
+                    | Node::InstanceVariableWriteNode { .. }
+                    | Node::InstanceVariableOrWriteNode { .. }
+                    | Node::ClassVariableWriteNode { .. }
+                    | Node::ClassVariableOrWriteNode { .. }
+                    | Node::GlobalVariableWriteNode { .. }
+                    | Node::GlobalVariableOrWriteNode { .. }
+                    | Node::MultiWriteNode { .. }
+            )
+        {
+            return Use::Assigned;
+        }
+        Use::Escapes
+    }
+
+    /// Is the mention at `span` a Sorbet type: in a `sig { … }`, an
+    /// argument of `T.nilable(…)`, `T::Array[…]`, the type of `T.let`?
+    fn sorbet_type(parents: &[Node<'_>], span: (usize, usize)) -> bool {
+        let inside = |n: &Node<'_>| {
+            let (start, end) = span_of(n);
+            start <= span.0 && span.1 <= end
+        };
+        let in_sig = parents.iter().any(|p| {
+            p.as_call_node().is_some_and(|c| c.receiver().is_none() && c.name().as_slice() == b"sig" && c.block().is_some_and(|b| inside(&b)))
+        });
+        let [.., call, args] = parents else { return in_sig };
+        let Some(call) = call.as_call_node().filter(|_| args.as_arguments_node().is_some()) else { return in_sig };
+        let of_t = call.receiver().and_then(|r| segments(&r)).is_some_and(|(s, _)| s.first().map(String::as_str) == Some("T"));
+        if !of_t {
+            return in_sig;
+        }
+        // `T.let(value, Type)`: the value is no type.
+        let value = matches!(call.name().as_slice(), b"let" | b"cast" | b"bind" | b"must" | b"unsafe" | b"assert_type!")
+            && args.as_arguments_node().and_then(|a| a.arguments().iter().next()).is_some_and(|first| inside(&first));
+        in_sig || !value
+    }
+
+    /// Is the mention `site` possibly of the constant (or module) `full`?
+    /// Only one Ruby certainly resolves to another constant, or to none a
+    /// source declares, is not (`denotes`). A constant under a first name
+    /// no source declares is a gem's or Ruby's, whose other names are not
+    /// known (`MiniTest::Test` is `Minitest::Test`): a mention of one of
+    /// theirs may be of any other.
+    fn relevant(site: &Site, full: &str) -> bool {
+        let name = full.rsplit("::").next().unwrap_or(full);
+        let theirs = |n: &str| matches!(find(n.split("::").next().unwrap_or(n)), Found::Missing);
+        match denotes(site, name) {
+            Some(Some(found)) => found == full || (theirs(&found) && theirs(full)),
+            Some(None) => theirs(full),
+            None => true,
+        }
+    }
+
+    /// The constant the mention `site` of `name` certainly names, by
+    /// Ruby's lookup where it is written: `Some(None)` when no registered
+    /// source declares one there; `None` when not certain (lexical scopes
+    /// not known, `x::NAME`, an alias such as `KAlias::NAME`, a name
+    /// `A::` does not declare itself and so may inherit, a scope whose
+    /// ancestors are not known).
+    fn denotes(site: &Site, name: &str) -> Option<Option<String>> {
+        let qualifier = site.qualifier.as_ref()?;
+        let Some((first, rest)) = qualifier.split_first() else {
+            return match (site.rooted, find(name)) {
+                (true, Found::Missing) => Some(None),
+                (true, Found::Namespace | Found::Value(_)) => Some(Some(name.to_string())),
+                (true, Found::Unknown) => None,
+                (false, _) => match lookup(site, name)? {
+                    Resolution::Declared(full) => Some(Some(full)),
+                    Resolution::Missing => Some(None),
+                    Resolution::Unknown => None,
+                },
+            };
+        };
+        let mut full = if site.rooted {
+            match find(first) {
+                Found::Missing => return gem_path(first, rest, name),
+                _ => first.clone(),
+            }
+        } else {
+            match lookup(site, first)? {
+                Resolution::Declared(full) => full,
+                Resolution::Missing => return gem_path(first, rest, name),
+                Resolution::Unknown => return None,
+            }
+        };
+        for seg in rest.iter().map(String::as_str).chain([name]) {
+            // `A::B` is `A`'s own `B`, or one an ancestor of `A` has.
+            if !(matches!(find(&full), Found::Namespace) || declared_before(site, &full, true)) {
+                return None;
+            }
+            full = format!("{full}::{seg}");
+            if matches!(find(&full), Found::Missing | Found::Unknown) && !declared_before(site, &full, false) {
+                return None;
+            }
+        }
+        Some(Some(full))
+    }
+
+    /// A path whose first name no registered source declares is through a
+    /// gem's or Ruby's module (`FixtureFactory::Registry::ClassMethods`):
+    /// it names the constant it spells, one of theirs, unless a source
+    /// changes the ancestors of a module along it, whose constants it
+    /// then reaches too (`Minitest::Test.include(Helper)` makes
+    /// `Minitest::Test::MODES` `Helper::MODES`).
+    fn gem_path(first: &str, rest: &[String], name: &str) -> Option<Option<String>> {
+        let mut path = first.to_string();
+        for seg in rest.iter().map(String::as_str).chain([name]) {
+            if changed_from_outside(&path, Reach::Ancestry).is_some() {
+                return None;
+            }
+            path = format!("{path}::{seg}");
+        }
+        Some(Some(path))
+    }
+
+    /// `resolution` of `name` at `site`, where a scope's constant its own
+    /// source declares above it unconditionally is certain, though that
+    /// source is a test source not registered yet (whose declarations
+    /// `find` does not take as certain).
+    fn lookup(site: &Site, name: &str) -> Option<Resolution> {
+        let cref = site.cref.as_ref()?;
+        for scope in cref.iter().rev() {
+            let full = format!("{scope}::{name}");
+            if declared_before(site, &full, false) {
+                return Some(Resolution::Declared(full));
+            }
+            if !matches!(find(&full), Found::Missing) {
+                break;
+            }
+        }
+        Some(resolution(cref, name))
+    }
+
+    /// Does the source of `site` declare `full` (a `class`/`module` when
+    /// `namespace`) once, unconditionally, above it?
+    fn declared_before(site: &Site, full: &str, namespace: bool) -> bool {
+        let last = full.rsplit("::").next().unwrap_or(full);
+        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == full)).collect();
+        let [d] = all.as_slice() else { return false };
+        d.path == site.path && d.certain && d.names.len() == 1 && d.start < site.at && (!namespace || d.kind != Kind::Const)
     }
 
     /// The line at `at` of `path` (registered, or a late test source),
@@ -3817,18 +4423,17 @@ pub(super) mod consts {
         format!("`{text}` ({} line {line}{late})", sources::relative_path(path))
     }
 
-    /// The first place a registered source (or a test source not
-    /// registered yet) changes the module `module` from outside its body
-    /// (`Mod.include(X)`, `Mod.const_set`, `Mod.class_methods do`).
-    fn changed_from_outside(module: &str, path: &str, scope: Option<&str>) -> Option<String> {
+    /// The first use of the module `module` in a registered source (or a
+    /// test source not registered yet) that may change it, for `reach`
+    /// (`changes`): `Mod.include(X)`, `Mod.class_methods do`, `Alias =
+    /// Mod`, and for `Reach::Methods`/`Reach::Constants` any use not
+    /// listed.
+    pub(in super::super) fn changed_from_outside(module: &str, reach: Reach) -> Option<String> {
         let name = module.rsplit("::").next().unwrap_or(module);
-        let (mut sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
-        sites.extend(late_sites(name));
-        sites
+        sites_of(name)
             .iter()
-            .filter(|s| REOPENERS.contains(&s.method.as_str()))
-            .find(|s| relevant(s, module, path, scope, &decls))
-            .map(|s| format!("is changed from outside its body at {}", describe_at(&s.path, s.at)))
+            .find(|s| changes(s, reach) && relevant(s, module))
+            .map(|s| format!("may be changed at {}", describe_at(&s.path, s.at)))
     }
 
     // ---- Test sources not registered yet -----------------------------
@@ -4328,6 +4933,21 @@ pub(super) mod consts {
                     self.push(names, false, Kind::Const, 0, 0);
                 }
             }
+            // `X, Kinds::ALL = …`: bound, but not by a declaration.
+            if let Some(target) = node.as_constant_path_target_node() {
+                if target.name().is_some_and(|n| constant_id_str(&n) == self.name) {
+                    let names = match target.parent() {
+                        None => vec![self.name.to_string()],
+                        Some(parent) => segments(&parent)
+                            .map(|(s, rooted)| {
+                                let joined = format!("{}::{}", s.join("::"), self.name);
+                                if rooted { vec![joined] } else { vec![self.qualified(&joined), joined] }
+                            })
+                            .unwrap_or_default(),
+                    };
+                    self.push(names, false, Kind::Const, 0, 0);
+                }
+            }
             if let Some(call) = node.as_call_node() {
                 if call.receiver().is_none() && call.name().as_slice() == b"private_constant" {
                     let names: Vec<String> = call
@@ -4353,6 +4973,14 @@ pub(super) mod consts {
             self.parents.pop();
             if self.scopes.last().is_some_and(|s| s.at == self.parents.len()) {
                 self.scopes.pop();
+            }
+        }
+
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+            // `X, ALL = 1, %i[z]`, `rescue => ALL`.
+            if node.as_constant_target_node().is_some_and(|t| constant_id_str(&t.name()) == self.name) {
+                let names = vec![self.qualified(self.name)];
+                self.push(names, false, Kind::Const, 0, 0);
             }
         }
     }
