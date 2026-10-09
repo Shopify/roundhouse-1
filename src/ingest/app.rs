@@ -2309,6 +2309,11 @@ end
         roots.dedup();
         roots
     };
+    app.test_load_roots = test_load_roots
+        .iter()
+        .filter_map(|root| root.strip_prefix(dir).ok())
+        .map(|rel| format!("{}/", rel.display()))
+        .collect();
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();
@@ -2865,11 +2870,13 @@ end
             .chain(path_gems.iter().map(|gem| gem.join("lib")))
             .collect();
         let lifted: Vec<&str> = super::on_load_hooks::FIRED_HOOKS.iter().map(|(h, _)| *h).collect();
+        let test_load_path: Vec<PathBuf> = app.test_load_roots.iter().map(|root| dir.join(root)).collect();
         let inputs = super::initializer_programs::Inputs {
             vfs,
             dir,
             files: &boot_initializers,
             load_path: &load_path,
+            test_load_path: &test_load_path,
             loaded_support: &loaded_support,
             lifted: &lifted,
         };

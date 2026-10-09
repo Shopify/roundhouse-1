@@ -4804,10 +4804,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
-            // rails/test_help.rb's ActiveRecord::TestFixtures (transactional
-            // tests on every writing pool): `ActiveSupport.on_load(:active_support_test_case)
-            // { include ActiveRecord::TestFixtures }`.
-            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\nTestBase.include(ActiveRecord::TestFixtures)\n");
+            content.push_str(&test_case_load_hooks_block());
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")
@@ -5656,6 +5653,70 @@ fn framework_load_hook_block(app: &App, before_models: bool) -> String {
             out.push_str(&format!("ActiveSupport.run_load_hooks(:{hook}, {base}) # {site}\n"));
         }
     }
+    out
+}
+
+/// The PostgreSQL test helper's end: rails/test_help.rb (railties
+/// 8.2.0.alpha) as Rails runs it after boot, with the test-case load
+/// hooks ([`TEST_LOAD_HOOKS`]) fired where Rails fires them.
+///
+/// rails/test_help requires active_support/test_case, which ends
+/// `ActiveSupport.run_load_hooks(:active_support_test_case, self)`: the
+/// hooks the app's initializers and engines registered at boot run then,
+/// in their order. Then its own `on_load(:active_support_test_case)`,
+/// which runs at once: ActiveRecord::TestFixtures (transactional tests
+/// on every writing pool, runtime/spinel/cruby/test/active_record_test_fixtures.rb).
+///
+/// The other test bases are autoloads Rails loads where code first names
+/// one, a test's superclass, and each base's file ends firing its hooks.
+/// The runtime test helper defines them up front, so each base's hooks
+/// fire when the first class descends from it
+/// (`ActiveSupport::LazyLoadHooks.run_when_subclassed`), after those of
+/// the bases its file requires: action_view/test_case.rb requires
+/// action_controller/test_case. A process that never loads a base never
+/// runs its hooks, as in Rails. Not modeled: a reference that does not
+/// subclass (Core's test/support/initializers/sprockets_debug.rb
+/// `ActionView::TestCase.prepend(...)`), which in Rails loads the base
+/// and fires its hooks then, fires them here at the first subclass.
+///
+/// ActiveSupport::TestCase is `TestBase` (the test helper's
+/// `MINITEST_TEST_CASES`), so its hooks run on `TestBase`, which a tree
+/// without that alias has as well; a base the tree does not define is
+/// skipped.
+///
+/// A hook of the tree's own code that raises there is named,
+/// error[load_hook_not_run], and the next runs
+/// (`ActiveSupport::LazyLoadHooks.naming_failures`): in Rails it ends the
+/// test boot, or the load of the test file naming the base. A hook
+/// registered once its base fired (a test-support file's) runs at
+/// registration, as in Rails.
+///
+/// [`TEST_LOAD_HOOKS`]: crate::ingest::initializer_programs::TEST_LOAD_HOOKS
+fn test_case_load_hooks_block() -> String {
+    let (first, rest) = crate::ingest::initializer_programs::TEST_LOAD_HOOKS.split_first().expect("TEST_LOAD_HOOKS");
+    let (hook, _base, site) = first;
+    let mut out = format!(
+        "\n# rails/test_help.rb: active_support/test_case fires its load hooks as it\n\
+         # loads, the hooks boot registered run in their order, a failing one is\n\
+         # named and the next runs (`project::test_case_load_hooks_block`).\n\
+         # ActiveSupport::TestCase is TestBase.\n\
+         require_relative \"../runtime/active_record_test_fixtures\"\n\
+         if defined?(ActiveSupport::LazyLoadHooks)\n  \
+         ActiveSupport::LazyLoadHooks.naming_failures({site:?}) {{ ActiveSupport.run_load_hooks(:{hook}, TestBase) }}\n\
+         end\n\
+         # rails/test_help.rb's own `on_load(:active_support_test_case)`, which runs\n\
+         # at once: `include ActiveRecord::TestFixtures`.\n\
+         TestBase.include(ActiveRecord::TestFixtures)\n\
+         # The other test bases load where code first names one, a test's\n\
+         # superclass: their hooks fire as the first class descends from one.\n\
+         if defined?(ActiveSupport::LazyLoadHooks)\n"
+    );
+    for (hook, base, site) in rest {
+        // action_view/test_case.rb requires action_controller/test_case.
+        let after = if *hook == "action_view_test_case" { ", after: [:action_controller_test_case]" } else { "" };
+        out.push_str(&format!("  ActiveSupport::LazyLoadHooks.run_when_subclassed(:{hook}, {base}, {site:?}{after}) if defined?({base})\n"));
+    }
+    out.push_str("end\n");
     out
 }
 
@@ -8123,6 +8184,16 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         writeln!(body, "    {feature:?} => {loads:?},").unwrap();
     }
     body.push_str("  }.freeze\n");
+    let test_features = test_load_path_features(app, &program_anchors, &declarations_by_source, &emitted_file);
+    body.push_str(
+        "  # feature on the test load path (a test-support file) => the files\n  \
+         # requiring it loads in the test environment (`project::test_load_path_features`)\n  \
+         TEST_LOAD_PATH_FEATURES = {\n",
+    );
+    for (feature, loads) in &test_features {
+        writeln!(body, "    {feature:?} => {loads:?},").unwrap();
+    }
+    body.push_str("  }.freeze\n");
     // The constants a Zeitwerk `on_load("Cpath")` callback of the app
     // names (`initializer_programs` carries it for
     // runtime/spinel/rails_autoloaders.rb), each with the emitted file
@@ -8187,7 +8258,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     if !app.eager_load.is_empty() {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
     }
-    if !compiled_features.is_empty() {
+    if !compiled_features.is_empty() || !test_features.is_empty() {
         body.push_str(COMPILED_GEM_REQUIRE);
     }
     if boot_programs.is_empty() {
@@ -8635,6 +8706,57 @@ fn compiled_gem_features(
     out
 }
 
+/// The test load path's features ([`App::test_load_roots`]): a carried
+/// file below a root, by the path a `require` names it with there
+/// (`support/helpers/sql_assertions` for
+/// components/platform/essentials/test/support/helpers/sql_assertions.rb),
+/// and the emitted files requiring it loads, as [`compiled_gem_features`]
+/// gives them. Core's engines put each component's `test` and
+/// `test/support` on `$LOAD_PATH` in the test environment, and a hook's
+/// or a support file's `require "support/helpers/…"` loads from there;
+/// the emitted tree has no such directories, so the `require` loads the
+/// emitted files (`COMPILED_GEM_REQUIRE`) when `Rails.env.test?`. A
+/// feature two roots' carried files answer is left out: Ruby loads the
+/// one first on `$LOAD_PATH`, an order the engines' load decides, and
+/// its `require` goes on to Kernel's, which raises LoadError where it
+/// runs.
+fn test_load_path_features(
+    app: &App,
+    program_anchors: &std::collections::BTreeSet<String>,
+    declarations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: &dyn Fn(&str) -> bool,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut found: std::collections::BTreeMap<String, Vec<Vec<String>>> = std::collections::BTreeMap::new();
+    if app.test_load_roots.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let programs = program_anchors
+        .iter()
+        .filter_map(|anchor| anchor.strip_prefix("models/roundhouse_files/"))
+        .map(|rel| format!("{rel}.rb"));
+    let sources: std::collections::BTreeSet<String> = declarations_by_source.keys().cloned().chain(programs).collect();
+    for rel in &sources {
+        let Some(feature) = app
+            .test_load_roots
+            .iter()
+            .find_map(|root| rel.strip_prefix(root.as_str()))
+            .and_then(|rest| rest.strip_suffix(".rb"))
+        else {
+            continue;
+        };
+        let program = format!("models/roundhouse_files/{}", rel.strip_suffix(".rb").unwrap_or(rel));
+        let loads: Vec<String> = if program_anchors.contains(&program) {
+            vec![program]
+        } else {
+            declarations_by_source.get(rel).into_iter().flatten().filter(|a| emitted_file(a)).cloned().collect()
+        };
+        if !loads.is_empty() {
+            found.entry(feature.to_string()).or_default().push(loads);
+        }
+    }
+    found.into_iter().filter(|(_, hits)| hits.len() == 1).filter_map(|(f, mut hits)| hits.pop().map(|h| (f, h))).collect()
+}
+
 /// The `require` of a compiled gem's feature (`COMPILED_GEM_FEATURES`,
 /// [`compiled_gem_features`]), installed once app/models.rb has defined
 /// RoundhouseAutoload: it loads the compiled files, as the gem's own
@@ -8649,7 +8771,9 @@ fn compiled_gem_features(
 /// autoloads, was then a plain LoadError.
 const COMPILED_GEM_REQUIRE: &str = r##"
 # A gem the tree compiles from source answers its own features for a
-# native gem that requires one (`project::compiled_gem_features`).
+# native gem that requires one (`project::compiled_gem_features`), and
+# in the test environment a carried test-support file answers its
+# feature on the test load path (`project::test_load_path_features`).
 module Kernel
   previous = instance_method(:require)
   # A module prepended to Kernel stays in front of this method.
@@ -8657,7 +8781,9 @@ module Kernel
   RoundhouseAutoload.const_set(:REQUIRE_BEFORE_COMPILED_GEMS, previous)
 
   private def require(feature)
-    files = feature.is_a?(String) && RoundhouseAutoload::COMPILED_GEM_FEATURES[feature.delete_suffix(".rb")]
+    key = feature.is_a?(String) && feature.delete_suffix(".rb")
+    files = key && (RoundhouseAutoload::COMPILED_GEM_FEATURES[key] ||
+      (RoundhouseAutoload::TEST_LOAD_PATH_FEATURES[key] if defined?(::Rails.env) && ::Rails.env.test?))
     return RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, feature) unless files
     files.map { |file| RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, RoundhouseAutoload.path(file)) }.any?
   end

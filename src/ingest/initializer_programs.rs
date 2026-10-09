@@ -34,8 +34,10 @@
 //! runtime's port of lazy_load_hooks. It is carried only for a hook the
 //! emitted app fires: a framework hook whose base the runtime defines
 //! ([`FRAMEWORK_LOAD_HOOKS`], fired by boot as the runtime has loaded
-//! that base), or a hook the app's own code fires
-//! (`ActiveSupport.run_load_hooks(:hook, …)`, see [`class_load_hooks`]).
+//! that base), a test-case hook the emitted test helper fires
+//! ([`TEST_LOAD_HOOKS`], where rails/test_help loads each test base), or
+//! a hook the app's own code fires (`ActiveSupport.run_load_hooks(:hook,
+//! …)`, see [`class_load_hooks`]).
 //! Inside the block `self` is the hook's base (`class_eval`); the
 //! analyzer types it so.
 //!
@@ -81,6 +83,29 @@ pub const FRAMEWORK_LOAD_HOOKS: &[(&str, &str, &str)] = &[
     ("action_mailer", "ActionMailer::Base", "actionmailer/lib/action_mailer/base.rb:1083"),
 ];
 
+/// The test-case load hooks the emitted test helper fires (the PostgreSQL
+/// CRuby tree, `project::test_case_load_hooks_block`), each on the base
+/// Rails fires it with, where (rails 5813559f, 8.2.0.alpha). Each base's
+/// file ends firing its hooks as it loads, after boot:
+/// active_support/test_case where rails/test_help.rb requires it, the
+/// others where a test first names them (autoloads), which the emitted
+/// helper takes as the first class descending from one. A hook
+/// registered later (rails/test_help's own, a test-support file's) runs
+/// at once. Boot does not fire them: an initializer's or engine's
+/// `on_load(:active_support_test_case)` waits for the test helper, as
+/// natively it waits for the test environment.
+pub const TEST_LOAD_HOOKS: &[(&str, &str, &str)] = &[
+    ("active_support_test_case", "ActiveSupport::TestCase", "activesupport/lib/active_support/test_case.rb:408"),
+    ("action_controller_test_case", "ActionController::TestCase", "actionpack/lib/action_controller/test_case.rb:611"),
+    (
+        "action_dispatch_integration_test",
+        "ActionDispatch::IntegrationTest",
+        "actionpack/lib/action_dispatch/testing/integration.rb:693",
+    ),
+    ("action_view_test_case", "ActionView::TestCase", "actionview/lib/action_view/test_case.rb:256"),
+    ("active_job_test_case", "ActiveJob::TestCase", "activejob/lib/active_job/test_case.rb:9"),
+];
+
 /// Calls whose block Rails runs later, and whose value nobody reads: the
 /// block's statements are carried one by one.
 const DEFERRED: &[&str] =
@@ -114,6 +139,10 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
     pub dir: &'a Path,
     pub files: &'a [PathBuf],
     pub load_path: &'a [PathBuf],
+    /// The test load path (`App::test_load_roots`): a feature found only
+    /// there is left as written, for the emitted `require` to resolve
+    /// (`project::test_load_path_features`).
+    pub test_load_path: &'a [PathBuf],
     pub loaded_support: &'a crate::det::HashSet<PathBuf>,
     /// Hooks a runtime port lifts by itself (`on_load_hooks::FIRED_HOOKS`
     /// on PostgreSQL): left to that reader.
@@ -668,6 +697,15 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
         if target.is_none() && STDLIB.contains(&feature.as_str()) {
             return;
         }
+        // On the test load path only (a test hook's `require
+        // "support/helpers/…"`): the emitted `require` loads the carried
+        // file there, in the test environment, as Ruby resolves it
+        // natively (`project::test_load_path_features`).
+        if target.is_none()
+            && inputs.test_load_path.iter().filter(|root| inputs.vfs.exists(&root.join(&file))).count() == 1
+        {
+            return;
+        }
         failure = Some(match target {
             Some(t) => format!("`require {feature:?}` loads {}, which boot does not load", relative(inputs.dir, &t)),
             None => format!("`require {feature:?}`: not a runtime port, a lib file of the tree or a stdlib feature"),
@@ -856,7 +894,7 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
             });
             return Ok(Hook::Fired);
         }
-        if self.fired.bases.contains_key(&name) {
+        if self.fired.bases.contains_key(&name) || TEST_LOAD_HOOKS.iter().any(|(h, _, _)| *h == name) {
             return Ok(Hook::Fired);
         }
         Err(format!(
@@ -866,9 +904,10 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
 }
 
 /// The base `on_load(:hook)`'s block runs on (`class_eval`), for the
-/// analyzer: a framework hook's, or the one the app's code fires it with.
+/// analyzer: a framework or test-case hook's, or the one the app's code
+/// fires it with.
 pub fn hook_base(app: &App, hook: &str) -> Option<String> {
-    if let Some((_, base, _)) = FRAMEWORK_LOAD_HOOKS.iter().find(|(h, _, _)| *h == hook) {
+    if let Some((_, base, _)) = FRAMEWORK_LOAD_HOOKS.iter().chain(TEST_LOAD_HOOKS).find(|(h, _, _)| *h == hook) {
         return Some(base.to_string());
     }
     app.load_hook_bases.get(hook).cloned()

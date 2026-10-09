@@ -1410,6 +1410,7 @@ impl Analyzer {
             inquirers: inquiry::inquirer_methods(app),
             load_hook_bases: crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS
                 .iter()
+                .chain(crate::ingest::initializer_programs::TEST_LOAD_HOOKS)
                 .map(|(hook, base, _)| (hook.to_string(), ClassId(Symbol::from(*base))))
                 .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
                 .collect(),
