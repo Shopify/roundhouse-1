@@ -268,12 +268,15 @@ fn native(label: &str, support: &[(&str, &str)], tests: &str, classes: &[&str]) 
     let files: Vec<&str> = support.iter().map(|(path, _)| *path).chain(["tests.rb"]).collect();
     let program = format!(
         r##"require {oracle:?}
-RailsOracle.activate("activesupport", minitest: "5.27.0")
+RailsOracle.activate("activesupport", "activejob", minitest: "5.27.0")
 require "minitest"
 require "json"
 Minitest.seed = 4242
 require "active_support/all"
 require "active_support/test_case"
+require "active_job"
+require "active_job/test_helper"
+ActiveJob::Base.logger = Logger.new(nil)
 abort "native: activesupport is not Core's" unless Gem.loaded_specs["activesupport"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)
 {files:?}.each {{ |f| load f }}
 {classes:?}.each do |class_name|
@@ -350,6 +353,10 @@ fn emitted(support: &[(&str, &str)], tests: &str, classes: &[&str], native: &BTr
     for (path, _) in support {
         if let Ok(text) = std::fs::read_to_string(emitted.join("test/support").join(path)) {
             sources.push_str(&format!("\n# test/support/{path}\n{text}"));
+        }
+        // A library module's own copy.
+        if let Ok(text) = std::fs::read_to_string(emitted.join("app/models/shop").join(path)) {
+            sources.push_str(&format!("\n# app/models/shop/{path}\n{text}"));
         }
     }
     let out_file = emitted.join("results.jsonl");
@@ -488,4 +495,172 @@ fn a_library_modules_own_includes_and_helpers_run_as_natively() {
     .collect();
     assert_eq!(native, expected, "native oracle");
     emitted(&support, INC_TESTS, &classes, &native);
+}
+
+/// A library module that includes the testing gems' modules (as Core's
+/// `Merchandising::CatalogTestHelper` includes `ActiveJob::TestHelper`)
+/// beside a plain module of its own, one in the same `include`. The
+/// library file loads with the app tree, before the test runtime defines
+/// those modules, so they are left to each includer, which natively has
+/// them right after the module; the app's plain module stays in the
+/// module's own ancestry. (`Minitest::Assertions` and most of
+/// `ActiveSupport::Testing` are not modules of the emitted test runtime,
+/// whose `TestBase` has their methods: a test class that includes one
+/// itself does not load either.)
+const GEM_HELPER: &str = r##"module Shop
+  module GemHelper
+    extend ActiveSupport::Concern
+    include ActiveJob::TestHelper
+    include ActiveSupport::Testing::TimeHelpers, Consts
+
+    def self.depth
+      DEPTH
+    end
+
+    included do
+      setup do
+        @depth = GemHelper.depth
+      end
+    end
+
+    def counted
+      n = 0
+      assert_difference -> { n }, 2 do
+        n += 2
+      end
+      n
+    end
+  end
+end
+"##;
+
+const GEM_TESTS: &str = r##"class GemHelperTest < ActiveSupport::TestCase
+  include Shop::GemHelper
+
+  test "the module keeps its own plain include" do
+    assert_equal 7, @depth
+    assert_equal 7, Shop::GemHelper::DEPTH
+    assert Shop::GemHelper.include?(Shop::Consts)
+  end
+
+  test "the includer has the gems' methods" do
+    assert_equal 2, counted
+    assert_no_enqueued_jobs do
+      @depth += 1
+    end
+    travel_to Time.utc(2020, 1, 2) do
+      assert_equal 2020, Time.now.year
+    end
+  end
+
+  test "the module comes before the gems' modules in the includer" do
+    ancestors = self.class.ancestors
+    assert ancestors.index(Shop::GemHelper) < ancestors.index(ActiveJob::TestHelper)
+    assert_includes ancestors, Shop::Consts
+  end
+end
+
+class UnrelatedGemTest < ActiveSupport::TestCase
+  test "a class beside it loads" do
+    assert_equal 2, 1 + 1
+  end
+end
+"##;
+
+#[test]
+fn a_library_modules_includes_of_the_testing_gems_go_to_its_includers() {
+    let support = [("consts_helper.rb", CONSTS_HELPER), ("gem_helper.rb", GEM_HELPER)];
+    let classes = ["GemHelperTest", "UnrelatedGemTest"];
+    let native = native("gems", &support, GEM_TESTS, &classes);
+    let expected: BTreeMap<String, (String, u64)> = [
+        ("GemHelperTest#test_the_module_keeps_its_own_plain_include", 3),
+        // `assert_difference` and `assert_no_enqueued_jobs` count two each.
+        ("GemHelperTest#test_the_includer_has_the_gems'_methods", 6),
+        ("GemHelperTest#test_the_module_comes_before_the_gems'_modules_in_the_includer", 3),
+        ("UnrelatedGemTest#test_a_class_beside_it_loads", 1),
+    ]
+    .iter()
+    .map(|(id, n)| (id.to_string(), ("pass".to_string(), *n)))
+    .collect();
+    assert_eq!(native, expected, "native oracle");
+    let sources = emitted(&support, GEM_TESTS, &classes, &native);
+    let library = sources.split("# app/models/shop/gem_helper.rb").nth(1).expect("the module's library copy");
+    assert!(library.contains("include Shop::Consts") && !library.contains("ActiveJob") && !library.contains("TimeHelpers"), "{library}");
+}
+
+/// A helper that calls `super` is spliced into each includer only, and a
+/// `private :label` naming it goes with it; the module keeps the rest.
+const LABEL_HELPER: &str = r##"module Shop
+  module LabelHelper
+    extend ActiveSupport::Concern
+
+    PREFIX = "lbl"
+
+    def self.prefix
+      PREFIX
+    end
+
+    included do
+      setup do
+        @prefix = LabelHelper.prefix
+      end
+    end
+
+    def label
+      "#{PREFIX}-#{super}"
+    end
+
+    def shown
+      label
+    end
+    private :label, :shown
+
+    def visible
+      shown
+    end
+  end
+end
+"##;
+
+const LABEL_TESTS: &str = r##"class LabelBaseTest < ActiveSupport::TestCase
+  def label
+    "base"
+  end
+end
+
+class LabelTest < LabelBaseTest
+  include Shop::LabelHelper
+
+  test "a private helper calls super into the superclass" do
+    assert_equal "lbl-base", visible
+    assert_equal "lbl-base", send(:label)
+    refute_respond_to self, :label
+    refute_respond_to self, :shown
+    assert_equal "lbl", @prefix
+  end
+
+  test "the module keeps the visibility of the helpers it defines" do
+    assert Shop::LabelHelper.private_method_defined?(:shown)
+    assert Shop::LabelHelper.public_method_defined?(:visible)
+  end
+end
+"##;
+
+#[test]
+fn a_visibility_change_naming_a_spliced_super_helper_goes_with_it() {
+    let support = [("label_helper.rb", LABEL_HELPER)];
+    let classes = ["LabelTest"];
+    let native = native("label", &support, LABEL_TESTS, &classes);
+    let expected: BTreeMap<String, (String, u64)> =
+        [("LabelTest#test_a_private_helper_calls_super_into_the_superclass", 5), ("LabelTest#test_the_module_keeps_the_visibility_of_the_helpers_it_defines", 2)]
+            .iter()
+            .map(|(id, n)| (id.to_string(), ("pass".to_string(), *n)))
+            .collect();
+    assert_eq!(native, expected, "native oracle");
+    let sources = emitted(&support, LABEL_TESTS, &classes, &native);
+    // The reflection keeps its helpers in the library body: `label`, which
+    // calls `super`, is left to the includer, and `private` keeps `:shown`.
+    let library = sources.split("# app/models/shop/label_helper.rb").nth(1).expect("the module's library copy");
+    assert!(library.contains("def shown") && library.contains("def visible") && !library.contains("def label"), "{library}");
+    assert!(library.lines().any(|l| l.trim() == "private :shown"), "{library}");
 }

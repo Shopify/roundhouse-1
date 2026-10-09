@@ -210,10 +210,16 @@ struct Mixin {
     /// Its body's `include`s, as (modules, the call's offset, whether
     /// `extend ActiveSupport::Concern` came before it, where).
     body_includes: Vec<(Vec<IncludeRef>, usize, bool, String)>,
-    /// For a library module: the offsets of the body `include`s it keeps
-    /// (`TestMixins::library_includes`), whose modules are in its own
-    /// ancestry natively.
-    kept_includes: Vec<usize>,
+    /// For a library module: the body `include`s it keeps
+    /// (`TestMixins::library_includes`), by offset, with which of each
+    /// call's modules it keeps (natively in its own ancestry, and defined
+    /// when the library file loads).
+    kept_includes: Vec<(usize, Vec<bool>)>,
+    /// For a library module: its library body keeps its instance helpers
+    /// too (`library_member`), because something reaches the module's own
+    /// methods rather than an includer's copies: reflection on its
+    /// methods, or a use the splice does not see (`TestMixins::reached`).
+    keeps_helpers: bool,
     /// The modules in its own ancestry the test files declare, nearest
     /// first (`TestMixins::module_ancestry`): after its lexical scopes,
     /// Ruby looks a constant its bodies read up in these.
@@ -405,6 +411,15 @@ pub(super) struct TestMixins {
     /// The support files of real modules (`Mixin::real`) whose library
     /// carry failed, with why (`note_uncarried`).
     uncarried: std::cell::RefCell<Map<String, String>>,
+    /// Each module the test files reach other than by a test class's or
+    /// module's own `include`, as written: a receiver of
+    /// `METHOD_REFLECTION`, or what an `include`/`extend`/`prepend` with a
+    /// receiver, in a block or method, or in a class without a superclass
+    /// names (`reached_modules`); `::` leads a rooted one. A module is
+    /// reached by its rooted name, or by a relative one its full name ends
+    /// with, which errs toward keeping its helpers where that resolves
+    /// lexically elsewhere.
+    reached: Set<String>,
 }
 
 /// What a concern's `included do` block does on the class, as far as a
@@ -463,20 +478,51 @@ const NO_TEARDOWN: &[&str] = &[
     "Mocha::API",
 ];
 
-/// Modules of Ruby and of the testing gems Core uses (minitest 5.27,
-/// ActiveSupport, ActiveJob) that are not an `ActiveSupport::Concern` and
-/// define no `included` hook (checked against those gems): a library
-/// module's `include` of one puts it in the module's own ancestry.
-const PLAIN_LIBRARY_MODULES: &[&str] = &[
-    "Kernel",
-    "Comparable",
-    "Enumerable",
+/// Modules of Ruby itself: a library module's `include` of one puts it in
+/// the module's own ancestry, and it is defined before any app file loads.
+const CORE_LIBRARY_MODULES: &[&str] = &["Kernel", "Comparable", "Enumerable"];
+
+/// Modules of the testing gems Core uses (minitest 5.27, ActiveSupport,
+/// ActiveJob) that are not an `ActiveSupport::Concern` and define no
+/// `included` hook (checked against those gems). Natively a library
+/// module's `include` of one puts it in the module's own ancestry; but the
+/// library file loads with the app tree, before the test runtime defines
+/// them (the CRuby tree's `RoundhouseAutoload.eager_load!` runs in boot,
+/// ahead of `test/test_helper.rb`), so the include is left to each
+/// includer, which the splice gives it where the module stands
+/// (`ClassWalk`): the includer's ancestry has it right after the module,
+/// as natively. Only reflection on the module itself (`M.include?(X)`,
+/// `M.ancestors`) tells.
+const TEST_FRAMEWORK_MODULES: &[&str] = &[
     "Minitest::Assertions",
     "ActiveSupport::Testing::Assertions",
     "ActiveSupport::Testing::TimeHelpers",
     "ActiveSupport::Testing::ErrorReporterAssertions",
     "ActiveSupport::Testing::ConstantStubbing",
     "ActiveJob::TestHelper",
+];
+
+/// Calls on a module that read or change its own instance methods: a
+/// library module so reflected on keeps its helpers in its library body
+/// (`Mixin::keeps_helpers`).
+const METHOD_REFLECTION: &[&str] = &[
+    "instance_methods",
+    "public_instance_methods",
+    "private_instance_methods",
+    "protected_instance_methods",
+    "undefined_instance_methods",
+    "instance_method",
+    "public_instance_method",
+    "method_defined?",
+    "public_method_defined?",
+    "private_method_defined?",
+    "protected_method_defined?",
+    "remove_method",
+    "undef_method",
+    "alias_method",
+    "send",
+    "public_send",
+    "__send__",
 ];
 
 /// What a test class inherits from the test classes the scan read above
@@ -505,6 +551,7 @@ impl TestMixins {
         let root = result.node();
         let before = self.decls.len();
         let stmts = root.as_program_node().map(|p| p.statements().body().iter().collect::<Vec<_>>()).unwrap_or_default();
+        reached_modules(&root, &mut self.reached);
         let declared = self.declared.entry(file.to_string()).or_default();
         for stmt in stmts {
             scan_node(&stmt, &[], file, &mut self.decls, &mut self.classes, &mut self.known, declared);
@@ -602,10 +649,17 @@ impl TestMixins {
             let mut ancestry = Vec::new();
             self.module_ancestry(&includes, &m.nesting.clone(), &mut ancestry, 0);
             self.mixins[k].ancestry = ancestry;
-            if self.mixins[k].real && self.mixins[k].fatal.is_none() {
-                match self.library_includes(k) {
-                    Ok(kept) => self.mixins[k].kept_includes = kept,
-                    Err(why) => self.mixins[k].fatal = Some(why),
+            if self.mixins[k].real {
+                let name = &self.mixins[k].name;
+                self.mixins[k].keeps_helpers = self.reached.iter().any(|w| match w.strip_prefix("::") {
+                    Some(full) => name == full,
+                    None => name == w || name.ends_with(&format!("::{w}")),
+                });
+                if self.mixins[k].fatal.is_none() {
+                    match self.library_includes(k) {
+                        Ok(kept) => self.mixins[k].kept_includes = kept,
+                        Err(why) => self.mixins[k].fatal = Some(why),
+                    }
                 }
             }
         }
@@ -657,23 +711,20 @@ impl TestMixins {
     }
 
     /// Which of library module `k`'s body `include`s (`Mixin::real`) its
-    /// library body keeps, by offset: natively each puts its module in
-    /// `k`'s own ancestry, unless `k` already extends
-    /// `ActiveSupport::Concern` and the module is a concern too
-    /// (`append_features` then defers it to each includer, which the
-    /// splice includes it in). A module whose kind or library form is
-    /// not known refuses `k`'s includers by name.
-    fn library_includes(&self, k: usize) -> Result<Vec<usize>, String> {
+    /// library body keeps, by offset, with which of each call's modules:
+    /// natively each puts its module in `k`'s own ancestry, unless `k`
+    /// already extends `ActiveSupport::Concern` and the module is a
+    /// concern too (`append_features` then defers it to each includer,
+    /// which the splice includes it in). A testing gem's module is left to
+    /// the includers too (`TEST_FRAMEWORK_MODULES`). A module whose kind
+    /// or library form is not known refuses `k`'s includers by name.
+    fn library_includes(&self, k: usize) -> Result<Vec<(usize, Vec<bool>)>, String> {
         let m = &self.mixins[k];
         let mut kept = Vec::new();
         for (refs, offset, after_concern, site) in &m.body_includes {
             let keep = refs.iter().map(|r| self.library_include(m, r, *after_concern, site)).collect::<Result<Vec<bool>, String>>()?;
-            if keep.iter().all(|&k| k) {
-                kept.push(*offset);
-            } else if keep.iter().any(|&k| k) {
-                return Err(format!(
-                    "its `include` {site} names both a concern its includers get and a module it includes itself, which one statement of the library module cannot keep"
-                ));
+            if keep.iter().any(|&k| k) {
+                kept.push((*offset, keep));
             }
         }
         Ok(kept)
@@ -709,8 +760,12 @@ impl TestMixins {
         let written = r.written();
         let found = candidates(r, &m.nesting).into_iter().find_map(|c| self.module_index.get(&c).map(|d| (c, d)));
         let Some((name, decls)) = found else {
-            if PLAIN_LIBRARY_MODULES.contains(&written.trim_start_matches("::")) {
+            let gem = written.trim_start_matches("::");
+            if CORE_LIBRARY_MODULES.contains(&gem) {
                 return Ok(true);
+            }
+            if TEST_FRAMEWORK_MODULES.contains(&gem) {
+                return Ok(false);
             }
             return Err(format!(
                 "its `include {written}` {site}: whether `{written}` is an ActiveSupport::Concern (an include deferred to each includer) or a plain module (one in `{}`'s own ancestry) is not known to the shared-test splice",
@@ -758,20 +813,23 @@ impl TestMixins {
     /// each shared module's body keeps what belongs to the module itself
     /// when it is a library module (`Mixin::real`: its nested classes and
     /// modules, `class << self`, `def self.…`, module-level instance
-    /// variables, constants, `extend T::…`, helpers, the `include`s
-    /// `library_includes` keeps; `library_member`), and nothing for one
-    /// that is not; the file's other classes, modules and requires stay
-    /// as written. Removed statements become blanks of the
-    /// same lines, so every kept offset and line is the source's. `None`
-    /// when nothing would be left but empty shared modules: the file is
-    /// spliced only, as before.
+    /// variables, constants, `extend T::…`, attributes, the `include`s
+    /// `library_includes` keeps, and its helpers when something reaches
+    /// them there, `Mixin::keeps_helpers`; `library_member`), and nothing
+    /// for one that is not; the file's other classes, modules and requires
+    /// stay as written. Removed statements and arguments become blanks of
+    /// the same lines, so every kept offset and line is the source's.
+    /// `None` when nothing would be left but empty shared modules: the
+    /// file is spliced only, as before; or when a statement cannot keep
+    /// just some of its arguments (`note_uncarried` then says why).
     pub(super) fn library_source(&self, file: &str, source: &[u8]) -> Option<Vec<u8>> {
-        let mut spliced: Map<usize, bool> = Map::default();
-        let mut kept: Vec<usize> = Vec::new();
+        let mut spliced: Map<usize, Option<LibraryForm>> = Map::default();
+        let mut kept: Vec<(usize, Vec<bool>)> = Vec::new();
         for d in self.decls.iter().filter(|d| d.file == file) {
             if let Some(&k) = self.by_name.get(&d.name) {
-                spliced.insert(d.offset, self.mixins[k].real);
-                kept.extend(&self.mixins[k].kept_includes);
+                let m = &self.mixins[k];
+                spliced.insert(d.offset, m.real.then_some(LibraryForm { helpers: m.keeps_helpers }));
+                kept.extend(m.kept_includes.iter().cloned());
             }
         }
         if spliced.is_empty() {
@@ -780,19 +838,24 @@ impl TestMixins {
         let result = super::prism::parse_silent(source);
         let root = result.node();
         let stmts = root.as_program_node().map(|p| p.statements().body().iter().collect::<Vec<_>>()).unwrap_or_default();
-        let mut blank: Vec<(usize, usize)> = Vec::new();
-        let mut keeps = false;
-        library_blanks(&stmts, &spliced, &kept, source, &mut blank, &mut keeps, false);
-        if !keeps {
+        let mut walk = LibraryBlanks { spliced: &spliced, kept: &kept, source, blank: Vec::new(), continued: Vec::new(), keeps: false };
+        if let Err(why) = walk.walk(&stmts, false) {
+            self.note_uncarried(file, why);
+            return None;
+        }
+        if !walk.keeps {
             return None;
         }
         let mut out = source.to_vec();
-        for (start, end) in blank {
+        for (start, end) in walk.blank {
             for b in &mut out[start..end] {
                 if *b != b'\n' {
                     *b = b' ';
                 }
             }
+        }
+        for at in walk.continued {
+            out[at] = b'\\';
         }
         Some(out)
     }
@@ -2806,112 +2869,294 @@ fn module_hook(stmt: &Node<'_>) -> Option<String> {
     None
 }
 
-/// `library_source`'s walk: the ranges to blank in `stmts` (a file's,
-/// or a module's or class's body; `nested` below the top level), and
-/// whether a declaration is kept (`keeps`): a library module's member,
-/// or a class, module or statement other than a shared module.
-fn library_blanks(
-    stmts: &[Node<'_>],
-    spliced: &Map<usize, bool>,
-    kept: &[usize],
-    source: &[u8],
-    blank: &mut Vec<(usize, usize)>,
-    keeps: &mut bool,
-    nested: bool,
-) {
-    for stmt in stmts {
-        let body = stmt
-            .as_module_node()
-            .and_then(|m| m.body())
-            .or_else(|| stmt.as_class_node().and_then(|c| c.body()))
-            .or_else(|| stmt.as_singleton_class_node().and_then(|c| c.body()));
-        let declaration = stmt.as_module_node().is_some() || stmt.as_class_node().is_some();
-        let Some(&real) = spliced.get(&stmt.location().start_offset()).filter(|_| stmt.as_module_node().is_some()) else {
-            if declaration {
-                let inner = body.map(flatten_statements).unwrap_or_default();
-                let range = stmt.location().start_offset()..stmt.location().end_offset();
-                if spliced.keys().any(|at| range.contains(at)) {
-                    library_blanks(&inner, spliced, kept, source, blank, keeps, true);
-                } else {
-                    *keeps = true;
-                }
-            } else if nested {
-                *keeps = true;
-            }
-            continue;
-        };
-        let members = body.map(flatten_statements).unwrap_or_default();
-        // Each member's verdict; a `sig` (`None`) goes with the def after it.
-        let mut hidden = false;
-        let mut verdicts: Vec<Option<bool>> = Vec::new();
-        for member in &members {
-            if member.as_module_node().is_some() || member.as_class_node().is_some() {
-                // A nested shared module is blanked on its own terms.
-                let at = member.location().start_offset();
-                if member.as_module_node().is_some() && spliced.contains_key(&at) {
-                    library_blanks(std::slice::from_ref(member), spliced, kept, source, blank, keeps, true);
-                } else {
-                    *keeps |= real;
-                }
-                verdicts.push(Some(true));
-                continue;
-            }
-            verdicts.push(if real { library_member(member, kept, &mut hidden) } else { Some(false) });
-        }
-        let mut next = false;
-        for (member, verdict) in members.iter().zip(verdicts.iter_mut()).rev() {
-            let keep = verdict.unwrap_or(next);
-            *verdict = Some(keep);
-            next = keep;
-            if member.as_module_node().is_some() || member.as_class_node().is_some() {
-                continue;
-            }
-            if keep {
-                *keeps = true;
-            } else {
-                blank.push(blank_range(member, source));
+/// The modules `root` reaches other than by the `include` of a test
+/// class's or module's own body, by their written names, into
+/// `out` (`TestMixins::reached`): a constant that receives a
+/// `METHOD_REFLECTION` call, or that an `include`, `extend` or `prepend`
+/// (also through `send`) names with a receiver, at the top level, in a
+/// block, method or `class << …`, or in the body of a class without a
+/// superclass, where the splice does not take the module's helpers.
+fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
+    use ruby_prism::Visit;
+    struct Reach<'s> {
+        out: &'s mut Set<String>,
+        /// Each enclosing scope: whether a receiverless `include` in it is
+        /// one the splice handles (a module's or a subclass's body).
+        own: Vec<bool>,
+    }
+    impl Reach<'_> {
+        fn note(&mut self, node: &Node<'_>) {
+            if let Some(path) = constant_path_of(node).filter(|p| !p.is_empty()) {
+                let rooted = node.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                self.out.insert(format!("{}{}", if rooted { "::" } else { "" }, path.join("::")));
             }
         }
+    }
+    impl<'pr> Visit<'pr> for Reach<'_> {
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.own.push(true);
+            ruby_prism::visit_module_node(self, node);
+            self.own.pop();
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.own.push(node.superclass().is_some());
+            ruby_prism::visit_class_node(self, node);
+            self.own.pop();
+        }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            self.own.push(false);
+            ruby_prism::visit_singleton_class_node(self, node);
+            self.own.pop();
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.own.push(false);
+            ruby_prism::visit_def_node(self, node);
+            self.own.pop();
+        }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.own.push(false);
+            ruby_prism::visit_block_node(self, node);
+            self.own.pop();
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.own.push(false);
+            ruby_prism::visit_lambda_node(self, node);
+            self.own.pop();
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = constant_id_str(&node.name());
+            let args: Vec<Node<'pr>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            if let Some(receiver) = node.receiver().filter(|_| METHOD_REFLECTION.contains(&name)) {
+                self.note(&receiver);
+            }
+            let mixes = |n: &str| matches!(n, "include" | "extend" | "prepend");
+            if mixes(name) && !(node.receiver().is_none() && self.own.last() == Some(&true)) {
+                args.iter().for_each(|a| self.note(a));
+            }
+            let sent = args.first().and_then(|a| a.as_symbol_node()).is_some_and(|s| mixes(&String::from_utf8_lossy(s.unescaped())));
+            if matches!(name, "send" | "public_send" | "__send__") && sent {
+                args[1..].iter().for_each(|a| self.note(a));
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    Reach { out, own: Vec::new() }.visit(root);
+}
+
+/// How a library module (`Mixin::real`) is carried (`library_source`).
+#[derive(Clone, Copy)]
+struct LibraryForm {
+    /// Its instance helpers stay in its body (`Mixin::keeps_helpers`).
+    helpers: bool,
+}
+
+/// `library_source`'s walk: the ranges to blank (`blank`), the bytes that
+/// become a `\` line continuation (`continued`), and whether a
+/// declaration is kept (`keeps`): a library module's member, or a class,
+/// module or statement other than a shared module. `spliced` is each
+/// shared module's form by offset (`None`: not a library module), `kept`
+/// the `include`s library modules keep (`Mixin::kept_includes`).
+struct LibraryBlanks<'a> {
+    spliced: &'a Map<usize, Option<LibraryForm>>,
+    kept: &'a [(usize, Vec<bool>)],
+    source: &'a [u8],
+    blank: Vec<(usize, usize)>,
+    continued: Vec<usize>,
+    keeps: bool,
+}
+
+impl LibraryBlanks<'_> {
+    /// `stmts`: a file's, or a module's or class's body (`nested` below
+    /// the top level).
+    fn walk(&mut self, stmts: &[Node<'_>], nested: bool) -> Result<(), String> {
+        for stmt in stmts {
+            let body = stmt
+                .as_module_node()
+                .and_then(|m| m.body())
+                .or_else(|| stmt.as_class_node().and_then(|c| c.body()))
+                .or_else(|| stmt.as_singleton_class_node().and_then(|c| c.body()));
+            let declaration = stmt.as_module_node().is_some() || stmt.as_class_node().is_some();
+            let Some(&form) = self.spliced.get(&stmt.location().start_offset()).filter(|_| stmt.as_module_node().is_some()) else {
+                if declaration {
+                    let inner = body.map(flatten_statements).unwrap_or_default();
+                    let range = stmt.location().start_offset()..stmt.location().end_offset();
+                    if self.spliced.keys().any(|at| range.contains(at)) {
+                        self.walk(&inner, true)?;
+                    } else {
+                        self.keeps = true;
+                    }
+                } else if nested {
+                    self.keeps = true;
+                }
+                continue;
+            };
+            let members = body.map(flatten_statements).unwrap_or_default();
+            // The instance methods the body defines, and the ones it
+            // leaves to the splice: a visibility change keeps only the
+            // names of methods the library body still defines.
+            let (mut defined, mut left): (Set<String>, Set<String>) = (Set::default(), Set::default());
+            if let Some(form) = form {
+                for member in &members {
+                    if let Some(def) = instance_def(member) {
+                        let name = constant_id_str(&def.name()).to_string();
+                        if form.helpers && !def_calls_super(&def) { defined.insert(name) } else { left.insert(name) };
+                    }
+                }
+            }
+            let dropped = |name: &str| left.contains(name) && !defined.contains(name);
+            // Each member's verdict; a `sig` (`None`) goes with the def after it.
+            let mut hidden = false;
+            let mut verdicts: Vec<Option<bool>> = Vec::new();
+            for member in &members {
+                if member.as_module_node().is_some() || member.as_class_node().is_some() {
+                    // A nested shared module is blanked on its own terms.
+                    let at = member.location().start_offset();
+                    if member.as_module_node().is_some() && self.spliced.contains_key(&at) {
+                        self.walk(std::slice::from_ref(member), true)?;
+                    } else {
+                        self.keeps |= form.is_some();
+                    }
+                    verdicts.push(Some(true));
+                    continue;
+                }
+                let Some(form) = form else {
+                    verdicts.push(Some(false));
+                    continue;
+                };
+                let verdict = match library_member(member, form, self.kept, &dropped, &mut hidden) {
+                    Member::Keep => Some(true),
+                    Member::Drop => Some(false),
+                    Member::Sig => None,
+                    Member::Some(keep) => {
+                        let call = member.as_call_node().expect("a call keeps some arguments");
+                        self.blank_args(&call, &keep)?;
+                        Some(true)
+                    }
+                };
+                verdicts.push(verdict);
+            }
+            let mut next = false;
+            for (member, verdict) in members.iter().zip(verdicts.iter_mut()).rev() {
+                let keep = verdict.unwrap_or(next);
+                *verdict = Some(keep);
+                next = keep;
+                if member.as_module_node().is_some() || member.as_class_node().is_some() {
+                    continue;
+                }
+                if keep {
+                    self.keeps = true;
+                } else {
+                    self.blank.push(blank_range(member, self.source));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Blank the arguments of `call` that `keep` drops (some, not all):
+    /// with the separators after them, and before the first one kept a
+    /// line break in a call without parentheses is continued with `\`, so
+    /// the kept ones stay its arguments. `include A,\n  B` keeping `B` is
+    /// `include   \\\n  B`. A line with no byte to continue refuses.
+    fn blank_args(&mut self, call: &ruby_prism::CallNode<'_>, keep: &[bool]) -> Result<(), String> {
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let span = |n: &Node<'_>| (n.location().start_offset(), n.location().end_offset());
+        let kept: Vec<usize> = (0..args.len()).filter(|&i| keep.get(i).copied().unwrap_or(true)).collect();
+        let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else { return Ok(()) };
+        // Before the first kept argument.
+        let lead = (span(&args[0]).0, span(&args[first]).0);
+        if lead.0 < lead.1 {
+            self.blank.push(lead);
+            if call.opening_loc().is_none() {
+                for at in lead.0..lead.1 {
+                    if self.source[at] == b'\n' {
+                        if at == lead.0 || self.source[at - 1] == b'\n' {
+                            let text = String::from_utf8_lossy(call.location().as_slice()).into_owned();
+                            let shown: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
+                            return Err(format!(
+                                "`{shown}` keeps only some of its arguments in the library module, and its line breaks leave no room to continue the call"
+                            ));
+                        }
+                        self.continued.push(at - 1);
+                    }
+                }
+            }
+        }
+        // Between kept arguments: a dropped one and the separator after
+        // it; the separator after a kept one stays.
+        for pair in kept.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if b > a + 1 {
+                self.blank.push((span(&args[a + 1]).0, span(&args[b]).0));
+            }
+        }
+        // After the last kept argument.
+        if let Some(end) = args.last().map(|n| span(n).1).filter(|&end| end > span(&args[last]).1) {
+            self.blank.push((span(&args[last]).1, end));
+        }
+        Ok(())
     }
 }
 
-/// Whether a library module (`Mixin::real`) keeps `member` in its own
+/// What a library module's body keeps of one member (`library_member`).
+enum Member {
+    Keep,
+    Drop,
+    /// A `sig`: as the def after it.
+    Sig,
+    /// The call, with only these of its arguments.
+    Some(Vec<bool>),
+}
+
+/// What a library module (`Mixin::real`) keeps of `member` in its own
 /// body: what belongs to the module itself (`module_member`, constants,
-/// `extend T::…`), its helper methods that do not call `super` (each
-/// includer still gets its own copy, `ClassWalk::finish`), with their
-/// visibility, and the `include`s it keeps (`kept`). What the splice gives each includer is
-/// blanked: its tests, callbacks, `included do` block, tags, the
+/// `extend T::…`), its attributes, its helper methods that do not call
+/// `super` when its form keeps helpers (each includer still gets its own
+/// copy, `ClassWalk::finish`), a visibility change of the methods it still
+/// defines (`dropped` names one left to the splice), and the modules of
+/// the `include`s it keeps (`kept`). What the splice gives each includer
+/// is blanked: its tests, callbacks, `included do` block, tags, the
 /// `extend`s of `ActiveSupport::Concern` and `Declarative`, and the
-/// concerns it defers. `None` for a `sig`, which goes with the next def.
-fn library_member(member: &Node<'_>, kept: &[usize], hidden: &mut bool) -> Option<bool> {
+/// modules it defers.
+fn library_member(member: &Node<'_>, form: LibraryForm, kept: &[(usize, Vec<bool>)], dropped: &dyn Fn(&str) -> bool, hidden: &mut bool) -> Member {
+    let all = |keep: Vec<bool>| match (keep.iter().all(|&k| k), keep.iter().any(|&k| k)) {
+        (true, _) => Member::Keep,
+        (false, true) => Member::Some(keep),
+        (false, false) => Member::Drop,
+    };
+    let yes = |keep: bool| if keep { Member::Keep } else { Member::Drop };
     if module_member(member) || member.as_constant_write_node().is_some() {
-        return Some(true);
+        return Member::Keep;
     }
     if let Some(level) = bare_visibility(member) {
         *hidden = level != MethodVisibility::Public;
-        return Some(true);
+        return Member::Keep;
     }
     if is_test_declaration_shape(member) && !non_public_def(member, *hidden) {
-        return Some(false);
+        return Member::Drop;
     }
     // A def that calls `super` is left to the splice: the includer's
     // chain runs through its `RoundhouseSuper…` copies only.
     if let Some(def) = instance_def(member) {
-        return Some(!def_calls_super(&def));
+        return yes(form.helpers && !def_calls_super(&def));
     }
-    let call = member.as_call_node().filter(|c| c.receiver().is_none())?;
+    let Some(call) = member.as_call_node().filter(|c| c.receiver().is_none()) else { return Member::Drop };
     let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
-    Some(match constant_id_str(&call.name()) {
-        "sig" => return None,
-        "include" => kept.contains(&call.location().start_offset()),
-        "extend" => args.iter().all(|n| {
-            matches!(constant_path_of(n).map(|p| p.join("::")).as_deref(), Some("T::Helpers" | "T::Sig" | "T::Generic"))
-        }),
-        "attr_reader" | "attr_writer" | "attr_accessor" | "private" | "protected" | "public" => {
-            call.block().is_none() && args.iter().all(|a| a.as_symbol_node().is_some())
+    match constant_id_str(&call.name()) {
+        "sig" => Member::Sig,
+        "include" => {
+            let at = call.location().start_offset();
+            kept.iter().find(|(o, _)| *o == at).map_or(Member::Drop, |(_, keep)| all(keep.clone()))
         }
-        _ => false,
-    })
+        "extend" => yes(args.iter().all(|n| {
+            matches!(constant_path_of(n).map(|p| p.join("::")).as_deref(), Some("T::Helpers" | "T::Sig" | "T::Generic"))
+        })),
+        "attr_reader" | "attr_writer" | "attr_accessor" => yes(call.block().is_none() && args.iter().all(|a| a.as_symbol_node().is_some())),
+        "private" | "protected" | "public" if call.block().is_none() && args.iter().all(|a| a.as_symbol_node().is_some()) => {
+            all(args.iter().map(|a| a.as_symbol_node().is_some_and(|s| !dropped(&String::from_utf8_lossy(s.unescaped())))).collect())
+        }
+        _ => Member::Drop,
+    }
 }
 
 /// The bytes a statement takes: from the comment lines right above it
@@ -3127,6 +3372,7 @@ fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
         real,
         body_includes: Vec::new(),
         kept_includes: Vec::new(),
+        keeps_helpers: false,
         ancestry: Vec::new(),
     };
     let result = super::prism::parse_silent(source);
@@ -4061,10 +4307,6 @@ end
                 "COLORS = [:red].freeze",
                 "module CatalogHelper",
                 "LIMIT = 3",
-                "#: -> void",
-                "def build_catalog(limit: LIMIT)",
-                "Factories.define(COLORS, limit)",
-                "end",
                 "module Factories",
                 "class << self",
                 "def define(colors, limit)",
@@ -4086,6 +4328,90 @@ end
         assert_eq!(kept, ["require \"x\"", "module Plain", "def plain; end", "end", "module Shop", "module Spliced", "end", "end"], "{other}");
         // Neither: spliced only, as before.
         assert!(mixins.library_source("foo_shared_tests.rb", FOO.as_bytes()).is_none());
+
+        // A test that reflects on the module's own methods reaches its
+        // library body: the helper stays there too, its `#:` with it. A
+        // module of the same last name elsewhere does not.
+        let helper = "    #: -> void\n    def build_catalog(limit: LIMIT)\n      Factories.define(COLORS, limit)\n    end\n";
+        for (receiver, kept) in [("Shop::CatalogHelper", true), ("::Shop::CatalogHelper", true), ("CatalogHelper", true), ("::CatalogHelper", false), ("Other::CatalogHelper", false)] {
+            let mut mixins = TestMixins::default();
+            let reflects = format!("class ReflectTest < ActiveSupport::TestCase\n  test \"r\" do\n    assert {receiver}.method_defined?(:build_catalog)\n  end\nend\n");
+            mixins.scan(CATALOG.as_bytes(), "catalog_helper.rb");
+            mixins.scan(reflects.as_bytes(), "reflect_test.rb");
+            mixins.set_library_context(["catalog_helper.rb".to_string()], Vec::new());
+            mixins.finish();
+            let library = String::from_utf8(mixins.library_source("catalog_helper.rb", CATALOG.as_bytes()).expect("a library file")).unwrap();
+            assert_eq!(library.contains(helper), kept, "{receiver}: {library}");
+        }
+    }
+
+    #[test]
+    fn a_module_is_reached_by_reflection_and_by_uses_the_splice_does_not_see() {
+        let reached = |source: &str| {
+            let result = super::super::prism::parse_silent(source.as_bytes());
+            let mut out = Set::default();
+            reached_modules(&result.node(), &mut out);
+            let mut out: Vec<String> = out.into_iter().collect();
+            out.sort();
+            out
+        };
+        // A test class's and a module's own `include`s are the splice's.
+        assert!(reached("module A\n  include Helper\nend\nclass T < ActiveSupport::TestCase\n  include Shop::Helper\nend\n").is_empty());
+        for (source, name) in [
+            ("class T < ActiveSupport::TestCase\n  test \"x\" do\n    Shop::Helper.instance_methods(false)\n  end\nend\n", "Shop::Helper"),
+            ("class T < ActiveSupport::TestCase\n  def x\n    Object.new.extend(::Shop::Helper)\n  end\nend\n", "::Shop::Helper"),
+            ("class Fake\n  include Helper\nend\n", "Helper"),
+            ("klass = Class.new do\n  include Shop::Helper\nend\n", "Shop::Helper"),
+            ("klass.send(:include, Shop::Helper)\n", "Shop::Helper"),
+            ("Helper.private_method_defined?(:x)\n", "Helper"),
+        ] {
+            assert_eq!(reached(source), [name], "{source}");
+        }
+    }
+
+    #[test]
+    fn a_call_keeps_only_some_of_its_arguments_in_place() {
+        // (statement, which arguments stay, the statement after)
+        for (call, keep, after) in [
+            ("include A, B, C", vec![true, false, true], "include A,    C"),
+            ("include A, B", vec![false, true], "include    B"),
+            ("include A, B", vec![true, false], "include A   "),
+            ("include A,\n  B", vec![false, true], "include  \\\n  B"),
+            ("include(A,\n  B)", vec![false, true], "include(  \n  B)"),
+            ("private :a,\n  :b, # c\n  :d", vec![true, false, true], "private :a,\n         \n  :d"),
+        ] {
+            let source = format!("{call}\n");
+            let result = super::super::prism::parse_silent(source.as_bytes());
+            let root = result.node();
+            let stmt = root.as_program_node().unwrap().statements().body().iter().next().unwrap();
+            let (spliced, kept) = (Map::default(), Vec::new());
+            let mut walk = LibraryBlanks { spliced: &spliced, kept: &kept, source: source.as_bytes(), blank: Vec::new(), continued: Vec::new(), keeps: false };
+            walk.blank_args(&stmt.as_call_node().unwrap(), &keep).unwrap();
+            let mut out = source.clone().into_bytes();
+            for (start, end) in walk.blank {
+                out[start..end].iter_mut().filter(|b| **b != b'\n').for_each(|b| *b = b' ');
+            }
+            walk.continued.iter().for_each(|&at| out[at] = b'\\');
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out.trim_end_matches('\n'), after, "{call}");
+            // Still one call of the kept arguments.
+            let reparsed = super::super::prism::parse_silent(out.as_bytes());
+            let root = reparsed.node();
+            let body: Vec<Node<'_>> = root.as_program_node().unwrap().statements().body().iter().collect();
+            assert_eq!(body.len(), 1, "{out}");
+            let count = body[0].as_call_node().and_then(|c| c.arguments()).map_or(0, |a| a.arguments().iter().count());
+            assert_eq!(count, keep.iter().filter(|&&k| k).count(), "{out}");
+        }
+        // An empty line before the first kept argument leaves nothing to
+        // continue the call with.
+        let source = "include A,\n\n  B\n";
+        let result = super::super::prism::parse_silent(source.as_bytes());
+        let root = result.node();
+        let stmt = root.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let (spliced, kept) = (Map::default(), Vec::new());
+        let mut walk = LibraryBlanks { spliced: &spliced, kept: &kept, source: source.as_bytes(), blank: Vec::new(), continued: Vec::new(), keeps: false };
+        let err = walk.blank_args(&stmt.as_call_node().unwrap(), &[false, true]).unwrap_err();
+        assert!(err.contains("keeps only some of its arguments"), "{err}");
     }
 
     /// The review's shape: a library module that includes a plain module
@@ -4105,12 +4431,31 @@ end
         mixins.finish();
         let library = String::from_utf8(mixins.library_source("inc.rb", INC.as_bytes()).expect("a library file")).unwrap();
         let kept: Vec<&str> = library.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        // Nothing reaches its helpers in the module: they are the
+        // includers' only.
+        assert_eq!(kept, ["module Shop", "module IncHelper", "include Consts", "def self.depth", "DEPTH", "end", "private", "end", "end"], "{library}");
+
+        // Reflected on, it keeps the helpers that do not call `super`, and
+        // a visibility change keeps the names of those only. A testing
+        // gem's module is left to the includers.
+        let inc = INC
+            .replace("include Consts\n", "include ActiveJob::TestHelper, Consts\n")
+            .replace("    private\n", "    private :with_super, :helper_depth\n    private\n");
+        let reflects = format!("{INC_TEST}\nclass ReflectTest < ActiveSupport::TestCase\n  test \"r\" do\n    assert Shop::IncHelper.private_method_defined?(:helper_depth)\n  end\nend\n");
+        let mut mixins = TestMixins::default();
+        for (file, source) in [("inc.rb", inc.as_str()), ("consts.rb", CONSTS), ("inc_test.rb", reflects.as_str())] {
+            mixins.scan(source.as_bytes(), file);
+        }
+        mixins.set_library_context(["inc.rb", "consts.rb"].map(String::from), Vec::new());
+        mixins.finish();
+        let library = String::from_utf8(mixins.library_source("inc.rb", inc.as_bytes()).expect("a library file")).unwrap();
+        let kept: Vec<&str> = library.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         assert_eq!(
             kept,
             [
                 "module Shop",
                 "module IncHelper",
-                "include Consts",
+                "include                        Consts",
                 "def self.depth",
                 "DEPTH",
                 "end",
@@ -4118,6 +4463,7 @@ end
                 "def helper_depth",
                 "DEPTH",
                 "end",
+                "private              :helper_depth",
                 "private",
                 "def test_named_helper",
                 "DEPTH",
@@ -4127,6 +4473,12 @@ end
             ],
             "{library}"
         );
+        let files = [("inc.rb", inc.as_str()), ("consts.rb", CONSTS), ("inc_test.rb", INC_TEST)];
+        let tms = run_with(&files, &["inc.rb", "consts.rb"], "inc_test.rb").unwrap();
+        let includes: Vec<&str> = tms[0].includes.iter().map(|i| i.0.as_str()).collect();
+        // `include A, B` is `include B; include A`: A comes first, as natively.
+        assert_eq!(includes, ["Shop::Consts", "ActiveJob::TestHelper", "::Shop::IncHelper", "RoundhouseSuperShop_IncHelper"]);
+
         let files = [("inc.rb", INC), ("consts.rb", CONSTS), ("inc_test.rb", INC_TEST)];
         let tms = run_with(&files, &["inc.rb", "consts.rb"], "inc_test.rb").unwrap();
         let tm = &tms[0];
@@ -4164,7 +4516,7 @@ end
             let err = run_with(&files, &["inc.rb", "consts.rb", "plain.rb"], "inc_test.rb").unwrap_err();
             assert!(err.contains("test class `IncTest` refused") && err.contains(why), "{to}: {err}");
         }
-        // A gem module that is not a concern is kept as written.
+        // A testing gem's module beside a plain one: the includer gets it.
         let inc = INC.replace("include Consts", "include Consts, ActiveJob::TestHelper");
         let files = [("inc.rb", inc.as_str()), ("consts.rb", CONSTS), ("inc_test.rb", INC_TEST)];
         run_with(&files, &["inc.rb", "consts.rb"], "inc_test.rb").unwrap();
