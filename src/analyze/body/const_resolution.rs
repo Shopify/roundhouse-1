@@ -732,6 +732,12 @@ impl ConstResolver {
         }
     }
 
+    /// The fully qualified declaration a reference resolves to, whether a
+    /// namespace or a value.
+    pub(crate) fn declaration_name(&self, span: Span, path: &[Symbol]) -> Option<&str> {
+        self.resolved_name(span, path).map(|(name, _)| name.0.as_str())
+    }
+
     /// Full names of the classes and modules that `file` opens with
     /// `class` or `module`.
     pub(crate) fn class_definitions(&self, file: FileId) -> impl Iterator<Item = &str> {

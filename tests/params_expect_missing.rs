@@ -6,7 +6,7 @@
 //! `@params` (ledgered in docs/pipeline/runtime.md). Behavior against
 //! Rails is pinned in `emit_and_run.rs`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -19,7 +19,7 @@ fn controller_for(target: BuildTarget, helper_body: &str) -> String {
     let controller = format!(
         "class ArticlesController < ApplicationController\n  def create\n    @article = Article.new(article_params)\n    @article.save\n    head :created\n  end\n\n  private\n\n  def article_params\n    {helper_body}\n  end\nend\n"
     );
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/article.rb"), b"class Article < ApplicationRecord\nend\n".to_vec());
     tree.insert(

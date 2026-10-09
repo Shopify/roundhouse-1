@@ -679,7 +679,7 @@ pub fn attribute_initializer_constants(diags: &mut [Diagnostic], app: &App) {
         return;
     }
     let root = app.root.trim_end_matches('/');
-    let mut assigned: HashMap<String, Vec<String>> = HashMap::new();
+    let mut assigned: HashMap<String, Vec<String>> = HashMap::default();
     for f in &app.sources {
         let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
         if !rel.starts_with("config/initializers/") {
@@ -695,7 +695,7 @@ pub fn attribute_initializer_constants(diags: &mut [Diagnostic], app: &App) {
     if assigned.is_empty() {
         return;
     }
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     for d in diags.iter_mut() {
         if d.severity == Severity::Info || !is_unsupported_constant(d) {
             continue;
