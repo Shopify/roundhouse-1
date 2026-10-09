@@ -4186,6 +4186,11 @@ fn ruby_family_files(
     if app_uses_date(app) {
         inject_cruby_date_calendar_boot_requires(&mut files)?;
     }
+    // A require cycle left in the tree is a circular require at boot,
+    // which Core's StrictWarning raises: named here, each one.
+    for cycle in crate::require_graph::cycles(&files) {
+        eprintln!("roundhouse: warning[require_cycle]: {}", cycle.describe());
+    }
     Ok(files)
 }
 
@@ -9032,7 +9037,23 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     } else {
         files.push(("app/models.rb".to_string(), body));
     }
-    require_namespace_files_first(files, app);
+    // A namespace's declarations file whose constant autoloads another
+    // file (a program: Core's podding/sorting_hat.rb, which only
+    // requires its children) loads that file as its `module SortingHat`
+    // line runs: an edge no require line shows.
+    let mut autoloads_from: BTreeMap<String, String> = BTreeMap::new();
+    for (namespace, children) in &namespaces {
+        for (name, child) in children {
+            let Some(file) = child.file.as_ref() else { continue };
+            let full = if namespace == "Object" { name.clone() } else { format!("{namespace}::{name}") };
+            let declarations = format!("models/{}", emit::ruby::library_file_stem(&full, app));
+            let target = as_loaded(file);
+            if declarations != target {
+                autoloads_from.insert(format!("app/{declarations}"), format!("app/{target}"));
+            }
+        }
+    }
+    require_namespace_files_first(files, app, &autoloads_from);
     load_declarations_through_their_program(files, app, &program_of_file);
     // Each program that is an autoload, and each a load-time need is
     // required through (`require_through`), autoloaded or not: that
@@ -9294,9 +9315,18 @@ fn unroll_literal_require_loops(files: &mut [(String, String)], app: &App) {
 /// A namespace is skipped when it encloses the requiring file or one of
 /// its program's declarations: it is loading or loaded already. It is
 /// also skipped when its file already reaches the requiring file by
-/// requires, since the new edge would close a cycle. File programs'
-/// source trees (models/roundhouse_files) are paths, not namespaces.
-fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
+/// requires, or by the autoload its own `module` line runs
+/// (`autoloads_from`: declarations file => the file its constant
+/// autoloads), since the new edge would close a cycle. Core's
+/// podding/sorting_hat.rb program requires its children, and the
+/// namespace file a test initializer's reopen of `Podding::SortingHat`
+/// declares autoloads that program. File programs' source trees
+/// (models/roundhouse_files) are paths, not namespaces.
+fn require_namespace_files_first(
+    files: &mut [(String, String)],
+    app: &App,
+    autoloads_from: &std::collections::BTreeMap<String, String>,
+) {
     use std::collections::{BTreeMap, BTreeSet};
     const PROGRAMS: &str = "app/models/roundhouse_files/";
     let normalize = |path: &str| -> String {
@@ -9349,6 +9379,11 @@ fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
         let dir = dir_of(path);
         let out = edges.entry(stem_of(path)).or_default();
         out.extend(content.lines().filter_map(|l| required(&dir, l).map(|(target, _)| target)));
+    }
+    for (declarations, target) in autoloads_from {
+        if present.contains(declarations) {
+            edges.entry(declarations.clone()).or_default().insert(target.clone());
+        }
     }
     let reaches = |edges: &BTreeMap<String, BTreeSet<String>>, from: &str, to: &str| -> bool {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -16718,7 +16753,7 @@ mod tests {
             file("app/models/vaulted.rb", "require_relative \"payments/vault/card\"\n\nmodule Vaulted\nend\n"),
             file("app/models/guarded.rb", "require_relative \"payments/vault/card\" if ENV[\"CARDS\"]\nrequire_relative \"payments/vault/card\"\n"),
         ];
-        super::require_namespace_files_first(&mut files, &App::new());
+        super::require_namespace_files_first(&mut files, &App::new(), &Default::default());
         let body = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
         assert_eq!(
             body("app/models/vaulted.rb"),
@@ -16735,6 +16770,30 @@ mod tests {
              require_relative \"payments/vault\"\n\
              require_relative \"payments/vault/card\"\n"
         );
+    }
+
+    #[test]
+    fn a_program_whose_namespace_file_autoloads_it_requires_no_namespace_file() {
+        let file = |path: &str, body: &str| (path.to_string(), body.to_string());
+        const PROGRAM: &str = "app/models/roundhouse_files/lib/podding/sorting_hat.rb";
+        // Core's podding/sorting_hat.rb: the program requires a child of
+        // `Podding::SortingHat`, whose namespace file (declared by a test
+        // initializer's reopen) autoloads the program back. Requiring the
+        // namespace file first would be a circular require of the program.
+        let child = "require RoundhouseAutoload.path(\"models/podding/sorting_hat/selector\")\n";
+        let mut files = vec![
+            file("app/models/podding.rb", "module Podding\nend\n"),
+            file("app/models/podding/sorting_hat.rb", "module Podding\n  module SortingHat\n  end\nend\n"),
+            file("app/models/podding/sorting_hat/selector.rb", "module Podding\n  module SortingHat\n    class Selector\n    end\n  end\nend\n"),
+            file(PROGRAM, child),
+            file("app/models/podding/uses_selector.rb", child),
+        ];
+        let autoloads_from = [("app/models/podding/sorting_hat".to_string(), "app/models/roundhouse_files/lib/podding/sorting_hat".to_string())];
+        super::require_namespace_files_first(&mut files, &App::new(), &autoloads_from.into_iter().collect());
+        let body = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
+        assert!(!body(PROGRAM).contains("require_relative \"../../../podding/sorting_hat\""), "{}", body(PROGRAM));
+        // Any other file still loads the namespace first.
+        assert!(body("app/models/podding/uses_selector.rb").contains("require_relative \"sorting_hat\"\n"), "{}", body("app/models/podding/uses_selector.rb"));
     }
 
     #[test]

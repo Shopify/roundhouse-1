@@ -15229,7 +15229,9 @@ fn waits_on_its_constant(self_anchor: &str, anchor: &str, owner: &str, app: &App
 /// calls, its constants' values, its class-variable initializers (none
 /// of them the closures they only store, `walk_load_time_paths`) and
 /// the method bodies those run at load (`load_time_methods`). Any
-/// other method body is read later.
+/// other method body is read later. Each read also reads the namespaces
+/// it goes through, and the header reopens the enclosing ones
+/// (`namespace_prefixed`): both run those namespaces' autoloads.
 fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
     let build = || {
         let files = require_guard_owners(app);
@@ -15277,8 +15279,13 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
                     }
                 }
             }
-            for path in &paths {
-                let Some(to) = require_path_for_body_const(path, app, name) else { continue };
+            // The header reopens each enclosing namespace (`module Plat;
+            // module Artifact` around `module EmptyCheckable`), which
+            // runs that namespace's autoload when its file has not run.
+            let segments = split(&lc.name);
+            paths.extend((1..segments.len()).map(|n| segments[..n].to_vec()));
+            for path in namespace_prefixed(&paths) {
+                let Some(to) = require_path_for_body_const(&path, app, name) else { continue };
                 if to != from && files.contains_key(&to) {
                     let from_id = node(&from, &mut ids, &mut edges);
                     let to_id = node(&to, &mut ids, &mut edges);
@@ -15304,8 +15311,10 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
                     walk_load_time_paths(expr, &mut paths, &mut later);
                 }
             }
-            for path in &paths {
-                let Some(to) = require_path_for_body_const(path, app, name) else { continue };
+            let segments = split(&model.name);
+            paths.extend((1..segments.len()).map(|n| segments[..n].to_vec()));
+            for path in namespace_prefixed(&paths) {
+                let Some(to) = require_path_for_body_const(&path, app, name) else { continue };
                 if to != from && files.contains_key(&to) {
                     let from_id = node(&from, &mut ids, &mut edges);
                     let to_id = node(&to, &mut ids, &mut edges);
@@ -15332,9 +15341,24 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
     }
 }
 
+/// Each constant path read at load, with the namespaces it is read
+/// through: Ruby resolves `::Caps::Abstract` by looking up `Caps` first,
+/// which runs `Caps`'s autoload, so caps.rb loads before caps/abstract.rb
+/// and is as much a load-time need of the reading file.
+fn namespace_prefixed(paths: &BTreeSet<Vec<String>>) -> BTreeSet<Vec<String>> {
+    let mut out = BTreeSet::new();
+    for path in paths {
+        let skip = path.first().is_some_and(|head| head.is_empty()) as usize;
+        for n in (skip + 1)..=path.len() {
+            out.insert(path[..n].to_vec());
+        }
+    }
+    out
+}
+
 /// Tarjan's strongly connected components of the graph whose node `v`
 /// has the out-edges `edges[v]`, iteratively: each node's component.
-fn strongly_connected(edges: &[Vec<usize>]) -> Vec<usize> {
+pub(crate) fn strongly_connected(edges: &[Vec<usize>]) -> Vec<usize> {
     const UNSEEN: usize = usize::MAX;
     let n = edges.len();
     let (mut index, mut low, mut component) = (vec![UNSEEN; n], vec![0; n], vec![UNSEEN; n]);

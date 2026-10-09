@@ -47,6 +47,11 @@ pub(crate) fn library_file_stem(name: &str, app: &App) -> String {
     crate::naming::underscore(&library::file_owner(name, app))
 }
 
+/// Tarjan's strongly connected components (`library::strongly_connected`).
+pub(crate) fn strongly_connected(edges: &[Vec<usize>]) -> Vec<usize> {
+    library::strongly_connected(edges)
+}
+
 /// The app/models.rb anchor of a support file's file program.
 pub(crate) fn file_program_anchor(app: &App, program: &crate::app::FileProgram) -> String {
     library::file_program_anchor(app, program)
