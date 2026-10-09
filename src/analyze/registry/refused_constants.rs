@@ -10,15 +10,14 @@
 //! never reaches it.
 
 /// `(name, namespace, reason)`: `namespace` also covers every constant
-/// nested under `name` (`ActiveRecord::Fixture::FormatError`).
+/// nested under `name` (`ActiveRecord::Tasks::DatabaseTasks`).
 const REFUSED: &[(&str, bool, &str)] = &[
-    // fixtures.rb, fixture_set/*.rb. Not test_fixtures.rb: the PostgreSQL
-    // tree carries ActiveRecord::TestFixtures' transactional tests
-    // (runtime/spinel/cruby/test/active_record_test_fixtures.rb, indexed
-    // where the app carries that runtime).
-    ("ActiveRecord::FixtureSet", true, FIXTURES),
-    ("ActiveRecord::Fixture", true, FIXTURES),
-    ("ActiveRecord::FixtureClassNotFound", false, FIXTURES),
+    // Not fixtures.rb or test_fixtures.rb: the PostgreSQL tree carries
+    // ActiveRecord::FixtureSet, its File and ActiveRecord::Fixture
+    // (runtime/spinel/cruby/active_record_fixture_set.rb, gated to that
+    // tree by analyze::runtime_reads) and ActiveRecord::TestFixtures'
+    // transactional tests (runtime/spinel/cruby/test/active_record_test_fixtures.rb,
+    // indexed where the app carries that runtime).
     // tasks/*.rb.
     ("ActiveRecord::Tasks", true, DATABASE_TASKS),
     // connection_adapters: the adapter's schema reflection objects.
@@ -47,8 +46,6 @@ const REFUSED: &[(&str, bool, &str)] = &[
     ("ActionView::Helpers::AssetUrlHelper", true, ASSET_URL_HELPER),
 ];
 
-const FIXTURES: &str = "Rails' fixture loader is not carried: the app's fixture files are compiled at build time, \
-    and the test harness loads them before each test";
 const DATABASE_TASKS: &str = "Rails' database tasks are not carried: the schema is compiled from the app's schema file, \
     and the database is created and prepared outside the program";
 const SCHEMA_REFLECTION: &str = "the adapter's schema reflection objects are not carried: the schema is compiled from the \
@@ -79,14 +76,14 @@ mod tests {
 
     #[test]
     fn exact_and_nested_names() {
-        assert_eq!(refusal("ActiveRecord::FixtureSet"), Some(super::FIXTURES));
-        assert_eq!(refusal("::ActiveRecord::Fixture::FormatError"), Some(super::FIXTURES));
+        // The PostgreSQL tree's runtime carries the fixture classes.
+        assert_eq!(refusal("ActiveRecord::FixtureSet"), None);
+        assert_eq!(refusal("::ActiveRecord::Fixture::FormatError"), None);
         assert_eq!(refusal("ActiveRecord::Tasks::DatabaseTasks"), Some(super::DATABASE_TASKS));
         assert_eq!(refusal("ActiveRecord::ConnectionAdapters::PostgreSQL::TypeMetadata"), Some(super::SCHEMA_REFLECTION));
         // Exact entries do not cover their namespace, nor a longer name.
         assert_eq!(refusal("ActiveRecord::ConnectionAdapters::PostgreSQL::OID"), None);
         assert_eq!(refusal("ActiveRecord::ConnectionAdapters::ColumnDefinition"), None);
-        assert_eq!(refusal("ActiveRecord::FixtureSetting"), None);
         assert_eq!(refusal("ActiveRecord::Base"), None);
         assert_eq!(refusal("ActiveSupport::CurrentAttributes::NOT_SET"), Some(super::CURRENT_ATTRIBUTES));
         assert_eq!(refusal("::ActionView::Helpers::AssetUrlHelper"), Some(super::ASSET_URL_HELPER));
