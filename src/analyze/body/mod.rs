@@ -1193,6 +1193,92 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    /// An instance method of an app module that a class or module body
+    /// `extend`s runs as that extender's singleton method, with the class
+    /// object as self: ApplicationRecord's `extend AcceleratedBelongsTo`
+    /// makes `accelerated_belongs_to :shop` a class macro whose
+    /// `class_eval <<~RUBY` and `alias_method` work on the model class.
+    /// `extension_modules` types such a module class side only when that
+    /// is its only use. Core's `Denormalize` also runs `include
+    /// AcceleratedBelongsTo` from its `included do` block, so the module
+    /// stays on the instance side and each Module-protocol call was
+    /// refused, raising at boot in every model.
+    ///
+    /// A Module-only method sent to implicit self there still has one
+    /// meaning: no instance answers `class_eval`, `alias_method`,
+    /// `define_method` or the other names `is_module_protocol` lists
+    /// unless its class defines them, so on an instance that got the
+    /// module by `include` Ruby raises NoMethodError at the call. The
+    /// emitted call is the same send and raises in the same way. So
+    /// when no app class declares the name as an instance method (an
+    /// includer's instance would answer it), the call's only answer is
+    /// Module's on the extender. `include?` stays out, because Array,
+    /// String, Hash and Set answer it. A module nothing extends keeps the
+    /// refusal: there, self is never a class.
+    ///
+    /// The module's code types with the module as self, or, when one
+    /// class includes it (`App::sole_includer_of_modules`), with that
+    /// class's instance. The second case is the module's own instance
+    /// method when the call sits in a file that declares the module, the
+    /// enclosing `def` is one of the module's instance methods, and the
+    /// typed class mixes the module in.
+    fn self_runs_as_extender(&self, method: &Symbol, ctx: &Ctx, span: crate::span::Span) -> bool {
+        if ctx.class_side || method.as_str() == "include?" { return false; }
+        let Some(Ty::Class { id: self_id, .. }) = ctx.self_ty.as_ref() else { return false };
+        let app_module = |id: &ClassId| self.classes().get(id).is_some_and(|info| info.is_module && info.app_declared);
+        let modules: Vec<ClassId> = if app_module(self_id) {
+            vec![self_id.clone()]
+        } else {
+            let (Some((def, false)), Some(resolver)) = (ctx.enclosing_def.as_ref(), self.const_resolver.as_ref()) else {
+                return false;
+            };
+            resolver.receivers_declared_in(span.file)
+                .map(|name| ClassId(Symbol::from(name)))
+                .filter(|id| {
+                    app_module(id)
+                        && self.classes().get(id).is_some_and(|info| info.has_instance_method(def))
+                        && self.mixes_in(self_id, id)
+                })
+                .collect()
+        };
+        if modules.is_empty() {
+            return false;
+        }
+        // A scan of the whole registry, noted as `instance_method_definers`
+        // notes its own: the class set and each visited entry.
+        if let Some(deps) = self.deps {
+            deps.note(DepKey::Class(&class_set_key()));
+        }
+        let extended = self.classes.iter().any(|(id, info)| {
+            if let Some(deps) = self.deps {
+                deps.note(DepKey::Class(id));
+            }
+            modules.iter().any(|module| info.extends.contains(module))
+        });
+        extended
+            && !self.classes().instance_method_definers(method)
+                .any(|id| self.classes.get(id).is_some_and(|info| info.app_declared))
+    }
+
+    /// Whether `module` is among `class`'s mixins: its includes, theirs,
+    /// and its superclasses'.
+    fn mixes_in(&self, class: &ClassId, module: &ClassId) -> bool {
+        let mut stack = vec![class];
+        let mut seen = crate::det::HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(info) = self.classes().get(id) else { continue };
+            if info.includes().contains(module) {
+                return true;
+            }
+            stack.extend(info.includes().iter());
+            stack.extend(info.parent());
+        }
+        false
+    }
+
     /// An instance method of a class that descends from `Module` (Core's
     /// `class MethodTimingRecorder < Module`) runs with a module as self:
     /// every instance of such a class is a module, whichever subclass.
@@ -2357,7 +2443,8 @@ impl<'a> BodyTyper<'a> {
                 }
                 let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
                     || (recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
-                        && send::is_module_protocol(method) && self.self_is_module_instance(ctx))
+                        && send::is_module_protocol(method)
+                        && (self.self_is_module_instance(ctx) || self.self_runs_as_extender(method, ctx, expr.span)))
                     || send::is_module_query_on_module_value(method, recv_ty.as_ref())
                     // `x.class` is a class object, though not a known one:
                     // enough for a query, not for `define_method`.
