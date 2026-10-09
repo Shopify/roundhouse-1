@@ -197,6 +197,12 @@ const REFUSED: &str = r##"class FrameworkReader
     ActiveRecord::ConnectionAdapters::SqlTypeMetadata.new(sql_type: "integer")
   end
 
+  def self.aggregate?(reflection)
+    reflection.is_a?(ActiveRecord::Reflection::AggregateReflection)
+  end
+
+  # Carried on the PostgreSQL tree since the model answers a reflection
+  # for every compiled association (runtime/spinel/cruby/active_record_core.rb).
   def self.through?(reflection)
     reflection.is_a?(ActiveRecord::Reflection::ThroughReflection)
   end
@@ -227,12 +233,13 @@ fn configurations_type_on_postgresql_and_framework_classes_are_refused_by_name()
         ("ActiveRecord::Fixture::FormatError", "Rails' fixture loader is not carried"),
         ("ActiveRecord::Tasks::DatabaseTasks", "Rails' database tasks are not carried"),
         ("ActiveRecord::ConnectionAdapters::SqlTypeMetadata", "the adapter's schema reflection objects are not carried"),
-        ("ActiveRecord::Reflection::ThroughReflection", "Rails' reflection classes are not carried"),
+        ("ActiveRecord::Reflection::AggregateReflection", "Rails' reflection classes are not carried"),
     ] {
         let expected = format!("constant not supported (all targets): {name} — {reason}");
         assert!(refusals.iter().any(|e| e.contains(&expected)), "no {expected:?} in:\n{refusals:#?}");
     }
     assert_eq!(refusals.len(), 5, "{refusals:#?}");
+    assert!(!errors.iter().any(|e| e.contains("ThroughReflection")), "{errors:#?}");
 }
 
 /// Without the PostgreSQL runtime nothing carries them: the reads stay

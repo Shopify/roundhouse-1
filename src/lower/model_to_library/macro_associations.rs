@@ -5,10 +5,13 @@
 //! (`macro_replay`), and the `belongs_to` and `reflect_on_association`
 //! it makes there are answered from the compiled association: the class
 //! gets `self.belongs_to`, which answers the reflection of an
-//! association it compiled and raises for any other, and
-//! `self.reflect_on_association`, which answers a
-//! `ActiveRecord::Reflection::BelongsToReflection` for each such
-//! association (and defers to the superclass for the rest). The
+//! association it compiled, with the options the macro passes, and
+//! raises for any other, and `self.reflect_on_association`, which
+//! answers a `ActiveRecord::Reflection::BelongsToReflection` for each
+//! such association (and defers to the superclass for the rest). On the
+//! PostgreSQL CRuby tree that method answers every association the model
+//! compiled instead (`emit::ruby::library::apply_association_reflections`).
+//! The
 //! association's reader goes in GeneratedAttributeMethods
 //! (`emit::ruby::library::generated_attribute_methods`), as Rails defines
 //! it in a generated module, so the reader a macro's `class_eval` writes
@@ -58,8 +61,8 @@ pub(crate) fn declared_readers(model: &Model) -> Vec<Symbol> {
     declared(model).into_iter().map(|(_, assoc)| assoc.name().clone()).collect()
 }
 
-/// `self.reflect_on_association(name)` and `self.belongs_to(name, *args)`
-/// for a model whose class macros declare associations.
+/// `self.reflect_on_association(name)` and `self.belongs_to(name, *args,
+/// **options)` for a model whose class macros declare associations.
 pub(super) fn push_reflection_methods(methods: &mut Vec<MethodDef>, model: &Model, models: &[Model]) {
     let declared = declared(model);
     if declared.is_empty() {
@@ -112,39 +115,33 @@ pub(super) fn push_reflection_methods(methods: &mut Vec<MethodDef>, model: &Mode
         methods.push(class_method(model, "reflect_on_association", vec![param.clone()], answer));
     }
     // `belongs_to :shop, ...` at class-body run time: the compiled
-    // association's reflection, or an error naming one never compiled.
-    let reflected = send(None, "reflect_on_association", vec![name_ref()]);
-    let message = Expr::new(
-        Span::synthetic(),
-        ExprNode::StringInterp {
-            parts: vec![
-                crate::expr::InterpPart::Expr { expr: send(None, "name", Vec::new()) },
-                crate::expr::InterpPart::Text { value: ".belongs_to :".to_string() },
-                crate::expr::InterpPart::Expr { expr: name_ref() },
-                crate::expr::InterpPart::Text {
-                    value: " at class-body run time: the compiler lowers only the associations a class macro declares from its call".to_string(),
-                },
-            ],
-        },
-    );
-    let raise = send(
-        None,
-        "raise",
-        vec![Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("NotImplementedError")] }), message],
-    );
-    let body = Expr::new(
-        Span::synthetic(),
-        ExprNode::BoolOp {
-            op: crate::expr::BoolOpKind::Or,
-            surface: crate::expr::BoolOpSurface::Word,
-            left: reflected,
-            right: raise,
-        },
-    );
-    let mut rest = Param::positional(Symbol::from("_args"));
-    rest.rest = true;
+    // association's reflection, which takes the options the macro
+    // passes (the macro may add its own: Core's
+    // `accelerated_readonly_belongs_to` merges `autosave: false`), or an
+    // error naming one never compiled.
     if !methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "belongs_to") {
-        methods.push(class_method(model, "belongs_to", vec![param, rest], body));
+        // `runtime_src` reads required positionals only: the params are
+        // written plain and given their kinds below.
+        let source = "def self.belongs_to(name, _args, options)\n  \
+             reflection = reflect_on_association(name)\n  \
+             if reflection.nil?\n    \
+             raise NotImplementedError, \"#{self.name}.belongs_to :#{name} at class-body run time: the compiler lowers \
+             only the associations a class macro declares from its call\"\n  \
+             end\n  \
+             reflection._roundhouse_declared(options)\n\
+             end\n";
+        let parsed = crate::runtime_src::parse_methods(source)
+            .unwrap_or_else(|e| panic!("macro_associations: generated `belongs_to` failed to parse: {e}\n{source}"));
+        for mut m in parsed {
+            m.enclosing_class = Some(model.name.0.clone());
+            m.name_span = Span::synthetic();
+            if let [_, args, options] = m.params.as_mut_slice() {
+                args.rest = true; // *_args
+                options.keyword = true; // **options
+                options.rest = true;
+            }
+            methods.push(m);
+        }
     }
 }
 

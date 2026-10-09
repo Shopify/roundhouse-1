@@ -2575,6 +2575,7 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool) {
 pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
 
+    apply_association_reflections(lcs, app);
     if !super::expr::native_keywords() || !app_calls_association(app) {
         return;
     }
@@ -2674,6 +2675,302 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
             lc.methods.push(m);
         }
     }
+}
+
+/// `Model.reflect_on_association(name)` on the PostgreSQL CRuby tree: a
+/// reflection for every association the model compiled, as Rails builds
+/// one per declaration (reflection.rb; the classes are ported in
+/// runtime/spinel/cruby/active_record_core.rb):
+///
+/// ```ruby
+/// def self.reflect_on_association(association)
+///   reflections = ::Product.instance_variable_get(:@__roundhouse_reflections)
+///   if reflections.nil?
+///     reflections = { metafields: ::ActiveRecord::Reflection::HasManyReflection.new(:metafields, "Metafield", "owner_id", { as: "owner", autosave: false }, ::Product) }
+///     ::Product.instance_variable_set(:@__roundhouse_reflections, reflections)
+///   end
+///   reflections.fetch(association.to_sym) { superclass.reflect_on_association(association) if superclass.respond_to?(:reflect_on_association) }
+/// end
+/// ```
+///
+/// Each reflection is built once, on the class that declares it, and
+/// answered after, so a write to its `options` is seen by every later
+/// reader and by subclasses, as Rails shares one reflection object:
+/// Core's HasSyncedActiveRecordMetafields declares `base.has_many
+/// :metafields, ...` in its `included` hook and then writes
+/// `base.reflect_on_association(:metafields).options[:autosave] = false`.
+/// The class answered a reflection only for an association a class
+/// macro declares (`model_to_library::macro_associations`), so its 30
+/// includers failed with "undefined method 'options' for nil".
+///
+/// `options` is the declaration's keyword hash: each literal value is
+/// copied from the call in the source (`DeclarationOptions`); any other
+/// (a lambda, a constant, a `**splat`, a block's extension) is named,
+/// and reading `options` raises NotImplementedError with the names
+/// rather than answering a hash without them. An association a class
+/// macro declares takes its options when the macro's `belongs_to` runs
+/// (`_roundhouse_declared`). A later declaration of a name replaces the
+/// earlier, last, as Rails' `add_reflection` does. A subclass of another
+/// model hands the names it does not declare to its parent's method (nil
+/// when the parent answers none, as Rails answers nil for a name no class
+/// declares); a root model answers nil, and a subclass that declares
+/// nothing inherits its parent's. A `reflect_on_association` the model defines itself (or
+/// a concern's copy) wins; the one `macro_associations` writes is
+/// replaced in place, so an include positioned after it
+/// (`hooked_include_position`) stays there.
+///
+/// CRuby/JRuby with the PostgreSQL runtime only, where the reflection
+/// classes are carried, and only where some body calls
+/// `reflect_on_association` or a class macro declares an association.
+pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App) {
+    use crate::dialect::{Association, ModelBodyItem};
+
+    if !super::expr::native_keywords() || !app.carries_postgresql_runtime() {
+        return;
+    }
+    let generated = |m: &MethodDef| {
+        m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && m.name_span.file.0 == 0
+    };
+    if !lcs.iter().any(|lc| lc.methods.iter().any(generated)) && !app_calls_method(app, "reflect_on_association") {
+        return;
+    }
+    let mut declarations = DeclarationOptions::default();
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && !generated(m)) {
+            continue; // the model's own wins
+        }
+        let inherits = model.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p));
+        let owner = format!("::{}", model.name.0.as_str().trim_start_matches("::"));
+        let macro_declared = crate::lower::model_to_library::macro_associations::declaring_calls(model);
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for item in &model.body {
+            let ModelBodyItem::Association { assoc, span, .. } = item else { continue };
+            let name = assoc.name().as_str();
+            let (options, mut unsupported) = if !span.is_synthetic() && macro_declared.contains(span) {
+                ("nil".to_string(), Vec::new())
+            } else {
+                declarations.of(app, *span)
+            };
+            if matches!(assoc, Association::HasMany { extension, .. } if !extension.is_empty())
+                && !unsupported.iter().any(|u| u.contains("block"))
+            {
+                unsupported.push("`extend:` (the declaration's block)".to_string());
+            }
+            let unsupported = if unsupported.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<String> = unsupported.iter().map(|u| ruby_single_quoted(u)).collect();
+                format!(", unsupported: [{}]", names.join(", "))
+            };
+            let class = |t: &ClassId| format!("{:?}", t.0.as_str().trim_start_matches("::"));
+            let reflection = "::ActiveRecord::Reflection";
+            let new = match assoc {
+                Association::BelongsTo { target, foreign_key, polymorphic, foreign_type, primary_key, .. } => {
+                    let foreign_type = match (polymorphic, foreign_type) {
+                        (true, Some(t)) => format!("{:?}", t.as_str()),
+                        (true, None) => format!("{:?}", format!("{name}_type")),
+                        (false, _) => "nil".to_string(),
+                    };
+                    format!(
+                        "{reflection}::BelongsToReflection.new(:{name}, {:?}, {}, {foreign_type}, {}, {options}, {owner}{unsupported})",
+                        foreign_key.as_str(),
+                        if *polymorphic { "nil".to_string() } else { class(target) },
+                        primary_key.as_ref().map_or_else(|| "nil".to_string(), |k| format!("{:?}", k.as_str())),
+                    )
+                }
+                Association::HasMany { target, foreign_key, through: None, .. } => format!(
+                    "{reflection}::HasManyReflection.new(:{name}, {}, {:?}, {options}, {owner}{unsupported})",
+                    class(target),
+                    foreign_key.as_str()
+                ),
+                Association::HasMany { target, through: Some(_), .. } => format!(
+                    "{reflection}::ThroughReflection.new({reflection}::HasManyReflection.new(:{name}, {}, nil, {options}, {owner}{unsupported}))",
+                    class(target)
+                ),
+                Association::HasOne { target, foreign_key, .. } => format!(
+                    "{reflection}::HasOneReflection.new(:{name}, {}, {:?}, {options}, {owner}{unsupported})",
+                    class(target),
+                    foreign_key.as_str()
+                ),
+                Association::HasAndBelongsToMany { target, .. } => format!(
+                    "{reflection}::HasAndBelongsToManyReflection.new(:{name}, {}, nil, {options}, {owner}{unsupported})",
+                    class(target)
+                ),
+            };
+            entries.retain(|(n, _)| n != name);
+            entries.push((name.to_string(), new));
+        }
+        if entries.is_empty() && inherits {
+            // The parent's answers every name.
+            if let Some(i) = lc.methods.iter().position(generated) {
+                lc.methods.remove(i);
+            }
+            continue;
+        }
+        let otherwise = if inherits {
+            "reflections.fetch(association.to_sym) { superclass.reflect_on_association(association) if superclass.respond_to?(:reflect_on_association) }"
+        } else {
+            "reflections[association.to_sym]"
+        };
+        let table: Vec<String> = entries.iter().map(|(name, new)| format!("{name}: {new}")).collect();
+        let src = format!(
+            "def self.reflect_on_association(association)\n  \
+             reflections = {owner}.instance_variable_get(:@__roundhouse_reflections)\n  \
+             if reflections.nil?\n    \
+             reflections = {{ {} }}\n    \
+             {owner}.instance_variable_set(:@__roundhouse_reflections, reflections)\n  \
+             end\n  \
+             {otherwise}\n\
+             end\n",
+            table.join(", ")
+        );
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("apply_association_reflections: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            m.name_span = Span::synthetic();
+            match lc.methods.iter().position(generated) {
+                Some(i) => lc.methods[i] = m,
+                None => lc.methods.insert(0, m),
+            }
+        }
+    }
+}
+
+/// `text` as a Ruby single-quoted string literal, which interpolates
+/// nothing.
+fn ruby_single_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// The keyword options of association declarations, read off the
+/// source call at the declaration's span, parsed once per file.
+#[derive(Default)]
+struct DeclarationOptions {
+    by_file: HashMap<u32, HashMap<u32, (String, Vec<String>)>>,
+}
+
+impl DeclarationOptions {
+    /// The options of the call at `span` as a Ruby hash literal of its
+    /// literal values in source order, and a description of each option
+    /// it leaves out.
+    fn of(&mut self, app: &App, span: Span) -> (String, Vec<String>) {
+        let missing = || ("{}".to_string(), vec!["the declaration (no source call)".to_string()]);
+        if span.is_synthetic() || span.file.0 == 0 {
+            return missing();
+        }
+        let calls = self.by_file.entry(span.file.0).or_insert_with(|| {
+            match (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
+                Some(source) => declaration_calls(&source.text),
+                None => HashMap::default(),
+            }
+        });
+        calls.get(&span.start).cloned().unwrap_or_else(missing)
+    }
+}
+
+/// Every call in `text` by its start offset (the outermost of calls
+/// starting together): its keyword options, as `DeclarationOptions::of`
+/// answers them.
+fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
+    struct Calls {
+        out: HashMap<u32, (String, Vec<String>)>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Calls {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            // By the call's start, and by its message's: a statement an
+            // `included(base)` hook declares is read with `base.`
+            // blanked, so its span starts at `has_many`.
+            let starts = [Some(node.location().start_offset()), node.message_loc().map(|m| m.start_offset())];
+            for at in starts.into_iter().flatten() {
+                self.out.entry(at as u32).or_insert_with(|| call_options(node));
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    fn label(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c == '_' || c.is_ascii_lowercase())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    }
+    // A literal whose source text means the same anywhere.
+    fn literal(node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(s) = node.as_string_node() {
+            return !s.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<"));
+        }
+        if let Some(a) = node.as_array_node() {
+            return a.elements().iter().all(|e| literal(&e));
+        }
+        if let Some(h) = node.as_hash_node() {
+            return h.elements().iter().all(|e| {
+                e.as_assoc_node().is_some_and(|a| a.key().as_symbol_node().is_some() && literal(&a.value()))
+            });
+        }
+        node.as_symbol_node().is_some()
+            || node.as_integer_node().is_some()
+            || node.as_float_node().is_some()
+            || node.as_true_node().is_some()
+            || node.as_false_node().is_some()
+            || node.as_nil_node().is_some()
+    }
+    fn call_options(call: &ruby_prism::CallNode<'_>) -> (String, Vec<String>) {
+        let mut pairs: Vec<String> = Vec::new();
+        let mut unsupported: Vec<String> = Vec::new();
+        for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
+            let Some(hash) = arg.as_keyword_hash_node() else { continue };
+            for element in hash.elements().iter() {
+                let Some(assoc) = element.as_assoc_node() else {
+                    unsupported.push("a `**` splat".to_string());
+                    continue;
+                };
+                let key = assoc.key();
+                let name = key.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+                match name {
+                    Some(name) if label(&name) => {
+                        let value = assoc.value();
+                        if literal(&value) {
+                            pairs.push(format!("{name}: {}", String::from_utf8_lossy(value.location().as_slice())));
+                        } else {
+                            unsupported.push(format!("`{name}:` (not a literal)"));
+                        }
+                    }
+                    _ => unsupported.push(format!("the key `{}`", String::from_utf8_lossy(key.location().as_slice()))),
+                }
+            }
+        }
+        if call.block().is_some() {
+            unsupported.push("`extend:` (the declaration's block)".to_string());
+        }
+        let hash = if pairs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", pairs.join(", ")) };
+        (hash, unsupported)
+    }
+    let mut calls = Calls { out: HashMap::default() };
+    ruby_prism::Visit::visit(&mut calls, &ruby_prism::parse(text.as_bytes()).node());
+    calls.out
+}
+
+/// Some emit-bound body, view or test sends `method`.
+fn app_calls_method(app: &App, method: &str) -> bool {
+    fn walk(e: &Expr, method: &str, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ExprNode::Send { method: m, .. } = &*e.node {
+            if m.as_str() == method {
+                *found = true;
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, method, found));
+    }
+    let mut found = false;
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, method, &mut found));
+    for view in &app.views {
+        walk(&view.body, method, &mut found);
+    }
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, method, &mut found));
+    found
 }
 
 /// Some emit-bound body, view or test calls `association(x)`, on a
@@ -7924,6 +8221,8 @@ fn emit_library_class_decl_inner(
                 include_extends.push((inc, carriers));
             }
         }
+    } else if app.models.iter().any(|m| m.name == lc.name) {
+        include_extends = carrier_included_modules(lc, &spliced_extends, app);
     }
     let carrier_extends: Vec<&crate::ident::ClassId> = spliced_extends
         .iter()
@@ -8460,12 +8759,78 @@ fn emit_library_class_decl_inner(
         }
         out
     };
+    // Class-body calls the ingest didn't model (`LibraryClass::
+    // unknown_calls`), replayed verbatim when — and only when — the
+    // class extends a base we don't model at all, or reopens a loaded
+    // gem's class. See `replays_foreign_class_body`.
+    //
+    // Never an analyzer include refusal (`is_include_refusal`): a ledger
+    // record for check, not a statement. The include it names is written
+    // above (`write_include`), where the source has it; replayed, the
+    // record raised again at the end of a body whose include had run.
+    let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
+        lc.unknown_calls
+            .iter()
+            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
+            .collect()
+    } else {
+        for call in dropped_class_body_calls(lc, app) {
+            report_dropped_class_body_call(lc, call);
+        }
+        modelled_class_body_calls(lc, app).into_iter().filter(|c| !is_body_statement(c)).collect()
+    };
+    // The body statements the ingest kept (`carries_body_statement`),
+    // written where the source has them on CRuby/JRuby: among the other
+    // replayed calls when no def is above them, else just before the
+    // first def below them (`positioned_statements`). Every other target
+    // refuses them by name (`project::report_body_statements`).
+    let mut positioned_statements: Vec<(usize, &Expr)> = Vec::new();
+    let mut flowing_statements: Vec<&Expr> = Vec::new();
+    if super::expr::native_keywords() && !railtie {
+        for call in lc.unknown_calls.iter().filter(|c| is_body_statement(c)) {
+            match body_statement_place(lc, call) {
+                Some(Some(at)) => positioned_statements.push((at, call)),
+                Some(None) => flowing_statements.push(call),
+                None => {}
+            }
+        }
+    }
+    let replayed: Vec<&Expr> = if flowing_statements.is_empty() {
+        replayed
+    } else {
+        lc.unknown_calls
+            .iter()
+            .filter(|c| {
+                replayed.iter().chain(flowing_statements.iter()).any(|r| std::ptr::eq(*r, *c))
+            })
+            .collect()
+    };
+    // A replayed `extend M` of the app's own module the source writes
+    // above an include goes right before that include
+    // (`extends_before_includes`), and leaves the replayed calls.
+    // A model's replayed class-body calls are its class-side
+    // initializers (`lower::model_to_library::collect_class_attr_initializers`).
+    let hoistable: Vec<&Expr> = replayed
+        .iter()
+        .copied()
+        .chain(lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).filter(|_| !ordered_state))
+        .collect();
+    let extends_before = if railtie { Vec::new() } else { extends_before_includes(lc, app, &hoistable) };
+    let replayed: Vec<&Expr> = replayed
+        .into_iter()
+        .filter(|c| !extends_before.iter().any(|(_, e)| std::ptr::eq(*e, *c)))
+        .collect();
     let extended_at_include: std::cell::RefCell<Vec<ClassId>> = std::cell::RefCell::new(Vec::new());
     // `with_extends`: the include's `ClassMethods` extends follow its
     // line, ahead of its carried block, as `Concern#append_features` runs
     // them (`base.extend(ClassMethods)`, then `base.class_eval(&block)`).
     // A positioned include has them at the top of the body already.
     let write_include = |s: &mut String, inc: &ClassId, with_extends: bool| {
+        for (_, call) in extends_before.iter().filter(|(before, _)| *before == inc) {
+            for line in super::emit_expr(call).lines() {
+                writeln!(s, "{body_pad}{line}").unwrap();
+            }
+        }
         // An include analysis refused (error[gem_requires_rails]): the
         // module is only the RBI of a gem no tree loads, so the source's
         // include fails here, by name, as a NotImplementedError (a
@@ -8585,52 +8950,7 @@ fn emit_library_class_decl_inner(
     // reaches Object#initialize and raises. Those (and any constant
     // reading them) emit after the methods, which is where the source
     // had them. `emit_deferred_constants` renders that tail.
-    // Class-body calls the ingest didn't model (`LibraryClass::
-    // unknown_calls`), replayed verbatim when — and only when — the
-    // class extends a base we don't model at all, or reopens a loaded
-    // gem's class. See `replays_foreign_class_body`.
-    //
-    // Never an analyzer include refusal (`is_include_refusal`): a ledger
-    // record for check, not a statement. The include it names is written
-    // above (`write_include`), where the source has it; replayed, the
-    // record raised again at the end of a body whose include had run.
-    let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
-        lc.unknown_calls
-            .iter()
-            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
-            .collect()
-    } else {
-        for call in dropped_class_body_calls(lc, app) {
-            report_dropped_class_body_call(lc, call);
-        }
-        modelled_class_body_calls(lc, app).into_iter().filter(|c| !is_body_statement(c)).collect()
-    };
-    // The body statements the ingest kept (`carries_body_statement`),
-    // written where the source has them on CRuby/JRuby: among the other
-    // replayed calls when no def is above them, else just before the
-    // first def below them (`positioned_statements`). Every other target
-    // refuses them by name (`project::report_body_statements`).
-    let mut positioned_statements: Vec<(usize, &Expr)> = Vec::new();
-    let mut flowing_statements: Vec<&Expr> = Vec::new();
-    if super::expr::native_keywords() && !railtie {
-        for call in lc.unknown_calls.iter().filter(|c| is_body_statement(c)) {
-            match body_statement_place(lc, call) {
-                Some(Some(at)) => positioned_statements.push((at, call)),
-                Some(None) => flowing_statements.push(call),
-                None => {}
-            }
-        }
-    }
-    let replayed: Vec<&Expr> = if flowing_statements.is_empty() {
-        replayed
-    } else {
-        lc.unknown_calls
-            .iter()
-            .filter(|c| {
-                replayed.iter().chain(flowing_statements.iter()).any(|r| std::ptr::eq(*r, *c))
-            })
-            .collect()
-    };
+    // (The replayed class-body calls are computed above the includes.)
     let instance_form = extend_self_instance_defs(lc, app, &replayed);
     // A replayed `prepend` whose module's `self.prepended(base)` hook
     // reaches this class's methods is written after them, the way
@@ -8926,7 +9246,12 @@ fn emit_library_class_decl_inner(
     // The seeds written at their include (`carried_seed`) are not here,
     // nor an ordered body's state, written with its constants above.
     let own_inits: Vec<&Expr> =
-        lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).filter(|_| !ordered_state).collect();
+        lc.class_ivar_initializers
+            .iter()
+            .filter(|e| !carried_seed(e))
+            .filter(|_| !ordered_state)
+            .filter(|e| !extends_before.iter().any(|(_, x)| std::ptr::eq(*x, *e)))
+            .collect();
     let late_at = own_inits
         .iter()
         .position(|init| is_self_call(init) || calls_own_class_method(init, &own_class_methods))
@@ -9263,6 +9588,70 @@ fn late_includes<'a>(lc: &'a LibraryClass, app: &App, positioned: &[(usize, &Cla
         }
     }
     late
+}
+
+/// The replayed `extend M`s of the app's own modules that the source
+/// writes above an include of `lc`, each with that include (the first
+/// one below it in the same file), in source order.
+///
+/// The include bucket opens the emitted body and the replayed calls
+/// follow the methods, but a class body runs its mixins in the source's
+/// order, and an include's `included(base)` hook may call what the
+/// extend gave `base`: Core's Customer writes `extend
+/// SensitiveAttributeValidations` above `include
+/// CustomerPasswordProtection`, whose hook runs
+/// `base.validate_sensitive(...)`. Replayed after the methods, the
+/// extend came too late: "undefined method 'validate_sensitive' for
+/// class Customer". Written right before its include, it runs where the
+/// source has it relative to the includes. An extend only adds the
+/// module to the singleton's ancestors, so writing it above the methods
+/// and constants changes nothing else, except through the module's own
+/// `extended` hook, which may read them: an extend of a module with one
+/// stays with the replayed calls. Matched by the written name
+/// (`job_class_side::include_offsets`), as `late_includes` does.
+fn extends_before_includes<'a, 'e>(
+    lc: &'a LibraryClass,
+    app: &App,
+    replayed: &[&'e Expr],
+) -> Vec<(&'a ClassId, &'e Expr)> {
+    let mut by_file: BTreeMap<u32, Vec<(u32, &'a ClassId)>> = BTreeMap::new();
+    let mut out = Vec::new();
+    for call in replayed {
+        if call.span.is_synthetic() {
+            continue;
+        }
+        let Some(modules) = app_module_extend(lc, call, app) else { continue };
+        let hooked = modules.iter().any(|m| {
+            m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "extended")
+        });
+        if hooked {
+            continue;
+        }
+        let includes = by_file.entry(call.span.file.0).or_insert_with(|| {
+            let Some(source) = (call.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
+                return Vec::new();
+            };
+            let offsets = crate::lower::job_class_side::include_offsets(&source.text, lc.name.0.as_str());
+            let mut cursor = 0;
+            let mut placed = Vec::new();
+            for inc in &lc.includes {
+                let id = inc.0.as_str().trim_start_matches("::");
+                let found = offsets[cursor..]
+                    .iter()
+                    .position(|(written, _)| id == written || id.ends_with(&format!("::{written}")));
+                if let Some(k) = found {
+                    cursor += k + 1;
+                    placed.push((offsets[cursor - 1].1, inc));
+                }
+            }
+            placed
+        });
+        let next = includes.iter().filter(|(at, _)| *at > call.span.start).min_by_key(|(at, _)| *at);
+        if let Some((_, inc)) = next {
+            out.push((*inc, *call));
+        }
+    }
+    out
 }
 
 /// Where `include inc` must be written in `lc`'s body when the source's
@@ -11050,6 +11439,59 @@ fn concern_carrier_extends(includes: &[ClassId], app: &App) -> Vec<ClassId> {
     // Ruby runs a Concern's deferred includes before its own extend, and
     // `include A, B` includes B first; the last extend has precedence.
     out.reverse();
+    out
+}
+
+/// For a model, the app modules its Concerns' `ClassMethods` carriers
+/// include, per include of the model, in the order Ruby extends them.
+///
+/// ActiveSupport::Concern's `append_features` extends the includer with
+/// the carrier, which brings the carrier's own includes to the class
+/// side. A model takes the carrier's `def`s as class-side copies instead
+/// (`ingest::app::splice_concern_class_methods_into_includers`), which
+/// reach none of those: Core's ParamConditions::ClassMethods does
+/// `include ApiConditions`, and its includers (Order, Theme, ...) raised
+/// "There are no methods named (since_id_filter) found in ApiConditions"
+/// from `param_conditions :since_id_filter`, whose `respond_to?` found no
+/// ApiConditions method. So the model extends the carrier's included
+/// modules right after the include, where `append_features` extends the
+/// carrier. Not the carrier itself, which would put its methods below
+/// the copies, so a copy's `super` would run the carrier's own `def` of
+/// the same name; a copy's `super` reaches the included module, as the
+/// carrier's does in Ruby. A carrier the model extends already
+/// (`spliced_extends`) brings them itself. A module the carrier names
+/// that is not one of the app's is left out: the copies never had it
+/// either, and the tree may not define it.
+fn carrier_included_modules<'a>(
+    lc: &'a LibraryClass,
+    spliced_extends: &[&ClassId],
+    app: &App,
+) -> Vec<(&'a ClassId, Vec<ClassId>)> {
+    let mut extended: Vec<ClassId> = Vec::new();
+    let mut out = Vec::new();
+    for inc in &lc.includes {
+        let mut modules: Vec<ClassId> = Vec::new();
+        for carrier in concern_carrier_extends(std::slice::from_ref(inc), app) {
+            if spliced_extends.iter().any(|s| s.0.as_str().trim_start_matches("::") == carrier.0.as_str()) {
+                continue;
+            }
+            for carrier_lc in library_classes_named(carrier.0.as_str(), app).into_iter().filter(|c| c.is_module) {
+                for written in &carrier_lc.includes {
+                    let path: Vec<Symbol> =
+                        written.0.as_str().trim_start_matches("::").split("::").map(Symbol::from).collect();
+                    let Some(module) = resolve_app_module(carrier_lc, &path, app) else { continue };
+                    let id = ClassId(Symbol::from(module.name.0.as_str().trim_start_matches("::")));
+                    if !extended.contains(&id) {
+                        extended.push(id.clone());
+                        modules.push(id);
+                    }
+                }
+            }
+        }
+        if !modules.is_empty() {
+            out.push((inc, modules));
+        }
+    }
     out
 }
 
