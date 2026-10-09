@@ -832,6 +832,88 @@ pub(crate) fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>,
             block_param: None,
         });
     }
+    // ActiveModel's `validate!(context = nil)`: `valid?(context) ||
+    // raise_validation_error`, which raises `ValidationError.new(self)`
+    // (Core's PayPal RequestForInformation runs it in `initialize`). The
+    // context is passed exactly when this `valid?` takes one.
+    if !defines("validate!") {
+        let contexts = uses_validation_context(model);
+        let context = Symbol::from("context");
+        let valid = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("valid?"),
+                args: if contexts { vec![local_read(&context)] } else { Vec::new() },
+                block: None,
+                parenthesized: contexts,
+            },
+        );
+        let error = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Const { path: vec![Symbol::from("ActiveModel"), Symbol::from("ValidationError")] },
+                )),
+                method: Symbol::from("new"),
+                args: vec![Expr::new(span, ExprNode::SelfRef)],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        let raise = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("raise"),
+                args: vec![error],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        let body = Expr::new(
+            span,
+            ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, surface: Default::default(), left: valid, right: raise },
+        );
+        let mut params = Vec::new();
+        let mut signature = fn_sig(vec![], Ty::Bool);
+        if contexts {
+            params.push(crate::dialect::Param {
+                name: context.clone(),
+                default: Some(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
+                keyword: false,
+                rest: false,
+                forwarding: false,
+                from_keyword: false,
+                from_kwrest: false,
+            });
+            if let Ty::Fn { params, .. } = &mut signature {
+                params.push(crate::ty::Param {
+                    name: context,
+                    ty: Ty::Union { variants: vec![Ty::Sym, Ty::Nil] },
+                    kind: crate::ty::ParamKind::Optional,
+                });
+            }
+        }
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("validate!"),
+            receiver: MethodReceiver::Instance,
+            params,
+            body,
+            signature: Some(signature),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: true,
+            block_param: None,
+        });
+    }
     if uses_validation_context(model) && !defines("validation_context") {
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,

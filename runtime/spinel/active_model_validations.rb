@@ -958,8 +958,13 @@ module ActiveModel
 
     def initialize(model)
       @model = model
-      errors = @model.errors.full_messages.join(", ")
-      super(I18n.t(:"#{@model.class.i18n_scope}.errors.messages.model_invalid", errors: errors, default: :"errors.messages.model_invalid"))
+      # A lowered tableless model (its `validate!` synthesized, its
+      # include gone) holds its full messages in an Array and has no
+      # ActiveModel::Translation; its scope is ActiveModel's.
+      errors = @model.errors
+      errors = (errors.is_a?(Array) ? errors : errors.full_messages).join(", ")
+      scope = @model.class.respond_to?(:i18n_scope) ? @model.class.i18n_scope : :activemodel
+      super(I18n.t(:"#{scope}.errors.messages.model_invalid", errors: errors, default: :"errors.messages.model_invalid"))
     end
   end
 
