@@ -64,6 +64,10 @@ module ActiveSupport
     def inspect: () -> String
     def ==: (untyped other) -> bool
     def eql?: (untyped other) -> bool
+    def is_a?: (untyped klass) -> bool
+    def kind_of?: (untyped klass) -> bool
+    def instance_of?: (untyped klass) -> bool
+    def self.===: (untyped other) -> bool
     def hash: () -> Integer
     def <=>: (untyped other) -> Integer?
     def self.value_of: (untyped other) -> untyped

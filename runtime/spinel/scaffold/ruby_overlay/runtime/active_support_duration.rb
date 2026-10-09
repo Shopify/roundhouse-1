@@ -334,6 +334,30 @@ module ActiveSupport
       other.is_a?(Duration) && other.seconds.eql?(@seconds)
     end
 
+    # activesupport 8.2 duration.rb: a Duration is a Duration and also
+    # whatever its value is. `10.minutes.is_a?(Integer)` is true, so
+    # sorbet's `T.let(10.minutes, Integer)` accepts it. Core's
+    # ShopifyPayments::Capability declares `CACHE_TTL` that way.
+    # `kind_of?` is an alias, and `instance_of?` answers for Duration
+    # or for the value's own class.
+    def is_a?(klass)
+      Duration == klass || @seconds.is_a?(klass)
+    end
+    alias_method :kind_of?, :is_a?
+
+    def instance_of?(klass)
+      Duration == klass || @seconds.instance_of?(klass)
+    end
+
+    # Rails' `Duration.===` asks the operand's `is_a?`, rescuing
+    # NoMethodError for a BasicObject. `Integer === 10.minutes` stays
+    # false, because Module#=== does not call `is_a?`.
+    def self.===(other)
+      other.is_a?(Duration)
+    rescue ::NoMethodError
+      false
+    end
+
     def hash
       @seconds.hash
     end
