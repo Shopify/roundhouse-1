@@ -1772,6 +1772,7 @@ fn reference_columns(
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
+            generated_int4_compatible: None,
         },
     };
     key.nullable = opts.nullable.unwrap_or(true);
@@ -1785,6 +1786,7 @@ fn reference_columns(
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
+            generated_int4_compatible: None,
         });
     }
     Ok(out)

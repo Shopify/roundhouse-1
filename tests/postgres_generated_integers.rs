@@ -3,7 +3,7 @@
 //! The explicit PostgreSQL expression mode validates schema DDL only. These
 //! tests preserve the existing Portable application and SQLite boundaries.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::Symbol;
