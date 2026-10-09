@@ -165,7 +165,19 @@ fn every_test_class_of_an_authored_file_is_emitted_indexed_and_run() {
 fn a_test_class_ingest_cannot_reach_is_refused_by_name() {
     let src = "if ENV[\"X\"]\n  class GuardedTest < ActiveSupport::TestCase\n    test \"g\" do\n      assert true\n    end\n  end\nend\n";
     let err = roundhouse::ingest::ingest_test_files(src.as_bytes(), "guarded_test.rb").unwrap_err().to_string();
-    assert!(err.contains("test class `GuardedTest` (line 2) refused"), "{err}");
+    // The reason leads, the names and line follow in parentheses, so the
+    // survey buckets refusals by reason.
+    assert!(
+        err.contains(
+            "test class `GuardedTest` refused: it is declared inside a conditional, which is not modeled; \
+             its tests would not run (`GuardedTest`, line 2)"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        roundhouse::ingest::survey::bucket_message(&err[err.find("test class").unwrap()..]),
+        "test class refused: it is declared inside a conditional, which is not modeled; its tests would not run"
+    );
 
     let src = "class LoopTest < ActiveSupport::TestCase\n  %w[a b].each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";
     let err = roundhouse::ingest::ingest_test_files(src.as_bytes(), "loop_test.rb").unwrap_err().to_string();

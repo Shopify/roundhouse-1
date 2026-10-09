@@ -2592,6 +2592,14 @@ pub struct TestModule {
     /// to all of them, so a run of the file runs every class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    /// Each test method the class body defines as it loads, under that
+    /// name (before TestTags' persistent rename, which runs when
+    /// Minitest lists the methods), and whether ActiveSupport's `test`
+    /// declared it (else a `def test_…`). A subclass's `test` declaring
+    /// one of these names raises as it loads
+    /// (`ingest::test::refuse_inherited_test_redefinitions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defined_tests: Vec<(String, bool)>,
 }
 
 impl TestModule {
