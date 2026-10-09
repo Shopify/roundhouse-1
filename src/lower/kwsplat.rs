@@ -135,6 +135,11 @@ struct Signatures {
     /// Superclass links, so a call landing on an inherited `initialize`
     /// still resolves.
     parents: HashMap<ClassId, ClassId>,
+    /// Each instance method name in `methods`, with its owner when only
+    /// one app class defines it (`None` when several do), so
+    /// [`unique_instance_params`] is a lookup rather than a scan of
+    /// every method per send.
+    instance_owners: HashMap<Symbol, Option<ClassId>>,
 }
 
 pub fn apply_kwsplat_expansion(app: &mut App) -> Vec<Diagnostic> {
@@ -364,6 +369,12 @@ fn collect_signatures(app: &App) -> Signatures {
                 );
             }
         }
+    }
+    for (owner, name) in sigs.methods.keys() {
+        sigs.instance_owners
+            .entry(name.clone())
+            .and_modify(|unique| *unique = None)
+            .or_insert_with(|| Some(owner.clone()));
     }
     sigs
 }
@@ -663,9 +674,8 @@ fn is_literal(expr: &Expr) -> bool {
 /// The parameters of the only app class defining instance method
 /// `method`, or `None` when none or several do.
 fn unique_instance_params<'s>(method: &Symbol, sigs: &'s Signatures) -> Option<&'s Vec<Param>> {
-    let mut found = sigs.methods.iter().filter(|((_, name), _)| name == method);
-    let (_, params) = found.next()?;
-    found.next().is_none().then_some(params)
+    let owner = sigs.instance_owners.get(method)?.as_ref()?;
+    sigs.methods.get(&(owner.clone(), method.clone()))
 }
 
 /// The callee's parameter list, walking the inheritance chain the way
