@@ -993,6 +993,9 @@ class TestBase
   # invoke `super` — same Minitest before_setup → setup ordering.)
   def setup
     SchemaSetup.reset! if defined?(SchemaSetup)
+    # Each test's integration session starts on Rails' default origin;
+    # a test body's `_url` reads it (`RequestDispatch#sync_url_origin`).
+    ActionView::ViewHelpers.url_origin = "http://www.example.com" if defined?(ActionView::ViewHelpers)
     ActiveSupport.travel(0) if defined?(ActiveSupport)
     # AFTER the schema reset, which reloads fixtures — and our fixture
     # loader runs model callbacks, so a broadcasting `after_create_commit`
@@ -1700,6 +1703,7 @@ module RequestDispatch
   # test has ever seen.
   def host!(name)
     @__host = name
+    sync_url_origin
   end
 
   def host
@@ -1712,6 +1716,16 @@ module RequestDispatch
   # `https://` its absolute URLs carry).
   def https!(flag = true)
     @__https = flag
+    sync_url_origin
+  end
+
+  # The session's origin, where a test body's `_url` builds its URL
+  # (`ActionView::ViewHelpers.url_for_path`): Rails' integration
+  # session hands its `host` and `https?` to the url helpers.
+  def sync_url_origin
+    protocol = https? ? "https://" : "http://"
+    ActionView::ViewHelpers.url_origin =
+      ActionController.build_host_url(protocol, host, ActionController.url_port_of(host), "")
   end
 
   def https?
@@ -1719,6 +1733,7 @@ module RequestDispatch
   end
 
   def dispatch_request(method, path, params, headers = {}, as = nil)
+    path = integration_request_path(path)
     require_relative "../config/routes"
     # Controllers load on demand (the CRuby target's routes.rb no longer
     # eager-requires them; they're lazy-loaded at dispatch). The blog's
@@ -2060,9 +2075,54 @@ module RequestDispatch
   # Two-argument form retained for hand-written spinel-blog tests
   # (`assert_redirected_to "/articles/1", res`); single-argument form
   # used by emitted tests pulls from the dispatch-stashed response.
+  #
+  # Both sides are compared as ABSOLUTE urls, as Rails'
+  # `normalize_argument_to_redirection` compares them: a path is
+  # resolved against the request (`http://www.example.com` + path). A
+  # controller's `redirect_to articles_url` answers the absolute form
+  # and the scaffold's `redirect_to @article` the path, and a test may
+  # spell its expectation either way.
   def assert_redirected_to(expected_path, response = @__response)
     raise "expected a redirect, got status=#{response.status} location=#{response.location.inspect}" unless response.redirect?
-    raise "expected redirect to #{expected_path.inspect}, got #{response.location.inspect}" unless expected_path == response.location
+    expected = redirection_url_for_assertion(expected_path.to_s)
+    actual = redirection_url_for_assertion(response.location.to_s)
+    raise "expected redirect to #{expected_path.inspect}, got #{response.location.inspect}" unless expected == actual
+  end
+
+  # A path resolved against the request, through the same builder a
+  # controller's `_url` uses, so the scheme's standard port drops out
+  # on both sides (`Host: blog.test:80` names `http://blog.test/…`).
+  def redirection_url_for_assertion(location)
+    return location unless location.start_with?("/")
+    return location if location.start_with?("//")
+    req = @__request
+    protocol = req.nil? ? "http://" : req.protocol
+    hostport = req.nil? ? host : req.host
+    ActionController.build_host_url(protocol, hostport, ActionController.url_port_of(hostport), location)
+  end
+
+  # `get "http://blog.test/articles"` — Rails' integration session takes
+  # an absolute url as readily as a path, and `follow_redirect!` hands
+  # it one whenever the controller redirected to a `_url` helper. The
+  # scheme becomes the session's (Rails' `https!` from the url, so an
+  # `http://` url turns it back off), the authority its host (`host!`),
+  # and the router sees the path.
+  def integration_request_path(path)
+    return path unless path.start_with?("http://") || path.start_with?("https://")
+    https!(path.start_with?("https://"))
+    url_host = ActionController.location_host(path)
+    host!(url_host) unless url_host.empty?
+    # The authority ends at the first `/` or `?`; with no path the
+    # request is for the root, and keeps its query
+    # (`http://h?before=6` → `/?before=6`). A `#fragment` never reaches
+    # the server, so it drops before the router sees the path.
+    rest = path[ActionController.find_substr(path, "://") + 3, path.length].to_s
+    hash = ActionController.find_substr(rest, "#")
+    rest = rest[0, hash].to_s if hash >= 0
+    slash = ActionController.find_substr(rest, "/")
+    query = ActionController.find_substr(rest, "?")
+    return "/" + rest[query, rest.length].to_s if query >= 0 && (slash < 0 || query < slash)
+    slash < 0 ? "/" : rest[slash, rest.length].to_s
   end
 
   # `assert_select` over the Dom primitive surface (defined above). The

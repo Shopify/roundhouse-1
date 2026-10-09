@@ -438,10 +438,10 @@ fn rewrite(
                 ExprNode::Var { name, .. } => var_sets.get(name).cloned(),
                 _ => None,
             };
-            if let (Some(elems), ExprNode::Lambda { params, body, .. }) =
+            if let (Some(elems), ExprNode::Lambda { params, extra_params, signature: block_sig, body, .. }) =
                 (elems, &mut *block.node)
             {
-                if params.len() == 1 {
+                if params.len() == 1 && extra_params.is_empty() && block_sig.is_empty() {
                     let param = params[0].clone();
                     let mut inner: Vec<IterBinding<'_>> = Vec::new();
                     for b in bindings {
@@ -457,10 +457,10 @@ fn rewrite(
             }
         }
     }
-    if let ExprNode::Lambda { params, body, .. } = &mut *e.node {
+    if let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = &mut *e.node {
         let survivors: Vec<IterBinding<'_>> = bindings
             .iter()
-            .filter(|b| !params.contains(b.name))
+            .filter(|b| !params.contains(b.name) && !extra_params.iter().any(|p| &p.name == b.name) && !block_sig.names().any(|n| n == b.name))
             .map(|b| IterBinding { name: b.name, elems: b.elems })
             .collect();
         rewrite(body, var_sets, providers, origins, &survivors, registry, diags);

@@ -1178,7 +1178,12 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
                 continue;
             }
         } else if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
-            if block.is_some() {
+            // A block declaring `extra_params` is declined there, so it
+            // reports here like any unlowered DSL call; one with a
+            // `signature` is refused by name there.
+            if block.as_ref().is_some_and(|b| {
+                !matches!(&*b.node, ExprNode::Lambda { extra_params, .. } if !extra_params.is_empty())
+            }) {
                 continue;
             }
             // `after_initialize :set_defaults, if: :new_record?` —
@@ -1189,7 +1194,7 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
                 continue;
             }
             if let ExprNode::Send { args, .. } = &*expr.node {
-                if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lambda { params, .. }) if params.is_empty()) {
+                if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lambda { params, extra_params, .. }) if params.is_empty() && extra_params.is_empty()) {
                     continue;
                 }
             }

@@ -1487,7 +1487,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
             let signature = block_signature(l.parameters(), file)?;
             note_signature(&body, &signature);
-            ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature }
+            ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature, extra_params: Vec::new() }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -3298,7 +3298,7 @@ fn ingest_call_block(
                 );
                 return Ok(Some(Expr::new(
                     sym_span,
-                    ExprNode::Lambda { signature: Default::default(), rest_param: None,
+                    ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
                         params,
                         block_param: None,
                         body,
@@ -3381,7 +3381,7 @@ fn ingest_call_block(
                 note_signature(&body, &signature);
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
+                    ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature, extra_params: Vec::new() },
                 )));
             }
             // Any other proc-valued expression is evaluated once and passed as the block.
@@ -3458,7 +3458,7 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     note_signature(&body, &signature);
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
+        ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature, extra_params: Vec::new() },
     ))
 }
 
@@ -3628,7 +3628,7 @@ fn ingest_for(node: &ruby_prism::ForNode<'_>, span: Span, file: &str) -> IngestR
     }
     let block = Expr::new(
         at,
-        ExprNode::Lambda {
+        ExprNode::Lambda { extra_params: Vec::new(),
             params,
             rest_param: None,
             block_param: None,
@@ -3771,7 +3771,7 @@ fn refused_block_signature(
     });
     Some(Expr::new(
         span,
-        ExprNode::Lambda { signature: Default::default(),
+        ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(),
             rest_param: Some(Symbol::from("__refused_args")),
             params: vec![],
             block_param: None,
@@ -3786,22 +3786,32 @@ fn refused_block_signature(
 /// (`|a, b = 1, *r, c|`). Posts are bound by popping the rest after the
 /// optionals bind, where Ruby binds the posts first, so `(1, 2)` would
 /// give `b` 2 and `c` nil instead of `b` 1 and `c` 2.
+///
+/// `**nil` (no keywords accepted) has no representation either: dropped,
+/// the emitted block would accept the keywords the source rejects.
 fn unrepresented_block_params(pn: &ruby_prism::ParametersNode<'_>) -> Vec<String> {
-    if pn.posts().iter().next().is_none() {
-        return Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    if pn.posts().iter().next().is_some() {
+        out.extend(
+            pn.optionals()
+                .iter()
+                .filter_map(|opt| opt.as_optional_parameter_node())
+                .map(|op| format!("`{} = …` (an optional parameter ahead of post parameters)", constant_id_str(&op.name()))),
+        );
     }
-    pn.optionals()
-        .iter()
-        .filter_map(|opt| opt.as_optional_parameter_node())
-        .map(|op| format!("`{} = …` (an optional parameter ahead of post parameters)", constant_id_str(&op.name())))
-        .collect()
+    if pn.keyword_rest().is_some_and(|node| node.as_no_keywords_parameter_node().is_some()) {
+        out.push("`**nil` (no keywords accepted)".to_string());
+    }
+    out
 }
 
 /// A block's or lambda's optional, keyword and named keyword-rest
 /// parameters (`|a, b = 1, item:, context: 1, **opts|`). Ingest used to
 /// drop them, so the emitted `lambda do |item:, context: 1|` was
 /// `lambda do` with a body reading names nothing bound. A nameless `**`
-/// binds nothing the body can read and stays absent, as does `**nil`.
+/// is an empty `kwrest`: it binds nothing the body can read, but dropped,
+/// the block would reject the keywords the source accepts. `**nil` is
+/// refused (`unrepresented_block_params`).
 fn block_signature(params_node: Option<Node<'_>>, file: &str) -> IngestResult<crate::expr::BlockSignature> {
     let mut signature = crate::expr::BlockSignature::default();
     let Some(pn) = params_node
@@ -3830,8 +3840,7 @@ fn block_signature(params_node: Option<Node<'_>>, file: &str) -> IngestResult<cr
     signature.kwrest = pn
         .keyword_rest()
         .and_then(|k| k.as_keyword_rest_parameter_node())
-        .and_then(|k| k.name())
-        .map(|name| Symbol::from(constant_id_str(&name)));
+        .map(|k| k.name().map(|name| Symbol::from(constant_id_str(&name))).unwrap_or_else(|| Symbol::from("")));
     Ok(signature)
 }
 

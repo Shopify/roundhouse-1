@@ -610,7 +610,8 @@ pub struct BlockSignature {
     /// `|item:, context: 1|`: keywords, required when there is no default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<(Symbol, Option<Expr>)>,
-    /// `|**opts|`: the named keyword rest, without its sigil.
+    /// `|**opts|`: the keyword rest, without its sigil; empty for a
+    /// nameless `**`, which binds no name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kwrest: Option<Symbol>,
 }
@@ -626,7 +627,7 @@ impl BlockSignature {
             .iter()
             .map(|(n, _)| n)
             .chain(self.keywords.iter().map(|(n, _)| n))
-            .chain(self.kwrest.iter())
+            .chain(self.kwrest.iter().filter(|n| !n.as_str().is_empty()))
     }
 
     /// The default expressions, in order.
@@ -738,6 +739,16 @@ pub enum ExprNode {
         /// local variable or method 'args'`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_param: Option<Symbol>,
+        /// The parameters `params` and `rest_param` do not hold, in
+        /// source order: optional positionals (`size = 18`, with
+        /// `default`), keywords (`key:` / `limit: 10`, `keyword`) and a
+        /// keyword rest (`**opts`, `keyword` and `rest`; empty name for
+        /// an anonymous `**`). Kept for the same reason as `rest_param`:
+        /// the body reads these names, and a signature without them
+        /// raises `NameError`. Optionals come after `params` and before
+        /// `rest_param`; keywords after it, as Ruby orders them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_params: Vec<crate::dialect::Param>,
         block_param: Option<Symbol>,
         body: Expr,
         /// Surface form when this Lambda represents a block attached to
@@ -1101,9 +1112,16 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, signature, .. } => {
+            ExprNode::Lambda { body, signature, extra_params, .. } => {
+                // Defaults are evaluated where the lambda is called, before
+                // the body runs; walk them first.
                 for d in signature.defaults_mut() {
                     f(d);
+                }
+                for p in extra_params.iter_mut() {
+                    if let Some(d) = &mut p.default {
+                        f(d);
+                    }
                 }
                 f(body);
             }
@@ -1329,9 +1347,16 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, signature, .. } => {
+            ExprNode::Lambda { body, signature, extra_params, .. } => {
+                // Defaults are evaluated where the lambda is called, before
+                // the body runs; walk them first.
                 for d in signature.defaults() {
                     f(d);
+                }
+                for p in extra_params.iter() {
+                    if let Some(d) = &p.default {
+                        f(d);
+                    }
                 }
                 f(body);
             }

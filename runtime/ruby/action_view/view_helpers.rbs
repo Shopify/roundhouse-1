@@ -51,6 +51,7 @@ module ActionView
     def self.to_query: (Hash[Symbol, untyped] params) -> String
     def self.to_query_pairs: (Hash[Symbol, untyped] params, String namespace) -> String
     def self.to_query_value: (String name, untyped value) -> String
+    def self.url_for_path: (String path) -> String
     def self.url_encode_component: (String s) -> String
     def self.url_encode_mailto_address: (String s) -> String
     def self.needs_url_escape?: (String s) -> bool
@@ -178,6 +179,7 @@ module ActionView
     # Crystal's already-Symbol-keyed callers finally match the param.
     def self.render_attrs: (Hash[Symbol, untyped] attrs) -> String
     def self.attr_value_text: (String name, untyped v) -> String
+    def self.haml_class: (String static_classes, untyped value) -> String
 
     # Rails' BOOLEAN_ATTRIBUTES membership — presence-is-the-value
     # attributes render `name="name"` when truthy and vanish when

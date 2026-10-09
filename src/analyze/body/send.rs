@@ -490,6 +490,21 @@ impl<'a> BodyTyper<'a> {
             }
             return Some(vec![recv_ty.clone()]);
         }
+        if method.as_str() == "in_batches" {
+            let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some());
+            let of = match recv_ty {
+                Ty::Relation { of } => Some(of.clone()),
+                Ty::Array { elem } => match &**elem {
+                    Ty::Class { id, .. } if is_model(id) => Some(id.clone()),
+                    _ => None,
+                },
+                Ty::Class { id, .. } if class_object_receiver && is_model(id) => Some(id.clone()),
+                _ => None,
+            };
+            if let Some(of) = of {
+                return Some(vec![Ty::Relation { of }]);
+            }
+        }
         if let Ty::Tuple { elems } = recv_ty {
             let as_array = Ty::Array {
                 elem: Box::new(elems.iter().cloned().reduce(union_of).unwrap_or(Ty::Untyped)),
@@ -2540,6 +2555,8 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     };
     let accepts = |actual: Option<&Ty>, expected: &Ty| match actual {
         None | Some(Ty::Var { .. } | Ty::Untyped) => true,
+        // Not only an exact String: a request parameter's other arms (nil, an Array, nested params) raise in Rails too, as `Time.parse` accepts.
+        Some(Ty::Union { variants }) if *expected == Ty::Str => variants.contains(&Ty::Str),
         Some(actual) => actual == expected || matches!(expected, Ty::Union { variants } if variants.contains(actual)),
     };
     Some(if args.len() <= expected.len()
@@ -2561,11 +2578,11 @@ fn date_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     // `ActiveSupport.in_time_zone` takes a String?/Symbol zone (runtime
     // `to_s`); reject known non-zone types such as `TimeZoneData`.
     let zone_arg = |a: Option<&crate::expr::Expr>| {
-        a.is_none_or(|e| {
-            matches!(
-                e.ty.as_ref(),
-                None | Some(Ty::Str | Ty::Sym | Ty::Nil | Ty::Var { .. } | Ty::Untyped)
-            )
+        a.is_none_or(|e| match e.ty.as_ref() {
+            None | Some(Ty::Str | Ty::Sym | Ty::Nil | Ty::Var { .. } | Ty::Untyped) => true,
+            // Not only a bare name: a nullable zone column reads `String?`, which the runtime's `to_s` takes too.
+            Some(Ty::Union { variants }) => variants.iter().all(|t| matches!(t, Ty::Str | Ty::Sym | Ty::Nil)),
+            _ => false,
         })
     };
     // Arity must match `lower::time_calendar::rewrite_date_value` — typing
@@ -2599,9 +2616,13 @@ fn date_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
         },
         "to_date" if zero => date(),
         // ActiveSupport calendar that preserves a date-only value.
+        "beginning_of_week" | "end_of_week" | "at_beginning_of_week" | "at_end_of_week"
+            if zero || matches!(args, [day] if crate::lower::time_calendar::week_start_wday(day).is_some()) =>
+        {
+            date()
+        }
         "yesterday" | "tomorrow" | "next_week" | "prev_week" | "last_week"
         | "last_month" | "last_year"
-        | "beginning_of_week" | "end_of_week" | "at_beginning_of_week" | "at_end_of_week"
         | "beginning_of_month" | "end_of_month" | "at_beginning_of_month" | "at_end_of_month"
         | "beginning_of_year" | "end_of_year" | "at_beginning_of_year" | "at_end_of_year"
             if zero =>

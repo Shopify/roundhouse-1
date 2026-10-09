@@ -168,6 +168,7 @@ fn join_owner_target(orig: &Expr, ctor: Expr) -> Result<Expr, Expr> {
         span,
         ExprNode::Lambda {
             signature: Default::default(),
+            extra_params: Vec::new(),
             rest_param: None,
             params: vec![param],
             block_param: None,

@@ -1362,7 +1362,7 @@ fn send_to(recv: Expr, method: &str, args: Vec<Expr>, parenthesized: bool) -> Ex
 fn block1(param: &str, body: Expr) -> Expr {
     Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { signature: Default::default(), rest_param: None,
+        ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
             params: vec![Symbol::from(param)],
             block_param: None,
             body,

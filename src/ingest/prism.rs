@@ -154,7 +154,10 @@ mod tests {
         });
         assert!(diags.is_empty());
         let ExprNode::Send { block: Some(block), .. } = &*expr.node else { panic!("missing map block") };
-        let ExprNode::Lambda { params, body, .. } = &*block.node else { panic!("missing lambda") };
+        let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = &*block.node else { panic!("missing lambda") };
+        if !(extra_params.is_empty() && block_sig.is_empty()) {
+            panic!("missing lambda")
+        }
         assert_eq!(params[0].as_str(), "__mw_24");
         // The multi-write's assignments are spliced into the block body.
         let ExprNode::Seq { exprs } = &*body.node else { panic!("missing block body") };

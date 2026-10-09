@@ -87,7 +87,7 @@ fn map_to_each(value: &Expr) -> Option<Expr> {
     if method.as_str() != "map" || !args.is_empty() {
         return None;
     }
-    let ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } = &*block.node
+    let ExprNode::Lambda { signature, extra_params, rest_param, params, block_param, body, block_style } = &*block.node
     else {
         return None;
     };
@@ -116,7 +116,7 @@ fn map_to_each(value: &Expr) -> Option<Expr> {
     let enqueue = send(target, "perform_later", job_args.clone(), span);
     let lambda = Expr::new(
         block.span,
-        ExprNode::Lambda { signature: signature.clone(),
+        ExprNode::Lambda { signature: signature.clone(), extra_params: extra_params.clone(),
             rest_param: rest_param.clone(),
             params: params.clone(),
             block_param: block_param.clone(),

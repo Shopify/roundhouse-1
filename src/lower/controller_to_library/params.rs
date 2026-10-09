@@ -707,11 +707,11 @@ fn rewrite_tail(e: &Expr, spec: &ParamsSpec) -> Expr {
         // `reading(request.body) { |body| … }` — the helper's value is
         // the BLOCK's, so the rewrite belongs inside it.
         ExprNode::Send { recv, method, args, block: Some(b), parenthesized } => {
-            let ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } = &*b.node else {
+            let ExprNode::Lambda { signature, extra_params, rest_param, params, block_param, body, block_style } = &*b.node else {
                 return e.clone();
             };
             let new_block = Expr {
-                node: Box::new(ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
+                node: Box::new(ExprNode::Lambda { signature: signature.clone(), extra_params: extra_params.clone(), rest_param: rest_param.clone(),
                     params: params.clone(),
                     block_param: block_param.clone(),
                     body: rewrite_tail(body, spec),

@@ -73,8 +73,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
                 params,
                 rest_param: None,
                 signature,
+                extra_params,
                 ..
-            } if params.len() >= 2 && signature.is_empty() => true,
+            } if params.len() >= 2 && signature.is_empty() && extra_params.is_empty() => true,
             _ => false,
         };
 
@@ -125,9 +126,12 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
 /// `index = __with_index_i + offset` so the block body keeps reading
 /// the caller's name at the offset-adjusted value.
 fn inject_offset_binding(block: &mut Expr, offset: Expr, span: crate::span::Span) {
-    let ExprNode::Lambda { params, body, .. } = &mut *block.node else {
+    let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = &mut *block.node else {
         return;
     };
+    if !(extra_params.is_empty() && block_sig.is_empty()) {
+        return;
+    }
     if params.len() < 2 {
         return;
     }
@@ -270,7 +274,7 @@ mod tests {
     fn lambda(params: &[&str], body: Expr) -> Expr {
         Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda { signature: Default::default(),
+            ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(),
                 params: params.iter().map(|p| Symbol::from(*p)).collect(),
                 rest_param: None,
                 block_param: None,
@@ -316,9 +320,12 @@ mod tests {
         assert_eq!(method.as_str(), "each_with_index");
         assert!(args.is_empty());
         assert!(recv.is_some());
-        let ExprNode::Lambda { params, .. } = &*block.as_ref().unwrap().node else {
+        let ExprNode::Lambda { extra_params, signature: block_sig, params, .. } = &*block.as_ref().unwrap().node else {
             panic!("expected Lambda");
         };
+        if !(extra_params.is_empty() && block_sig.is_empty()) {
+            panic!("expected Lambda")
+        }
         assert_eq!(params[1].as_str(), "index");
     }
 
@@ -336,9 +343,12 @@ mod tests {
             panic!("expected Send");
         };
         assert_eq!(method.as_str(), "each_with_index");
-        let ExprNode::Lambda { params, body, .. } = &*block.as_ref().unwrap().node else {
+        let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = &*block.as_ref().unwrap().node else {
             panic!("expected Lambda");
         };
+        if !(extra_params.is_empty() && block_sig.is_empty()) {
+            panic!("expected Lambda")
+        }
         assert_eq!(params[1].as_str(), "__with_index_i");
         let ExprNode::Seq { exprs } = &*body.node else {
             panic!("expected Seq, got {}", body.node.kind_str());
@@ -385,7 +395,7 @@ mod tests {
         let each = send(Some(var("items")), "each", vec![], None);
         let block = Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda { signature: Default::default(),
+            ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(),
                 params: vec![Symbol::from("item")],
                 rest_param: Some(Symbol::from("rest")),
                 block_param: None,
@@ -415,9 +425,12 @@ mod tests {
             panic!("expected Send");
         };
         assert_eq!(method.as_str(), "each_with_index");
-        let ExprNode::Lambda { params, .. } = &*block.as_ref().unwrap().node else {
+        let ExprNode::Lambda { extra_params, signature: block_sig, params, .. } = &*block.as_ref().unwrap().node else {
             panic!("expected Lambda");
         };
+        if !(extra_params.is_empty() && block_sig.is_empty()) {
+            panic!("expected Lambda")
+        }
         assert_eq!(params[1].as_str(), "__with_index_i1");
     }
 }

@@ -55,7 +55,7 @@ use self::rewrites::{
     rewrite_assoc_through_parent_typed, rewrite_destroy_bang,
     rewrite_model_new_to_from_params, rewrite_update_to_typed_variant, rewrite_params,
     rewrite_redirect_to, rewrite_render_location_kwarg, rewrite_render_to_views,
-    rewrite_route_helpers,
+    rewrite_controller_route_helpers,
 };
 use self::util::{ivars_in_scope, method_name_for_action, views_module_name};
 
@@ -2575,7 +2575,7 @@ fn collect_rescue_handlers(
                     )
                 }
                 (None, Some(b)) => match &*b.node {
-                    ExprNode::Lambda { params, body, .. } => {
+                    ExprNode::Lambda { params, extra_params, signature: block_sig, body, .. } if extra_params.is_empty() && block_sig.is_empty() => {
                         // A block parameter names the exception; rewrite
                         // the reads to the rescue binding rather than
                         // renaming the binding, which would collide with
@@ -2675,37 +2675,18 @@ fn action_to_method(
     deferred_out: &mut crate::det::HashMap<Symbol, Expr>,
 ) -> MethodDef {
     let method_name = method_name_for_action(a.name.as_str());
-    // Required positionals first, then optional positionals with their
-    // defaults — so `def get_from_cache(opts = {})` round-trips instead of
-    // emitting `def get_from_cache` and crashing the body that reads `opts`.
-    let mut params: Vec<Param> = a
-        .params
-        .fields
-        .iter()
-        .map(|(n, _)| Param::positional(n.clone()))
-        .collect();
-    for (n, default) in &a.opt_params {
-        params.push(Param::with_default(n.clone(), default.clone()));
-    }
-    // Then the keyword params. The call sites in this very controller
-    // pass them by name, so emitting the `def` without them left every
-    // such helper raising `ArgumentError` the first time its action
-    // ran — the same failure the optional positionals above were added
-    // for, one parameter kind over.
+    // Required positionals, optionals (so `def get_from_cache(opts = {})`
+    // round-trips instead of emitting `def get_from_cache` and crashing
+    // the body that reads `opts`), `*rest`, the keywords, `**rest`, and
+    // the anonymous `**` / `...` — `Action::formal_params`. The call sites
+    // in this very controller pass all of them, so a `def` without one
+    // raises `ArgumentError` the first time its action runs.
     //
-    // Carried, not converted: ruby has keyword arguments, and turning
-    // them into positionals would lose the two things that make them
-    // keywords — any order, and skipping an optional one. A target
-    // that cannot express them says so instead (see the emit).
-    for (n, default) in &a.kw_params {
-        params.push(Param::keyword(n.clone(), default.clone()));
-    }
-    // `**rest` last, the only position Ruby accepts it in.
-    if let Some(n) = &a.kwrest_param {
-        let mut p = Param::keyword(n.clone(), None);
-        p.rest = true;
-        params.push(p);
-    }
+    // Keywords are carried, not converted: ruby has keyword arguments,
+    // and turning them into positionals would lose the two things that
+    // make them keywords — any order, and skipping an optional one. A
+    // target that cannot express a kind says so instead (see the emit).
+    let params: Vec<Param> = a.formal_params();
     // Order matters: turbo_stream is tested before json, so an action
     // with both templates picks the one the request actually asked for.
     let mut variants: Vec<&str> = Vec::new();
@@ -2955,9 +2936,10 @@ fn mark_param_kinds(sig: Ty, params: &[Param]) -> Ty {
 ///    object; model constructors expect a plain Hash.
 /// 10. `rewrite_destroy_bang` — `<recv>.destroy!` → `<recv>.destroy`.
 ///    Spinel's runtime model has only one destroy variant.
-/// 11. `rewrite_route_helpers` — bare `<x>_path` → `RouteHelpers.<x>_path`
-///    (covers `articles_path` and the like that appear outside
-///    redirect_to's first arg).
+/// 11. `rewrite_controller_route_helpers` — bare `<x>_path` →
+///    `RouteHelpers.<x>_path` (covers `articles_path` and the like that
+///    appear outside redirect_to's first arg), and `<x>_url` →
+///    `url_from_path(RouteHelpers.<x>_path)`, the absolute URL.
 ///
 /// Run in this order because each pass leaves the IR in a shape the
 /// next pass expects: render-views needs the synthesized symbol-form
@@ -3120,7 +3102,8 @@ fn lower_action_body(
     // project_arel_compile_time_first.md.
     let with_destroy = rewrite_destroy_bang(&with_assoc);
     let with_destroy = rewrites::rewrite_request_format(&with_destroy);
-    let with_routes = rewrite_route_helpers(&with_destroy, shadows, route_id_segments);
+    let with_routes =
+        rewrite_controller_route_helpers(&with_destroy, shadows, route_id_segments);
     // Some rewrites (rewrite_assoc_through_parent in particular)
     // produce nested Seqs — `Seq { ..., Seq { stmts }, ... }`. The
     // body-typer's Seq walker only propagates ivar bindings from
@@ -3193,7 +3176,7 @@ fn flatten_seqs(expr: &Expr) -> Expr {
                 args: args.iter().map(flatten).collect(),
                 block: block.as_ref().map(flatten),
             },
-            ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
+            ExprNode::Lambda { signature, extra_params, rest_param, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), extra_params: extra_params.clone(), rest_param: rest_param.clone(),
                 params: params.clone(),
                 block_param: block_param.clone(),
                 body: flatten(body),

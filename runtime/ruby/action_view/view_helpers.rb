@@ -288,6 +288,20 @@ module ActionView
     # `"+".Replace(x, …)`, which compiles nowhere).
     MAILTO_ESCAPE_PATTERN = /[ !"\#$%&'()*+,\/:;<=>?\[\\\]^`{|}]/.freeze
 
+    # The URL a view's `<x>_url` route helper answers, given its path.
+    # Rails answers it absolute, on the request's scheme and host
+    # (`http://www.example.com/articles/1.json`). This universal body
+    # answers the PATH: a strict target's view has no request in scope
+    # (neither `ActionController::Current` nor `Rails.application`
+    # reaches those runtimes), and a path is what a client resolves
+    # against the page it came from. The ruby family reopens it in
+    # `view_helpers_ext.rb` over the request, so the lanes that know the
+    # host render what Rails renders. jbuilder's `json.url
+    # article_url(…)` is the caller (`jbuilder_to_library`).
+    def self.url_for_path(path)
+      path
+    end
+
     # Monomorphic, like `url_encode`.
     def self.url_encode_component(s)
       return s unless needs_url_escape?(s)
@@ -1096,6 +1110,34 @@ module ActionView
     # same split `to_query_value` makes for `Hash#to_query`.
     def self.attr_value_text(name, v)
       v.to_s
+    end
+
+    # The HAML compiler's shortcut-class merge (`src/haml.rs`'s
+    # `element`): `.g{ class: k }` folds the `.g` shortcut and the hash
+    # `class:` value together, matching Haml 7.5.1's own runtime
+    # semantics rather than dropping one side. `static_classes` is the
+    # folded `.class` shortcuts, already space-joined, in source order;
+    # `value` is the hash `class:`'s own (scalar) value — an Array
+    # LITERAL `class:` value is chained one element at a time by the
+    # compiler instead (each element is its own `haml_class` call), so
+    # this method only ever sees a scalar.
+    #
+    # Semantics (MEASURED against Haml 7.5.1): nil, false and ""
+    # leave `static_classes` alone — Haml never renders a bare
+    # `class=""` when a shortcut class is present. Otherwise the value
+    # is stringified and split on whitespace, and each token is
+    # appended unless already present (first occurrence wins — a
+    # shortcut class a dynamic value repeats does not duplicate).
+    # Escaping stays in `render_attrs`/`attr_value_text`, which already
+    # escapes the merged String exactly once.
+    def self.haml_class(static_classes, value)
+      text = value.to_s
+      return static_classes if value.nil? || text == "false" || text == ""
+      tokens = static_classes.split(" ")
+      text.split(" ").each do |tok|
+        tokens << tok unless tokens.include?(tok)
+      end
+      tokens.join(" ")
     end
 
     # Rails ActionView's `BOOLEAN_ATTRIBUTES`, verbatim — the attributes

@@ -252,8 +252,11 @@ module ActionDispatch
     # an https page, and the browser blocked the fetch.
     def ssl?
       return true if @env.fetch("HTTPS", "").to_s == "on"
-      forwarded = @env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s
-      forwarded.split(",").first.to_s.strip.downcase == "https"
+      forwarded = @env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s.split(",").first.to_s.strip.downcase
+      return forwarded == "https" unless forwarded.empty?
+      # No proxy header: the scheme Rack itself reports, the one key the
+      # Rack spec requires (`Rack::Request#scheme`'s last resort).
+      @env.fetch("rack.url_scheme", "").to_s.downcase == "https"
     end
 
     # Rails' `request.optional_port`: the port, unless it is the
@@ -276,8 +279,13 @@ module ActionDispatch
     end
 
     # Scheme + host, no path — what Rails builds absolute URLs from.
+    # The scheme's standard port is dropped (`host_with_port` writes no
+    # `:443` over TLS or `:80` without it), so the CSRF check compares
+    # it with an Origin the way a browser serializes one.
     def base_url
-      protocol + @host
+      default = ssl? ? ":443" : ":80"
+      host = @host.end_with?(default) ? @host[0, @host.length - default.length].to_s : @host
+      protocol + host
     end
 
     # Absolute URL of this request. Feed templates interpolate it as

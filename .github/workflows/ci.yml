@@ -1045,7 +1045,15 @@ jobs:
           test -n "$TESTS"
           status=0
           for suite in $TESTS; do
-            cargo test --test "$suite" -- --ignored --nocapture || status=1
+            case "$suite" in
+              param_binds|param_binds_values|param_binds_cleanup)
+                # These suites also contain JRuby tests, run in compare-jruby.
+                cargo test --test "$suite" -- --ignored --nocapture _spinel || status=1
+                ;;
+              *)
+                cargo test --test "$suite" -- --ignored --nocapture || status=1
+                ;;
+            esac
           done
           exit "$status"
       - *advisory-result
@@ -1933,6 +1941,10 @@ jobs:
       # (`presentation-preload-introspection` in suite-causes.json), and
       # they turn `message_test` red.
       #
+      # 412/69 -> 417/69, on the notice `3ab64d40`'s run emitted (the
+      # 32b4144 pin's own tests, plus `RichText#embeds`: the last
+      # `MessageTest` case left fails only on `deferred-preload-timing`).
+      #
       # 392/66 -> 412/69, on the notice this bump's own run emitted
       # (`61503a01`: 412 of 414, 69 of 70, 2 skipped). The runner now
       # agrees with the laptop on files green: the vips loader-policy
@@ -1945,7 +1957,7 @@ jobs:
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
         env:
-          FLOOR_TESTS: 412
+          FLOOR_TESTS: 417
           FLOOR_FILES: 69
         run: |
           set -euo pipefail
@@ -2579,6 +2591,12 @@ jobs:
             Db.close
           end
           RUBY
+      - name: JRuby parameter bind contract
+        run: |
+          jruby -S gem install jdbc-sqlite3 --no-document
+          jruby tests/param_binds_jruby.rb
+          jruby tests/support/jdbc_value_semantics.rb
+          cargo test --locked --test param_binds_values --test param_binds_cleanup jruby -- --ignored --nocapture
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.MRI_RUBY }}

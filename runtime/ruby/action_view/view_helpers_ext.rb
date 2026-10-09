@@ -18,6 +18,36 @@ module ActionView
       "roundhouse-nonce"
     end
 
+    # The ruby family's `url_for_path` (see the universal body in
+    # view_helpers.rb): absolute, on the request's scheme and host —
+    # `Rails.application.protocol` / `.domain`, the grounding an ERB
+    # view's `_url` gets — as Rails' view `url_for` answers it.
+    #
+    # Under the test harness the origin is the integration session's
+    # instead (`url_origin`, set from `host!` / `https!`): a test body's
+    # `_url` runs between requests, where Rails answers
+    # `http://www.example.com/…` and the last request is no guide. Every
+    # request the harness dispatches carries that same origin, so a view
+    # rendered inside one answers the same either way. Empty outside
+    # tests.
+    @url_origin = ""
+
+    def self.url_origin=(origin)
+      @url_origin = origin
+    end
+
+    def self.url_for_path(path)
+      origin = @url_origin
+      return origin + path unless origin.empty?
+      # Through the controller's `_url` builder, so the scheme's
+      # standard port drops out (`Host: blog.test:80` names
+      # `http://blog.test/…`, as Rails and `url_from_path` do).
+      hostport = Rails.application.domain
+      ActionController.build_host_url(
+        Rails.application.protocol, hostport, ActionController.url_port_of(hostport), path
+      )
+    end
+
     # Rails `class_names` (alias of `token_list`): strings/arrays add
     # their tokens, hash entries contribute their key when the value is
     # truthy (`class_names("nav", current_page: cur == path)`), nil and

@@ -51,7 +51,10 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         match arm.pattern {
             Pattern::Wildcard => tail = arm.body,
             Pattern::Expr { expr: pat } => {
-                let ExprNode::Lambda { params, body, .. } = *pat.node else { unreachable!() };
+                let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = *pat.node else { unreachable!() };
+                if !(extra_params.is_empty() && block_sig.is_empty()) {
+                    unreachable!()
+                }
                 let mut cond = body;
                 subst(&mut cond, &params[0], &scrutinee);
                 tail = Expr::new(
@@ -79,7 +82,7 @@ fn claims(expr: &Expr) -> bool {
             Pattern::Wildcard => i == arms.len() - 1,
             Pattern::Expr { expr } => matches!(
                 &*expr.node,
-                ExprNode::Lambda { params, block_param: None, signature, .. } if params.len() == 1 && signature.is_empty()
+                ExprNode::Lambda { params, block_param: None, signature, extra_params, .. } if params.len() == 1 && signature.is_empty() && extra_params.is_empty()
             ),
             _ => false,
         }
@@ -113,8 +116,11 @@ pub(crate) fn subst(e: &mut Expr, param: &Symbol, scrutinee: &Expr) {
     // A nested lambda that rebinds the name shadows it.
     if matches!(
         &*e.node,
-        ExprNode::Lambda { params, block_param, .. }
-            if params.contains(param) || block_param.as_ref() == Some(param)
+        ExprNode::Lambda { params, extra_params, signature: block_sig, block_param, .. }
+            if params.contains(param)
+                || extra_params.iter().any(|p| &p.name == param)
+                || block_sig.names().any(|n| n == param)
+                || block_param.as_ref() == Some(param)
     ) {
         return;
     }

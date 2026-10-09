@@ -415,6 +415,8 @@ fn controller_new_action_is_reserved_word_escaped() {
                 opt_params: vec![],
                 kw_params: vec![],
                 kwrest_param: None,
+                rest_param: None,
+                anonymous_formal: None,
                 block_param: None,
                 body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 renders: RenderTarget::Inferred,

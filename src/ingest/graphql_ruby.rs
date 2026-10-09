@@ -836,9 +836,12 @@ fn scope_block(class: &LibraryClass) -> Option<String> {
         if method.as_str() != "scope" || !args.is_empty() {
             return None;
         }
-        let ExprNode::Lambda { params, body, .. } = &*block.node else {
+        let ExprNode::Lambda { extra_params, signature: block_sig, params, body, .. } = &*block.node else {
             return None;
         };
+        if !(extra_params.is_empty() && block_sig.is_empty()) {
+            return None;
+        }
         params
             .is_empty()
             .then(|| crate::emit::ruby::emit_expr(body))
@@ -1055,7 +1058,7 @@ fn field_declaration(call: &Expr) -> Option<FieldDecl> {
     // (an extension, a `|field|` form) is not read.
     if let Some(block) = block {
         match &*block.node {
-            ExprNode::Lambda { params, body, signature, .. } if params.is_empty() && signature.is_empty() => {
+            ExprNode::Lambda { params, body, signature, extra_params, .. } if params.is_empty() && signature.is_empty() && extra_params.is_empty() => {
                 for stmt in statements(body) {
                     match &*stmt.node {
                         ExprNode::Send {

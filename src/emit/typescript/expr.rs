@@ -3620,7 +3620,7 @@ mod async_hof_tests {
     fn synth_lambda(params: Vec<&str>, body: Expr) -> Expr {
         Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda { signature: Default::default(), rest_param: None,
+            ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
                 params: params.into_iter().map(Symbol::from).collect(),
                 block_param: None,
                 body,

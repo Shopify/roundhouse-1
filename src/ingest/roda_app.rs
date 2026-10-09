@@ -1020,6 +1020,8 @@ fn action_item(name: Symbol, body: Expr) -> ControllerBodyItem {
             kw_params: Vec::new(),
             kwrest_param: None,
             block_param: None,
+            rest_param: None,
+            anonymous_formal: None,
             body,
             renders,
             effects: EffectSet::pure(),

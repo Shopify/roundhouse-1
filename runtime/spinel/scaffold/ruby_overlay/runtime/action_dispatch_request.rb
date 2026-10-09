@@ -112,7 +112,9 @@ module ActionDispatch
     # X-Forwarded-Proto, which Rack honors unconfigured.
     def ssl?
       return true if @env["HTTPS"] == "on"
-      @env["HTTP_X_FORWARDED_PROTO"].to_s.split(",").first.to_s.strip.downcase == "https"
+      forwarded = @env["HTTP_X_FORWARDED_PROTO"].to_s.split(",").first.to_s.strip.downcase
+      return forwarded == "https" unless forwarded.empty?
+      @env["rack.url_scheme"].to_s.downcase == "https"
     end
 
     def protocol
@@ -130,8 +132,14 @@ module ActionDispatch
       port
     end
 
+    # Without the scheme's standard port, as the shared twin's: Rails'
+    # `host_with_port` writes no `:443`/`:80`, and the CSRF check
+    # compares this with an Origin a browser serializes the same way.
     def base_url
-      "#{protocol}#{host}"
+      h = host
+      default = ssl? ? ":443" : ":80"
+      h = h[0, h.length - default.length] if h.end_with?(default)
+      "#{protocol}#{h}"
     end
 
     def remote_ip

@@ -200,8 +200,8 @@ fn parse_decls(body: &[ModelBodyItem]) -> Vec<Result<TokenForDecl, Option<Symbol
         let value = match block {
             None => None,
             Some(b) => match &*b.node {
-                ExprNode::Lambda { params, rest_param, block_param, body, signature, .. }
-                    if params.is_empty() && rest_param.is_none() && block_param.is_none() && signature.is_empty() =>
+                ExprNode::Lambda { params, rest_param, block_param, body, signature, extra_params, .. }
+                    if params.is_empty() && rest_param.is_none() && block_param.is_none() && signature.is_empty() && extra_params.is_empty() =>
                 {
                     Some(body.clone())
                 }

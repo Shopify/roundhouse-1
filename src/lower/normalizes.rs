@@ -80,8 +80,8 @@ fn declaration(expr: &Expr) -> Option<(Vec<Symbol>, (Symbol, Expr))> {
                         continue;
                     };
                     match (key.as_str(), &*v.node) {
-                        ("with", ExprNode::Lambda { params, rest_param: None, body, signature, .. })
-                            if params.len() == 1 && signature.is_empty() =>
+                        ("with", ExprNode::Lambda { params, rest_param: None, body, signature, extra_params, .. })
+                            if params.len() == 1 && signature.is_empty() && extra_params.is_empty() =>
                         {
                             with = Some((params[0].clone(), body.clone()));
                         }

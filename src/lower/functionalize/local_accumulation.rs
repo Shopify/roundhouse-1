@@ -134,7 +134,7 @@ fn rewrite(e: &Expr) -> Expr {
         }
         ExprNode::Return { value } => syn(ExprNode::Return { value: rewrite(value) }),
         // Recurse into block bodies (`coll.each do |x| acc[k] = x end`).
-        ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } => syn(ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
+        ExprNode::Lambda { signature, extra_params, rest_param, params, block_param, body, block_style } => syn(ExprNode::Lambda { signature: signature.clone(), extra_params: extra_params.clone(), rest_param: rest_param.clone(),
             params: params.clone(),
             block_param: block_param.clone(),
             body: rewrite(body),
@@ -484,7 +484,7 @@ mod tests {
             block: None,
             parenthesized: false,
         });
-        let lambda = syn(ExprNode::Lambda { signature: Default::default(), rest_param: None,
+        let lambda = syn(ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
             params: vec![s("x")],
             block_param: None,
             body: block_body,

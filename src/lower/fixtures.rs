@@ -12,7 +12,7 @@
 //! plus a thread-local id map; Python might use sqlite3 directly;
 //! Crystal might emit DB.exec. That's per-target.
 
-use crate::dialect::{Association, Fixture, FixtureValue, Model};
+use crate::dialect::{Association, Fixture, FixtureFileBlob, FixtureValue, Model};
 use crate::schema::ColumnType;
 use indexmap::IndexMap;
 use crate::expr::Expr;
@@ -41,6 +41,11 @@ pub struct LoweredFixture {
     /// ahead of the inserts and in the same scope as the values.
     /// Empty for every fixture without ERB.
     pub preamble: Vec<Expr>,
+    /// Rows rendered by `ActiveStorage::FixtureSet.blob` (see
+    /// [`crate::dialect::Fixture::file_blobs`]): label → the call's
+    /// arguments. Their records carry no fields; the loader reads,
+    /// uploads and inserts the file instead.
+    pub file_blobs: indexmap::IndexMap<Symbol, FixtureFileBlob>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,6 +124,7 @@ fn lower_fixture(fixture: &Fixture, app: &App) -> LoweredFixture {
         class,
         records,
         preamble: fixture.preamble.clone(),
+        file_blobs: fixture.file_blobs.clone(),
     }
 }
 
@@ -194,6 +200,28 @@ fn resolve_field_inner(
     // `save` and not `save!`, so all seven rooms vanished without a
     // word — and every messages row referencing one went with them.
     let value = value.strip_prefix(':').unwrap_or(value);
+
+    // `blob: handbook_reading_image_blob` in active_storage/attachments.yml.
+    // Rails resolves it through the Attachment's `belongs_to :blob`; the
+    // synthesized Attachment model leaves that association out (the blob
+    // is a runtime class, see `lower::attachment_model`), so the
+    // reference is resolved here, against the blobs fixture set.
+    if crate::lower::attachment_model::is_attachment_model(model) && key.as_str() == "blob" {
+        let referenced = app.fixtures.iter().any(|f| {
+            f.class_id().0.as_str() == "ActiveStorage::Blob"
+                && f.name.as_str() == "active_storage_blobs"
+                && f.records.keys().any(|l| l.as_str() == value)
+        });
+        if referenced && model.attributes.fields.contains_key(&Symbol::from("blob_id")) {
+            return Some(vec![LoweredFixtureField {
+                column: Symbol::from("blob_id"),
+                value: LoweredFixtureValue::FkLookup {
+                    target_fixture: Symbol::from("active_storage_blobs"),
+                    target_label: Symbol::from(value),
+                },
+            }]);
+        }
+    }
 
     for assoc in model.associations() {
         if let Association::BelongsTo {
@@ -387,6 +415,11 @@ pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
     let mut out = Vec::new();
     for fixture in &app.fixtures {
         let class = fixture.class_id();
+        // Rows `ActiveStorage::FixtureSet.blob` renders load through
+        // `ActiveStorage::FixtureSet.load_blob!`, not a model.
+        if !fixture.records.is_empty() && fixture.records.keys().all(|l| fixture.file_blobs.contains_key(l)) {
+            continue;
+        }
         let Some(model) = app.models.iter().find(|m| m.name == class) else {
             out.push(format!("fixture set `{}` loads {}, which is not a model of this app", fixture.path, class.0));
             continue;
@@ -726,6 +759,15 @@ fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, r
             .map(|c| (c.name.clone(), column_cast_type(&c.col_type)))
             .collect()
     });
+    // `ActiveStorage::FixtureSet.blob` rows load through
+    // `ActiveStorage::FixtureSet.load_blob!` (the model-path loader,
+    // `fixture_to_library`); a raw row insert has no file to upload.
+    if let Some(label) = fixture.file_blobs.keys().next() {
+        errors.push(format!(
+            "roundhouse: fixture set `{}` record `{label}` is an `ActiveStorage::FixtureSet.blob` row, which the raw-row fixture loader does not upload",
+            fixture.path
+        ));
+    }
     if table.is_none() {
         errors.push(format!(
             "roundhouse: fixture set `{}`: table `{}` is not in this tree's schema",

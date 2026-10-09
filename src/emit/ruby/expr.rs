@@ -631,9 +631,9 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::Let { name, value, body, .. } => {
             format!("{name} = {}\n{}", emit_expr(value), emit_expr(body))
         }
-        ExprNode::Lambda { params, rest_param, block_param, body, signature, .. } => {
+        ExprNode::Lambda { params, rest_param, block_param, body, signature, extra_params, .. } => {
             note_emitted_signature(body, signature);
-            let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
+            let ps = block_params(params, rest_param.as_ref(), signature, extra_params, block_param.as_ref());
             if ps.is_empty() {
                 format!("-> {{ {} }}", emit_expr(body))
             } else {
@@ -1914,16 +1914,26 @@ fn is_setter_method(m: &str) -> bool {
 /// A block's or lambda's parameter list in Ruby's order: required,
 /// optional, rest, keyword, keyword rest, block (`|a, b = 1, *r, k:,
 /// j: 2, **o, &blk|`). Post parameters were desugared off the rest at
-/// ingest.
+/// ingest. Every name the body reads has to be bound here; one left out
+/// raises `NameError` when the emitted program runs. `signature` and
+/// `extra_params` are the two IR spellings of the same optional, keyword
+/// and keyword-rest parameters (ingest fills `signature`).
 fn block_params(
     params: &[crate::ident::Symbol],
     rest_param: Option<&crate::ident::Symbol>,
     signature: &crate::expr::BlockSignature,
+    extra_params: &[crate::dialect::Param],
     block_param: Option<&crate::ident::Symbol>,
 ) -> Vec<String> {
     let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
     for (name, default) in &signature.optionals {
         ps.push(format!("{name} = {}", emit_arg(default)));
+    }
+    for p in extra_params.iter().filter(|p| !p.keyword) {
+        match &p.default {
+            Some(d) => ps.push(format!("{} = {}", p.name, emit_expr(d))),
+            None => ps.push(p.name.to_string()),
+        }
     }
     if let Some(r) = rest_param {
         ps.push(format!("*{r}"));
@@ -1934,8 +1944,17 @@ fn block_params(
             None => ps.push(format!("{name}:")),
         }
     }
+    for p in extra_params.iter().filter(|p| p.keyword && !p.rest) {
+        match &p.default {
+            Some(d) => ps.push(format!("{}: {}", p.name, emit_expr(d))),
+            None => ps.push(format!("{}:", p.name)),
+        }
+    }
     if let Some(k) = &signature.kwrest {
         ps.push(format!("**{k}"));
+    }
+    for p in extra_params.iter().filter(|p| p.keyword && p.rest) {
+        ps.push(format!("**{}", p.name));
     }
     if let Some(b) = block_param {
         ps.push(format!("&{b}"));
@@ -1948,7 +1967,7 @@ fn block_params(
 /// body; `do … end` spans multiple lines when the body has newlines.
 pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     use crate::expr::BlockStyle;
-    let ExprNode::Lambda { signature, params, rest_param, block_param, body, block_style } = &*block.node else {
+    let ExprNode::Lambda { signature, extra_params, params, rest_param, block_param, body, block_style } = &*block.node else {
         // A non-Lambda block expression is a Proc FORWARD (`&block` —
         // ingest lowers the block-pass arg to a bare Var in the block
         // slot). Rendering it as a literal `{ block }` block made the
@@ -1973,7 +1992,7 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     // `args`, and an emitted module answers a bare name from its own
     // functions when no local binds it.
     note_emitted_signature(body, signature);
-    let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
+    let ps = block_params(params, rest_param.as_ref(), signature, extra_params, block_param.as_ref());
     let params_str = if ps.is_empty() {
         String::new()
     } else {
@@ -2479,7 +2498,7 @@ mod tests {
         // modifier-if wrap above.
         let block = Expr::new(
             Span::default(),
-            ExprNode::Lambda { signature: Default::default(), rest_param: None,
+            ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
                 params: vec![],
                 block_param: None,
                 body: lit_sym("body"),

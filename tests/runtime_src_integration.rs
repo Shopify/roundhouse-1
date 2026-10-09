@@ -957,7 +957,10 @@ fn every_runtime_method_body_concretely_typed() {
     // Upstream 304 -> 316 (+12); merged over this tree's 520 (+6 at the
     // a47f2b16a merge). MEASURED 462 after the 4228ed837 merge, so 526
     // still holds.
-    const CEILING: usize = 526;
+    // origin/main 6c26039c6 moves upstream 316 -> 317: AttachedMany#each's
+    // `yield`, `in_batches`' `yield self` (2) and `haml_class`'s untyped
+    // `value` (2), net of upstream's own reductions.
+    const CEILING: usize = 527;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

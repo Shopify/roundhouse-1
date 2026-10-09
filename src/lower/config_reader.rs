@@ -287,9 +287,12 @@ fn unwrap_config_tap(expr: &mut Expr) {
     if method.as_str() != "tap" || !args.is_empty() || !is_config_root(r) {
         return;
     }
-    let ExprNode::Lambda { params, body, rest_param: None, block_param: None, .. } = &*b.node else {
+    let ExprNode::Lambda { extra_params, signature: block_sig, params, body, rest_param: None, block_param: None, .. } = &*b.node else {
         return;
     };
+    if !(extra_params.is_empty() && block_sig.is_empty()) {
+        return;
+    }
     let [param] = params.as_slice() else { return };
     let receiver = r.clone();
     let mut body = body.clone();
