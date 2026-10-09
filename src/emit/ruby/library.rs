@@ -8612,6 +8612,9 @@ fn emit_library_class_decl_inner(
             requires.push(rel);
         }
     }
+    // What the header itself needs (the superclasses, a runtime reopen's
+    // file) is required above it; the body's needs follow.
+    let header_requires: BTreeSet<String> = requires.iter().cloned().collect();
     // `include`d modules must be LOADED before the `include` executes at
     // class-definition time — unlike body const-refs (request-time), so we
     // require them even when they're same-dir siblings (plain Ruby has no
@@ -8853,6 +8856,27 @@ fn emit_library_class_decl_inner(
     }
     body_requires.retain(|r| !requires.contains(r));
     requires.extend(body_requires);
+    // A body need in this file's own load-time require cycle
+    // (`load_cycle_components`) is required inside the body, right after
+    // the header, where natively its autoload runs: this class is then
+    // defined, and the file it loads, reaching back for it, finds it
+    // (`require_line`'s guard) instead of requiring this file while it
+    // loads, Ruby's circular require. Core's payments/vault
+    // LegacyPaymentInstrument: its `CLASS_MAPPING` reads the classes
+    // that include it, each of which requires it at the top of its file.
+    let in_body: Vec<String> = if super::expr::native_keywords() {
+        let cycles = load_cycle_components(app);
+        let own = cycles.get(&self_anchor);
+        requires
+            .iter()
+            .filter(|r| !header_requires.contains(*r))
+            .filter(|r| own.is_some() && cycles.get(&anchor_of_relative(&out_dir, r)) == own)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    requires.retain(|r| !in_body.contains(r));
     // The source's own top-level requires first, as Ruby runs them
     // before the body (`authored_requires`). A load-time need that one
     // of them already loads is not repeated.
@@ -8980,6 +9004,12 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
+    for r in &in_body {
+        writeln!(s, "{body_pad}{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
+    }
+    if !in_body.is_empty() {
+        writeln!(s).unwrap();
+    }
     if let Some((module, retargeted)) = &generated_attributes {
         let inner_pad = format!("{body_pad}  ");
         writeln!(s, "{body_pad}module GeneratedAttributeMethods").unwrap();
@@ -14927,6 +14957,33 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
                     if run.as_ref().is_none_or(|run| run.contains(&i)) {
                         walk_load_time_paths(&m.body, &mut paths, &mut later);
                     }
+                }
+            }
+            for path in &paths {
+                let Some(to) = require_path_for_body_const(path, app, name) else { continue };
+                if to != from && files.contains_key(&to) {
+                    let from_id = node(&from, &mut ids, &mut edges);
+                    let to_id = node(&to, &mut ids, &mut edges);
+                    edges[from_id].insert(to_id);
+                }
+            }
+        }
+        // A model's file reads its superclass and what its body runs at
+        // load: its `include`s and the other statements carried as
+        // written. Core's payments/vault models each include
+        // LegacyPaymentInstrument, whose `CLASS_MAPPING` reads them back.
+        for model in &app.models {
+            let name = model.name.0.as_str();
+            let from = format!("app/models/{}", crate::naming::underscore(&file_owner(name, app)));
+            if !files.contains_key(&from) {
+                continue;
+            }
+            let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+            let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
+            paths.extend(model.parent.iter().map(split));
+            for item in &model.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } = item {
+                    walk_load_time_paths(expr, &mut paths, &mut later);
                 }
             }
             for path in &paths {
