@@ -1378,6 +1378,129 @@ pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Ve
         .collect()
 }
 
+/// One model per class: every other declaration of a model's class (a
+/// file that reopens it) is merged into the declaration in the
+/// constant's own file, after that one's body, as Ruby runs a reopen
+/// when it loads.
+///
+/// Core writes a nested class's file around its owner restated in full,
+/// superclass included: `class Event < GlobalDB::ShopRecord` around
+/// `class OrderEvent` in event/order_event.rb (21 such files for Event,
+/// 29 for PlaybookTimelineEvent), with at most a repeated
+/// `extend(FixMeMyModelHasImplicitAssociationValidation)`. Ingest
+/// classifies each such file as a model of that name, so the app held
+/// several `Event` models, each lowered to app/models/event.rb:
+/// - the emitted file was whichever came last (the tree keeps the last
+///   of one path), so Core's Event lost every association and macro of
+///   its body to a reopen;
+/// - a lookup by name found whichever came first:
+///   shipping_line/applied_discount.rb (`class ShippingLine <
+///   GlobalDB::ShopRecord` around `class AppliedDiscount`) sorts before
+///   shipping_line.rb, so the emitted ShippingLine answered
+///   no reflection (`emit::ruby::library::apply_association_reflections`
+///   read the reopen's empty body) and its `accelerated_readonly_belongs_to
+///   :shop` raised NotImplementedError at class load (also GiftCard and
+///   PlaybookTimelineEvent).
+///
+/// The declaration kept is the one in `<underscore(name)>.rb`, the file
+/// Zeitwerk loads for the constant; else the first with a body; else the
+/// first. The reopens follow it in ingest order. What a reopen gives the
+/// class joins the declaration's: its body items, enums, class-attribute
+/// seeds, visibility changes and the facts stamped per model (STI
+/// subclasses, subclass declarations, retypable and aliased attributes),
+/// and the superclass, keys and query constraints where the declaration
+/// names none.
+pub(crate) fn merge_model_reopens(app: &mut crate::App) {
+    let mut groups: HashMap<ClassId, Vec<usize>> = HashMap::default();
+    let mut order: Vec<ClassId> = Vec::new();
+    for (i, model) in app.models.iter().enumerate() {
+        let members = groups.entry(model.name.clone()).or_default();
+        if members.is_empty() {
+            order.push(model.name.clone());
+        }
+        members.push(i);
+    }
+    if groups.values().all(|members| members.len() < 2) {
+        return;
+    }
+    let path_of = |model: &Model| {
+        (model.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)).map(|s| s.path.as_str())
+    };
+    let mut merges: Vec<(usize, usize)> = Vec::new();
+    for name in &order {
+        let members = &groups[name];
+        if members.len() < 2 {
+            continue;
+        }
+        let own_file = format!("{}.rb", crate::naming::underscore(name.0.as_str()));
+        let in_own_file = |i: &usize| {
+            path_of(&app.models[*i]).is_some_and(|p| p == own_file || p.ends_with(&format!("/{own_file}")))
+        };
+        let kept = members
+            .iter()
+            .copied()
+            .find(in_own_file)
+            .or_else(|| members.iter().copied().find(|&i| !app.models[i].body.is_empty()))
+            .unwrap_or(members[0]);
+        merges.extend(members.iter().copied().filter(|&i| i != kept).map(|i| (kept, i)));
+    }
+    let mut slots: Vec<Option<Model>> = std::mem::take(&mut app.models).into_iter().map(Some).collect();
+    for (kept, reopen) in merges {
+        let reopen = slots[reopen].take().expect("each reopen merges once");
+        absorb_model_reopen(slots[kept].as_mut().expect("the kept declaration stays"), reopen);
+    }
+    app.models = slots.into_iter().flatten().collect();
+}
+
+fn absorb_model_reopen(target: &mut Model, reopen: Model) {
+    fn extend_new<T: PartialEq>(into: &mut Vec<T>, from: Vec<T>) {
+        for item in from {
+            if !into.contains(&item) {
+                into.push(item);
+            }
+        }
+    }
+    if target.parent.is_none() {
+        target.parent = reopen.parent;
+        target.parent_span = reopen.parent_span;
+    }
+    if target.primary_key.is_none() {
+        target.primary_key = reopen.primary_key;
+    }
+    if target.composite_primary_key.is_empty() {
+        target.composite_primary_key = reopen.composite_primary_key;
+    }
+    if target.query_constraints.is_empty() {
+        target.query_constraints = reopen.query_constraints;
+    }
+    if target.ignored_columns.is_empty() {
+        target.ignored_columns = reopen.ignored_columns;
+    }
+    target.body.extend(reopen.body);
+    for (name, values) in reopen.enums {
+        target.enums.entry(name).or_insert(values);
+    }
+    for (name, value) in reopen.enum_defaults {
+        target.enum_defaults.entry(name).or_insert(value);
+    }
+    // A later class-attribute write wins, as it runs later.
+    target.class_attr_defaults.extend(reopen.class_attr_defaults);
+    target.visibility_overrides.extend(reopen.visibility_overrides);
+    extend_new(&mut target.sti_subclass_names, reopen.sti_subclass_names);
+    target.sti_subclass_names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    for (subclass, items) in reopen.subclass_declarations {
+        if !target.subclass_declarations.iter().any(|(s, _)| *s == subclass) {
+            target.subclass_declarations.push((subclass, items));
+        }
+    }
+    target.subclass_default_scope |= reopen.subclass_default_scope;
+    target.lexical_json_shadow |= reopen.lexical_json_shadow;
+    extend_new(&mut target.retypable_attributes, reopen.retypable_attributes);
+    extend_new(&mut target.defaulted_attributes, reopen.defaulted_attributes);
+    extend_new(&mut target.attribute_aliases, reopen.attribute_aliases);
+    extend_new(&mut target.claimed_body_calls, reopen.claimed_body_calls);
+}
+
 /// An STI subclass (a library class whose superclass is a model) that
 /// runs ActiveSupport::Callbacks' class side includes the port itself
 /// when no model ancestor's lowered class does (`model_class`), as each
