@@ -302,3 +302,114 @@ fn a_name_only_whitespace_separates_is_the_same_test_natively_and_refused() {
     let names: Vec<&str> = tm.iter().flat_map(|m| m.tests.iter().map(|t| t.method_name.as_str())).collect();
     assert_eq!(names, ["test_a_b", "test_a_b_tag:slow:true"]);
 }
+
+/// A blockless `test "x"` flunks under the name TestTags passed on, one
+/// assertion; a persistent rename onto a twin the body defined under the
+/// tag leaves one test with the first body. The emitted tree lists and
+/// runs exactly what native Minitest does, with the same outcomes,
+/// assertion counts and failure messages.
+const EDGES: &str = r#"
+class EdgesTest < ActiveSupport::TestCase
+  tag(slow: true) do
+    test "tagged no block"
+  end
+
+  test "no block"
+
+  test "x" do
+    assert_equal 2, 1 + 1
+  end
+
+  tag owner: "a"
+
+  test "x" do
+    flunk "the second body"
+  end
+end
+"#;
+
+/// `id => (status, assertions, first failure message)`.
+fn outcomes(text: &str) -> BTreeMap<String, (String, u64, String)> {
+    let mut map = BTreeMap::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let row: Value = serde_json::from_str(line).expect("JSON row");
+        let message = row["exceptions"].as_array().and_then(|e| e.first()).map(|e| e["message"].as_str().unwrap_or("").to_string());
+        let message = message.or_else(|| row["message"].as_str().map(str::to_string)).unwrap_or_default();
+        let id = row["id"].as_str().unwrap().to_string();
+        let value = (row["status"].as_str().unwrap().to_string(), row["assertions"].as_u64().unwrap(), message);
+        assert!(map.insert(id.clone(), value).is_none(), "{id} reported twice");
+    }
+    map
+}
+
+#[test]
+fn blockless_tests_and_persistent_twins_match_native() {
+    let oracle = format!(
+        "{}{EDGES}\nEdgesTest.runnable_methods.each do |name|\n  result = EdgesTest.new(name).run\n  status = result.passed? ? \"pass\" : (result.skipped? ? \"skip\" : (result.error? ? \"error\" : \"fail\"))\n  puts JSON.generate(id: \"EdgesTest##{{name}}\", status: status, assertions: result.assertions, message: result.failure&.message.to_s)\nend\n",
+        oracle_prelude()
+    );
+    let out = ruby().args(["-e", &oracle]).output().expect("native Minitest");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let native = outcomes(&String::from_utf8_lossy(&out.stdout));
+    let want: BTreeMap<String, (String, u64, String)> = [
+        ("EdgesTest#test_tagged_no_block_tag:slow:true", ("fail", 1, "No implementation provided for tagged no block_tag:slow:true")),
+        ("EdgesTest#test_no_block_tag:owner:a", ("fail", 1, "No implementation provided for no block")),
+        ("EdgesTest#test_x_tag:owner:a", ("pass", 1, "")),
+    ]
+    .into_iter()
+    .map(|(id, (status, n, message))| (id.to_string(), (status.to_string(), n, message.to_string())))
+    .collect();
+    assert_eq!(native, want, "native oracle");
+
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("test/models/edges_test.rb", EDGES)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (_, classes) = index(&emitted);
+    let (file, tests) = &classes["EdgesTest"];
+    let mut listed: Vec<String> = tests.iter().map(|t| format!("EdgesTest#{t}")).collect();
+    listed.sort();
+    assert_eq!(listed, want.keys().cloned().collect::<Vec<_>>(), "index");
+    let results = emitted.join("edges.results.jsonl");
+    let out = ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), file])
+        .current_dir(&emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &results)
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("emitted CRuby");
+    let log = format!("stdout={}\nstderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&results).unwrap_or_else(|e| panic!("no results: {e}\n{log}"));
+    assert_eq!(outcomes(&text), native, "emitted results vs native\n{log}");
+}
+
+/// ActiveSupport's `method_defined?` sees inherited methods: natively a
+/// subclass's `test "shared"` under a parent's `test_shared` raises as
+/// the class loads. Roundhouse refuses the subclass with that message.
+#[test]
+fn a_test_redefining_an_inherited_test_raises_natively_and_is_refused() {
+    let base = "class BaseEdgeTest < ActiveSupport::TestCase\n  test \"shared\" do\n    assert true\n  end\nend\n";
+    let sub = "class SubEdgeTest < BaseEdgeTest\n  test \"shared\" do\n    assert true\n  end\nend\n";
+    let oracle = format!("{}{base}begin\n{sub}\nrescue => e\n  puts e.message\nend\n", oracle_prelude());
+    let out = ruby().args(["-e", &oracle]).output().expect("native");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "test_shared is already defined in SubEdgeTest");
+
+    let dir = std::env::temp_dir().join(format!("rh-inherited-redefinition-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, text) in [
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("test/models/base_edge_test.rb", base),
+        ("test/models/sub_edge_test.rb", sub),
+    ] {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+    let err = roundhouse::ingest::ingest_app(&dir).map(|_| ()).unwrap_err().to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(err.contains("test class `SubEdgeTest` refused"), "{err}");
+    assert!(err.contains("`test_shared is already defined in SubEdgeTest`, inherited from `BaseEdgeTest`"), "{err}");
+}

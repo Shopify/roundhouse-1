@@ -704,20 +704,25 @@ fn build_library_class(
     let mut methods: Vec<MethodDef> = tm
         .tests
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
+            // Natively a `flags:` test defines no method of its own name
+            // (ingest leaves it out with a survey gap); emitting it under
+            // one would list a test native never runs, or shadow a
+            // sibling of that name.
             if native_assertions && t.toggle_flags {
                 crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                     t.body.span,
                     None,
                     "toggle_flags_test",
                     format!(
-                        "test {:?} declares ToggleFlagsHelper `flags:`: natively it runs as `_FLAGS:` variants, \
-                         each under its flag configuration; it is emitted once, as {}, without them",
+                        "test {:?} declares ToggleFlagsHelper `flags:`: natively it runs only as `_FLAGS:` \
+                         variants, each under its flag configuration, and defines no {}; it is not emitted",
                         t.name, t.method_name
                     ),
                 ));
+                return None;
             }
-            test_to_method_def(&tm.name, t, if native_assertions { None } else { inline_setup.as_ref() }, &helper_shadows, route_id_segments, native_assertions)
+            Some(test_to_method_def(&tm.name, t, if native_assertions { None } else { inline_setup.as_ref() }, &helper_shadows, route_id_segments, native_assertions))
         })
         .collect();
     if native_assertions {

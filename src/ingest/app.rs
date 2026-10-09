@@ -2269,6 +2269,12 @@ end
         }
     }
 
+    // Shared test modules (`module FooSharedTests; include SharedTests;
+    // test "…" do`) are read from the same files; a module-only file has
+    // no test class. A class's includes are resolved against them once
+    // every file is read (they sort after or before their includers).
+    let mut test_mixins = super::test_mixin::TestMixins::default();
+    let mut loaded: Vec<(PathBuf, TestModule)> = Vec::new();
     for entry in test_files {
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         if let Some(tms) =
@@ -2276,13 +2282,35 @@ end
         {
             for mut tm in tms {
                 tm.source_file = Some(entry.strip_prefix(dir).unwrap_or(&entry).display().to_string());
-                splice_test_helpers(&mut tm, &shared_test_helpers);
-                if let Some(case_setup) = &test_case_setup {
-                    splice_test_case_setup(&mut tm, case_setup);
-                }
-                app.test_modules.push(tm);
+                loaded.push((entry.clone(), tm));
             }
         }
+        test_mixins.scan(&source, &entry.display().to_string());
+    }
+    test_mixins.finish();
+    let have: crate::det::HashSet<String> = loaded.iter().map(|(_, tm)| tm.name.0.to_string()).collect();
+    for (file, class) in test_mixins.unreached_includers(&|name| have.contains(name)) {
+        let entry = PathBuf::from(&file);
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
+        if let Some(mut tm) = unwrap_or_record(test_mixins.ingest_includer(&source, &file, &class))?.flatten() {
+            tm.source_file = Some(entry.strip_prefix(dir).unwrap_or(&entry).display().to_string());
+            loaded.push((entry, tm));
+        }
+    }
+    for (entry, mut tm) in loaded {
+        if test_mixins.gives_test_macros(&tm) {
+            if let Some(source) = read_or_ledger(vfs, &entry)? {
+                test_mixins.refuse_test_macro_calls(&tm, &source, &entry.display().to_string())?;
+            }
+        }
+        if !splice_test_mixins(vfs, &test_mixins, &entry, &mut tm)? {
+            continue;
+        }
+        splice_test_helpers(&mut tm, &shared_test_helpers);
+        if let Some(case_setup) = &test_case_setup {
+            splice_test_case_setup(&mut tm, case_setup);
+        }
+        app.test_modules.push(tm);
     }
 
     // YAML fixtures — `test/fixtures/*.yml`. The file stem is conventionally
@@ -2814,7 +2842,7 @@ end
     }
     super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
-    super::test::resolve_test_parents(&mut app);
+    super::test::resolve_test_parents(&mut app)?;
     super::library_class::resolve_library_parents(&mut app);
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
@@ -11016,6 +11044,22 @@ fn splice_test_case_setup(tm: &mut TestModule, case_setup: &crate::expr::Expr) {
         }
     }
     tm.setup = Some(Expr::new(crate::span::Span::synthetic(), ExprNode::Seq { exprs }));
+}
+
+/// Splice the tests a class gets from the shared test modules it includes
+/// (`super::test_mixin`), under their native method names. `false` when
+/// the class is refused (recorded by name under `--survey`).
+fn splice_test_mixins<V: Vfs + ?Sized>(
+    vfs: &V,
+    mixins: &super::test_mixin::TestMixins,
+    entry: &Path,
+    tm: &mut TestModule,
+) -> IngestResult<bool> {
+    if !mixins.applies(tm) {
+        return Ok(true);
+    }
+    let Some(source) = read_or_ledger(vfs, entry)? else { return Ok(true) };
+    Ok(unwrap_or_record(mixins.splice(tm, &source, &entry.display().to_string()))?.is_some())
 }
 
 /// Copy shared helper methods onto a test class, the test's own
