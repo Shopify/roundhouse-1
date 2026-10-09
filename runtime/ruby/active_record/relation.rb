@@ -2172,6 +2172,14 @@ module ActiveRecord
     end
 
     def column_predicate(col, val, note = false)
+      # `col` or `table.col`, each part a bare identifier (`sql_ident`'s
+      # allowlist) or one already quoted as PostgreSQL writes it
+      # (`"Order"`, inner quotes doubled); anything else raises before
+      # any SQL is built.
+      parts = col.split(".", -1)
+      unless parts.size <= 2 && parts.all? { |part| part.match?(/\A(?:[A-Za-z_][A-Za-z0-9_]*|"(?:[^"]|"")+")\z/) }
+        raise ArgumentError, "SQL identifier \"" + col + "\" is not a column name"
+      end
       qcol = col.include?(".") ? quote_column_path(col) : "#{@table}.#{quote_column_path(col)}"
       # A column of this model with a declared type (`attribute`) binds
       # what the type serializes, as Rails' QueryAttribute does.

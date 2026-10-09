@@ -1117,6 +1117,8 @@ class TestBase
   # own message.
   def assert_nothing_raised
     yield
+  end
+
   # Rails' `freeze_time`: `travel_to(Time.now)`, held still — every
   # read until `travel_back` (the block's end, or the next test's
   # setup) answers the same whole second.

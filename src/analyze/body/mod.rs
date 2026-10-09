@@ -2888,9 +2888,24 @@ impl<'a> BodyTyper<'a> {
                     // the port's `ActiveSupport::JSON::Encoding.as_json`,
                     // which asks an object with an `as_json` of its own and
                     // answers core_ext/object/json.rb's table for the rest.
-                    if method.as_str() == "as_json" && expr.diagnostic.is_none() {
+                    // A class under an unseen (gem) ancestor likely has the
+                    // gem's own `as_json`: the port still asks it, and a
+                    // dispatch-miss note keeps the gem attribution (the
+                    // serializer gem's base, f0491734d).
+                    let gem_owned = matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if self.has_unknown_ancestor(id));
+                    let gem_noted = gem_owned && matches!(&expr.diagnostic,
+                        Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed { method: m, .. }) if m.as_str() == "as_json");
+                    if method.as_str() == "as_json" && (expr.diagnostic.is_none() || gem_noted) {
                         match self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some()) {
                             send::AsJsonResidue::Route => {
+                                if gem_owned && expr.diagnostic.is_none() {
+                                    if let Some(recv_ty) = recv_ty.clone() {
+                                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed {
+                                            method: method.clone(),
+                                            recv_ty,
+                                        });
+                                    }
+                                }
                                 expr.decisions |= crate::expr::OBJECT_AS_JSON;
                                 return send::object_as_json_ty(recv_ty.as_ref(), class_object_receiver);
                             }

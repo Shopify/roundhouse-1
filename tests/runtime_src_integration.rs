@@ -955,8 +955,9 @@ fn every_runtime_method_body_concretely_typed() {
     // `select_rows`' rows are), `Base.uncached`'s block value (the
     // `Timeout.timeout` shape), and `Relation#to_h`'s yielded pairs.
     // Upstream 304 -> 316 (+12); merged over this tree's 520 (+6 at the
-    // a47f2b16a merge, +6 at the 4228ed837 merge).
-    const CEILING: usize = 532;
+    // a47f2b16a merge). MEASURED 462 after the 4228ed837 merge, so 526
+    // still holds.
+    const CEILING: usize = 526;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -392,9 +392,9 @@ fn untyped_subexpressions_baseline() {
     // campfire's `reorder(Arel.sql("+messages.created_at"))`): 547 ->
     // 549, MEASURED — each one's `fragment` parameter, read here
     // without its RBS.
-    // Upstream 529 -> 549 (+20) at the 4228ed837 merge, over this
-    // tree's 552.
-    const CEILING: usize = 572;
+    // Upstream 529 -> 549 (+20) at the 4228ed837 merge; MEASURED 505
+    // on the merged runtime, so this tree's 552 still holds.
+    const CEILING: usize = 552;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

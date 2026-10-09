@@ -1,7 +1,9 @@
-//! `X.new(…).as_json` on a constant roundhouse refuses is one gap, the
+//! `X.new(…).to_query` on a constant roundhouse refuses is one gap, the
 //! constant's: the Object-extension refusal on its result counted the
 //! same root twice. A receiver that only reaches the constant through a
-//! local keeps its refusal.
+//! local keeps its refusal. (Upstream wrote it with `as_json`; this tree
+//! routes an untyped `as_json` to the ActiveSupport JSON port instead of
+//! refusing it, so the Object extension here is `to_query`.)
 
 use std::process::Command;
 
@@ -14,7 +16,7 @@ fn an_object_extension_on_a_refused_constant_is_not_refused_again() {
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         (
             "app/controllers/articles_controller.rb",
-            "class ArticlesController < ApplicationController\n  def index\n    article = Article.first\n    Nowhere::Resource.new(article).as_json\n    resource = Nowhere::Resource.new(article)\n    resource.as_json\n    head :ok\n  end\nend\n",
+            "class ArticlesController < ApplicationController\n  def index\n    article = Article.first\n    Nowhere::Resource.new(article).to_query\n    resource = Nowhere::Resource.new(article)\n    resource.to_query\n    head :ok\n  end\nend\n",
         ),
         ("db/schema.rb", "ActiveRecord::Schema[8.1].define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\n  resources :articles, only: [:index]\nend\n"),

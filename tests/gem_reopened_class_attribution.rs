@@ -1,8 +1,8 @@
 //! A serializer's `as_json` comes from the serializer gem, which parks
 //! its base under the framework's `ActiveModel` namespace. With the gem
 //! unmodeled, the call is a coverage note naming it, also when the app
-//! reopens that base; an app class the gem does not define keeps the
-//! Object-extension error.
+//! reopens that base; an app class the gem does not define is not
+//! attributed to it.
 
 use std::process::Command;
 
@@ -56,10 +56,12 @@ fn assert_attribution(out: &str) {
     assert!(!out.contains("articles_controller.rb:4:5: error"), "{out}");
 
     // No gem behind these: the app's own class, and one the app nests in a gem's namespace.
-    let report = line("articles_controller.rb:5:5");
-    assert!(report.contains("error[unsupported]: Object extension"), "{report}");
-    let nested = line("articles_controller.rb:6:5");
-    assert!(nested.contains("error[unsupported]: Object extension"), "{nested}");
+    // Upstream refused both as an Object extension; this tree routes an
+    // `as_json` no static method answers to the ActiveSupport JSON port
+    // (af92d4df8), so neither is refused, and neither names a gem.
+    for pos in ["articles_controller.rb:5:5", "articles_controller.rb:6:5"] {
+        assert!(!out.lines().any(|l| l.contains(pos)), "{pos}:\n{out}");
+    }
 }
 
 #[test]

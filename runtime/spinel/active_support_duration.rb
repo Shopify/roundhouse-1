@@ -328,6 +328,8 @@ module ActiveSupport
 
     def in_years
       @seconds / SECONDS_PER_YEAR.to_f
+    end
+
     # Numeric predicates Rails' Duration answers by delegating to its
     # value — net/http asks `zero?` of a timeout, and campfire passes
     # `7.seconds` as one (Opengraph::Fetch).
