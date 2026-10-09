@@ -7316,6 +7316,27 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             || (n >= 3 && dir[n - 1] == "concerns" && dir[n - 3] == "app")
             || loader_roots.contains(dir.join("/").as_str())
     };
+    // A directory a Zeitwerk loader collapses adds no namespace
+    // (`ingest::zeitwerk`): database_documentation 3.2.0's
+    // `model_metadata/concerns/metadata.rb` names
+    // DatabaseDocumentation::ModelMetadata::Metadata. A source's path is
+    // read for its constant without those directories.
+    let collapsed_dirs: std::collections::BTreeSet<&str> = app
+        .zeitwerk_loaders
+        .iter()
+        .flat_map(|l| l.collapsed.iter())
+        .map(|d| d.strip_prefix(app.root.as_str()).unwrap_or(d).trim_matches('/'))
+        .collect();
+    let constant_path = |path: &str| -> String {
+        let segments: Vec<&str> = path.split('/').collect();
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i + 1 == segments.len() || !collapsed_dirs.contains(segments[..=*i].join("/").as_str()))
+            .map(|(_, segment)| *segment)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
     let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut in_place_program: BTreeMap<String, String> = BTreeMap::new();
@@ -7332,7 +7353,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             .iter()
             .filter(|source| {
                 let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
-                let path = rel.strip_suffix(".rb").unwrap_or(rel);
+                let path = constant_path(rel.strip_suffix(".rb").unwrap_or(rel));
                 let depth = stem.matches('/').count() + 1;
                 let segments: Vec<&str> = path.split('/').collect();
                 if segments.len() < depth {
@@ -7381,7 +7402,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         .iter()
         .filter_map(|source| {
             let rel = source.path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&source.path);
-            rel.strip_suffix(".rb")
+            rel.strip_suffix(".rb").map(constant_path)
         })
         .flat_map(|path| {
             let segments: Vec<&str> = path.split('/').collect();
