@@ -2464,6 +2464,9 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
             // the cache alone would leave the reader answering the
             // record it held before.
             load_on_assign(lc, name, stale_state);
+            if stale_state {
+                loaded_answers_stale(lc, name);
+            }
         }
         let mut keys = own;
         let mut seen = vec![model.name.clone()];
@@ -2483,6 +2486,36 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
                 invalidate_on_fk_write(lc, &name, &type_column, stale_state);
             }
         }
+    }
+}
+
+/// The synthesized `<name>_loaded?` (`association(:name).loaded?`,
+/// collapsed by `lower::assoc_loaded`) answers as the association
+/// object's does: a target a key write made stale is still loaded
+/// (`@<name>_stale_loaded`) until the reader, a reset or a reload
+/// replaces it. A hand-written predicate is left alone.
+fn loaded_answers_stale(lc: &mut LibraryClass, name: &Symbol) {
+    let predicate = Symbol::from(format!("{}_loaded?", name.as_str()));
+    let loaded = Symbol::from(format!("{}_loaded", name.as_str()));
+    let Some(m) = lc.methods.iter_mut().find(|m| {
+        m.name == predicate && m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.name_span.is_synthetic()
+    }) else {
+        return;
+    };
+    let src = format!("def __loaded\n  @{n}_loaded == true || @{n}_stale_loaded == true\nend\n", n = name.as_str());
+    let answer = crate::runtime_src::parse_methods(&src)
+        .unwrap_or_else(|e| panic!("loaded_answers_stale: generated source failed to parse: {e}\n{src}"))
+        .pop()
+        .expect("one method")
+        .body;
+    let last = match &mut *m.body.node {
+        ExprNode::Seq { exprs } => exprs.last_mut(),
+        _ => Some(&mut m.body),
+    };
+    if let Some(last) = last.filter(|e| matches!(&*e.node, ExprNode::Ivar { name } if name == &loaded)) {
+        let ty = last.ty.clone();
+        *last = answer;
+        last.ty = ty.or(Some(crate::ty::Ty::Bool));
     }
 }
 
@@ -3264,11 +3297,30 @@ fn app_calls_method(app: &App, method: &str) -> bool {
 /// `lower::assoc_loaded` collapsed onto a reader (`IrHint::
 /// AssociationTarget`, which the Ruby emit writes back), or reloads or
 /// resets a collection reader (`IrHint::AssociationProxy`, which runs
-/// on the association object).
+/// on the association object), or asks a belongs_to's
+/// `association(:x).loaded?` (collapsed onto the flat `x_loaded?`,
+/// which answers a stale target as loaded from the same record).
 pub(crate) fn app_calls_association(app: &App) -> bool {
-    fn walk(e: &Expr, found: &mut bool) {
+    let belongs_to_loaded: Vec<String> = app
+        .models
+        .iter()
+        .flat_map(|m| m.associations())
+        .filter_map(|a| match a {
+            crate::dialect::Association::BelongsTo { name, polymorphic: false, .. } => {
+                Some(format!("{}_loaded?", name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    fn walk(e: &Expr, belongs_to_loaded: &[String], found: &mut bool) {
         if *found {
             return;
+        }
+        if let ExprNode::Send { method, args, block: None, .. } = &*e.node {
+            if args.is_empty() && belongs_to_loaded.iter().any(|n| n == method.as_str()) {
+                *found = true;
+                return;
+            }
         }
         if matches!(
             e.hint,
@@ -3288,14 +3340,14 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
             *found = true;
             return;
         }
-        e.node.for_each_child(&mut |c| walk(c, found));
+        e.node.for_each_child(&mut |c| walk(c, belongs_to_loaded, found));
     }
     let mut found = false;
-    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut found));
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &belongs_to_loaded, &mut found));
     for view in &app.views {
-        walk(&view.body, &mut found);
+        walk(&view.body, &belongs_to_loaded, &mut found);
     }
-    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &mut found));
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &belongs_to_loaded, &mut found));
     found
 }
 

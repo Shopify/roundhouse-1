@@ -171,6 +171,33 @@ const PLAIN_EXPECTED: &[&str] = &[
     "has_one cached: edited",
 ];
 
+/// An app whose only reflection read is `association(:shop).loaded?`,
+/// which `lower::assoc_loaded` collapses onto the flat `shop_loaded?`:
+/// a key write keeps a loaded target loaded (stale) as Rails' does,
+/// and `Product.new(shop: …)` holds the target its writer loaded.
+const LOADED_ONLY_PROBE: &str = r##"class CacheProbe
+  def self.lines
+    out = []
+    held = Product.new(shop: Shop.new(name: "unsaved"), title: "f")
+    out << "new with target: #{held.association(:shop).loaded?} #{held.shop.name}"
+    s = Shop.create!(name: "one")
+    s2 = Shop.create!(name: "two")
+    p = Product.find(Product.create!(shop: s, title: "p").id)
+    before = p.association(:shop).loaded?
+    p.shop
+    out << "read: #{before} #{p.association(:shop).loaded?}"
+    p.shop_id = s2.id
+    out << "fk change: #{p.association(:shop).loaded?} #{p.shop.name} #{p.association(:shop).loaded?}"
+    p.reload
+    out << "reload: #{p.association(:shop).loaded?}"
+    out
+  end
+end
+"##;
+
+const LOADED_ONLY_EXPECTED: &[&str] =
+    &["new with target: true unsaved", "read: false true", "fk change: true two true", "reload: false"];
+
 const SCHEMA: &str = r#"ActiveRecord::Schema.define(version: 1) do
   create_table "shops", force: :cascade do |t|
     t.string "name"
@@ -285,6 +312,14 @@ fn association_readers_cache_without_association_objects_on_sqlite() {
     let files = models(PLAIN_PROBE);
     let native = native_sqlite("plain", &files);
     assert_eq!(native, PLAIN_EXPECTED, "native");
+    assert_eq!(emitted_sqlite(&files), native, "emitted");
+}
+
+#[test]
+fn belongs_to_loaded_answers_a_stale_target_on_sqlite() {
+    let files = models(LOADED_ONLY_PROBE);
+    let native = native_sqlite("loaded_only", &files);
+    assert_eq!(native, LOADED_ONLY_EXPECTED, "native");
     assert_eq!(emitted_sqlite(&files), native, "emitted");
 }
 
