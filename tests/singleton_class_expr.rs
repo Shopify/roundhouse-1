@@ -3,8 +3,8 @@
 //! `included do … class << self … end … end` (a concern's hook block) is
 //! ingested as an ordinary expression, where no class-body walk
 //! classifies the block. It used to hit the "unsupported expression
-//! node" fallthrough; it now evaluates to its last statement, with its
-//! defs lifting to nil like any bare `def`.
+//! node" fallthrough; its statements are now written against the singleton
+//! class (tests/expression_singleton_class.rs).
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -50,8 +50,8 @@ fn surveyed(files: &[(&str, &str)]) -> (roundhouse::App, Vec<String>) {
 
 
 /// At expression position — inside an `included do` block, where no
-/// class-body walk classifies it — the block evaluates to its last
-/// statement and its defs lift to nil like any bare `def`.
+/// class-body walk classifies it — the block ingests without a gap:
+/// its `def` is written `def self.tracked`.
 #[test]
 fn a_singleton_block_at_expression_position_ingests() {
     let (_, gaps) = surveyed(&[(

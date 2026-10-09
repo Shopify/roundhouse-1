@@ -5847,6 +5847,38 @@ fn framework_shadow_scopes(
     fn framework_module(namespace: &str, name: &str) -> bool {
         matches!((namespace, name), ("ActiveSupport", "Concern") | ("T", "Sig" | "Helpers"))
     }
+    // A `module T::Helpers` / `module T::Sig` reopening whose body only
+    // (re)defines sorbet-runtime's own declarations, as the fallback a
+    // gem writes for when sorbet-runtime is absent
+    // (elasticsearch-shopify's `unless defined?(T::Helpers); module T;
+    // module Helpers; def interface!; end ...`). The module stays the one
+    // a Concern extends, and none of these is a hook `include` or
+    // `extend` runs (`append_features`, `included`, `extended`, ...) or a
+    // method Concern#append_features calls on the module, so extending
+    // it leaves the Concern protocol as it is. Anything else in the body
+    // (another def, a constant, an include) is still a barrier, as is
+    // any reopening of ActiveSupport::Concern.
+    fn sorbet_declaration_stubs(namespace: &str, body: Option<&ruby_prism::Node<'_>>) -> bool {
+        const DECLARATIONS: &[&str] = &[
+            "abstract!",
+            "interface!",
+            "final!",
+            "sealed!",
+            "mixes_in_class_methods",
+            "requires_ancestor",
+            "sig",
+        ];
+        namespace == "T"
+            && body.is_none_or(|body| {
+                body.as_statements_node().is_some_and(|stmts| {
+                    stmts.body().iter().all(|stmt| {
+                        stmt.as_def_node().is_some_and(|def| {
+                            def.receiver().is_none() && DECLARATIONS.contains(&constant_id_str(&def.name()))
+                        })
+                    })
+                })
+            })
+    }
     struct Shadows<'a> {
         scope: Vec<String>,
         out: &'a mut HashSet<Vec<String>>,
@@ -5932,7 +5964,7 @@ fn framework_shadow_scopes(
                 self.out.insert(self.scope[..self.scope.len() - 1].to_vec());
             }
             if let [namespace, name] = self.scope.as_slice() {
-                if framework_module(namespace, name) {
+                if framework_module(namespace, name) && (class || !sorbet_declaration_stubs(namespace, body.as_ref())) {
                     self.out.insert(Vec::new());
                 }
             }
