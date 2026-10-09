@@ -211,13 +211,16 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             .enumerate()
             .filter_map(|(j, (n, _))| constant_file(lc.name.0.as_str(), n.as_str(), app).map(|stem| (j, stem)))
             .collect();
+        // A namespace constant a file program writes after a statement of
+        // its own runs in that program (`program_constants`).
+        let ran: Vec<usize> = program_constants(lc, app).into_iter().map(|(j, _)| j).collect();
         // A namespace constant a required file writes beside a nested
         // declaration loads with that declaration's file (`nested_file_constant`).
         let beside: Vec<(usize, String, bool)> = lc
             .constants
             .iter()
             .enumerate()
-            .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j))
+            .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j) && !ran.contains(j))
             .filter_map(|(j, (n, _))| nested_file_constant(lc, n.as_str(), app).map(|(stem, before)| (j, stem, before)))
             .collect();
         // Not one a constant left in the namespace's file reads at load:
@@ -225,7 +228,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         let beside: Vec<(usize, String, bool)> = {
             let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
             for (j, (_, value)) in lc.constants.iter().enumerate() {
-                if !beside.iter().any(|(k, _, _)| *k == j) {
+                if !beside.iter().any(|(k, _, _)| *k == j) && !ran.contains(&j) {
                     walk_const_paths(value, &mut paths);
                 }
             }
@@ -251,7 +254,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             .filter_map(|(j, call)| statement_file(lc.name.0.as_str(), call, app).map(|target| (j, target)))
             .collect();
         let without_apart;
-        let lc = if apart.is_empty() && moved.is_empty() && beside.is_empty() {
+        let lc = if apart.is_empty() && moved.is_empty() && beside.is_empty() && ran.is_empty() {
             lc
         } else {
             let mut copy = lc.clone();
@@ -259,7 +262,9 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
                 .constants
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j) && !beside.iter().any(|(k, _, _)| k == j))
+                .filter(|(j, _)| {
+                    !apart.iter().any(|(k, _)| k == j) && !beside.iter().any(|(k, _, _)| k == j) && !ran.contains(j)
+                })
                 .map(|(_, c)| c.clone())
                 .collect();
             copy.unknown_calls = lc
@@ -13667,6 +13672,13 @@ pub(super) fn emit_file_program(
                                 require_anchor(s, &anchor);
                             }
                         }
+                        // And those it runs after statements of its own
+                        // (`program_constants`), here.
+                        if loaded.insert(format!("constants of {}", name.0.as_str())) {
+                            if let Some(reopen) = program_constants_written_in(name.0.as_str(), rel, app, out_path) {
+                                lines(s, pad, &reopen);
+                            }
+                        }
                     }
                 }
                 ProgramItem::Statement(expr) => {
@@ -14469,6 +14481,135 @@ fn constant_files_written_in(owner: &str, rel: &str, app: &App) -> Vec<String> {
         }
     }
     out
+}
+
+/// The namespace module `lc`'s constants that a file program runs, by
+/// index, with that program's source file (relative to the app root):
+/// those the program writes after a statement of its own. Core's
+/// lib/shopify/protobuf/metafield_pb.rb:
+///
+/// ```ruby
+/// pool = ::Google::Protobuf::DescriptorPool.generated_pool
+/// pool.add_serialized_file(descriptor_data)
+///
+/// module Shopify
+///   module Protobuf
+///     Metafield = ::Google::Protobuf::DescriptorPool.generated_pool.lookup("shopify.protobuf.Metafield").msgclass
+/// ```
+///
+/// Ruby assigns a constant where its file writes it, after the
+/// statements above it. Ingest merges every reopen of the module into
+/// one, so each `*_pb.rb`'s lookups were written into the namespace's
+/// file, which the first program to load it required after adding only
+/// its own descriptor: every other lookup answered nil (NoMethodError,
+/// `msgclass` for nil). Such a constant is written into its program
+/// instead, in a reopening of the module right after the declaration
+/// (`program_constants_written_in`).
+///
+/// Only for a module that keeps a file of its own (as `constant_file`),
+/// and not a constant one left in the namespace's file reads at load:
+/// that file would read it before its program runs.
+fn program_constants(lc: &LibraryClass, app: &App) -> Vec<(usize, String)> {
+    use crate::app::ProgramItem;
+    let owner = lc.name.0.as_str().trim_start_matches("::");
+    if app.file_programs.is_empty() || lc.constants.is_empty() {
+        return Vec::new();
+    }
+    let classes = library_classes_named(owner, app);
+    if classes.is_empty()
+        || !classes.iter().all(|c| c.is_module && c.origin.is_none())
+        || is_model_named(owner, app)
+        || file_owner(owner, app) != owner
+        || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
+    {
+        return Vec::new();
+    }
+    // Each source file whose program runs a statement before declaring
+    // the module.
+    let mut runs_first: crate::det::HashMap<u32, Option<String>> = crate::det::HashMap::default();
+    let mut program_of = |file: u32| -> Option<String> {
+        runs_first
+            .entry(file)
+            .or_insert_with(|| {
+                let source = app.sources.get((file as usize).checked_sub(1)?)?;
+                let rel = relative_source_path(app, &source.path);
+                let program = app.file_programs.iter().find(|p| relative_source_path(app, &p.source) == rel)?;
+                let at = program.items.iter().position(|item| {
+                    matches!(item, ProgramItem::Declared(names) if names.iter().any(|n| n.0.as_str().trim_start_matches("::") == owner))
+                })?;
+                program.items[..at]
+                    .iter()
+                    .any(|item| !matches!(item, ProgramItem::Declared(_) | ProgramItem::Require { .. }))
+                    .then(|| rel.to_string())
+            })
+            .clone()
+    };
+    let moved: Vec<(usize, String)> = lc
+        .constants
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, _))| !lc.top_level_constants.iter().any(|t| t.name.as_str() == n.as_str()))
+        .filter(|(_, (n, _))| constant_file(owner, n.as_str(), app).is_none())
+        .filter_map(|(j, (_, value))| program_of(value.span.file.0).map(|rel| (j, rel)))
+        .collect();
+    if moved.is_empty() {
+        return moved;
+    }
+    let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+    for (j, (_, value)) in lc.constants.iter().enumerate() {
+        if !moved.iter().any(|(k, _)| *k == j) {
+            walk_const_paths(value, &mut paths);
+        }
+    }
+    let read = |name: &str| {
+        paths.iter().any(|p| match p.split_last() {
+            Some((last, prefix)) => last == name && (prefix.is_empty() || prefix.join("::").trim_start_matches("::") == owner),
+            None => false,
+        })
+    };
+    moved.into_iter().filter(|(j, _)| !read(lc.constants[*j].0.as_str())).collect()
+}
+
+/// The namespace module `owner`'s constants the file program of the
+/// source `rel` runs (`program_constants`), as a reopening of the
+/// module with only them, rendered at the program's `out_path`.
+fn program_constants_written_in(owner: &str, rel: &str, app: &App, out_path: &Path) -> Option<String> {
+    let classes = library_classes_named(owner, app);
+    let first = classes.first()?;
+    let written_here = |span: &Span| {
+        app.sources
+            .get((span.file.0 as usize).wrapping_sub(1))
+            .is_some_and(|source| relative_source_path(app, &source.path) == rel)
+    };
+    if !classes.iter().any(|c| c.constants.iter().any(|(_, v)| written_here(&v.span))) {
+        return None;
+    }
+    let mut constants = Vec::new();
+    for c in &classes {
+        for (j, from) in program_constants(c, app) {
+            if from == rel {
+                constants.push(c.constants[j].clone());
+            }
+        }
+    }
+    if constants.is_empty() {
+        return None;
+    }
+    let reopen = LibraryClass {
+        includes: Vec::new(),
+        methods: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+        nullable_columns: Vec::new(),
+        constants,
+        unknown_calls: Vec::new(),
+        visibility_overrides: Vec::new(),
+        method_aliases: Vec::new(),
+        top_level_constants: Vec::new(),
+        conditional_definitions: Vec::new(),
+        ..(*first).clone()
+    };
+    Some(emit_library_class_decl(&reopen, app, out_path.to_path_buf()).content)
 }
 
 /// Each library class => the ids of the source files that declare it
