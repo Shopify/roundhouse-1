@@ -628,6 +628,8 @@ pub(super) fn ingest_test_class(
                 if call.receiver().is_none()
                     && constant_id_str(&call.name()) == "include"
                 {
+                    // Tests its modules' `included` hooks declare.
+                    macros.mixin_gaps(&stmt)?;
                     if let Some(args) = call.arguments() {
                         for arg in args.arguments().iter() {
                             if let Some(path) = constant_path_of(&arg) {
@@ -2166,15 +2168,17 @@ end
         assert_eq!(names, ["test_checks_a", "test_kept"]);
         // (Each source its own path: the registry keeps a path's first
         // text.) Without `extend TestGenerator`, `generate_test` is not its.
-        let src = "class GenTest < ActiveSupport::TestCase\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
+        // (And each class its own name: a class declared in two sources
+        // may be given methods by the other.)
+        let src = "class GenPlainTest < ActiveSupport::TestCase\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "gen_plain_test.rb").unwrap_err().to_string();
         assert!(
-            err.contains("tests declared by a call of the class method `checks` are not modeled; they will not run (`GenTest` line 8: `generate_test` is not TestGenerator's"),
+            err.contains("tests declared by a call of the class method `checks` are not modeled; they will not run (`GenPlainTest` line 8: `generate_test` is not TestGenerator's"),
             "{err}"
         );
         // A call before the macro is defined runs no macro (native
         // raises NoMethodError): nothing is expanded, the macro is named.
-        let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  checks :a\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\nend\n";
+        let src = "class GenLateTest < ActiveSupport::TestCase\n  extend TestGenerator\n  checks :a\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "gen_late_test.rb").unwrap_err().to_string();
         assert!(err.contains("a `class << self` method that declares tests when called") && err.contains("`checks`"), "{err}");
     }

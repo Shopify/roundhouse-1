@@ -9,7 +9,9 @@
 //!   each test body;
 //! - a class-body loop over a collection computed from app constants
 //!   (`HELPERS.keys - (SEEDS + [X])`, `Module.constants`, a constant
-//!   Array of Hashes naming modules) declares one test per element;
+//!   Array of Hashes naming modules) declares one test per element, when
+//!   each constant is a literal of frozen values that every source uses
+//!   only in the few ways known to leave it as written;
 //! - a macro or loop that cannot be evaluated before it runs is a named
 //!   survey gap, and the class's other tests still run;
 //! - each case below the first test is one where an earlier version
@@ -27,7 +29,9 @@
 //!   another source, a concern the superclass has, a macro called in a
 //!   loop, a condition or a plain method, a change through a part of a
 //!   constant: `first`, `to_a`, a block call's result, an unfrozen String
-//!   another constant holds).
+//!   another constant holds; a constant passed on, `class_methods` from
+//!   outside the concern, a test class declared in another file, a macro
+//!   called from an `included` block, by `send("gen")` or `method(:gen)`).
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -183,7 +187,7 @@ const CONST_LOOP_TEST: &str = r##"class ConstLoopTest < ActiveSupport::TestCase
     end
   end
 
-  CASES = [{ name: "first", mod: StagedChange }, { name: "second", mod: Reasons }].freeze
+  CASES = [{ name: :first, mod: StagedChange }.freeze, { name: :second, mod: Reasons }.freeze].freeze
   CASES.each do |c|
     test "case #{c[:name]}" do
       assert_kind_of Module, c[:mod]
@@ -209,6 +213,11 @@ end
 /// program does not.
 const NOT_MODELED: [&str; 4] =
     ["ConstLoopTest#test_computed_alpha", "ConstLoopTest#test_computed_beta", "MacroTest#test_each_x", "MacroTest#test_each_y"];
+
+/// The loop gaps of a constant (`consts::NOT_LITERAL`, `consts::USED`).
+const NOT_LITERAL: &str =
+    "tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run";
+const USED: &str = "tests declared by a loop over a constant a source uses in a way not known to leave it unchanged are not modeled; they will not run";
 
 /// Core's TestTags naming (`_tag:<key>:<value>` per tag) for `test`'s
 /// tags Hash, prepended on ActiveSupport::TestCase's singleton.
@@ -596,8 +605,8 @@ fn constants_changed_after_assignment_are_gaps() {
   ALL << :b
   NAMES = { "x" => 1 }
   NAMES["y"] = 2
-  LIST = %w[p q]
-  LIST.concat(%w[r])
+  LIST = %i[p q]
+  LIST.concat(%i[r])
   FIXED = [:z].freeze
 end
 "##;
@@ -642,17 +651,17 @@ end
   end
 end
 "##;
-    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
     let native = matches_native(
         &[("app/models/kinds.rb", kinds), ("app/models/flags.rb", flags), ("test/models/mutated_const_test.rb", test)],
         &["MutatedConstTest"],
         &|id| !id.ends_with("#test_fixed_z"),
         &[
-            &format!("{changed} (`MutatedConstTest` line 2, first test at line 3: `Kinds::ALL`: "),
-            &format!("{changed} (`MutatedConstTest` line 8, first test at line 9: `Kinds::NAMES`: "),
-            &format!("{changed} (`MutatedConstTest` line 14, first test at line 15: `Kinds::LIST`: "),
-            &format!("{changed} (`MutatedConstTest` line 28, first test at line 29: `MutatedConstTest::CASES`: "),
-            &format!("{changed} (`MutatedConstTest` line 34, first test at line 35: `Flags::ALL`: "),
+            &format!("{USED} (`MutatedConstTest` line 2, first test at line 3: `Kinds::ALL`: `ALL << :b` (app/models/kinds.rb line 3))"),
+            // (A Hash with String keys: its keys are frozen copies.)
+            &format!("{USED} (`MutatedConstTest` line 8, first test at line 9: `Kinds::NAMES`: `NAMES[\"y\"] = 2` (app/models/kinds.rb line 5))"),
+            &format!("{USED} (`MutatedConstTest` line 14, first test at line 15: `Kinds::LIST`: `LIST.concat(%i[r])` (app/models/kinds.rb line 7))"),
+            &format!("{USED} (`MutatedConstTest` line 28, first test at line 29: `MutatedConstTest::CASES`: `CASES << :b` (test/models/mutated_const_test.rb line 27))"),
+            &format!("{USED} (`MutatedConstTest` line 34, first test at line 35: `Flags::ALL`: `ALL.delete(:legacy)` (app/models/flags.rb line 3))"),
         ],
     );
     assert_eq!(native.len(), 12, "{native:#?}");
@@ -884,11 +893,15 @@ end
 }
 
 /// Each test reads its element from the app constant, so an Array or
-/// String element is the constant's own object.
+/// String element is the constant's own object. A loop over a literal
+/// with an unfrozen String is a gap, and so is one whose mutable
+/// elements (an Array in a frozen Array) a source reads other than as
+/// the loop.
 #[test]
 fn constant_elements_keep_their_identity() {
-    let frozen = "module FrozenKinds\n  ALL = [\"a\", \"b\"].freeze\n  NESTED = [[\"x\", \"y\"]].freeze\nend\n";
-    let thawed = "module ThawedKinds\n  ALL = [\"c\"]\nend\n";
+    let frozen = "# frozen_string_literal: true\n\nmodule FrozenKinds\n  ALL = [\"a\", \"b\"].freeze\n  NESTED = [[\"x\", \"y\"]].freeze\n  NESTED_USED = [[\"u\"]].freeze\nend\n";
+    let thawed = "# frozen_string_literal: true\n\nmodule ThawedKinds\n  ALL = [\"c\"]\nend\n";
+    let loose = "module LooseKinds\n  ALL = [\"d\"].freeze\nend\n";
     let test = r##"class IdentityTest < ActiveSupport::TestCase
   FrozenKinds::ALL.each do |k|
     test "same #{k}" do
@@ -899,7 +912,12 @@ fn constant_elements_keep_their_identity() {
   FrozenKinds::NESTED.each do |pair|
     test "pair #{pair.join}" do
       refute_predicate pair, :frozen?
-      assert_same FrozenKinds::NESTED.first, pair
+    end
+  end
+
+  FrozenKinds::NESTED_USED.each do |pair|
+    test "used #{pair.join}" do
+      assert_same FrozenKinds::NESTED_USED.first, pair
     end
   end
 
@@ -908,14 +926,29 @@ fn constant_elements_keep_their_identity() {
       assert_same ThawedKinds::ALL.first, k
     end
   end
+
+  LooseKinds::ALL.each do |k|
+    test "loose #{k}" do
+      assert_kind_of String, k
+    end
+  end
 end
 "##;
     let native = matches_native(
-        &[("app/models/frozen_kinds.rb", frozen), ("app/models/thawed_kinds.rb", thawed), ("test/models/identity_test.rb", test)],
+        &[
+            ("app/models/frozen_kinds.rb", frozen),
+            ("app/models/thawed_kinds.rb", thawed),
+            ("app/models/loose_kinds.rb", loose),
+            ("test/models/identity_test.rb", test),
+        ],
         &["IdentityTest"],
-        &|_| false,
-        &[],
+        &|id| id.ends_with("#test_used_u") || id.ends_with("#test_loose_d"),
+        &[
+            &format!("{USED} (`IdentityTest` line 14, first test at line 15: `FrozenKinds::NESTED_USED`: `assert_same FrozenKinds::NESTED_USED.first, pair` (test/models/identity_test.rb line 16))"),
+            &format!("{NOT_LITERAL} (`IdentityTest` line 26, first test at line 27: `LooseKinds::ALL`: `ALL = [\"d\"].freeze` (app/models/loose_kinds.rb line 2))"),
+        ],
     );
+    assert_eq!(native.len(), 6, "{native:#?}");
     assert!(native.values().all(|(s, _)| s == "pass"), "{native:#?}");
 }
 
@@ -1093,7 +1126,7 @@ end
         ],
         &["LevelsTest"],
         &|_| true,
-        &["tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (test/support/levels_ext.rb line 1, a test source not registered before this one))"],
+        &["tests declared by a loop over a constant a source uses in a way not known to leave it unchanged are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (test/support/levels_ext.rb line 1, a test source not registered before this one))"],
     );
     assert!(native.contains_key("LevelsTest#test_level_extra"), "{native:#?}");
 
@@ -1108,7 +1141,7 @@ end
         ],
         &["LevelsTest"],
         &|_| true,
-        &["tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (components/z/test/support/levels_ext.rb line 1, a test source not registered before this one))"],
+        &["tests declared by a loop over a constant a source uses in a way not known to leave it unchanged are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (components/z/test/support/levels_ext.rb line 1, a test source not registered before this one))"],
     );
 
     let modes_test = r##"class ModesTest < ActiveSupport::TestCase
@@ -1155,20 +1188,20 @@ end
 }
 
 /// A constant changed through `const_get`, or through its elements in a
-/// block (`each(&:upcase!)`, `each { |k| k << "z" }`, a local bound to
+/// block (`each(&:reverse!)`, `each { |k| k << :z }`, a local bound to
 /// one), is a gap; a block that only reads them is not.
 #[test]
 fn constants_changed_through_const_get_or_elements_are_gaps() {
-    let levels = "module Levels\n  ALL = [:a, :b]\n  NAMES = %w[x y]\n  KEYS = %w[k]\n  COPIED = %w[m]\n  SAFE = %w[s]\nend\n";
+    let levels = "module Levels\n  ALL = [:a, :b]\n  NAMES = [[:x, :w], [:y, :v]].freeze\n  KEYS = [[:k]].freeze\n  COPIED = [[:m]].freeze\n  SAFE = [[:s]].freeze\nend\n";
     let setup = r##"Levels.const_get(:ALL) << :c
-Levels::NAMES.each(&:upcase!)
-Levels::KEYS.each { |k| k << "z" }
+Levels::NAMES.each(&:reverse!)
+Levels::KEYS.each { |k| k << :z }
 Levels::COPIED.each do |n|
   m = n
-  m.concat("q")
+  m.concat([:q])
 end
-Levels::SAFE.each { |s| s.upcase }
-Levels.const_get(:SAFE).map(&:upcase)
+Levels::SAFE.each { |s| s.first }
+Levels.const_get(:SAFE).map(&:first)
 "##;
     let test = r##"class EscapeTest < ActiveSupport::TestCase
   Levels::ALL.each do |l|
@@ -1178,43 +1211,42 @@ Levels.const_get(:SAFE).map(&:upcase)
   end
 
   Levels::NAMES.each do |n|
-    test "name #{n}" do
-      assert_kind_of String, n
+    test "name #{n.first}" do
+      assert_kind_of Symbol, n.first
     end
   end
 
   Levels::KEYS.each do |k|
-    test "key #{k}" do
-      assert_equal "kz", k
+    test "key #{k.join}" do
+      assert_equal [:k, :z], k
     end
   end
 
   Levels::COPIED.each do |c|
-    test "copied #{c}" do
-      assert_equal "mq", c
+    test "copied #{c.join}" do
+      assert_equal [:m, :q], c
     end
   end
 
   Levels::SAFE.each do |s|
-    test "safe #{s}" do
-      assert_equal "s", s
+    test "safe #{s.first}" do
+      assert_equal [:s], s
     end
   end
 end
 "##;
-    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
     let native = matches_native(
         &[("app/models/levels.rb", levels), ("app/models/levels_setup.rb", setup), ("test/models/escape_test.rb", test)],
         &["EscapeTest"],
         &|id| !id.ends_with("#test_safe_s"),
         &[
-            &format!("{changed} (`EscapeTest` line 2, first test at line 3: `Levels::ALL`: `Levels.const_get(:ALL) << :c` (app/models/levels_setup.rb line 1))"),
-            &format!("{changed} (`EscapeTest` line 8, first test at line 9: `Levels::NAMES`: `Levels::NAMES.each(&:upcase!)` (app/models/levels_setup.rb line 2))"),
-            &format!("{changed} (`EscapeTest` line 14, first test at line 15: `Levels::KEYS`: "),
-            &format!("{changed} (`EscapeTest` line 20, first test at line 21: `Levels::COPIED`: "),
+            &format!("{USED} (`EscapeTest` line 2, first test at line 3: `Levels::ALL`: `Levels.const_get(:ALL) << :c` (app/models/levels_setup.rb line 1))"),
+            &format!("{USED} (`EscapeTest` line 8, first test at line 9: `Levels::NAMES`: `Levels::NAMES.each(&:reverse!)` (app/models/levels_setup.rb line 2))"),
+            &format!("{USED} (`EscapeTest` line 14, first test at line 15: `Levels::KEYS`: `Levels::KEYS.each {{ |k| k << :z }}` (app/models/levels_setup.rb line 3))"),
+            &format!("{USED} (`EscapeTest` line 20, first test at line 21: `Levels::COPIED`: `Levels::COPIED.each do |n|` (app/models/levels_setup.rb line 4))"),
         ],
     );
-    for id in ["EscapeTest#test_level_c", "EscapeTest#test_name_X", "EscapeTest#test_key_kz", "EscapeTest#test_copied_mq"] {
+    for id in ["EscapeTest#test_level_c", "EscapeTest#test_name_w", "EscapeTest#test_key_kz", "EscapeTest#test_copied_mq"] {
         assert!(native.contains_key(id), "{id}: {native:#?}");
     }
 }
@@ -1536,26 +1568,27 @@ end
 
 /// A load-time change through a part of a constant (`first`, `to_a`,
 /// `to_h`, a block call's result, an unfrozen String another constant
-/// holds) is a gap for a loop over it; a test body's use of it runs once
-/// every test is declared and is not.
+/// holds) is a gap for a loop over it, and so is any read of a mutable
+/// element other than as the loop, a test body's too; a constant frozen
+/// through and through may be read anywhere.
 #[test]
 fn changes_through_parts_of_a_constant_are_gaps() {
-    let levels = "module Levels\n  NAMES = %w[x y]\n  ALL = [:a, :b]\n  MAP = { k: 1 }\n  PICKED = %w[p q]\n  KEPT = [[\"m\", \"n\"]].freeze\nend\n";
+    let levels = "# frozen_string_literal: true\n\nmodule Levels\n  NAMES = [[:x], [:y]].freeze\n  ALL = [:a, :b]\n  MAP = { k: 1 }\n  PICKED = [[:p], [:q]].freeze\n  KEPT = [[:m, :n]].freeze\n  FROZEN = [[:m, :n].freeze].freeze\nend\n";
     let setup = r##"first = Levels::NAMES.first
-first << "z"
+first << :z
 list = Levels::ALL.to_a
 list << :c
 h = Levels::MAP.to_h
 h[:j] = 2
-picked = Levels::PICKED.select { |p| p == "p" }
-picked.first << "!"
+picked = Levels::PICKED.select { |p| p.first == :p }
+picked.first << :"!"
 seed = Held::SEEDS.first
 seed << "!"
 "##;
     let test = r##"class PartsTest < ActiveSupport::TestCase
   Levels::NAMES.each do |n|
-    test "name #{n}" do
-      assert_kind_of String, n
+    test "name #{n.join}" do
+      assert_kind_of Symbol, n.first
     end
   end
 
@@ -1572,8 +1605,8 @@ seed << "!"
   end
 
   Levels::PICKED.each do |p|
-    test "picked #{p}" do
-      assert_kind_of String, p
+    test "picked #{p.join}" do
+      assert_kind_of Symbol, p.first
     end
   end
 
@@ -1584,12 +1617,19 @@ seed << "!"
     end
   end
 
+  Levels::FROZEN.each do |pair|
+    test "frozen #{pair.join}" do
+      assert_same Levels::FROZEN.first, pair
+      assert_predicate pair, :frozen?
+    end
+  end
+
   setup do
-    @pair = Levels::KEPT.first
+    @pair = Levels::FROZEN.first
   end
 
   def test_reads_a_part
-    assert_same @pair, Levels::KEPT[0]
+    assert_same @pair, Levels::FROZEN[0]
   end
 
   Held::SEEDS.each do |seed|
@@ -1599,7 +1639,6 @@ seed << "!"
   end
 end
 "##;
-    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
     let native = matches_native(
         &[
             ("app/models/held.rb", "module Held\n  ADD = \"add\"\n  SEEDS = [ADD].freeze\nend\n"),
@@ -1608,18 +1647,127 @@ end
             ("test/models/parts_test.rb", test),
         ],
         &["PartsTest"],
-        &|id| !id.contains("#test_kept_") && !id.ends_with("#test_reads_a_part"),
+        &|id| !id.contains("#test_frozen_") && !id.ends_with("#test_reads_a_part"),
         &[
-            &format!("{changed} (`PartsTest` line 2, first test at line 3: `Levels::NAMES`: `first = Levels::NAMES.first` (app/models/levels_setup.rb line 1))"),
-            &format!("{changed} (`PartsTest` line 8, first test at line 9: `Levels::ALL`: `list = Levels::ALL.to_a` (app/models/levels_setup.rb line 3))"),
-            &format!("{changed} (`PartsTest` line 14, first test at line 15: `Levels::MAP`: `h = Levels::MAP.to_h` (app/models/levels_setup.rb line 5))"),
-            &format!("{changed} (`PartsTest` line 20, first test at line 21: `Levels::PICKED`: `picked = Levels::PICKED.select {{ |p| p == \"p\" }}` (app/models/levels_setup.rb line 7))"),
-            // `Held::ADD` is refused where `[ADD]` holds it, so the element
-            // and the name are not known.
-            "tests declared by a loop whose test names are not known before it runs are not modeled; they will not run (`PartsTest` line 41, first test at line 42: \"seed #{seed}\")",
+            &format!("{USED} (`PartsTest` line 2, first test at line 3: `Levels::NAMES`: `first = Levels::NAMES.first` (app/models/levels_setup.rb line 1))"),
+            &format!("{USED} (`PartsTest` line 8, first test at line 9: `Levels::ALL`: `list = Levels::ALL.to_a` (app/models/levels_setup.rb line 3))"),
+            &format!("{USED} (`PartsTest` line 14, first test at line 15: `Levels::MAP`: `h = Levels::MAP.to_h` (app/models/levels_setup.rb line 5))"),
+            &format!("{USED} (`PartsTest` line 20, first test at line 21: `Levels::PICKED`: `picked = Levels::PICKED.select {{ |p| p.first == :p }}` (app/models/levels_setup.rb line 7))"),
+            &format!("{USED} (`PartsTest` line 26, first test at line 27: `Levels::KEPT`: `assert_same Levels::KEPT.first, pair` (test/models/parts_test.rb line 28))"),
+            // `[ADD]` holds an unfrozen String.
+            &format!("{NOT_LITERAL} (`PartsTest` line 48, first test at line 49: `Held::ADD`: `ADD = \"add\"` (app/models/held.rb line 2))"),
         ],
     );
     for id in ["PartsTest#test_name_xz", "PartsTest#test_level_c", "PartsTest#test_map_j", "PartsTest#test_picked_p!", "PartsTest#test_kept_mn", "PartsTest#test_seed_add!"] {
         assert!(native.contains_key(id), "{id}: {native:#?}");
     }
+}
+
+/// What may give a class its methods outside the body ingest reads makes
+/// a macro call a named gap: `class_methods` of the concern from another
+/// source, the class declared in another file.
+#[test]
+fn outside_changes_to_a_class_or_concern_are_named() {
+    let ext = "GenConcern.class_methods do\n  def gen(k)\n  end\nend\n";
+    let test = "class OutsideTest < ActiveSupport::TestCase\n  include GenConcern\n\n  gen(:a)\n\n  test \"kept\" do\n    assert true\n  end\nend\n";
+    matches_native(
+        &[("app/models/gen_concern.rb", GEN_CONCERN), ("app/models/gen_concern_ext.rb", ext), ("test/models/outside_test.rb", test)],
+        &["OutsideTest"],
+        &|id| id != "OutsideTest#test_kept",
+        &[&format!(
+            "{}the module that defines it is not known (`GenConcern` is changed from outside its body at `GenConcern.class_methods do` (app/models/gen_concern_ext.rb line 1)))",
+            call_gap("gen", "OutsideTest", 4)
+        )],
+    );
+
+    // Native: `a_reopen_test.rb`'s `def self.gen` is the class's own,
+    // ahead of the concern's, and declares nothing.
+    let first = "class ZReopenTest < ActiveSupport::TestCase\n  def self.gen(k)\n  end\nend\n";
+    let second = "class ZReopenTest < ActiveSupport::TestCase\n  include GenConcern\n\n  gen(:z)\n\n  test \"z kept\" do\n    assert true\n  end\nend\n";
+    let native = matches_native(
+        &[("app/models/gen_concern.rb", GEN_CONCERN), ("test/models/a_reopen_test.rb", first), ("test/models/z_reopen_test.rb", second)],
+        &["ZReopenTest"],
+        &|_| false,
+        &[&format!(
+            "{}the class may be given methods outside this body (`ZReopenTest` is declared again in test/models/a_reopen_test.rb))",
+            call_gap("gen", "ZReopenTest", 4)
+        )],
+    );
+    assert_eq!(native.keys().collect::<Vec<_>>(), ["ZReopenTest#test_z_kept"]);
+}
+
+/// Tests a macro declares when it is called other than as a class-body
+/// statement are named: from a concern's `included do` block as the
+/// class includes it, through `send` of a String, through `method(:gen)`.
+#[test]
+fn hook_and_indirect_macro_calls_are_named() {
+    let inc = "module IncGen\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def gen(k)\n      test(\"inc #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\n\n  included do\n    gen(:inc)\n  end\nend\n";
+    let test = "class IncludedCallTest < ActiveSupport::TestCase\n  include IncGen\n\n  gen(:own)\nend\n";
+    let native = matches_native(
+        &[("app/models/inc_gen.rb", inc), ("test/models/included_call_test.rb", test)],
+        &["IncludedCallTest"],
+        &|id| id == "IncludedCallTest#test_inc_inc",
+        &[&format!("{}a hook of `IncGen` calls it as `include IncGen` runs, which is not expanded)", call_gap("gen", "IncludedCallTest", 2))],
+    );
+    assert_eq!(native.len(), 2, "{native:#?}");
+
+    let test = r##"class IndirectCallTest < ActiveSupport::TestCase
+  include GenConcern
+
+  method(:gen).call(:a)
+  send("gen", :b)
+  gen(:e)
+
+  test "kept" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/gen_concern.rb", GEN_CONCERN), ("test/models/indirect_call_test.rb", test)],
+        &["IndirectCallTest"],
+        &|id| id.ends_with("_a") || id.ends_with("_b"),
+        &[
+            &format!("{}it is called inside `method(:gen).call(:a)`, which is not expanded)", call_gap("gen", "IndirectCallTest", 4)),
+            &format!("{}it is called other than as `gen(…)` (`send(\"gen\", :b)`))", call_gap("gen", "IndirectCallTest", 5)),
+        ],
+    );
+    assert_eq!(native.len(), 4, "{native:#?}");
+}
+
+/// A constant frozen through and through may be passed anywhere; one
+/// whose Array is not frozen may not, and one whose elements may change
+/// may be read only as the loop.
+#[test]
+fn only_a_deeply_frozen_constant_may_be_passed_on() {
+    let passed = "# frozen_string_literal: true\n\nmodule Passed\n  DEEP = [:a, \"b\"].freeze\n  SHALLOW = [:c, :d]\n  NESTED = [[:e]].freeze\nend\n";
+    let test = r##"class PassedTest < ActiveSupport::TestCase
+  Passed::DEEP.each do |k|
+    test "deep #{k}" do
+      assert_includes Passed::DEEP, k
+    end
+  end
+
+  Passed::SHALLOW.each do |k|
+    test "shallow #{k}" do
+      assert_includes Passed::SHALLOW, k
+    end
+  end
+
+  Passed::NESTED.each do |pair|
+    test "nested #{pair.join}" do
+      assert_equal [:e], pair
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/passed.rb", passed), ("test/models/passed_test.rb", test)],
+        &["PassedTest"],
+        &|id| id.contains("#test_shallow_"),
+        &[&format!(
+            "{USED} (`PassedTest` line 8, first test at line 9: `Passed::SHALLOW`: `assert_includes Passed::SHALLOW, k` (test/models/passed_test.rb line 10))"
+        )],
+    );
+    assert_eq!(native.len(), 5, "{native:#?}");
 }

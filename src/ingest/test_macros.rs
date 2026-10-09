@@ -154,6 +154,10 @@ struct Concern {
     /// and whether it may prepend (what it gives comes before the
     /// class's own methods).
     hook: Option<(String, bool)>,
+    /// The methods its hooks (`included do`, `def self.included`) call
+    /// as a class includes it: one that declares tests declares them
+    /// there.
+    runs: Vec<String>,
     /// The span of its `module` statement.
     start: usize,
     end: usize,
@@ -316,6 +320,7 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
     let mut methods = Methods::default();
     let mut dependencies = Vec::new();
     let mut hook = None;
+    let mut runs = Vec::new();
     for stmt in body {
         // A `module ClassMethods` body's constants are looked up from
         // it; a `class_methods` block's from the concern.
@@ -330,6 +335,7 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
         if let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_some()) {
             if matches!(def.name().as_slice(), b"included" | b"append_features" | b"prepended" | b"prepend_features") {
                 hook.get_or_insert_with(|| (first_line(stmt), may_prepend(stmt)));
+                runs.extend(calls_in(stmt, true));
             }
             continue;
         }
@@ -355,6 +361,7 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
                     if let Some(op) = singleton_op(&body) {
                         hook.get_or_insert((op, may_prepend(&body)));
                     }
+                    runs.extend(calls_in(&body, true));
                 }
             }
             _ => {}
@@ -368,6 +375,7 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
         dependencies,
         cref: cref.to_vec(),
         hook,
+        runs,
         start: span.0,
         end: span.1,
     })
@@ -520,12 +528,9 @@ fn singleton_op(node: &Node<'_>) -> Option<String> {
                 self.found = Some(first_line(&node.as_node()));
                 return;
             }
-            if matches!(name, b"send" | b"public_send" | b"__send__") {
-                let first = node.arguments().and_then(|a| a.arguments().iter().next());
-                let literal = first.as_ref().and_then(|f| {
-                    f.as_symbol_node().map(|s| s.unescaped().to_vec()).or_else(|| f.as_string_node().map(|s| s.unescaped().to_vec()))
-                });
-                if literal.is_none_or(|n| OPS.contains(&n.as_slice())) {
+            if SENDS.contains(&name) {
+                let literal = literal_name(node.arguments().and_then(|a| a.arguments().iter().next()));
+                if literal.is_none_or(|n| OPS.contains(&n.as_bytes())) {
                     self.found = Some(first_line(&node.as_node()));
                     return;
                 }
@@ -754,6 +759,13 @@ pub(super) struct Macros<'pr> {
     file: String,
     class: ClassId,
     class_start: usize,
+    class_end: usize,
+    /// Where a source other than this class body may change the class
+    /// (`consts::reopened_elsewhere`), when one does.
+    reopened: std::cell::OnceCell<Option<String>>,
+    /// (statement start, module, method): the hooks of the modules that
+    /// statement mixes in call the method as it runs.
+    runs: Vec<(usize, String, String)>,
     /// Starts of the call statements this class body makes of its own
     /// macros.
     calls: Vec<(String, usize)>,
@@ -789,6 +801,9 @@ struct Seen {
     singleton: Vec<String>,
     /// The concerns among `class`.
     concerns: Vec<String>,
+    /// (module, method) the hooks of the modules mixed in by the
+    /// statement at hand call as it runs.
+    runs: Vec<(String, String)>,
 }
 
 /// What `include`ing (or `prepend`ing) the module written `segs` where
@@ -808,16 +823,16 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize, seen: &
     }
     seen.class.push(full.clone());
     #[allow(clippy::type_complexity)]
-    let found: Vec<(String, Methods, Vec<Vec<String>>, Vec<String>, Option<(String, bool)>, usize, usize)> = CONCERNS.with(|c| {
+    let found: Vec<(String, Methods, Vec<Vec<String>>, Vec<String>, Option<(String, bool)>, Vec<String>, usize, usize)> = CONCERNS.with(|c| {
         c.borrow()
             .iter()
             .filter(|concern| concern.module == full)
             .filter(|concern| sources::with_text(&concern.path, fingerprint) == Some(concern.fingerprint))
-            .map(|c| (c.path.clone(), c.methods.clone(), c.dependencies.clone(), c.cref.clone(), c.hook.clone(), c.start, c.end))
+            .map(|c| (c.path.clone(), c.methods.clone(), c.dependencies.clone(), c.cref.clone(), c.hook.clone(), c.runs.clone(), c.start, c.end))
             .collect()
     });
     match found.as_slice() {
-        [(path, methods, dependencies, inner, hook, start, end)] => {
+        [(path, methods, dependencies, inner, hook, runs, start, end)] => {
             // `ClassMethods` reopened (or the concern) in another source:
             // the methods it gives are not all in this one.
             let scope = inner.len().checked_sub(2).and_then(|i| inner.get(i)).map(String::as_str);
@@ -825,6 +840,7 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize, seen: &
                 return (vec![Gives::Unknown(why)], None);
             }
             seen.concerns.push(full.clone());
+            seen.runs.extend(runs.iter().map(|n| (full.clone(), n.clone())));
             let mut out = Vec::new();
             let mut hooks = None;
             for dep in dependencies {
@@ -852,7 +868,10 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize, seen: &
         [] => match consts::module_declarations(&full) {
             Err(why) => (vec![Gives::Unknown(why)], None),
             Ok(decls) => match module_hook(&decls) {
-                Some(hook) => (vec![Gives::Unknown(format!("`{full}` has a hook (`{hook}`)"))], None),
+                Some((hook, runs)) => {
+                    seen.runs.extend(runs.into_iter().map(|n| (full.clone(), n)));
+                    (vec![Gives::Unknown(format!("`{full}` has a hook (`{hook}`)"))], None)
+                }
                 None => (Vec::new(), None),
             },
         },
@@ -887,6 +906,7 @@ fn extend_gives(segs: &[String], cref: Option<&[String]>, seen: &mut Seen) -> Op
             // `def self.extended` runs after the body defined its methods.
             if let Some(hook) = items.iter().find(|i| i.as_def_node().is_some_and(|d| d.receiver().is_some() && d.name().as_slice() == b"extended")) {
                 methods.more.push((usize::MAX, first_line(hook), More::Any));
+                seen.runs.extend(calls_in(hook, true).into_iter().map(|n| (full.clone(), n)));
             }
             methods_of(&items, scopes, &mut methods);
             Some(())
@@ -924,8 +944,9 @@ fn resolve_module(segs: &[String], cref: Option<&[String]>) -> Result<Option<Str
 }
 
 /// A hook of the plain module declared at `decls` that runs when a
-/// class includes it (`def self.included`, `included do`).
-fn module_hook(decls: &[(String, usize, usize, Vec<String>)]) -> Option<String> {
+/// class includes it (`def self.included`, `included do`), and the
+/// methods it calls.
+fn module_hook(decls: &[(String, usize, usize, Vec<String>)]) -> Option<(String, Vec<String>)> {
     decls.iter().find_map(|(file, start, end, _)| {
         sources::with_text(file, |text| {
             let result = ruby_prism::parse(text.as_bytes());
@@ -935,7 +956,7 @@ fn module_hook(decls: &[(String, usize, usize, Vec<String>)]) -> Option<String> 
                 let hook = item.as_def_node().is_some_and(|d| {
                     d.receiver().is_some() && matches!(d.name().as_slice(), b"included" | b"append_features" | b"prepended" | b"prepend_features")
                 }) || item.as_call_node().is_some_and(|c| c.receiver().is_none() && matches!(c.name().as_slice(), b"included" | b"prepended"));
-                hook.then(|| first_line(item))
+                hook.then(|| (first_line(item), calls_in(item, true)))
             })
         })
         .flatten()
@@ -949,6 +970,7 @@ impl<'pr> Macros<'pr> {
         let mut gifts: Vec<(usize, Gives)> = Vec::new();
         let mut prepended: Vec<(usize, Gives)> = Vec::new();
         let mut seen = Seen::default();
+        let mut runs = Vec::new();
         let mut generator = false;
         let declares = |def: &ruby_prism::DefNode<'_>| def.body().is_some_and(|b| hidden_test_declaration(&b).is_some());
         let cref = consts::cref_of(file, class_node.location().start_offset());
@@ -1029,6 +1051,7 @@ impl<'pr> Macros<'pr> {
                     opaque.push((at, op, may_prepend(stmt)));
                 }
             }
+            runs.extend(seen.runs.drain(..).map(|(module, name)| (at, module, name)));
         }
         let calls = body
             .iter()
@@ -1051,6 +1074,9 @@ impl<'pr> Macros<'pr> {
             file: file.to_string(),
             class: class.clone(),
             class_start: class_node.location().start_offset(),
+            class_end: class_node.location().end_offset(),
+            reopened: std::cell::OnceCell::new(),
+            runs,
             calls,
             cx: consts::ConstCx::of_class(class_node, body, file, 0),
         }
@@ -1067,6 +1093,30 @@ impl<'pr> Macros<'pr> {
             || macro_defined_in(name).is_some()
     }
 
+    fn reopened(&self) -> Option<&String> {
+        self.reopened
+            .get_or_init(|| {
+                let full = self.class.0.as_str();
+                let scope = full.rsplit_once("::").map(|(scope, _)| scope);
+                consts::reopened_elsewhere(full, &self.file, self.class_start, self.class_end, scope)
+            })
+            .as_ref()
+    }
+
+    /// Name the tests the hooks of the modules the class-body statement
+    /// `stmt` mixes in declare as they run (`included do gen(:a) end`):
+    /// a call there of a method that declares tests is not expanded.
+    pub(super) fn mixin_gaps(&self, stmt: &Node<'pr>) -> IngestResult<()> {
+        let at = stmt.location().start_offset();
+        let found = self.runs.iter().find(|(start, _, name)| {
+            *start == at && !matches!(name.as_str(), "test" | "generate_test" | "setup" | "teardown") && self.matters(name)
+        });
+        if let Some((_, module, name)) = found {
+            self.record_gap(name, stmt, format!("a hook of `{module}` calls it as `{}` runs, which is not expanded", first_line(stmt)))?;
+        }
+        Ok(())
+    }
+
     fn line(&self, at: usize) -> String {
         sources::line_at(&self.file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into())
     }
@@ -1078,6 +1128,13 @@ impl<'pr> Macros<'pr> {
     /// else that of the module included or extended last before it.
     /// `None` when the call runs no method that declares tests anywhere.
     fn lookup(&self, name: &str, call_at: usize) -> Option<Origin> {
+        // Another body of the class (another file's `class X`, an
+        // `X.class_eval`) may define its singleton methods.
+        if let Some(why) = self.reopened() {
+            if self.matters(name) {
+                return Some(Origin::Unmodeled(format!("the class may be given methods outside this body ({why})")));
+            }
+        }
         // What a prepended module gives comes before the class's own.
         for (at, gift) in self.prepended.iter().rev().filter(|(at, _)| *at < call_at) {
             let may = match gift {
@@ -1331,7 +1388,11 @@ impl<'pr> Macros<'pr> {
         tags: &TestTags,
         tag_consts: &TagConstants<'pr>,
     ) -> IngestResult<Option<Vec<Test>>> {
-        let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && c.block().is_none()) else {
+        self.mixin_gaps(stmt)?;
+        let Some(call) = stmt
+            .as_call_node()
+            .filter(|c| c.receiver().is_none() && c.block().is_none() && !SENDS.contains(&c.name().as_slice()))
+        else {
             if let Some(found) = self.other_call(stmt)? {
                 return Ok(Some(found));
             }
@@ -1437,37 +1498,11 @@ impl<'pr> Macros<'pr> {
     /// by `other_use`); a statement that also declares tests itself is
     /// left to `declare_hidden` after. `None` for any other statement.
     fn nested_call(&self, stmt: &Node<'pr>) -> IngestResult<Option<Vec<Test>>> {
-        use ruby_prism::Visit;
         if stmt.as_def_node().is_some() || stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_singleton_class_node().is_some() {
             return Ok(None);
         }
-        const LATER: &[&[u8]] = &[b"test", b"setup", b"teardown", b"it", b"specify", b"before", b"after", b"around"];
-        struct Scan {
-            calls: Vec<String>,
-        }
-        impl<'pr> Visit<'pr> for Scan {
-            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-                let name = node.name();
-                if node.receiver().is_none_or(|r| r.as_self_node().is_some()) {
-                    self.calls.push(constant_id_str(&name).to_string());
-                }
-                if node.receiver().is_none() && LATER.contains(&name.as_slice()) && node.block().is_some() {
-                    if let Some(args) = node.arguments() {
-                        self.visit(&args.as_node());
-                    }
-                    return;
-                }
-                ruby_prism::visit_call_node(self, node);
-            }
-            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
-            fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
-            fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
-            fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
-        }
-        let mut scan = Scan { calls: Vec::new() };
-        scan.visit(stmt);
         let at = stmt.location().start_offset();
-        let found = scan.calls.into_iter().find(|name| {
+        let found = calls_in(stmt, false).into_iter().find(|name| {
             !matches!(name.as_str(), "test" | "generate_test" | "setup" | "teardown")
                 && !self.own.iter().any(|o| o.name == *name)
                 && (self.matters(name) || self.lookup(name, at).is_some_and(|o| !matches!(o, Origin::Inert)))
@@ -1489,10 +1524,9 @@ impl<'pr> Macros<'pr> {
         if !own_receiver {
             return Ok(None);
         }
-        let name = if matches!(call.name().as_slice(), b"send" | b"public_send" | b"__send__") {
-            let first = call.arguments().and_then(|a| a.arguments().iter().next());
-            match first.and_then(|f| f.as_symbol_node().map(|s| s.unescaped().to_vec())) {
-                Some(name) => String::from_utf8_lossy(&name).into_owned(),
+        let name = if SENDS.contains(&call.name().as_slice()) {
+            match literal_name(call.arguments().and_then(|a| a.arguments().iter().next())) {
+                Some(name) => name,
                 None => return Ok(None),
             }
         } else if call.receiver().is_some() || call.block().is_some() {
@@ -2185,6 +2219,63 @@ fn uses(root: &Node<'_>, name: &str, dynamic: bool) -> Vec<Use> {
     let mut scan = Scan { name: name.as_bytes(), dynamic, out: Vec::new() };
     scan.visit(root);
     scan.out
+}
+
+/// The calls that send a method named by their first argument.
+const SENDS: &[&[u8]] = &[b"send", b"public_send", b"__send__"];
+
+/// The name a Symbol or String literal `node` writes.
+fn literal_name(node: Option<Node<'_>>) -> Option<String> {
+    let node = node?;
+    let bytes = node.as_symbol_node().map(|s| s.unescaped().to_vec()).or_else(|| node.as_string_node().map(|s| s.unescaped().to_vec()))?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The methods `node` (a method's body, for a `def`) calls as it runs:
+/// those it calls on the class (`self`, no receiver; on anything when
+/// `any_receiver`), and those a `send` or `method` of a literal there
+/// names (`send("gen", :a)`, `method(:gen).call`). The blocks of tests
+/// and hooks (run later), nested methods, classes and modules are not
+/// looked in.
+fn calls_in(node: &Node<'_>, any_receiver: bool) -> Vec<String> {
+    use ruby_prism::Visit;
+    const LATER: &[&[u8]] = &[b"test", b"setup", b"teardown", b"it", b"specify", b"before", b"after", b"around"];
+    struct Scan {
+        any_receiver: bool,
+        calls: Vec<String>,
+    }
+    impl<'pr> Visit<'pr> for Scan {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = node.name();
+            if self.any_receiver || node.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+                self.calls.push(constant_id_str(&name).to_string());
+                if SENDS.contains(&name.as_slice()) || matches!(name.as_slice(), b"method" | b"public_method") {
+                    self.calls.extend(literal_name(node.arguments().and_then(|a| a.arguments().iter().next())));
+                }
+            }
+            if node.receiver().is_none() && LATER.contains(&name.as_slice()) && node.block().is_some() {
+                if let Some(args) = node.arguments() {
+                    self.visit(&args.as_node());
+                }
+                return;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut scan = Scan { any_receiver, calls: Vec::new() };
+    match node.as_def_node() {
+        Some(def) => {
+            if let Some(body) = def.body() {
+                scan.visit(&body);
+            }
+        }
+        None => scan.visit(node),
+    }
+    scan.calls
 }
 
 fn first_line(node: &Node<'_>) -> String {
