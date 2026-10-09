@@ -397,15 +397,18 @@ impl<'a> ClassSide<'a> {
     }
 
     /// Class-side readers the lowered model synthesizes from its schema
-    /// table (`schema::push_schema_methods`), which a replayed call reaches
-    /// as ActiveRecord's: database_documentation's macro builds its
-    /// `ModelAnnotation.new(table_name: table_name, ...)`.
+    /// table (`schema::push_schema_methods`, [`SCHEMA_CLASS_METHODS`]),
+    /// which a replayed call reaches as ActiveRecord's:
+    /// database_documentation's macro builds its
+    /// `ModelAnnotation.new(table_name: table_name, ...)`. Answered when
+    /// the class or a model ancestor has a compiled table.
     fn synthesized(&self, name: &str) -> bool {
-        name == "table_name"
-            && std::iter::once(self.owner)
-                .chain(self.chain.iter().map(|m| &m.name))
-                .filter_map(|n| self.app.models.iter().find(|m| &m.name == n))
-                .any(|m| self.app.schema.tables.contains_key(&m.table.0))
+        SCHEMA_CLASS_METHODS.contains(&name)
+            && (self.schema
+                || std::iter::once(self.owner)
+                    .chain(self.chain.iter().map(|m| &m.name))
+                    .filter_map(|n| self.app.models.iter().find(|m| &m.name == n))
+                    .any(|m| self.app.schema.tables.contains_key(&m.table.0)))
     }
 
     fn base_modules(&self) -> &[(&'a LibraryClass, &'a LibraryClass)] {
@@ -845,9 +848,6 @@ impl<'s, 'a> Walk<'s, 'a> {
             return walked;
         }
         if CLASS_SIDE_BUILTINS.contains(&name) || self.side.synthesized(name) {
-            return Ok(());
-        }
-        if self.side.schema && SCHEMA_CLASS_METHODS.contains(&name) {
             return Ok(());
         }
         Err(format!("{} calls `{name}`, which the lowered `{}` does not define", self.via(), self.side.owner.0.as_str()))
