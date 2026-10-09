@@ -269,3 +269,34 @@ fn plain_scalar_values_are_not_reparsed_as_documents() {
     assert_eq!(field(&f, "one", "copy").as_deref(), Some("..."));
     assert_eq!(field(&f, "one", "metadata").as_deref(), Some(r#"{"number":12,"float":1.5,"flag":true,"empty":null,"string":"012"}"#));
 }
+
+/// The shape bin/slice.rb (v3.26) writes for a set Core spreads over
+/// several files (FasterFixtures unions their rows): one merged
+/// `_fixture:` header, then each file's body in order. Each body may
+/// define its own `DEFAULTS` anchor; the repeated (ignored) key is
+/// dropped, every row keeps its own file's defaults, and the ERB values
+/// of the `.yml.erb` part ride through.
+#[test]
+fn a_set_merged_from_several_files_keeps_each_files_rows_and_defaults() {
+    let f = fixture(
+        "_fixture:\n  ignore:\n    - DEFAULTS\n    - SETTINGS_DEFAULTS\n\
+         \n# --- essentials/shops.yml\n\
+         DEFAULTS: &DEFAULTS\n  email: a@x\n\
+         snowdevil:\n  <<: *DEFAULTS\n  name: Snowdevil\n\
+         \n# --- shop_identity/shops.yml.erb\n\
+         DEFAULTS: &DEFAULTS\n  email: b@x\n\
+         SETTINGS_DEFAULTS: &SETTINGS\n  plan: basic\n\
+         shop_one:\n  <<: [*DEFAULTS, *SETTINGS]\n  \
+         billing_account_id: \"<%= ActiveRecord::FixtureSet.identify(:b) %>\"\n",
+    )
+    .expect("ingest");
+    let labels: Vec<&str> = f.records.keys().map(|k| k.as_str()).collect();
+    assert_eq!(labels, ["snowdevil", "shop_one"]);
+    assert_eq!(field(&f, "snowdevil", "email").as_deref(), Some("a@x"));
+    assert_eq!(field(&f, "shop_one", "email").as_deref(), Some("b@x"));
+    assert_eq!(field(&f, "shop_one", "plan").as_deref(), Some("basic"));
+    assert!(matches!(
+        f.records[&Symbol::from("shop_one")].get(&Symbol::from("billing_account_id")),
+        Some(FixtureValue::Ruby(_))
+    ));
+}
