@@ -22,7 +22,12 @@
 //!   subclass's call of an inherited macro, a test source registered
 //!   after the test, `A = B =`, changes through `const_get` or a block,
 //!   a class-body local a loop's tests read, a concern macro that cannot
-//!   be expanded or is registered later).
+//!   be expanded or is registered later, a module mixed in again, a
+//!   prepended module, `alias_method`, a `ClassMethods` reopened in
+//!   another source, a concern the superclass has, a macro called in a
+//!   loop, a condition or a plain method, a change through a part of a
+//!   constant: `first`, `to_a`, a block call's result, an unfrozen String
+//!   another constant holds).
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -34,7 +39,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::process::Command;
 
-const STAGED_CHANGE: &str = r##"module StagedChange
+/// As Core's sources are, with frozen String literals: an unfrozen
+/// String constant another constant holds is a gap
+/// (`changes_through_parts_of_a_constant_are_gaps`).
+const STAGED_CHANGE: &str = r##"# frozen_string_literal: true
+
+module StagedChange
   ADD = "add"
   REMOVE = "remove"
   TIP = "tip"
@@ -1281,4 +1291,335 @@ fn unexpandable_or_later_concern_macros_are_named() {
         &["tests declared by a call of the class method `test_permission` are not modeled; they will not run (`ConcernMacroTest` line 4: the module that defines it is not known (`Access::PermissionHelper` is declared in test/support/helpers/access/permission_helper.rb, a test source not registered before this one))"],
     );
     assert_eq!(native.len(), 2, "{native:#?}");
+}
+
+// ---- Round 3: mixin order, aliases, reopened modules, nested calls ----
+
+/// The message prefix of a gap for a call of the macro `name`.
+fn call_gap(name: &str, class: &str, line: u32) -> String {
+    format!("tests declared by a call of the class method `{name}` are not modeled; they will not run (`{class}` line {line}: ")
+}
+
+const C_ONE: &str = "module COne\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def cgen(k)\n      test(\"one #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+const C_TWO: &str = "module CTwo\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def cgen(k)\n      test(\"two #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+
+/// Extending or including a module the class already has adds nothing:
+/// the module mixed in between keeps its place ahead of it. Including
+/// `A, B` puts `A` first.
+#[test]
+fn mixing_in_a_module_again_adds_nothing() {
+    let gen_a = "module GenA\n  def gen(k)\n    test(\"a #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let gen_b = "module GenB\n  def gen(k)\n    test(\"b #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let test = r##"class ReextendTest < ActiveSupport::TestCase
+  extend GenA
+  extend GenB
+  extend GenA
+
+  gen(:x)
+end
+
+class ReincludeTest < ActiveSupport::TestCase
+  include COne
+  include CTwo
+  include COne
+
+  cgen(:y)
+end
+
+class ArgOrderTest < ActiveSupport::TestCase
+  include COne, CTwo
+
+  cgen(:z)
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/c_one.rb", C_ONE),
+            ("app/models/c_two.rb", C_TWO),
+            ("app/models/gen_a.rb", gen_a),
+            ("app/models/gen_b.rb", gen_b),
+            ("test/models/reextend_test.rb", test),
+        ],
+        &["ReextendTest", "ReincludeTest", "ArgOrderTest"],
+        &|_| false,
+        &[],
+    );
+    assert_eq!(
+        native.keys().collect::<Vec<_>>(),
+        ["ArgOrderTest#test_one_z", "ReextendTest#test_b_x", "ReincludeTest#test_two_y"]
+    );
+}
+
+/// A prepended concern's class methods come before the class's own
+/// (`singleton_class.prepend`): the call is named, never expanded with
+/// the class's own macro.
+#[test]
+fn a_prepended_module_is_named() {
+    let pre = "module PreConcern\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def gen(k)\n      test(\"pre #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+    let test = r##"class PrependTest < ActiveSupport::TestCase
+  class << self
+    def gen(k)
+      test("own #{k}") { assert_kind_of Symbol, k }
+    end
+  end
+
+  prepend PreConcern
+
+  gen(:z)
+
+  test "kept" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/pre_concern.rb", pre), ("test/models/prepend_test.rb", test)],
+        &["PrependTest"],
+        &|id| id == "PrependTest#test_pre_z",
+        &[&format!("{}a module the class body prepends (line 8) comes before its own methods", call_gap("gen", "PrependTest", 10))],
+    );
+    assert_eq!(native.keys().collect::<Vec<_>>(), ["PrependTest#test_kept", "PrependTest#test_pre_z"]);
+}
+
+/// `alias_method` after a def makes the name run the aliased method; a
+/// concern's `ClassMethods` reopened in another source (which loads after
+/// it) is named.
+#[test]
+fn aliases_and_reopened_class_methods_are_followed_or_named() {
+    let alias = r##"module AliasConcern
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    def gen(k)
+      test("alias #{k}") { assert_kind_of Symbol, k }
+    end
+
+    def quiet(k)
+    end
+
+    alias_method :gen, :quiet
+  end
+end
+"##;
+    let plain = "module PlainConcern\n  extend ActiveSupport::Concern\n\n  module ClassMethods\n    def pgen(k)\n    end\n  end\nend\n";
+    let plain_ext = "module PlainConcern\n  module ClassMethods\n    def pgen(k)\n      test(\"reopened #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+    let gen_ext = "module GenConcern\n  module ClassMethods\n    def gen(k)\n    end\n  end\nend\n";
+    let test = r##"class AliasTest < ActiveSupport::TestCase
+  include AliasConcern
+
+  gen(:q)
+
+  test "alias kept" do
+    assert true
+  end
+end
+
+class ReopenedTest < ActiveSupport::TestCase
+  include PlainConcern
+
+  pgen(:r)
+end
+
+class LateReopenTest < ActiveSupport::TestCase
+  include GenConcern
+
+  gen(:a)
+
+  test "kept" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/alias_concern.rb", alias),
+            ("app/models/gen_concern.rb", GEN_CONCERN),
+            ("app/models/gen_concern_ext.rb", gen_ext),
+            ("app/models/plain_concern.rb", plain),
+            ("app/models/plain_concern_ext.rb", plain_ext),
+            ("test/models/alias_test.rb", test),
+        ],
+        &["AliasTest", "ReopenedTest", "LateReopenTest"],
+        &|id| id == "ReopenedTest#test_reopened_r",
+        &[
+            &format!("{}the module that defines it is not known (", call_gap("pgen", "ReopenedTest", 14)),
+            &format!("{}the module that defines it is not known (", call_gap("gen", "LateReopenTest", 20)),
+        ],
+    );
+    assert_eq!(
+        native.keys().collect::<Vec<_>>(),
+        ["AliasTest#test_alias_kept", "LateReopenTest#test_kept", "ReopenedTest#test_reopened_r"]
+    );
+}
+
+/// A concern the superclass already includes is not included again
+/// (`append_features` returns false): the call runs what the superclass
+/// gives, so it is named.
+#[test]
+fn a_concern_the_superclass_has_is_named() {
+    let test = r##"class AParentTest < ActiveSupport::TestCase
+  include GenConcern
+
+  def self.gen(k)
+  end
+
+  test "parent" do
+    assert true
+  end
+end
+
+class BChildTest < AParentTest
+  include GenConcern
+
+  gen(:c)
+end
+"##;
+    let native = matches_native(
+        &[("app/models/gen_concern.rb", GEN_CONCERN), ("test/models/a_parent_test.rb", test)],
+        &["AParentTest", "BChildTest"],
+        &|_| false,
+        &[&format!("{}`GenConcern` may already be an ancestor of the class (", call_gap("gen", "BChildTest", 15))],
+    );
+    assert_eq!(native.keys().collect::<Vec<_>>(), ["AParentTest#test_parent", "BChildTest#test_parent"]);
+}
+
+/// A macro called inside a loop or a condition, or by a plain method the
+/// class calls, is named; the class's direct calls are expanded.
+#[test]
+fn macro_calls_not_made_by_the_class_body_are_named() {
+    let ind = r##"module IndConcern
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def gen(k)
+      test("ind #{k}") { assert_kind_of Symbol, k }
+    end
+
+    def gen_twice(k)
+      gen(k)
+      gen(:"#{k}2")
+    end
+  end
+end
+"##;
+    let test = r##"class LoopConcernTest < ActiveSupport::TestCase
+  include GenConcern
+
+  [:d, :e].each { |k| gen(k) }
+  gen(:f) if true
+  gen(:g)
+end
+
+class IndirectTest < ActiveSupport::TestCase
+  include IndConcern
+
+  gen_twice(:h)
+  gen(:i)
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/gen_concern.rb", GEN_CONCERN),
+            ("app/models/ind_concern.rb", ind),
+            ("test/models/loop_concern_test.rb", test),
+        ],
+        &["LoopConcernTest", "IndirectTest"],
+        &|id| !id.ends_with("_g") && !id.ends_with("_i"),
+        &[
+            &format!("{}it is called inside `[:d, :e].each {{ |k| gen(k) }}`, which is not expanded", call_gap("gen", "LoopConcernTest", 4)),
+            &format!("{}it is called inside `gen(:f) if true`, which is not expanded", call_gap("gen", "LoopConcernTest", 5)),
+            &format!("{}the method it runs, `IndConcern`'s, declares no test itself but calls `gen`, which may declare tests)", call_gap("gen_twice", "IndirectTest", 12)),
+        ],
+    );
+    assert_eq!(native.len(), 7, "{native:#?}");
+}
+
+/// A load-time change through a part of a constant (`first`, `to_a`,
+/// `to_h`, a block call's result, an unfrozen String another constant
+/// holds) is a gap for a loop over it; a test body's use of it runs once
+/// every test is declared and is not.
+#[test]
+fn changes_through_parts_of_a_constant_are_gaps() {
+    let levels = "module Levels\n  NAMES = %w[x y]\n  ALL = [:a, :b]\n  MAP = { k: 1 }\n  PICKED = %w[p q]\n  KEPT = [[\"m\", \"n\"]].freeze\nend\n";
+    let setup = r##"first = Levels::NAMES.first
+first << "z"
+list = Levels::ALL.to_a
+list << :c
+h = Levels::MAP.to_h
+h[:j] = 2
+picked = Levels::PICKED.select { |p| p == "p" }
+picked.first << "!"
+seed = Held::SEEDS.first
+seed << "!"
+"##;
+    let test = r##"class PartsTest < ActiveSupport::TestCase
+  Levels::NAMES.each do |n|
+    test "name #{n}" do
+      assert_kind_of String, n
+    end
+  end
+
+  Levels::ALL.each do |l|
+    test "level #{l}" do
+      assert_kind_of Symbol, l
+    end
+  end
+
+  Levels::MAP.each do |k, v|
+    test "map #{k}" do
+      assert_kind_of Integer, v
+    end
+  end
+
+  Levels::PICKED.each do |p|
+    test "picked #{p}" do
+      assert_kind_of String, p
+    end
+  end
+
+  Levels::KEPT.each do |pair|
+    test "kept #{pair.join}" do
+      assert_same Levels::KEPT.first, pair
+      refute_predicate pair, :frozen?
+    end
+  end
+
+  setup do
+    @pair = Levels::KEPT.first
+  end
+
+  def test_reads_a_part
+    assert_same @pair, Levels::KEPT[0]
+  end
+
+  Held::SEEDS.each do |seed|
+    test "seed #{seed}" do
+      assert_kind_of String, seed
+    end
+  end
+end
+"##;
+    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
+    let native = matches_native(
+        &[
+            ("app/models/held.rb", "module Held\n  ADD = \"add\"\n  SEEDS = [ADD].freeze\nend\n"),
+            ("app/models/levels.rb", levels),
+            ("app/models/levels_setup.rb", setup),
+            ("test/models/parts_test.rb", test),
+        ],
+        &["PartsTest"],
+        &|id| !id.contains("#test_kept_") && !id.ends_with("#test_reads_a_part"),
+        &[
+            &format!("{changed} (`PartsTest` line 2, first test at line 3: `Levels::NAMES`: `first = Levels::NAMES.first` (app/models/levels_setup.rb line 1))"),
+            &format!("{changed} (`PartsTest` line 8, first test at line 9: `Levels::ALL`: `list = Levels::ALL.to_a` (app/models/levels_setup.rb line 3))"),
+            &format!("{changed} (`PartsTest` line 14, first test at line 15: `Levels::MAP`: `h = Levels::MAP.to_h` (app/models/levels_setup.rb line 5))"),
+            &format!("{changed} (`PartsTest` line 20, first test at line 21: `Levels::PICKED`: `picked = Levels::PICKED.select {{ |p| p == \"p\" }}` (app/models/levels_setup.rb line 7))"),
+            // `Held::ADD` is refused where `[ADD]` holds it, so the element
+            // and the name are not known.
+            "tests declared by a loop whose test names are not known before it runs are not modeled; they will not run (`PartsTest` line 41, first test at line 42: \"seed #{seed}\")",
+        ],
+    );
+    for id in ["PartsTest#test_name_xz", "PartsTest#test_level_c", "PartsTest#test_map_j", "PartsTest#test_picked_p!", "PartsTest#test_kept_mn", "PartsTest#test_seed_add!"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
 }

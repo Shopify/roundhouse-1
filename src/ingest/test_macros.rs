@@ -30,6 +30,20 @@
 //! methods another way (`define_singleton_method`, an `extend` of a
 //! module not known), a module a test source registered later declares,
 //! or a superclass's macro, makes the call a named gap.
+//!
+//! Mixing in follows Ruby: an `include` or `extend` of a module the
+//! class already has adds nothing (`include A, B` mixes `B` in first);
+//! an `alias_method` after a `def` makes the name the aliased method's.
+//! The call is named, not expanded, when what it runs is not certain:
+//! a module the body prepends (it comes before the class's own methods),
+//! a module whose `ClassMethods` another source reopens or changes, a
+//! concern an ancestor may already include (`append_features` then adds
+//! nothing; `mixed_in` scans the sources that mix the module in), a
+//! module statement that may define the name again after its `def`. A
+//! plain method whose body calls a macro, `test`, or a method not known
+//! before it runs (`reaching`) is named as well, as is a macro called
+//! inside a statement this module does not expand (a loop, a modifier
+//! `if`: `nested_call`).
 //! Each call is expanded as Ruby runs it: the arguments are bound to the
 //! parameters (`test_unroll::bind_call`), each test is named as the
 //! macro names it (`#{key}`, `to_sentence`), and its body starts by
@@ -79,21 +93,48 @@ enum GivenKind {
     /// Its body declares tests: (def start, def end, the lexical scopes
     /// of its body).
     Macro(usize, usize, Vec<String>),
-    /// It declares none itself: the first method its body calls.
-    Plain(Option<String>),
+    /// It declares none itself.
+    Plain(Calls),
+}
+
+/// The methods a plain method's body calls as the class body runs it
+/// (not in a block a test or hook runs later, nor in a nested `def`).
+#[derive(Clone, Default)]
+struct Calls {
+    /// Receiverless (or `self.`) calls by name, `super` included.
+    names: Vec<String>,
+    /// A call whose method is not known before it runs (`send(name)`,
+    /// `public_send`, `instance_exec`, `method_missing`).
+    dynamic: Option<String>,
+}
+
+/// A statement of a module body, other than a `def`, that may give the
+/// includer (or extender) more singleton methods.
+#[derive(Clone)]
+enum More {
+    /// Defines these names (`define_method(:a)`, `attr_reader :a`,
+    /// `alias_method :a, :b` of a method not defined before it).
+    Names(Vec<String>),
+    /// Adds a module behind this one (`include X`): it gives only a name
+    /// this module does not define.
+    Behind,
+    /// May define any name.
+    Any,
 }
 
 /// The methods a module body defines for its includer's (or extender's)
 /// singleton class.
 #[derive(Clone, Default)]
 struct Methods {
+    /// In order: a name defined again (or aliased) later is the later.
     given: Vec<Given>,
     /// It includes or extends TestGenerator, so `generate_test` in a
     /// macro is its.
     generator: bool,
-    /// A statement that may define more (`include X`, `define_method`,
-    /// `alias_method`).
-    more: Option<String>,
+    /// Statements that may define more, as (how many of `given` are
+    /// defined before it, the statement, what it may define): a hook
+    /// that runs as the module is mixed in comes after them all.
+    more: Vec<(usize, String, More)>,
 }
 
 /// A concern (`extend ActiveSupport::Concern`) from a source.
@@ -109,8 +150,13 @@ struct Concern {
     /// The lexical scopes inside it.
     cref: Vec<String>,
     /// A statement that changes the includer's singleton class other
-    /// than by `ClassMethods` (in its `included do`, or its own hook).
-    hook: Option<String>,
+    /// than by `ClassMethods` (in its `included do`, or its own hook),
+    /// and whether it may prepend (what it gives comes before the
+    /// class's own methods).
+    hook: Option<(String, bool)>,
+    /// The span of its `module` statement.
+    start: usize,
+    end: usize,
 }
 
 thread_local! {
@@ -127,10 +173,12 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static MACRO_NAMES: RefCell<(Option<String>, u32, Option<Option<String>>, HashMap<String, String>)> =
         RefCell::new((None, 0, None, HashMap::new()));
-    /// `foreign_use` answers: (registry first path, files) → (name, file) → answer.
+    /// `foreign_use` answers: (registry first path) → (name, file) →
+    /// (registered files read, late root read, answer). Registering more
+    /// files only adds uses, so each file is read once per name.
     #[allow(clippy::type_complexity)]
-    static FOREIGN: RefCell<((Option<String>, u32), HashMap<(String, String), Option<String>>)> =
-        RefCell::new(((None, 0), HashMap::new()));
+    static FOREIGN: RefCell<(Option<String>, HashMap<(String, String), (u32, Option<Option<String>>, Option<String>)>)> =
+        RefCell::new((None, HashMap::new()));
 }
 
 fn fingerprint(text: &str) -> u64 {
@@ -219,7 +267,8 @@ fn record_concerns(root: &Node<'_>, file: &str, print: u64) -> Vec<Concern> {
                     if exact {
                         let mut cref: Vec<String> = self.scopes.iter().map(|(n, _)| n.clone()).collect();
                         cref.push(name.clone());
-                        if let Some(concern) = concern_of(&body, &name, &cref, self.file, self.print) {
+                        let span = (module.location().start_offset(), module.location().end_offset());
+                        if let Some(concern) = concern_of(&body, &name, &cref, self.file, self.print, span) {
                             self.found.push(concern);
                         }
                     }
@@ -249,7 +298,7 @@ fn flatten_statements_of<'pr>(node: &Node<'pr>) -> Vec<Node<'pr>> {
 /// The concern whose body is `body` (an `extend ActiveSupport::Concern`
 /// module): its `module ClassMethods` or `class_methods do`, the modules
 /// it includes, and a hook that changes its includer's singleton class.
-fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, print: u64) -> Option<Concern> {
+fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, print: u64, span: (usize, usize)) -> Option<Concern> {
     let is_concern = body.iter().any(|s| {
         s.as_call_node().is_some_and(|c| {
             c.receiver().is_none()
@@ -280,7 +329,7 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
         }
         if let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_some()) {
             if matches!(def.name().as_slice(), b"included" | b"append_features" | b"prepended" | b"prepend_features") {
-                hook.get_or_insert_with(|| first_line(stmt));
+                hook.get_or_insert_with(|| (first_line(stmt), may_prepend(stmt)));
             }
             continue;
         }
@@ -296,14 +345,16 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
                     match consts::segments(&arg) {
                         Some((segs, false)) => dependencies.push(segs),
                         _ => {
-                            hook.get_or_insert_with(|| first_line(stmt));
+                            hook.get_or_insert_with(|| (first_line(stmt), may_prepend(stmt)));
                         }
                     }
                 }
             }
             b"included" | b"prepended" => {
-                if let Some(op) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()).and_then(|b| singleton_op(&b)) {
-                    hook.get_or_insert(op);
+                if let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+                    if let Some(op) = singleton_op(&body) {
+                        hook.get_or_insert((op, may_prepend(&body)));
+                    }
                 }
             }
             _ => {}
@@ -317,7 +368,19 @@ fn concern_of(body: &[Node<'_>], module: &str, cref: &[String], file: &str, prin
         dependencies,
         cref: cref.to_vec(),
         hook,
+        start: span.0,
+        end: span.1,
     })
+}
+
+/// May `node` prepend to a singleton class (`singleton_class.prepend
+/// M`, a `send` of a name not known before it runs)? What a prepended
+/// module gives comes before the class's own methods, defined before or
+/// after it.
+fn may_prepend(node: &Node<'_>) -> bool {
+    let text = node.location().as_slice();
+    let has = |word: &[u8]| text.windows(word.len()).any(|w| w == word);
+    has(b"prepend") || has(b"send")
 }
 
 /// Record the methods of a module body's `items` (written where the
@@ -330,7 +393,7 @@ fn methods_of(items: &[Node<'_>], scopes: &[String], out: &mut Methods) {
                 let kind = if def.body().is_some_and(|b| hidden_test_declaration(&b).is_some()) {
                     GivenKind::Macro(loc.start_offset(), loc.end_offset(), scopes.to_vec())
                 } else {
-                    GivenKind::Plain(def.body().and_then(|b| first_call(&b)))
+                    GivenKind::Plain(def.body().map(|b| calls_of(&b)).unwrap_or_default())
                 };
                 out.given.push(Given { name: constant_id_str(&def.name()).to_string(), kind });
             }
@@ -340,9 +403,60 @@ fn methods_of(items: &[Node<'_>], scopes: &[String], out: &mut Methods) {
             out.generator = true;
             continue;
         }
-        if !defines_nothing(item) && out.more.is_none() {
-            out.more = Some(first_line(item));
+        // `alias_method :new, :old` (`alias new old`) of a method defined
+        // before it: `new` runs `old`'s body.
+        if let Some((new, old)) = alias_of(item) {
+            match out.given.iter().rposition(|g| g.name == old) {
+                Some(at) => {
+                    let kind = out.given[at].kind.clone();
+                    out.given.push(Given { name: new, kind });
+                }
+                None => out.more.push((out.given.len(), first_line(item), More::Names(vec![new]))),
+            }
+            continue;
         }
+        if defines_nothing(item) {
+            continue;
+        }
+        let more = match item.as_call_node().filter(|c| c.receiver().is_none() && c.block().is_none()) {
+            Some(call) => {
+                let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                let symbols: Option<Vec<String>> = args
+                    .iter()
+                    .map(|a| a.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+                    .collect();
+                match (call.name().as_slice(), symbols) {
+                    // Its own singleton class's, not the includer's.
+                    (b"extend", _) if !args.is_empty() && args.iter().all(|a| consts::segments(a).is_some()) => continue,
+                    (b"include", _) if !args.is_empty() && args.iter().all(|a| consts::segments(a).is_some()) => More::Behind,
+                    (b"attr_reader" | b"attr_accessor" | b"attr_writer" | b"attr", Some(names)) if !names.is_empty() => {
+                        let writer = call.name().as_slice() != b"attr_reader" && call.name().as_slice() != b"attr";
+                        let mut all = names.clone();
+                        if writer {
+                            all.extend(names.iter().map(|n| format!("{n}=")));
+                        }
+                        More::Names(all)
+                    }
+                    (b"define_method", Some(names)) if names.len() == 1 => More::Names(names),
+                    _ => More::Any,
+                }
+            }
+            None => More::Any,
+        };
+        out.more.push((out.given.len(), first_line(item), more));
+    }
+}
+
+/// `alias_method :new, :old` or `alias new old` (Symbols): (new, old).
+fn alias_of(item: &Node<'_>) -> Option<(String, String)> {
+    let sym = |n: &Node<'_>| n.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+    if let Some(alias) = item.as_alias_method_node() {
+        return Some((sym(&alias.new_name())?, sym(&alias.old_name())?));
+    }
+    let call = item.as_call_node().filter(|c| c.receiver().is_none() && c.name().as_slice() == b"alias_method")?;
+    match call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default().as_slice() {
+        [new, old] => Some((sym(new)?, sym(old)?)),
+        _ => None,
     }
 }
 
@@ -525,6 +639,23 @@ fn macro_defs(text: &str) -> Vec<String> {
                 self.out.push(constant_id_str(&node.name()).to_string());
             }
         }
+        // An alias of a macro is one.
+        fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
+            self.alias(&node.as_node());
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.alias(&node.as_node());
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    impl Scan {
+        fn alias(&mut self, node: &Node<'_>) {
+            if let Some((new, old)) = alias_of(node) {
+                if self.out.contains(&old) {
+                    self.out.push(new);
+                }
+            }
+        }
     }
     let result = ruby_prism::parse(text.as_bytes());
     let mut scan = Scan { in_class: Vec::new(), out: Vec::new() };
@@ -598,13 +729,26 @@ pub(super) struct Macros<'pr> {
     /// Every class method the body defines, in order.
     own: Vec<Own<'pr>>,
     /// Statements of the body that may define class methods ingest does
-    /// not list, as (start, the statement): `define_singleton_method`, a
-    /// concern's `included` hook, an `attr_accessor` in `class << self`.
-    opaque: Vec<(usize, String)>,
+    /// not list, as (start, the statement, it may prepend):
+    /// `define_singleton_method`, a concern's `included` hook, an
+    /// `attr_accessor` in `class << self`, `singleton_class.prepend M`.
+    opaque: Vec<(usize, String, bool)>,
     /// What the modules the body includes and extends give its singleton
     /// class, as (statement start, gift), the one Ruby looks in last
-    /// first.
+    /// first. A module the class body already mixed in gives nothing
+    /// again (Ruby's `include`/`extend` of an ancestor, a concern's
+    /// `append_features` for an includer that has it).
     gifts: Vec<(usize, Gives)>,
+    /// What the concerns the body prepends give (before the class's own
+    /// singleton methods), as (statement start, gift).
+    prepended: Vec<(usize, Gives)>,
+    /// The concerns the body includes (or that they include), whose own
+    /// dependencies `gifts` follows.
+    concerns: Vec<String>,
+    /// The superclass as written, or why it is not known.
+    superclass: Result<Vec<String>, String>,
+    /// `superclass_names` of it, with the class's own and Ruby's.
+    chain: std::cell::OnceCell<Result<Vec<String>, String>>,
     /// The class body extends TestGenerator.
     generator: bool,
     file: String,
@@ -634,27 +778,53 @@ fn mixin_call<'pr>(stmt: &Node<'pr>) -> Option<(&'static str, Vec<Node<'pr>>)> {
     Some((verb, call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default()))
 }
 
+/// The modules a class body has mixed in so far: an `include` (or
+/// `prepend`) of one it includes, or an `extend` of one its singleton
+/// class has, changes nothing.
+#[derive(Default)]
+struct Seen {
+    /// Included or prepended (concerns' dependencies too).
+    class: Vec<String>,
+    /// Extended (a concern's `ClassMethods` as `{concern}::ClassMethods`).
+    singleton: Vec<String>,
+    /// The concerns among `class`.
+    concerns: Vec<String>,
+}
+
 /// What `include`ing (or `prepend`ing) the module written `segs` where
 /// the lexical scopes are `cref` gives the includer's singleton class,
 /// the one Ruby looks in last first, and an `included` hook that
-/// changes it there.
-fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize) -> (Vec<Gives>, Option<String>) {
+/// changes it there (and whether it may prepend). A module the class
+/// body already has gives nothing (`seen`).
+fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize, seen: &mut Seen) -> (Vec<Gives>, Option<(String, bool)>) {
     let written = segs.join("::");
     let full = match resolve_module(segs, cref) {
         Ok(Some(full)) => full,
         Ok(None) => return (Vec::new(), None),
         Err(why) => return (vec![Gives::Unknown(why)], None),
     };
-    let found: Vec<(String, Methods, Vec<Vec<String>>, Vec<String>, Option<String>)> = CONCERNS.with(|c| {
+    if seen.class.contains(&full) {
+        return (Vec::new(), None);
+    }
+    seen.class.push(full.clone());
+    #[allow(clippy::type_complexity)]
+    let found: Vec<(String, Methods, Vec<Vec<String>>, Vec<String>, Option<(String, bool)>, usize, usize)> = CONCERNS.with(|c| {
         c.borrow()
             .iter()
             .filter(|concern| concern.module == full)
             .filter(|concern| sources::with_text(&concern.path, fingerprint) == Some(concern.fingerprint))
-            .map(|c| (c.path.clone(), c.methods.clone(), c.dependencies.clone(), c.cref.clone(), c.hook.clone()))
+            .map(|c| (c.path.clone(), c.methods.clone(), c.dependencies.clone(), c.cref.clone(), c.hook.clone(), c.start, c.end))
             .collect()
     });
     match found.as_slice() {
-        [(path, methods, dependencies, inner, hook)] => {
+        [(path, methods, dependencies, inner, hook, start, end)] => {
+            // `ClassMethods` reopened (or the concern) in another source:
+            // the methods it gives are not all in this one.
+            let scope = inner.len().checked_sub(2).and_then(|i| inner.get(i)).map(String::as_str);
+            if let Some(why) = consts::reopened_elsewhere(&full, path, *start, *end, scope) {
+                return (vec![Gives::Unknown(why)], None);
+            }
+            seen.concerns.push(full.clone());
             let mut out = Vec::new();
             let mut hooks = None;
             for dep in dependencies {
@@ -662,12 +832,18 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize) -> (Vec
                     out.push(Gives::Unknown(format!("`{full}` includes concerns more than 8 deep")));
                     break;
                 }
-                let (gives, hook) = include_gives(dep, Some(inner), depth + 1);
+                let (gives, hook) = include_gives(dep, Some(inner), depth + 1, seen);
                 out.extend(gives);
                 hooks = hooks.or(hook);
             }
-            out.push(Gives::Methods { from: full.clone(), path: path.clone(), methods: methods.clone() });
-            let hook = hook.as_ref().map(|h| format!("the concern `{full}` changes its includer's singleton class (`{h}`)"));
+            let class_methods = format!("{full}::ClassMethods");
+            if !seen.singleton.contains(&class_methods) {
+                seen.singleton.push(class_methods);
+                out.push(Gives::Methods { from: full.clone(), path: path.clone(), methods: methods.clone() });
+            }
+            let hook = hook
+                .as_ref()
+                .map(|(h, sticky)| (format!("the concern `{full}` changes its includer's singleton class (`{h}`)"), *sticky));
             (out, hook.or(hooks))
         }
         [_, _, ..] => (vec![Gives::Unknown(format!("`{written}` is declared as a concern in more than one source"))], None),
@@ -684,13 +860,18 @@ fn include_gives(segs: &[String], cref: Option<&[String]>, depth: usize) -> (Vec
 }
 
 /// What `extend`ing the module written `segs` where the lexical scopes
-/// are `cref` gives the singleton class.
-fn extend_gives(segs: &[String], cref: Option<&[String]>) -> Option<Gives> {
+/// are `cref` gives the singleton class: nothing for one it has
+/// (`seen`).
+fn extend_gives(segs: &[String], cref: Option<&[String]>, seen: &mut Seen) -> Option<Gives> {
     let full = match resolve_module(segs, cref) {
         Ok(Some(full)) => full,
         Ok(None) => return None,
         Err(why) => return Some(Gives::Unknown(why)),
     };
+    if seen.singleton.contains(&full) {
+        return None;
+    }
+    seen.singleton.push(full.clone());
     let decls = match consts::module_declarations(&full) {
         Ok(decls) => decls,
         Err(why) => return Some(Gives::Unknown(why)),
@@ -703,8 +884,9 @@ fn extend_gives(segs: &[String], cref: Option<&[String]>) -> Option<Gives> {
             let root = result.node();
             let module = node_at(&root, *start, *end)?.as_module_node()?;
             let items = module.body().map(flatten_statements).unwrap_or_default();
+            // `def self.extended` runs after the body defined its methods.
             if let Some(hook) = items.iter().find(|i| i.as_def_node().is_some_and(|d| d.receiver().is_some() && d.name().as_slice() == b"extended")) {
-                methods.more.get_or_insert_with(|| first_line(hook));
+                methods.more.push((usize::MAX, first_line(hook), More::Any));
             }
             methods_of(&items, scopes, &mut methods);
             Some(())
@@ -763,8 +945,10 @@ fn module_hook(decls: &[(String, usize, usize, Vec<String>)]) -> Option<String> 
 impl<'pr> Macros<'pr> {
     pub(super) fn of_class(class_node: &ruby_prism::ClassNode<'pr>, body: &[Node<'pr>], class: &ClassId, file: &str) -> Self {
         let mut own = Vec::new();
-        let mut opaque: Vec<(usize, String)> = Vec::new();
+        let mut opaque: Vec<(usize, String, bool)> = Vec::new();
         let mut gifts: Vec<(usize, Gives)> = Vec::new();
+        let mut prepended: Vec<(usize, Gives)> = Vec::new();
+        let mut seen = Seen::default();
         let mut generator = false;
         let declares = |def: &ruby_prism::DefNode<'_>| def.body().is_some_and(|b| hidden_test_declaration(&b).is_some());
         let cref = consts::cref_of(file, class_node.location().start_offset());
@@ -798,14 +982,16 @@ impl<'pr> Macros<'pr> {
                     } else if let Some(("include", args)) = mixin_call(item) {
                         // `include` in the singleton class: `extend`.
                         sync();
+                        let item_at = item.location().start_offset();
                         for arg in args.iter().rev() {
                             match consts::segments(arg) {
-                                Some((segs, false)) => gifts.extend(extend_gives(&segs, cref.as_deref()).map(|g| (item.location().start_offset(), g))),
-                                _ => opaque.push((item.location().start_offset(), first_line(item))),
+                                Some((segs, false)) => gifts.extend(extend_gives(&segs, cref.as_deref(), &mut seen).map(|g| (item_at, g))),
+                                _ => opaque.push((item_at, first_line(item), may_prepend(item))),
                             }
                         }
                     } else if !defines_nothing(item) {
-                        opaque.push((item.location().start_offset(), first_line(item)));
+                        // `prepend M` here comes before the class's own.
+                        opaque.push((item.location().start_offset(), first_line(item), may_prepend(item)));
                     }
                 }
             } else if let Some(def) = stmt.as_def_node() {
@@ -813,30 +999,34 @@ impl<'pr> Macros<'pr> {
                     let kind = if declares(&def) { OwnKind::Macro } else { OwnKind::Plain };
                     own.push(Own { name: constant_id_str(&def.name()).to_string(), def, kind, singleton: false });
                 } else if def.receiver().is_some() {
-                    opaque.push((at, first_line(stmt)));
+                    opaque.push((at, first_line(stmt), false));
                 }
             } else if let Some((verb, args)) = mixin_call(stmt) {
                 sync();
                 // `include A, B` includes B, then A: A is looked in first.
                 for arg in args.iter().rev() {
                     let Some((segs, false)) = consts::segments(arg) else {
-                        opaque.push((at, first_line(stmt)));
+                        opaque.push((at, first_line(stmt), verb == "prepend" || may_prepend(stmt)));
                         continue;
                     };
                     if verb == "extend" {
                         generator |= segs == ["TestGenerator"];
-                        gifts.extend(extend_gives(&segs, cref.as_deref()).map(|g| (at, g)));
+                        gifts.extend(extend_gives(&segs, cref.as_deref(), &mut seen).map(|g| (at, g)));
                     } else {
-                        let (gives, hook) = include_gives(&segs, cref.as_deref(), 0);
-                        gifts.extend(gives.into_iter().map(|g| (at, g)));
-                        if let Some(hook) = hook {
-                            opaque.push((at, hook));
+                        // A concern's `prepend_features` prepends its
+                        // `ClassMethods` to the singleton class: before
+                        // the class's own methods.
+                        let (gives, hook) = include_gives(&segs, cref.as_deref(), 0, &mut seen);
+                        let list = if verb == "prepend" { &mut prepended } else { &mut gifts };
+                        list.extend(gives.into_iter().map(|g| (at, g)));
+                        if let Some((hook, sticky)) = hook {
+                            opaque.push((at, hook, sticky || verb == "prepend"));
                         }
                     }
                 }
             } else if stmt.as_class_node().is_none() && stmt.as_module_node().is_none() {
                 if let Some(op) = singleton_op(stmt) {
-                    opaque.push((at, op));
+                    opaque.push((at, op, may_prepend(stmt)));
                 }
             }
         }
@@ -850,6 +1040,13 @@ impl<'pr> Macros<'pr> {
             own,
             opaque,
             gifts,
+            prepended,
+            concerns: seen.concerns,
+            superclass: match class_node.superclass() {
+                None => Err("the class statement does not name its superclass".into()),
+                Some(s) => consts::segments(&s).map(|(segs, _)| segs).ok_or_else(|| "its superclass is not a constant".into()),
+            },
+            chain: std::cell::OnceCell::new(),
             generator,
             file: file.to_string(),
             class: class.clone(),
@@ -863,60 +1060,109 @@ impl<'pr> Macros<'pr> {
     /// class's own, one a module gives it, or one any source defines?
     fn matters(&self, name: &str) -> bool {
         self.own.iter().any(|o| o.name == name && !matches!(o.kind, OwnKind::Plain))
-            || self.gifts.iter().any(|(_, g)| match g {
+            || self.gifts.iter().chain(&self.prepended).any(|(_, g)| match g {
                 Gives::Methods { methods, .. } => methods.given.iter().any(|m| m.name == name && matches!(m.kind, GivenKind::Macro(..))),
                 Gives::Unknown(_) => false,
             })
             || macro_defined_in(name).is_some()
     }
 
+    fn line(&self, at: usize) -> String {
+        sources::line_at(&self.file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into())
+    }
+
     /// The macro a call of `name` at `call_at` of the class body runs, as
-    /// Ruby looks it up in the singleton class: the class's own singleton
-    /// method defined last before it (one that declares no test itself
-    /// when it replaces a macro), else that of the module included or
-    /// extended last before it. `None` when the call runs no method that
-    /// declares tests anywhere.
+    /// Ruby looks it up in the singleton class: a concern's prepended
+    /// first, then the class's own singleton method defined last before
+    /// it (one that declares no test itself when it replaces a macro),
+    /// else that of the module included or extended last before it.
+    /// `None` when the call runs no method that declares tests anywhere.
     fn lookup(&self, name: &str, call_at: usize) -> Option<Origin> {
+        // What a prepended module gives comes before the class's own.
+        for (at, gift) in self.prepended.iter().rev().filter(|(at, _)| *at < call_at) {
+            let may = match gift {
+                Gives::Unknown(why) => Some(why.clone()),
+                Gives::Methods { from, methods, .. } => (methods.given.iter().any(|m| m.name == name) || !methods.more.is_empty())
+                    .then(|| format!("`{from}` may define it")),
+            };
+            if let Some(why) = may {
+                return (self.matters(name)).then(|| {
+                    Origin::Unmodeled(format!(
+                        "a module the class body prepends (line {}) comes before its own methods, and is not modeled ({why})",
+                        self.line(*at)
+                    ))
+                });
+            }
+        }
         let own_at = self.own.iter().rposition(|o| o.name == name && o.def.location().start_offset() < call_at);
-        let opaque = self.opaque.iter().filter(|(at, _)| *at < call_at).last();
-        if let Some((at, what)) = opaque {
-            let after_own = own_at.is_none_or(|i| self.own[i].def.location().start_offset() < *at);
-            if after_own && self.matters(name) {
-                let line = sources::line_at(&self.file, *at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
-                return Some(Origin::Unmodeled(format!("the class body may define it another way (`{what}` at line {line})")));
+        let before: Vec<&(usize, String, bool)> = self.opaque.iter().filter(|(at, _, _)| *at < call_at).collect();
+        // One that may prepend comes before a later definition too.
+        let doubt = before.iter().rev().find(|(_, _, prepends)| *prepends).or_else(|| {
+            before.last().filter(|(at, _, _)| own_at.is_none_or(|i| self.own[i].def.location().start_offset() < *at))
+        });
+        if let Some((at, what, _)) = doubt {
+            if self.matters(name) {
+                return Some(Origin::Unmodeled(format!("the class body may define it another way (`{what}` at line {})", self.line(*at))));
             }
         }
         if let Some(at) = own_at {
             return match &self.own[at].kind {
                 OwnKind::Macro => Some(Origin::Own(at)),
                 OwnKind::Unmodeled(why) => Some(Origin::Unmodeled(why.clone())),
-                OwnKind::Plain => self.matters(name).then_some(Origin::Shadow(at)),
+                OwnKind::Plain if self.matters(name) => Some(Origin::Shadow(at)),
+                OwnKind::Plain => {
+                    let calls = self.own[at].def.body().map(|b| calls_of(&b)).unwrap_or_default();
+                    self.reaching(name, &calls, 0, &mut vec![name.to_string()]).map(|why| {
+                        Origin::Unmodeled(format!("the method it runs (line {}) declares no test itself but {why}", self.line(self.own[at].def.location().start_offset())))
+                    })
+                }
             };
         }
         let mut unknown: Option<String> = None;
-        for (_, gift) in self.gifts.iter().rev().filter(|(at, _)| *at < call_at) {
+        for (at, gift) in self.gifts.iter().rev().filter(|(at, _)| *at < call_at) {
             match gift {
                 Gives::Unknown(why) => {
                     unknown.get_or_insert_with(|| why.clone());
                 }
                 Gives::Methods { from, path, methods } => {
-                    let Some(found) = methods.given.iter().rev().find(|m| m.name == name) else {
-                        if let Some(more) = &methods.more {
-                            unknown.get_or_insert_with(|| format!("`{from}` may define it (`{more}`)"));
+                    let found_at = methods.given.iter().rposition(|m| m.name == name);
+                    // A statement after the definition may define it again;
+                    // `include X` there gives only what the module does not.
+                    let later = methods.more.iter().find(|(pos, _, more)| match more {
+                        More::Behind => found_at.is_none(),
+                        More::Names(names) => names.iter().any(|n| n == name) && found_at.is_none_or(|i| *pos > i),
+                        More::Any => found_at.is_none_or(|i| *pos > i),
+                    });
+                    let Some(found_at) = found_at else {
+                        if let Some((_, line, _)) = later {
+                            unknown.get_or_insert_with(|| format!("`{from}` may define it (`{line}`)"));
                         }
                         continue;
                     };
+                    let found = &methods.given[found_at];
                     if let Some(why) = unknown {
                         return self.matters(name).then(|| Origin::Unmodeled(format!("{why}, before `{from}` that defines it")));
+                    }
+                    if let Some((_, line, _)) = later {
+                        return self.matters(name).then(|| Origin::Unmodeled(format!("`{from}` may define it again after its definition (`{line}`)")));
+                    }
+                    let matters = self.matters(name);
+                    if matters {
+                        if let Some(why) = self.ancestry_doubt(from, *at) {
+                            return Some(Origin::Unmodeled(format!(
+                                "`{from}` may already be an ancestor of the class ({why}), so mixing it in at line {} may add nothing",
+                                self.line(*at)
+                            )));
+                        }
                     }
                     return match &found.kind {
                         GivenKind::Macro(start, end, cref) => {
                             Some(Origin::Concern(path.clone(), *start, *end, cref.clone(), methods.generator))
                         }
-                        GivenKind::Plain(None) => self.matters(name).then_some(Origin::Inert),
-                        GivenKind::Plain(Some(called)) => self.matters(name).then(|| {
-                            Origin::Unmodeled(format!("the method it runs, `{from}`'s, declares no test itself but calls `{called}`"))
-                        }),
+                        GivenKind::Plain(calls) => match self.reaching(name, calls, 0, &mut vec![name.to_string()]) {
+                            Some(why) => Some(Origin::Unmodeled(format!("the method it runs, `{from}`'s, declares no test itself but {why}"))),
+                            None => matters.then_some(Origin::Inert),
+                        },
                     };
                 }
             }
@@ -925,6 +1171,86 @@ impl<'pr> Macros<'pr> {
             Some(why) if self.matters(name) => Some(Origin::Unmodeled(format!("the module that defines it is not known ({why})"))),
             _ => None,
         }
+    }
+
+    /// Why a plain class method named `name` whose body makes `calls` may
+    /// declare tests: it calls one that declares tests somewhere (`super`
+    /// of a name that does), one not known before it runs, or a plain
+    /// one the class or a module it mixes in defines that does (at most
+    /// 8 deep).
+    fn reaching(&self, name: &str, calls: &Calls, depth: usize, visited: &mut Vec<String>) -> Option<String> {
+        if let Some(dynamic) = &calls.dynamic {
+            return Some(format!("calls a method not known before it runs (`{dynamic}`)"));
+        }
+        for called in &calls.names {
+            let declares = matches!(called.as_str(), "test" | "generate_test" | "it" | "specify" | "describe" | "context")
+                || if called == "super" { self.matters(name) } else { self.matters(called) };
+            if declares {
+                return Some(format!("calls `{called}`, which may declare tests"));
+            }
+            if visited.contains(called) {
+                continue;
+            }
+            visited.push(called.clone());
+            let mut defined: Vec<Calls> = self
+                .own
+                .iter()
+                .filter(|o| o.name == *called && matches!(o.kind, OwnKind::Plain))
+                .map(|o| o.def.body().map(|b| calls_of(&b)).unwrap_or_default())
+                .collect();
+            for (_, gift) in self.gifts.iter().chain(&self.prepended) {
+                if let Gives::Methods { methods, .. } = gift {
+                    for given in methods.given.iter().filter(|g| g.name == *called) {
+                        if let GivenKind::Plain(inner) = &given.kind {
+                            defined.push(inner.clone());
+                        }
+                    }
+                }
+            }
+            for inner in defined {
+                if depth >= 8 {
+                    return Some(format!("calls `{called}`, which calls methods more than 8 deep"));
+                }
+                if let Some(why) = self.reaching(called, &inner, depth + 1, visited) {
+                    return Some(format!("calls `{called}`, which {why}"));
+                }
+            }
+        }
+        None
+    }
+
+    /// The last names of the class, its superclasses (as written), and
+    /// the classes and modules every Ruby class has as ancestors.
+    fn chain(&self) -> Result<&Vec<String>, String> {
+        self.chain
+            .get_or_init(|| {
+                let written = self.superclass.clone()?;
+                let mut names = consts::superclass_names(&written)?;
+                names.extend(self.class.0.as_str().rsplit("::").next().map(str::to_string));
+                for always in ["Object", "BasicObject", "Kernel", "Module", "Class", "TestCase", "Test", "Runnable"] {
+                    names.push(always.to_string());
+                }
+                Ok(names)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Why the module `module` (mixed in by the class-body statement at
+    /// `gift_at`) may already be an ancestor of the class: a source mixes
+    /// it into the class (another of its bodies), a superclass, Ruby's
+    /// classes, or a module one of those mixes in, or in a way ingest
+    /// does not follow (`X.include(M)`, in a method or block). `None`
+    /// when no source does.
+    fn ancestry_doubt(&self, module: &str, gift_at: usize) -> Option<String> {
+        let chain = match self.chain() {
+            Ok(chain) => chain,
+            Err(why) => return Some(why),
+        };
+        let word = module.rsplit("::").next().unwrap_or(module);
+        let mut visited = vec![word.to_string()];
+        let place = Place { file: &self.file, class_start: self.class_start, gift_at, concerns: &self.concerns };
+        mixed_in(word, chain, &place, 0, &mut visited)
     }
 
     /// The first use of the class method `name` (defined in the class
@@ -1006,7 +1332,10 @@ impl<'pr> Macros<'pr> {
         tag_consts: &TagConstants<'pr>,
     ) -> IngestResult<Option<Vec<Test>>> {
         let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && c.block().is_none()) else {
-            return self.other_call(stmt);
+            if let Some(found) = self.other_call(stmt)? {
+                return Ok(Some(found));
+            }
+            return self.nested_call(stmt);
         };
         let name = constant_id_str(&call.name()).to_string();
         let Some(origin) = self.lookup(&name, call.location().start_offset()) else {
@@ -1082,6 +1411,11 @@ impl<'pr> Macros<'pr> {
     /// Name the tests the call of `name` that is the statement `stmt`
     /// declares as not modeled (`why`), and mark it handled.
     fn name_gap(&self, name: &str, stmt: &Node<'pr>, why: String) -> IngestResult<Option<Vec<Test>>> {
+        self.record_gap(name, stmt, why)?;
+        Ok(Some(Vec::new()))
+    }
+
+    fn record_gap(&self, name: &str, stmt: &Node<'pr>, why: String) -> IngestResult<()> {
         let at = stmt.location().start_offset();
         let line = sources::line_at(&self.file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
         super::super::survey::continue_or_fail(IngestError::Unsupported {
@@ -1093,6 +1427,56 @@ impl<'pr> Macros<'pr> {
         })?;
         let print = sources::with_text(&self.file, fingerprint).unwrap_or_default();
         EXPANDED.with(|e| e.borrow_mut().push((self.file.clone(), print, at)));
+        Ok(())
+    }
+
+    /// The class-body statement `stmt` (not itself a call `expand`
+    /// models) calling a macro inside it as the body runs: in a loop, a
+    /// conditional (`gen(:a) if x`), a block other than a test's or a
+    /// hook's. Named (the class body's own macros' other calls are named
+    /// by `other_use`); a statement that also declares tests itself is
+    /// left to `declare_hidden` after. `None` for any other statement.
+    fn nested_call(&self, stmt: &Node<'pr>) -> IngestResult<Option<Vec<Test>>> {
+        use ruby_prism::Visit;
+        if stmt.as_def_node().is_some() || stmt.as_class_node().is_some() || stmt.as_module_node().is_some() || stmt.as_singleton_class_node().is_some() {
+            return Ok(None);
+        }
+        const LATER: &[&[u8]] = &[b"test", b"setup", b"teardown", b"it", b"specify", b"before", b"after", b"around"];
+        struct Scan {
+            calls: Vec<String>,
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                let name = node.name();
+                if node.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+                    self.calls.push(constant_id_str(&name).to_string());
+                }
+                if node.receiver().is_none() && LATER.contains(&name.as_slice()) && node.block().is_some() {
+                    if let Some(args) = node.arguments() {
+                        self.visit(&args.as_node());
+                    }
+                    return;
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+            fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+            fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+            fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        }
+        let mut scan = Scan { calls: Vec::new() };
+        scan.visit(stmt);
+        let at = stmt.location().start_offset();
+        let found = scan.calls.into_iter().find(|name| {
+            !matches!(name.as_str(), "test" | "generate_test" | "setup" | "teardown")
+                && !self.own.iter().any(|o| o.name == *name)
+                && (self.matters(name) || self.lookup(name, at).is_some_and(|o| !matches!(o, Origin::Inert)))
+        });
+        let Some(name) = found else { return Ok(None) };
+        self.record_gap(&name, stmt, format!("it is called inside `{}`, which is not expanded", first_line(stmt)))?;
+        if hidden_test_declaration(stmt).is_some() {
+            return Ok(None);
+        }
         Ok(Some(Vec::new()))
     }
 
@@ -1246,14 +1630,19 @@ fn uses_generate_test(def: &ruby_prism::DefNode<'_>) -> bool {
 /// where that class is ingested): `Base.gen(…)`, `:gen`, a call from a
 /// method or block.
 fn foreign_use(name: &str, file: &str) -> Option<String> {
-    let key = registry();
-    let cached = FOREIGN.with(|f| {
-        let f = f.borrow();
-        (f.0 == key).then(|| f.1.get(&(name.to_string(), file.to_string())).cloned()).flatten()
+    let (first, count) = registry();
+    let root = consts::late_root();
+    let key = (name.to_string(), file.to_string());
+    let (mut read, mut late_read, mut found) = FOREIGN.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.0 != first {
+            *f = (first.clone(), HashMap::new());
+        }
+        match f.1.get(&key) {
+            Some(entry) if entry.0 <= count => entry.clone(),
+            _ => (0, None, None),
+        }
     });
-    if let Some(found) = cached {
-        return found;
-    }
     let check = |path: &str, text: &str| -> Option<String> {
         if !has_word(text, name) {
             return None;
@@ -1267,29 +1656,322 @@ fn foreign_use(name: &str, file: &str) -> Option<String> {
             Use::Call(at) | Use::Named(at) => Some(format!("{} of {}", use_text(text, at), sources::relative_path(path))),
         })
     };
-    let mut found = None;
-    for id in 1..=key.1 {
-        let Some(path) = sources::path_of(FileId(id)) else { continue };
-        if path == file {
-            continue;
-        }
-        found = sources::with_text(&path, |text| check(&path, text)).flatten();
-        if found.is_some() {
-            break;
-        }
-    }
     if found.is_none() {
+        for id in read + 1..=count {
+            let Some(path) = sources::path_of(FileId(id)) else { continue };
+            if path != file {
+                found = sources::with_text(&path, |text| check(&path, text)).flatten();
+            }
+            read = id;
+            if found.is_some() {
+                break;
+            }
+        }
+        read = read.max(count);
+    }
+    // A test source not registered now is read once per root: when it is
+    // registered, the files above read it.
+    if found.is_none() && late_read.as_ref() != Some(&root) {
         let (files, ids) = consts::late_sources(None);
         found = ids.into_iter().filter(|i| files[*i].0 != file).find_map(|i| check(&files[i].0, &files[i].1));
+        late_read = Some(root);
     }
-    FOREIGN.with(|f| {
-        let mut f = f.borrow_mut();
-        if f.0 != key {
-            *f = (key, HashMap::new());
-        }
-        f.1.insert((name.to_string(), file.to_string()), found.clone());
-    });
+    FOREIGN.with(|f| f.borrow_mut().1.insert(key, (read, late_read, found.clone())));
     found
+}
+
+/// The class body a gift is looked up for: its file, its class
+/// statement's start, the start of the statement that mixes the module
+/// in, and the concerns whose dependencies the body's gifts follow.
+struct Place<'a> {
+    file: &'a str,
+    class_start: usize,
+    gift_at: usize,
+    concerns: &'a [String],
+}
+
+/// A statement that mixes a module whose name ends in a word into
+/// something (`include W`, `extend A::W`, `prepend W::ClassMethods`).
+#[derive(Clone)]
+struct Mixin {
+    path: String,
+    at: usize,
+    /// The statement, with where it is.
+    shown: String,
+    kind: MixinKind,
+}
+
+#[derive(Clone)]
+enum MixinKind {
+    /// Into something not known here: a receiver (`X.include W`), the
+    /// top level, a block that runs as the file loads, a class method,
+    /// a mixin of a module not known before it runs.
+    Unknown,
+    /// Into the class (or its singleton class) a `class` statement
+    /// declares: (its last name, the statement's start, the mixin is a
+    /// statement of its body or of a `class << self` in it).
+    Class(String, usize, bool),
+    /// Into the includers of a module (its body includes or prepends it,
+    /// or its `included do`, or its `ClassMethods`): the module's last
+    /// name.
+    Module(String),
+    /// Into only a module itself (`extend W` in its body), or an object
+    /// in a test or an instance method (run after the tests are listed).
+    Inert,
+}
+
+thread_local! {
+    /// `mixins_of` by word: (registry first path) → word → (last
+    /// registered file read, registered mixins, late root, late mixins).
+    #[allow(clippy::type_complexity)]
+    static MIXINS: RefCell<(Option<String>, HashMap<String, (u32, Vec<Mixin>, Option<Option<String>>, Vec<Mixin>)>)> =
+        RefCell::new((None, HashMap::new()));
+}
+
+/// Every statement in a source (registered, or a test source on disk
+/// not registered now) that mixes in a module whose name has `word` as a
+/// name, or a module not known before it runs.
+fn mixins_of(word: &str) -> Vec<Mixin> {
+    let (first, count) = registry();
+    let root = consts::late_root();
+    MIXINS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != first {
+            *m = (first.clone(), HashMap::new());
+        }
+        let entry = m.1.entry(word.to_string()).or_insert_with(|| (0, Vec::new(), None, Vec::new()));
+        if entry.0 > count {
+            *entry = (0, Vec::new(), None, Vec::new());
+        }
+        if entry.0 < count {
+            let (paths, last) = consts::registered_mentioning(word, entry.0);
+            for path in paths {
+                entry.1.extend(sources::with_text(&path, |text| scan_mixins(text, &path, word)).unwrap_or_default());
+            }
+            entry.0 = last.max(entry.0);
+        }
+        if entry.2.as_ref() != Some(&root) {
+            let (files, ids) = consts::late_sources(Some(word));
+            entry.3 = ids.into_iter().flat_map(|i| scan_mixins(&files[i].1, &files[i].0, word)).collect();
+            entry.2 = Some(root);
+        }
+        let late = entry.3.iter().filter(|x| sources::with_text(&x.path, |_| ()).is_none());
+        entry.1.iter().chain(late).cloned().collect()
+    })
+}
+
+/// The mixins of `text` (of `path`) `mixins_of` lists for `word`.
+fn scan_mixins(text: &str, path: &str, word: &str) -> Vec<Mixin> {
+    use ruby_prism::Visit;
+    #[derive(Clone)]
+    enum Scope {
+        Class(String, usize),
+        Singleton,
+        Module(String),
+        /// A method: an instance method of a class runs in a test.
+        Def(bool),
+        /// A block: a test's or hook's (run later), a concern's
+        /// `included`/`class_methods`/`prepended` (run in its includer),
+        /// or another.
+        Block(BlockKind),
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum BlockKind {
+        Later,
+        Hook,
+        Other,
+    }
+    const LATER: &[&[u8]] = &[b"test", b"setup", b"teardown", b"it", b"specify", b"before", b"after", b"around"];
+    struct Scan<'a> {
+        text: &'a str,
+        path: &'a str,
+        word: &'a str,
+        scopes: Vec<Scope>,
+        out: Vec<Mixin>,
+    }
+    impl Scan<'_> {
+        fn record(&mut self, at: usize, node: &Node<'_>, verb: &[u8], receiver: bool) {
+            let kind = if receiver {
+                MixinKind::Unknown
+            } else {
+                self.place(verb)
+            };
+            let line = self.text[..at].matches('\n').count() + 1;
+            let late = if sources::with_text(self.path, |_| ()).is_some() { "" } else { ", a test source not registered before this one" };
+            let shown = format!("`{}` in {} line {line}{late}", first_line(node), sources::relative_path(self.path));
+            self.out.push(Mixin { path: self.path.to_string(), at, shown, kind });
+        }
+        /// Where a receiverless `include`/`extend`/`prepend` (`verb`)
+        /// written in the current scopes mixes in.
+        fn place(&self, verb: &[u8]) -> MixinKind {
+            let mut hook = false;
+            let mut singleton = false;
+            for scope in self.scopes.iter().rev() {
+                match scope {
+                    Scope::Block(BlockKind::Later) | Scope::Def(true) => return MixinKind::Inert,
+                    Scope::Block(BlockKind::Hook) => hook = true,
+                    Scope::Block(BlockKind::Other) | Scope::Def(false) => return MixinKind::Unknown,
+                    Scope::Singleton => singleton = true,
+                    // A concern's `ClassMethods`: its includer's singleton.
+                    Scope::Module(name) if name == "ClassMethods" => hook = true,
+                    Scope::Module(_) if singleton => return MixinKind::Inert,
+                    Scope::Module(_) if verb == b"extend" && !hook => return MixinKind::Inert,
+                    Scope::Module(name) => return MixinKind::Module(name.clone()),
+                    Scope::Class(..) if hook => return MixinKind::Unknown,
+                    Scope::Class(name, start) => return MixinKind::Class(name.clone(), *start, true),
+                }
+            }
+            MixinKind::Unknown
+        }
+        fn names_word(&self, arg: &Node<'_>) -> Option<bool> {
+            if arg.as_self_node().is_some() {
+                return Some(false);
+            }
+            consts::segments(arg).map(|(segs, _)| segs.iter().any(|s| s == self.word))
+        }
+    }
+    impl<'pr> Visit<'pr> for Scan<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let name = consts::segments(&node.constant_path()).and_then(|(s, _)| s.last().cloned()).unwrap_or_default();
+            self.scopes.push(Scope::Class(name, node.location().start_offset()));
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.scopes.pop();
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let name = consts::segments(&node.constant_path()).and_then(|(s, _)| s.last().cloned()).unwrap_or_default();
+            self.scopes.push(Scope::Module(name));
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.scopes.pop();
+        }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            let own = node.expression().as_self_node().is_some();
+            self.scopes.push(if own { Scope::Singleton } else { Scope::Block(BlockKind::Other) });
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.scopes.pop();
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            let instance = node.receiver().is_none() && matches!(self.scopes.last(), Some(Scope::Class(..)));
+            self.scopes.push(Scope::Def(instance));
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.scopes.pop();
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.scopes.push(Scope::Block(BlockKind::Other));
+            ruby_prism::visit_lambda_node(self, node);
+            self.scopes.pop();
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = node.name();
+            let name = name.as_slice();
+            let receiver = node.receiver().is_some_and(|r| r.as_self_node().is_none());
+            let args: Vec<Node<'pr>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let mixes = |n: &[u8]| matches!(n, b"include" | b"extend" | b"prepend" | b"append_features" | b"prepend_features" | b"extend_object");
+            let (verb, mixed): (Option<Vec<u8>>, &[Node<'pr>]) = if mixes(name) {
+                (Some(name.to_vec()), &args[..])
+            } else if matches!(name, b"send" | b"public_send" | b"__send__") {
+                let first = args.first().and_then(|f| {
+                    f.as_symbol_node().map(|s| s.unescaped().to_vec()).or_else(|| f.as_string_node().map(|s| s.unescaped().to_vec()))
+                });
+                match first {
+                    Some(n) if mixes(&n) => (Some(n), &args[1..]),
+                    Some(_) => (None, &[]),
+                    // A name not known before it runs, with arguments.
+                    None if args.len() > 1 => (Some(b"send".to_vec()), &args[1..]),
+                    None => (None, &[]),
+                }
+            } else {
+                (None, &[])
+            };
+            if let Some(verb) = verb {
+                let at = node.location().start_offset();
+                for arg in mixed {
+                    match self.names_word(arg) {
+                        Some(true) => self.record(at, &node.as_node(), &verb, receiver || verb == b"send"),
+                        Some(false) => {}
+                        // `include mod`: a module not known here.
+                        None => self.record(at, &node.as_node(), &verb, receiver || verb == b"send"),
+                    }
+                }
+            }
+            if let Some(r) = node.receiver() {
+                self.visit(&r);
+            }
+            if let Some(a) = node.arguments() {
+                self.visit(&a.as_node());
+            }
+            if let Some(block) = node.block() {
+                let kind = if node.receiver().is_none() && LATER.contains(&name) {
+                    BlockKind::Later
+                } else if node.receiver().is_none() && matches!(name, b"included" | b"prepended" | b"class_methods") {
+                    BlockKind::Hook
+                } else {
+                    BlockKind::Other
+                };
+                self.scopes.push(Scope::Block(kind));
+                self.visit(&block);
+                self.scopes.pop();
+            }
+        }
+    }
+    if !text.contains("include") && !text.contains("extend") && !text.contains("prepend") && !text.contains("send") {
+        return Vec::new();
+    }
+    let result = ruby_prism::parse(text.as_bytes());
+    let mut scan = Scan { text, path, word, scopes: Vec::new(), out: Vec::new() };
+    scan.visit(&result.node());
+    scan.out
+}
+
+/// Why a module whose last name is `word` may be an ancestor of a class
+/// whose class, superclasses and Ruby's classes have the last names
+/// `chain` (`place` the gift being looked up), through the modules
+/// that include it (at most 4 deep; `visited` are being looked at).
+fn mixed_in(word: &str, chain: &[String], place: &Place<'_>, depth: usize, visited: &mut Vec<String>) -> Option<String> {
+    for mixin in mixins_of(word) {
+        match &mixin.kind {
+            MixinKind::Unknown => return Some(mixin.shown),
+            MixinKind::Inert => {}
+            MixinKind::Class(name, start, direct) => {
+                if mixin.path == place.file && *start == place.class_start && *direct {
+                    // This class body's own: the gift itself (or one
+                    // `Seen` drops), one after it, or a concern's
+                    // dependency `include_gives` follows.
+                    let followed = place.concerns.iter().any(|c| c.rsplit("::").next() == Some(word));
+                    if depth == 0 || mixin.at >= place.gift_at || followed {
+                        continue;
+                    }
+                    return Some(mixin.shown);
+                }
+                if chain.contains(name) {
+                    return Some(mixin.shown);
+                }
+            }
+            MixinKind::Module(owner) => {
+                if chain.contains(owner) || consts::known_module_named(owner) {
+                    return Some(mixin.shown);
+                }
+                if visited.contains(owner) {
+                    continue;
+                }
+                if depth >= 4 {
+                    return Some(format!("{}, in modules more than 4 deep", mixin.shown));
+                }
+                visited.push(owner.clone());
+                if let Some(why) = mixed_in(owner, chain, place, depth + 1, visited) {
+                    return Some(format!("{}, and {why}", mixin.shown));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Does `text` have `name` as a whole word?
@@ -1399,6 +2081,67 @@ fn first_call(node: &Node<'_>) -> Option<String> {
     let mut scan = Scan { found: None };
     scan.visit(node);
     scan.found
+}
+
+/// The methods `body` (a plain class method's) calls as it runs: the
+/// receiverless ones and `self.`'s by name (`super` too; a `send` of a
+/// literal name), and the first call of a method not known before it
+/// runs. Blocks tests and hooks run later (`setup do`), nested methods,
+/// classes and modules are not looked in.
+fn calls_of(body: &Node<'_>) -> Calls {
+    use ruby_prism::Visit;
+    const LATER: &[&[u8]] = &[b"test", b"setup", b"teardown", b"it", b"specify", b"before", b"after", b"around"];
+    const EVAL: &[&[u8]] = &[b"instance_eval", b"instance_exec", b"class_eval", b"class_exec", b"module_eval", b"module_exec"];
+    struct Scan {
+        out: Calls,
+    }
+    impl<'pr> Visit<'pr> for Scan {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = node.name();
+            let name = name.as_slice();
+            let own = node.receiver().is_none_or(|r| r.as_self_node().is_some());
+            let args: Vec<Node<'pr>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let literal = |n: &Node<'_>| {
+                n.as_symbol_node()
+                    .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                    .or_else(|| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+            };
+            if matches!(name, b"send" | b"public_send" | b"__send__" | b"method" | b"public_method") {
+                match args.first().and_then(literal) {
+                    Some(called) => self.out.names.push(called),
+                    None => {
+                        self.out.dynamic.get_or_insert_with(|| first_line(&node.as_node()));
+                    }
+                }
+            } else if (EVAL.contains(&name) && !args.is_empty()) || name == b"method_missing" {
+                self.out.dynamic.get_or_insert_with(|| first_line(&node.as_node()));
+            } else if own {
+                self.out.names.push(constant_id_str(&node.name()).to_string());
+            }
+            if node.receiver().is_none() && LATER.contains(&name) && node.block().is_some() {
+                if let Some(args) = node.arguments() {
+                    self.visit(&args.as_node());
+                }
+                return;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+            self.out.names.push("super".into());
+            ruby_prism::visit_super_node(self, node);
+        }
+        fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            self.out.names.push("super".into());
+            ruby_prism::visit_forwarding_super_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+    }
+    let mut scan = Scan { out: Calls::default() };
+    scan.visit(body);
+    scan.out.names.dedup();
+    scan.out
 }
 
 /// The uses of the method `name` in `root`; with `dynamic`, a `send`

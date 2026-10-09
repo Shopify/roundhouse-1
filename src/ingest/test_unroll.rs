@@ -901,8 +901,11 @@ fn collection(
             // not what the loop iterates. An Array or Hash literal that is
             // not frozen also changes where it is passed on.
             let value = write.value();
-            let container = value.as_array_node().is_some() || value.as_hash_node().is_some();
-            if consts::local_changed(env.cx.as_deref(), file, constant_id_str(&name), container) {
+            let string = value.as_string_node().is_some_and(|s| !s.is_frozen())
+                || value.as_interpolated_string_node().is_some_and(|s| !s.is_frozen());
+            let container = string || value.as_array_node().is_some() || value.as_hash_node().is_some();
+            let mutability = consts::Mutability { string, container, parts: consts::mutable_parts(&value) };
+            if consts::local_changed(env.cx.as_deref(), file, constant_id_str(&name), mutability) {
                 return Ok(None);
             }
             let env = Env { cx: env.cx.as_ref().map(|cx| Rc::new(cx.before(at))), ..env.clone() };
@@ -2211,8 +2214,10 @@ pub(super) mod consts {
             Hit::Decl(decl) => {
                 let value = evaluate_at(&decl.path, decl.start, decl.end, decl.cref.clone(), None, cx.depth + 1)?;
                 let full = decl.names.first()?;
-                let container = unfrozen_container(&value, &decl.path, decl.start, decl.end);
-                if let Some(site) = changed(full, &decl.path, decl.cref.last().map(String::as_str), container) {
+                let (string, parts) = mutability_at(&decl.path, decl.start, decl.end);
+                let container = string || unfrozen_container(&value, &decl.path, decl.start, decl.end);
+                let mutability = Mutability { string, container, parts };
+                if let Some(site) = changed(full, &decl.path, decl.cref.last().map(String::as_str), mutability) {
                     return refuse(CHANGED, format!("`{full}`: {site}"));
                 }
                 Some(value)
@@ -2222,8 +2227,10 @@ pub(super) mod consts {
                 let full = format!("{}::{name}", local.class);
                 let local = Local { before: stmt, ..local.clone() };
                 let value = evaluate_at(&cx.file, start, end, cx.cref.clone(), Some(local), cx.depth + 1)?;
-                let container = unfrozen_container(&value, &cx.file, start, end);
-                if let Some(site) = changed(&full, &cx.file, cx.cref.last().map(String::as_str), container) {
+                let (string, parts) = mutability_at(&cx.file, start, end);
+                let container = string || unfrozen_container(&value, &cx.file, start, end);
+                let mutability = Mutability { string, container, parts };
+                if let Some(site) = changed(&full, &cx.file, cx.cref.last().map(String::as_str), mutability) {
                     return refuse(CHANGED, format!("`{full}`: {site}"));
                 }
                 Some(value)
@@ -2231,17 +2238,16 @@ pub(super) mod consts {
         }
     }
 
-    /// Is the test class body constant `name` (of `cx`, written with an
-    /// Array or Hash literal when `container`) changed anywhere after it
-    /// is assigned? Records the refusal.
-    pub(in super::super) fn local_changed(cx: Option<&ConstCx>, file: &str, name: &str, container: bool) -> bool {
+    /// Is the test class body constant `name` (of `cx`, of `mutability`)
+    /// changed anywhere after it is assigned? Records the refusal.
+    pub(in super::super) fn local_changed(cx: Option<&ConstCx>, file: &str, name: &str, mutability: Mutability) -> bool {
         let class = cx.and_then(|cx| cx.local.as_ref()).map(|l| l.class.clone());
         let full = match &class {
             Some(class) => format!("{class}::{name}"),
             None => format!("?::{name}"),
         };
         let scope = class.as_deref().map(|c| c.rsplit("::").next().unwrap_or(c));
-        match changed(&full, file, scope, container) {
+        match changed(&full, file, scope, mutability) {
             Some(site) => {
                 refuse::<()>(CHANGED, format!("`{full}`: {site}"));
                 true
@@ -2708,6 +2714,131 @@ pub(super) mod consts {
             .map(|d| sources::relative_path(&d.path))
     }
 
+    /// Is `last` the last name of one of `KNOWN_MODULES` (a framework
+    /// module a test class has as an ancestor without a source)?
+    pub(in super::super) fn known_module_named(last: &str) -> bool {
+        KNOWN_MODULES.iter().any(|m| m.rsplit("::").next() == Some(last))
+    }
+
+    /// Namespaces of the framework's test case classes: a superclass
+    /// under one that no source declares is the framework's.
+    const FRAMEWORK: &[&str] = &[
+        "ActiveSupport::", "ActionDispatch::", "ActionController::", "ActionView::", "ActionMailer::", "ActionCable::",
+        "ActiveJob::", "ActionMailbox::", "Rails::", "Minitest::",
+    ];
+
+    /// The last names of the superclasses of a class whose superclass is
+    /// written `written`, each as written (a class of that name in any
+    /// namespace may be it), up to a framework class and its known
+    /// superclasses. `Err` for one no source (registered, or a test
+    /// source on disk) declares, or whose superclass is not a constant.
+    pub(in super::super) fn superclass_names(written: &[String]) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut todo: Vec<Vec<String>> = vec![written.to_vec()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(segs) = todo.pop() {
+            let full = segs.join("::");
+            if !seen.insert(full.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_ANCESTORS {
+                return Err(format!("it has more than {MAX_ANCESTORS} superclasses"));
+            }
+            let Some(last) = segs.last().cloned() else { continue };
+            out.push(last.clone());
+            let suffix = format!("::{full}");
+            if let Some(&(mut class, _)) = KNOWN_SUPERCLASSES.iter().find(|(c, _)| *c == full || c.ends_with(&suffix)) {
+                while let Some((_, parent)) = KNOWN_SUPERCLASSES.iter().find(|(c, _)| *c == class) {
+                    out.extend(parent.rsplit("::").next().map(str::to_string));
+                    class = parent;
+                }
+                continue;
+            }
+            let found: Vec<Decl> = decls(&last)
+                .into_iter()
+                .chain(late_decls(&last))
+                .filter(|d| d.kind == Kind::Class && d.names.iter().any(|n| *n == full || n.ends_with(&suffix)))
+                .collect();
+            if found.is_empty() {
+                if FRAMEWORK.iter().any(|f| full.starts_with(f)) {
+                    continue;
+                }
+                return Err(format!("its superclass `{full}` is not declared in a source"));
+            }
+            for decl in found {
+                let parent = with_any_text(&decl.path, |text| {
+                    let result = ruby_prism::parse(text.as_bytes());
+                    let root = result.node();
+                    let class = node_at(&root, decl.start, decl.end)?.as_class_node()?;
+                    Some(class.superclass().map(|s| segments(&s).map(|(segs, _)| segs)))
+                })
+                .flatten();
+                match parent {
+                    None => return Err(format!("the declaration of `{full}` was not found")),
+                    Some(None) => {}
+                    Some(Some(None)) => return Err(format!("the superclass of `{full}` is not a constant")),
+                    Some(Some(Some(segs))) => todo.push(segs),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The sources (registered, or test sources on disk not registered
+    /// now) that have the capitalized word `name`, as (path, registered).
+    pub(in super::super) fn files_mentioning(name: &str) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> =
+            files_with(name, 0).into_iter().filter_map(|id| sources::path_of(FileId(id))).map(|p| (p, true)).collect();
+        let (files, late) = late_sources(Some(name));
+        out.extend(late.into_iter().map(|i| (files[i].0.clone(), false)));
+        out
+    }
+
+    /// The registered files (ids above `after`) that have the capitalized
+    /// word `name`, and the id of the last registered file.
+    pub(in super::super) fn registered_mentioning(name: &str, after: u32) -> (Vec<String>, u32) {
+        let ids = files_with(name, after);
+        (ids.into_iter().filter_map(|id| sources::path_of(FileId(id))).collect(), registered_last())
+    }
+
+    /// Where a source other than the `module` statement at `start..end`
+    /// of `path` (in the scope whose last name is `scope`) declares the
+    /// module `full` again, or its `ClassMethods`, or changes either from
+    /// outside (`X.class_eval`, `X::ClassMethods.define_method`): a
+    /// registered source or a test source on disk.
+    pub(in super::super) fn reopened_elsewhere(full: &str, path: &str, start: usize, end: usize, scope: Option<&str>) -> Option<String> {
+        let last = full.rsplit("::").next().unwrap_or(full);
+        let inside = |d: &Decl| d.path == path && start <= d.start && d.end <= end;
+        let late = |p: &str| if is_registered(p) { String::new() } else { ", a test source not registered before this one".into() };
+        if let Some(d) = decls(last).into_iter().chain(late_decls(last)).find(|d| d.names.iter().any(|n| n == full) && !inside(d)) {
+            return Some(format!("`{full}` is declared again in {}{}", sources::relative_path(&d.path), late(&d.path)));
+        }
+        let methods = format!("{full}::ClassMethods");
+        let qualified = format!("{last}::ClassMethods");
+        for (file, _) in files_mentioning(last) {
+            let found = with_any_text(&file, |text| {
+                if may_declare(text, "ClassMethods") {
+                    if let Some(d) = scan(text, &file, "ClassMethods").into_iter().find(|d| d.names.iter().any(|n| *n == methods) && !inside(d)) {
+                        return Some(format!("`{methods}` is declared again in {}{}", sources::relative_path(&d.path), late(&d.path)));
+                    }
+                }
+                text.match_indices(&qualified).find_map(|(at, _)| {
+                    let rest = text[at + qualified.len()..].strip_prefix('.')?;
+                    let method: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                    (REOPENERS.contains(&method.as_str()) || MUTATORS.contains(&method.as_str())).then(|| {
+                        let line = text[..at].matches('\n').count() + 1;
+                        format!("`{methods}` is changed from outside its body ({} line {line}{})", sources::relative_path(&file), late(&file))
+                    })
+                })
+            })
+            .flatten();
+            if found.is_some() {
+                return found;
+            }
+        }
+        changed_from_outside(full, path, scope).map(|site| format!("`{full}` {site}"))
+    }
+
     /// May `module` (an ancestor) have the constant `name` itself?
     fn declares(module: &str, name: &str) -> bool {
         !matches!(find(&format!("{module}::{name}")), Found::Missing) || (known(module) && KNOWN_CONSTANTS.contains(&name))
@@ -3084,12 +3215,53 @@ pub(super) mod consts {
         /// `ALL.first << x`), or the constant (`const_set(:ALL, …)`).
         Change,
         /// The object itself, passed on, bound or returned: something
-        /// may change it.
+        /// may change it. A chain of reads that may return it (`ALL.to_a`,
+        /// `ALL.itself`, a method not known) is too.
         Passed,
-        /// Read by methods that do not change it, a namespace (`ALL::X`)
-        /// or a declaration.
+        /// A chain of reads that returns a part of it, or a new collection
+        /// of its parts (`ALL.first`, `ALL[0]`, `ALL.values`, `ALL.sort`),
+        /// passed on, bound or returned: something may change the part.
+        Part,
+        /// A Hash key (`{ ALL => x }`): the Hash holds the object, or a
+        /// frozen copy of a String.
+        Key,
+        /// Read by methods that do not change it or return what a change
+        /// can reach (`size`, `join`, `include?`, a call with a block), a
+        /// namespace (`ALL::X`) or a declaration.
         Read,
     }
+
+    /// Methods whose result is a new object that holds no part of the
+    /// receiver, or one that cannot change (a number, a Symbol, a frozen
+    /// receiver).
+    const FRESH: &[&str] = &[
+        "size", "length", "count", "join", "to_s", "inspect", "to_json", "to_sym", "to_i", "to_f", "to_r", "to_c",
+        "hash", "freeze", "keys", "to_sentence", "humanize", "titleize", "upcase", "downcase", "capitalize",
+        "swapcase", "strip", "lstrip", "rstrip", "chomp", "chop", "squish", "tr", "gsub", "sub", "center", "ljust",
+        "rjust", "succ", "ord", "chr", "bytes", "chars", "split", "lines", "bytesize", "encoding", "class", "name",
+        "object_id", "index", "rindex", "find_index", "camelize", "underscore", "dasherize", "parameterize",
+        "pluralize", "singularize", "classify", "tableize", "demodulize", "deconstantize", "to_param", "to_query",
+    ];
+
+    /// Methods whose result is a part of the receiver, or a new
+    /// collection of its parts.
+    const PARTS: &[&str] = &[
+        "[]", "first", "last", "fetch", "dig", "sample", "min", "max", "minmax", "at", "take", "drop", "slice",
+        "values", "values_at", "fetch_values", "flatten", "compact", "reverse", "rotate", "shuffle", "sort", "uniq",
+        "zip", "dup", "clone", "to_set", "entries", "each_slice", "each_cons", "each_with_index", "except", "slice",
+        "without", "excluding", "invert", "transpose", "product", "combination", "permutation", "cycle", "lazy",
+        "select", "filter", "reject", "map", "collect", "flat_map", "find", "detect", "group_by", "partition",
+        "sort_by", "min_by", "max_by", "each", "each_value", "each_key", "each_pair", "each_with_object", "inject",
+        "reduce", "filter_map", "chunk_while", "slice_when", "find_all", "grep", "grep_v", "take_while", "drop_while",
+        "sum",
+    ];
+
+    /// Methods that, given a block, run it for each part: what they
+    /// return is not used as a loop's (`ALL.each do |x| … end`).
+    const EACH: &[&str] = &[
+        "each", "each_with_index", "each_pair", "each_key", "each_value", "each_slice", "each_cons", "each_entry",
+        "reverse_each", "each_char", "each_line", "each_byte",
+    ];
 
     /// Methods that change their receiver (Array, Hash, String, Set), or
     /// change a module or reach code that may (`send`, `class_eval`).
@@ -3142,11 +3314,16 @@ pub(super) mod consts {
         }
         // Read through a call whose block may change what it is given
         // (`ALL.each(&:upcase!)`, `ALL.each { |n| n << "x" }`): its
-        // elements change.
-        if out.iter().any(|s| s.kind != SiteKind::Change) {
-            let changers = block_changers(path, text);
-            for site in out.iter_mut().filter(|s| s.kind != SiteKind::Change) {
-                if changers.iter().any(|(start, end)| *start <= site.at && site.at < *end) {
+        // elements change. A test's or hook's body in a test source or a
+        // test class (`test "…" do`, `setup do`, `def test_x`) runs once
+        // every test is declared: what it does to the constant cannot
+        // change a test's name.
+        if !out.is_empty() {
+            let spans = block_changers(path, text);
+            for site in out.iter_mut() {
+                if spans.later.iter().any(|(start, end)| *start <= site.at && site.at < *end) {
+                    site.kind = SiteKind::Read;
+                } else if site.kind != SiteKind::Change && spans.changers.iter().any(|(start, end)| *start <= site.at && site.at < *end) {
                     site.kind = SiteKind::Change;
                 }
             }
@@ -3189,8 +3366,19 @@ pub(super) mod consts {
 
     thread_local! {
         /// `block_changers` by path (with the length of the text read).
-        static CHANGERS: RefCell<HashMap<String, (usize, Rc<Vec<(usize, usize)>>)>> = RefCell::new(HashMap::new());
+        static CHANGERS: RefCell<HashMap<String, (usize, Rc<Spans>)>> = RefCell::new(HashMap::new());
     }
+
+    /// The spans of a source's calls whose block may change what it is
+    /// given (`changers`), and of its tests' and hooks' bodies (`later`).
+    #[derive(Default)]
+    struct Spans {
+        changers: Vec<(usize, usize)>,
+        later: Vec<(usize, usize)>,
+    }
+
+    /// Methods Minitest runs once every test is declared.
+    const LATER_DEFS: &[&str] = &["setup", "teardown", "before_setup", "after_teardown", "before_teardown", "after_setup"];
 
     /// The spans (from the start of the call to its block) of the calls
     /// in `text` whose block may change what it is given: a block
@@ -3198,27 +3386,62 @@ pub(super) mod consts {
     /// (`&:upcase!`, `&blk`), or a block that changes a parameter in place
     /// (`|n| n << "x"`, `n.upcase!`, `n[0] = x`), or passes it to a method
     /// that may. Tests' and hooks' blocks and methods' bodies run later,
-    /// after the class bodies declared their tests: they are not counted.
-    fn block_changers(path: &str, text: &str) -> Rc<Vec<(usize, usize)>> {
+    /// after the class bodies declared their tests: they are not counted,
+    /// and the spans of the blocks of `test`, `setup` and the like, and of
+    /// the bodies of `def test_…`, `def setup` and the like, are `later`.
+    fn block_changers(path: &str, text: &str) -> Rc<Spans> {
         use ruby_prism::Visit;
         if let Some(found) = CHANGERS.with(|c| c.borrow().get(path).filter(|(len, _)| *len == text.len()).map(|(_, f)| f.clone())) {
             return found;
         }
         struct Scan {
-            out: Vec<(usize, usize)>,
+            out: Spans,
+            /// The source is a test source (under a `test` directory).
+            test_source: bool,
+            /// Whether each enclosing class is a test class (`…Test`, `<
+            /// …TestCase`, `< …Test`).
+            classes: Vec<bool>,
+        }
+        impl Scan {
+            fn in_test(&self) -> bool {
+                self.test_source || self.classes.iter().any(|c| *c)
+            }
         }
         impl<'pr> Visit<'pr> for Scan {
+            fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                let text = |n: Node<'_>| String::from_utf8_lossy(n.location().as_slice()).into_owned();
+                let name = text(node.constant_path());
+                let superclass = node.superclass().map(text).unwrap_or_default();
+                let test = name.ends_with("Test") || superclass.ends_with("TestCase") || superclass.ends_with("Test");
+                self.classes.push(test);
+                ruby_prism::visit_class_node(self, node);
+                self.classes.pop();
+            }
             fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
                 if let Some(block) = node.block() {
-                    if !later_block(node) && block_changes(&block) {
-                        self.out.push((node.location().start_offset(), block.location().start_offset()));
+                    if later_block(node) {
+                        if block.as_block_node().is_some() && self.in_test() {
+                            self.out.later.push((block.location().start_offset(), block.location().end_offset()));
+                        }
+                    } else if block_changes(&block) {
+                        self.out.changers.push((node.location().start_offset(), block.location().start_offset()));
                     }
                 }
                 ruby_prism::visit_call_node(self, node);
             }
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                let name = constant_id_str(&node.name());
+                if node.receiver().is_none() && (name.starts_with("test_") || LATER_DEFS.contains(&name)) && self.in_test() {
+                    if let Some(body) = node.body() {
+                        self.out.later.push((body.location().start_offset(), body.location().end_offset()));
+                    }
+                }
+                ruby_prism::visit_def_node(self, node);
+            }
         }
         let result = ruby_prism::parse(text.as_bytes());
-        let mut scan = Scan { out: Vec::new() };
+        let test_source = path.starts_with("test/") || path.contains("/test/");
+        let mut scan = Scan { out: Spans::default(), test_source, classes: Vec::new() };
         scan.visit(&result.node());
         let found = Rc::new(scan.out);
         CHANGERS.with(|c| c.borrow_mut().insert(path.to_string(), (text.len(), found.clone())));
@@ -3464,6 +3687,14 @@ pub(super) mod consts {
         let mut s = rest;
         let mut first: Option<String> = None;
         let mut chained = false;
+        // The last call of the chain: its name, it is a predicate, it
+        // has a block (`{ … }`, `do`, `&blk`).
+        let mut last = String::new();
+        let mut predicate = false;
+        let mut block = false;
+        // The block is `&:m` of a method whose result holds no part
+        // (`map(&:to_s)`).
+        let mut fresh_block = false;
         let method = |first: &Option<String>| first.clone().unwrap_or_default();
         loop {
             let mut t = s.trim_start_matches([' ', '\t']);
@@ -3480,6 +3711,7 @@ pub(super) mod consts {
                     return (SiteKind::Change, first.unwrap_or_else(|| "[]=".into()));
                 }
                 first.get_or_insert_with(|| "[]".into());
+                (last, predicate, block) = ("[]".into(), false, false);
                 chained = true;
                 continue;
             }
@@ -3498,11 +3730,8 @@ pub(super) mod consts {
                 None
             };
             let Some(t) = after_dot else {
-                if chained {
-                    return (SiteKind::Read, method(&first));
-                }
                 // A declaration, or an operator that makes a new value.
-                if is_assignment(t) {
+                if is_assignment(t) && !chained {
                     return (SiteKind::Read, String::new());
                 }
                 let reads = ["==", "!=", "===", "=~", "!~", "<=>", "<=", ">=", "+", "-", "*", "/", "%", "^"];
@@ -3512,9 +3741,31 @@ pub(super) mod consts {
                     || (t.starts_with('<') && !t.starts_with("<<"))
                     || (t.starts_with('>') && !t.starts_with(">>"))
                 {
-                    return (SiteKind::Read, String::new());
+                    return (SiteKind::Read, method(&first));
                 }
-                return (SiteKind::Passed, String::new());
+                if !chained {
+                    let kind = if t.starts_with("=>") { SiteKind::Key } else { SiteKind::Passed };
+                    return (kind, String::new());
+                }
+                // The end of a chain of reads: what its last call returns
+                // is passed on, bound or returned. A loop with a block
+                // (`ALL.each do |x|`) is read: `block_changers` says
+                // whether the block changes what it is given. Another
+                // call with a block may return parts (`select { … }`,
+                // `map(&:itself)`) or the object (`tap { … }`).
+                let do_block = t.strip_prefix("do").is_some_and(|r| !r.bytes().next().is_some_and(ident));
+                let maps = ["map", "collect", "flat_map", "filter_map"].contains(&last.as_str());
+                if predicate
+                    || FRESH.contains(&last.as_str())
+                    || ((block || do_block) && EACH.contains(&last.as_str()))
+                    || (fresh_block && maps)
+                {
+                    return (SiteKind::Read, method(&first));
+                }
+                if PARTS.contains(&last.as_str()) {
+                    return (SiteKind::Part, method(&first));
+                }
+                return (SiteKind::Passed, method(&first));
             };
             let len = t.bytes().take_while(|b| ident(*b)).count();
             if len == 0 {
@@ -3524,7 +3775,7 @@ pub(super) mod consts {
             let mut after = &t[len..];
             let bang = after.starts_with('!') && !after.starts_with("!=");
             // `include?`: a predicate changes nothing.
-            let predicate = after.starts_with('?') && !after.starts_with("?:");
+            predicate = after.starts_with('?') && !after.starts_with("?:");
             if bang || predicate {
                 after = &after[1..];
             }
@@ -3536,14 +3787,22 @@ pub(super) mod consts {
             if is_assignment(next) {
                 return (SiteKind::Change, method(&first));
             }
+            last = name.to_string();
+            block = false;
+            fresh_block = false;
             s = after;
             if let Some(inside) = s.strip_prefix('(') {
                 let Some(close) = matching(inside, b'(', b')') else { return (SiteKind::Change, method(&first)) };
+                block = inside[..close].trim_start().starts_with('&') || inside[..close].contains(", &");
+                fresh_block = inside[..close].trim().strip_prefix("&:").is_some_and(|m| {
+                    FRESH.contains(&m) || (m.ends_with('?') && m[..m.len() - 1].bytes().all(ident))
+                });
                 s = &inside[close + 1..];
             }
-            let block = s.trim_start_matches([' ', '\t']);
-            if let Some(inside) = block.strip_prefix('{') {
+            let rest = s.trim_start_matches([' ', '\t']);
+            if let Some(inside) = rest.strip_prefix('{') {
                 let Some(close) = matching(inside, b'{', b'}') else { return (SiteKind::Change, method(&first)) };
+                block = true;
                 s = &inside[close + 1..];
             }
             chained = true;
@@ -3595,17 +3854,105 @@ pub(super) mod consts {
 
     /// The first place a registered source changes the constant `full`
     /// (declared in `path`, in the scope whose last name is `scope`) after
-    /// it is assigned, or, for an unfrozen Array or Hash (`container`),
-    /// passes it on.
-    fn changed(full: &str, path: &str, scope: Option<&str>, container: bool) -> Option<String> {
+    /// it is assigned; for an unfrozen Array, Hash or String
+    /// (`container`), passes it on; for one with parts that may change in
+    /// place (`parts`: an unfrozen String, an Array or Hash, a value not
+    /// written as a literal), passes it or a part of it on. A Hash holds
+    /// a frozen copy of a String key, the key itself otherwise.
+    fn changed(full: &str, path: &str, scope: Option<&str>, m: Mutability) -> Option<String> {
         let name = full.rsplit("::").next().unwrap_or(full);
         let (mut sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
         sites.extend(late_sites(name));
         sites
             .iter()
-            .filter(|s| s.kind == SiteKind::Change || (container && s.kind == SiteKind::Passed))
+            .filter(|s| match s.kind {
+                SiteKind::Change => true,
+                SiteKind::Passed => m.container || m.parts,
+                SiteKind::Key => (m.container && !m.string) || m.parts,
+                SiteKind::Part => m.parts,
+                SiteKind::Read => false,
+            })
             .find(|s| relevant(s, full, path, scope, &decls))
             .map(describe)
+    }
+
+    /// What of a constant's value may change in place: it is an unfrozen
+    /// String (`string`); it is that or an unfrozen Array or Hash
+    /// (`container`); its parts may (`parts`, `mutable_parts`).
+    #[derive(Clone, Copy, Debug)]
+    pub(in super::super) struct Mutability {
+        pub string: bool,
+        pub container: bool,
+        pub parts: bool,
+    }
+
+    /// May the parts of the constant value `node` change in place: an
+    /// element (or a Hash value or key other than a String) that is an
+    /// unfrozen String, an Array or Hash, or a value not written as a
+    /// literal? A constant's element is taken to be what it names (a
+    /// class, a Symbol). `node.freeze` freezes `node`, not its parts.
+    pub(in super::super) fn mutable_parts(node: &Node<'_>) -> bool {
+        fn element(node: &Node<'_>) -> bool {
+            if let Some(call) = node.as_call_node() {
+                return match call.receiver() {
+                    Some(r) if call.name().as_slice() == b"freeze" && call.arguments().is_none() => {
+                        r.as_string_node().is_none() && r.as_interpolated_string_node().is_none() && mutable_parts(&r)
+                    }
+                    _ => true,
+                };
+            }
+            if let Some(string) = node.as_string_node() {
+                return !string.is_frozen();
+            }
+            if let Some(string) = node.as_interpolated_string_node() {
+                return !string.is_frozen();
+            }
+            !(node.as_symbol_node().is_some()
+                || node.as_interpolated_symbol_node().is_some()
+                || node.as_integer_node().is_some()
+                || node.as_float_node().is_some()
+                || node.as_rational_node().is_some()
+                || node.as_imaginary_node().is_some()
+                || node.as_nil_node().is_some()
+                || node.as_true_node().is_some()
+                || node.as_false_node().is_some()
+                || node.as_range_node().is_some()
+                || node.as_regular_expression_node().is_some()
+                || node.as_constant_read_node().is_some()
+                || node.as_constant_path_node().is_some())
+        }
+        if let Some(call) = node.as_call_node() {
+            return match call.receiver() {
+                Some(r) if call.name().as_slice() == b"freeze" && call.arguments().is_none() => mutable_parts(&r),
+                _ => true,
+            };
+        }
+        if let Some(array) = node.as_array_node() {
+            return array.elements().iter().any(|e| element(&e));
+        }
+        if let Some(hash) = node.as_hash_node() {
+            return hash.elements().iter().any(|e| match e.as_assoc_node() {
+                Some(assoc) => element(&assoc.value()) || (assoc.key().as_string_node().is_none() && element(&assoc.key())),
+                None => true,
+            });
+        }
+        false
+    }
+
+    /// Is the constant value `node` a String that may change in place?
+    fn unfrozen_string(node: &Node<'_>) -> bool {
+        node.as_string_node().is_some_and(|s| !s.is_frozen()) || node.as_interpolated_string_node().is_some_and(|s| !s.is_frozen())
+    }
+
+    /// (`unfrozen_string`, `mutable_parts`) of the value at `start..end`
+    /// of `path`.
+    fn mutability_at(path: &str, start: usize, end: usize) -> (bool, bool) {
+        sources::with_text(path, |text| {
+            let result = ruby_prism::parse(text.as_bytes());
+            let root = result.node();
+            node_at(&root, start, end).map(|n| (unfrozen_string(&n), mutable_parts(&n))).unwrap_or((true, true))
+        })
+        .unwrap_or((true, true))
     }
 
     /// The first place a registered source changes the module `module`
@@ -4145,6 +4492,67 @@ pub(super) mod consts {
             if self.scopes.last().is_some_and(|s| s.at == self.parents.len()) {
                 self.scopes.pop();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn kind(rest: &str) -> SiteKind {
+            classify(rest).0
+        }
+
+        // What follows a mention: a change, the object passed on, a part
+        // of it passed on, or a read that reaches neither.
+        #[test]
+        fn a_chain_ending_in_a_part_or_the_object_is_not_a_read() {
+            for rest in [" << :x", "[0] = 1", ".concat([1])", ".first << \"z\"", ".to_a.push(1)", ".map!(&:upcase)", ".x = 1"] {
+                assert_eq!(kind(rest), SiteKind::Change, "{rest:?}");
+            }
+            for rest in [".first\n", ".last)", "[0]\n", ".dig(:a, :b)\n", ".values\n", ".sort\n", ".map(&:x)\n", ".select { |x| x }.first\n", ".select { |x| x }\n", ".map do |x|", ".find(&:x)\n"] {
+                assert_eq!(kind(rest), SiteKind::Part, "{rest:?}");
+            }
+            for rest in ["\n", ", 1)", ".to_a\n", ".to_h\n", ".itself\n", ".anything\n", ".tap { |x| x }\n"] {
+                assert_eq!(kind(rest), SiteKind::Passed, "{rest:?}");
+            }
+            for rest in [".size\n", ".join(\",\")\n", ".include?(:a)\n", ".each do |x|", ".each_with_index { |x, i| x }\n", ".map(&:to_s).each do |x|", ".count { |x| x }\n", ".map(&:upcase)\n", ".map(&:empty?)\n", " == 1", ".first.to_s\n", "::X", " = [1]", " + [1]"] {
+                assert_eq!(kind(rest), SiteKind::Read, "{rest:?}");
+            }
+            // A Hash key: the Hash holds it (or a frozen copy of a String).
+            assert_eq!(kind(" => 1"), SiteKind::Key);
+        }
+
+        fn parts(src: &str) -> bool {
+            let result = ruby_prism::parse(src.as_bytes());
+            let root = result.node();
+            let stmts = flatten_statements(root.as_program_node().unwrap().statements().as_node());
+            mutable_parts(&stmts[0])
+        }
+
+        #[test]
+        fn parts_that_may_change_in_place_are_told_from_ones_that_cannot() {
+            for src in ["[:a, 1, nil, 1..2, X]", "[:a].freeze", "{ a: :b, \"k\" => 1 }", "[\"a\".freeze]", "# frozen_string_literal: true\n[\"a\", \"b\"]"] {
+                assert!(!parts(src), "{src:?}");
+            }
+            for src in ["[\"a\"]", "[[:a]].freeze", "[{ a: 1 }]", "[Foo.new]", "{ a: \"x\" }", "{ [1] => :a }", "[[:a].freeze].freeze + []", "[\"a\".dup.freeze]"] {
+                assert!(parts(src), "{src:?}");
+            }
+        }
+
+        // A mention in a test's or hook's body (in a test source) runs once
+        // every test is declared; one in the class body does not.
+        #[test]
+        fn mentions_in_test_bodies_are_reads() {
+            let body = "  setup do\n    @a = ALL.first\n  end\n  test \"t\" do\n    ALL << 1\n  end\n  def test_u\n    take(ALL)\n  end\n  ALL.first << 2\nend\n";
+            let kinds = |path: &str, class: &str| {
+                scan_sites(&format!("{class}\n{body}"), path, "ALL").iter().map(|s| s.kind).collect::<Vec<_>>()
+            };
+            use SiteKind::*;
+            assert_eq!(kinds("/app/test/models/x.rb", "class X"), [Read, Read, Read, Change]);
+            assert_eq!(kinds("x_test.rb", "class XTest"), [Read, Read, Read, Change]);
+            assert_eq!(kinds("x_test.rb", "class X < ActiveSupport::TestCase"), [Read, Read, Read, Change]);
+            assert_eq!(kinds("/app/app/models/x.rb", "class X"), [Part, Change, Passed, Change]);
         }
     }
 }
