@@ -507,8 +507,8 @@ fn nested_blocks(
                 }
                 continue;
             }
-            let Some(rest) = line.strip_prefix("require_relative ") else { continue };
-            let target = rest.trim().trim_matches('"');
+            // A guarded require (`require_line`) keeps its guard.
+            let Some((target, guard)) = split_require_relative(line) else { continue };
             let rebased = rebase_relative(&stem, parent.name.0.as_str(), target, app);
             // A sibling that is now in THIS file needs no require, and
             // naming it would name a path that no longer exists: one
@@ -527,7 +527,7 @@ fn nested_blocks(
             if own_dir.is_some_and(|d| rebased == d.trim_end_matches('/')) {
                 continue;
             }
-            hoisted.push(format!("require_relative {rebased:?}"));
+            hoisted.push(format!("require_relative {rebased:?}{guard}"));
         }
         // A plain `require "x"` names a library, not a path, and is
         // carried as written.
@@ -8186,10 +8186,23 @@ fn emit_library_class_decl_inner(
     }
     body_requires.retain(|r| !requires.contains(r));
     requires.extend(body_requires);
-    for r in &requires {
-        writeln!(s, "require_relative {r:?}").unwrap();
+    // The source's own top-level requires first, as Ruby runs them
+    // before the body (`authored_requires`). A load-time need that one
+    // of them already loads is not repeated.
+    let (authored, after) = authored_requires(lc, app, &out_dir, &self_anchor);
+    for line in &authored {
+        writeln!(s, "{line}").unwrap();
     }
-    if !requires.is_empty() {
+    for r in &requires {
+        if authored.iter().any(|a| split_require_relative(a).is_some_and(|(target, _)| target == r)) {
+            continue;
+        }
+        writeln!(s, "{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
+    }
+    for line in &after {
+        writeln!(s, "{line}").unwrap();
+    }
+    if !requires.is_empty() || !authored.is_empty() || !after.is_empty() {
         writeln!(s).unwrap();
     }
 
@@ -8765,7 +8778,7 @@ fn emit_library_class_decl_inner(
             }
             writeln!(s).unwrap();
             for r in reqs {
-                writeln!(s, "require_relative {r:?}").unwrap();
+                writeln!(s, "{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
             }
             writeln!(s).unwrap();
             open_header(&mut s);
@@ -8781,7 +8794,7 @@ fn emit_library_class_decl_inner(
                 }
                 writeln!(s).unwrap();
                 for r in reqs {
-                    writeln!(s, "require_relative {r:?}").unwrap();
+                    writeln!(s, "{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
                 }
                 writeln!(s).unwrap();
                 open_header(&mut s);
@@ -9640,7 +9653,7 @@ fn emit_with_top_level_constants(
     };
     let mut s = String::new();
     for r in &requires {
-        writeln!(s, "require_relative {r:?}").unwrap();
+        writeln!(s, "{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
     }
     if !requires.is_empty() {
         writeln!(s).unwrap();
@@ -9823,6 +9836,12 @@ struct NameIndex {
     conditional_declarations: HashMap<String, String>,
     /// `first_module_bare_named`'s answers, on first use.
     first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
+    /// `require_guard_owners`, on first use.
+    require_guards: std::cell::OnceCell<std::rc::Rc<HashMap<String, Option<String>>>>,
+    /// `authored_require_sources`, on first use.
+    authored_requires: std::cell::OnceCell<std::rc::Rc<HashMap<String, Vec<usize>>>>,
+    /// `load_cycle_components`, on first use.
+    load_cycles: std::cell::OnceCell<std::rc::Rc<HashMap<String, usize>>>,
 }
 
 thread_local! {
@@ -9855,6 +9874,9 @@ impl NameIndex {
             superclass_nestings: std::cell::RefCell::default(),
             conditional_declarations: conditional_declarations(app),
             first_modules_bare: std::cell::OnceCell::new(),
+            require_guards: std::cell::OnceCell::new(),
+            authored_requires: std::cell::OnceCell::new(),
+            load_cycles: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -13583,6 +13605,516 @@ fn relpath(from_dir: &Path, to_anchor: &str) -> String {
     let mut parts: Vec<&str> = std::iter::repeat("..").take(ups).collect();
     parts.extend(&to_parts[common..]);
     parts.join("/")
+}
+
+/// The tree-root anchor (`app/models/x`, no `.rb`) that a
+/// `require_relative` of `rel` names from a file in `from_dir`.
+fn anchor_of_relative(from_dir: &Path, rel: &str) -> String {
+    let mut parts: Vec<&str> = from_dir.to_str().unwrap_or("").split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// A `require_relative "x"` line, guarded or not (`require_line`), as
+/// `(target, rest)`: `rest` is whatever follows the closing quote
+/// (` unless defined?(::X)`).
+fn split_require_relative(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("require_relative \"")?;
+    let end = rest.find('"')?;
+    Some((&rest[..end], &rest[end + 1..]))
+}
+
+/// The line requiring `rel` from the file `self_anchor` in `out_dir`,
+/// for a load-time need of that file: a superclass, an include or
+/// extend, a class-body call, a constant's value.
+///
+/// On the Ruby family, a require that can reach a file still loading is
+/// guarded on the constant the required file opens
+/// (`require_guard_owners`), because that is how Zeitwerk resolves the
+/// reference. A constant that is already defined needs no load, even
+/// when its file is still running its body. A constant whose autoload is
+/// registered loads when the reference runs. An unguarded require of a
+/// file that is still loading is a circular require. Native load order
+/// does not have one, and Core's StrictWarning raises on it. A require
+/// can reach a loading file in two ways (`waits_on_its_constant`), and
+/// Core has a case of each:
+/// - `Pricing::DiscountFunctionApi::APIS` lists the four discount API
+///   classes, and each of them does `extend Pricing::DiscountFunctionApi`.
+/// - payments_api.rb ends in `ActiveSupport.run_load_hooks(:payments_api,
+///   …)`. A hook loads `Checkouts::One::ActionFinished`, whose
+///   `extend PaymentsApi::PostOffsiteRedirectCallbackInterface` required
+///   payments_api.rb back.
+///
+/// Any other require stays a plain line, which the project's passes then
+/// order (the namespace's file first) and route through a file program.
+/// So does a constant that is neither defined nor autoloaded, such as a
+/// plain gem's, and every require on the strict targets, which splice a
+/// `require_relative` where it stands.
+///
+/// `defined?(::A::B)` loads `A` when `A` still autoloads. Natively the
+/// body loads it at the reference, after the class header has defined
+/// the requiring class. A namespace that runs load hooks is therefore
+/// checked first, without loading it (`hook_namespace_pending`). While
+/// its autoload is pending, the body's reference loads it, and the hook
+/// it runs finds the requiring class defined.
+fn require_line(out_dir: &Path, rel: &str, self_anchor: &str, app: &App) -> String {
+    if super::expr::native_keywords() {
+        let anchor = anchor_of_relative(out_dir, rel);
+        if let Some(Some(owner)) = require_guard_owners(app).get(&anchor) {
+            if waits_on_its_constant(self_anchor, &anchor, owner, app) {
+                let mut condition = hook_namespace_pending(owner, app);
+                condition.push(format!("defined?(::{owner})"));
+                return format!("require_relative {rel:?} unless {}", condition.join(" || "));
+            }
+        }
+    }
+    format!("require_relative {rel:?}")
+}
+
+/// The clauses that are true while a namespace of `owner`, down to the
+/// innermost one whose file runs load hooks (`App::class_load_hooks`),
+/// still autoloads. None of them loads anything: `Object.autoload?(:A,
+/// false)`, then `(defined?(::A) && ::A.autoload?(:B, false))`, and so
+/// on. Empty when no namespace of `owner` runs hooks.
+fn hook_namespace_pending(owner: &str, app: &App) -> Vec<String> {
+    let segments: Vec<&str> = owner.split("::").collect();
+    let depth = app
+        .class_load_hooks
+        .iter()
+        .map(|hook| hook.class.trim_start_matches("::"))
+        .filter(|class| *class == owner || owner.strip_prefix(class).is_some_and(|rest| rest.starts_with("::")))
+        .map(|class| class.split("::").count())
+        .max()
+        .unwrap_or(0);
+    (0..depth)
+        .map(|j| match j {
+            0 => format!("Object.autoload?(:{}, false)", segments[0]),
+            _ => {
+                let outer = segments[..j].join("::");
+                format!("(defined?(::{outer}) && ::{outer}.autoload?(:{}, false))", segments[j])
+            }
+        })
+        .collect()
+}
+
+/// Whether the load-time require from `self_anchor` of `anchor` (the file
+/// of `owner`) can reach a file that is still loading (`require_line`):
+/// - the two files are in one load-time require cycle
+///   (`load_cycle_components`);
+/// - `owner`, or a namespace enclosing it, is a class whose file ends in
+///   `ActiveSupport.run_load_hooks` (`App::class_load_hooks`). Loading
+///   `owner` loads that namespace's file first, and the hooks it runs can
+///   load any file, including the one requiring `owner`.
+fn waits_on_its_constant(self_anchor: &str, anchor: &str, owner: &str, app: &App) -> bool {
+    let cycles = load_cycle_components(app);
+    if cycles.get(self_anchor).is_some_and(|c| cycles.get(anchor) == Some(c)) {
+        return true;
+    }
+    app.class_load_hooks.iter().any(|hook| {
+        let class = hook.class.trim_start_matches("::");
+        owner == class || owner.strip_prefix(class).is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
+/// The library class files (`require_guard_owners`) in a load-time
+/// require cycle, each mapped to its cycle: the strongly connected
+/// components of more than one file, over what each class reads while
+/// its file loads. That is its superclass, its includes, its class-body
+/// calls (not a closure a call only stores), its constants' values and
+/// its class-variable initializers. A method body is read later.
+fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
+    let build = || {
+        let files = require_guard_owners(app);
+        let mut ids: HashMap<String, usize> = HashMap::default();
+        let mut anchors: Vec<String> = Vec::new();
+        let mut edges: Vec<BTreeSet<usize>> = Vec::new();
+        let mut node = |anchor: &str, ids: &mut HashMap<String, usize>, edges: &mut Vec<BTreeSet<usize>>| -> usize {
+            if let Some(&id) = ids.get(anchor) {
+                return id;
+            }
+            ids.insert(anchor.to_string(), anchors.len());
+            anchors.push(anchor.to_string());
+            edges.push(BTreeSet::new());
+            anchors.len() - 1
+        };
+        let split = |id: &ClassId| -> Vec<String> {
+            id.0.as_str().trim_start_matches("::").split("::").map(str::to_string).collect()
+        };
+        for lc in &app.library_classes {
+            let name = lc.name.0.as_str();
+            let from = format!("app/models/{}", crate::naming::underscore(&file_owner(name, app)));
+            if !files.contains_key(&from) {
+                continue;
+            }
+            let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+            let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
+            paths.extend(lc.parent.iter().map(split));
+            paths.extend(lc.includes.iter().map(split));
+            for call in &lc.unknown_calls {
+                walk_class_body_call_paths(call, &mut paths, &mut later);
+            }
+            for (_, value) in &lc.constants {
+                walk_const_paths(value, &mut paths);
+            }
+            for init in &lc.class_ivar_initializers {
+                walk_const_paths(init, &mut paths);
+            }
+            for path in &paths {
+                let Some(to) = require_path_for_body_const(path, app, name) else { continue };
+                if to != from && files.contains_key(&to) {
+                    let from_id = node(&from, &mut ids, &mut edges);
+                    let to_id = node(&to, &mut ids, &mut edges);
+                    edges[from_id].insert(to_id);
+                }
+            }
+        }
+        let edges: Vec<Vec<usize>> = edges.into_iter().map(|e| e.into_iter().collect()).collect();
+        let component = strongly_connected(&edges);
+        let mut sizes: HashMap<usize, usize> = HashMap::default();
+        for c in &component {
+            *sizes.entry(*c).or_default() += 1;
+        }
+        let out: HashMap<String, usize> = ids
+            .into_iter()
+            .filter(|(_, id)| sizes.get(&component[*id]).is_some_and(|n| *n > 1))
+            .map(|(anchor, id)| (anchor, component[id]))
+            .collect();
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.load_cycles.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
+/// Tarjan's strongly connected components of the graph whose node `v`
+/// has the out-edges `edges[v]`, iteratively: each node's component.
+fn strongly_connected(edges: &[Vec<usize>]) -> Vec<usize> {
+    const UNSEEN: usize = usize::MAX;
+    let n = edges.len();
+    let (mut index, mut low, mut component) = (vec![UNSEEN; n], vec![0; n], vec![UNSEEN; n]);
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let (mut next, mut components) = (0, 0);
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&(v, i)) = work.last() {
+            if let Some(&w) = edges[v].get(i) {
+                work.last_mut().unwrap().1 += 1;
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    component[w] = components;
+                    if w == v {
+                        break;
+                    }
+                }
+                components += 1;
+            }
+        }
+    }
+    component
+}
+
+/// Framework roots whose classes the runtime (or a loaded gem) defines
+/// before any app file runs. An app file under one of them reopens them
+/// (or nests under them), so a defined constant there does not mean that
+/// file has loaded.
+const FRAMEWORK_ROOTS: &[&str] = &[
+    "ActiveSupport",
+    "ActiveModel",
+    "ActiveRecord",
+    "ActionController",
+    "ActionView",
+    "ActionDispatch",
+    "ActionMailer",
+    "ActionMailbox",
+    "ActionCable",
+    "ActionText",
+    "ActiveJob",
+    "ActiveStorage",
+    "Rails",
+    "Arel",
+    "Rack",
+    "Zeitwerk",
+    "Minitest",
+    "T",
+];
+
+/// Each app/models anchor of a library class or model, mapped to the
+/// class or module its file opens (`file_owner`). The value is None when
+/// a load-time require of the file must not wait on that constant
+/// (`require_line`):
+/// - a file program declares the file, and its loads go through the
+///   program (`project::load_declarations_through_their_program`);
+/// - the constant is Ruby's, a runtime framework's, or a loaded gem's,
+///   so the file is a reopen of a constant defined before it loads;
+/// - the class is declared in a load-time conditional;
+/// - two owners share the anchor.
+///
+/// The keys are also the class files the tree writes (`authored_requires`).
+fn require_guard_owners(app: &App) -> std::rc::Rc<HashMap<String, Option<String>>> {
+    let build = || {
+        let declared_by_programs: BTreeSet<String> = app
+            .file_programs
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|item| match item {
+                crate::app::ProgramItem::Declared(names) => Some(names),
+                _ => None,
+            })
+            .flatten()
+            .map(|name| format!("app/models/{}", super::library_file_stem(name.0.as_str(), app)))
+            .collect();
+        let mut out: HashMap<String, Option<String>> = HashMap::default();
+        let names = app.library_classes.iter().map(|lc| lc.name.0.as_str()).chain(app.models.iter().map(|m| m.name.0.as_str()));
+        for name in names {
+            let owner = file_owner(name, app);
+            let anchor = format!("app/models/{}", crate::naming::underscore(&owner));
+            let guard = guards_on_owner(&owner, &anchor, &declared_by_programs, app).then(|| owner.clone());
+            match out.get(&anchor) {
+                Some(seen) if *seen != guard => {
+                    out.insert(anchor, None);
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(anchor, guard);
+                }
+            }
+        }
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.require_guards.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
+/// Whether a load-time require of `owner`'s file (`anchor`) can wait on
+/// `owner` being defined (`require_guard_owners`).
+fn guards_on_owner(owner: &str, anchor: &str, declared_by_programs: &BTreeSet<String>, app: &App) -> bool {
+    let root = owner.split("::").next().unwrap_or(owner);
+    if declared_by_programs.contains(anchor)
+        || crate::gem_boundary::RUBY_CORE.contains(&root)
+        || crate::gem_boundary::RUBY_STDLIB.contains(&root)
+        || FRAMEWORK_ROOTS.contains(&root)
+        || is_core_class_name(root)
+        || is_gem_facade_root(root)
+        || runtime_reopen_anchor(owner).is_some()
+        || conditional_owner(owner, app).is_some()
+    {
+        return false;
+    }
+    let id = ClassId(Symbol::from(owner));
+    if app.gem_boundary.loaded_reopen(&id).is_some() || app.gem_boundary.loaded_source_reopen(&id).is_some() {
+        return false;
+    }
+    library_classes_named(owner, app).iter().all(|lc| {
+        !matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants)) && !reopens_loaded_gem_class(lc, app)
+    })
+}
+
+/// A source's top-level `require "f"` and `require_relative "f"`
+/// statements (one string literal argument), in source order, as
+/// `(feature, relative, offset)`.
+fn top_level_requires(source: &crate::span::SourceFile) -> Vec<(String, bool, u32)> {
+    let result = ruby_prism::parse(source.text.as_bytes());
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if call.receiver().is_some() || call.block().is_some() {
+            continue;
+        }
+        let relative = match call.name().as_slice() {
+            b"require" => false,
+            b"require_relative" => true,
+            _ => continue,
+        };
+        let Some(arguments) = call.arguments() else { continue };
+        let args: Vec<ruby_prism::Node<'_>> = arguments.arguments().iter().collect();
+        let [one] = args.as_slice() else { continue };
+        let Some(text) = one.as_string_node() else { continue };
+        out.push((String::from_utf8_lossy(text.unescaped()).into_owned(), relative, stmt.location().start_offset() as u32));
+    }
+    out
+}
+
+/// Each class or module whose file carries the top-level requires of an
+/// app source (`authored_requires`), mapped to those sources (indices
+/// into `app.sources`). Only a source with no file program qualifies,
+/// since a program keeps its requires itself (`emit_file_program`). The
+/// file is that of each class the source writes a body into (`file_owner`).
+/// When the source only declares empty classes, it is the file of the
+/// innermost one.
+///
+/// A support-walk source lists its classes in `app.library_class_files`.
+/// An app/models-walk source (a concern under app/models/concerns) is
+/// not listed there: its classes are the library classes whose bodies
+/// it writes.
+fn authored_require_sources(app: &App) -> std::rc::Rc<HashMap<String, Vec<usize>>> {
+    let build = || {
+        let programs: BTreeSet<&str> = app.file_programs.iter().map(|p| p.source.as_str()).collect();
+        let ids: HashMap<&str, usize> = app.sources.iter().enumerate().map(|(i, s)| (s.path.as_str(), i)).collect();
+        let mut listed: Vec<(usize, Vec<&str>)> = Vec::new();
+        for (source, names) in &app.library_class_files {
+            let Some(&i) = ids.get(source.as_str()) else { continue };
+            listed.push((i, names.iter().map(|n| n.0.as_str()).collect()));
+        }
+        let support: BTreeSet<usize> = listed.iter().map(|(i, _)| *i).collect();
+        let mut walked: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+        for lc in &app.library_classes {
+            for file in body_files(lc.name.0.as_str(), app) {
+                let Some(i) = (file as usize).checked_sub(1) else { continue };
+                if i < app.sources.len() && !support.contains(&i) {
+                    let names = walked.entry(i).or_default();
+                    if !names.contains(&lc.name.0.as_str()) {
+                        names.push(lc.name.0.as_str());
+                    }
+                }
+            }
+        }
+        listed.extend(walked);
+        let mut out: HashMap<String, Vec<usize>> = HashMap::default();
+        for (i, names) in listed {
+            let source = &app.sources[i];
+            if programs.contains(source.path.as_str())
+                || !source.text.contains("require")
+                || top_level_requires(source).is_empty()
+            {
+                continue;
+            }
+            let file = i as u32 + 1;
+            let mut written: Vec<&str> = names.iter().copied().filter(|n| body_files(n, app).contains(&file)).collect();
+            if written.is_empty() {
+                let deepest = names.iter().map(|n| n.matches("::").count()).max();
+                written = names.iter().copied().filter(|n| Some(n.matches("::").count()) == deepest).collect();
+            }
+            for name in written {
+                let sources = out.entry(file_owner(name, app)).or_default();
+                if !sources.contains(&i) {
+                    sources.push(i);
+                }
+            }
+        }
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.authored_requires.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
+/// The lines that open `lc`'s file for the top-level requires its
+/// sources write, on the Ruby family. A source the app/models walk
+/// ingests has no file program, so nothing else carries them.
+///
+/// Core's essentials concern model_uuid_columns.rb starts with
+/// `require "shopify/model_uuid_enabled_attributes"`. That file is the
+/// essentials gem's lib, and nothing autoloads it. The concern reads
+/// `::Shopify::ModelUuidEnabledAttributes::BY_MODEL_NAME` only in a
+/// method body. A body-only reference is left to app/models.rb, so the
+/// emitted file loaded nothing, and the first model to declare a uuid
+/// column raised NameError.
+///
+/// Each require of a carried app file becomes a `require_relative` of the
+/// emitted files of what that file declares, in authored order. This is
+/// what Ruby loads when it runs the source, and it is how a file program
+/// carries a require (`ProgramItem::Require`). An app file the tree does
+/// not carry gets a named error. A file that declares nothing beyond
+/// the modules it opens has those modules opened. A feature outside the
+/// app (a gem's, the stdlib's) is not handled here.
+fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: &str) -> (Vec<String>, Vec<String>) {
+    if !super::expr::native_keywords() {
+        return (Vec::new(), Vec::new());
+    }
+    let by_owner = authored_require_sources(app);
+    let Some(sources) = by_owner.get(lc.name.0.as_str()) else { return (Vec::new(), Vec::new()) };
+    let table = carried_sources(app);
+    let files = require_guard_owners(app);
+    let mut requires: Vec<String> = Vec::new();
+    let mut after: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for &i in sources {
+        let source = &app.sources[i];
+        let rel = relative_source_path(app, &source.path);
+        for (feature, relative, offset) in top_level_requires(source) {
+            let site = format!("{rel}:{}", source.line_col(offset).0);
+            let written = format!("require{} {feature:?}", if relative { "_relative" } else { "" });
+            match program_require_source(rel, &feature, relative, &table) {
+                Some(Ok((required, anchor))) => {
+                    let anchors: Vec<String> = match table.declarations.get(&required) {
+                        Some(declared) if declared.is_empty() => Vec::new(),
+                        Some(declared) => {
+                            let mut anchors: Vec<String> =
+                                declared.iter().filter(|a| files.contains_key(&format!("app/{a}"))).cloned().collect();
+                            if anchors.is_empty() {
+                                anchors.push(anchor);
+                            }
+                            anchors
+                        }
+                        None => vec![anchor],
+                    };
+                    for anchor in anchors {
+                        let target = format!("app/{anchor}");
+                        if target != self_anchor && seen.insert(target.clone()) {
+                            requires.push(format!("require_relative {:?}", relpath(out_dir, &target)));
+                        }
+                    }
+                }
+                Some(Err(required)) if table.loads_nothing(&required) => {
+                    let text = app.sources.iter().find(|f| relative_source_path(app, &f.path) == required).map(|f| f.text.as_str());
+                    let opened = text.and_then(crate::ingest::opened_modules::opened_modules).unwrap_or_default();
+                    after.push(format!("# {site}: `{written}` loads {required}, which declares nothing the tree carries beyond the modules it opens"));
+                    for path in opened {
+                        let open: Vec<String> = path.iter().map(|segment| format!("module {segment}")).collect();
+                        after.push(format!("{}; {}", open.join("; "), vec!["end"; path.len()].join("; ")));
+                    }
+                }
+                Some(Err(_)) => {
+                    let message = format!(
+                        "roundhouse: error[file_require_not_carried]: {site}: `{written}` names an app file the tree does not carry; it was not loaded"
+                    );
+                    after.push(format!("$stderr.puts {message:?}"));
+                }
+                None => {}
+            }
+        }
+    }
+    (requires, after)
 }
 
 /// A class-body call's constant references, split into the ones its
