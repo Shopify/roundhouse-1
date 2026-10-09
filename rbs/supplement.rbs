@@ -53,6 +53,11 @@ end
 class Psych::Coder
 end
 
+# ruby -e 'require "uri"; p [URI::RFC2396_PARSER.class, URI::RFC2396_PARSER.equal?(URI::DEFAULT_PARSER)]'
+#   => [URI::RFC2396_Parser, false]
+# (uri 1.0, Ruby 3.4+; activeresource's active_resource.rb reads it.)
+URI::RFC2396_PARSER: URI::RFC2396_Parser
+
 # Not here: Resolv::DNS::Resource::IN::CAA. The constant names a generated
 # class (`p Resolv::DNS::Resource::IN::CAA` prints
 # `Resolv::DNS::Resource::Type257_Class1`), so a class declaration under

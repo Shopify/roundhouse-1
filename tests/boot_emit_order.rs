@@ -460,3 +460,38 @@ fn a_class_body_write_through_a_writer_an_included_hook_defines_runs_as_native()
         "[3, :default, nil, 9, :on]\n",
     );
 }
+
+/// activeresource's http_mock.rb writes `HttpMock`'s verbs in a loop over
+/// a literal Hash of `%w[]` lists, its heredoc interpolating a
+/// conditional on the key. The statement was dropped as a call on a
+/// computed receiver, so `mock.post(...)` raised NoMethodError and no
+/// HttpMock connection could send a request.
+const VERBS: &[(&str, &str)] = &[(
+    "verbs.rb",
+    r##"module Verbs
+  class Mock
+    { true  => %w[post put],
+      false => %w[get head] }.each do |has_body, methods|
+      methods.each do |method|
+        module_eval <<-EOE, __FILE__, __LINE__ + 1
+          def #{method}(path, #{'body, ' if has_body}headers, options = {})
+            [:#{method}, path, #{has_body ? 'body, ' : 'nil, '}headers, options]
+          end
+        EOE
+      end
+    end
+  end
+end
+"##,
+)];
+
+#[test]
+fn a_module_eval_loop_over_a_literal_hash_of_lists_runs_as_native() {
+    gem_same_as_native(
+        "verbs",
+        VERBS,
+        "verbs",
+        "m = Verbs::Mock.new\np m.post(\"/a\", \"b\", {})\np m.get(\"/c\", {}, 1)\np Verbs::Mock.instance_method(:put).arity, Verbs::Mock.instance_method(:head).arity\n",
+        "[:post, \"/a\", \"b\", {}, {}]\n[:get, \"/c\", nil, {}, 1]\n-4\n-3\n",
+    );
+}

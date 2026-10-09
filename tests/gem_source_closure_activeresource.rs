@@ -96,21 +96,23 @@ fn app() -> Option<emit_and_run::Overlay> {
 /// end` on a plain includer is a recorded gap, and ActiveResource::Base,
 /// its includer here, extends ActiveModel::Naming itself (base.rb:1860).
 ///
-/// Not yet (e2e round 6). Here the boot raises at active_resource.rb:4
-/// (`URI::RFC2396_PARSER`, "constant not supported"; Core's tree carries it)
-/// and the check reports ActiveSupport::XmlMini, Builder::XmlMarkup,
-/// `to_param` and `acts_like?` (Object extensions), `const_get` /
-/// `const_defined?` on an unproven receiver, the association builders'
-/// constants and ActiveModel::ForbiddenAttributesProtection. In a capped
-/// Core emit it loads, and the boot raises NoMethodError (`subclasses` for
-/// module ActiveResource::Validations): the emitted Validations module,
-/// a Concern in the gem, runs `include ActiveModel::Validations` on itself,
-/// and the runtime port's append_features (runtime/active_model_validations.rb)
-/// defines callbacks on the module instead of deferring to the including
-/// class. bin/gem-sources.rb keeps shopify_api held (GEM_SOURCES_PULL_GIT
-/// off) until this passes.
+/// Not yet (e2e round 7). URI::RFC2396_PARSER is typed now
+/// (rbs/supplement.rbs), and in Core the ActiveResource::Validations boot
+/// crash is gone (runtime-concerns). In Core's PostgreSQL tree compiled
+/// activeresource boots and test_runtime.rb gets past
+/// `require "active_resource/http_mock"` (capped emit of
+/// payment_method/direct_test.rb). This probe is a SQLite app, so it
+/// carries none of the PostgreSQL tree's runtime ports: the check reports
+/// ActiveModel::Conversion, Naming, Serialization and Serializers::JSON,
+/// ActiveSupport::Inflector and Deprecation as "ruby does not emit", and
+/// `to_param` (which Conversion answers on the PostgreSQL tree), as well as
+/// ActiveSupport::XmlMini, Builder::XmlMarkup, `acts_like?`, `const_get` /
+/// `const_defined?` on an unproven receiver and
+/// ActiveModel::ForbiddenAttributesProtection. A PostgreSQL probe needs
+/// tests/support/pg_probe.rs' native-compare driver rather than
+/// `run_test`.
 #[test]
-#[ignore = "compiled activeresource does not boot yet: URI::RFC2396_PARSER here; in Core, ActiveResource::Validations' include of ActiveModel::Validations (runtime port append_features)"]
+#[ignore = "SQLite probe: the ActiveModel/ActiveSupport runtime ports activeresource includes ship only with the PostgreSQL tree; also XmlMini, Builder::XmlMarkup, acts_like?"]
 fn activeresource_compiled_as_a_gem_source_answers_http_mock() {
     use roundhouse::ingest::survey;
     let Some(app) = app() else { return };
