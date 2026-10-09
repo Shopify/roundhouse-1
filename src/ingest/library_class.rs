@@ -2205,6 +2205,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
     note_discarded(file, discarded);
     admit_nameless_rest(&mut methods);
+    strip_expanded_included_hook(module, file, &owner, &mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
     if !class_attribute_effects.is_empty() {
@@ -3048,6 +3049,12 @@ pub(super) fn included_hook_class_methods_body<'pr>(
 fn included_hook_parameter(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     let receiver = def.receiver()?;
     receiver.as_self_node()?;
+    hook_parameter(def)
+}
+
+/// The one required parameter of a `def included(base)` (with or without
+/// a receiver), and nothing else in the signature.
+fn hook_parameter(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     if constant_id_str(&def.name()) != "included" {
         return None;
     }
@@ -6452,6 +6459,13 @@ fn ingest_concern_hook_items(
                 }
             }
         }
+        // A plain `def self.included(base)` hook's model DSL on `base`
+        // runs on each includer the way an `included do` block's does.
+        if hook == "included" {
+            if let Some(expansion) = plain_included_hook_expansion(&module, source, file, &id) {
+                items.extend(expansion.items);
+            }
+        }
         if !enums.is_empty() {
             enums_out.push((id.clone(), enums));
         }
@@ -6460,6 +6474,300 @@ fn ingest_concern_hook_items(
         }
     }
     (out, enums_out)
+}
+
+/// A module's plain `included` hook statements that run the model DSL
+/// on the includer (`base.has_many ...`, `base.validates ...`): the
+/// items they declare, as the includer's own body would, and where those
+/// statements start in the source.
+pub(super) struct PlainHookExpansion {
+    /// Where the hook's name stands (`MethodDef::name_span`).
+    hook_name_start: usize,
+    items: Vec<crate::dialect::ModelBodyItem>,
+    /// The start offsets of the hook statements the items stand for.
+    statements: Vec<usize>,
+}
+
+/// The model DSL a plain `included(base)` hook's `base.<macro>(...)`
+/// statement is expanded into each includer for: what Active Record
+/// declares on a model and the lowered model declares statically from
+/// its body, so the runtime base answers none of it on the class side.
+/// Not a writer (`base.table_name = ...`), whose receiver the includer's
+/// body needs; not `attribute`, which Core's `CustomerFoundations`
+/// entities (no model) take through such hooks too; not `enum` or
+/// `delegated_type`, which expand per app constant table; not a
+/// lifecycle callback (`base.before_save :x`), which the PostgreSQL
+/// CRuby tree registers when the hook runs, in Rails' chains beside the
+/// compiled ones (runtime/spinel/cruby/active_record_callbacks.rb).
+fn expands_into_includer(name: &str) -> bool {
+    matches!(
+        name,
+        "belongs_to"
+            | "has_many"
+            | "has_one"
+            | "has_and_belongs_to_many"
+            | "scope"
+            | "default_scope"
+            | "validate"
+            | "validates"
+            | "validates_with"
+            | "validates_associated"
+            | "accepts_nested_attributes_for"
+            | "serialize"
+            | "store"
+            | "store_accessor"
+            | "normalizes"
+            | "encrypts"
+            | "composed_of"
+            | "alias_attribute"
+            | "attr_readonly"
+    ) || (name.starts_with("validates_") && name.ends_with("_of"))
+        || CONCERN_MODEL_MACROS.iter().any(|m| *m == name && *m != "include")
+}
+
+/// A module's plain `included` hook: `def self.included(base)` in its
+/// body, or `def included(base)` in its `class << self` (the last one,
+/// as Ruby keeps it), with the parameter's name.
+fn plain_included_hook<'pr>(module: &ruby_prism::ModuleNode<'pr>) -> Option<(ruby_prism::DefNode<'pr>, String)> {
+    let mut found = None;
+    for stmt in flatten_statements(module.body()?) {
+        if let Some(def) = stmt.as_def_node() {
+            if let Some(param) = included_hook_parameter(&def) {
+                found = Some((def, param));
+            }
+        } else if let Some(sc) = stmt.as_singleton_class_node() {
+            if sc.expression().as_self_node().is_none() {
+                continue;
+            }
+            for inner in sc.body().map(flatten_statements).unwrap_or_default() {
+                let Some(def) = inner.as_def_node() else { continue };
+                if def.receiver().is_some() {
+                    continue;
+                }
+                if let Some(param) = hook_parameter(&def) {
+                    found = Some((def, param));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Where the call a hook statement makes on `param` names its method,
+/// when the statement is `param.<macro>(...)` for a macro
+/// [`expands_into_includer`] and nothing else in it reads the hook's
+/// locals (the parameter among them) or its block: written in the
+/// includer's body, it means the same.
+fn expandable_hook_statement(stmt: &ruby_prism::Node<'_>, param: &str) -> Option<usize> {
+    let call = stmt.as_call_node()?;
+    let recv = call.receiver()?.as_local_variable_read_node()?;
+    if constant_id_str(&recv.name()) != param || recv.depth() != 0 || call.is_safe_navigation() {
+        return None;
+    }
+    if !expands_into_includer(&constant_id_str(&call.name())) {
+        return None;
+    }
+    struct ReachesHook {
+        depth: u32,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for ReachesHook {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+        }
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.found |= node.receiver().is_none()
+                && matches!(&*constant_id_str(&node.name()), "block_given?" | "iterator?" | "binding" | "__method__");
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_forwarding_super_node(&mut self, _node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_super_node(&mut self, _node: &ruby_prism::SuperNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_yield_node(&mut self, _node: &ruby_prism::YieldNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.depth += 1;
+            ruby_prism::visit_block_node(self, node);
+            self.depth -= 1;
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.depth += 1;
+            ruby_prism::visit_lambda_node(self, node);
+            self.depth -= 1;
+        }
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut reaches = ReachesHook { depth: 0, found: false };
+    if let Some(args) = call.arguments() {
+        ruby_prism::Visit::visit(&mut reaches, &args.as_node());
+    }
+    if let Some(block) = call.block() {
+        ruby_prism::Visit::visit(&mut reaches, &block);
+    }
+    if reaches.found {
+        return None;
+    }
+    Some(call.message_loc()?.start_offset())
+}
+
+/// The model DSL module `module`'s plain `included(base)` hook runs on
+/// `base`, read as the includer's own body statements.
+///
+/// Ruby runs the hook at `include`, so `base.has_many :items` there is
+/// `has_many :items` in the includer's body where its `include` stands:
+/// what an ActiveSupport::Concern's `included do` block is, and spliced
+/// the same way (`concern_model_items`). Core's
+/// `HasSyncedActiveRecordMetafields` (30 models) declares `has_many
+/// :metafields` so; written as authored, the hook raised at the include,
+/// as the runtime base declares no association on the class side. Its
+/// callbacks stay in the hook, which the runtime registers
+/// ([`expands_into_includer`]).
+///
+/// Each statement [`expandable_hook_statement`] accepts is re-read with
+/// `base.` blanked, the file's offsets kept (so its spans and lines are
+/// the file's), and kept when every item it declares is one an
+/// `included do` statement carries. The hook keeps the rest
+/// (`base.extend`, `base.define_method`, ...) and runs them as written;
+/// [`strip_expanded_included_hook`] takes the expanded statements out of
+/// it. One that is not carried stays in the hook too, and is recorded.
+fn plain_included_hook_expansion(
+    module: &ruby_prism::ModuleNode<'_>,
+    source: &[u8],
+    file: &str,
+    owner: &ClassId,
+) -> Option<PlainHookExpansion> {
+    use crate::dialect::ModelBodyItem;
+    let (def, param) = plain_included_hook(module)?;
+    let mut expansion = PlainHookExpansion { hook_name_start: def.name_loc().start_offset(), items: Vec::new(), statements: Vec::new() };
+    for stmt in flatten_statements(def.body()?) {
+        let Some(call_start) = expandable_hook_statement(&stmt, &param) else { continue };
+        let (start, end) = (stmt.location().start_offset(), stmt.location().end_offset());
+        if source.get(start..end) != Some(stmt.location().as_slice()) {
+            continue;
+        }
+        // The file up to the statement as blanks (newlines kept), then
+        // the statement with `base.` blanked.
+        let mut text: Vec<u8> = source[..call_start].iter().map(|&b| if b == b'\n' { b'\n' } else { b' ' }).collect();
+        text.extend_from_slice(&source[call_start..end]);
+        text.push(b'\n');
+        let result = super::prism::parse_silent(&text);
+        if result.errors().next().is_some() {
+            continue;
+        }
+        let root = result.node();
+        let Some(inner) = root
+            .as_program_node()
+            .into_iter()
+            .flat_map(|p| p.statements().body().iter().collect::<Vec<_>>())
+            .find(|s| s.location().start_offset() == call_start)
+        else {
+            continue;
+        };
+        let carried = match super::model::ingest_model_body_items(&inner, owner, file, Vec::new(), None) {
+            Ok(parsed) => parsed
+                .into_iter()
+                .filter(|item| !matches!(item, ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node, crate::expr::ExprNode::Lit { .. })))
+                .map(|item| match &item {
+                    ModelBodyItem::Association { .. }
+                    | ModelBodyItem::Scope { .. }
+                    | ModelBodyItem::Validation { .. }
+                    | ModelBodyItem::Callback { .. } => Ok(item),
+                    ModelBodyItem::Unknown { .. }
+                        if unknown_is_block_callback(&item) || unknown_is_model_macro(&item) || carries_to_includer(&item) =>
+                    {
+                        Ok(item)
+                    }
+                    _ => Err(()),
+                })
+                .collect::<Result<Vec<_>, ()>>()
+                .ok(),
+            Err(err) => {
+                super::survey::record(&err);
+                None
+            }
+        };
+        match carried {
+            Some(items) if !items.is_empty() => {
+                expansion.items.extend(items);
+                expansion.statements.push(start);
+            }
+            _ => super::survey::record(&IngestError::Unsupported {
+                file: file.to_string(),
+                message: format!(
+                    "`{}`'s `included` hook statement on line {} declares what an includer's body does not carry, so it runs as written on the includer",
+                    owner.0.as_str(),
+                    super::sources::line_at(file, start).unwrap_or(0)
+                ),
+            }),
+        }
+    }
+    (!expansion.statements.is_empty()).then_some(expansion)
+}
+
+/// Take the statements [`plain_included_hook_expansion`] expands into
+/// each includer out of the module's lowered `included` hook, and drop
+/// a hook with nothing left: the includers declare them statically, and
+/// run as written they raised (the runtime base declares no model DSL on
+/// the class side). The file's registered text is what the expansion
+/// re-reads; without it the hook stays whole.
+fn strip_expanded_included_hook(
+    module: &ruby_prism::ModuleNode<'_>,
+    file: &str,
+    owner: &ClassId,
+    methods: &mut Vec<crate::dialect::MethodDef>,
+) {
+    let Some(text) = super::sources::text_of_file(super::sources::file_id(file)) else { return };
+    let Some(expansion) =
+        super::survey::without_recording(|| plain_included_hook_expansion(module, text.as_bytes(), file, owner))
+    else {
+        return;
+    };
+    let Some(at) = methods.iter().position(|m| {
+        m.receiver == MethodReceiver::Class
+            && m.name.as_str() == "included"
+            && !m.name_span.is_synthetic()
+            && m.name_span.start as usize == expansion.hook_name_start
+    }) else {
+        return;
+    };
+    let expanded = |e: &Expr| !e.span.is_synthetic() && expansion.statements.contains(&(e.span.start as usize));
+    let body = &mut methods[at].body;
+    let empty = match &mut *body.node {
+        ExprNode::Seq { exprs } => {
+            exprs.retain(|e| !expanded(e));
+            exprs.is_empty()
+        }
+        _ => expanded(body),
+    };
+    if empty {
+        methods.remove(at);
+    }
 }
 
 /// Does this class's ancestry, as a `sig/**/*.rbs` sidecar states it,
