@@ -25,6 +25,11 @@ require_relative "action_controller/cookies"
 # The error `Params.require_key` raises; travels with its consumer for
 # the same reason message_digest does.
 require_relative "action_controller/parameter_missing"
+# `ActionController::Parameters` itself, for the app code that names
+# the class outside a request (`Parameters.new(hash)`, `is_a?` checks,
+# coder allow-lists whose `constantize` runs at class-body time). A
+# controller's `params` stay lowered to String-keyed hashes.
+require_relative "action_controller/parameters"
 # geared_pagination's `set_page_and_extract_portion_from` + the `Page` it
 # sets — a third Base reopen kept off the strict-target tables, for the
 # reason its own header gives.
