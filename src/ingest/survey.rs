@@ -296,7 +296,16 @@ pub fn bucket_key(err: &IngestError) -> String {
 }
 
 /// [`bucket_key`] of a recorded gap message.
+///
+/// A test-class refusal (`test class `X` refused: <reason>`) leads with
+/// the class's name, which would make every refusal its own bucket and,
+/// past 120 characters of a long qualified name, cut the reason off. Its
+/// key is the reason, under `test class refused:`, with any line number
+/// in it as `line N`: the same reason in two classes is one bucket.
 pub fn bucket_message(msg: &str) -> String {
+    if let Some((_, reason)) = msg.strip_prefix("test class `").and_then(|rest| rest.split_once("` refused: ")) {
+        return bucket_message(&format!("test class refused: {}", without_line_numbers(reason)));
+    }
     let trimmed = msg.split('(').next().unwrap_or(msg);
     // Strip trailing whitespace introduced by the split + truncate to
     // a reasonable display width.
@@ -304,6 +313,23 @@ pub fn bucket_message(msg: &str) -> String {
     // character panics, and the ledger lines carry em dashes.
     let key = trimmed.trim_end();
     key.chars().take(120).collect()
+}
+
+/// `text` with each `line <digits>` written `line N`.
+fn without_line_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("line ") {
+        let (head, tail) = rest.split_at(at + "line ".len());
+        out.push_str(head);
+        let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 {
+            out.push('N');
+        }
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -321,5 +347,27 @@ mod tests {
             message: format!("{pad}— tail"),
         };
         assert_eq!(bucket_key(&err), format!("{pad}—"));
+    }
+
+    /// A test-class refusal buckets by its reason: the class name (which
+    /// used to fill the key, or, before a `(line N)`, be all of it) and
+    /// the line are not part of it.
+    #[test]
+    fn test_class_refusals_bucket_by_reason() {
+        let key = |message: &str| bucket_message(message);
+        let long = "Checkouts::Api::DiscountApplicationsPresenter::DiscountAllocationPresenterTest";
+        let a = key(&format!(
+            "test class `{long}` refused: it is declared inside a block, which is not modeled; its tests would not run (`{long}`, line 12)"
+        ));
+        let b = key("test class `ATest` refused: it is declared inside a block, which is not modeled; its tests would not run (`ATest`, line 3)");
+        assert_eq!(a, "test class refused: it is declared inside a block, which is not modeled; its tests would not run");
+        assert_eq!(a, b);
+        let c = key("test class `BTest` refused: a test declared at line 46 by a class-body statement ingest does not model (a loop)");
+        let d = key("test class `CTest` refused: a test declared at line 7 by a class-body statement ingest does not model (a loop)");
+        assert_eq!(c, "test class refused: a test declared at line N by a class-body statement ingest does not model");
+        assert_eq!(c, d);
+        // Anything else keeps its key.
+        assert_eq!(key("view not modeled (public.v)"), "view not modeled");
+        assert_eq!(without_line_numbers("line 4, lines, line x, line 10"), "line N, lines, line x, line N");
     }
 }

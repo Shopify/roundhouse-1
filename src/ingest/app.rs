@@ -2814,7 +2814,7 @@ end
     }
     super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
-    super::test::resolve_test_parents(&mut app);
+    super::test::resolve_test_parents(&mut app)?;
     super::library_class::resolve_library_parents(&mut app);
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
