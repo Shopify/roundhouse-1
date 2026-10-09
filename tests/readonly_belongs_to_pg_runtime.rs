@@ -427,9 +427,15 @@ fn overlay() -> emit_and_run::Overlay {
 /// ActiveRecord::Relation` casts. The emitted tree runs the module as
 /// written; each gap here is a separate analyzer fix, and an error
 /// not listed still fails the test.
+///
+/// `module_eval` is no longer refused as Module protocol here: on a
+/// PostgreSQL app the `cruby_module_protocol` pass lifts that refusal,
+/// since CRuby runs the call as written. The same site then reports the
+/// ivar's `Module?` typing, as `send` on it already does; `roundhouse
+/// check` still names the Module protocol refusal.
 const KNOWN_CONCERN_GAPS: [&str; 5] = [
     "a call on a literal list in a class or module body is not carried; Ruby runs it when the body loads: [:build, :create, :create!, :<<, :push, :concat, :delete, :delete_all, :destroy, :destroy_all].each",
-    "Module protocol not supported (all targets): module_eval requires a proven class/module object receiver",
+    "no known method `module_eval` on Module?",
     "no known method `send` on Module?",
     "no known method `arity` on nil",
     "declared type not supported (all targets): ActiveRecord::Relation has no indexed declaration or modeled dependency",
