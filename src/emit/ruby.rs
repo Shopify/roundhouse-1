@@ -9,7 +9,7 @@
 //! helpers live in `shared`; expression emission lives in `expr`.
 
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::EmittedFile;
 use crate::App;
@@ -1462,6 +1462,16 @@ pub fn emit_with_assertions(
             .filter(|(l, _)| test_names_of(&l.test_class).is_empty())
             .map(|(l, path)| (l.test_class.name.0.as_str(), path.clone()))
             .collect();
+        // The same by the authored file that declares them, for a test
+        // file's `require` of it (`authored_requires`).
+        let mut support_sources: std::collections::BTreeMap<&str, Vec<PathBuf>> = std::collections::BTreeMap::new();
+        for ((l, path), module) in test_lowered.iter().zip(&out_paths).zip(&app.test_modules) {
+            if let Some(source) = module.source_file.as_deref().filter(|_| test_names_of(&l.test_class).is_empty()) {
+                support_sources.entry(source).or_default().push(path.clone());
+            }
+        }
+        let program_anchors: crate::det::HashSet<String> =
+            app.file_programs.iter().map(|program| library::file_program_anchor(app, program)).collect();
         assert_eq!(test_lowered.len(), app.test_modules.len(), "one lowered class per test module");
         for ((lowered, out_path), module) in test_lowered.iter().zip(out_paths).zip(&app.test_modules) {
             let lc = &lowered.test_class;
@@ -1586,6 +1596,11 @@ pub fn emit_with_assertions(
             // file program's statement is (`RoundhouseAutoload.file_statement`).
             for (anchor, site) in &test_helper_anchors {
                 writeln!(preamble, "RoundhouseAutoload.file_statement({site:?}) {{ require_relative \"../../app/{anchor}\" }}").unwrap();
+            }
+            // The file's own top-level loads, after its `require
+            // "test_helper"`, in source order.
+            for line in authored_requires(app, module, &support_sources, &program_anchors) {
+                preamble.push_str(&line);
             }
             if let Some(parent_path) = lc.parent.as_ref().and_then(|p| test_paths.get(p.0.as_str())) {
                 let rel = parent_path.strip_prefix("test").unwrap_or(parent_path).with_extension("");
@@ -2018,6 +2033,96 @@ fn require_declarations_through_programs(
 /// splicing a companion class into a host file — the host already
 /// emits its own require headers, and the companion's headers would
 /// either duplicate or land in the wrong order.
+/// The preamble lines that run a test file's top-level loads
+/// (`TestModule::file_requires`), each under `RoundhouseAutoload.
+/// file_statement` at its site, which names a load that fails and goes
+/// on, as a support file's program statement does. A `require` of a
+/// feature runs as written: in the test environment a carried
+/// test-support file answers its feature on the test load path
+/// (`project::test_load_path_features`), a compiled gem's its own, and
+/// any other goes on to Kernel's. `require "test_helper"` is the
+/// preamble's own. A file a relative load names is, in this order, a
+/// support class's emitted test file, its feature on the test load
+/// path, or its emitted file program; a file none of them carries, or a
+/// load that names no literal file, raises its reason where it runs.
+fn authored_requires(
+    app: &App,
+    module: &crate::dialect::TestModule,
+    support_sources: &std::collections::BTreeMap<&str, Vec<PathBuf>>,
+    program_anchors: &crate::det::HashSet<String>,
+) -> Vec<String> {
+    use crate::dialect::TestRequireTarget;
+    let Some(source) = module.source_file.as_deref() else { return Vec::new() };
+    // The helper's own loads are its programs' (`App::test_helper_programs`).
+    if source == "test/test_helper.rb" {
+        return Vec::new();
+    }
+    let from_test = |path: &Path| {
+        let rel = path.strip_prefix("test").unwrap_or(path).with_extension("");
+        format!("require_relative \"../{}\"", rel.display())
+    };
+    let support = |rel: &str| support_sources.get(rel).map(|paths| paths.iter().map(|p| from_test(p)).collect::<Vec<_>>());
+    let mut out = Vec::new();
+    for require in &module.file_requires {
+        let site = format!("{source}:{}", require.line);
+        let statements: Vec<String> = match &require.target {
+            TestRequireTarget::Feature(feature) => {
+                let feature = feature.strip_suffix(".rb").unwrap_or(feature);
+                if feature == "test_helper" {
+                    continue;
+                }
+                app.test_load_roots
+                    .iter()
+                    .find_map(|root| support(&format!("{root}{feature}.rb")))
+                    .unwrap_or_else(|| vec![format!("require {feature:?}")])
+            }
+            TestRequireTarget::Relative(path) => {
+                let rel = normalize_relative(Path::new(source).parent().unwrap_or(Path::new("")), path);
+                let rel = if rel.ends_with(".rb") { rel } else { format!("{rel}.rb") };
+                if rel == "test/test_helper.rb" {
+                    continue;
+                }
+                let anchor = format!("models/roundhouse_files/{}", rel.strip_suffix(".rb").unwrap_or(&rel));
+                let feature = app.test_load_roots.iter().find_map(|root| rel.strip_prefix(root.as_str()));
+                if let Some(lines) = support(&rel) {
+                    lines
+                } else if let Some(feature) = feature {
+                    vec![format!("require {:?}", feature.strip_suffix(".rb").unwrap_or(feature))]
+                } else if program_anchors.contains(&anchor) {
+                    vec![format!("require_relative \"../../app/{anchor}\"")]
+                } else {
+                    let why = format!("roundhouse: `require_relative {path:?}` loads {rel}, which the emitted tree does not carry");
+                    vec![format!("raise LoadError, {why:?}")]
+                }
+            }
+            TestRequireTarget::Unsupported(call) => {
+                let why = format!("roundhouse: `{call}` is not supported (all targets): it loads no literal file");
+                vec![format!("raise NotImplementedError, {why:?}")]
+            }
+        };
+        for statement in statements {
+            out.push(format!("RoundhouseAutoload.file_statement({site:?}) {{ {statement} }}\n"));
+        }
+    }
+    out
+}
+
+/// `path` from the app-relative directory `dir`, with its `.` and `..`
+/// segments resolved (a `..` above the app root stays).
+fn normalize_relative(dir: &Path, path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for segment in dir.to_string_lossy().split('/').chain(path.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| p != "..") => {
+                parts.pop();
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join("/")
+}
+
 fn strip_require_headers(content: &str) -> String {
     let lines = content.lines();
     let mut body_start = 0usize;
