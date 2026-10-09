@@ -171,7 +171,15 @@ pub fn emit_expr(e: &Expr) -> String {
     // but CRuby's.
     let runtime_declared_type = e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
         && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if matches!(construct.as_str(), "declared type" | "constant"));
-    if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e.diagnostic.as_ref().filter(|_| !runtime_declared_type) {
+    // A constructor call refused only for ingest's flattened keywords
+    // (`CONSTRUCTOR_KEYWORDS_AS_WRITTEN`): this tree writes them back, so
+    // the source call runs.
+    let constructor_as_written = e.decisions & crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN != 0
+        && native_keywords()
+        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
+    if let Some(kind @ DiagnosticKind::Unsupported { .. }) =
+        &e.diagnostic.as_ref().filter(|_| !runtime_declared_type && !constructor_as_written)
+    {
         // This is an expression, including in a rescue list or a binary
         // operand. A bare command-style `raise` is not valid there.
         let stub = crate::emit::diagnostics::StubStyle::Raise

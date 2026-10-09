@@ -990,3 +990,141 @@ fn models_without_flattened_initializers_keep_keyword_hashes_under_unknown_looku
         "model keyword hashes and splats must remain intact when constructor lookup is external:\n{emitted}"
     );
 }
+
+/// The CRuby tree writes flattened constructor keywords back as keywords,
+/// so a call refused for strict targets only because its keywords might
+/// reach a flattened slot runs there as the source wrote it, and a call
+/// the lowering did move to positional slots is restored.
+#[test]
+fn the_cruby_tree_runs_constructor_keywords_the_strict_targets_refuse() {
+    let source = r#"
+class HookedConstructor
+  def self.method_added(_name)
+  end
+
+  attr_reader :label, :step
+
+  def initialize(label: "default", step: 1)
+    @label = label
+    @step = step
+  end
+end
+
+class OrderedConstructor
+  attr_reader :first, :second
+
+  def initialize(first: 1, second: 2)
+    @first = first
+    @second = second
+  end
+end
+
+class NativeConstructorCalls
+  def self.build(options)
+    [
+      HookedConstructor.new(step: 3),
+      OrderedConstructor.new(second: 5, first: 4),
+      OrderedConstructor.new(**options),
+      OrderedConstructor.new(second: 7),
+    ]
+  end
+end
+"#;
+    let classes =
+        ingest_library_classes(source.as_bytes(), "native_constructors.rb").expect("ingest");
+    let mut app = App::new();
+    app.library_classes.extend(classes);
+    let diagnostics = roundhouse::session::analyze_and_lower(&mut app);
+    for call in [
+        "HookedConstructor.new(step: 3)",
+        "OrderedConstructor.new(second: 5, first: 4)",
+        "OrderedConstructor.new(**options)",
+    ] {
+        let start = source.find(call).expect("source call") as u32;
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.span.start == start
+                && matches!(
+                    &diagnostic.kind,
+                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "constructor keyword arguments"
+                )),
+            "strict targets must still refuse {call:?}: {diagnostics:#?}"
+        );
+    }
+    let strict = emit_library(&app)
+        .into_iter()
+        .map(|file| file.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        strict.contains("raise \"roundhouse: constructor keyword arguments not supported"),
+        "the strict emit keeps the refusal stub:\n{strict}"
+    );
+
+    let emitted: Vec<_> =
+        roundhouse::emit::ruby::with_native_keyword_splats(|| emit_library(&app))
+            .into_iter()
+            .filter(|file| file.path.extension().is_some_and(|extension| extension == "rb"))
+            .collect();
+    let native = emitted
+        .iter()
+        .map(|file| file.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for call in [
+        "HookedConstructor.new(step: 3)",
+        "OrderedConstructor.new(second: 5, first: 4)",
+        "OrderedConstructor.new(**options)",
+        "OrderedConstructor.new(second: 7)",
+    ] {
+        assert!(
+            native.contains(call),
+            "the CRuby tree writes {call:?} as the source did:\n{native}"
+        );
+    }
+    assert!(
+        !native.contains("constructor keyword arguments not supported"),
+        "no constructor refusal stub on the CRuby tree:\n{native}"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "roundhouse-native-constructor-keywords-{}-{}",
+        std::process::id(),
+        RUN.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for file in &emitted {
+        let path = dir.join(&file.path);
+        std::fs::create_dir_all(path.parent().expect("emitted file parent")).expect("mkdir");
+        std::fs::write(path, &file.content).expect("write emitted source");
+    }
+    let requires = emitted
+        .iter()
+        .map(|file| format!("require_relative {:?}", file.path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let script = format!(
+        "{requires}\n{}",
+        [
+            "hooked, ordered, splatted, filled = NativeConstructorCalls.build({ second: 9 })",
+            "p [hooked.label, hooked.step]",
+            "p [ordered.first, ordered.second]",
+            "p [splatted.first, splatted.second]",
+            "p [filled.first, filled.second]",
+        ]
+        .join("\n")
+    );
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(&dir)
+        .output()
+        .expect("run Ruby");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[\"default\", 3]\n[4, 5]\n[1, 9]\n[1, 7]\n",
+        "{}\n{native}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

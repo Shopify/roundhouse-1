@@ -20,6 +20,11 @@ pub(super) struct InstanceCallParams {
     unqualified_class_ids: HashMap<String, String>,
     ambiguous_names: HashSet<String>,
     model_names: HashSet<String>,
+    /// Every flattened `initialize`/`new` in the app has its keywords
+    /// written back as keywords by the Ruby family
+    /// (`Param::keywords_written_as_keywords`), so a constructor call the
+    /// CRuby tree leaves as written binds as Ruby's does.
+    ruby_family_writes_constructor_keywords: bool,
 }
 
 impl InstanceCallParams {
@@ -76,8 +81,52 @@ impl InstanceCallParams {
             unqualified_class_ids,
             ambiguous_names: names.ambiguous_names.clone(),
             model_names: names.model_names.clone(),
+            ruby_family_writes_constructor_keywords: ruby_family_writes_constructor_keywords(app),
         }
     }
+}
+
+/// Whether the Ruby family writes every flattened constructor keyword
+/// back. Ingest flattens an optional keyword into a positional-with-default
+/// (`Param::from_keyword`), which is what makes an unverified `new` lookup
+/// unsafe on targets without keyword arguments. A native-keyword tree
+/// writes a method's trailing flattened keywords back (`emit_method`), and
+/// keeps every unrewritten call's keywords, so the binding is Ruby's own.
+/// One `initialize` or `new` anywhere whose flattened keywords are not
+/// written back could be the effective constructor of an unverified
+/// lookup, so it keeps every such refusal on that tree too.
+fn ruby_family_writes_constructor_keywords(app: &App) -> bool {
+    let constructor = |method: &&crate::dialect::MethodDef| {
+        matches!(method.name.as_str(), "initialize" | "new")
+    };
+    let written_back = |method: &crate::dialect::MethodDef| {
+        crate::dialect::Param::keywords_written_as_keywords(&method.params)
+    };
+    let classes = app
+        .library_classes
+        .iter()
+        .chain(app.rails_application.iter())
+        .chain(
+            app.test_modules
+                .iter()
+                .flat_map(|module| module.inner_classes.iter()),
+        );
+    classes
+        .flat_map(|class| class.methods.iter())
+        .filter(constructor)
+        .all(written_back)
+        && app
+            .models
+            .iter()
+            .flat_map(|model| model.methods())
+            .filter(constructor)
+            .all(written_back)
+        && app
+            .test_modules
+            .iter()
+            .flat_map(|module| module.helpers.iter())
+            .filter(constructor)
+            .all(written_back)
 }
 
 pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> {
@@ -299,7 +348,7 @@ pub(super) fn refuse_keyword_splats(
     if let Some(reason) =
         constructor_refusal_reason(params, expr.span, id.0.as_str(), class_name, args)
     {
-        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
+        refuse_constructor(expr, params, reason, diagnostics);
     }
 }
 
@@ -355,7 +404,7 @@ fn rewrite_instance_call(
         && let Some(reason) =
             constructor_refusal_reason(params, expr.span, id.0.as_str(), class_id, args)
     {
-        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
+        refuse_constructor(expr, params, reason, diagnostics);
         return;
     }
     if is_constructor {
@@ -374,8 +423,8 @@ fn rewrite_instance_call(
     if is_constructor {
         if respell_constructor(args, slots).is_err() {
             refuse_constructor(
-                expr.span,
-                &mut expr.diagnostic,
+                expr,
+                params,
                 "cannot safely move these keywords into initialize's positional slots without changing Ruby argument binding or evaluation semantics",
                 diagnostics,
             );
@@ -417,8 +466,8 @@ pub(super) fn rewrite_custom_new_call(
     };
     if respell_constructor(args, slots).is_err() {
         refuse_constructor(
-            expr.span,
-            &mut expr.diagnostic,
+            expr,
+            params,
             "cannot safely move these keywords into custom `new` positional slots without changing Ruby argument binding or evaluation semantics",
             diagnostics,
         );
@@ -488,19 +537,35 @@ fn constructor_refusal_reason(
     None
 }
 
+/// The refusal holds on every target that keeps ingest's flattened
+/// keywords positional. Where its only cause is that flattening, and the
+/// Ruby family writes every flattened constructor keyword back, the call
+/// is marked `CONSTRUCTOR_KEYWORDS_AS_WRITTEN`: the CRuby tree writes it as
+/// the source did. A lexical refinement's `new` is not modeled as a method,
+/// so that refusal holds on every tree.
 fn refuse_constructor(
-    span: crate::span::Span,
-    diagnostic_kind: &mut Option<crate::diagnostic::DiagnosticKind>,
+    expr: &mut Expr,
+    params: &InstanceCallParams,
     detail: &str,
     diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
+    let as_written = params.ruby_family_writes_constructor_keywords
+        && !params.lexical_refinement_calls.contains(&expr.span);
+    let detail = if as_written {
+        format!("{detail}; the CRuby tree, which writes flattened keywords back, runs the call as written")
+    } else {
+        detail.to_string()
+    };
     let diagnostic = crate::diagnostic::Diagnostic::unsupported(
-        span,
+        expr.span,
         None,
         crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS,
         detail,
     );
-    *diagnostic_kind = Some(diagnostic.kind.clone());
+    expr.diagnostic = Some(diagnostic.kind.clone());
+    if as_written {
+        expr.decisions |= crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN;
+    }
     diagnostics.push(diagnostic);
 }
 
@@ -550,7 +615,11 @@ fn respell_constructor(args: &mut Vec<Expr>, slots: &[Slot]) -> Result<(), ()> {
             return Err(());
         }
         previous_pos = Some(pos);
-        supplied.push((pos, value.clone()));
+        let mut value = value.clone();
+        // The Ruby family writes the flattened keyword back, and with it
+        // this argument (`lower::keyword_marks`).
+        value.mark_source_keyword(slots[pos].name.clone());
+        supplied.push((pos, value));
     }
 
     let last_pos = previous_pos.expect("non-empty entries have a positional slot");
@@ -570,7 +639,9 @@ fn respell_constructor(args: &mut Vec<Expr>, slots: &[Slot]) -> Result<(), ()> {
         if !is_context_free_constructor_default(default) {
             return Err(());
         }
-        moved.push(default.clone());
+        let mut fill = default.clone();
+        fill.mark_keyword_default_fill(slots[pos].name.clone());
+        moved.push(fill);
     }
     args.pop();
     args.extend(moved);

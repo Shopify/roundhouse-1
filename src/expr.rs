@@ -256,6 +256,17 @@ pub const KEYWORD_DEFAULT_FILL: u64 = 1 << 16;
 /// strong-params lowering reads this to know which refusal to apply.
 pub const FROM_PARAMS_EXPECT: u64 = 1 << 28;
 
+/// On a `Class.new(k: v)` the shared constructor lowering refused
+/// (`diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS`) only because its keywords
+/// might reach a flattened `initialize` or `new` positionally: the
+/// effective constructor could not be verified, or the keywords could not
+/// be moved into its slots. The Ruby family writes every flattened
+/// constructor keyword in this app back as a keyword
+/// (`Param::keywords_written_as_keywords`), so a native-keyword tree runs
+/// the call as written and Ruby binds it. Every other target keeps the
+/// refusal stub.
+pub const CONSTRUCTOR_KEYWORDS_AS_WRITTEN: u64 = 1 << 29;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -1965,7 +1976,7 @@ mod tests {
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
-            FROM_PARAMS_EXPECT,
+            FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN,
         ];
         let mut seen = 0u64;
         for bit in bits {
