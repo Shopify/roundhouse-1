@@ -983,6 +983,11 @@ pub struct ZeitwerkLoader {
     /// The directories its `eager_load_dir` names, in call order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub eager_dirs: Vec<ZeitwerkEagerDir>,
+    /// The directories it collapses (`collapse`, glob patterns expanded),
+    /// absolute like `root`: each adds no namespace, so a file under one
+    /// is named by its path without that directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<String>,
 }
 
 /// A directory a Zeitwerk loader's `eager_load_dir` loads

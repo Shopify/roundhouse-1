@@ -370,6 +370,18 @@ impl<'a> ClassSide<'a> {
             })
     }
 
+    /// Class-side readers the lowered model synthesizes from its schema
+    /// table (`schema::push_schema_methods`), which a replayed call reaches
+    /// as ActiveRecord's: database_documentation's macro builds its
+    /// `ModelAnnotation.new(table_name: table_name, ...)`.
+    fn synthesized(&self, name: &str) -> bool {
+        name == "table_name"
+            && std::iter::once(self.owner)
+                .chain(self.chain.iter().map(|m| &m.name))
+                .filter_map(|n| self.app.models.iter().find(|m| &m.name == n))
+                .any(|m| self.app.schema.tables.contains_key(&m.table.0))
+    }
+
     fn base_modules(&self) -> &[(&'a LibraryClass, &'a LibraryClass)] {
         self.base.get_or_init(|| base_include_class_modules(self.app))
     }
@@ -806,7 +818,7 @@ impl<'s, 'a> Walk<'s, 'a> {
             self.path.pop();
             return walked;
         }
-        if CLASS_SIDE_BUILTINS.contains(&name) {
+        if CLASS_SIDE_BUILTINS.contains(&name) || self.side.synthesized(name) {
             return Ok(());
         }
         Err(format!("{} calls `{name}`, which the lowered `{}` does not define", self.via(), self.side.owner.0.as_str()))

@@ -290,7 +290,7 @@ fn a_gem_extension_loader_inflects_ignores_and_eager_loads_directories() {
 fn unmodeled_file_level_loader_calls_are_refused_at_their_lines() {
     let root = std::env::temp_dir().join(format!("roundhouse-zeitwerk-file-refused-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let entry = "module Host\nend\n\nLOADER = Zeitwerk::Loader.for_gem_extension(Host)\nLOADER.collapse(\"#{__dir__}/x\")\nLOADER.inflector.inflect(\"a\" => name)\nLOADER.eager_load_dir(\"#{__dir__}/ext\")\nOTHER = Zeitwerk::Loader.for_gem_extension(Host.itself)\n";
+    let entry = "module Host\nend\n\nLOADER = Zeitwerk::Loader.for_gem_extension(Host)\nLOADER.do_not_eager_load(\"#{__dir__}/x\")\nLOADER.inflector.inflect(\"a\" => name)\nLOADER.eager_load_dir(\"#{__dir__}/ext\")\nOTHER = Zeitwerk::Loader.for_gem_extension(Host.itself)\n";
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
@@ -305,8 +305,8 @@ fn unmodeled_file_level_loader_calls_are_refused_at_their_lines() {
     let _ = std::fs::remove_dir_all(&root);
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     for expected in [
-        "ext.rb:5:1: error[file_statement_unsupported]: file-level statement `Zeitwerk::Loader#collapse` does not run",
-        "`Zeitwerk::Loader#collapse` is not modeled",
+        "ext.rb:5:1: error[file_statement_unsupported]: file-level statement `Zeitwerk::Loader#do_not_eager_load` does not run",
+        "`Zeitwerk::Loader#do_not_eager_load` is not modeled",
         "ext.rb:6:1: error[file_statement_unsupported]: file-level statement `Zeitwerk::Inflector#inflect` does not run",
         "`Zeitwerk::Inflector#inflect` of anything but one literal",
         "ext.rb:7:1: error[file_statement_unsupported]: file-level statement `Zeitwerk::Loader#eager_load_dir` does not run",

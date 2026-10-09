@@ -78,14 +78,25 @@
 //! file name, so an inflection override changes nothing there; it is
 //! read for the namespace an `eager_load_dir` compiles to.
 //!
+//! `collapse(pattern, …)` (database_documentation 3.2.0's
+//! `loader.collapse("#{__dir__}/**/concerns")`) makes each directory the
+//! patterns name add no namespace: `model_metadata/concerns/metadata.rb`
+//! is `DatabaseDocumentation::ModelMetadata::Metadata`. Zeitwerk expands
+//! the patterns with `Dir.glob` when `collapse` runs (zeitwerk 2.8.2
+//! loader/config.rb:171); so does the compile, against the carried tree.
+//! The loader records the directories, which the generated autoload
+//! reads when it maps a file's path to its constant
+//! (`project::apply_models_autoload`), and an `eager_load_dir` namespace
+//! skips them, as Zeitwerk's walk does.
+//!
 //! Paths are evaluated at compile time from literals:
 //! `File.join(__dir__, "x", …)`, `File.expand_path("x", __dir__)` and
 //! `"#{__dir__}/x"` are the source file's directory joined with the
 //! literal parts. Any other loader call (an inflector other than a
-//! literal `inflect` hash, `collapse`, `eager_load` at load, reloading,
-//! callbacks, a computed path) is a named refusal at its site: one in a
-//! class body raises there when the body runs, one at file level is a
-//! file statement the program names and does not run.
+//! literal `inflect` hash, `eager_load` at load, reloading, callbacks,
+//! a computed path) is a named refusal at its site: one in a class body
+//! raises there when the body runs, one at file level is a file
+//! statement the program names and does not run.
 //!
 //! Recorded through a thread-local collector like [`super::survey`],
 //! since a class-body walk returns classes, not app facts;
@@ -126,6 +137,9 @@ pub(super) struct LoaderDecl {
     pub inflections: Vec<(String, String)>,
     /// Directories `eager_load_dir` was called on, absolute.
     pub eager_dirs: Vec<PathBuf>,
+    /// Directories `collapse` names (its glob patterns expanded), absolute
+    /// and sorted: each adds no namespace.
+    pub collapsed: Vec<PathBuf>,
 }
 
 /// A loader constructor the walk has seen, under its handle name.
@@ -383,6 +397,7 @@ fn declare_loader(value: &Node<'_>, key: &str, file: &str, write: &Node<'_>, sco
         setup: false,
         inflections: Vec::new(),
         eager_dirs: Vec::new(),
+        collapsed: Vec::new(),
     });
     Some(handle(key, span_of(value, file)))
 }
@@ -681,6 +696,39 @@ fn apply(stmt: &Node<'_>, file: &str, scope: Scope<'_>) -> Option<Applied> {
             });
             Some(Applied::Static)
         }
+        // `collapse(pattern, …)` (zeitwerk 2.8.2 loader/config.rb:171):
+        // each pattern is expanded with `Dir.glob` when the call runs, and
+        // a directory it names adds no namespace.
+        "collapse" => {
+            let mut dirs = Vec::new();
+            for arg in &args {
+                let Some(pattern) = literal_path(arg, file) else {
+                    return Some(Applied::Refused(
+                        "`Zeitwerk::Loader#collapse` of a path that is not a literal under `__dir__` is not modeled"
+                            .into(),
+                    ));
+                };
+                match glob_dirs(&pattern) {
+                    Some(found) => dirs.extend(found),
+                    None => {
+                        return Some(Applied::Refused(
+                            "`Zeitwerk::Loader#collapse` of a glob with a character class, braces or an escape is not \
+                             modeled (`*`, `?` and `**` are)"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            with_loader(&key, |d| {
+                for dir in dirs {
+                    if !d.collapsed.contains(&dir) {
+                        d.collapsed.push(dir);
+                    }
+                }
+                d.collapsed.sort();
+            });
+            Some(Applied::Static)
+        }
         // The root a `Loader.new` was declared with (`following_push_dir`),
         // or a `for_gem` loader's own directory again; Zeitwerk maps the
         // directory to the namespace given last.
@@ -742,6 +790,100 @@ fn literal_inflections(call: &ruby_prism::CallNode<'_>) -> Option<Vec<(String, S
         .collect()
 }
 
+/// The directories `Dir.glob(pattern)` names under Ruby's default flags,
+/// sorted: `*` and `?` within a component, neither matching a leading
+/// `.`, and `**` as a whole component for zero or more directories,
+/// neither hidden nor reached through a symlink (`**` alone is `*`).
+/// `None` for a character class, braces or an escape, which this does
+/// not model.
+fn glob_dirs(pattern: &Path) -> Option<Vec<PathBuf>> {
+    let text = pattern.to_string_lossy();
+    if text.contains(['[', ']', '{', '}', '\\']) {
+        return None;
+    }
+    let mut base = PathBuf::new();
+    let mut rest: Vec<String> = Vec::new();
+    for component in pattern.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if rest.is_empty() && !part.contains(['*', '?']) {
+            base.push(component);
+        } else {
+            rest.push(part.into_owned());
+        }
+    }
+    let mut out = Vec::new();
+    glob_expand(&base, &rest, &mut out);
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+fn glob_expand(dir: &Path, rest: &[String], out: &mut Vec<PathBuf>) {
+    let Some((head, tail)) = rest.split_first() else {
+        if dir.is_dir() {
+            out.push(dir.to_path_buf());
+        }
+        return;
+    };
+    let children = || -> Vec<(String, PathBuf)> {
+        let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| (entry.file_name().to_string_lossy().into_owned(), entry.path()))
+            .collect();
+        found.sort();
+        found
+    };
+    if head == "**" && !tail.is_empty() {
+        glob_expand(dir, tail, out);
+        for (name, path) in children() {
+            let real_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+            if real_dir && !name.starts_with('.') {
+                glob_expand(&path, rest, out);
+            }
+        }
+        return;
+    }
+    if !head.contains(['*', '?']) {
+        glob_expand(&dir.join(head), tail, out);
+        return;
+    }
+    let head = if head == "**" { "*" } else { head.as_str() };
+    for (name, path) in children() {
+        if (!name.starts_with('.') || head.starts_with('.')) && wildcard_match(head.as_bytes(), name.as_bytes()) {
+            glob_expand(&path, tail, out);
+        }
+    }
+}
+
+/// `*` (any run) and `?` (one character) against a whole name.
+fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len()).any(|skip| wildcard_match(rest, &name[skip..])),
+        Some((b'?', rest)) => !name.is_empty() && wildcard_match(rest, &name[1..]),
+        Some((c, rest)) => name.first() == Some(c) && wildcard_match(rest, &name[1..]),
+    }
+}
+
+/// The constant segments of `relative` (components under the loader's
+/// root, the last a file's stem when `file` is set), camelized: a
+/// directory the loader collapses adds none, as Zeitwerk's walk skips it.
+fn constant_segments(decl: &LoaderDecl, relative: &[String], file: bool) -> Vec<String> {
+    let mut at = decl.root.clone();
+    let mut out = Vec::new();
+    for (i, segment) in relative.iter().enumerate() {
+        at.push(segment);
+        let is_dir = !(file && i + 1 == relative.len());
+        if is_dir && decl.collapsed.contains(&at) {
+            continue;
+        }
+        out.push(camelize(segment, &decl.inflections));
+    }
+    out
+}
+
 /// Zeitwerk's constant name for a file or directory basename
 /// (`Zeitwerk::Inflector#camelize`): an override, else each `_` part
 /// capitalized. A gem loader's version file is `VERSION`, which no
@@ -795,16 +937,15 @@ fn eager_load_dir(decl: &LoaderDecl, key: &str, path: &Path, stmt: &Node<'_>, fi
         return Applied::Static;
     }
     let namespace: Vec<String> =
-        decl.namespace.iter().cloned().chain(segments.iter().map(|s| camelize(s, &decl.inflections))).collect();
+        decl.namespace.iter().cloned().chain(constant_segments(decl, &segments, false)).collect();
     // The constant the calling file itself defines under this loader:
     // while Ruby requires the file, its autoload reads as undefined until
     // the file opens it, so an `eager_load_dir` under it (graphql-shopify's
     // `shopify/patches`, called before `module GraphQL::Shopify`) returns.
     let own: Option<Vec<String>> = Path::new(file).strip_prefix(root).ok().and_then(|rel| {
         let rel = rel.with_extension("");
-        let parts: Vec<String> =
-            rel.components().map(|c| camelize(&c.as_os_str().to_string_lossy(), &decl.inflections)).collect();
-        let own: Vec<String> = decl.namespace.iter().cloned().chain(parts).collect();
+        let rel: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        let own: Vec<String> = decl.namespace.iter().cloned().chain(constant_segments(decl, &rel, true)).collect();
         namespace.starts_with(&own).then_some(own)
     });
     with_loader(key, |d| {
@@ -936,6 +1077,7 @@ pub(super) fn resolve(decls: &[LoaderDecl], files: &[(PathBuf, Vec<ClassId>)]) -
                 managed,
                 ignored,
                 eager_dirs,
+                collapsed: decl.collapsed.iter().map(|dir| dir.display().to_string()).collect(),
             }
         })
         .collect()
