@@ -1025,6 +1025,12 @@ pub(crate) fn model_macro_verdicts<'a>(model: &'a Model, app: &'a crate::App) ->
 /// `declared_optional`), as ActiveRecord's `belongs_to` reads the class
 /// attribute when it declares the association.
 pub fn replay_model_macros(app: &mut crate::App) {
+    // A replayed statement belongs to the one model the class emits, and
+    // a model's starting `belongs_to_required_by_default` is read from
+    // its ancestor by name: one model per class first
+    // (`merge_model_reopens`), which also leaves every later pass and the
+    // emitter one model to find by name.
+    super::merge_model_reopens(app);
     let mut replays: Vec<(usize, Vec<crate::span::Span>)> = Vec::new();
     // Per model, the settings by statement span.
     let mut settings: Vec<Vec<(crate::span::Span, bool)>> = vec![Vec::new(); app.models.len()];
