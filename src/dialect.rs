@@ -2686,6 +2686,35 @@ pub struct TestModule {
     /// (`ingest::test::carried_body_statement`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub body_statements: Vec<TestBodyStatement>,
+    /// The file's top-level loads (`require "support/helpers/…"`,
+    /// `require_relative "../x"`), in source order, which Ruby runs
+    /// before the class is defined. Each runs in the emitted test's
+    /// preamble (`emit::ruby`), one that cannot load named where it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_requires: Vec<TestFileRequire>,
+}
+
+/// A test file's top-level load (`TestModule::file_requires`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TestFileRequire {
+    pub target: TestRequireTarget,
+    /// The line the source writes it on, for the site that names a load
+    /// that fails.
+    #[serde(default)]
+    pub line: u32,
+}
+
+/// What a test file's top-level load names.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TestRequireTarget {
+    /// `require "feature"`, looked up on `$LOAD_PATH`.
+    Feature(String),
+    /// `require_relative "path"` (or `require File.expand_path("path",
+    /// __dir__)`): the path relative to the file's directory.
+    Relative(String),
+    /// A load whose file is not a literal (`require path`, `load "x"`),
+    /// as written: not modeled.
+    Unsupported(String),
 }
 
 /// A test class-body statement carried as written (`TestModule::

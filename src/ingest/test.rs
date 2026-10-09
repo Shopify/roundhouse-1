@@ -7,7 +7,7 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{MethodDef, Test, TestModule};
+use crate::dialect::{MethodDef, Test, TestFileRequire, TestModule, TestRequireTarget};
 use crate::expr::{Expr, ExprNode};
 use crate::span::Span;
 use crate::{ClassId, Symbol};
@@ -80,7 +80,7 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
         let mut test_nodes = Vec::new();
         push_with_nested_test_classes(first, &mut test_nodes);
         refuse_unreached_test_classes(&root, &test_nodes, file)?;
-        return ingest_each_test_class(&test_nodes, &helper_nodes, file);
+        return Ok(with_file_requires(ingest_each_test_class(&test_nodes, &helper_nodes, file)?, &root, file));
     }
     // A test class declared in a test class's body (Core's
     // `class PermissionGeneratorTest … class ValidateInitialTest <
@@ -92,7 +92,63 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
         push_with_nested_test_classes(class, &mut all_test_nodes);
     }
     refuse_unreached_test_classes(&root, &all_test_nodes, file)?;
-    ingest_each_test_class(&all_test_nodes, &helper_nodes, file)
+    Ok(with_file_requires(ingest_each_test_class(&all_test_nodes, &helper_nodes, file)?, &root, file))
+}
+
+/// Each of the file's classes with the file's top-level loads
+/// (`TestModule::file_requires`): every emitted class file runs them, as
+/// the authored file ran them before any of its classes.
+fn with_file_requires(mut modules: Vec<TestModule>, root: &Node<'_>, file: &str) -> Vec<TestModule> {
+    let requires = file_requires(root, file);
+    for tm in &mut modules {
+        tm.file_requires = requires.clone();
+    }
+    modules
+}
+
+/// The `require`, `require_relative` and `load` calls among the file's
+/// top-level statements, bare or on `Kernel`, in source order. A literal
+/// feature or relative path is kept as such, as is `require
+/// File.expand_path("path", __dir__)` (the path from the file's
+/// directory); any other load is kept as written, unmodeled.
+fn file_requires(root: &Node<'_>, file: &str) -> Vec<TestFileRequire> {
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).to_string();
+    let literal = |n: &Node<'_>| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string());
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        let name = constant_id_str(&call.name());
+        if !LOADS.contains(&name) || name == "autoload" {
+            continue;
+        }
+        if call.receiver().is_some_and(|r| text(&r).trim_start_matches("::") != "Kernel") || call.block().is_some() {
+            continue;
+        }
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let expanded = || {
+            let inner = args.first()?.as_call_node()?;
+            if constant_id_str(&inner.name()) != "expand_path"
+                || inner.receiver().is_none_or(|r| text(&r).trim_start_matches("::") != "File")
+            {
+                return None;
+            }
+            let inner_args: Vec<Node<'_>> = inner.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            match inner_args.as_slice() {
+                [path, dir] if text(dir) == "__dir__" => literal(path),
+                _ => None,
+            }
+        };
+        let target = match (name, args.as_slice()) {
+            ("require", [arg]) if literal(arg).is_some() => TestRequireTarget::Feature(literal(arg).unwrap_or_default()),
+            ("require_relative", [arg]) if literal(arg).is_some() => TestRequireTarget::Relative(literal(arg).unwrap_or_default()),
+            ("require", [_]) if expanded().is_some() => TestRequireTarget::Relative(expanded().unwrap_or_default()),
+            _ => TestRequireTarget::Unsupported(text(&stmt).lines().next().unwrap_or_default().trim_end().to_string()),
+        };
+        let line = super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0);
+        out.push(TestFileRequire { target, line });
+    }
+    out
 }
 
 /// Ingest each test class on its own. A class that cannot be ingested is
@@ -913,6 +969,7 @@ pub(super) fn ingest_test_class(
         source_file: None,
         defined_tests,
         body_statements,
+        file_requires: Vec::new(),
     })
 }
 
