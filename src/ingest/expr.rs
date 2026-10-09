@@ -2558,28 +2558,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             });
         }
         // `class << self … end` at expression position (inside an
-        // `included do` / `Class.new do` block, where no class-body walk
-        // classifies it). Ruby evaluates the body with `self` the
-        // singleton class and the block's value is its last statement
-        // (nil when empty). The `def`s in it lift to nil exactly as a
-        // bare `def` does above; the statements around them keep their
-        // own expressions, so a constant or call in the block is not lost.
+        // `included do` / `Class.new do` block or a method body, where no
+        // class-body walk classifies it). Ruby evaluates the body with
+        // `self` the singleton class; each statement is written aimed at
+        // `singleton_class` (`def self.x`, `singleton_class.send(:alias_method,
+        // ...)`), or refused by name (`singleton_class::singleton_class_expr`).
         n if n.as_singleton_class_node().is_some() => {
             let sc = n.as_singleton_class_node().unwrap();
-            match sc.body() {
-                Some(body) => {
-                    // Its body is ingested inline, so a `def` in it is
-                    // written `def self.x` (the same singleton method
-                    // when `self` is the class, as in `Class.new do`).
-                    // One this mapping cannot reach is refused.
-                    let marks = singleton_def_marks(&body, file);
-                    let saved = SINGLETON_DEFS.with(|m| std::mem::replace(&mut *m.borrow_mut(), marks));
-                    let out = ingest_expr(&body, file);
-                    SINGLETON_DEFS.with(|m| *m.borrow_mut() = saved);
-                    return out;
-                }
-                None => ExprNode::Lit { value: Literal::Nil },
-            }
+            return super::singleton_class::singleton_class_expr(&sc, span, file);
         }
         other => {
             return Err(IngestError::Unsupported {
@@ -4047,7 +4033,20 @@ thread_local! {
     static SINGLETON_DEFS: std::cell::RefCell<Vec<(String, usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The marks [`SINGLETON_DEFS`] holds for a `class << self` body.
+/// Runs `f` with the `def`s of the `class << self` body `body` marked
+/// ([`SINGLETON_DEFS`]): one `ingest_expr` reaches there is written
+/// `def self.x`, or refused when it is nested in another statement.
+pub(super) fn with_singleton_defs<T>(body: &Node<'_>, file: &str, f: impl FnOnce() -> T) -> T {
+    let marks = singleton_def_marks(body, file);
+    let saved = SINGLETON_DEFS.with(|m| std::mem::replace(&mut *m.borrow_mut(), marks));
+    let out = f();
+    SINGLETON_DEFS.with(|m| *m.borrow_mut() = saved);
+    out
+}
+
+/// The marks [`SINGLETON_DEFS`] holds for a `class << self` body: a
+/// direct statement, or the argument of a direct `private` /
+/// `protected` / `public` (`private def x`), is direct.
 fn singleton_def_marks(body: &Node<'_>, file: &str) -> Vec<(String, usize, bool)> {
     use ruby_prism::Visit;
     struct Nested<'a>(&'a mut Vec<(String, usize, bool)>, &'a str);
@@ -4067,10 +4066,24 @@ fn singleton_def_marks(body: &Node<'_>, file: &str) -> Vec<(String, usize, bool)
         None => Vec::new(),
     };
     for stmt in &direct {
-        match stmt.as_def_node() {
-            Some(def) => marks.push((file.to_string(), def.location().start_offset(), true)),
-            None => Nested(&mut marks, file).visit(stmt),
+        if let Some(def) = stmt.as_def_node() {
+            marks.push((file.to_string(), def.location().start_offset(), true));
+            continue;
         }
+        if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && matches!(constant_id_str(&call.name()), "private" | "protected" | "public")
+            && let Some(args) = call.arguments()
+        {
+            for arg in args.arguments().iter() {
+                match arg.as_def_node() {
+                    Some(def) => marks.push((file.to_string(), def.location().start_offset(), true)),
+                    None => Nested(&mut marks, file).visit(&arg),
+                }
+            }
+            continue;
+        }
+        Nested(&mut marks, file).visit(stmt);
     }
     if direct.is_empty() {
         Nested(&mut marks, file).visit(body);
