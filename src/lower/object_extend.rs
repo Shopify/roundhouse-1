@@ -40,6 +40,17 @@
 //! mixins carry the same methods as the concern splice's static copies,
 //! and `project::target_files` stubs the call for them
 //! ([`stub_module_hook_extends`]).
+//!
+//! The same holds for a module's `extended(base)` hook, which Ruby calls
+//! with the object `extend` was called on. In app code that is a class:
+//! a class body's `extend M`, `Const.extend(M)`, another hook's
+//! `base.extend(M)`. The instance form `obj.extend(M)` is itself the
+//! stub here, so it raises before `M.extended` could run. Core's sharded
+//! models get their lazy-loading verifier this way
+//! (`ShardedTable::ClassMethods.extended(base)`:
+//! `base.extend(Podding::Verifier::LazyLoadingConcern) unless
+//! Rails.application.config.eager_load`); stubbing that call dropped
+//! the verifier and raised in every sharded model's class body.
 
 use crate::app::App;
 use crate::det::HashSet;
@@ -110,10 +121,12 @@ fn stub_expr(span: crate::span::Span) -> Expr {
 }
 
 /// Each `param.extend(Const, …)` in a library module's `included(param)` /
-/// `prepended(param)` hook or a class's `inherited(param)` hook, by span:
-/// Ruby calls these hooks with the class or module being extended, so the
-/// receiver is a class object. Not `extended(param)`, whose parameter is
-/// any object. A body that reassigns the parameter proves nothing.
+/// `prepended(param)` / `extended(param)` hook or a class's
+/// `inherited(param)` hook, by span: Ruby calls these hooks with the
+/// class or module being extended, so the receiver is a class object.
+/// (`extended(param)` gets whatever `extend` was called on; the instance
+/// form `obj.extend(M)` is the raise stub, so it never reaches the hook.)
+/// A body that reassigns the parameter proves nothing.
 /// Also each `k.extend(Const, …)` on a local only ever assigned a
 /// `Class.new` / `Module.new`, which is a class object as well.
 fn module_hook_extends(app: &App) -> HashSet<Span> {
@@ -142,7 +155,7 @@ fn module_hook_extends(app: &App) -> HashSet<Span> {
     for lc in &app.library_classes {
         for m in &lc.methods {
             let hook = match m.name.as_str() {
-                "included" | "prepended" => lc.is_module,
+                "included" | "prepended" | "extended" => lc.is_module,
                 "inherited" => !lc.is_module,
                 _ => false,
             };

@@ -102,6 +102,35 @@ module Rails
       false
     end
 
+    # `config.eager_load`, Application::Configuration's `attr_accessor
+    # :eager_load` (railties 8.2.0.alpha application/configuration.rb),
+    # which bootstrap.rb's `set_eager_load` initializer fills in with
+    # `!config.reloading_enabled?` when the environment left it nil. The
+    # environment's write is not a lifted key: ingest compiles it into
+    # `RoundhouseAutoload.eager_load?` (app/models.rb), the value boot's
+    # Finisher-style `eager_load!` branches on, so the reader answers that
+    # same value. Core's config/environments/test.rb writes
+    # `config.eager_load = BootLib.test_eager_load?`, and
+    # ShardedTable::ClassMethods.extended reads it to decide whether a
+    # sharded model verifies lazy loading. Without the autoload index,
+    # whatever the options store holds (a NoMethodError if nothing set it).
+    def eager_load
+      return method_missing(:eager_load) unless defined?(::RoundhouseAutoload.eager_load?)
+
+      ::RoundhouseAutoload.eager_load?
+    end
+
+    # A write after the environment's cannot change what boot loaded, and
+    # storing it where the reader above would not see it would make the
+    # two disagree, so it is refused by name. Without the autoload index,
+    # the options store takes it.
+    def eager_load=(value)
+      return method_missing(:eager_load=, value) unless defined?(::RoundhouseAutoload.eager_load?)
+
+      raise NotImplementedError, "error[config_eager_load_write_not_applied]: config.eager_load = #{value.inspect}: " \
+        "this tree's eager loading is the environment's config.eager_load, compiled into RoundhouseAutoload.eager_load?"
+    end
+
     # Two framework keys (railties 8.2.0.alpha
     # application/configuration.rb) a gem's railtie reads, outside the
     # lifted ones. `filter_parameters` is the app's list, lifted onto the
