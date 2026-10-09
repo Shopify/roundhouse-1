@@ -123,6 +123,9 @@ struct ClassRef {
     name: String,
     nesting: Vec<String>,
     includes: Vec<IncludeRef>,
+    /// The constants its body `extend`s, in source order, with each
+    /// call's offset.
+    extends: Vec<(IncludeRef, usize)>,
     file: String,
 }
 
@@ -226,12 +229,18 @@ pub(super) struct TestMixins {
     /// Each module whose includers get a test-declaring class method
     /// (its own `macros` or an included module's), as (method, module).
     macro_modules: Map<String, Vec<(String, String)>>,
+    /// The files that declare a shared test module (`finish`): spliced
+    /// into their includers, so not library modules of their own.
+    shared_files: Set<String>,
 }
 
 impl TestMixins {
     /// Read the module declarations of one test file.
     pub(super) fn scan(&mut self, source: &[u8], file: &str) {
-        if !source.windows(7).any(|w| w == b"module ") {
+        // A file with no module and no `include`/`extend` declares
+        // nothing the scan records.
+        let has = |word: &[u8]| source.windows(word.len()).any(|w| w == word);
+        if !has(b"module ") && !has(b"include") && !has(b"extend") {
             return;
         }
         let result = super::prism::parse_silent(source);
@@ -280,6 +289,7 @@ impl TestMixins {
                 break;
             }
         }
+        self.shared_files = self.decls.iter().filter(|d| relevant.contains(&d.name)).map(|d| d.file.clone()).collect();
         let mut names: Vec<&String> = relevant.iter().collect();
         names.sort();
         for name in names {
@@ -339,6 +349,40 @@ impl TestMixins {
             }
             self.macro_modules = macro_modules;
         }
+    }
+
+    /// Whether `file` declares a shared test module (one that declares
+    /// tests, tags or setups for its includers, includes such a module,
+    /// or is `SharedTests`). Its modules are spliced into the test
+    /// classes that include them; a file of other modules only is a
+    /// test-support library file (`ingest::app`).
+    pub(super) fn declares_shared_tests(&self, file: &str) -> bool {
+        self.shared_files.contains(file)
+    }
+
+    /// Each scanned class that includes or extends a module, with its
+    /// `Module.nesting` (the class, then each scope around it as the file
+    /// wrote them, innermost first): `module Foo; class BarTest` is
+    /// [Foo::BarTest, Foo], `class Foo::BarTest` is [Foo::BarTest].
+    pub(super) fn class_nestings(&self) -> crate::det::HashMap<String, Vec<String>> {
+        self.classes.iter().map(|c| (c.name.clone(), c.nesting.clone())).collect()
+    }
+
+    /// Each scanned class's `extend`s, as (class, file, [(candidates,
+    /// offset)]): the names the constant may resolve to, innermost scope
+    /// first and the top level last (just the top level for a rooted
+    /// `::M`), and the call's offset in the file. The test-class ingest
+    /// does not carry a class-body `extend`; `ingest::app` resolves these
+    /// against the app's modules.
+    pub(super) fn class_extends(&self) -> Vec<(String, String, Vec<(Vec<String>, usize)>)> {
+        self.classes
+            .iter()
+            .filter(|c| !c.extends.is_empty())
+            .map(|c| {
+                let extends = c.extends.iter().map(|(r, at)| (candidates(r, &c.nesting), *at)).collect();
+                (c.name.clone(), c.file.clone(), extends)
+            })
+            .collect()
     }
 
     /// The test-declaring class methods the modules `tm` includes give
@@ -1287,6 +1331,7 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
         nesting.extend(outer.iter().cloned());
         let stmts = c.body().map(flatten_statements).unwrap_or_default();
         let mut includes = Vec::new();
+        let mut extends = Vec::new();
         for stmt in &stmts {
             if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
                 scan_node(stmt, &nesting, file, out, classes, known);
@@ -1298,10 +1343,16 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
                         includes.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)));
                     }
                 }
+                if call.receiver().is_none() && constant_id_str(&call.name()) == "extend" {
+                    if let Some(args) = call.arguments() {
+                        let at = call.location().start_offset();
+                        extends.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)).map(|r| (r, at)));
+                    }
+                }
             }
         }
-        if c.superclass().is_some() && !includes.is_empty() {
-            classes.push(ClassRef { name, nesting, includes, file: file.to_string() });
+        if c.superclass().is_some() && (!includes.is_empty() || !extends.is_empty()) {
+            classes.push(ClassRef { name, nesting, includes, extends, file: file.to_string() });
         }
         return;
     }

@@ -1289,6 +1289,7 @@ pub fn emit_with_assertions(
         // require-resolution paths the library emitter knows. Pass them
         // as synthesized siblings so any test body that references one
         // gets an explicit `require_relative "../fixtures/<plural>"`.
+        let declaration_programs = declaration_programs(app);
         let fixture_siblings: Vec<(String, String)> = fixture_lcs
             .iter()
             .map(|lc| {
@@ -1446,6 +1447,7 @@ pub fn emit_with_assertions(
                 out_path,
                 &fixture_siblings,
             );
+            emitted.content = require_declarations_through_programs(&emitted.content, &test_rb_path, &declaration_programs);
             // Class-body constant assignments (`TABLE = [...]`) go back
             // INSIDE the class, at the top of its body — the source's
             // own scope. They used to hoist to file scope so bare-name
@@ -1853,6 +1855,91 @@ fn render_autorun_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[
     s
 }
 
+/// Each declarations file (`models/<stem>`) of a support file's file
+/// program => that program's anchor, for a file exactly one program
+/// declares (`ProgramItem::Declared`).
+fn declaration_programs(app: &App) -> std::collections::BTreeMap<String, String> {
+    let mut by_file: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for program in &app.file_programs {
+        let anchor = library::file_program_anchor(app, program);
+        for item in &program.items {
+            if let crate::app::ProgramItem::Declared(names) = item {
+                for name in names {
+                    by_file
+                        .entry(format!("models/{}", library_file_stem(name.0.as_str(), app)))
+                        .or_default()
+                        .insert(anchor.clone());
+                }
+            }
+        }
+    }
+    by_file
+        .into_iter()
+        .filter_map(|(file, programs)| (programs.len() == 1).then(|| (file, programs.into_iter().next().unwrap())))
+        .collect()
+}
+
+/// A test file's `require_relative` of a declarations file whose source
+/// has a file program (`declaration_programs`), as a require of that
+/// program. The test's source required the source file (Core's `require
+/// "support/helpers/apps/test_helper"`, `require
+/// "platform/essentials/testing/toggle_flags_helper"`), and Ruby loading
+/// it runs the whole file: its requires and every declaration it makes,
+/// not only the one the test names. Loaded alone, a declarations file
+/// leaves out its siblings (`ToggleFlagsHelper::ClassMethods`, which the
+/// module's `included` hook extends its includer with) where no autoload
+/// reaches them.
+fn require_declarations_through_programs(
+    content: &str,
+    test_path: &std::path::Path,
+    programs: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if programs.is_empty() {
+        return content.to_string();
+    }
+    let dir: Vec<String> = test_path
+        .parent()
+        .map(|d| d.to_string_lossy().split('/').filter(|p| !p.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut out = String::with_capacity(content.len());
+    let mut in_headers = true;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches('\n');
+        // The header block: the synthesized `require_relative`s, with
+        // stdlib `require "bigdecimal"` lines among them.
+        if in_headers && !text.starts_with("require_relative \"") && !text.starts_with("require \"") && !text.trim().is_empty() {
+            in_headers = false;
+        }
+        let rel = in_headers.then(|| text.strip_prefix("require_relative \"").and_then(|r| r.strip_suffix('"'))).flatten();
+        let Some(rel) = rel else {
+            out.push_str(line);
+            continue;
+        };
+        let mut target: Vec<String> = dir.clone();
+        for part in rel.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    target.pop();
+                }
+                other => target.push(other.to_string()),
+            }
+        }
+        let anchor = target.join("/");
+        match anchor.strip_prefix("app/").and_then(|a| programs.get(a)) {
+            Some(program) => {
+                let common = dir.iter().zip(format!("app/{program}").split('/')).take_while(|(a, b)| a.as_str() == *b).count();
+                let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), dir.len() - common).collect();
+                parts.extend(format!("app/{program}").split('/').skip(common).map(str::to_string));
+                out.push_str(&format!("require_relative \"{}\"\n", parts.join("/")));
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 /// Drop the leading `require_relative "..."` lines from an emitted
 /// class file's content, leaving just the class body. Used when
 /// splicing a companion class into a host file — the host already
@@ -2185,6 +2272,31 @@ mod method_sig_tests {
         assert!(
             out.contains("def get_from_cache(opts = {}, &block)"),
             "got:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declaration_program_header_tests {
+    use super::require_declarations_through_programs;
+
+    // `ToggleFlagsHelper::ClassMethods`: the test names `ToggleFlagsHelper`,
+    // whose declarations file alone leaves out the `ClassMethods` its
+    // `included` hook extends with. The header loads the source's program
+    // (every declaration and require of the file), past a stdlib
+    // `require` among the headers; a declarations file with no program,
+    // and a `require_relative` in the body, stay.
+    #[test]
+    fn header_of_a_declarations_file_with_a_program_requires_the_program() {
+        let programs = std::collections::BTreeMap::from([(
+            "models/toggle_flags_helper".to_string(),
+            "models/roundhouse_files/lib/testing/toggle_flags_helper".to_string(),
+        )]);
+        let content = "require_relative \"../test_helper\"\nrequire \"bigdecimal\"\nrequire_relative \"../../app/models/shop\"\nrequire_relative \"../../app/models/toggle_flags_helper\"\n\nclass FooTest < TestBase\n  require_relative \"../../app/models/toggle_flags_helper\"\nend\n";
+        let out = require_declarations_through_programs(content, std::path::Path::new("test/models/foo_test.rb"), &programs);
+        assert_eq!(
+            out,
+            "require_relative \"../test_helper\"\nrequire \"bigdecimal\"\nrequire_relative \"../../app/models/shop\"\nrequire_relative \"../../app/models/roundhouse_files/lib/testing/toggle_flags_helper\"\n\nclass FooTest < TestBase\n  require_relative \"../../app/models/toggle_flags_helper\"\nend\n"
         );
     }
 }
