@@ -9,6 +9,11 @@
 //! interface_field.id)`, and loading the `shops` fixtures died on
 //! `undefined method 'id' for an instance of GraphApi::Field`. The
 //! source spelling dispatches to whatever `extensions` really is.
+//!
+//! Outside a model body the guess is still taken for a call the has_many
+//! reader's Array cannot answer (`exists?`, `joins`, `create!`): there the
+//! source spelling fails on a record, so the seed is the only reading that
+//! can work.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -84,6 +89,11 @@ end
     return [] if Commitment.where(name: "x").none?
     fields.select { |field| field.extensions.any? }
   end
+
+  def self.extended?(record)
+    return false if Commitment.where(name: "x").none?
+    record.extensions.exists?
+  end
 end
 "#,
         ),
@@ -119,7 +129,22 @@ fn untyped_owner_in_plain_library_code_keeps_the_dynamic_read() {
     let out = file(&emitted(), "app/models/field_override.rb");
     assert!(out.contains("if f.extensions.any?"), "kept `f.extensions.any?`:\n{out}");
     assert!(out.contains("field.extensions.any?"), "kept `field.extensions.any?`:\n{out}");
-    assert!(!out.contains("Relation.new(Extension)"), "no guessed seed:\n{out}");
+    assert!(
+        !out.contains("commitment_id: f.id") && !out.contains("commitment_id: field.id"),
+        "no guessed seed off `f` / `field`:\n{out}"
+    );
+}
+
+/// The same plain module, a call the reader's Array has no answer for:
+/// `record.extensions.exists?` would be a NoMethodError on the
+/// folded reader, so the by-name guess still seeds it.
+#[test]
+fn untyped_owner_in_plain_library_code_seeds_a_relation_only_call() {
+    let out = file(&emitted(), "app/models/field_override.rb");
+    assert!(
+        out.contains("ActiveRecord::Relation.new(Extension).where(commitment_id: record.id)"),
+        "`exists?` seeds by name:\n{out}"
+    );
 }
 
 /// Inside a model body the stamped `FakeField` owner is still not a

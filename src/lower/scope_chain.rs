@@ -1122,8 +1122,8 @@ pub struct AssocRegistry {
     /// `@story.merged_stories.<scope|chain|terminal>` seed a Relation
     /// even though the receiver's class is statically unknown; ambiguous
     /// names are never tracked. Read only for an owner with no known
-    /// type, and by the rewriter only in a model body
-    /// (`resolve_assoc_read`).
+    /// type; outside a model body, only for a call the reader's Array
+    /// cannot answer (`assoc_owner_seed`).
     has_many_by_name: HashMap<Symbol, Option<(ClassId, Symbol)>>,
     /// model -> its REAL table name, straight off the ingested `Model`.
     ///
@@ -2514,6 +2514,24 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
     }
 }
 
+/// Does the has_many READER's Array answer `<assoc>.<method>(args)` the
+/// way the association would? The reader returns its loaded records, so
+/// `any?`, `empty?`, `size`, `count`, `first`, `last`, a block `select`
+/// and `<<` work there without a seed (`count(:col)` would count
+/// elements equal to `:col`, so only the bare form counts). What does
+/// not — `where`, `joins`, `exists?`, `find_by`, `create!`, a scope —
+/// is a NoMethodError on the Array. Only the by-NAME guess outside a
+/// model body asks (`assoc_owner_seed`).
+fn reader_array_answers(method: &str, args: &[Expr], block: Option<&Expr>) -> bool {
+    match method {
+        "any?" | "empty?" | "none?" | "size" | "length" | "include?" | "<<" | "push" => true,
+        "first" | "last" => args.len() <= 1,
+        "count" => args.is_empty(),
+        "select" => args.is_empty() && block.is_some(),
+        _ => false,
+    }
+}
+
 /// `first(n)` / `last(n)` on a relation are DIFFERENT METHODS from the
 /// bare forms — they answer an Array of up to n records where `first`
 /// answers one record or nil. The runtime splits them (`first_n` /
@@ -2705,10 +2723,10 @@ fn seedable_assoc_read(ctx: &Ctx, value: &Expr, span: crate::span::Span) -> Opti
             ctx.assocs.has_many_fk(&self_model, aname).cloned().map(|(target, _)| target)
         }),
         ExprNode::Ivar { .. } | ExprNode::Var { .. } => {
-            assoc_owner_seed(ctx, aname, owner, span).map(|(target, _, _)| target)
+            assoc_owner_seed(ctx, aname, owner, span, None).map(|(target, _, _)| target)
         }
         ExprNode::Send { .. } if owner_reads_once(owner) => {
-            assoc_owner_seed(ctx, aname, owner, span).map(|(target, _, _)| target)
+            assoc_owner_seed(ctx, aname, owner, span, None).map(|(target, _, _)| target)
         }
         _ => None,
     };
@@ -2720,27 +2738,38 @@ fn assoc_owner_seed(
     aname: &Symbol,
     owner: &Expr,
     span: crate::span::Span,
+    next: Option<(&Symbol, &[Expr], Option<&Expr>)>,
 ) -> Option<(ClassId, Symbol, Expr)> {
     // Resolution is `assoc_read_target`'s three rungs — the owner's
     // stamped type (which disambiguates an assoc name declared on
     // several models), then the owner's NAME, then the assoc name when
     // it is unique across models.
     //
-    // The by-NAME rung guesses the receiver is a record, so it is taken
-    // only in a body that runs on a model (`Ctx::in_model_body`). In
-    // any other body an untyped owner is as likely to be anything else
-    // answering the same method name — a `GraphQL::Schema::Field`'s
-    // `extensions` in Core's `GraphApi::HasFieldOverride` — and the
+    // The by-NAME rung guesses the receiver is a record. A body that
+    // runs on a model (`Ctx::in_model_body`) takes the guess as it
+    // always did. In any other body an untyped owner is as likely to be
+    // anything else answering the same method name — a
+    // `GraphQL::Schema::Field`'s `extensions` in Core's
+    // `GraphApi::HasFieldOverride`, a `Struct`'s `fields` — so there the
+    // guess is taken only when the call that `next` names is one the
+    // has_many reader's Array cannot answer (`reader_array_answers`).
+    // Where the Array does answer it (`any?`, `size`, `<<`), the source
+    // spelling is right for a record and for anything else, and the
     // seed would turn a working dynamic call into a query keyed off an
-    // `id` the receiver doesn't have. The typed and owner-name rungs
-    // carry the other bodies, as they always carried campfire's
-    // `@room.messages`.
+    // `id` the receiver may not have. Where it does not (`joins`,
+    // `create!`), the dynamic call fails on a record's reader, so the
+    // guess is the only reading that can work. `next` is `None` for an
+    // alias recorded at an assignment; the seed arm asks again with the
+    // call once one follows. The typed and owner-name rungs carry every
+    // body, as they always carried campfire's `@room.messages`.
     //
     // What is this function's OWN judgment is the seedability filter:
     // each rung carries the OWNER it resolved through so the check can
     // ask about that exact declaration; the by-NAME rung has no owner
     // and is checked against every declarer.
-    resolve_assoc_read(owner, aname, ctx.models, ctx.assocs, ctx.plain_subclasses, ctx.in_model_body())
+    let by_name = ctx.in_model_body()
+        || next.is_none_or(|(method, args, block)| !reader_array_answers(method.as_str(), args, block));
+    resolve_assoc_read(owner, aname, ctx.models, ctx.assocs, ctx.plain_subclasses, by_name)
         .filter(|(owner_model, _, _)| !ctx.assocs.is_unseedable(owner_model.as_ref(), aname))
         .map(|(_, target, fk)| {
             let owner_id = syn(
@@ -3884,6 +3913,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     return None;
                 }
                 if aargs.is_empty() {
+                    let next = Some((&method, args.as_slice(), block.as_ref()));
                     // (target, fk, owner-id expression)
                     let resolved: Option<(ClassId, Symbol, Expr)> = match &*ir.node {
                         ExprNode::SelfRef => ctx.instance_self.clone().and_then(|self_model| {
@@ -3903,10 +3933,10 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // `Current.user.memberships` that every
                         // room-scoped controller opens with.
                         ExprNode::Ivar { .. } | ExprNode::Var { .. } => {
-                            assoc_owner_seed(ctx, aname, ir, span)
+                            assoc_owner_seed(ctx, aname, ir, span, next)
                         }
                         ExprNode::Send { .. } if owner_reads_once(ir) => {
-                            assoc_owner_seed(ctx, aname, ir, span)
+                            assoc_owner_seed(ctx, aname, ir, span, next)
                         }
                         // Any other owner EXPRESSION, for a constructor
                         // only: `Room.find(id).messages.create!(…)`.
@@ -3919,7 +3949,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // instance of Array, found by once-campfire-rust's
                         // model scenario (scripts/campfire-db-differential).
                         _ if matches!(method.as_str(), "build" | "create" | "create!") => {
-                            assoc_owner_seed(ctx, aname, ir, span)
+                            assoc_owner_seed(ctx, aname, ir, span, next)
                         }
                         _ => None,
                     };
@@ -5530,6 +5560,16 @@ mod tests {
     /// expression for an owner of the given stamped type, rewritten in a
     /// body whose self model is `instance_self`.
     fn rewrite_by_name_read(owner_ty: Option<crate::ty::Ty>, instance_self: Option<&str>) -> Expr {
+        rewrite_by_name_call(owner_ty, instance_self, "any?", vec![])
+    }
+
+    /// [`rewrite_by_name_read`] with `f.extensions.<method>(args)`.
+    fn rewrite_by_name_call(
+        owner_ty: Option<crate::ty::Ty>,
+        instance_self: Option<&str>,
+        method: &str,
+        args: Vec<Expr>,
+    ) -> Expr {
         let commitment = ingest(
             "class Commitment < ApplicationRecord\n  has_many :extensions\nend\n",
             "app/models/commitment.rb",
@@ -5559,8 +5599,8 @@ mod tests {
             span(),
             ExprNode::Send {
                 recv: Some(read),
-                method: Symbol::from("any?"),
-                args: vec![],
+                method: Symbol::from(method),
+                args,
                 block: None,
                 parenthesized: false,
             },
@@ -5572,8 +5612,13 @@ mod tests {
 
     /// The source shape `f.extensions.any?`, untouched.
     fn kept_dynamic_read(expr: &Expr) -> bool {
+        kept_dynamic_call(expr, "any?")
+    }
+
+    /// The source shape `f.extensions.<method>(…)`, untouched.
+    fn kept_dynamic_call(expr: &Expr, expected: &str) -> bool {
         let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node else { return false };
-        method.as_str() == "any?"
+        method.as_str() == expected
             && matches!(&*r.node, ExprNode::Send { recv: Some(o), method: m, .. }
                 if m.as_str() == "extensions"
                     && matches!(&*o.node, ExprNode::Var { name, .. } if name.as_str() == "f"))
@@ -5588,13 +5633,37 @@ mod tests {
     /// Plain library code, untyped owner: the by-NAME rung would guess the
     /// receiver is a Commitment because one model declares `extensions`.
     /// Nothing says so, and the seed would read `f.id` off whatever `f`
-    /// really is, so the read stays dynamic.
+    /// really is, so a call the reader's Array answers stays dynamic.
     #[test]
     fn by_name_rung_declines_an_untyped_owner_outside_a_model_body() {
         let expr = rewrite_by_name_read(None, None);
         assert!(kept_dynamic_read(&expr), "expected `f.extensions.any?`, got {:?}", expr.node);
         let expr = rewrite_by_name_read(Some(crate::ty::Ty::Untyped), None);
         assert!(kept_dynamic_read(&expr), "expected `f.extensions.any?`, got {:?}", expr.node);
+        for method in ["size", "count", "first", "empty?"] {
+            let expr = rewrite_by_name_call(None, None, method, vec![]);
+            assert!(kept_dynamic_call(&expr, method), "expected `f.extensions.{method}`, got {:?}", expr.node);
+        }
+    }
+
+    /// Outside a model body, a call the reader's Array has no answer for
+    /// still takes the guess: `f.extensions.exists?` / `.where(…)` is a
+    /// NoMethodError on a record's folded reader, so the seed is the
+    /// only reading that can run. A stamped non-model owner declines
+    /// either way.
+    #[test]
+    fn by_name_rung_seeds_a_relation_only_call_outside_a_model_body() {
+        let expr = rewrite_by_name_call(None, None, "exists?", vec![]);
+        assert!(seeded_extension_relation(&expr), "`exists?` seeds by name, got {:?}", expr.node);
+        let id_hash = Expr::new(
+            span(),
+            ExprNode::Hash { entries: vec![(sym_lit("id"), sym_lit("x"))], kwargs: true },
+        );
+        let expr = rewrite_by_name_call(None, None, "where", vec![id_hash]);
+        assert!(seeded_extension_relation(&expr), "`where` seeds by name, got {:?}", expr.node);
+        let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![] };
+        let expr = rewrite_by_name_call(Some(field), None, "exists?", vec![]);
+        assert!(kept_dynamic_call(&expr, "exists?"), "a stamped Field keeps its own method, got {:?}", expr.node);
     }
 
     /// A stamped non-model type is the receiver's class, even inside a
