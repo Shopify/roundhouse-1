@@ -6,7 +6,7 @@
 //! `config/routes/`.
 //!
 //! Recovery discipline: in survey mode an unsupported DSL construct
-//! (`use_doorkeeper`, …) records a gap and drops
+//! (`authenticate`, `authenticated`, `unauthenticated`, `use_doorkeeper`, …) records a gap and drops
 //! that one entry — the rest of the table still flattens. In strict
 //! mode it still fails loud so the fixture that introduces a new form
 //! forces a recognizer. Not-modeled ≠ absent: a dropped entry is a
@@ -14,12 +14,14 @@
 //! in every mode with a located error carried on the route table; strict
 //! emission refuses it unless explicitly overridden.
 //!
-//! Devise's wrappers (`authenticated` / `unauthenticated` /
-//! `devise_scope`) flatten like `constraints` — nested routes are kept,
-//! auth is not enforced. `devise_for` expands a static route/helper
-//! table (sessions / registrations / passwords / confirmations) from
-//! the resource name and optional `controllers:` overrides; it does
-//! not claim Warden or Devise controller runtime.
+//! `devise_scope` is path-transparent and its routes are kept. The
+//! authentication guards (`authenticate`, `authenticated`, and
+//! `unauthenticated`) are unsupported: flattening them would expose
+//! guarded handlers because the generated runtime does not enforce
+//! Warden/Devise route constraints. `devise_for` expands a static
+//! route/helper table (sessions / registrations / passwords /
+//! confirmations) from the resource name and optional `controllers:`
+//! overrides; it does not claim Warden or Devise controller runtime.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use crate::det::{HashMap, HashSet};
@@ -392,8 +394,22 @@ fn ingest_literal_engine_mount(
             route_mount_gap(&draw, &engine.file, cx, detail);
             return None;
         }
-        if has_mount_block_call(&body, &["authenticated", "unauthenticated", "devise_scope"]) {
-            route_mount_gap(&draw, &engine.file, cx, "Devise visibility wrappers in engine routes are not enforced and cannot be composed");
+        if has_mount_block_call(&body, &["authenticate", "authenticated", "unauthenticated"]) {
+            route_mount_gap(
+                &draw,
+                &engine.file,
+                cx,
+                "authentication guards in engine routes are not enforced and cannot be composed",
+            );
+            return None;
+        }
+        if has_mount_block_call(&body, &["devise_scope"]) {
+            route_mount_gap(
+                &draw,
+                &engine.file,
+                cx,
+                "`devise_scope` in engine routes is not composed",
+            );
             return None;
         }
         if has_mount_block_call(&body, &["direct"]) {
@@ -974,6 +990,8 @@ fn ingest_route_body(
     ingest_route_stmts(flatten_statements(body).into_iter(), file, parent, cx)
 }
 
+/// Walk route statements, recording unsupported entries in survey mode and
+/// returning their errors in strict mode.
 fn ingest_route_stmts<'pr>(
     stmts: impl Iterator<Item = Node<'pr>>,
     file: &str,
@@ -1076,16 +1094,15 @@ fn ingest_route_stmts<'pr>(
         //     flattened child with its `ResourceScope` and let the
         //     flattener build the right path. `find_comment` reading
         //     `params[:id]` depends on the member routes carrying `:id`.
-        //   - `authenticated` / `unauthenticated` / `devise_scope` —
-        //     Devise visibility wrappers. Runtime auth is not modeled;
-        //     nested routes still belong in the table.
+        //   - `devise_scope` — a path-transparent Devise mapping wrapper.
+        //     Authentication guards are not passthroughs: the generated
+        //     router cannot enforce their Warden constraint, so the generic
+        //     unsupported-DSL path drops their children with a survey gap.
         if matches!(
             method.as_str(),
             "constraints"
                 | "member"
                 | "collection"
-                | "authenticated"
-                | "unauthenticated"
                 | "devise_scope"
         ) {
             if let Some(block_node) = call.block() {
@@ -1097,7 +1114,7 @@ fn ingest_route_stmts<'pr>(
                         let scope = match method.as_str() {
                             "member" => Some(ResourceScope::Member),
                             "collection" => Some(ResourceScope::Collection),
-                            _ => None, // constraints / Devise wrappers: no scope change
+                            _ => None, // constraints / devise_scope: no path change
                         };
                         if let Some(scope) = scope {
                             retag_scope(&mut inner, scope);
@@ -1377,6 +1394,7 @@ fn redirect_expression_is_string(expr: &crate::expr::Expr) -> bool {
     }
 }
 
+/// Recognize a route DSL call; unknown calls return an unsupported-DSL error.
 fn ingest_route_call(
     call: &ruby_prism::CallNode<'_>,
     method: &str,
@@ -1498,10 +1516,11 @@ fn ingest_route_call(
             suppress_helpers: false,
             entries: block_entries(call, file, parent, cx)?,
         })),
-        // Unknown DSL — `concern`, `use_doorkeeper`, `authenticate`
-        // (non-block), etc. land here. Strict ingest fails loud so the
-        // fixture that introduces them forces a recognizer; survey
-        // callers get a per-entry ledger line (see ingest_route_stmts).
+        // Unknown DSL — `concern`, `use_doorkeeper`, and Devise's
+        // route-authentication guards (`authenticate` / `authenticated` /
+        // `unauthenticated`), among others, land here. Strict ingest fails
+        // loud so the fixture that introduces them forces a recognizer;
+        // survey callers get a per-entry ledger line (see ingest_route_stmts).
         _ => Err(IngestError::Unsupported {
             file: file.into(),
             message: format!("unsupported routes DSL: `{method}`"),

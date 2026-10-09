@@ -109,7 +109,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
         if matches!(&expr.diagnostic,
             Some(DiagnosticKind::Unsupported { .. }))
         {
-            if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
+            if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic
+                && construct.as_str() != crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
+            {
                 out.push(Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone()));
             }
         }
@@ -490,12 +492,18 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             // Produced by `retypable_attributes::diagnose` as a returned list.
             DiagnosticKind::AttributeTypeUnevaluated { .. } => Diagnostic::stub_text(kind),
         };
-        out.push(Diagnostic {
-            span: expr.span,
-            kind: kind.clone(),
-            severity: Diagnostic::default_severity(kind),
-            message,
-        });
+        if !matches!(
+            kind,
+            DiagnosticKind::Unsupported { construct, .. }
+                if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
+        ) {
+            out.push(Diagnostic {
+                span: expr.span,
+                kind: kind.clone(),
+                severity: Diagnostic::default_severity(kind),
+                message,
+            });
+        }
     }
 
     // RBS-declared `untyped` reaches this site. Emit a GradualUntyped

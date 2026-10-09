@@ -68,6 +68,10 @@ pub(super) struct Visibility {
     /// What this body is, when its load-time conditional definitions are
     /// refused (`a model body`); names the refusal.
     scope: &'static str,
+    /// The visibility in effect at each statement offset, for source
+    /// declarations a later pass synthesizes into methods
+    /// (`declaration_defaults`).
+    defaults: HashMap<usize, MethodVisibility>,
 }
 
 /// The branches of a class-body `if` / `elsif` / `else` or `unless` /
@@ -235,6 +239,44 @@ pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'p
 }
 
 impl Visibility {
+    /// Recover lexical defaults for source declarations that a later pass
+    /// synthesizes into methods. Parse and walk each class body once per file.
+    pub(super) fn declaration_defaults(
+        source: &str,
+        file: &str,
+    ) -> HashMap<usize, MethodVisibility> {
+        let parsed = ruby_prism::parse(source.as_bytes());
+        let root = parsed.node();
+        let mut defaults = HashMap::default();
+        let bodies = super::util::find_all_classes_with_scope(&root)
+            .into_iter()
+            .filter_map(|(_, class)| class.body())
+            .chain(
+                super::util::find_all_module_declarations_with_scope(&root)
+                    .into_iter()
+                    .filter_map(|(_, module)| module.body()),
+            );
+        for body in bodies {
+            if let Ok(visibility) = Self::resolve(Some(&body), file, None) {
+                defaults.extend(visibility.defaults);
+            }
+            for statement in flatten_statements(body) {
+                let Some(call) = statement.as_call_node() else { continue };
+                if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+                    continue;
+                }
+                let block_body = call
+                    .block()
+                    .and_then(|block| block.as_block_node())
+                    .and_then(|block| block.body());
+                if let Ok(visibility) = Self::resolve(block_body.as_ref(), file, None) {
+                    defaults.extend(visibility.defaults);
+                }
+            }
+        }
+        defaults
+    }
+
     pub(super) fn resolve(
         body: Option<&Node<'_>>,
         file: &str,
@@ -875,6 +917,7 @@ impl Visibility {
         for statement in flatten_statements(body) {
             let offset = statement.location().start_offset();
             STATEMENT.set(Some((offset, statement.location().end_offset())));
+            self.defaults.insert(offset, default);
             let def = definition(&statement);
             let node = &statement;
             let mut inline = None;

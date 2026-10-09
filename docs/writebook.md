@@ -128,9 +128,31 @@ attr `content`) was the prior prerequisite and remains covered by
 `tests/relation_delegated_reader_typing.rs` and
 `tests/emit_and_run.rs::delegated_type_singular_reader_plain_text_body_runs`.
 
-Still separate: `delegate :title, to: :leafable` through Leafable,
-renderer/Redcarpet, embeds/uploads, option-carrying `strict_loading:`, and
-load-hook notifications. Generic string eval stays unsupported.
+Model `delegate` declarations and delegates inside concern `included do`
+blocks are lowered to ordinary methods after those items are spliced into
+their models. Top-level `delegate` calls in module bodies remain unsupported:
+their receiver and generated method surface depend on each eventual includer.
+This covers
+zero-argument forwarding, setters and fixed-arity operators, `prefix: true` or
+an explicit Symbol/String prefix. `allow_nil: true` remains unsupported because
+Rails distinguishes a nil target that responds to the delegated method from
+one that does not; a simple nil guard would change behavior. Delegated names
+that collide with the model's synthesized method surface are also left
+unexpanded rather than silently choosing the wrong definition. The four
+Writebook `Leafable#title` check errors are cleared; the behavior is also
+exercised by abstract `emit_and_run` overlays, which execute emitted Ruby
+through persisted `belongs_to` and polymorphic `delegated_type` associations.
+The latter covers Leaf's `searchable_content`-style delegation. This does not
+claim collection association proxies, arbitrary argument/block forwarding or
+unsupported options such as `private:`; targets using `yield` or
+`block_given?` are left unexpanded, as are declarations under a lexical
+`private`/`protected` marker rather than being emitted with the wrong
+visibility. The remaining `URI::HTTPS`
+constant error is cleared by registering the bundled Ruby class value; this
+does not claim the separate embed-provider or sanitizer integrations.
+Renderer/Redcarpet, embeds/uploads, option-carrying
+`strict_loading:`, and load-hook notifications remain separate. Generic string
+eval stays unsupported.
 
 The original Page tests were emitted with `--target ruby --survey
 --allow-unsupported` and attempted with `ruby -Itest -I. test/models/page_test.rb`.

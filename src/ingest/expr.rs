@@ -876,6 +876,31 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     }
                 }
             }
+            // `params.expect(widget: :name)`: Rails wraps a non-Array
+            // filter value (`Array.wrap` in `permit_hash`), so it is
+            // `params.expect(widget: [:name])`, the spelling every
+            // consumer of the expect shape reads.
+            let mut args = args;
+            if method == "expect"
+                && block.is_none()
+                && args.len() == 1
+                && recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                        if method.as_str() == "params" && args.is_empty())
+                })
+            {
+                if let ExprNode::Hash { entries, .. } = &mut *args[0].node {
+                    for (_, v) in entries.iter_mut() {
+                        if matches!(&*v.node, ExprNode::Lit { value: Literal::Sym { .. } }) {
+                            let sym = v.clone();
+                            *v = Expr::new(sym.span, ExprNode::Array {
+                                elements: vec![sym],
+                                style: crate::expr::ArrayStyle::Brackets,
+                            });
+                        }
+                    }
+                }
+            }
             // `binding.local_variable_get(:class)` is how Ruby reads a
             // local named after a reserved word (a keyword param such as
             // `class:`). It is a plain local read, so ingest it as one.

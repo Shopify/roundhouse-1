@@ -821,10 +821,6 @@
     "Error|send_dispatch_failed|app/controllers/action_text/markdown/uploads_controller.rb:12:17|no known method `safe_markdown_attribute` on Page?": 1,
     "Error|send_dispatch_failed|app/controllers/concerns/set_book_leaf.rb:27:7|no known method `constantize` on String": 1,
     "Error|send_dispatch_failed|app/controllers/leafables_controller.rb:70:7|no known method `broadcast_render_later_to` on Turbo::StreamsChannel": 1,
-    "Error|send_dispatch_failed|app/views/leaves/_header.html.erb:12:19|no known method `title` on Page | Section | Picture | nil": 1,
-    "Error|send_dispatch_failed|app/views/pages/edit.html.erb:1:35|no known method `title` on Page": 1,
-    "Error|send_dispatch_failed|app/views/pictures/edit.html.erb:1:35|no known method `title` on Picture": 1,
-    "Error|send_dispatch_failed|app/views/sections/edit.html.erb:1:35|no known method `title` on Section": 1,
     "Error|unsupported|<synthetic>|include not supported (all targets): MarkdownRenderer includes unresolved Rouge::Plugins::Redcarpet": 1,
     "Error|unsupported|app/helpers/arrangement_helper.rb:3:5|anonymous keyword forwarding not supported (all targets): forwarding destination's declaration cannot be verified": 1,
     "Error|unsupported|app/helpers/books_helper.rb:18:5|anonymous keyword forwarding not supported (all targets): forwarding destination's declaration cannot be verified": 1,
@@ -833,7 +829,6 @@
     "Error|unsupported|app/helpers/leaves_helper.rb:3:5|anonymous keyword forwarding not supported (all targets): forwarding destination's declaration cannot be verified": 1,
     "Error|unsupported|app/models/demo_content.rb:20:26|constant not supported (all targets): FrontMatterParser::Parser — unmodeled gem `front_matter_parser`; emitted constant availability is unverified": 1,
     "Error|unsupported|app/models/embed_provider.rb:119:9|constant not supported (all targets): ActiveSupport::Digest": 1,
-    "Error|unsupported|app/models/embed_provider.rb:132:31|constant not supported (all targets): URI::HTTPS": 1,
     "Error|unsupported|app/models/html_scrubber.rb:27:17|constant not supported (all targets): Rails::Html::WhiteListSanitizer": 1,
     "Error|unsupported|app/models/html_scrubber.rb:35:23|constant not supported (all targets): Loofah::HTML5::SafeList::ACCEPTABLE_ATTRIBUTES": 1,
     "Error|unsupported|app/models/leaf/searchable.rb:72:9|constant not supported (all targets): Rails::Html::FullSanitizer": 1,
@@ -1212,8 +1207,7 @@
       "Warning|lower_residue|lib/rails_ext/action_text_markdown.rb:36:3|`extend` in the body of `ActionText::Markdown::Uploads` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
       "Warning|lower_residue|lib/rails_ext/action_text_markdown.rb:38:3|`included` in the body of `ActionText::Markdown::Uploads` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
       "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:2:3|`extend` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
-      "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:4:3|`included` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
-      "Warning|unsupported|app/models/leaf.rb:8:3|delegate not supported (all targets): model DSL call on `Leaf` not lowered": 1
+      "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:4:3|`included` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1
     },
     "spinel": {
       "Error|unsupported|<synthetic>|class variable read not supported (spinel): native Ruby semantics have no verified implementation on this target": 1,
@@ -1269,8 +1263,7 @@
       "Warning|lower_residue|lib/rails_ext/action_text_markdown.rb:36:3|`extend` in the body of `ActionText::Markdown::Uploads` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
       "Warning|lower_residue|lib/rails_ext/action_text_markdown.rb:38:3|`included` in the body of `ActionText::Markdown::Uploads` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
       "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:2:3|`extend` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
-      "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:4:3|`included` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1,
-      "Warning|unsupported|app/models/leaf.rb:8:3|delegate not supported (all targets): model DSL call on `Leaf` not lowered": 1
+      "Warning|lower_residue|lib/rails_ext/active_storage_sluggable.rb:4:3|`included` in the body of `ActiveStorage::Sluggable` is not modelled and is dropped; only a class extending a base roundhouse does NOT model (a gem's, whose DSL is the class) replays its class body verbatim": 1
     }
   }
 }

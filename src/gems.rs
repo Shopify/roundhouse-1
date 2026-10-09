@@ -404,7 +404,7 @@ const FATES: &[(&str, GemFate)] = &[
     // ── Modeled (each row names where) ───────────────────────────
     ("addressable", GemFate::Modeled), // catalog/gems: Addressable::URI
     ("bcrypt", GemFate::Modeled),      // catalog/gems: BCrypt::*; has_secure_password
-    ("devise", GemFate::Modeled), // helpers; devise_for = static 4 mappings (not model-module-driven); visibility wrappers
+    ("devise", GemFate::Modeled), // helpers; devise_for = static 4 mappings (not model-module-driven); no Warden route guards
     ("faker", GemFate::Modeled),       // catalog/gems: Faker::*
     ("geared_pagination", GemFate::Modeled), // registry/controllers: set_page_and_extract_portion_from
     ("image_processing", GemFate::Modeled), // active_storage variants seam

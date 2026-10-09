@@ -667,13 +667,27 @@ pub(super) fn ingest_model_with_enum_constants(
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
             let mut unknown_seen = false;
+            let mut unknown_refused = false;
             for (i, mut item) in items.into_iter().enumerate() {
                 if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
-                } else if let ModelBodyItem::Unknown { .. } = &item
-                    && !std::mem::replace(&mut unknown_seen, true)
-                {
-                    visibility_overrides.extend(visibility.model_item_overrides(&statement, file)?);
+                } else if let ModelBodyItem::Unknown { .. } = &item {
+                    // The statement's unknown items share one statement, so
+                    // its overrides are read once; a refused one (survey
+                    // mode) drops every unknown item it produced.
+                    if unknown_refused {
+                        continue;
+                    }
+                    if !std::mem::replace(&mut unknown_seen, true) {
+                        match visibility.model_item_overrides(&statement, file) {
+                            Ok(overrides) => visibility_overrides.extend(overrides),
+                            Err(err) => {
+                                super::survey::continue_or_fail(err)?;
+                                unknown_refused = true;
+                                continue;
+                            }
+                        }
+                    }
                 }
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);

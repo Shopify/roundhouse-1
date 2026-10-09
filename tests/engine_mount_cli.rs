@@ -93,6 +93,46 @@ fn strict_transpile_composes_a_literal_isolated_engine_mount() {
     }
 }
 
+/// CLI smoke: one authentication guard fails strict emission; survey keeps
+/// the unguarded sibling. Full guard coverage lives in `tests/ingest.rs`.
+#[test]
+fn authentication_route_guard_fail_closed_cli_smoke() {
+    let fixture = Fixture::new("auth-route-guards");
+    let app = fixture.write_app(false);
+    std::fs::write(
+        app.join("config/routes.rb"),
+        "Rails.application.routes.draw do\n  authenticate :user do\n    get \"/account\", to: \"widgets#index\"\n  end\nend\n",
+    )
+    .unwrap();
+    let strict_out = fixture.0.join("strict");
+    let strict = transpile(&app, "spinel", &strict_out, &[]);
+    let strict_stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(!strict.status.success(), "strict mode accepted authenticate: {strict_stderr}");
+    assert!(
+        strict_stderr.contains("unsupported routes DSL: `authenticate`"),
+        "{strict_stderr}"
+    );
+    assert!(!strict_out.exists(), "strict mode wrote output for authenticate");
+
+    std::fs::write(
+        app.join("config/routes.rb"),
+        "Rails.application.routes.draw do\n  authenticate :user do\n    get \"/account\", to: \"widgets#index\"\n  end\n  get \"/widgets\", to: \"widgets#index\"\nend\n",
+    )
+    .unwrap();
+    let survey_out = fixture.0.join("survey");
+    let surveyed = transpile(&app, "spinel", &survey_out, &["--survey"]);
+    let survey_stderr = String::from_utf8_lossy(&surveyed.stderr);
+    assert!(surveyed.status.success(), "survey should keep the sibling: {survey_stderr}");
+    assert!(survey_stderr.contains("Survey: 1 ingest gap(s)"), "{survey_stderr}");
+    assert!(
+        survey_stderr.contains("unsupported routes DSL: `authenticate`"),
+        "{survey_stderr}"
+    );
+    let routes = std::fs::read_to_string(survey_out.join("config/routes.rb")).unwrap();
+    assert!(routes.contains("/widgets"), "unguarded sibling lost: {routes}");
+    assert!(!routes.contains("/account"), "guarded route escaped: {routes}");
+}
+
 /// Nested literal engine namespaces can be loaded through their ancestor
 /// modules without allowing declarations in those ancestors.
 #[test]
@@ -202,19 +242,39 @@ fn complex_engine_mount_shapes_remain_explicit_errors() {
 
 /// Protected engine routes are not made public by flattening their scope.
 #[test]
-fn devise_visibility_wrappers_inside_an_engine_remain_errors() {
+fn authentication_guards_and_devise_scope_inside_an_engine_remain_errors() {
     let fixture = Fixture::new("devise");
     let app = fixture.write_app(true);
-    std::fs::write(
-        app.join("vendor/catalog/config/routes.rb"),
-        "Catalog::Engine.routes.draw do\n  authenticated :user do\n    get \"/products\", to: \"products#index\"\n  end\nend\n",
-    ).unwrap();
-    let out = fixture.0.join("out");
-    let result = transpile(&app, "spinel", &out, &[]);
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(!result.status.success(), "{stderr}");
-    assert!(stderr.contains("Devise visibility wrappers"), "{stderr}");
-    assert!(!out.exists());
+    for (label, routes, needle) in [
+        (
+            "authenticate",
+            "Catalog::Engine.routes.draw do\n  authenticate :user do\n    get \"/products\", to: \"products#index\"\n  end\nend\n",
+            "authentication guards in engine routes",
+        ),
+        (
+            "authenticated",
+            "Catalog::Engine.routes.draw do\n  authenticated :user do\n    get \"/products\", to: \"products#index\"\n  end\nend\n",
+            "authentication guards in engine routes",
+        ),
+        (
+            "unauthenticated",
+            "Catalog::Engine.routes.draw do\n  unauthenticated :user do\n    get \"/products\", to: \"products#index\"\n  end\nend\n",
+            "authentication guards in engine routes",
+        ),
+        (
+            "devise_scope",
+            "Catalog::Engine.routes.draw do\n  devise_scope :user do\n    get \"/products\", to: \"products#index\"\n  end\nend\n",
+            "`devise_scope` in engine routes is not composed",
+        ),
+    ] {
+        std::fs::write(app.join("vendor/catalog/config/routes.rb"), routes).unwrap();
+        let out = fixture.0.join(format!("out-{label}"));
+        let result = transpile(&app, "spinel", &out, &[]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{label}: {stderr}");
+        assert!(stderr.contains(needle), "{label}: {stderr}");
+        assert!(!out.exists(), "{label}: wrote output");
+    }
 }
 
 /// The shared host route parser flattens several request guards. An engine

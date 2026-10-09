@@ -2958,6 +2958,7 @@ end
     if !late_on_load.is_empty() {
         splice_concerns_into_models_named(&mut app, &concern_class_method_spans, &late_on_load);
     }
+    super::model_delegate::lower_model_delegates(&mut app);
     super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     super::test::resolve_test_parents(&mut app)?;

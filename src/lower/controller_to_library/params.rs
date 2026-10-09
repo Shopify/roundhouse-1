@@ -264,7 +264,8 @@ pub fn collect_specs(controllers: &[Controller]) -> ParamsSpecs {
     let mut specs: Vec<ParamsSpec> = Vec::new();
     for c in controllers {
         for action in c.actions() {
-            collect_from_expr(&action.body, &c.name, &mut index, &mut specs);
+            let tail = body_tail(&action.body);
+            collect_from_expr(&action.body, tail, &c.name, &mut index, &mut specs);
         }
     }
     assign_class_ids(&mut specs);
@@ -431,6 +432,7 @@ fn record(
 
 fn collect_from_expr(
     expr: &Expr,
+    tail: &Expr,
     controller: &ClassId,
     index: &mut BTreeMap<(Symbol, Vec<Symbol>), usize>,
     specs: &mut Vec<ParamsSpec>,
@@ -449,7 +451,12 @@ fn collect_from_expr(
             }
         }
     }
-    if let Some((resource, fields, nested)) = match_permit_call_full(expr) {
+    let found = if std::ptr::eq(expr, tail) {
+        match_reverse_merge(expr).or_else(|| match_permit_call_full(expr))
+    } else {
+        match_permit_call_full(expr)
+    };
+    if let Some((resource, fields, nested)) = found {
         warn_nested_keys(&resource, &nested, controller, expr.span);
         record(resource, fields, controller, expr.span, Wants::default(), index, specs);
         // Stop here. The merge form (`permit(...).merge(k: v)`) matched
@@ -458,7 +465,7 @@ fn collect_from_expr(
         // register a second, narrower class for the same call site.
         return;
     }
-    walk_children(expr, &mut |c| collect_from_expr(c, controller, index, specs));
+    walk_children(expr, &mut |c| collect_from_expr(c, tail, controller, index, specs));
 }
 
 /// Record the NON-SCALAR permit keys this pass drops.
@@ -611,14 +618,23 @@ pub fn model_update_name(spec: &ParamsSpec, bang: bool) -> Symbol {
 
 /// First permit list in `expr`, in the same pre-order the collector
 /// uses — the way a `<resource>_params` helper body names its spec.
-pub fn first_permit_in(expr: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
+pub fn first_permit_in(body: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
+    first_permit_at(body, body_tail(body))
+}
+
+fn first_permit_at(expr: &Expr, tail: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
+    if std::ptr::eq(expr, tail) {
+        if let Some((resource, fields, _)) = match_reverse_merge(expr) {
+            return Some((resource, fields));
+        }
+    }
     if let Some(found) = match_permit_call(expr) {
         return Some(found);
     }
     let mut found = None;
     walk_children(expr, &mut |c| {
         if found.is_none() {
-            found = first_permit_in(c);
+            found = first_permit_at(c, tail);
         }
     });
     found
@@ -965,6 +981,39 @@ fn match_permit_call_full(expr: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<Symbo
     }
 
     None
+}
+
+/// Form 4: `{ field: expr, … }.merge(<permit-chain>)`, ingest's spelling
+/// of `<permit-chain>.reverse_merge(field: expr, …)`. The defaults' keys
+/// join the fields as Form 3's do. Callers match it only at a method
+/// body's tail (see [`body_tail`]): the rewrite is a statement Seq, and
+/// the tail of a params helper is where one can stand.
+fn match_reverse_merge(expr: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<Symbol>)> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+        return None;
+    };
+    if method.as_str() != "merge" || args.len() != 1 {
+        return None;
+    }
+    let ExprNode::Hash { entries, .. } = &*recv.node else { return None };
+    let (resource, mut fields, nested) = match_permit_call_full(&args[0])?;
+    for (k, _) in entries {
+        let k = sym_of(k)?;
+        if !fields.contains(&k) {
+            fields.push(k);
+        }
+    }
+    Some((resource, fields, nested))
+}
+
+/// The expression a body returns: the last statement, through nested Seqs
+/// and an explicit `return`.
+fn body_tail(body: &Expr) -> &Expr {
+    match &*body.node {
+        ExprNode::Seq { exprs } if !exprs.is_empty() => body_tail(&exprs[exprs.len() - 1]),
+        ExprNode::Return { value } => body_tail(value),
+        _ => body,
+    }
 }
 
 /// Match `params.require(:resource)` — returns the resource symbol on
@@ -1953,6 +2002,7 @@ pub fn params_class_info(lc: &LibraryClass) -> crate::analyze::ClassInfo {
 /// resource there, and the two forms refuse differently, which the shared
 /// `<Resource>Params` class cannot know - so the check sits at the call.
 pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Expr {
+    let tail = body_tail(expr);
     map_expr(expr, &|e| {
         // `<permit-chain>.compact` — DROP the `.compact`. Rails' version
         // removes nil-valued keys, and a presence-aware `from_raw`
@@ -1984,10 +2034,79 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Exp
                 return Some(build_from_raw_merge(&spec.class_id, entries, e.span, arg));
             }
         }
+        // Reverse-merge form (Form 4), at the body's tail only. Under an
+        // explicit `return` the statements replace the `return`, which
+        // moves onto the final `_p`.
+        let defaults = |e: &Expr| -> Option<Expr> {
+            let (resource, fields, _) = match_reverse_merge(e)?;
+            let ExprNode::Send { recv: Some(recv), args, .. } = &*e.node else { unreachable!() };
+            let ExprNode::Hash { entries, .. } = &*recv.node else { unreachable!() };
+            let (_, permitted) = match_permit_call(&args[0])?;
+            let spec = specs.find(&resource, &fields)?;
+            let arg = factory_arg(&args[0], guard, e.span);
+            Some(build_from_raw_defaults(&spec.class_id, entries, &permitted, e.span, arg))
+        };
+        if let ExprNode::Return { value } = &*e.node {
+            if std::ptr::eq(value, tail) {
+                if let Some(seq) = defaults(value) {
+                    let ExprNode::Seq { mut exprs } = *seq.node else { unreachable!() };
+                    let last = exprs.pop().expect("from_raw Seq ends in `_p`");
+                    exprs.push(Expr::new(e.span, ExprNode::Return { value: last }));
+                    return Some(Expr::new(e.span, ExprNode::Seq { exprs }));
+                }
+            }
+        }
+        if std::ptr::eq(e, tail) {
+            if let Some(seq) = defaults(e) {
+                return Some(seq);
+            }
+        }
         let (resource, fields) = match_permit_call(e)?;
         let spec = specs.find(&resource, &fields)?;
         Some(build_from_raw_call(&spec.class_id, e.span, factory_arg(e, guard, e.span)))
     })
+}
+
+/// `<chain>.reverse_merge(k: v)`: [`build_from_raw_merge`], except that a
+/// key the chain permits keeps the request's value when one was provided
+/// (`_p.k = v unless _p.k_provided`). A key it does not permit never
+/// comes from the request in Rails, so it is always assigned.
+fn build_from_raw_defaults(
+    class_id: &ClassId,
+    entries: &[(Expr, Expr)],
+    permitted: &[Symbol],
+    span: Span,
+    arg: Expr,
+) -> Expr {
+    let ExprNode::Seq { exprs } = *build_from_raw_merge(class_id, entries, span, arg).node else {
+        unreachable!("build_from_raw_merge returns a Seq")
+    };
+    // `_p = from_raw(...)`, then a (value, flag) setter pair per Symbol
+    // key in entry order, then `_p`.
+    let mut setters = exprs[1..exprs.len() - 1].chunks(2);
+    let mut out = vec![exprs[0].clone()];
+    for (k, _) in entries {
+        let ExprNode::Lit { value: Literal::Sym { value: name } } = &*k.node else { continue };
+        let pair = Expr::new(span, ExprNode::Seq { exprs: setters.next().unwrap().to_vec() });
+        if !permitted.contains(name) {
+            out.push(pair);
+            continue;
+        }
+        let send = |recv: Expr, method: Symbol| {
+            Expr::new(span, ExprNode::Send { recv: Some(recv), method, args: vec![], block: None, parenthesized: false })
+        };
+        let p = Expr::new(span, ExprNode::Var { id: VarId(0), name: Symbol::from("_p") });
+        out.push(Expr::new(
+            span,
+            ExprNode::If {
+                cond: send(send(p, provided_field(name)), Symbol::from("!")),
+                then_branch: pair,
+                else_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+            },
+        ));
+    }
+    out.push(exprs[exprs.len() - 1].clone());
+    Expr::new(span, ExprNode::Seq { exprs: out })
 }
 
 /// `<chain>.merge(k: v)` → `_p = <Class>.from_raw(@params); _p.k = v;

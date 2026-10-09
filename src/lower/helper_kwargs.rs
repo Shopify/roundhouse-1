@@ -56,31 +56,57 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
-pub fn apply_helper_kwarg_positional_lowering(app: &mut App) {
+mod constructor;
+use constructor::InstanceCallParams;
+
+pub(super) fn lexical_refinement_calls(app: &App) -> crate::det::HashSet<crate::span::Span> {
+    constructor::lexical_refinement_calls(app)
+}
+
+pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
     // Refused/native markers remain intact for diagnosis; only ordinary
     // producers rejoin this pass's established positional normalization.
-    let _ = super::forwarding::apply(app);
     apply_to_test_modules(app);
+    let mut diagnostics = Vec::new();
+    let (plans, constructors) =
+        crate::analyze::forwarding::keyword_calls_and_constructor_contracts(app);
+    let constructor_names = super::forwarding::constructor_names(app, &constructors);
+    let instance_params = InstanceCallParams::new(app, constructors, &constructor_names);
     let class_params = library_class_call_params(app);
-    let instance_params = instance_call_params(app);
-    if !class_params.is_empty() || !instance_params.is_empty() {
+    let _ = super::forwarding::apply_with_plans(app, &plans, &constructor_names);
+    super::for_each_hook_body(app, &mut |expr| {
+        constructor::refuse_keyword_splats(expr, &instance_params, &mut diagnostics);
+    });
+    for view in &mut app.views {
+        constructor::refuse_keyword_splats(&mut view.body, &instance_params, &mut diagnostics);
+    }
+    if !class_params.is_empty()
+        || !instance_params.slots.is_empty()
+        || !instance_params.unknown_new.is_empty()
+    {
         super::for_each_hook_body(app, &mut |e| {
-            rewrite_class_and_instance(e, &class_params, &instance_params);
+            rewrite_class_and_instance(e, &class_params, &instance_params, &mut diagnostics);
         });
         for view in &mut app.views {
-            rewrite_class_and_instance(&mut view.body, &class_params, &instance_params);
+            rewrite_class_and_instance(
+                &mut view.body,
+                &class_params,
+                &instance_params,
+                &mut diagnostics,
+            );
         }
     }
     super::kwsplat::restore_kwrest_in_test_helpers(app);
     let params = helper_param_names(app);
     if params.is_empty() {
-        return;
+        return diagnostics;
     }
     let mut rewrite = |e: &mut Expr| rewrite_calls(e, &params);
     super::for_each_hook_body(app, &mut rewrite);
     for view in &mut app.views {
         rewrite_calls(&mut view.body, &params);
     }
+    diagnostics
 }
 
 /// The same repair for a library class's CLASS method called through
@@ -110,10 +136,7 @@ fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> 
             {
                 continue;
             }
-            params.insert(
-                key,
-                m.params.iter().map(slot_of).collect(),
-            );
+            params.insert(key, m.params.iter().map(slot_of).collect());
         }
     }
     params
@@ -122,23 +145,55 @@ fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> 
 fn rewrite_class_and_instance(
     e: &mut Expr,
     class_params: &HashMap<(String, Symbol), Vec<Slot>>,
-    instance_params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_params: &InstanceCallParams,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
     e.node.for_each_child_mut(&mut |c| {
-        rewrite_class_and_instance(c, class_params, instance_params)
+        rewrite_class_and_instance(c, class_params, instance_params, diagnostics)
     });
-    rewrite_class_calls_node(e, class_params);
-    rewrite_instance_calls_node(e, instance_params);
+    constructor::rewrite_instance_call_node(e, instance_params, diagnostics);
+    rewrite_class_calls_node(e, class_params, instance_params, diagnostics);
 }
 
-fn rewrite_class_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
+fn rewrite_class_calls_node(
+    e: &mut Expr,
+    params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_params: &InstanceCallParams,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    if matches!(
+        &e.diagnostic,
+        Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+            if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
+    ) {
+        return;
+    }
+    if constructor::rewrite_custom_new_call(e, instance_params, diagnostics) {
+        return;
+    }
     if params.is_empty() {
         return;
     }
-    let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *e.node else { return };
-    let ExprNode::Const { path } = &*recv.node else { return };
-    let class = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-    let Some(slots) = params.get(&(class, method.clone())) else { return };
+    let ExprNode::Send {
+        recv: Some(recv),
+        method,
+        args,
+        ..
+    } = &mut *e.node
+    else {
+        return;
+    };
+    let ExprNode::Const { path } = &*recv.node else {
+        return;
+    };
+    let class = path
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("::");
+    let Some(slots) = params.get(&(class.clone(), method.clone())) else {
+        return;
+    };
     respell(args, slots, true);
 }
 
@@ -151,44 +206,6 @@ fn rewrite_class_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec
 /// handed the Hash as `ipaddr:`, and every link unfurl failed to
 /// connect.
 ///
-/// Keyed by the receiver's TYPE, not the method name: `Location` has a
-/// `fetch_content_type` of its own, with no parameters. Same narrowing
-/// as the class-method rule — only `from_keyword` slots may be named.
-fn instance_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
-    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
-    for lc in &app.library_classes {
-        for m in &lc.methods {
-            if m.receiver != crate::dialect::MethodReceiver::Instance {
-                continue;
-            }
-            let key = (lc.name.0.as_str().to_string(), m.name.clone());
-            // A later native definition replaces the earlier flattened ABI,
-            // just as it does for class-method keyword normalization above.
-            params.remove(&key);
-            if m.params.iter().any(|p| p.rest || p.keyword || p.forwarding)
-                || !m.params.iter().any(|p| p.from_keyword)
-            {
-                continue;
-            }
-            params.insert(
-                key,
-                m.params.iter().map(slot_of).collect(),
-            );
-        }
-    }
-    params
-}
-
-fn rewrite_instance_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
-    if params.is_empty() {
-        return;
-    }
-    let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *e.node else { return };
-    let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else { return };
-    let Some(slots) = params.get(&(id.0.as_str().to_string(), method.clone())) else { return };
-    respell(args, slots, true);
-}
-
 /// The same repair inside a TEST CLASS.
 ///
 /// Ingest lowers a keyword parameter the same way wherever it is
@@ -244,6 +261,7 @@ fn apply_to_test_modules(app: &mut App) {
 
 /// One positional slot of a helper: its name, and its default when it
 /// has one.
+#[derive(Clone)]
 struct Slot {
     name: Symbol,
     default: Option<Expr>,
@@ -251,7 +269,11 @@ struct Slot {
 }
 
 fn slot_of(p: &crate::dialect::Param) -> Slot {
-    Slot { name: p.name.clone(), default: p.default.clone(), from_keyword: p.from_keyword }
+    Slot {
+        name: p.name.clone(),
+        default: p.default.clone(),
+        from_keyword: p.from_keyword,
+    }
 }
 
 /// Helper name → its parameter slots, in declaration order.
@@ -308,13 +330,20 @@ fn helper_param_names(app: &App) -> HashMap<Symbol, Vec<Slot>> {
 
 fn rewrite_calls(e: &mut Expr, params: &HashMap<Symbol, Vec<Slot>>) {
     e.node.for_each_child_mut(&mut |c| rewrite_calls(c, params));
-    let ExprNode::Send { recv, method, args, .. } = &mut *e.node else { return };
+    let ExprNode::Send {
+        recv, method, args, ..
+    } = &mut *e.node
+    else {
+        return;
+    };
     // Receiverless only: the bare spelling a view writes, before
     // `rewrite_helper_calls` prefixes the module at emit time.
     if recv.is_some() {
         return;
     }
-    let Some(slots) = params.get(method) else { return };
+    let Some(slots) = params.get(method) else {
+        return;
+    };
     respell(args, slots, false);
 }
 
@@ -330,7 +359,13 @@ fn rewrite_calls(e: &mut Expr, params: &HashMap<Symbol, Vec<Slot>>) {
 /// differ from Ruby's when two keyword values have side effects.
 fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
     let Some(last) = args.last() else { return };
-    let ExprNode::Hash { entries, kwargs: true } = &*last.node else { return };
+    let ExprNode::Hash {
+        entries,
+        kwargs: true,
+    } = &*last.node
+    else {
+        return;
+    };
     if entries.is_empty() {
         return;
     }
@@ -340,8 +375,15 @@ fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
     let filled = args.len() - 1;
     let mut supplied: Vec<(usize, Expr)> = Vec::new();
     for (k, v) in entries {
-        let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node else { return };
-        let Some(pos) = slots.iter().position(|s| s.name == *value) else { return };
+        let ExprNode::Lit {
+            value: Literal::Sym { value },
+        } = &*k.node
+        else {
+            return;
+        };
+        let Some(pos) = slots.iter().position(|s| s.name == *value) else {
+            return;
+        };
         if keyword_slots_only && !slots[pos].from_keyword {
             return;
         }
@@ -368,7 +410,9 @@ fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
                 continue;
             }
         }
-        let Some(default) = slots[pos].default.as_ref() else { return };
+        let Some(default) = slots[pos].default.as_ref() else {
+            return;
+        };
         if !is_context_free(default) {
             return;
         }
@@ -386,7 +430,9 @@ fn is_context_free(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Lit { .. } | ExprNode::Const { .. } => true,
         ExprNode::Array { elements, .. } => elements.iter().all(is_context_free),
-        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| is_context_free(k) && is_context_free(v)),
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .all(|(k, v)| is_context_free(k) && is_context_free(v)),
         _ => false,
     }
 }

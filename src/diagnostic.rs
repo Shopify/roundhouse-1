@@ -22,6 +22,8 @@ use crate::ident::Symbol;
 use crate::span::{SourceFile, Span};
 use crate::ty::Ty;
 
+pub(crate) const CONSTRUCTOR_KEYWORD_ARGUMENTS: &str = "constructor keyword arguments";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub span: Span,

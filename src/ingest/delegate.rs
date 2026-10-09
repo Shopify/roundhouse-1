@@ -80,6 +80,18 @@
 //! A module holding only such declarations is a mixin
 //! (`util::body_has_direct_method_decl`), not a namespace: Core's
 //! `Apps::Models::UiExtension::Schema::ValidationDelegation`.
+//!
+//! ## Association-checked model delegates
+//!
+//! [`expand_delegates`] is the stricter expansion `ingest::model_delegate`
+//! runs once concerns are spliced into their models: a declaration the
+//! model expansion above left is expanded only through a statically known
+//! association whose target has the delegated method at the synthesized
+//! arity (`delegate_declarations.rs`). Its forwarders replace an earlier
+//! definition and yield to a later one, as Rails' do.
+
+#[path = "delegate_declarations.rs"]
+mod declarations;
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -239,6 +251,7 @@ fn delegated_names(call: &Expr) -> Vec<String> {
     let ExprNode::Send { args, .. } = &*call.node else { return Vec::new() };
     let mut names = Vec::new();
     let (mut to, mut prefix) = (None, false);
+    let mut explicit: Option<String> = None;
     for a in args {
         match &*a.node {
             ExprNode::Lit { value: Literal::Sym { value } } => names.push(value.as_str().to_string()),
@@ -251,12 +264,21 @@ fn delegated_names(call: &Expr) -> Vec<String> {
                         (ExprNode::Lit { value: Literal::Sym { value: key } }, ExprNode::Lit { value: Literal::Bool { value: true } }) if key.as_str() == "prefix" => {
                             prefix = true
                         }
+                        (ExprNode::Lit { value: Literal::Sym { value: key } }, ExprNode::Lit { value: Literal::Sym { value } }) if key.as_str() == "prefix" => {
+                            explicit = Some(value.as_str().to_string())
+                        }
+                        (ExprNode::Lit { value: Literal::Sym { value: key } }, ExprNode::Lit { value: Literal::Str { value } }) if key.as_str() == "prefix" => {
+                            explicit = Some(value.to_string())
+                        }
                         _ => {}
                     }
                 }
             }
             _ => {}
         }
+    }
+    if let Some(explicit) = explicit {
+        return names.into_iter().map(|n| format!("{explicit}_{n}")).collect();
     }
     match (prefix, to) {
         (true, Some(to)) => names.into_iter().map(|n| format!("{to}_{n}")).collect(),
@@ -327,6 +349,135 @@ fn record_synthesis_failure(delegates: &[Delegation], diags: &[crate::diagnostic
 /// with the result).
 pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef> {
     expand_delegates_declining(lc, &crate::det::HashSet::default()).0
+}
+
+/// A receiverless `delegate` call.
+pub(super) fn is_delegate_declaration(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "delegate")
+}
+
+/// The association-checked expansion (module doc): consume each
+/// declaration in `unknown_calls` that `declarations::DelegateEligibility`
+/// admits and return its forwarders, each carrying the visibility in
+/// effect at the declaration and placed at it.
+pub(super) fn expand_delegates(
+    name: &crate::ident::ClassId,
+    methods: &[MethodDef],
+    unknown_calls: &mut Vec<Expr>,
+    additional_method_bodies: &[Expr],
+    blocked_names: &crate::det::HashSet<String>,
+    supported_target_methods: Option<&crate::det::HashSet<(String, String, usize)>>,
+    sources: &[crate::span::SourceFile],
+) -> Vec<MethodDef> {
+    let called_with_args =
+        declarations::names_called_with_arguments(methods, additional_method_bodies);
+    let mut eligibility = declarations::DelegateEligibility::new(
+        methods,
+        &called_with_args,
+        blocked_names,
+        supported_target_methods,
+        sources,
+    );
+    let delegates = declarations::take_delegate_decls_from_calls(unknown_calls, &mut eligibility);
+    if delegates.is_empty() {
+        return Vec::new();
+    }
+    let src = declaration_source(name, methods, &delegates);
+    let (parsed, diags) = crate::ingest::prism::scope(|| {
+        crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate>")
+    });
+    match parsed {
+        Ok(classes) if diags.is_empty() => classes
+            .into_iter()
+            .flat_map(|class| class.methods)
+            .map(|mut method| {
+                if let Some(delegate) = delegates
+                    .iter()
+                    .find(|delegate| delegate.name == method.name.as_str())
+                {
+                    method.visibility = delegate.visibility;
+                    let at = crate::span::Span {
+                        file: delegate.declaration_span.file,
+                        start: delegate.declaration_span.start,
+                        end: delegate.declaration_span.start,
+                    };
+                    anchor(&mut method, at);
+                    method.name_span = at;
+                }
+                method
+            })
+            .collect(),
+        Ok(_) => {
+            let names = delegates.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ");
+            let file = delegates
+                .iter()
+                .map(|d| d.file.as_str())
+                .find(|f| !f.is_empty())
+                .unwrap_or("<delegate>")
+                .to_string();
+            super::survey::record_synthesis_failure(file, &format!("delegate forwarder for `{names}`"), &diags);
+            Vec::new()
+        }
+        Err(err) => {
+            super::survey::record(&err);
+            Vec::new()
+        }
+    }
+}
+
+/// [`operator_forwarder`] for the fixed-arity operators only: `[]` and
+/// `[]=` may take variable positional arities, which the
+/// association-checked expansion does not forward.
+fn fixed_operator_forwarder(t: &str, m: &str) -> Option<(&'static str, String)> {
+    if matches!(m, "[]" | "[]=") {
+        return None;
+    }
+    operator_forwarder(t, m)
+}
+
+/// The association-checked expansion's forwarders, as Ruby source. A
+/// later explicit definition wins, while a declaration that follows an
+/// earlier definition replaces it, and the last declaration of a name
+/// stands, as in Rails.
+fn declaration_source(
+    name: &crate::ident::ClassId,
+    methods: &[MethodDef],
+    delegates: &[declarations::Delegation],
+) -> String {
+    let defined_after = |name: &str, declaration: crate::span::Span| {
+        methods.iter().any(|method| {
+            method.receiver == MethodReceiver::Instance
+                && method.name.as_str() == name
+                && method.name_span.file == declaration.file
+                && method.name_span.start > declaration.start
+        })
+    };
+    let mut body = String::new();
+    let mut generated_names = crate::det::HashSet::default();
+    for d in delegates.iter().rev() {
+        if defined_after(&d.name, d.declaration_span) {
+            continue;
+        }
+        if !generated_names.insert(d.name.as_str()) {
+            continue;
+        }
+        let (target, m) = (receiver(d.target.as_str()), d.method.as_str());
+        let t = target.as_ref();
+        let (params, call) = if let Some(forwarder) = fixed_operator_forwarder(t, m) {
+            forwarder
+        } else if let Some(attr) = m.strip_suffix('=') {
+            ("value", format!("{t}.{attr} = value"))
+        } else {
+            ("", format!("{t}.{m}"))
+        };
+        let signature = if params.is_empty() {
+            d.name.clone()
+        } else {
+            format!("{}({params})", d.name)
+        };
+        body.push_str(&format!("  def {signature}\n    {call}\n  end\n\n"));
+    }
+    format!("class {}\n{body}end\n", name.0.as_str().replace("::", "__"))
 }
 
 /// `expand_delegates_in_class`, leaving any delegation that names one
@@ -469,6 +620,7 @@ fn take_delegate_decls(
         }
         let mut names: Vec<(Symbol, crate::span::Span)> = Vec::new();
         let (mut to, mut prefix, mut allow_nil) = (None, false, false);
+        let mut explicit_prefix: Option<String> = None;
         let mut unknown_option = false;
         for a in args {
             match &*a.node {
@@ -487,17 +639,24 @@ fn take_delegate_decls(
                                     unknown_option = true;
                                 }
                             }
-                            "prefix" => {
-                                prefix = matches!(&*v.node,
-                                    ExprNode::Lit { value: Literal::Bool { value: true } });
-                                if !prefix {
-                                    unknown_option = true;
+                            // `prefix: true` names `<to>_<m>`; an explicit
+                            // `prefix: :parent` / `"parent"` names
+                            // `parent_<m>`, as ActiveSupport does.
+                            "prefix" => match &*v.node {
+                                ExprNode::Lit { value: Literal::Bool { value: true } } => prefix = true,
+                                ExprNode::Lit { value: Literal::Bool { value: false } } => {}
+                                ExprNode::Lit { value: Literal::Sym { value } } if explicit_prefix_name(value.as_str()) => {
+                                    explicit_prefix = Some(value.as_str().to_string())
                                 }
-                            }
+                                ExprNode::Lit { value: Literal::Str { value } } if explicit_prefix_name(value) => {
+                                    explicit_prefix = Some(value.to_string())
+                                }
+                                _ => unknown_option = true,
+                            },
                             "allow_nil" => allow_nil = matches!(&*v.node,
                                 ExprNode::Lit { value: Literal::Bool { value: true } }),
-                            // `private:`, `prefix: :other_name` and the
-                            // rest are shapes this does not reproduce.
+                            // `private:` and the rest are shapes this
+                            // does not reproduce.
                             _ => unknown_option = true,
                         }
                     }
@@ -521,7 +680,9 @@ fn take_delegate_decls(
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
         let into = if needs_forwarding { &mut *declined } else { &mut out };
         for (m, at) in names {
-            let name = if prefix {
+            let name = if let Some(explicit) = &explicit_prefix {
+                format!("{explicit}_{}", m.as_str())
+            } else if prefix {
                 format!("{}_{}", target.as_str(), m.as_str())
             } else {
                 m.as_str().to_string()
@@ -532,6 +693,14 @@ fn take_delegate_decls(
         needs_forwarding
     });
     out
+}
+
+/// An explicit `prefix:` that makes `<prefix>_<method>` a method name:
+/// an identifier, so the synthesized source cannot be broken by it.
+fn explicit_prefix_name(prefix: &str) -> bool {
+    let mut chars = prefix.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// The target and `allow_nil` of a class body's `delegate_missing_to

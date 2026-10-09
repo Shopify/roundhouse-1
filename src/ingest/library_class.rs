@@ -4119,6 +4119,27 @@ fn walk_decl_body_in<'pr>(
                             }
                         }
                     }
+                    // `class << self; send(:include, M); end` is
+                    // `extend M`, as the bare `include` above is.
+                    "send" | "public_send"
+                        if force_class_receiver
+                            && call.arguments().is_some_and(|args| {
+                                args.arguments().iter().next().is_some_and(|arg| {
+                                    symbol_value(&arg).as_deref() == Some("include")
+                                })
+                            }) =>
+                    {
+                        if let Ok(mut expr) = ingest_expr(&stmt, file) {
+                            if let ExprNode::Send { args, .. } = &mut *expr.node {
+                                if let Some(first) = args.first_mut() {
+                                    first.node = Box::new(ExprNode::Lit {
+                                        value: crate::expr::Literal::Sym { value: Symbol::from("extend") },
+                                    });
+                                }
+                            }
+                            out.unknown_calls.push(expr);
+                        }
+                    }
                     "attr_reader" | "attr_writer" | "attr_accessor"
                     | "cattr_reader" | "cattr_writer" | "cattr_accessor"
                     | "mattr_reader" | "mattr_writer" | "mattr_accessor" => {
@@ -6123,6 +6144,7 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "has_json",
     "typed_store",
     "broadcasts_to",
+    "delegate",
     // `included do include Other end` runs on the includer: spliced
     // after the includer's own `include` line, `Other` sits ahead of
     // this concern in the lookup order, as in Ruby.

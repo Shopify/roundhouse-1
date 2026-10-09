@@ -17,6 +17,8 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 mod external;
+mod constructor;
+pub(crate) use constructor::ConstructorContract;
 
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -659,9 +661,10 @@ fn walk(
         _ => false,
     };
     if forwards_keywords {
-        let source_ok = enclosing.params.iter().any(|p| {
-            p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding
-        });
+        let source_ok = enclosing
+            .params
+            .iter()
+            .any(|p| p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding);
         let resolved = destination(app, contracts, Some((owner, enclosing)), e);
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
@@ -809,7 +812,11 @@ fn keyword_contract_error(
     if method.unsupported_formals.is_some() {
         return Some("forwarding destination has an unrepresented parameter declaration");
     }
-    if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
+    if method
+        .params
+        .iter()
+        .any(|p| p.from_keyword || p.from_kwrest)
+    {
         return Some("forwarding destination has flattened keyword parameters");
     }
     let unretained = if matches!(&*call.node, ExprNode::Super { .. }) {
@@ -832,7 +839,10 @@ fn keyword_contract_error(
         || destinations.iter().any(|(_, (candidate, _))| {
             !accepts_keywords(candidate)
                 || candidate.unsupported_formals.is_some()
-                || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
+                || candidate
+                    .params
+                    .iter()
+                    .any(|p| p.from_keyword || p.from_kwrest)
         })
     {
         return Some("forwarding destination has no verified keyword parameter ABI");
@@ -1165,21 +1175,46 @@ pub(crate) fn keyword_refusal(span: Span, policy: KeywordPolicy) -> Diagnostic {
     )
 }
 
-/// [`keyword_calls`] and [`keyword_splats_into_nameless_rest`] of one app
-/// state, over one [`SourceContractIndex`]: the index is a function of the
-/// app alone, so sharing it changes neither answer.
-pub(crate) fn keyword_calls_and_nameless_rest(app: &App) -> (HashMap<Span, KeywordPolicy>, Vec<Diagnostic>) {
-    let contracts = SourceContractIndex::new(app);
-    let plans = keyword_calls_with_index(app, &contracts);
-    let refusals = keyword_splats_into_nameless_rest(app, &contracts);
-    (plans, refusals)
-}
-
 /// Classify before projection. Source copies sharing a span must agree:
 /// a cloned concern body can have different contracts in two includers.
 pub(crate) fn keyword_calls(app: &App) -> HashMap<Span, KeywordPolicy> {
     let contracts = SourceContractIndex::new(app);
     keyword_calls_with_index(app, &contracts)
+}
+
+/// [`keyword_calls`], [`keyword_splats_into_nameless_rest`] and the
+/// constructor contracts of one app state, over one
+/// [`SourceContractIndex`]: the index is a function of the app alone, so
+/// sharing it changes no answer. The plans and the nameless-rest
+/// refusals read it before the unmodeled-lookup mutations are indexed.
+pub(crate) fn keyword_calls_nameless_rest_and_constructor_contracts(
+    app: &App,
+) -> (
+    HashMap<Span, KeywordPolicy>,
+    Vec<Diagnostic>,
+    HashMap<ClassId, ConstructorContract<'_>>,
+) {
+    let mut contracts = SourceContractIndex::new(app);
+    let plans = keyword_calls_with_index(app, &contracts);
+    let refusals = keyword_splats_into_nameless_rest(app, &contracts);
+    constructor::index_unmodeled_lookup_mutations(app, &mut contracts);
+    let constructors = constructor::constructor_contracts_with_index(app, &contracts);
+    (plans, refusals, constructors)
+}
+
+pub(crate) fn keyword_calls_and_constructor_contracts(
+    app: &App,
+) -> (
+    HashMap<Span, KeywordPolicy>,
+    HashMap<ClassId, ConstructorContract<'_>>,
+) {
+    let mut contracts = SourceContractIndex::new(app);
+    let plans = keyword_calls_with_index(app, &contracts);
+    constructor::index_unmodeled_lookup_mutations(app, &mut contracts);
+    (
+        plans,
+        constructor::constructor_contracts_with_index(app, &contracts),
+    )
 }
 
 fn keyword_calls_with_index(
@@ -1237,13 +1272,8 @@ fn keyword_calls_with_index(
                     .as_ref()
                     .is_some_and(|d| d.method.params.iter().any(|p| p.forwarding))
                 {
-                    if contract_error(
-                        context,
-                        e,
-                        resolved.map(|d| (d.method, d.model)),
-                        contracts,
-                    )
-                    .is_none()
+                    if contract_error(context, e, resolved.map(|d| (d.method, d.model)), contracts)
+                        .is_none()
                     {
                         KeywordPolicy::Native
                     } else {
@@ -1420,7 +1450,8 @@ fn possible_full_destination(
 }
 
 fn has_forwarding(args: &[Expr]) -> bool {
-    args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+    args.iter()
+        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
 }
 
 fn has_source_packet(args: &[Expr]) -> bool {
@@ -1649,14 +1680,14 @@ fn has_return(e: &Expr) -> bool {
 struct SourceContractIndex<'a> {
     parents: HashMap<ClassId, &'a ClassId>,
     includes: HashMap<ClassId, Vec<ClassId>>,
+    modules: HashSet<ClassId>,
+    unmodeled_constructor_lookup: HashSet<ClassId>,
     fragments: HashMap<ClassId, usize>,
     instance: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
     class: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
     virtual_owners: Vec<&'a ClassId>,
     full_selectors: HashSet<Symbol>,
     app: &'a App,
-    /// Names declared as a `module` in some fragment.
-    modules: HashSet<ClassId>,
     /// Names whose methods are not all source declarations: models and
     /// controllers (synthesized readers, actions, relation entry points)
     /// and library classes a lowering generated.
@@ -1690,6 +1721,7 @@ impl<'a> SourceContractIndex<'a> {
             fragments: HashMap::default(),
             instance: HashMap::default(),
             class: HashMap::default(),
+            unmodeled_constructor_lookup: HashSet::default(),
             virtual_owners: Vec::new(),
             full_selectors: HashSet::default(),
             app,
@@ -2396,7 +2428,7 @@ impl<'a> SourceContractIndex<'a> {
         if !seen.insert(owner.clone()) {
             return true;
         }
-        self.fragments.get(owner).copied().unwrap_or(0) <= 1
+        (self.fragments.get(owner).copied().unwrap_or(0) <= 1 || self.modules.contains(owner))
             && self
                 .parent(owner)
                 .is_none_or(|parent| self.verified_hierarchy(parent, seen))

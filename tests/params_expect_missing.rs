@@ -16,9 +16,15 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :articles do |t|\n    t.string :title\n    t.text :body\n  end\nend\n";
 
 fn controller_for(target: BuildTarget, helper_body: &str) -> String {
-    let controller = format!(
-        "class ArticlesController < ApplicationController\n  def create\n    @article = Article.new(article_params)\n    @article.save\n    head :created\n  end\n\n  private\n\n  def article_params\n    {helper_body}\n  end\nend\n"
-    );
+    emit_controller(
+        target,
+        format!(
+            "class ArticlesController < ApplicationController\n  def create\n    @article = Article.new(article_params)\n    @article.save\n    head :created\n  end\n\n  private\n\n  def article_params\n    {helper_body}\n  end\nend\n"
+        ),
+    )
+}
+
+fn emit_controller(target: BuildTarget, controller: String) -> String {
     let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/article.rb"), b"class Article < ApplicationRecord\nend\n".to_vec());
@@ -81,4 +87,34 @@ fn expect_passes_nested_keys_by_the_value_their_filter_takes() {
         src.contains(r#"Params.expect_present(@params, "article", ["title"], ["tags"], ["settings", "prefs"], ["items"])"#),
         "{src}"
     );
+}
+
+/// A bare-Symbol filter value is a one-key list: Rails wraps it
+/// (`Array.wrap` in `permit_hash`), so `expect(article: :title)` lowers
+/// like `expect(article: [:title])` instead of keeping `@params.expect`.
+#[test]
+fn expect_with_a_bare_symbol_filter_is_a_one_key_list() {
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        let src = controller_for(target, "params.expect(article: :title)");
+        assert!(
+            src.contains(r#"ArticleParams.from_raw(Params.expect_present(@params, "article", ["title"], [], [], []))"#),
+            "{target:?}:\n{src}"
+        );
+        assert!(!src.contains("@params.expect("), "{target:?}:\n{src}");
+    }
+}
+
+/// The same filter written as a statement, the guard-only spelling: the
+/// action refuses a missing resource instead of calling `Hash#expect`.
+#[test]
+fn statement_expect_with_a_bare_symbol_filter_keeps_the_refusal() {
+    let src = emit_controller(
+        BuildTarget::Spinel,
+        "class ArticlesController < ApplicationController\n  def create\n    params.expect(article: :title)\n    head :created\n  end\nend\n".to_string(),
+    );
+    assert!(
+        src.contains(r#"Params.expect_present(@params, "article", ["title"], [], [], [])"#),
+        "{src}"
+    );
+    assert!(!src.contains("@params.expect("), "{src}");
 }

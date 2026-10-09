@@ -1,6 +1,7 @@
 //! ActiveJob class-side entries (`lower::job_class_side`) + the
 //! url_helpers include marker — both upstream-lobsters idioms.
 
+use roundhouse::emit::ruby::emit_library;
 use roundhouse::ingest::ingest_app_from_tree;
 
 fn app_from(files: Vec<(&str, &str)>) -> roundhouse::App {
@@ -35,8 +36,7 @@ fn job_classes_gain_inline_class_side_entries() {
             .methods
             .iter()
             .find(|m| {
-                m.name.as_str() == name
-                    && m.receiver == roundhouse::dialect::MethodReceiver::Class
+                m.name.as_str() == name && m.receiver == roundhouse::dialect::MethodReceiver::Class
             })
             .unwrap_or_else(|| panic!("`{name}` class-side entry not synthesized"))
     };
@@ -83,17 +83,29 @@ fn a_set_chain_folds_and_a_kept_set_is_synthesized() {
     ]);
     let diags = roundhouse::lower::job_class_side::apply_job_class_side(&mut app);
     let class = |n: &str| {
-        app.library_classes.iter().find(|lc| lc.name.0.as_str() == n).expect(n)
+        app.library_classes
+            .iter()
+            .find(|lc| lc.name.0.as_str() == n)
+            .expect(n)
     };
-    let go = class("Caller").methods.iter().find(|m| m.name.as_str() == "go").unwrap();
+    let go = class("Caller")
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "go")
+        .unwrap();
     let body = format!("{:?}", go.body);
     assert!(!body.contains("\"set\""), "the chain folds: {body}");
     assert!(
-        diags.iter().any(|d| d.message.contains("dropped under inline")),
+        diags
+            .iter()
+            .any(|d| d.message.contains("dropped under inline")),
         "dropped set-options must be ledgered: {diags:?}"
     );
     assert!(
-        !class("NotifyJob").methods.iter().any(|m| m.name.as_str() == "set"),
+        !class("NotifyJob")
+            .methods
+            .iter()
+            .any(|m| m.name.as_str() == "set"),
         "a folded chain leaves no `set` behind"
     );
     let set = class("OtherJob")
@@ -105,7 +117,8 @@ fn a_set_chain_folds_and_a_kept_set_is_synthesized() {
     assert!(
         matches!(&set.signature, Some(roundhouse::ty::Ty::Fn { ret, .. })
             if matches!(**ret, roundhouse::ty::Ty::Untyped)),
-        "`set` is typed untyped, not as an instance: {:?}", set.signature
+        "`set` is typed untyped, not as an instance: {:?}",
+        set.signature
     );
 }
 
@@ -128,7 +141,9 @@ fn kwarg_perform_stays_unwrapped_on_the_residue_ledger() {
         .find(|lc| lc.name.0.as_str() == "KwJob")
         .expect("ingested");
     assert!(
-        !kw.methods.iter().any(|m| m.name.as_str() == "perform_later"),
+        !kw.methods
+            .iter()
+            .any(|m| m.name.as_str() == "perform_later"),
         "kwarg perform must not gain a positional wrapper"
     );
     assert!(
@@ -153,8 +168,52 @@ fn url_helpers_include_records_the_route_helpers_marker() {
         .find(|lc| lc.name.0.as_str() == "Routes")
         .expect("Routes ingested");
     assert!(
-        routes.includes.iter().any(|i| i.0.as_str() == "RouteHelpers"),
+        routes
+            .includes
+            .iter()
+            .any(|i| i.0.as_str() == "RouteHelpers"),
         "url_helpers include records the RouteHelpers marker: {:?}",
         routes.includes
+    );
+}
+
+#[test]
+fn singleton_class_includes_are_ledgered_until_emission_support_exists() {
+    let app = app_from(vec![(
+        "extras/extensions.rb",
+        "class ExtensionTarget\n  class << self\n    include ConstantMixin\n    send(:include, DynamicMixin)\n    public_send(:include, OtherMixin)\n  end\nend\n",
+    )]);
+    let target = app
+        .library_classes
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "ExtensionTarget")
+        .expect("ExtensionTarget ingested");
+    let retained = format!("{:?}", target.unknown_calls);
+    for mixin in ["ConstantMixin", "DynamicMixin", "OtherMixin"] {
+        assert!(
+            retained.contains(mixin),
+            "singleton-class extension `{mixin}` must remain in the class body: {retained}"
+        );
+    }
+    assert!(
+        !retained.contains("\"include\""),
+        "singleton-class include operations normalize to class-side extensions: {retained}"
+    );
+
+    let (files, diagnostics) = roundhouse::emit::diagnostics::scope(|| emit_library(&app));
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("is not modelled and is dropped")),
+        "class-side extensions that the Ruby emitter cannot preserve must remain visible as a gap: {diagnostics:#?}"
+    );
+    let output = files
+        .iter()
+        .map(|file| file.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !output.contains("extend ConstantMixin"),
+        "do not claim runtime support until class-side extensions survive emission: {output}"
     );
 }

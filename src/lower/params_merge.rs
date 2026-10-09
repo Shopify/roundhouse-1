@@ -865,7 +865,8 @@ fn convert_attributes_in(e: &mut Expr, helpers: &BTreeMap<Symbol, ClassId>, spec
     // hash it stands for is `to_attrs`. Converting there rather than
     // synthesizing a `merge` on every params class keeps the result a
     // plain Symbol-keyed Hash, which is what the constructor on the
-    // other end of it wants.
+    // other end of it wants. `merge!` converts the same way: `to_attrs`
+    // is a fresh Hash, and the call site uses only the merged result.
     //
     // Controller actions only, like everything else in this walk. The
     // model-side spelling (`User.new(user_params.merge(role: …))` in
@@ -879,7 +880,7 @@ fn convert_attributes_in(e: &mut Expr, helpers: &BTreeMap<Symbol, ClassId>, spec
         ..
     } = &mut *e.node
     {
-        if method.as_str() == "merge" && params_source_class(recv, helpers, specs).is_some() {
+        if matches!(method.as_str(), "merge" | "merge!") && params_source_class(recv, helpers, specs).is_some() {
             let span = recv.span;
             let inner = recv.clone();
             *recv = to_attrs_send(inner, span);

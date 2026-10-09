@@ -1004,7 +1004,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("attached_url");
     diags.extend(kwrest_forward::apply_kwrest_forward_lowering(app));
     ran!("kwrest_forward");
-    helper_kwargs::apply_helper_kwarg_positional_lowering(app);
+    diags.extend(helper_kwargs::apply_helper_kwarg_positional_lowering(app));
     ran!("helper_kwargs");
     view_to_library::form_wrapper::preserve_argument_owners(app, registry);
     ran!("form_wrapper_owners");

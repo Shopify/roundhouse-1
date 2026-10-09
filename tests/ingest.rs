@@ -385,23 +385,80 @@ end
     );
 }
 
+/// Strict ingest rejects authentication guards; survey mode reports and omits
+/// guarded routes while retaining public siblings.
 #[test]
-fn devise_scope_and_authenticated_passthrough_nested_routes() {
+fn devise_authentication_route_guards_are_unsupported_and_survey_keeps_public_routes() {
+    for (wrapper, route) in [
+        (
+            "authenticate",
+            "authenticate :user do\n    get \"/account\", to: \"widgets#index\"\n  end",
+        ),
+        (
+            "authenticated",
+            "authenticated :user, ->(user) { user.admin? } do\n    get \"/admin/reports\", to: \"widgets#index\"\n  end",
+        ),
+        (
+            "unauthenticated",
+            "unauthenticated :user do\n    get \"/join\", to: \"widgets#index\"\n  end",
+        ),
+    ] {
+        let source = format!(
+            "Rails.application.routes.draw do\n  {route}\n  get \"/health\", to: \"widgets#index\"\nend\n"
+        );
+        let (strict, _) = roundhouse::ingest::prism::scope(|| {
+            roundhouse::ingest::ingest_routes(source.as_bytes(), "config/routes.rb")
+        });
+        let err = strict.expect_err("route authentication must fail strict ingest");
+        assert!(err.to_string().contains("config/routes.rb"), "{err}");
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
+        assert!(
+            err.to_string().contains(expected_diagnostic.as_str()),
+            "strict ingest did not identify `{wrapper}`: {err}"
+        );
+    }
+
     let source = br#"Rails.application.routes.draw do
-  authenticated :user, lambda { |u| u.admin? } do
-    namespace :admin do
-      resources :users, only: [:index]
-      root to: "dashboard#show"
-    end
+  authenticate :user do
+    get "/account", to: "widgets#index"
+  end
+  authenticated :user, ->(user) { user.admin? } do
+    get "/admin/reports", to: "widgets#index"
   end
   unauthenticated :user do
-    get "join", to: "registrations#new"
+    get "/join", to: "widgets#index"
   end
+  get "/health", to: "widgets#index"
+end
+"#;
+    roundhouse::ingest::survey::activate();
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let gaps = roundhouse::ingest::survey::drain();
+    let table = result.expect("survey ingest recovers");
+    for wrapper in ["authenticate", "authenticated", "unauthenticated"] {
+        let expected_diagnostic = format!("unsupported routes DSL: `{wrapper}`");
+        assert!(
+            gaps.iter().any(|gap| format!("{gap:?}").contains(expected_diagnostic.as_str())),
+            "the refusal for `{wrapper}` must be surveyed: {gaps:?}"
+        );
+    }
+
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    assert_eq!(flat.len(), 1, "guarded routes must not reach dispatch: {flat:?}");
+    assert_eq!(flat[0].path, "/health", "the public sibling must survive: {flat:?}");
+}
+
+/// `devise_scope` is path-transparent and does not impose an authentication
+/// guard.
+#[test]
+fn devise_scope_passthrough_nested_routes() {
+    let source = br#"Rails.application.routes.draw do
   devise_scope :user do
     get "session/otp", to: "sessions#otp"
-  end
-  authenticated :user do
-    root to: "dashboard#show", as: :user_root
   end
 end
 "#;
@@ -411,37 +468,13 @@ end
     });
     let gaps = roundhouse::ingest::survey::drain();
     let table = result.expect("ingest");
-    assert!(
-        gaps.iter().all(|g| {
-            let s = format!("{g:?}");
-            !s.contains("authenticated")
-                && !s.contains("unauthenticated")
-                && !s.contains("devise_scope")
-        }),
-        "Devise wrappers must not survey: {gaps:?}"
-    );
+    assert!(gaps.is_empty(), "devise_scope is still a path-transparent wrapper: {gaps:?}");
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
     assert!(
-        flat.iter().any(|r| r.path == "/admin/users" && r.as_name == "admin_users"),
-        "authenticated nested resources: {flat:?}"
-    );
-    assert!(
-        flat.iter().any(|r| r.path == "/join" && r.controller.0.as_str() == "RegistrationsController"),
-        "unauthenticated nested route: {flat:?}"
-    );
-    assert!(
         flat.iter().any(|r| r.path == "/session/otp" && r.controller.0.as_str() == "SessionsController"),
         "devise_scope nested route: {flat:?}"
-    );
-    assert!(
-        flat.iter().any(|r| r.as_name == "user_root"),
-        "authenticated root as: :user_root: {flat:?}"
-    );
-    assert!(
-        flat.iter().any(|r| r.path == "/admin" && r.as_name == "admin_root"),
-        "namespaced root without as: keeps admin_root: {flat:?}"
     );
 }
 
@@ -664,8 +697,6 @@ fn cable_mounts_inherit_draw_and_concern_scope() {
         ("concern :live do\n mount ActionCable.server => '/cable'\nend\nnamespace :admin do\n concerns :live\nend", 1),
         ("concern :live do\n mount ActionCable.server => '/cable'\nend\nresources :widgets, concerns: :live", 1),
         ("constraints id: /[0-9]+/ do\n mount ActionCable.server => '/cable'\nend", 1),
-        ("authenticated :user do\n mount ActionCable.server => '/cable'\nend", 1),
-        ("unauthenticated :user do\n mount ActionCable.server => '/cable'\nend", 1),
         ("devise_scope :user do\n mount ActionCable.server => '/cable'\nend", 1),
         ("if Rails.env.development?\n mount ActionCable.server => '/cable'\nend", 1),
     ] {
@@ -684,6 +715,26 @@ fn cable_mounts_inherit_draw_and_concern_scope() {
             assert_eq!(&origin[span.start as usize..span.end as usize],
                 b"mount ActionCable.server => '/cable'", "{body}: located mount");
         }
+    }
+
+    // These guards are rejected before the fixed runtime cable mount is
+    // visited. Treating them as transparent would discard their guard.
+    for wrapper in ["authenticate :user", "authenticated :user", "unauthenticated :user"] {
+        let source = format!(
+            "Rails.application.routes.draw do\n  {wrapper} do\n    mount ActionCable.server => '/cable'\n  end\nend\n"
+        );
+        let err = roundhouse::ingest::routes::ingest_routes_with_draws(
+            source.as_bytes(),
+            "config/routes.rb",
+            &draws,
+        )
+        .expect_err("auth guard must fail closed before a nested mount");
+        let method = wrapper.split_whitespace().next().unwrap();
+        let expected_diagnostic = format!("unsupported routes DSL: `{method}`");
+        assert!(
+            err.to_string().contains(expected_diagnostic.as_str()),
+            "{wrapper}: {err}"
+        );
     }
 }
 
