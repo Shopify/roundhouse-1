@@ -90,7 +90,7 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
     for gem in gems {
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, extensions) = gemspec(vfs, home, gem, version);
+        let (require_paths, extensions) = gemspec(vfs, home, &dir, gem, version);
         let key = (dir.clone(), require_paths.clone());
         let cached = cache().lock().ok().and_then(|c| c.get(&key).cloned());
         let read = match cached {
@@ -163,7 +163,7 @@ pub fn engine_isolated_prefixes<V: Vfs + ?Sized>(
         }
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let (require_paths, _) = gemspec(vfs, home, &dir, gem, version);
         let mut engines = Vec::new();
         for path in &require_paths {
             engine_files(vfs, &dir.join(path), 0, &mut engines);
@@ -204,23 +204,32 @@ const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "a
 /// (`project::gem_source_dependencies`), which the boot loads there too:
 /// elasticsearch-shopify 6.0.1's `require "elastic/transport"` loads
 /// elastic-transport, whose `Elastic::Transport::Transport::Errors::*`
-/// its errors.rb lists at load. A required feature is a gem's when that
-/// gem, a lock dependency of a gem source (transitively), has the file
-/// under a require path. Not read: a gem whose lock closure reaches a
-/// Rails gem (the boot refuses its feature), a ported gem (its runtime
-/// port answers, `project::gem_port_files`), a gem the app carries, and
-/// a gem already read. Runs after the sources are registered, which the
-/// feature walk reads. A gem owning a feature required for certain (not
-/// only under an `if`) joins `GemBoundary::loaded`.
+/// its errors.rb lists at load. So do the gem sources' other files, as
+/// they load ([`gem_source_file_requires`]): hedwig 1.68.0's
+/// configuration.rb, which its entry reaches only through `autoload
+/// :Configuration`, requires mono_logger for `MonoLogger.new`. A
+/// required feature is a gem's when that gem, a lock dependency of a gem
+/// source (transitively), has the file under a require path. Not read: a
+/// gem whose lock closure reaches a Rails gem (the boot refuses its
+/// feature), a ported gem (its runtime port answers,
+/// `project::gem_port_files`), a gem the app carries, and a gem already
+/// read. Runs after the sources are registered, which the feature walk
+/// reads. A gem owning a feature required for certain (not only under an
+/// `if`) joins `GemBoundary::loaded`.
 pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Path, app: &mut crate::app::App) {
     let Some(lock) = app.gem_lock.as_ref() else { return };
     let (features, _, _) = crate::project::gem_source_dependencies_with(app, true);
+    // What the gem sources require for certain: the entry walk's, which
+    // the boot's gem facades require in the CRuby tree
+    // (`project::gem_source_dependencies`), and each other file's, which
+    // its compiled program requires where Ruby would.
+    let (certain, _, _) = crate::project::gem_source_dependencies(app);
+    let (file_features, file_certain) = gem_source_file_requires(app, dir);
+    let features: BTreeSet<String> = features.into_iter().chain(file_features).collect();
+    let certain: BTreeSet<String> = certain.into_iter().chain(file_certain).collect();
     if features.is_empty() {
         return;
     }
-    // What the gem sources require for certain, which the boot's gem
-    // facades require in the CRuby tree (`project::gem_source_dependencies`).
-    let (certain, _, _) = crate::project::gem_source_dependencies(app);
     fn deps<'a>(lock: &'a Lockfile, gem: &str) -> impl Iterator<Item = &'a str> {
         lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
     }
@@ -262,7 +271,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
         }
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let (require_paths, _) = gemspec(vfs, home, &dir, gem, version);
         let owns = |feature: &str| {
             let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
             require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
@@ -303,6 +312,142 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
     sources.scans.extend(read.scans);
 }
 
+/// The features every file of a gem source (`App::gem_source_dirs`)
+/// requires from outside the compiled tree as it loads, beyond the files
+/// its entry reaches by `require` (`project::gem_source_dependencies`):
+/// a file Ruby loads on a constant reference, through `autoload` (hedwig
+/// 1.68.0's `autoload :Configuration` under `eager_autoload`), or that
+/// the app requires itself. Its compiled program carries the require
+/// (`RoundhouseAutoload.file_statement`), so the gem is loaded before
+/// any of the file's own code reads its constants, as in Ruby. `(may,
+/// certain)`: a require at the file's top level or in a `class`/`module`
+/// body is certain; one under an `if`/`unless`, a `case` or in a `rescue`
+/// or `else` body is only possible. Not listed: `require_relative`, a
+/// Rails framework feature (the runtime's ports answer those), and a
+/// feature some compiled `lib/` answers.
+fn gem_source_file_requires(app: &crate::app::App, dir: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut may = BTreeSet::new();
+    let mut certain = BTreeSet::new();
+    if app.gem_source_dirs.is_empty() {
+        return (may, certain);
+    }
+    let root = dir.display().to_string();
+    let relative = |path: &str| -> String {
+        path.strip_prefix(root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    // Each compiled `lib/` file by the feature it answers, under every
+    // `lib/` its path has.
+    let mut compiled: BTreeSet<String> = BTreeSet::new();
+    for source in &app.sources {
+        let rel = relative(&source.path);
+        let Some(stem) = rel.strip_suffix(".rb") else { continue };
+        if let Some(feature) = stem.strip_prefix("lib/") {
+            compiled.insert(feature.to_string());
+        }
+        for (at, _) in stem.match_indices("/lib/") {
+            compiled.insert(stem[at + "/lib/".len()..].to_string());
+        }
+    }
+    for source in &app.sources {
+        let rel = relative(&source.path);
+        if !rel.ends_with(".rb") || !app.gem_source_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+            continue;
+        }
+        if !source.text.contains("require") {
+            continue;
+        }
+        let mut found = Vec::new();
+        file_requires(source.text.as_bytes(), &mut found);
+        for (feature, conditional) in found {
+            let stem = feature.strip_suffix(".rb").unwrap_or(&feature);
+            if crate::project::is_framework_feature(&feature) || compiled.contains(stem) {
+                continue;
+            }
+            if !conditional {
+                certain.insert(feature.clone());
+            }
+            may.insert(feature);
+        }
+    }
+    (may, certain)
+}
+
+/// A file's load-level `require "feature"` calls (no receiver, one
+/// string literal), each with whether it runs only under a condition.
+/// A method, block or lambda body runs when called, and is not read.
+fn file_requires(source: &[u8], out: &mut Vec<(String, bool)>) {
+    fn statements(node: Option<ruby_prism::StatementsNode<'_>>, conditional: bool, out: &mut Vec<(String, bool)>) {
+        for node in node.iter().flat_map(|s| s.body().iter()) {
+            walk(&node, conditional, out);
+        }
+    }
+    fn body(node: Option<Node<'_>>, conditional: bool, out: &mut Vec<(String, bool)>) {
+        match node {
+            Some(node) => match node.as_statements_node() {
+                Some(s) => statements(Some(s), conditional, out),
+                None => walk(&node, conditional, out),
+            },
+            None => {}
+        }
+    }
+    fn walk(node: &Node<'_>, conditional: bool, out: &mut Vec<(String, bool)>) {
+        if let Some(call) = node.as_call_node() {
+            if call.name().as_slice() != b"require" || call.receiver().is_some() || call.block().is_some() {
+                return;
+            }
+            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            if let [arg] = args.as_slice() {
+                if let Some(s) = arg.as_string_node() {
+                    out.push((String::from_utf8_lossy(s.unescaped()).into_owned(), conditional));
+                }
+            }
+        } else if let Some(n) = node.as_module_node() {
+            body(n.body(), conditional, out);
+        } else if let Some(n) = node.as_class_node() {
+            body(n.body(), conditional, out);
+        } else if let Some(n) = node.as_if_node() {
+            statements(n.statements(), true, out);
+            body(n.subsequent(), true, out);
+        } else if let Some(n) = node.as_else_node() {
+            statements(n.statements(), true, out);
+        } else if let Some(n) = node.as_unless_node() {
+            statements(n.statements(), true, out);
+            if let Some(e) = n.else_clause() {
+                statements(e.statements(), true, out);
+            }
+        } else if let Some(n) = node.as_case_node() {
+            for when in n.conditions().iter() {
+                if let Some(when) = when.as_when_node() {
+                    statements(when.statements(), true, out);
+                }
+            }
+            if let Some(e) = n.else_clause() {
+                statements(e.statements(), true, out);
+            }
+        } else if let Some(n) = node.as_begin_node() {
+            statements(n.statements(), conditional, out);
+            let mut rescue = n.rescue_clause();
+            while let Some(r) = rescue {
+                statements(r.statements(), true, out);
+                rescue = r.subsequent();
+            }
+            if let Some(e) = n.else_clause() {
+                statements(e.statements(), true, out);
+            }
+            if let Some(e) = n.ensure_clause() {
+                statements(e.statements(), conditional, out);
+            }
+        } else if let Some(n) = node.as_parentheses_node() {
+            body(n.body(), conditional, out);
+        }
+    }
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    if let Some(program) = root.as_program_node() {
+        statements(Some(program.statements()), false, out);
+    }
+}
+
 /// `<home>/gems/<gem>-<version>` (or a platform build of it,
 /// `nokogiri-1.19.4-x86_64-linux-gnu`); a gem the lock takes from git is
 /// Bundler's checkout `<home>/bundler/gems/<repo>-<rev12>`, or the gem's
@@ -341,10 +486,17 @@ fn gem_dir<V: Vfs + ?Sized>(
 
 /// The gemspec's `require_paths` (`<home>/specifications/<gem>-<version>.gemspec`,
 /// as RubyGems writes it: `s.require_paths = ["lib".freeze]`), `lib`
-/// when it names none, and whether it builds `extensions`.
-fn gemspec<V: Vfs + ?Sized>(vfs: &V, home: &Path, gem: &str, version: &str) -> (Vec<String>, bool) {
+/// when it names none, and whether it builds `extensions`. A gem the lock
+/// takes from git has no specification there: Bundler loads the
+/// checkout's own `<gem>.gemspec` (`dir`, [`gem_dir`]), as the gem home
+/// installs it in the same form (grpc's
+/// `s.require_paths = ["src/ruby/lib".freeze, ...]`).
+fn gemspec<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Path, gem: &str, version: &str) -> (Vec<String>, bool) {
     let spec = home.join("specifications").join(format!("{gem}-{version}.gemspec"));
-    let text = vfs.read_to_string(&spec).ok();
+    let text = vfs
+        .read_to_string(&spec)
+        .ok()
+        .or_else(|| vfs.read(&dir.join(format!("{gem}.gemspec"))).ok().map(|b| String::from_utf8_lossy(&b).into_owned()));
     let extensions = text.as_deref().is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("s.extensions")));
     let paths: Vec<String> = text
         .and_then(|text| {
