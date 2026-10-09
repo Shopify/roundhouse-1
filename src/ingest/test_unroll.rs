@@ -1869,6 +1869,7 @@ pub(super) mod consts {
         private: bool,
     }
 
+    #[derive(Clone)]
     enum Found {
         Missing,
         Unknown,
@@ -2419,7 +2420,7 @@ pub(super) mod consts {
     /// listed as only reading it. Else a named gap.
     pub(super) fn module_constants(module: &str) -> Option<Vec<Value>> {
         let last = module.rsplit("::").next()?;
-        let decls: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == module)).collect();
+        let decls: Vec<Decl> = decls(last).iter().filter(|d| d.names.iter().any(|n| n == module)).cloned().collect();
         let [decl] = decls.as_slice() else {
             return refuse(MODULE_BODY, format!("`{module}.constants`: `{module}` is not declared by one `module` body"));
         };
@@ -2706,19 +2707,29 @@ pub(super) mod consts {
     }
 
     fn find(full: &str) -> Found {
+        if let Some(found) = with_memo(|m| m.found.get(full).cloned()) {
+            return found;
+        }
+        let found = find_uncached(full);
+        with_memo(|m| m.found.insert(full.to_string(), found.clone()));
+        found
+    }
+
+    fn find_uncached(full: &str) -> Found {
         let last = full.rsplit("::").next().unwrap_or(full);
         // A test source not registered yet may declare it again.
         if late_decls(last).iter().any(|d| d.names.iter().any(|n| n == full)) {
             return Found::Unknown;
         }
-        let found: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == full)).collect();
+        let decls = decls(last);
+        let found: Vec<&Decl> = decls.iter().filter(|d| d.names.iter().any(|n| n == full)).collect();
         if found.is_empty() {
             return Found::Missing;
         }
         if found.iter().any(|d| !d.certain || d.names.len() > 1) {
             return Found::Unknown;
         }
-        let consts: Vec<&Decl> = found.iter().filter(|d| d.kind == Kind::Const).collect();
+        let consts: Vec<&Decl> = found.iter().copied().filter(|d| d.kind == Kind::Const).collect();
         match consts.as_slice() {
             [] => Found::Namespace,
             [one] if found.len() == 1 => Found::Value((*one).clone()),
@@ -2845,7 +2856,7 @@ pub(super) mod consts {
             return Err(why);
         }
         let last = full.rsplit("::").next().unwrap_or(full);
-        let own: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == full)).collect();
+        let own: Vec<Decl> = decls(last).iter().filter(|d| d.names.iter().any(|n| n == full)).cloned().collect();
         if own.is_empty() {
             return Err(format!("`{full}` is not in a registered source"));
         }
@@ -2872,7 +2883,7 @@ pub(super) mod consts {
         let last = written.rsplit("::").next().unwrap_or(written);
         let suffix = format!("::{written}");
         late_decls(last)
-            .into_iter()
+            .iter()
             .find(|d| d.names.iter().any(|n| n == written || n.ends_with(&suffix)))
             .map(|d| sources::relative_path(&d.path))
     }
@@ -2918,9 +2929,10 @@ pub(super) mod consts {
                 continue;
             }
             let found: Vec<Decl> = decls(&last)
-                .into_iter()
-                .chain(late_decls(&last))
+                .iter()
+                .chain(late_decls(&last).iter())
                 .filter(|d| d.kind == Kind::Class && d.names.iter().any(|n| *n == full || n.ends_with(&suffix)))
+                .cloned()
                 .collect();
             if found.is_empty() {
                 if FRAMEWORK.iter().any(|f| full.starts_with(f)) {
@@ -2973,7 +2985,7 @@ pub(super) mod consts {
         let last = full.rsplit("::").next().unwrap_or(full);
         let inside = |d: &Decl| d.path == path && start <= d.start && d.end <= end;
         let late = |p: &str| if is_registered(p) { String::new() } else { ", a test source not registered before this one".into() };
-        if let Some(d) = decls(last).into_iter().chain(late_decls(last)).find(|d| d.names.iter().any(|n| n == full) && !inside(d)) {
+        if let Some(d) = decls(last).iter().chain(late_decls(last).iter()).find(|d| d.names.iter().any(|n| n == full) && !inside(d)) {
             return Some(format!("`{full}` is declared again in {}{}", sources::relative_path(&d.path), late(&d.path)));
         }
         let methods = format!("{full}::ClassMethods");
@@ -3121,7 +3133,7 @@ pub(super) mod consts {
         if let Some((_, parent)) = KNOWN_SUPERCLASSES.iter().find(|(c, _)| *c == module) {
             parents.push(parent.to_string());
         }
-        let own: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == module)).collect();
+        let own: Vec<Decl> = decls(last).iter().filter(|d| d.names.iter().any(|n| n == module)).cloned().collect();
         if let Some(why) = late_reason(module) {
             return Err(why);
         }
@@ -3235,7 +3247,7 @@ pub(super) mod consts {
     fn singleton_adds(module: &str) -> Result<Vec<String>, String> {
         let last = module.rsplit("::").next().unwrap_or(module);
         let mut out = Vec::new();
-        let own: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == module)).collect();
+        let own: Vec<Decl> = decls(last).iter().filter(|d| d.names.iter().any(|n| n == module)).cloned().collect();
         for decl in &own {
             let found = sources::with_text(&decl.path, |text| -> Result<(), String> {
                 let result = ruby_prism::parse(text.as_bytes());
@@ -3403,7 +3415,7 @@ pub(super) mod consts {
 
     /// What in a constant's literal value may change in place, in
     /// increasing order.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     enum Shape {
         /// Nothing: a Symbol, a number, a frozen String, `nil`, a module,
         /// a frozen Array or Hash of these.
@@ -3597,8 +3609,21 @@ pub(super) mod consts {
     /// evaluated, the module passed on. An alias (`KA = Kinds`, assigned
     /// once with certainty) counts by its own uses.
     fn owner_reached(owner: &str, shape: Shape, depth: usize) -> Option<Site> {
+        let key = (owner.to_string(), shape, depth);
+        let pure = !asking();
+        if let Some(found) = pure.then(|| with_memo(|m| m.owner.get(&key).cloned())).flatten() {
+            return found;
+        }
+        let found = owner_reached_uncached(owner, shape, depth);
+        if pure {
+            with_memo(|m| m.owner.insert(key, found.clone()));
+        }
+        found
+    }
+
+    fn owner_reached_uncached(owner: &str, shape: Shape, depth: usize) -> Option<Site> {
         let last = owner.rsplit("::").next().unwrap_or(owner);
-        for site in sites_of(last).into_iter().filter(|s| relevant(s, owner)) {
+        for site in sites_of(last).iter().filter(|s| relevant(s, owner)) {
             let alias = site.alias.as_ref().filter(|a| depth < MAX_ALIASES && matches!(find(a), Found::Value(d) if d.path == site.path && d.start == site.at));
             if let Some(alias) = alias {
                 if let Some(found) = owner_reached(alias, shape, depth + 1) {
@@ -3606,8 +3631,8 @@ pub(super) mod consts {
                 }
                 continue;
             }
-            if !shape.allows(owner_need(&site)) {
-                return Some(site);
+            if !shape.allows(owner_need(site)) {
+                return Some(site.clone());
             }
         }
         None
@@ -3618,9 +3643,22 @@ pub(super) mod consts {
 
     /// Every mention of `name` in the registered sources and in the test
     /// sources not registered now.
-    fn sites_of(name: &str) -> Vec<Site> {
-        let mut sites = with_entry(name, |e| e.sites.clone());
-        sites.extend(late_sites(name));
+    fn sites_of(name: &str) -> Rc<Vec<Site>> {
+        if let Some(sites) = with_memo(|m| m.sites.get(name).cloned()) {
+            return sites;
+        }
+        let late = late_sites(name);
+        let sites = with_entry(name, |e| {
+            if late.is_empty() {
+                e.sites.clone()
+            } else {
+                let mut all = Vec::with_capacity(e.sites.len() + late.len());
+                all.extend(e.sites.iter().cloned());
+                all.extend(late);
+                Rc::new(all)
+            }
+        });
+        with_memo(|m| m.sites.insert(name.to_string(), sites.clone()));
         sites
     }
 
@@ -5261,6 +5299,21 @@ pub(super) mod consts {
     /// known (`MiniTest::Test` is `Minitest::Test`): a mention of one of
     /// theirs may be of any other.
     fn relevant(site: &Site, full: &str) -> bool {
+        // Inside `mixed_into_object`'s cycle check an answer may be the
+        // cautious one a cycle gives, not this site's own.
+        let pure = !asking();
+        let key = (site.path.clone(), site.at, site.qualifier.clone(), site.rooted, site.cref.clone(), full.to_string());
+        if let Some(found) = pure.then(|| with_memo(|m| m.relevant.get(&key).copied())).flatten() {
+            return found;
+        }
+        let found = relevant_uncached(site, full);
+        if pure {
+            with_memo(|m| m.relevant.insert(key, found));
+        }
+        found
+    }
+
+    fn relevant_uncached(site: &Site, full: &str) -> bool {
         let name = full.rsplit("::").next().unwrap_or(full);
         let theirs = |n: &str| matches!(find(n.split("::").next().unwrap_or(n)), Found::Missing);
         match denotes(site, name) {
@@ -5333,6 +5386,11 @@ pub(super) mod consts {
         Some(Some(full))
     }
 
+    thread_local! {
+        /// The names `mixed_into_object` is asking about, outermost first.
+        static ASKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
     /// May a module that declares `name` (or an ancestor of one) be mixed
     /// into `Object` where no mention of `Object` shows it: `class
     /// Object` reopened (`include Kinds` in its body); an `include` or
@@ -5341,9 +5399,6 @@ pub(super) mod consts {
     /// reaches what includes that module); the module passed on or
     /// aliased (`send(:include, Kinds)`, `KA = Kinds`)?
     fn mixed_into_object(name: &str) -> bool {
-        thread_local! {
-            static ASKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        }
         if !decls("Object").is_empty() || !late_decls("Object").is_empty() {
             return true;
         }
@@ -5352,9 +5407,9 @@ pub(super) mod consts {
             return true;
         }
         let owners: Vec<String> = decls(name)
-            .into_iter()
-            .chain(late_decls(name))
-            .flat_map(|d| d.names)
+            .iter()
+            .chain(late_decls(name).iter())
+            .flat_map(|d| d.names.iter().cloned())
             .filter_map(|n| n.strip_suffix(name)?.strip_suffix("::").map(str::to_string))
             .filter(|owner| !owner.is_empty())
             .collect();
@@ -5414,7 +5469,7 @@ pub(super) mod consts {
     /// `namespace`) once, unconditionally, above it?
     fn declared_before(site: &Site, full: &str, namespace: bool) -> bool {
         let last = full.rsplit("::").next().unwrap_or(full);
-        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == full)).collect();
+        let all: Vec<Decl> = decls(last).iter().chain(late_decls(last).iter()).filter(|d| d.names.iter().any(|n| n == full)).cloned().collect();
         let [d] = all.as_slice() else { return false };
         d.path == site.path && d.certain && d.names.len() == 1 && d.start < site.at && (!namespace || d.kind != Kind::Const)
     }
@@ -5543,7 +5598,7 @@ pub(super) mod consts {
             return true;
         }
         let last = module.rsplit("::").next().unwrap_or(module);
-        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == module)).collect();
+        let all: Vec<Decl> = decls(last).iter().chain(late_decls(last).iter()).filter(|d| d.names.iter().any(|n| n == module)).cloned().collect();
         if !all.is_empty() && all.iter().all(|d| d.kind == Kind::Class) {
             let plain = |d: &Decl| {
                 d.certain
@@ -5608,7 +5663,7 @@ pub(super) mod consts {
     /// test class) opens it with `module`/`class`, none assigns it.
     fn own_module(full: &str) -> bool {
         let last = full.rsplit("::").next().unwrap_or(full);
-        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == full)).collect();
+        let all: Vec<Decl> = decls(last).iter().chain(late_decls(last).iter()).filter(|d| d.names.iter().any(|n| n == full)).cloned().collect();
         !all.is_empty() && all.iter().all(|d| d.kind != Kind::Const)
     }
 
@@ -5834,8 +5889,8 @@ pub(super) mod consts {
         root: Option<String>,
         files: Rc<Vec<(String, String)>>,
         words: HashMap<String, Vec<usize>>,
-        decls: HashMap<String, Vec<Decl>>,
-        sites: HashMap<String, Vec<Site>>,
+        decls: HashMap<String, Rc<Vec<Decl>>>,
+        sites: HashMap<String, Rc<Vec<Site>>>,
     }
 
     thread_local! {
@@ -5960,7 +6015,10 @@ pub(super) mod consts {
     }
 
     /// The declarations of `name` in test sources not registered now.
-    fn late_decls(name: &str) -> Vec<Decl> {
+    fn late_decls(name: &str) -> Rc<Vec<Decl>> {
+        if let Some(found) = with_memo(|m| m.late_decls.get(name).cloned()) {
+            return found;
+        }
         let found = with_late(|late| {
             if let Some(found) = late.decls.get(name) {
                 return found.clone();
@@ -5974,14 +6032,28 @@ pub(super) mod consts {
                     found.extend(scan(text, path, name));
                 }
             }
+            let found = Rc::new(found);
             late.decls.insert(name.to_string(), found.clone());
             found
         });
-        found.into_iter().filter(|d| !is_registered(&d.path)).collect()
+        let found = unregistered(found, |d| &d.path);
+        with_memo(|m| m.late_decls.insert(name.to_string(), found.clone()));
+        found
+    }
+
+    /// `all` but those in a registered source (`all` itself when none is).
+    fn unregistered<T: Clone>(all: Rc<Vec<T>>, path: impl Fn(&T) -> &String) -> Rc<Vec<T>> {
+        if all.iter().all(|t| !is_registered(path(t))) {
+            return all;
+        }
+        Rc::new(all.iter().filter(|t| !is_registered(path(t))).cloned().collect())
     }
 
     /// Where test sources not registered now mention `name`.
     fn late_sites(name: &str) -> Vec<Site> {
+        if let Some(found) = with_memo(|m| m.late_sites.get(name).cloned()) {
+            return found.as_ref().clone();
+        }
         let found = with_late(|late| {
             if let Some(found) = late.sites.get(name) {
                 return found.clone();
@@ -5993,17 +6065,20 @@ pub(super) mod consts {
                 let (path, text) = &files[i];
                 found.extend(scan_uses(text, path, name));
             }
+            let found = Rc::new(found);
             late.sites.insert(name.to_string(), found.clone());
             found
         });
-        found.into_iter().filter(|s| !is_registered(&s.path)).collect()
+        let found = unregistered(found, |s| &s.path);
+        with_memo(|m| m.late_sites.insert(name.to_string(), found.clone()));
+        found.as_ref().clone()
     }
 
     /// Why `full` is not known when a test source not registered now
     /// declares it.
     fn late_reason(full: &str) -> Option<String> {
         let last = full.rsplit("::").next().unwrap_or(full);
-        late_decls(last).into_iter().find(|d| d.names.iter().any(|n| n == full)).map(|d| {
+        late_decls(last).iter().find(|d| d.names.iter().any(|n| n == full)).map(|d| {
             format!("`{full}` is declared in {}, a test source not registered before this one", sources::relative_path(&d.path))
         })
     }
@@ -6048,6 +6123,22 @@ pub(super) mod consts {
     /// The registered files (ids above `after`) that have `name` as a
     /// whole word.
     fn files_with(name: &str, after: u32) -> Vec<u32> {
+        sync_index();
+        INDEX.with(|index| {
+            let index = index.borrow();
+            match name.as_bytes().first() {
+                Some(b) if b.is_ascii_uppercase() => {
+                    index.files.get(name).map(|ids| ids.iter().copied().filter(|i| *i > after).collect()).unwrap_or_default()
+                }
+                // Not a word the index keeps: every file.
+                _ => ((after + 1)..=index.seen).collect(),
+            }
+        })
+    }
+
+    /// Index the files registered since the last call; the id of the
+    /// last registered file.
+    fn sync_index() -> u32 {
         let registry = registry_key();
         INDEX.with(|index| {
             let mut index = index.borrow_mut();
@@ -6063,13 +6154,7 @@ pub(super) mod consts {
                 index.seen = id;
                 id += 1;
             }
-            match name.as_bytes().first() {
-                Some(b) if b.is_ascii_uppercase() => {
-                    index.files.get(name).map(|ids| ids.iter().copied().filter(|i| *i > after).collect()).unwrap_or_default()
-                }
-                // Not a word the index keeps: every file.
-                _ => ((after + 1)..=index.seen).collect(),
-            }
+            index.seen
         })
     }
 
@@ -6105,8 +6190,8 @@ pub(super) mod consts {
     #[derive(Default)]
     struct Entry {
         seen: u32,
-        decls: Vec<Decl>,
-        sites: Vec<Site>,
+        decls: Rc<Vec<Decl>>,
+        sites: Rc<Vec<Site>>,
     }
 
     /// `f` of what the registered sources declare and say about `name`.
@@ -6140,8 +6225,12 @@ pub(super) mod consts {
         DECLS.with(|cache| {
             let mut cache = cache.borrow_mut();
             let entry = cache.by_name.entry(name.to_string()).or_default();
-            entry.decls.extend(decls);
-            entry.sites.extend(sites);
+            if !decls.is_empty() {
+                Rc::make_mut(&mut entry.decls).extend(decls);
+            }
+            if !sites.is_empty() {
+                Rc::make_mut(&mut entry.sites).extend(sites);
+            }
             entry.seen = entry.seen.max(last);
             f(entry)
         })
@@ -6154,8 +6243,61 @@ pub(super) mod consts {
 
     /// Every statement in a registered source that declares a constant
     /// called `name` (a module, a class, or an assignment).
-    fn decls(name: &str) -> Vec<Decl> {
-        with_entry(name, |e| e.decls.clone())
+    fn decls(name: &str) -> Rc<Vec<Decl>> {
+        if let Some(found) = with_memo(|m| m.decls.get(name).cloned()) {
+            return found;
+        }
+        let found = with_entry(name, |e| e.decls.clone());
+        with_memo(|m| m.decls.insert(name.to_string(), found.clone()));
+        found
+    }
+
+    /// What the lookups by name answer for one state of the sources: the
+    /// registry (its first file, how many files and the last one's
+    /// length) and the late sources' app root. A lookup made inside an
+    /// unroll is asked again for each constant, alias and mention it
+    /// passes, so each is made once per state.
+    #[derive(Default)]
+    struct Memo {
+        generation: Option<Generation>,
+        decls: HashMap<String, Rc<Vec<Decl>>>,
+        late_decls: HashMap<String, Rc<Vec<Decl>>>,
+        late_sites: HashMap<String, Rc<Vec<Site>>>,
+        sites: HashMap<String, Rc<Vec<Site>>>,
+        found: HashMap<String, Found>,
+        /// By what `denotes` reads of the site: path, offset, qualifier,
+        /// rootedness, lexical scopes; and the full name.
+        relevant: HashMap<(String, usize, Option<Vec<String>>, bool, Option<Vec<String>>, String), bool>,
+        owner: HashMap<(String, Shape, usize), Option<Site>>,
+    }
+
+    type Generation = (Option<(String, usize)>, u32, Option<usize>, Option<String>);
+
+    thread_local! {
+        static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
+    }
+
+    fn generation() -> Generation {
+        let last = sync_index();
+        let last_len = sources::path_of(FileId(last)).and_then(|p| sources::with_text(&p, str::len));
+        (registry_key(), last, last_len, app_root())
+    }
+
+    /// `f` of the memo for the sources as they are now.
+    fn with_memo<R>(f: impl FnOnce(&mut Memo) -> R) -> R {
+        let generation = generation();
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.generation.as_ref() != Some(&generation) {
+                *memo = Memo { generation: Some(generation), ..Memo::default() };
+            }
+            f(&mut memo)
+        })
+    }
+
+    /// Is `mixed_into_object` asking (where a cycle answers cautiously)?
+    fn asking() -> bool {
+        ASKED.with(|a| !a.borrow().is_empty())
     }
 
     /// A cheap test before parsing: does a line of `text` open a module
@@ -6370,6 +6512,26 @@ pub(super) mod consts {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // An unroll asks the same lookups for every constant, alias and
+        // mention it passes: each is answered once for a state of the
+        // sources, without copying what they declare, and again once a
+        // source registers.
+        #[test]
+        fn lookups_are_shared_and_answered_again_when_a_source_registers() {
+            sources::register("/memo/app/models/kinds.rb", "module Kinds\n  ALL = [:a].freeze\nend\n");
+            assert!(matches!(find("Kinds::ALL"), Found::Value(_)));
+            assert!(Rc::ptr_eq(&decls("ALL"), &decls("ALL")));
+            assert!(Rc::ptr_eq(&sites_of("Kinds"), &sites_of("Kinds")));
+            assert!(owner_reached("Kinds", Shape::Deep, 0).is_none());
+
+            sources::register("/memo/app/models/rebind.rb", "Kinds.const_set(name, [])\n");
+            assert_eq!(owner_reached("Kinds", Shape::Deep, 0).map(|s| s.path), Some("/memo/app/models/rebind.rb".to_string()));
+
+            sources::register("/memo/app/models/again.rb", "module Kinds\n  ALL = [:b].freeze\nend\n");
+            assert_eq!(decls("ALL").len(), 2);
+            assert!(matches!(find("Kinds::ALL"), Found::Unknown));
+        }
 
         fn needs(src: &str) -> Vec<Need> {
             scan_uses(src, "x.rb", "ALL").iter().map(|s| s.need).collect()
