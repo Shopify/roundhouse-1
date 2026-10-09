@@ -201,7 +201,7 @@ fn declares_tests(c: &ruby_prism::ClassNode<'_>) -> bool {
 
 /// `test "…" …` (a receiverless `test` call with arguments) or a
 /// receiverless `def test_…`, whether or not ingest models its form.
-fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
+pub(super) fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
     if let Some(def) = stmt.as_def_node() {
         return def.receiver().is_none() && def.name().as_slice().starts_with(b"test_");
     }
@@ -216,7 +216,7 @@ fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
 /// literal), as its offset. Nested classes and method bodies are not
 /// searched: a class is its own suite, and a method's body runs when
 /// called, not at class load.
-fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
+pub(super) fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     use ruby_prism::Visit;
     struct Find(Option<usize>);
     impl<'pr> Visit<'pr> for Find {
@@ -275,7 +275,7 @@ fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
     }
 }
 
-fn ingest_test_class(
+pub(super) fn ingest_test_class(
     (scope, class): &ScopedClass<'_>,
     top_level_helper_nodes: &[ScopedClass<'_>],
     file: &str,
@@ -967,7 +967,7 @@ fn collect_top_level_classes<'pr>(
     }
 }
 
-type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
+pub(super) type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
 
 /// Heuristic: a class is "the test class" when its name ends with
 /// `Test` (e.g. `ViewHelpersTest`, `InflectorTest`) OR when its parent
@@ -1004,7 +1004,7 @@ fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
 /// Recognize `setup do ... end` (Call with method=setup, block body)
 /// and `def setup; ...; end` (DefNode named setup). Returns the body
 /// expression in either case. Other shapes return Ok(None).
-fn ingest_setup_declaration(
+pub(super) fn ingest_setup_declaration(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Expr>> {
@@ -1047,7 +1047,7 @@ fn ingest_setup_declaration(
 /// (`teardown :close_files`, a block argument) is refused by name: it
 /// would otherwise fall to the unrecognized-statement drop below and
 /// its cleanup would silently never run.
-fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
+pub(super) fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
     if call.receiver().is_some() || constant_id_str(&call.name()) != "teardown" {
         return Ok(None);
@@ -1072,14 +1072,14 @@ fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Exp
 /// `persistent` is set once a blockless `tag(...)` installed its
 /// `runnable_methods` hook.
 #[derive(Clone, Debug, Default)]
-struct TestTags {
-    tags: Vec<(String, String)>,
-    persistent: bool,
+pub(super) struct TestTags {
+    pub(super) tags: Vec<(String, String)>,
+    pub(super) persistent: bool,
 }
 
 /// `Hash#merge!`: a key already present keeps its place and takes the
 /// new value.
-fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
+pub(super) fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
     for (key, pair) in more {
         match into.iter_mut().find(|(k, _)| k == key) {
             Some(entry) => entry.1 = pair.clone(),
@@ -1090,7 +1090,7 @@ fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
 
 /// `TestTags.generate_name_with_tags`: `name`, then `_tag:<k>:<v>` for
 /// each tag joined by `_`.
-fn name_with_tags(name: &str, tags: &[(String, String)]) -> String {
+pub(super) fn name_with_tags(name: &str, tags: &[(String, String)]) -> String {
     if tags.is_empty() {
         return name.to_string();
     }
@@ -1207,7 +1207,7 @@ fn literal_tags(node: &Node<'_>, file: &str) -> IngestResult<Option<(Vec<(String
 /// statements of its block when it has one. `Ok(None)` for any other
 /// statement, including a `tag` call whose argument is not one Hash.
 #[allow(clippy::type_complexity)]
-fn tag_declaration<'pr>(stmt: &Node<'pr>, file: &str) -> IngestResult<Option<(Vec<(String, String)>, Option<Vec<Node<'pr>>>)>> {
+pub(super) fn tag_declaration<'pr>(stmt: &Node<'pr>, file: &str) -> IngestResult<Option<(Vec<(String, String)>, Option<Vec<Node<'pr>>>)>> {
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
     if call.receiver().is_some() || call.name().as_slice() != b"tag" {
         return Ok(None);
@@ -1239,7 +1239,7 @@ fn tag_declaration<'pr>(stmt: &Node<'pr>, file: &str) -> IngestResult<Option<(Ve
 /// A class-body statement, or where a `tag(...) do … end` block begins
 /// and ends: TestTags#tag merges its tags for the statements in the
 /// block and restores the previous ones after it.
-enum BodyItem<'pr> {
+pub(super) enum BodyItem<'pr> {
     Stmt(Node<'pr>),
     TagsBegin(Vec<(String, String)>),
     TagsEnd,
@@ -1247,7 +1247,7 @@ enum BodyItem<'pr> {
 
 /// The class body's statements in order, each `tag … do` block's
 /// statements spliced in between its begin and end.
-fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyItem<'pr>>) -> IngestResult<()> {
+pub(super) fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyItem<'pr>>) -> IngestResult<()> {
     for stmt in stmts {
         match tag_declaration(&stmt, file)? {
             Some((tags, Some(block))) => {
@@ -1282,7 +1282,7 @@ fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyIt
 /// silently drop unrecognized body items rather than error; they'll
 /// surface when the test tries to reference something that isn't
 /// emitted).
-fn ingest_test_declaration(
+pub(super) fn ingest_test_declaration(
     stmt: &Node<'_>,
     file: &str,
     tags: &TestTags,
