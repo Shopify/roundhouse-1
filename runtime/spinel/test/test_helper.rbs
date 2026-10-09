@@ -245,6 +245,12 @@ module ActionView
   end
 end
 
+module ActiveJob
+  class TestCase < TestBase
+    include ActiveJob::TestHelper
+  end
+end
+
 module ActionCable
   module Channel
     # The channel harness (see the .rb). `subscribe_to` is what

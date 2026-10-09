@@ -1189,14 +1189,21 @@ module ActiveRecord
     # validates in `:create` when new, `:update` otherwise. A rule's
     # `on:` reads it through `validation_context`, which is nil outside
     # a run. Ruby-family-only, beside `save`'s other Rails options.
+    #
+    # The run is the class's validate chain (RuntimeValidations below):
+    # the compiled `validate` and whatever `validate`/`validates`
+    # registered at run time, in Rails' order, under `throw :abort`.
+    # Without a run-time registration it is the compiled `validate`.
     def valid?(context = nil)
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
       @errors = []
-      validate
-      ok = @errors.empty?
-      @validation_context = previous
-      ok
+      begin
+        ActiveRecord::RuntimeValidations.run(self)
+      ensure
+        @validation_context = previous
+      end
+      @errors.empty?
     end
 
     def validation_context
@@ -1326,5 +1333,799 @@ module ActiveRecord
       pair = changes_to_save[name]
       pair.nil? ? _attribute_snapshot[name] : pair[0]
     end
+
+
+    # ---- Validations declared at run time ----------------------------
+    #
+    # A model's class-body `validates`/`validate` compile into its
+    # `validate` (lower::model_to_library::validations). These are the
+    # class methods for the ones code declares while it runs: a
+    # concern's `included` hook (`base.validate(:check, if: :pred?)`,
+    # Core's SensitiveAttributeValidations), or a class method a macro
+    # calls (`validates(foreign_key, presence: true)`). They follow
+    # ActiveModel::Validations::ClassMethods (activemodel 8.2.0.alpha,
+    # validations.rb, validates.rb, with.rb, helper_methods.rb) and
+    # ActiveRecord::Validations' helpers. RuntimeValidations below keeps
+    # the registrations and runs them in `valid?`; the validators are
+    # the ActiveModel and ActiveRecord ports (runtime/spinel/
+    # active_model_validations.rb, active_record_validations.rb).
+    def self.validate(*args, &block)
+      ActiveRecord::RuntimeValidations.validate(self, args, block)
+    end
+
+    def self.validates(*attributes)
+      ActiveRecord::RuntimeValidations.validates(self, attributes, false)
+    end
+
+    def self.validates!(*attributes)
+      ActiveRecord::RuntimeValidations.validates(self, attributes, true)
+    end
+
+    def self.validates_with(*args, &block)
+      ActiveRecord::RuntimeValidations.validates_with(self, args, block)
+    end
+
+    def self.validates_each(*attr_names, &block)
+      ActiveRecord::RuntimeValidations.validates_each(self, attr_names, block)
+    end
+
+    # The `validates_<kind>_of` helpers: Active Record's validator where
+    # it has one (presence, absence, length, numericality, associated,
+    # uniqueness), Active Model's otherwise.
+    def self.validates_absence_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "AbsenceValidator", attr_names)
+    end
+
+    def self.validates_acceptance_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "AcceptanceValidator", attr_names)
+    end
+
+    def self.validates_associated(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "AssociatedValidator", attr_names)
+    end
+
+    def self.validates_comparison_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "ComparisonValidator", attr_names)
+    end
+
+    def self.validates_confirmation_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "ConfirmationValidator", attr_names)
+    end
+
+    def self.validates_exclusion_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "ExclusionValidator", attr_names)
+    end
+
+    def self.validates_format_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "FormatValidator", attr_names)
+    end
+
+    def self.validates_inclusion_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "InclusionValidator", attr_names)
+    end
+
+    def self.validates_length_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "LengthValidator", attr_names)
+    end
+
+    def self.validates_size_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "LengthValidator", attr_names)
+    end
+
+    def self.validates_numericality_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "NumericalityValidator", attr_names)
+    end
+
+    def self.validates_presence_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "PresenceValidator", attr_names)
+    end
+
+    def self.validates_uniqueness_of(*attr_names)
+      ActiveRecord::RuntimeValidations.helper(self, "UniquenessValidator", attr_names)
+    end
+
+    # The class_attribute `_validators` (attribute => validators) with
+    # its readers. It lists the validators registered at run time; a
+    # compiled rule has no validator object to list.
+    def self._validators
+      ActiveRecord::RuntimeValidations.validators_of(self)
+    end
+
+    def self.validators
+      ActiveRecord::RuntimeValidations.all_validators(self)
+    end
+
+    def self.validators_on(*attributes)
+      ActiveRecord::RuntimeValidations.validators_on(self, attributes)
+    end
+
+    # What ActiveModel::Error reads off a record to word its message:
+    # ActiveRecord::Translation (`i18n_scope`, `lookup_ancestors`),
+    # ActiveModel::Translation#human_attribute_name and
+    # ActiveModel::Naming#model_name (through the ports), and
+    # Validations#read_attribute_for_validation.
+    def self.i18n_scope
+      :activerecord
+    end
+
+    def self.lookup_ancestors
+      ActiveRecord::RuntimeValidations.lookup_ancestors(self)
+    end
+
+    def self.human_attribute_name(attribute, options = {})
+      ActiveRecord::RuntimeValidations.human_attribute_name(self, attribute, options)
+    end
+
+    def self.model_name
+      ActiveRecord::RuntimeValidations.model_name(self)
+    end
+
+    def model_name
+      ActiveRecord::RuntimeValidations.model_name(self.class)
+    end
+
+    def read_attribute_for_validation(attribute)
+      ActiveRecord::RuntimeValidations.read_attribute(self, attribute)
+    end
+
+    # Reflection#_reflect_on_association, which Active Record's presence
+    # and absence validators ask: the reflection a compiled model answers
+    # for an association its class macros declare
+    # (lower::model_to_library::macro_associations), else nil.
+    def self._reflect_on_association(association)
+      ActiveRecord::RuntimeValidations.reflect_on_association(self, association)
+    end
+
+    # AutosaveAssociation#marked_for_destruction?. Nothing here marks a
+    # record (`mark_for_destruction` is not ported), so it is false
+    # unless something set the flag.
+    def marked_for_destruction?
+      @marked_for_destruction == true
+    end
+
+    # The accumulator (an Array of full messages, base.rb) answering
+    # ActiveModel::Errors#add, so `errors.add(:password, :blank)` and the
+    # validators' adds record an ActiveModel::Error's full message
+    # (RuntimeValidations::Errors).
+    def errors
+      errors = @errors
+      if errors.nil?
+        errors = []
+        @errors = errors
+      end
+      ActiveRecord::RuntimeValidations.accumulator(errors, self)
+    end
+  end
+
+  # The validate chain of ActiveModel::Validations (`define_callbacks
+  # :validate, scope: :name`, ActiveSupport::Callbacks) for a compiled
+  # model, the way runtime/spinel/cruby/active_record_callbacks.rb runs
+  # the other chains. Each class keeps what it registered at run time;
+  # a class's chain is its superclass chain from Base down, at each
+  # class its registrations in order and then the compiled `validate`
+  # where that class defines it (a subclass's compiled `validate` calls
+  # `super()` first, so it runs the compiled rules of its ancestors
+  # too). A registration names a method (`validate :check`), a block, or
+  # a validator (`validates_with`), with `if:`/`unless:` conditions
+  # (`on:` and `except_on:` become conditions on the validation
+  # context), called as ActiveSupport::Callbacks::CallTemplate calls
+  # them. `throw :abort` ends the run; the record is valid when no error
+  # was added.
+  #
+  # Differences, at the edges:
+  # - A class's compiled rules run after what the class registered at
+  #   run time, wherever its body declared them; Rails keeps declaration
+  #   order.
+  # - A registration on a class after a subclass exists still runs
+  #   before the subclass's own; Rails appends it to the end of the
+  #   subclass's chain.
+  # - `_validators` lists only the run-time validators, and a class
+  #   copies its superclass's when first asked rather than when defined.
+  # - A `validate` of kind `:after` or `:around` (`validate :after,
+  #   :check`) raises NotImplementedError.
+  # - On a tree without the ActiveModel ports (only the PostgreSQL CRuby
+  #   tree carries them) `validates`, `validates_with`, `errors.add`,
+  #   `human_attribute_name` and `model_name` raise NotImplementedError
+  #   naming the port; `validate` with a method or block works anywhere.
+  #
+  # Each parameter is bound once to an ascribed local, so the runtime
+  # inference probes follow the bodies (tests/inference_on_spinel_blog_
+  # runtime*.rs).
+  module RuntimeValidations
+    EMPTY = [].freeze
+
+    @generation = 0
+    @context_predicates = {}
+
+    # ActiveModel::Validations::ClassMethods#validate, and set_callback's
+    # normalize_callback_params.
+    def self.validate(klass, args, block)
+      klass = klass #: untyped
+      filters = args.dup #: Array[untyped]
+      block = block #: untyped
+      options = extract_options!(filters)
+      symbols = true
+      filters.each { |filter| symbols = false unless filter.is_a?(Symbol) }
+      if symbols
+        options.each_key do |key|
+          unless [:on, :if, :unless, :prepend, :except_on].include?(key)
+            raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: :on, :if, :unless, :prepend, :except_on. " \
+              "Perhaps you meant to call `validates` instead of `validate`?"
+          end
+        end
+      end
+      if options.key?(:on)
+        conditions = [context_predicate(options[:on])] #: Array[untyped]
+        given = Array(options[:if]) #: Array[untyped]
+        given.each { |condition| conditions << condition }
+        options = options.merge(if: conditions)
+      end
+      if options.key?(:except_on)
+        except_on = Array(options[:except_on]) #: Array[untyped]
+        conditions = [ExceptOnContext.new(except_on)] #: Array[untyped]
+        given = Array(options[:unless]) #: Array[untyped]
+        given.each { |condition| conditions << condition }
+        options = options.merge(except_on: except_on, unless: conditions)
+      end
+      if [:before, :after, :around].include?(filters.first)
+        kind = filters.shift
+        unless kind == :before
+          raise NotImplementedError, "#{klass.name}.validate(#{kind.inspect}, ...): only :before validate callbacks are ported"
+        end
+      end
+      filters.unshift(block) if block
+      if_conditions = conditionals(options[:if])
+      unless_conditions = conditionals(options[:unless])
+      prepend = options[:prepend] ? true : false
+      entries = [] #: Array[Entry]
+      filters.each do |filter|
+        if filter.is_a?(String)
+          raise ArgumentError, "Passing string to define a callback is not supported. See the `define_callbacks` documentation for more information"
+        end
+        entries << Entry.new(filter, if_conditions, unless_conditions, prepend)
+      end
+      # CallbackChain#prepend keeps the filters' order at the front.
+      entries.reverse! if prepend
+      own = registrations(klass)
+      entries.each { |entry| own << entry }
+      @generation += 1
+      nil
+    end
+
+    # ActiveModel::Validations::ClassMethods#validates and #validates!.
+    def self.validates(klass, attributes, strict)
+      klass = klass #: untyped
+      names = attributes.dup #: Array[untyped]
+      strict = strict #: bool
+      port!("ActiveModel::Validations", "validates")
+      given = extract_options!(names)
+      validations = {} #: Hash[Symbol, untyped]
+      defaults = {} #: Hash[Symbol, untyped]
+      given.each do |key, value|
+        if [:if, :unless, :on, :allow_blank, :allow_nil, :strict, :except_on].include?(key)
+          defaults[key] = value
+        else
+          validations[key] = value
+        end
+      end
+      defaults[:strict] = true if strict
+      raise ArgumentError, "You need to supply at least one attribute" if names.empty?
+      raise ArgumentError, "You need to supply at least one validation" if validations.empty?
+      defaults[:attributes] = names
+      inflector = ::ActiveSupport::Inflector #: untyped
+      validations.each do |key, options|
+        name = "#{inflector.camelize(key.to_s)}Validator"
+        begin
+          validator = validator_class(klass, name)
+        rescue NameError
+          raise ArgumentError, "Unknown validator: '#{name}'"
+        end
+        next unless options
+        klass.validates_with(validator, merge_validates_options(defaults, parse_validates_options(options)))
+      end
+      nil
+    end
+
+    # ActiveModel::Validations::ClassMethods#validates_with.
+    def self.validates_with(klass, args, block)
+      klass = klass #: untyped
+      classes = args.dup #: Array[untyped]
+      block = block #: untyped
+      port!("ActiveModel::Validations", "validates_with")
+      options = extract_options!(classes)
+      options[:class] = klass
+      validators = validators_of(klass)
+      classes.each do |validator_class|
+        validator = validator_class.new(options.dup, &block)
+        if validator.respond_to?(:attributes) && !validator.attributes.empty?
+          validator.attributes.each { |attribute| validators[attribute.to_sym] << validator }
+        else
+          validators[nil] << validator
+        end
+        klass.validate(validator, options)
+      end
+      nil
+    end
+
+    # ClassMethods#validates_each: a BlockValidator over the attributes.
+    def self.validates_each(klass, attr_names, block)
+      klass = klass #: untyped
+      names = attr_names.dup #: Array[untyped]
+      block = block #: untyped
+      port!("ActiveModel::Validations", "validates_each")
+      klass.validates_with(::ActiveModel::BlockValidator, merge_attributes(names), &block)
+    end
+
+    # A `validates_<kind>_of` helper: HelperMethods#_merge_attributes into
+    # validates_with, with the named validator of Active Record's
+    # Validations, else Active Model's.
+    def self.helper(klass, name, attr_names)
+      klass = klass #: untyped
+      name = name #: String
+      names = attr_names.dup #: Array[untyped]
+      port!("ActiveModel::Validations", "validates_with(#{name})")
+      validator = nil #: untyped
+      validator_namespaces.each do |namespace|
+        validator = namespace.const_get(name, false) if validator.nil? && namespace.const_defined?(name, false)
+      end
+      if validator.nil?
+        raise NotImplementedError, "roundhouse: #{klass.name}: #{name} is not ported on this tree " \
+          "(runtime/spinel/active_record_validations.rb)"
+      end
+      klass.validates_with(validator, merge_attributes(names))
+    end
+
+    # `const_get("#{key.camelize}Validator")` from the class, as Rails'
+    # `validates` resolves it: the class and its ancestors, then the
+    # Validations modules ActiveRecord::Base includes, then Object.
+    def self.validator_class(klass, name)
+      klass = klass #: untyped
+      name = name #: String
+      mods = klass.ancestors #: Array[untyped]
+      mods.each do |mod|
+        if mod.equal?(::Object)
+          validator_namespaces.each { |namespace| return namespace.const_get(name, false) if namespace.const_defined?(name, false) }
+          break
+        end
+        return mod.const_get(name, false) if mod.const_defined?(name, false)
+      end
+      klass.const_get(name)
+    end
+
+    def self.validator_namespaces
+      namespaces = [] #: Array[untyped]
+      active_record = ::ActiveRecord #: untyped
+      namespaces << ::ActiveRecord::Validations if active_record.const_defined?(:Validations, false)
+      namespaces << ::ActiveModel::Validations if defined?(::ActiveModel::Validations)
+      namespaces
+    end
+
+    # The class's `_validators`, created on first use from its
+    # superclass's.
+    def self.validators_of(klass)
+      klass = klass #: untyped
+      own = klass.instance_variable_get(:@__runtime_validators) #: Hash[untyped, Array[untyped]]?
+      return own if own
+      # Hash.new { |hash, key| hash[key] = [] }
+      fresh = {} #: Hash[untyped, Array[untyped]]
+      table = fresh #: untyped
+      validations = ActiveRecord::RuntimeValidations #: untyped
+      table.default_proc = validations.method(:new_list).to_proc
+      unless klass.equal?(ActiveRecord::Base)
+        validators_of(klass.superclass).each { |key, list| fresh[key] = list.dup }
+      end
+      klass.instance_variable_set(:@__runtime_validators, fresh)
+      fresh
+    end
+
+    def self.new_list(hash, key)
+      lists = hash #: Hash[untyped, Array[untyped]]
+      key = key #: untyped
+      lists[key] = []
+    end
+
+    # ClassMethods#validators: `_validators.values.flatten.uniq`.
+    def self.all_validators(klass)
+      found = [] #: Array[untyped]
+      validators_of(klass).each_value { |list| list.each { |validator| found << validator } }
+      found.uniq
+    end
+
+    # ClassMethods#validators_on.
+    def self.validators_on(klass, attributes)
+      names = attributes #: Array[untyped]
+      validators = validators_of(klass)
+      found = [] #: Array[untyped]
+      names.each { |attribute| validators[attribute.to_sym].each { |validator| found << validator } }
+      found
+    end
+
+    # The class's own registrations, in order.
+    def self.registrations(klass)
+      klass = klass #: untyped
+      own = klass.instance_variable_get(:@__runtime_validations) #: Array[Entry]?
+      return own if own
+      fresh = [] #: Array[Entry]
+      klass.instance_variable_set(:@__runtime_validations, fresh)
+      fresh
+    end
+
+    # The record's validate chain, run (Validations#run_validations!).
+    def self.run(record)
+      record = record #: untyped
+      chain = chain(record.class)
+      if chain.nil?
+        record.__send__(:validate)
+      else
+        kernel = ::Kernel #: untyped
+        kernel.catch(:abort) do
+          chain.each { |entry| entry.run(record) }
+        end
+      end
+      nil
+    end
+
+    # The chain for `klass`, rebuilt when a registration anywhere changed
+    # the chains; nil when nothing in its lineage registered at run time.
+    def self.chain(klass)
+      klass = klass #: untyped
+      return nil if @generation.zero?
+      hit = klass.instance_variable_get(:@__runtime_validation_chain) #: [Integer, Array[Entry | CompiledEntry]?]?
+      return hit[1] if hit && hit[0] == @generation
+      built = build(klass)
+      klass.instance_variable_set(:@__runtime_validation_chain, [@generation, built])
+      built
+    end
+
+    def self.build(klass)
+      klass = klass #: untyped
+      lineage = [] #: Array[untyped]
+      c = klass #: untyped
+      while c
+        lineage.unshift(c)
+        break if c.equal?(ActiveRecord::Base)
+        c = c.superclass
+      end
+      registered = false
+      lineage.each { |k| registered = true if k.instance_variable_get(:@__runtime_validations) }
+      return nil unless registered
+      owner = compiled_owner(klass)
+      # A `validate` a module Base includes defines, not base.rb's no-op.
+      included = owner.nil? && !klass.instance_method(:validate).owner.equal?(ActiveRecord::Base)
+      chain = [] #: Array[Entry | CompiledEntry]
+      lineage.each do |k|
+        chain << COMPILED if included && k.equal?(ActiveRecord::Base)
+        registrations(k).each { |entry| apply(chain, entry) } if k.instance_variable_get(:@__runtime_validations)
+        chain << COMPILED if owner.equal?(k)
+      end
+      chain.freeze
+    end
+
+    # CallbackChain#append_one / #prepend_one with remove_duplicates.
+    def self.apply(chain, entry)
+      chain = chain #: Array[Entry | CompiledEntry]
+      entry = entry #: Entry
+      chain.delete_if { |other| entry.duplicates?(other) }
+      entry.prepend? ? chain.unshift(entry) : chain.push(entry)
+      nil
+    end
+
+    # The class in `klass`'s superclass chain, below Base, that defines
+    # `validate` itself or through a module it includes.
+    def self.compiled_owner(klass)
+      c = klass #: untyped
+      until c.nil? || c.equal?(ActiveRecord::Base)
+        parent = c.superclass #: untyped
+        own = (parent ? c.ancestors - parent.ancestors : c.ancestors) #: Array[untyped]
+        return c if own.any? { |m| m.method_defined?(:validate, false) || m.private_method_defined?(:validate, false) }
+        c = parent
+      end
+      nil
+    end
+
+    # ActiveRecord::Translation#lookup_ancestors, over Inheritance's
+    # base_class?: Base, or a class right below Base or an abstract
+    # class, ends the walk.
+    def self.lookup_ancestors(klass)
+      c = klass #: untyped
+      classes = [c] #: Array[untyped]
+      return classes if c.equal?(ActiveRecord::Base)
+      parent = c.superclass #: untyped
+      until parent.equal?(ActiveRecord::Base) || parent.abstract_class?
+        classes << parent
+        parent = parent.superclass
+      end
+      classes
+    end
+
+    def self.human_attribute_name(klass, attribute, options)
+      klass = klass #: untyped
+      attribute = attribute #: untyped
+      options = options #: untyped
+      port!("ActiveModel::Translation", "human_attribute_name")
+      translation = ::ActiveModel::Translation #: untyped
+      translation.instance_method(:human_attribute_name).bind_call(klass, attribute, options)
+    end
+
+    def self.model_name(klass)
+      klass = klass #: untyped
+      port!("ActiveModel::Naming", "model_name")
+      naming = ::ActiveModel::Naming #: untyped
+      naming.instance_method(:model_name).bind_call(klass)
+    end
+
+    # Validations#read_attribute_for_validation.
+    def self.read_attribute(record, attribute)
+      record = record #: untyped
+      attribute = attribute #: untyped
+      record.respond_to?(attribute, true) ? record.send(attribute) : nil
+    end
+
+    def self.reflect_on_association(klass, association)
+      klass = klass #: untyped
+      association = association #: untyped
+      klass.respond_to?(:reflect_on_association) ? klass.reflect_on_association(association) : nil
+    end
+
+    # Array#extract_options!.
+    def self.extract_options!(args)
+      list = args #: Array[untyped]
+      last = list.last #: untyped
+      return {} unless last.is_a?(Hash)
+      hash = last #: untyped
+      extractable = hash.respond_to?(:extractable_options?) ? hash.extractable_options? : hash.instance_of?(Hash)
+      return {} unless extractable
+      options = list.pop #: Hash[Symbol, untyped]
+      options
+    end
+
+    # Callback#check_conditionals.
+    def self.conditionals(value)
+      value = value #: untyped
+      return EMPTY if value.nil? || value == false || (value.respond_to?(:empty?) && value.empty?)
+      list = Array(value) #: Array[untyped]
+      list.each do |c|
+        if c.is_a?(String)
+          raise ArgumentError, "Passing string to be evaluated in :if and :unless conditional options is not " \
+            "supported. Pass a symbol for an instance method, or a lambda, proc or block, instead."
+        end
+      end
+      list.freeze
+    end
+
+    # ClassMethods#predicate_for_validation_context, one per context
+    # list.
+    def self.context_predicate(context)
+      given = context #: untyped
+      contexts = (given.is_a?(Array) ? given.sort : Array(given)) #: Array[untyped]
+      predicates = @context_predicates
+      found = predicates[contexts] #: OnContext?
+      return found if found
+      predicate = OnContext.new(contexts)
+      predicates[contexts] = predicate
+      predicate
+    end
+
+    # HelperMethods#_merge_attributes.
+    def self.merge_attributes(attr_names)
+      given = attr_names #: Array[untyped]
+      names = given.flatten #: Array[untyped]
+      options = {} #: Hash[untyped, untyped]
+      extract_options!(names).each { |key, value| options[key.respond_to?(:to_sym) ? key.to_sym : key] = value }
+      options[:attributes] = names
+      options
+    end
+
+    # ClassMethods#_parse_validates_options.
+    def self.parse_validates_options(options)
+      options = options #: untyped
+      if options == true
+        {}
+      elsif options.is_a?(Hash)
+        options
+      elsif options.is_a?(Range) || options.is_a?(Array)
+        { in: options }
+      else
+        { with: options }
+      end
+    end
+
+    # ClassMethods#_merge_validates_options.
+    def self.merge_validates_options(defaults, validator_options)
+      merged = defaults.dup #: Hash[untyped, untyped]
+      given = validator_options #: Hash[untyped, untyped]
+      given.each do |key, value|
+        merged[key] = merged.key?(key) && (key == :if || key == :unless || key == :on) ? Array(merged[key]) + Array(value) : value
+      end
+      merged
+    end
+
+    def self.port!(port, what)
+      port = port #: String
+      what = what #: String
+      ported =
+        if port == "ActiveModel::Validations"
+          defined?(::ActiveModel::EachValidator) && defined?(::ActiveModel::Validations::ClassMethods)
+        elsif port == "ActiveModel::Naming"
+          defined?(::ActiveModel::Naming)
+        else
+          defined?(::ActiveModel::Translation)
+        end
+      return nil if ported
+      raise NotImplementedError, "roundhouse: ActiveRecord::Base #{what} at run time goes through #{port} " \
+        "(runtime/spinel/active_model_validations.rb), which this tree does not carry"
+    end
+
+    # The record's accumulator, extended once with Errors#add.
+    def self.accumulator(errors, record)
+      list = errors #: untyped
+      record = record #: untyped
+      if ActiveRecord::RuntimeValidations.plain_array?(list)
+        list.extend(ActiveRecord::RuntimeValidations::Errors)
+        list.instance_variable_set(:@__roundhouse_record, record)
+      end
+      list
+    end
+
+    def self.plain_array?(value)
+      value = value #: untyped
+      value.instance_of?(Array) && !value.is_a?(ActiveRecord::RuntimeValidations::Errors) && !value.frozen?
+    end
+
+    # ActiveModel::Errors#add over the accumulator: the Error Rails builds
+    # (the port's, which words its message through I18n), raised for
+    # `strict:`, else its full message pushed with its attribute, short
+    # message, type and options (ActiveModel::ErrorAttributes.add, where
+    # the tree carries it: a tree whose code reads no error detail pushes
+    # the message alone, as its compiled rules do). Answers the Error.
+    def self.add_error(errors, attribute, type, options)
+      list = errors #: untyped
+      attribute = attribute #: untyped
+      type = type #: untyped
+      options = options #: Hash[Symbol, untyped]
+      unless defined?(::ActiveModel::Error) && ::ActiveModel::Error.respond_to?(:generate_message)
+        raise NotImplementedError, "roundhouse: errors.add(#{attribute.inspect}, #{type.inspect}) builds an ActiveModel::Error " \
+          "(runtime/spinel/active_model_validations.rb), which this tree does not carry"
+      end
+      record = list.instance_variable_get(:@__roundhouse_record) #: untyped
+      type = type.call(record, options) if type.respond_to?(:call)
+      name = attribute.to_sym #: Symbol
+      error = ::ActiveModel::Error.new(record, name, type, **options) #: untyped
+      exception = options[:strict] #: untyped
+      if exception
+        exception = ::ActiveModel::StrictValidationFailed if exception == true
+        raise exception, error.full_message
+      end
+      full = error.full_message #: untyped
+      short = error.message #: untyped
+      prefix = short.is_a?(String) && full.is_a?(String) && full.end_with?(short) ? full[0, full.length - short.length] : nil
+      if defined?(::ActiveModel::ErrorAttributes)
+        error_attributes = ::ActiveModel::ErrorAttributes #: untyped
+        error_attributes.add(list, name, full, prefix, error.raw_type, error.options)
+      else
+        list << full
+      end
+      error
+    end
+
+    # What a compiled model's `errors` answers beyond the Array.
+    module Errors
+      def add(attribute, type = :invalid, **options)
+        ActiveRecord::RuntimeValidations.add_error(self, attribute, type, options)
+      end
+    end
+
+    # A validate callback (ActiveSupport::Callbacks::Callback) with its
+    # CallTemplate and conditionals.
+    class Entry
+      def initialize(filter, if_conditions, unless_conditions, prepend)
+        @filter = filter #: untyped
+        @if = if_conditions #: Array[untyped]
+        @unless = unless_conditions #: Array[untyped]
+        @prepend = prepend #: bool
+      end
+
+      def filter
+        @filter
+      end
+
+      def prepend?
+        @prepend
+      end
+
+      def compiled?
+        false
+      end
+
+      # Callback#duplicates?: a method name replaces its earlier entry.
+      def duplicates?(other)
+        other = other #: untyped
+        @filter.is_a?(Symbol) && !other.compiled? && other.filter == @filter
+      end
+
+      def run(record)
+        record = record #: untyped
+        @if.each { |c| return nil unless Entry.call(c, record) }
+        @unless.each { |c| return nil if Entry.call(c, record) }
+        Entry.call(@filter, record)
+        nil
+      end
+
+      # CallTemplate: a Symbol is sent to the record, a Proc
+      # instance_exec'd on it (an arity above 1 wants the block a
+      # validate callback does not have), anything else answers
+      # `validate(record)` (`scope: :name`).
+      def self.call(filter, record)
+        filter = filter #: untyped
+        record = record #: untyped
+        if filter.is_a?(Symbol)
+          record.send(filter)
+        elsif filter.is_a?(::Proc)
+          callable = filter #: untyped
+          arity = callable.arity #: Integer
+          raise ArgumentError if arity > 1
+          arity > 0 ? record.instance_exec(record, &filter) : record.instance_exec(&filter)
+        else
+          filter.public_send(:validate, record)
+        end
+      end
+    end
+
+    # The `on:` predicate (`->(model) { context.include?(model.
+    # validation_context) }`, any of an Array context) and `except_on:`'s
+    # (`intersect?`), as condition objects: CallTemplate calls an object
+    # condition's `validate(record)` (`scope: :name`).
+    class OnContext
+      def initialize(contexts)
+        @contexts = contexts #: Array[untyped]
+      end
+
+      def validate(record)
+        record = record #: untyped
+        current = record.validation_context #: untyped
+        return @contexts.include?(current) unless current.is_a?(Array)
+        list = current #: Array[untyped]
+        list.any? { |c| @contexts.include?(c) }
+      end
+    end
+
+    class ExceptOnContext
+      def initialize(contexts)
+        @contexts = contexts #: Array[untyped]
+      end
+
+      def validate(record)
+        record = record #: untyped
+        current = Array(record.validation_context) #: Array[untyped]
+        @contexts.intersect?(current)
+      end
+    end
+
+    # The compiled `validate`, as the chain runs it.
+    class CompiledEntry
+      def filter
+        nil
+      end
+
+      def prepend?
+        false
+      end
+
+      def compiled?
+        true
+      end
+
+      def duplicates?(_other)
+        false
+      end
+
+      def run(record)
+        record = record #: untyped
+        record.__send__(:validate)
+        nil
+      end
+    end
+
+    COMPILED = CompiledEntry.new
   end
 end
