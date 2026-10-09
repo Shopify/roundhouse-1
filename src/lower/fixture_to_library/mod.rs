@@ -991,13 +991,22 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
             );
             let mut args = vec![lit_str(set.table.as_str().to_string()), columns_hash, timestamps, rows];
             if set.rules == crate::lower::fixtures::FixtureRules::FasterFixtures {
+                // `model:` is the set's model class name, which
+                // FasterFixtures' `normalize_fixture_value` hook takes for
+                // an Integer in a uuid column.
                 args.push(Expr::new(
                     Span::synthetic(),
                     ExprNode::Hash {
-                        entries: vec![(
-                            crate::lower::typing::lit_sym(Symbol::from("faster_fixtures")),
-                            crate::lower::typing::lit_bool(true),
-                        )],
+                        entries: vec![
+                            (
+                                crate::lower::typing::lit_sym(Symbol::from("faster_fixtures")),
+                                crate::lower::typing::lit_bool(true),
+                            ),
+                            (
+                                crate::lower::typing::lit_sym(Symbol::from("model")),
+                                lit_str(set.class.0.as_str().trim_start_matches("::").to_string()),
+                            ),
+                        ],
                         kwargs: true,
                     },
                 ));
@@ -1061,13 +1070,25 @@ fn raw_value_expr(v: &crate::lower::fixtures::RawFixtureValue) -> Expr {
         V::Str(s) => lit_str(s.clone()),
         V::Structured(value) => yaml_value_expr(value),
         V::Ruby(expr) => expr.clone(),
-        V::RubyReference { value, uuid, integer_passes } => send(
-            Some(test_fixtures_const()),
-            "fixture_reference",
-            vec![
+        V::RubyReference { value, uuid, integer_passes, identifier } => {
+            let mut args = vec![
                 value.clone(),
                 lit_str(if *uuid { "uuid" } else { "integer" }.to_string()),
                 crate::lower::typing::lit_bool(*integer_passes),
+            ];
+            if let Some((model, column)) = identifier {
+                args.push(lit_str(model.0.as_str().trim_start_matches("::").to_string()));
+                args.push(lit_str(column.as_str().to_string()));
+            }
+            send(Some(test_fixtures_const()), "fixture_reference", args, Ty::Untyped)
+        }
+        V::Identifier { model, column, label } => send(
+            Some(test_fixtures_const()),
+            "fixture_identifier",
+            vec![
+                lit_str(model.0.as_str().trim_start_matches("::").to_string()),
+                lit_str(column.as_str().to_string()),
+                lit_str(label.clone()),
             ],
             Ty::Untyped,
         ),

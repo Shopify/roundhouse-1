@@ -495,7 +495,19 @@ pub enum RawFixtureValue {
     /// A reference whose label an ERB tag produces: the runtime turns it
     /// into the referenced row's id (`identify`, by the column's type).
     /// `integer_passes` is FasterFixtures' rule that an Integer is the id.
-    RubyReference { value: Expr, uuid: bool, integer_passes: bool },
+    /// `identifier` is the set's model and the column, for a uuid column
+    /// under FasterFixtures (`Identifier`).
+    RubyReference { value: Expr, uuid: bool, integer_passes: bool, identifier: Option<(ClassId, Symbol)> },
+    /// FasterFixtures' `fixture_identifier(label, :uuid, column,
+    /// model_class)` for a uuid column: the runtime's
+    /// `TestFixtures.fixture_identifier`, since the app's FixtureSet hooks
+    /// decide it when the set loads. Core's ModelUuidFixtureCompatibility
+    /// stores a model-uuid column's id as
+    /// `ModelUuidAsInteger.serialize(identify(label, :integer))`, which
+    /// only the model's runtime `model_uuid_attributes` (an allowlist and
+    /// boot configuration) decides; any other uuid column takes
+    /// `identify(label, :uuid)`.
+    Identifier { model: ClassId, column: Symbol, label: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -890,6 +902,19 @@ fn faster_fixtures_row(
 ) {
     let has_col = |name: &str| col_type(name).is_some();
     let is_uuid = |name: &str| col_type(name) == Some("uuid");
+    let model_class = fixture.class_id();
+    // `fixture_identifier(label, column_type, column, model_class)`.
+    let identifier = |label: &str, column: &str| -> RawFixtureValue {
+        if is_uuid(column) {
+            RawFixtureValue::Identifier {
+                model: model_class.clone(),
+                column: Symbol::from(column),
+                label: label.to_string(),
+            }
+        } else {
+            RawFixtureValue::Int(fixture_identify(label))
+        }
+    };
     let absent = |row: &IndexMap<Symbol, RawFixtureValue>, k: &str| {
         matches!(row.get(&Symbol::from(k)), None | Some(RawFixtureValue::Nil))
     };
@@ -906,7 +931,7 @@ fn faster_fixtures_row(
     match &pk_name {
         Some(pk) if has_col(pk.as_str()) => {
             if absent(row, pk.as_str()) {
-                row.insert(pk.clone(), identify_value(label.as_str(), is_uuid(pk.as_str())));
+                row.insert(pk.clone(), identifier(label.as_str(), pk.as_str()));
             }
         }
         _ if table_pk.len() > 1 => {
@@ -932,7 +957,7 @@ fn faster_fixtures_row(
         _ => {}
     }
     if pk_name.as_ref().map(|p| p.as_str()) != Some("id") && has_col("id") && !row.contains_key(&Symbol::from("id")) {
-        row.insert(Symbol::from("id"), identify_value(label.as_str(), is_uuid("id")));
+        row.insert(Symbol::from("id"), identifier(label.as_str(), "id"));
     }
 
     // table_rows: a key that names no column is a reference — through the
@@ -965,14 +990,17 @@ fn faster_fixtures_row(
             RawFixtureValue::Str(s) => {
                 if let Some((target, class)) = polymorphic_fixture_value(&s) {
                     row.insert(Symbol::from(fk_type.as_str()), RawFixtureValue::Str(class));
-                    identify_value(&target, uuid)
+                    identifier(&target, &fk_id)
                 } else {
-                    identify_value(&s, uuid)
+                    identifier(&s, &fk_id)
                 }
             }
-            RawFixtureValue::Ruby(expr) => {
-                RawFixtureValue::RubyReference { value: expr, uuid, integer_passes: true }
-            }
+            RawFixtureValue::Ruby(expr) => RawFixtureValue::RubyReference {
+                value: expr,
+                uuid,
+                integer_passes: true,
+                identifier: uuid.then(|| (model_class.clone(), Symbol::from(fk_id.as_str()))),
+            },
             other => {
                 let text = match &other {
                     RawFixtureValue::Bool(b) => b.to_string(),
@@ -980,7 +1008,7 @@ fn faster_fixtures_row(
                     RawFixtureValue::Structured(v) => serde_json::to_string(v).unwrap_or_default(),
                     _ => String::new(),
                 };
-                identify_value(&text, uuid)
+                identifier(&text, &fk_id)
             }
         };
         row.insert(Symbol::from(fk_id.as_str()), resolved);
@@ -1067,7 +1095,7 @@ fn rails_row(
             }
             RawFixtureValue::Int(i) => identify_value(&i.to_string(), uuid),
             RawFixtureValue::Ruby(expr) => {
-                RawFixtureValue::RubyReference { value: expr, uuid, integer_passes: false }
+                RawFixtureValue::RubyReference { value: expr, uuid, integer_passes: false, identifier: None }
             }
             other => {
                 let text = match &other {

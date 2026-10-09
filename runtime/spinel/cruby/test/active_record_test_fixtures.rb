@@ -84,6 +84,10 @@ module ActiveRecord
     # ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid::ACCEPTABLE_UUID.
     FIXTURE_ACCEPTABLE_UUID = %r{\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z}
 
+    # The column a FixtureSet hook reads: ActiveRecord::ConnectionAdapters::Column's
+    # `name` and `type`.
+    FixtureColumn = Struct.new(:name, :type)
+
     # FasterFixtures' POLYMORPHIC_VALUE.
     FIXTURE_POLYMORPHIC_VALUE = /^(\S+)\s*\(([^\)]*)\)\s*$/
 
@@ -183,15 +187,47 @@ module ActiveRecord
       end
 
       # A reference an ERB tag names: the referenced row's id. Under
-      # FasterFixtures an Integer is the id itself.
-      def fixture_reference(value, column_type, integer_passes)
+      # FasterFixtures an Integer is the id itself, and a label in a uuid
+      # column is the set's `fixture_identifier` (`class_name`, `column`).
+      def fixture_reference(value, column_type, integer_passes, class_name = nil, column = nil)
         return nil if value.nil? || value == false
         return value if integer_passes && value.is_a?(Integer)
         text = value.to_s
         if integer_passes && (md = text.match(/^(\S+)\s*\(([^\)]*)\)\s*$/))
           text = md[1]
         end
+        return fixture_identifier(class_name, column, text) if class_name && column_type.to_s == "uuid"
         identify(text, column_type)
+      end
+
+      # FasterFixtures::FixtureSet#fixture_identifier(label, :uuid, column,
+      # model_class) for a uuid column (faster_fixtures.rb: the key a row
+      # omits, and each reference). Core prepends
+      # ModelUuidFixtureCompatibility onto FixtureSet
+      # (components/platform/essentials/lib/platform/testing/model_uuid_fixture_compatibility.rb):
+      # a model-uuid column (`model_class.model_uuid_attribute?(column)`)
+      # takes `type_for_attribute(column).serialize(identify(label,
+      # :integer))`, the integer id in the uuid's low 64 bits; any other
+      # takes `identify(label, :uuid)`. That serialize is the app's
+      # `normalize_fixture_value` of the same integer, so the set's
+      # normalize hook answers both: an id it converts is the column's.
+      def fixture_identifier(class_name, column, label)
+        integer = identify(label)
+        normalized = normalize_fixture_value(class_name, column, integer)
+        normalized == integer ? identify(label, "uuid") : normalized
+      end
+
+      # FasterFixtures::FixtureSet#normalize_fixture_value(value, column,
+      # model_class) for an Integer in a uuid column (table_rows, which
+      # Core's ModelUuidFixtureCompatibility overrides). The hook is the
+      # app's FixtureSet's own private method, run on an allocated set (it
+      # reads no state): FasterFixtures' answers the value unchanged.
+      # Without the app's FixtureSet loaded, nothing overrides it.
+      def normalize_fixture_value(class_name, column, value)
+        return value unless value.is_a?(Integer) && class_name
+        hooks = fixture_set_hooks
+        return value unless hooks
+        hooks.send(:normalize_fixture_value, value, FixtureColumn.new(column.to_s, :uuid), fixture_model_class(class_name))
       end
 
       # One set's rows, as Rails' insert_fixtures_set writes them
@@ -209,7 +245,11 @@ module ActiveRecord
       # is cast by its database type, and under FasterFixtures
       # (`faster_fixtures:`) a key whose `<key>_id` is a live column is
       # the reference `FixtureSet#table_rows` resolves.
-      def insert_fixture_rows(table, columns, timestamps, rows, faster_fixtures: false)
+      #
+      # Under FasterFixtures `model` is the set's model class name: an
+      # Integer in a uuid column then goes through the set's
+      # `normalize_fixture_value` (table_rows).
+      def insert_fixture_rows(table, columns, timestamps, rows, faster_fixtures: false, model: nil)
         return nil if rows.empty?
         now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
         live = nil
@@ -219,7 +259,7 @@ module ActiveRecord
           unknown = row.keys - columns.keys
           unless unknown.empty?
             live ||= fixture_live_columns(table)
-            unknown = resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+            unknown = resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures, model)
           end
           unless unknown.empty?
             raise FixtureError, %(table "#{table}" has no columns named #{unknown.map(&:inspect).join(", ")}.)
@@ -229,6 +269,13 @@ module ActiveRecord
         if live
           extra = rows.flat_map(&:keys).uniq - columns.keys
           columns = columns.merge(extra.to_h { |name| [name, live.fetch(name)] }) unless extra.empty?
+        end
+        if faster_fixtures && model
+          rows.each do |row|
+            row.each do |name, value|
+              row[name] = normalize_fixture_value(model, name, value) if value.is_a?(Integer) && columns[name] == "uuid"
+            end
+          end
         end
         names = columns.keys
         names = names.select { |name| rows.first.key?(name) } if rows.size == 1
@@ -246,6 +293,31 @@ module ActiveRecord
       end
 
       private
+        # A reference's id by the live column's type: a uuid one is the
+        # set's `fixture_identifier`.
+        def live_fixture_identifier(model, column, label, column_type)
+          return fixture_identifier(model, column, label) if model && column_type == "uuid"
+          identify(label, column_type)
+        end
+
+        # The app's FasterFixtures::FixtureSet, allocated to call its
+        # private hooks, once it is loaded (its file can load after the
+        # first set does).
+        def fixture_set_hooks
+          return @fixture_set_hooks if @fixture_set_hooks
+          return nil unless defined?(::FasterFixtures::FixtureSet) && ::FasterFixtures::FixtureSet.is_a?(Class)
+          return nil unless ::FasterFixtures::FixtureSet.private_method_defined?(:normalize_fixture_value) ||
+            ::FasterFixtures::FixtureSet.method_defined?(:normalize_fixture_value)
+          @fixture_set_hooks = ::FasterFixtures::FixtureSet.allocate
+        end
+
+        # `@class_name.safe_constantize`.
+        def fixture_model_class(class_name)
+          Object.const_get(class_name)
+        rescue NameError
+          nil
+        end
+
         # The table's columns in the database, column => cast type, as
         # `schema_cache.columns_hash` types them (a type this loader has no
         # cast for keeps its PostgreSQL name and is quoted as text).
@@ -273,7 +345,7 @@ module ActiveRecord
         # or false drops it, an Integer is the id, `label (Class)` also sets
         # `<key>_type`, any other label is identified by the column's type).
         # Answers the keys still unknown.
-        def resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+        def resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures, model = nil)
           unknown.reject do |key|
             next true if live.key?(key)
             next false unless faster_fixtures
@@ -290,9 +362,9 @@ module ActiveRecord
                 fk_type = "#{key}_type"
                 raise FixtureError, %(table "#{table}" has no column #{fk_type.inspect} for #{key}: #{value.inspect}) unless live.key?(fk_type)
                 row[fk_type] = md[2]
-                identify(md[1], live.fetch(fk_id))
+                live_fixture_identifier(model, fk_id, md[1], live.fetch(fk_id))
               else
-                identify(value, live.fetch(fk_id))
+                live_fixture_identifier(model, fk_id, value, live.fetch(fk_id))
               end
             true
           end
@@ -608,7 +680,34 @@ module ActiveRecord
       end
     end
 
-    def self.included(base)
+    # Rails' TestFixtures is an ActiveSupport::Concern, and this is its
+    # Concern#append_features: included into another concern (Core's
+    # ActiveRecordTestHelper::Fixtures) it is that concern's dependency,
+    # included into each class the concern is included into, ahead of the
+    # concern; a base that already has it is left alone; else its
+    # `included` block runs. A concern the compiler lowered to a plain
+    # module has no dependency list, so the module carries the same rule.
+    def self.append_features(base)
+      if base.instance_variable_defined?(:@_dependencies)
+        base.instance_variable_get(:@_dependencies) << self
+        return false
+      end
+      return false if base < self
+      super
+      if base.is_a?(Class)
+        fixtures_included(base)
+      else
+        fixtures = self
+        base.singleton_class.prepend(Module.new do
+          define_method(:append_features) do |klass|
+            klass.include(fixtures) if klass.is_a?(Class) && !(klass < fixtures)
+            super(klass)
+          end
+        end)
+      end
+    end
+
+    private_class_method def self.fixtures_included(base)
       base.class_eval do
         class_attribute :fixture_paths, instance_writer: false, default: [FIXTURE_PATH]
         class_attribute :fixture_table_names, default: TestFixtures.fixture_set_rows.keys.sort
