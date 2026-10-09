@@ -316,7 +316,7 @@ fn declares_tests(c: &ruby_prism::ClassNode<'_>) -> bool {
 
 /// `test "…" …` (a receiverless `test` call with arguments) or a
 /// receiverless `def test_…`, whether or not ingest models its form.
-fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
+pub(super) fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
     if let Some(def) = stmt.as_def_node() {
         return def.receiver().is_none() && def.name().as_slice().starts_with(b"test_");
     }
@@ -335,7 +335,7 @@ fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
 /// test; a `test` there, or in the body of a method there (a macro that
 /// declares tests where it is called), is (`test_unroll::declare_hidden`
 /// names either).
-fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
+pub(super) fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     use ruby_prism::Visit;
     struct Find {
         found: Option<usize>,
@@ -406,7 +406,7 @@ fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
     }
 }
 
-fn ingest_test_class(
+pub(super) fn ingest_test_class(
     (scope, class): &ScopedClass<'_>,
     top_level_helper_nodes: &[ScopedClass<'_>],
     file: &str,
@@ -1126,7 +1126,7 @@ fn collect_top_level_classes<'pr>(
     }
 }
 
-type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
+pub(super) type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
 
 /// A class that only nests (`class Deliverable` whose body is nothing
 /// but class and module declarations), is not test-shaped itself, and
@@ -1190,6 +1190,34 @@ fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
     false
 }
 
+/// The tests `stmt`, a class-body statement other than a literal `test`
+/// or `def test_…`, declares as the class loads, as `ingest_test_class`
+/// declares them: an unrolled literal loop's (also as a constant's value,
+/// `CASES = [...].each do`), in order; none for any other statement. The
+/// gaps of a statement that is not modeled are not recorded again
+/// (`ingest_test_class` named it). For `test_mixin`, which walks an
+/// includer's body again to place its own tests among the shared ones.
+pub(super) fn statement_tests<'pr>(
+    stmt: &Node<'pr>,
+    class_node: &ruby_prism::ClassNode<'pr>,
+    class: &ClassId,
+    file: &str,
+    tags: &TestTags,
+    consts: &TagConstants<'pr>,
+) -> IngestResult<Vec<Test>> {
+    let declare = |target: &Node<'pr>| match hidden_test_declaration(target) {
+        Some(offset) => super::survey::without_recording(|| {
+            test_unroll::declare_hidden(target, offset, class_node, class, file, tags, consts)
+        }),
+        None => Ok(Vec::new()),
+    };
+    match stmt.as_constant_write_node() {
+        Some(cw) if super::library_class::is_sorbet_type_alias(&cw.value()) => Ok(Vec::new()),
+        Some(cw) => declare(&cw.value()),
+        None => declare(stmt),
+    }
+}
+
 /// Add a test the class body declares as it loads, by a `def`
 /// (`is_def`) or by ActiveSupport's `test` (a literal statement, or one
 /// iteration of an unrolled loop), at `at`. A later `def` replaces an
@@ -1248,7 +1276,7 @@ fn declare_test(
 /// Recognize `setup do ... end` (Call with method=setup, block body)
 /// and `def setup; ...; end` (DefNode named setup). Returns the body
 /// expression in either case. Other shapes return Ok(None).
-fn ingest_setup_declaration(
+pub(super) fn ingest_setup_declaration(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Expr>> {
@@ -1291,7 +1319,7 @@ fn ingest_setup_declaration(
 /// (`teardown :close_files`, a block argument) is refused by name: it
 /// would otherwise fall to the unrecognized-statement drop below and
 /// its cleanup would silently never run.
-fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
+pub(super) fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
     if call.receiver().is_some() || constant_id_str(&call.name()) != "teardown" {
         return Ok(None);
@@ -1316,14 +1344,14 @@ fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Exp
 /// `persistent` is set once a blockless `tag(...)` installed its
 /// `runnable_methods` hook.
 #[derive(Clone, Debug, Default)]
-struct TestTags {
-    tags: Vec<(String, String)>,
-    persistent: bool,
+pub(super) struct TestTags {
+    pub(super) tags: Vec<(String, String)>,
+    pub(super) persistent: bool,
 }
 
 /// `Hash#merge!`: a key already present keeps its place and takes the
 /// new value.
-fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
+pub(super) fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
     for (key, pair) in more {
         match into.iter_mut().find(|(k, _)| k == key) {
             Some(entry) => entry.1 = pair.clone(),
@@ -1334,7 +1362,7 @@ fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
 
 /// `TestTags.generate_name_with_tags`: `name`, then `_tag:<k>:<v>` for
 /// each tag joined by `_`.
-fn name_with_tags(name: &str, tags: &[(String, String)]) -> String {
+pub(super) fn name_with_tags(name: &str, tags: &[(String, String)]) -> String {
     if tags.is_empty() {
         return name.to_string();
     }
@@ -1452,10 +1480,10 @@ fn literal_tags(node: &Node<'_>, file: &str) -> IngestResult<Option<(Vec<(String
 /// (`SLOW = { slow: true }.freeze`): a `tag(SLOW)` or `test "x", SLOW`
 /// after it names that Hash, since Ruby's lexical lookup finds the
 /// class's own constant first.
-struct TagConstants<'pr>(Vec<(Vec<u8>, usize, Option<Node<'pr>>)>);
+pub(super) struct TagConstants<'pr>(Vec<(Vec<u8>, usize, Option<Node<'pr>>)>);
 
 impl<'pr> TagConstants<'pr> {
-    fn of(stmts: &[Node<'pr>]) -> Self {
+    pub(super) fn of(stmts: &[Node<'pr>]) -> Self {
         let mut consts = Vec::new();
         for stmt in stmts {
             let Some(cw) = stmt.as_constant_write_node() else { continue };
@@ -1510,7 +1538,7 @@ fn source_excerpt(node: &Node<'_>) -> String {
 /// body assigns one to above it (`consts`); any other `tag` is refused
 /// by name, since its tags would be in the names of the tests after it.
 #[allow(clippy::type_complexity)]
-fn tag_declaration<'pr>(
+pub(super) fn tag_declaration<'pr>(
     stmt: &Node<'pr>,
     file: &str,
     consts: &TagConstants<'pr>,
@@ -1570,7 +1598,7 @@ fn tag_declaration<'pr>(
 /// A class-body statement, or where a `tag(...) do … end` block begins
 /// and ends: TestTags#tag merges its tags for the statements in the
 /// block and restores the previous ones after it.
-enum BodyItem<'pr> {
+pub(super) enum BodyItem<'pr> {
     Stmt(Node<'pr>),
     TagsBegin(Vec<(String, String)>),
     TagsEnd,
@@ -1578,7 +1606,7 @@ enum BodyItem<'pr> {
 
 /// The class body's statements in order, each `tag … do` block's
 /// statements spliced in between its begin and end.
-fn class_body_items<'pr>(
+pub(super) fn class_body_items<'pr>(
     stmts: Vec<Node<'pr>>,
     file: &str,
     consts: &TagConstants<'pr>,
@@ -1619,7 +1647,7 @@ fn class_body_items<'pr>(
 /// name is computed or whose tags or block are not modeled: the class
 /// body loop names that statement as a gap (`test_unroll::
 /// declare_hidden`), or unrolls the loop that declares it.
-fn ingest_test_declaration<'pr>(
+pub(super) fn ingest_test_declaration<'pr>(
     stmt: &Node<'pr>,
     file: &str,
     tags: &TestTags,

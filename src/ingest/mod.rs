@@ -89,6 +89,7 @@ pub mod sql_functions;
 pub mod structure_sql;
 pub mod survey;
 pub mod test;
+mod test_mixin;
 pub mod util;
 pub mod view;
 mod view_helper_includes;
