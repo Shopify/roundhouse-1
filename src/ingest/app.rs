@@ -2235,6 +2235,22 @@ end
     .map(PathBuf::from)
     .collect();
     let extra_test_paths = additional_test_paths.clone();
+    // The test load path: Rails' `test` and, for a test path inside a
+    // component (`components/apps/test/support/helpers`), that
+    // component's `test`, where Core's `require "support/helpers/…"`
+    // features resolve.
+    let test_load_roots: Vec<PathBuf> = {
+        let mut roots: Vec<PathBuf> = vec![dir.join("test")];
+        for path in &additional_test_paths {
+            let parts: Vec<&std::ffi::OsStr> = path.iter().collect();
+            if let Some(at) = parts.iter().rposition(|p| *p == "test") {
+                roots.push(dir.join(parts[..=at].iter().collect::<PathBuf>()));
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+    };
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();
@@ -2296,11 +2312,16 @@ end
     // every file is read (they sort after or before their includers).
     let mut test_mixins = super::test_mixin::TestMixins::default();
     let mut loaded: Vec<(PathBuf, TestModule)> = Vec::new();
+    // The files that declare no test class (`carry_test_support_files`).
+    let mut classless: Vec<PathBuf> = Vec::new();
     for entry in test_files {
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         if let Some(tms) =
             unwrap_or_record(ingest_test_files(&source, &entry.display().to_string()))?
         {
+            if tms.is_empty() {
+                classless.push(entry.clone());
+            }
             for mut tm in tms {
                 tm.source_file = Some(entry.strip_prefix(dir).unwrap_or(&entry).display().to_string());
                 loaded.push((entry.clone(), tm));
@@ -2309,6 +2330,19 @@ end
         test_mixins.scan(&source, &entry.display().to_string());
     }
     test_mixins.finish();
+    let test_class_nestings = test_mixins.class_nestings();
+    let test_class_extends = test_mixins.class_extends();
+    carry_test_support_files(
+        &mut app,
+        vfs,
+        &classless,
+        &test_load_roots,
+        &test_mixins,
+        &[&support_seen, &required_seen],
+        &model_bases,
+        &enum_constants,
+        &mut concern_enums,
+    )?;
     let have: crate::det::HashSet<String> = loaded.iter().map(|(_, tm)| tm.name.0.to_string()).collect();
     for (file, class) in test_mixins.unreached_includers(&|name| have.contains(name)) {
         let entry = PathBuf::from(&file);
@@ -2688,6 +2722,7 @@ end
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
     qualify_relative_includes(&mut app);
+    qualify_test_includes(&mut app, &test_class_nestings);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -2725,6 +2760,7 @@ end
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     splice_deferred_mixes_in_extends(&mut app, &concern_class_method_spans);
+    carry_test_class_extends(&mut app, &test_class_extends)?;
     // Before the macro expansions: a macro's generated body may read the
     // accessor (`session_accessor_prefix`), and a collision check reads
     // the includer's methods.
@@ -3457,6 +3493,134 @@ fn carry_support_file(
         None => {
             support_classes.push(names);
             app.library_classes.extend(classes);
+        }
+    }
+}
+
+/// Test-path files that declare no test class and no shared test module:
+/// Core's `components/*/test/support/helpers/**` (`module Apps::TestHelper`,
+/// `module GeoIpHelper` with its `class MockGeoIPLocation`), which a test
+/// file `require`s from the test load path and then includes or calls.
+/// Each is a library file, carried as the support walk carries one (its
+/// modules and classes, its file program, a Concern's `included do`), so
+/// the emitted tests that name its constants load it. A file a walk
+/// already carried (a support root's, or a `require_relative` target
+/// carried inline) is not carried twice. What the library route refuses
+/// is refused by name there (`drop_library_file`); an ActiveRecord model
+/// under a test path is refused here.
+#[allow(clippy::too_many_arguments)]
+fn carry_test_support_files<V: Vfs + ?Sized>(
+    app: &mut App,
+    vfs: &V,
+    classless: &[PathBuf],
+    load_roots: &[PathBuf],
+    test_mixins: &super::test_mixin::TestMixins,
+    carried: &[&crate::det::HashSet<PathBuf>],
+    model_bases: &super::library_class::ModelBases,
+    enum_constants: &super::model::EnumConstants,
+    concern_enums: &mut Vec<(crate::ident::ClassId, Vec<ConcernEnumDecl>)>,
+) -> IngestResult<()> {
+    let already: crate::det::HashSet<String> = app.library_class_files.iter().map(|(source, _)| source.clone()).collect();
+    // Not files the boot loads: a test-support file is on the test load
+    // path only, loaded by the tests that require it.
+    let mut not_at_boot: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
+    let mut carried_classes: Vec<(PathBuf, Vec<crate::ident::ClassId>)> = Vec::new();
+    for entry in classless {
+        let path_str = entry.display().to_string();
+        if test_mixins.declares_shared_tests(&path_str)
+            || carried.iter().any(|set| set.contains(entry))
+            || already.contains(&path_str)
+        {
+            continue;
+        }
+        let Some(source) = read_or_ledger(vfs, entry)? else { continue };
+        if super::library_class::has_active_record_base(&source, model_bases) {
+            unwrap_or_record::<()>(Err(IngestError::Unsupported {
+                file: path_str.clone(),
+                message: "test-support file not carried: it declares an ActiveRecord model, \
+                          and a model under a test path is not ingested as one"
+                    .to_string(),
+            }))?;
+            continue;
+        }
+        let (ingested, deferred) = super::inherited_alias::capturing(|| {
+            super::library_class::ingest_app_library_classes(&source, &path_str)
+        });
+        if ingested.is_ok() {
+            let (concern_items, concern_enum_decls) =
+                ingest_concern_model_items_with_constants(&source, &path_str, enum_constants);
+            app.concern_model_items.extend(concern_items);
+            app.concern_prepended_items
+                .extend(ingest_concern_prepended_items(&source, &path_str, enum_constants));
+            concern_enums.extend(concern_enum_decls);
+        }
+        match ingested {
+            // Every support file is in by now, so an `alias` of a method
+            // the file does not define is decided here.
+            Ok(classes) if !deferred.is_empty() => {
+                let verdict = super::inherited_alias::decide(&app.library_classes, &[(classes.clone(), deferred.clone())]);
+                if verdict.first().copied().unwrap_or(false) {
+                    carry_support_file(app, entry, &source, classes, &mut not_at_boot, &mut carried_classes, None);
+                } else {
+                    let err = super::inherited_alias::refusal(&path_str);
+                    let site = deferred[0];
+                    super::error_site::note(&err, site.start as usize, site.end as usize);
+                    drop_library_file(app, &path_str, &err);
+                }
+            }
+            Ok(classes) => carry_support_file(app, entry, &source, classes, &mut not_at_boot, &mut carried_classes, None),
+            Err(err) => drop_library_file(app, &path_str, &err),
+        }
+        if let Some(program) = app.file_programs.last_mut().filter(|p| p.source == path_str) {
+            resolve_test_load_path_requires(vfs, entry, load_roots, &mut program.items);
+        }
+    }
+    app.library_class_files.extend(
+        carried_classes
+            .into_iter()
+            .filter(|(_, names)| !names.is_empty())
+            .map(|(entry, names)| (entry.display().to_string(), names)),
+    );
+    Ok(())
+}
+
+/// A test-support file's `require "support/helpers/x"`: the feature, on
+/// the test load path (`load_roots`), is one file of the app's, required
+/// relative to `from` so the emit resolves it to that file's program or
+/// declarations (`ProgramItem::Require`, which looks a plain feature up
+/// under `lib/` only). A feature no root has, or more than one has
+/// (whose winner is the load path's order), stays as written.
+fn resolve_test_load_path_requires<V: Vfs + ?Sized>(
+    vfs: &V,
+    from: &Path,
+    load_roots: &[PathBuf],
+    items: &mut [crate::app::ProgramItem],
+) {
+    use crate::app::ProgramItem;
+    let Some(base) = from.parent() else { return };
+    for item in items {
+        match item {
+            ProgramItem::Require { feature, relative: relative @ false, .. } => {
+                let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                let hits: Vec<PathBuf> = load_roots.iter().map(|root| root.join(&rb)).filter(|p| vfs.exists(p)).collect();
+                let [hit] = hits.as_slice() else { continue };
+                let (from_parts, to_parts): (Vec<_>, Vec<_>) = (base.components().collect(), hit.components().collect());
+                let common = from_parts.iter().zip(&to_parts).take_while(|(a, b)| a == b).count();
+                let mut path = PathBuf::new();
+                for _ in common..from_parts.len() {
+                    path.push("..");
+                }
+                for part in &to_parts[common..] {
+                    path.push(part.as_os_str());
+                }
+                *feature = path.with_extension("").display().to_string();
+                *relative = true;
+            }
+            ProgramItem::Branch { then_items, else_items, .. } => {
+                resolve_test_load_path_requires(vfs, from, load_roots, then_items);
+                resolve_test_load_path_requires(vfs, from, load_roots, else_items);
+            }
+            _ => {}
         }
     }
 }
@@ -4286,6 +4450,9 @@ fn splice_concern_class_methods_into_includers(
     for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
         direct.entry(lc.name.clone()).or_insert_with(|| (lc.parent.clone(), lc.includes.clone()));
     }
+    for tm in &app.test_modules {
+        direct.entry(tm.name.clone()).or_insert_with(|| (tm.parent.clone(), tm.includes.clone()));
+    }
     let inherited = |name: &ClassId| -> HashSet<ClassId> {
         let mut out: HashSet<ClassId> = HashSet::default();
         let mut visited: HashSet<ClassId> = HashSet::default();
@@ -4430,6 +4597,26 @@ fn splice_concern_class_methods_into_includers(
         }
         if !carried.is_empty() {
             carrier_splices.insert(lc.name.clone(), carried);
+        }
+    }
+    // A test class including a Concern (a test-support helper module,
+    // `carry_test_support_files`) is extended as a library class is: a
+    // `class_methods do` def becomes its own class method, and the
+    // Concern's nested `module ClassMethods` reaches it through the
+    // `extend` the emit writes with its includes, as `append_features`
+    // runs it.
+    for tm in &mut app.test_modules {
+        let taken = tm.helpers.iter()
+            .filter(|m| m.receiver == MethodReceiver::Class)
+            .map(|m| m.name.clone())
+            .collect();
+        let (added, provenance, carried) = copies(tm.includes.clone(), taken, inherited(&tm.name));
+        tm.helpers.extend(added);
+        if !provenance.is_empty() {
+            spliced.insert(tm.name.clone(), provenance);
+        }
+        if !carried.is_empty() {
+            carrier_splices.insert(tm.name.clone(), carried);
         }
     }
     app.concern_spliced_class_methods = spliced;
@@ -6452,6 +6639,114 @@ fn qualify_relative_includes(app: &mut App) {
                 }
             }
             *inc = crate::ident::ClassId(crate::ident::Symbol::from(target.as_str()));
+        }
+    }
+}
+
+/// A test class's class-body `extend M` (the test-class ingest carries
+/// its includes, not its extends): when `M` resolves, from the class's
+/// lexical scopes outward (`TestMixins::class_extends`), to a module the
+/// app declares (a test-support helper's `module ClassMethods`), the
+/// emit writes the `extend` with the class's includes, as a carrier
+/// extend (`App::class_methods_carrier_splices`, with no copies). A
+/// sorbet `T::` helper is a no-op at run time, as for a library class.
+/// Any other is refused by name: its methods would be missing from the
+/// class's singleton.
+fn carry_test_class_extends(
+    app: &mut App,
+    extends: &[(String, String, Vec<(Vec<String>, usize)>)],
+) -> IngestResult<()> {
+    use crate::ident::{ClassId, Symbol};
+    let modules: crate::det::HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.is_module)
+        .map(|lc| lc.name.0.as_str().to_string())
+        .collect();
+    let test_classes: crate::det::HashSet<&str> = app.test_modules.iter().map(|tm| tm.name.0.as_str()).collect();
+    let mut carried: Vec<(ClassId, ClassId)> = Vec::new();
+    for (class, file, calls) in extends {
+        if !test_classes.contains(class.as_str()) {
+            continue;
+        }
+        for (candidates, at) in calls {
+            let written = candidates.last().cloned().unwrap_or_default();
+            if let Some(found) = candidates.iter().find(|c| modules.contains(c.as_str())) {
+                carried.push((ClassId(Symbol::from(class.as_str())), ClassId(Symbol::from(found.as_str()))));
+                continue;
+            }
+            if written == "T" || written.starts_with("T::") {
+                continue;
+            }
+            let err = IngestError::Unsupported {
+                file: file.clone(),
+                message: format!(
+                    "test class `{class}` extends `{written}`, which is not a module the tree carries; \
+                     the extend is not carried"
+                ),
+            };
+            super::error_site::note(&err, *at, *at);
+            unwrap_or_record::<()>(Err(err))?;
+        }
+    }
+    // A carrier the concern splice already copied for typing (a plain
+    // module's `ClassMethods`, which its includer may or may not be
+    // extended with) is now extended: the class body says so.
+    for (class, module) in carried {
+        let splices = app.class_methods_carrier_splices.entry(class).or_default();
+        match splices.iter_mut().find(|splice| splice.carrier == module) {
+            Some(splice) => splice.extend = true,
+            None => splices.push(crate::app::ClassMethodsCarrierSplice { carrier: module, methods: Vec::new(), extend: true }),
+        }
+    }
+    Ok(())
+}
+
+/// A test class's includes, resolved as Ruby resolves the constant in
+/// its body: through the class's lexical scopes (`Module.nesting`,
+/// innermost first, as the test file wrote them), then at the top level.
+/// The helper modules a test includes are library modules
+/// (`carry_test_support_files`): `include TestHelper` in `module Foo;
+/// class BarTest` is `Foo::TestHelper` when that is declared, and in
+/// `class Admin::OrderRisksControllerTest` (whose only scope is the class)
+/// `include TouchHelper` is the top-level `TouchHelper`. One no scope
+/// declares stays as written. A rooted `::A` is the top-level `A`; its
+/// root is kept where a scope declares an `A` of its own.
+fn qualify_test_includes(app: &mut App, nestings: &crate::det::HashMap<String, Vec<String>>) {
+    use crate::ident::{ClassId, Symbol};
+    let known: crate::det::HashSet<String> = app
+        .library_classes
+        .iter()
+        .map(|lc| lc.name.0.as_str().to_string())
+        .chain(app.concern_model_items.keys().map(|id| id.0.as_str().to_string()))
+        .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
+        .collect();
+    // Every declared constant path and each namespace above one.
+    let namespaces: crate::det::HashSet<&str> = known
+        .iter()
+        .flat_map(|name| name.match_indices("::").map(move |(at, _)| &name[..at]).chain(std::iter::once(name.as_str())))
+        .collect();
+    for tm in &mut app.test_modules {
+        let owner = tm.name.0.as_str().to_string();
+        // A class the scan did not record (no includes there) is read
+        // as nested in each namespace its name has.
+        let nesting: Vec<String> = nestings.get(&owner).cloned().unwrap_or_else(|| {
+            let parts: Vec<&str> = owner.split("::").collect();
+            (1..=parts.len()).rev().map(|depth| parts[..depth].join("::")).collect()
+        });
+        for inc in &mut tm.includes {
+            let written = inc.0.as_str();
+            if let Some(top) = written.strip_prefix("::") {
+                let first = top.split("::").next().unwrap_or(top);
+                let shadowed = nesting.iter().any(|scope| namespaces.contains(format!("{scope}::{first}").as_str()));
+                if !shadowed {
+                    *inc = ClassId(Symbol::from(top));
+                }
+                continue;
+            }
+            if let Some(found) = nesting.iter().map(|scope| format!("{scope}::{written}")).find(|c| known.contains(c)) {
+                *inc = ClassId(Symbol::from(found.as_str()));
+            }
         }
     }
 }
