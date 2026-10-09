@@ -520,6 +520,90 @@ fn contains_assign(e: &Expr) -> bool {
     found
 }
 
+/// A statement sequence, one statement per line. `value_used` is false
+/// for a sequence that is itself a statement of an enclosing one (it
+/// renders flat into that list), so its last statement is in void
+/// context too.
+///
+/// A statement that is not the sequence's value and has no effect — it
+/// renders as a bare `nil`, or it is a local, ivar or `self` read or a
+/// scalar literal ([`is_effect_free`]) — is not written. Lowerings leave
+/// a `nil` where they dropped or replaced a statement: an inert
+/// `config.cache_classes = false` the environment program consumed, a
+/// `class` hoisted out of a test block, a `require` the emitted loader
+/// answers, or survey mode's placeholder for a construct ingest could
+/// not take (recorded in the punch list). They leave a read where a
+/// grounded call became its receiver (`h.symbolize_keys!` on a
+/// symbol-keyed `h`) or an inlined block's value is not used (`_rec`
+/// after a lowered `find_or_create_by`). The diagnostic, if any, belongs
+/// to the dropped statement and is reported where it was made; a refused
+/// statement that carries its diagnostic renders as its `raise` and
+/// stays. Written out, `ruby -w` reports "possibly useless use of nil
+/// (a variable, …) in void context", and Core's strict_warnings.rb
+/// raises on that warning when the file loads. The sequence's own value
+/// is kept, a tail `nil` included.
+fn emit_seq(exprs: &[Expr], value_used: bool) -> String {
+    let mut out = String::new();
+    let last = exprs.len().saturating_sub(1);
+    let mut first = true;
+    // A dropped statement's blank line still separates what it sat
+    // between.
+    let mut pending_blank = false;
+    for (i, e) in exprs.iter().enumerate() {
+        let void = i < last || !value_used;
+        // A self binding whose value nothing reads only informs
+        // the typer: a `#: self as T` comment never runs, and a
+        // `T.bind` keeps just its value, `self`, as `T.cast` does.
+        if void && crate::expr::is_self_binding(e) {
+            continue;
+        }
+        let text = match &*e.node {
+            _ if void && is_effect_free(e) => String::new(),
+            ExprNode::Seq { exprs: inner } if void && is_plain_statement(e) => emit_seq(inner, false),
+            _ => emit_expr(e),
+        };
+        if void && (text == "nil" || text.is_empty()) {
+            pending_blank |= e.leading_blank_line;
+            continue;
+        }
+        if !first {
+            out.push('\n');
+            if e.leading_blank_line || pending_blank {
+                out.push('\n');
+            }
+            // Not before the first: a value-site Seq renders as
+            // `(a\nb)`, and the marker must start its line. The
+            // enclosing statement's or def's marker covers it.
+            if let Some(m) = super::source_markers::marker_for(&e.span) {
+                out.push_str(&m);
+                out.push('\n');
+            }
+        }
+        first = false;
+        pending_blank = false;
+        out.push_str(&text);
+    }
+    out
+}
+
+/// `e` renders as its node alone: `emit_expr` adds nothing around it
+/// (no stub for a diagnostic, no decision- or hint-driven rewrite).
+fn is_plain_statement(e: &Expr) -> bool {
+    e.diagnostic.is_none() && e.decisions == 0 && e.hint.is_none()
+}
+
+/// Evaluating `e` does nothing: a local, ivar or `self` read, or a
+/// scalar literal, written as itself. A bare name that is not a local
+/// is a method call (`Send`), so a `Var` is always a bound local.
+fn is_effect_free(e: &Expr) -> bool {
+    is_plain_statement(e)
+        && match &*e.node {
+            ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
+            ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
+            _ => false,
+        }
+}
+
 fn emit_node(n: &ExprNode) -> String {
     match n {
         ExprNode::Lit { value } => emit_literal(value),
@@ -652,35 +736,7 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::MatchRequired { value, pattern } => {
             format!("(({}) => {})", emit_expr(value), emit_match_pattern(pattern))
         }
-        ExprNode::Seq { exprs } => {
-            let mut out = String::new();
-            let last = exprs.len().saturating_sub(1);
-            let mut first = true;
-            for (i, e) in exprs.iter().enumerate() {
-                // A self binding whose value nothing reads only informs
-                // the typer: a `#: self as T` comment never runs, and a
-                // `T.bind` keeps just its value, `self`, as `T.cast` does.
-                if i < last && crate::expr::is_self_binding(e) {
-                    continue;
-                }
-                if !first {
-                    out.push('\n');
-                    if e.leading_blank_line {
-                        out.push('\n');
-                    }
-                    // Not before the first: a value-site Seq renders as
-                    // `(a\nb)`, and the marker must start its line. The
-                    // enclosing statement's or def's marker covers it.
-                    if let Some(m) = super::source_markers::marker_for(&e.span) {
-                        out.push_str(&m);
-                        out.push('\n');
-                    }
-                }
-                first = false;
-                out.push_str(&emit_expr(e));
-            }
-            out
-        }
+        ExprNode::Seq { exprs } => emit_seq(exprs, true),
         ExprNode::Assign { target, value } => {
             // Multi-stmt Seq as RHS (mattr/cattr block defaults) must
             // group so the assign value is the last expression — bare
@@ -1133,6 +1189,11 @@ fn emit_bool_op_operand(
             return format!("({s})");
         }
         ExprNode::Seq { exprs } if exprs.len() > 1 => {
+            return format!("({s})");
+        }
+        // `..`/`...` bind looser than `&&`/`||`: `r || a..b` is
+        // `(r || a)..b`.
+        ExprNode::Range { .. } => {
             return format!("({s})");
         }
         // A CONDITIONAL AS AN OPERAND, same argument one construct over.
@@ -1760,6 +1821,12 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
+        // A range binds looser than every infix operator and `||`/`&&`:
+        // Core's `search_ranges << (start...limit)` written bare is
+        // `(search_ranges << start)...limit`, which pushes the Integer
+        // (and `ruby -w` flags the range as void), and `(a..b) == r` bare
+        // is `a..(b == r)`.
+        ExprNode::Range { .. } => Some(".."),
         _ => None,
     }
 }
@@ -1781,6 +1848,7 @@ fn binop_prec(op: &str) -> u8 {
         // and the `and`/`or` word forms are the loosest of all.
         "&&" => 26,
         "||" => 25,
+        ".." => 22,
         "=" => 15,
         "and" => 11,
         "or" => 10,
