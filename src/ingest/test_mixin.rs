@@ -918,7 +918,9 @@ impl TestMixins {
     /// authorization(ProductInput, :vendor, …)`, whose `ClassMethods`
     /// body runs `generate_test`) declares tests ingest does not see: a
     /// named gap, so they are not lost without a word. Strict ingest fails.
-    pub(super) fn refuse_test_macro_calls(&self, tm: &TestModule, source: &[u8], file: &str) -> IngestResult<()> {
+    /// The statement is not carried to run in the emitted class either
+    /// (`TestModule::body_statements`): the macro it calls is not there.
+    pub(super) fn refuse_test_macro_calls(&self, tm: &mut TestModule, source: &[u8], file: &str) -> IngestResult<()> {
         let macros = self.included_test_macros(tm);
         if macros.is_empty() {
             return Ok(());
@@ -941,6 +943,8 @@ impl TestMixins {
             if super::test::macro_call_expanded(file, stmt.location().start_offset()) {
                 continue;
             }
+            let start = stmt.location().start_offset() as u32;
+            tm.body_statements.retain(|carried| carried.expr.span.start != start);
             let line = super::sources::line_at(file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
             super::survey::continue_or_fail(IngestError::Unsupported {
                 file: file.into(),
@@ -3983,12 +3987,15 @@ end
             mixins.scan(source.as_bytes(), file);
         }
         mixins.finish();
-        let tms = crate::ingest::test::ingest_test_files(class.as_bytes(), "input_test.rb").unwrap();
+        let mut tms = crate::ingest::test::ingest_test_files(class.as_bytes(), "input_test.rb").unwrap();
         assert!(mixins.gives_test_macros(&tms[0]));
-        let err = mixins.refuse_test_macro_calls(&tms[0], class.as_bytes(), "input_test.rb").unwrap_err().to_string();
+        assert_eq!(tms[0].body_statements.len(), 3, "{:#?}", tms[0].body_statements);
+        let err = mixins.refuse_test_macro_calls(&mut tms[0], class.as_bytes(), "input_test.rb").unwrap_err().to_string();
         assert!(err.contains("tests declared by a class method an included module gives the class are not modeled") && err.contains("`test_field` of `AuthHelper`"), "{err}");
         crate::ingest::survey::activate();
-        mixins.refuse_test_macro_calls(&tms[0], class.as_bytes(), "input_test.rb").unwrap();
+        mixins.refuse_test_macro_calls(&mut tms[0], class.as_bytes(), "input_test.rb").unwrap();
+        // `label(:x)` still runs; the macro calls are named, not run.
+        assert_eq!(tms[0].body_statements.len(), 1, "{:#?}", tms[0].body_statements);
         let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
         assert_eq!(gaps.len(), 2, "{gaps:#?}");
         assert!(gaps[1].contains("`test_fields` of `AuthHelper`"), "{}", gaps[1]);

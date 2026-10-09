@@ -1488,6 +1488,23 @@ pub fn emit_with_assertions(
                 &fixture_siblings,
             );
             emitted.content = require_declarations_through_programs(&emitted.content, &test_rb_path, &declaration_programs);
+            // The class body's other statements (`use_gcs`, `let(:x) { … }`),
+            // as written and in source order: those above every definition
+            // after the class's mixins, the others at the end of the class.
+            if !module.body_statements.is_empty() {
+                if minitest {
+                    emitted.content = splice_test_body_statements(&emitted.content, &module.body_statements, &test_rb_path);
+                } else {
+                    for statement in &module.body_statements {
+                        crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                            statement.expr.span,
+                            None,
+                            "test_class_body_statement",
+                            format!("`{class_name}`'s class-body statement runs only in the Minitest (CRuby) test emit; it will not run"),
+                        ));
+                    }
+                }
+            }
             // Class-body constant assignments (`TABLE = [...]`) go back
             // INSIDE the class, at the top of its body — the source's
             // own scope. They used to hoist to file scope so bare-name
@@ -1586,6 +1603,9 @@ pub fn emit_with_assertions(
             }
             for (_, value) in &lowered.constants {
                 library::walk_const_paths(value, &mut paths);
+            }
+            for statement in &module.body_statements {
+                library::walk_const_paths(&statement.expr, &mut paths);
             }
             for path in &paths {
                 let path: Vec<&str> =
@@ -2027,6 +2047,87 @@ fn strip_require_headers(content: &str) -> String {
 /// has its header indented under the module, so the match is on the
 /// trimmed line and the block takes the header's indentation. `block`'s
 /// lines arrive at two spaces — the body indent of a top-level class.
+/// Write a test class's carried class-body statements
+/// (`TestModule::body_statements`) into its emitted class: the ones above
+/// every definition right after the class's mixin lines (its `include`s
+/// and `extend`s, which the library emit writes first), the others just
+/// before its `end`, each group in source order. Before the first one
+/// below a `setup do` (`teardown do`) block, the class tells the runner
+/// so (`RoundhouseTestCallbacks.after_compiled_blocks`).
+fn splice_test_body_statements(content: &str, statements: &[crate::dialect::TestBodyStatement], rb_path: &std::path::Path) -> String {
+    let (mut setup_marked, mut teardown_marked) = (false, false);
+    let mut render = |group: &[&crate::dialect::TestBodyStatement]| -> String {
+        let mut out = String::new();
+        for statement in group {
+            for (below, marked, chain) in [
+                (statement.after_setup_blocks, &mut setup_marked, "setup"),
+                (statement.after_teardown_blocks, &mut teardown_marked, "teardown"),
+            ] {
+                if below && !*marked {
+                    writeln!(out, "RoundhouseTestCallbacks.after_compiled_blocks(self, :{chain})").unwrap();
+                    *marked = true;
+                }
+            }
+            out.push_str(&expr::with_emitted_file(rb_path, || expr::emit_expr(&statement.expr)));
+            out.push('\n');
+        }
+        out
+    };
+    let head: Vec<_> = statements.iter().filter(|s| !s.after_definitions).collect();
+    let tail: Vec<_> = statements.iter().filter(|s| s.after_definitions).collect();
+    let head = render(&head);
+    let tail = render(&tail);
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let Some(header) = lines.iter().position(|l| l.trim_start().starts_with("class ")) else {
+        debug_assert!(false, "no class header to splice body statements into:\n{content}");
+        return content.to_string();
+    };
+    let indent = &lines[header][..lines[header].len() - lines[header].trim_start().len()];
+    let body_indent = format!("{indent}  ");
+    let end = lines[header + 1..]
+        .iter()
+        .position(|l| l.trim_end_matches(['\n', '\r']) == format!("{indent}end"))
+        .map(|at| header + 1 + at)
+        .unwrap_or(lines.len());
+    // The mixin lines below the header, and the comments and blank
+    // lines among them.
+    let mut after_mixins = header + 1;
+    for (at, line) in lines.iter().enumerate().take(end).skip(header + 1) {
+        let trimmed = line.trim();
+        if ["include ", "extend ", "prepend "].iter().any(|m| trimmed.starts_with(m)) {
+            after_mixins = at + 1;
+        } else if !(trimmed.is_empty() || trimmed.starts_with('#')) {
+            break;
+        }
+    }
+    let indented = |block: &str| -> String {
+        let mut out = String::new();
+        for line in block.split_inclusive('\n') {
+            if !line.trim().is_empty() {
+                out.push_str(&body_indent);
+            }
+            out.push_str(line);
+        }
+        out
+    };
+    let mut out = String::with_capacity(content.len() + head.len() + tail.len());
+    for (at, line) in lines.iter().enumerate() {
+        if at == after_mixins && !head.is_empty() {
+            out.push_str(&indented(&head));
+            out.push('\n');
+        }
+        if at == end && !tail.is_empty() {
+            out.push('\n');
+            out.push_str(&indented(&tail));
+        }
+        out.push_str(line);
+    }
+    if end == lines.len() && !tail.is_empty() {
+        out.push_str(&indented(&tail));
+    }
+    out
+}
+
 fn splice_after_class_header(content: &str, block: &str) -> String {
     let mut out = String::with_capacity(content.len() + block.len());
     let mut done = false;

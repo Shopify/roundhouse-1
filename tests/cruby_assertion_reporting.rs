@@ -396,6 +396,100 @@ end
     assert_eq!(rows[0]["assertions"], 3, "{:#?}", rows[0]);
 }
 
+/// A test class body's macro calls run in the class as it loads (Core's
+/// `use_gcs`, from a Concern's ClassMethods, registers its setup with
+/// `prepend: true` and a teardown); a statement below the tests
+/// (`attr_reader`) runs too. They used to be dropped.
+const USE_PROBE_HELPER: &str = r#"
+module UseProbeHelper
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    def use_probe
+      setup(:setup_probe, prepend: true)
+      teardown(:reset_probe)
+    end
+
+    def use_second
+      setup :second
+    end
+  end
+
+  def setup_probe
+    @trace = "probe"
+  end
+
+  def second
+    @trace = @trace + " second"
+  end
+
+  def reset_probe
+    assert_equal "probe second block test", @trace
+  end
+end
+"#;
+
+#[test]
+fn test_class_body_macros_run_as_the_class_loads() {
+    let rows = compare_with(r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  include UseProbeHelper
+  use_probe
+  self.use_second
+
+  setup do
+    @trace = @trace + " block"
+  end
+
+  def test_probe
+    assert_equal "probe second block", @trace
+    @trace = @trace + " test"
+  end
+
+  attr_reader :trace
+
+  def test_tail
+    assert_equal "probe second block", trace
+    @trace = @trace + " test"
+  end
+end
+"#, Some(("lib/use_probe_helper.rb", USE_PROBE_HELPER)));
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["status"] == "pass" && row["assertions"] == 2), "{rows:#?}");
+}
+
+/// A setup callback registered below the class's compiled `setup do`
+/// block would run before it here: the test names that, not run it out of
+/// order.
+#[test]
+fn a_setup_registered_below_a_setup_block_is_refused_by_name() {
+    let source = r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  include UseProbeHelper
+  setup do
+    @trace = "block"
+  end
+  use_second
+  def test_order
+    assert_equal "block second", @trace
+  end
+end
+"#;
+    let native = native_rows_with(source, USE_PROBE_HELPER);
+    assert_eq!(native[0]["status"], "pass", "{native:#?}");
+    let (emitted, errors) = app(source).write("lib/use_probe_helper.rb", USE_PROBE_HELPER).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let results = emitted.join("results.jsonl");
+    let output = ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), "test/models/assertion_contract_test.rb"])
+        .current_dir(&emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &results)
+        .env("BLOG_DB", ":memory:")
+        .output().expect("emitted CRuby");
+    let text = std::fs::read_to_string(&results).expect("results");
+    assert!(text.contains("\"error\"") && text.contains("compiled `setup do` blocks"), "{text}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
 /// Rails' test base classes exist before the app's files reopen them:
 /// `ActiveSupport::TestCase` is the emitted `TestBase`, and a
 /// `class ActionController::TestCase` reopening keeps it a TestBase, with

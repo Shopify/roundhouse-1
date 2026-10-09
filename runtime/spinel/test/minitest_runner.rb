@@ -901,11 +901,24 @@ TestBase.include(RoundhouseMinitestLifecycleHooks)
 # it takes an argument), a method name, or an object answering
 # `before_setup(test)` / `after_teardown(test)`. `if:` and `unless:` take
 # the same. Other options, `around` and string filters are refused.
+#
+# A class's statements below its `setup do`/`teardown do` blocks follow
+# `after_compiled_blocks`: natively a callback they register runs after
+# those blocks' (setup) or before them (teardown). The blocks here are
+# compiled methods the runner calls after the chain (setup) or before it
+# (teardown), so such a callback (not `prepend: true`) is refused by name
+# when its test runs rather than run out of order.
 module RoundhouseTestCallbacks
   @registered = 0
 
   def self.next_registration
     @registered += 1
+  end
+
+  def self.after_compiled_blocks(klass, chain)
+    blocks = klass.instance_variable_defined?(:@__roundhouse_after_compiled_blocks) ? klass.instance_variable_get(:@__roundhouse_after_compiled_blocks) : klass.instance_variable_set(:@__roundhouse_after_compiled_blocks, [])
+    blocks << chain
+    nil
   end
 
   module ClassMethods
@@ -933,7 +946,9 @@ module RoundhouseTestCallbacks
     filters.each do |filter|
       raise ArgumentError, "Passing string to define a callback is not supported. See the `.set_callback` documentation to see supported values." if filter.is_a?(String)
       entry = {chain: chain, filter: filter, if: Array(options[:if]), unless: Array(options[:unless]),
-               prepend: options[:prepend] ? true : false, order: next_registration}
+               prepend: options[:prepend] ? true : false, order: next_registration,
+               after_compiled_blocks: klass.instance_variable_defined?(:@__roundhouse_after_compiled_blocks) && klass.instance_variable_get(:@__roundhouse_after_compiled_blocks).include?(chain)}
+      entry[:owner] = klass
       (klass.instance_variable_defined?(:@__roundhouse_test_callbacks) ? klass.instance_variable_get(:@__roundhouse_test_callbacks) : klass.instance_variable_set(:@__roundhouse_test_callbacks, [])) << entry
     end
     nil
@@ -955,9 +970,18 @@ module RoundhouseTestCallbacks
     entries.sort_by { |entry| entry.fetch(:prepend) ? [0, -entry.fetch(:order)] : [1, entry.fetch(:order)] }
   end
 
+  def self.refuse_misordered(entries, chain)
+    entry = entries.find { |e| e.fetch(:after_compiled_blocks, false) && !e.fetch(:prepend) }
+    return unless entry
+    raise NotImplementedError, "roundhouse: #{entry.fetch(:owner).name}.#{chain} #{entry.fetch(:filter).inspect}, registered below the class's " \
+      "compiled `#{chain} do` blocks, would run #{chain == :setup ? 'before' : 'after'} them here: that order is not ported"
+  end
+
   def self.run_setup(test)
+    entries = callbacks(test.class, :setup)
+    refuse_misordered(entries, :setup)
     catch(:abort) do
-      callbacks(test.class, :setup).each do |entry|
+      entries.each do |entry|
         call(test, entry.fetch(:filter), "before_setup") if applies?(test, entry)
       end
     end
@@ -965,7 +989,9 @@ module RoundhouseTestCallbacks
   end
 
   def self.run_teardown(test)
-    callbacks(test.class, :teardown).reverse_each do |entry|
+    entries = callbacks(test.class, :teardown)
+    refuse_misordered(entries, :teardown)
+    entries.reverse_each do |entry|
       call(test, entry.fetch(:filter), "after_teardown") if applies?(test, entry)
     end
     nil

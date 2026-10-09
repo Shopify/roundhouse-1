@@ -529,6 +529,13 @@ pub(super) fn ingest_test_class(
     // `test` declared it: a subclass's `test` of one of these raises
     // (`refuse_inherited_test_redefinitions`).
     let mut defined_tests: Vec<(String, bool)> = Vec::new();
+    // The class body's other statements, run as written in source order
+    // (`carried_body_statement`), and where each stands: below a
+    // definition, below a `setup do` or `teardown do` block.
+    let mut body_statements: Vec<crate::dialect::TestBodyStatement> = Vec::new();
+    let mut after_definitions = false;
+    let mut after_setup_blocks = false;
+    let mut after_teardown_blocks = false;
     if let Some(class_body) = class.body() {
         let stmts = flatten_statements(class_body);
         let consts = TagConstants::of(&stmts);
@@ -558,10 +565,12 @@ pub(super) fn ingest_test_class(
             if let Some(test) = ingest_test_declaration(&stmt, file, &test_tags, &consts)? {
                 let is_def = stmt.as_def_node().is_some();
                 declare_test(&mut tests, &mut defined_tests, test, is_def, &name, file, &stmt.location())?;
+                after_definitions = true;
                 continue;
             }
             if let Some(body) = ingest_teardown_block(&stmt, file)? {
                 teardowns.push(body);
+                after_teardown_blocks = true;
                 continue;
             }
             if let Some(body) = ingest_setup_declaration(&stmt, file)? {
@@ -571,8 +580,10 @@ pub(super) fn ingest_test_class(
                     let method = ingest_library_method(&def, &name, file)?;
                     helpers.retain(|m| m.name.as_str() != "setup");
                     helpers.push(method);
+                    after_definitions = true;
                     continue;
                 }
+                after_setup_blocks = true;
                 // Multiple setup hooks compose in source order — append
                 // by wrapping in a Seq. Rare in practice; first wins
                 // when stored as Option, so accumulate.
@@ -611,6 +622,7 @@ pub(super) fn ingest_test_class(
             if let Some(inner) = stmt.as_class_node() {
                 // A nested test class is a module of its own
                 // (`push_with_nested_test_classes`).
+                after_definitions = true;
                 if is_nested_test_class_node(&inner) {
                     continue;
                 }
@@ -618,6 +630,7 @@ pub(super) fn ingest_test_class(
                 continue;
             }
             if stmt.as_module_node().is_some() {
+                after_definitions = true;
                 inner_classes.extend(carried_classes(&stmt, &name_path, file)?);
                 continue;
             }
@@ -643,6 +656,7 @@ pub(super) fn ingest_test_class(
                 }
                 let m = ingest_library_method(&def, &name, file)?;
                 helpers.push(m);
+                after_definitions = true;
                 continue;
             }
             // `include ModName` at class-body scope. Captured for
@@ -757,6 +771,7 @@ pub(super) fn ingest_test_class(
                 for test in declared {
                     declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
                 }
+                after_definitions = true;
                 continue;
             }
             // Its other methods are the class's (`def self.m`).
@@ -766,12 +781,33 @@ pub(super) fn ingest_test_class(
                     m.receiver = crate::dialect::MethodReceiver::Class;
                     helpers.push(m);
                 }
+                after_definitions = true;
                 continue;
             }
             if let Some(offset) = hidden_test_declaration(&stmt) {
                 for test in test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &consts)? {
                     declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
                 }
+                after_definitions = true;
+                continue;
+            }
+            // `class << self` of nothing but methods: the class's.
+            if let Some(defs) = singleton_methods(&stmt) {
+                for def in defs {
+                    let mut m = ingest_library_method(&def, &name, file)?;
+                    m.receiver = crate::dialect::MethodReceiver::Class;
+                    helpers.push(m);
+                }
+                after_definitions = true;
+                continue;
+            }
+            if let Some(expr) = carried_body_statement(&stmt, &name, file)? {
+                body_statements.push(crate::dialect::TestBodyStatement {
+                    expr,
+                    after_definitions,
+                    after_setup_blocks,
+                    after_teardown_blocks,
+                });
             }
         }
     }
@@ -875,7 +911,58 @@ pub(super) fn ingest_test_class(
         includes,
         source_file: None,
         defined_tests,
+        body_statements,
     })
+}
+
+/// The methods of a `class << self` that holds nothing else.
+fn singleton_methods<'pr>(stmt: &Node<'pr>) -> Option<Vec<ruby_prism::DefNode<'pr>>> {
+    let singleton = stmt.as_singleton_class_node()?;
+    singleton.expression().as_self_node()?;
+    let items = singleton.body().map(flatten_statements).unwrap_or_default();
+    items.iter().map(|item| item.as_def_node()).collect()
+}
+
+/// A test class-body statement no case above models, which Ruby runs in
+/// the class as the body loads: a class macro (`use_gcs`, whose
+/// `setup(:setup_gcs, prepend: true)` registers the callback the
+/// runtime's `RoundhouseTestCallbacks` runs), `let(:x) { … }`, a class
+/// attribute write, `extend`. It runs as written in the emitted class
+/// (`TestModule::body_statements`). One the expression ingest does not
+/// model is named, not dropped.
+///
+/// A bare `private`/`protected`/`public`/`module_function` is not one:
+/// it sets the visibility of the `def`s below it in the source, which
+/// the emitted class defines elsewhere.
+fn carried_body_statement(stmt: &Node<'_>, class: &ClassId, file: &str) -> IngestResult<Option<Expr>> {
+    if let Some(call) = stmt.as_call_node() {
+        if call.receiver().is_none()
+            && call.arguments().is_none()
+            && call.block().is_none()
+            && matches!(constant_id_str(&call.name()), "private" | "protected" | "public" | "module_function")
+        {
+            return Ok(None);
+        }
+    }
+    match ingest_expr(stmt, file) {
+        Ok(expr) => Ok(Some(expr)),
+        Err(err) => {
+            let why = match &err {
+                IngestError::Unsupported { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            super::survey::continue_or_fail(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "test class-body statement `{}` of `{}`{} is not carried; it will not run: {why}",
+                    source_excerpt(stmt),
+                    class.0,
+                    line_suffix(file, &stmt.location())
+                ),
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 /// Classes the test helper reopens (no superclass: `class
@@ -1985,6 +2072,50 @@ class RoomMessagesViaStockTurboChannelTest < ActionCable::Channel::TestCase
   end
 end
 "#;
+
+    /// Class-body macro calls are carried in source order, each placed
+    /// by what is above it; a bare `private` and a `class << self` of
+    /// methods are not statements to carry.
+    #[test]
+    fn class_body_statements_are_carried_in_order() {
+        let src = r#"
+class GcsUserTest < ActiveSupport::TestCase
+  use_active_record_fixtures
+  use_gcs
+  self.allow_setup_mutations = true
+  setup do
+    @x = 1
+  end
+  let(:shop) { shops(:snowdevil) }
+  test "a" do
+    assert true
+  end
+  class << self
+    def helper_macro; end
+  end
+  private
+  attr_reader :x
+end
+"#;
+        let tm = ingest_test_file(src.as_bytes(), "gcs_user_test.rb").expect("ingest").expect("test class");
+        let carried: Vec<(String, bool, bool)> = tm
+            .body_statements
+            .iter()
+            .map(|s| {
+                let text = crate::emit::ruby::expr::emit_expr(&s.expr);
+                (text.lines().next().unwrap_or_default().to_string(), s.after_definitions, s.after_setup_blocks)
+            })
+            .collect();
+        let names: Vec<&str> = carried.iter().map(|(t, ..)| t.as_str()).collect();
+        assert_eq!(names.len(), 5, "{carried:#?}");
+        assert!(names[0].contains("use_active_record_fixtures") && names[1].contains("use_gcs"), "{carried:#?}");
+        assert!(names[2].contains("allow_setup_mutations = true") && names[3].contains("let(:shop)"), "{carried:#?}");
+        assert!(names[4].contains("attr_reader"), "{carried:#?}");
+        let flags: Vec<(bool, bool)> = carried.iter().map(|(_, d, s)| (*d, *s)).collect();
+        assert_eq!(flags, [(false, false), (false, false), (false, false), (false, true), (true, true)]);
+        assert!(tm.helpers.iter().any(|m| m.name.as_str() == "helper_macro"
+            && matches!(m.receiver, crate::dialect::MethodReceiver::Class)));
+    }
 
     #[test]
     fn every_test_class_in_a_file_is_its_own_module() {

@@ -2452,7 +2452,7 @@ end
     for (entry, mut tm) in loaded {
         if test_mixins.gives_test_macros(&tm) {
             if let Some(source) = read_or_ledger(vfs, &entry)? {
-                test_mixins.refuse_test_macro_calls(&tm, &source, &entry.display().to_string())?;
+                test_mixins.refuse_test_macro_calls(&mut tm, &source, &entry.display().to_string())?;
             }
         }
         if !splice_test_mixins(vfs, &test_mixins, &entry, &mut tm)? {
