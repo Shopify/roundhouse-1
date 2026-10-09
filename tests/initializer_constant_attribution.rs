@@ -35,28 +35,44 @@ fn reads_of_a_constant_an_initializer_assigns_are_coverage_notes() {
         std::fs::write(file, source).unwrap();
     }
 
+    // 010-stats.rb's plain `STATS = Object.new` runs as an initializer
+    // program, so the read resolves: no unsupported line at all.
     let out = check_continue(&root);
-    let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no `{needle}` line:\n{out}"));
+    assert!(!out.contains("constant not supported (all targets): STATS"), "STATS is ingested from 010-stats.rb:\n{out}");
+    assert_rest(&out);
 
-    let stats = line("constant not supported (all targets): STATS");
+    // Written rooted in both files, it has no home in the ingested tree
+    // yet, and its reads are coverage notes naming both initializers.
+    std::fs::write(root.join("config/initializers/010-stats.rb"), "::STATS = Object.new\n").unwrap();
+    let out = check_continue(&root);
+    let stats = line(&out, "constant not supported (all targets): STATS");
     assert!(stats.contains("note[unsupported]"), "{stats}");
     assert!(stats.contains("assigned in config/initializers/000-stats.rb, config/initializers/010-stats.rb"), "{stats}");
+    assert_rest(&out);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn line<'o>(out: &'o str, needle: &str) -> &'o str {
+    out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no `{needle}` line:\n{out}"))
+}
+
+/// The reads other than `STATS`, which answer the same either way.
+fn assert_rest(out: &str) {
     // Assigned in a class body, which runs with the file.
-    let roles = line("constant not supported (all targets): Rack::Attack::ADMIN_ROLES");
+    let roles = line(out, "constant not supported (all targets): Rack::Attack::ADMIN_ROLES");
     assert!(roles.contains("note[unsupported]") && roles.contains("000-stats.rb"), "{roles}");
 
     // Assigned only when a condition holds: it may be undefined at run time.
-    let maybe = line("constant not supported (all targets): MAYBE");
+    let maybe = line(out, "constant not supported (all targets): MAYBE");
     assert!(maybe.contains("error[unsupported]"), "{maybe}");
 
     // Not assigned anywhere: an error of its own.
-    let nope = line("constant not supported (all targets): Nope");
+    let nope = line(out, "constant not supported (all targets): Nope");
     assert!(nope.contains("error[unsupported]"), "{nope}");
     // The initializer assigns the top-level `STATS`, not `Admin::STATS`.
-    let admin = line("constant not supported (all targets): Admin::STATS");
+    let admin = line(out, "constant not supported (all targets): Admin::STATS");
     assert!(admin.contains("error[unsupported]"), "{admin}");
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
