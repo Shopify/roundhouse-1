@@ -4305,6 +4305,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
     files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
     let registrations = load_hook_registrations(app);
+    let hook_fires = framework_load_hook_block(app, true);
+    let late_hook_fires = framework_load_hook_block(app, false);
     let programs = initializer_program_block(app);
     let environment = environment_program_block(app);
     apply_class_load_hooks(files, app);
@@ -4734,8 +4736,17 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
                 content.insert_str(at, &replay);
             }
+            // Active Record's load hook, where Rails fires it: as its base
+            // loads, before any of the app's or the compiled gems' code
+            // (`framework_load_hook_block`). After the inflections, which a
+            // hook's table or class names read.
+            if !hook_fires.is_empty() {
+                let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
+                content.insert_str(at, &hook_fires);
+            }
             content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
+            content.push_str(&late_hook_fires);
             content.push_str(&programs);
             content.push_str(
                 "# Application#initialize!'s Finisher (middleware, to_prepare,\n\
@@ -5219,8 +5230,19 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
 /// LoadErrors: job-iteration's `require "active_job"`, responders' and
 /// typed_parameters' `require "action_controller"`, identifications'
 /// `require "active_support/multibyte/unicode"`).
+///
+/// `require "active_support"` answers ActiveSupport::Concern too:
+/// active_support.rb:39 (5813559f4aed) autoloads it, and Rails' own
+/// active_support/rails.rb:18 has loaded it before any gem.
+/// sequenced_column 1.2.1 requires only "active_support", then its
+/// `on_load(:active_record)` hook requires an extension that does
+/// `extend ActiveSupport::Concern`; the hook runs at registration once
+/// the tree has fired :active_record (`framework_load_hook_block`).
 const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
-    ("active_support", &["active_support_lazy_load_hooks", "active_support_core_ext", "active_support_inflector"]),
+    (
+        "active_support",
+        &["active_support_lazy_load_hooks", "active_support_core_ext", "active_support_inflector", "active_support_concern"],
+    ),
     ("active_support/core_ext/object/blank", &["active_support_core_ext"]),
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
@@ -5572,35 +5594,97 @@ fn gem_source_dependency_block(app: &App) -> String {
     out
 }
 
-/// Fire the framework load hooks where the runtime has loaded each
-/// base, then run each boot initializer's carried statements
-/// (`ingest::initializer_programs`) in Rails' `load_config_initializers`
-/// order, after the gems' railtie initializers and before the Finisher.
+/// The framework load hooks boot fires ahead of `require_relative
+/// "app/models"` ([`framework_load_hook_block`]): Active Record's, whose
+/// base the gem sources and the boot files' models subclass and extend.
+/// Rails loads ActionController::Base, ActiveJob::Base and
+/// ActionMailer::Base on their first reference, which a Rails boot makes
+/// after the initializers (routes, eager loading), so their hooks fire
+/// where they did, after the registrations and before the initializer
+/// programs. Firing `:action_controller` ahead of the gem sources would
+/// run, at registration inside the natively loaded responders 3.2.1's
+/// lib/responders.rb, its `include ActionController::RespondWith` hook,
+/// which Rails runs only once a controller loads; a raise there leaves
+/// responders.rb unloaded, so the next `require "responders"` runs its
+/// body again and adds its `responders.flash_responder` initializer
+/// once per require (Rails' TSort of the boot initializers then fails).
+const HOOKS_FIRED_BEFORE_MODELS: &[&str] = &["active_record"];
+
+/// Fire framework load hooks where Rails fires them: each as the file
+/// defining its base ends (`ActiveSupport.run_load_hooks`, at the site
+/// [`FRAMEWORK_LOAD_HOOKS`] notes), which Rails loads on the base's
+/// first reference, so before any subclass body runs (activerecord
+/// 8.2.0.alpha base.rb:336: `class Base … end` then the hook).
 ///
-/// A tree whose support files register load hooks and that has no
-/// initializers fires them too: Rails fires each framework hook whatever
-/// registered it, so a lib file's `ActiveSupport.on_load(:active_record)`
-/// runs once Active Record's base has loaded.
-fn initializer_program_block(app: &App) -> String {
+/// `before_models` selects [`HOOKS_FIRED_BEFORE_MODELS`]: `:active_record`,
+/// fired ahead of `require_relative "app/models"`, so before the compiled
+/// gem sources (Bundler.require), the boot files and the railtie files
+/// load. A hook registered by then (a natively loaded gem's) runs there;
+/// one registered later (a compiled gem's railtie, such as
+/// shopify-money's MoneyColumn::Railtie, a lib file, an initializer)
+/// runs at registration, as in Rails once the base has loaded. A model
+/// the boot files load (Payments::Transfer's `money_column`) so sees
+/// every macro a hook defines. The rest fire after the file
+/// registrations, before the initializer programs.
+///
+/// A tree whose support files or railties register load hooks fires
+/// them even with no initializers: Rails fires each framework hook
+/// whatever registered it.
+///
+/// [`FRAMEWORK_LOAD_HOOKS`]: crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS
+fn framework_load_hook_block(app: &App, before_models: bool) -> String {
+    if !fires_framework_load_hooks(app) {
+        return String::new();
+    }
+    let mut out = String::from(if before_models {
+        "# Rails fires Active Record's load hook as its base's file ends\n\
+         # (`ActiveSupport.run_load_hooks`, at the site noted), which loads on the\n\
+         # base's first reference: before any gem or app code subclasses or\n\
+         # extends it. The runtime has defined the base by here, so a hook\n\
+         # registered so far runs now, and one registered later (a compiled\n\
+         # gem's railtie, a lib file, an initializer) runs at registration, as\n\
+         # in Rails once the framework is loaded.\n\
+         require_relative \"runtime/active_support_lazy_load_hooks\"\n"
+    } else {
+        "# Rails fires each framework's load hook as the file defining its base\n\
+         # ends (`ActiveSupport.run_load_hooks`, at the site noted). The runtime\n\
+         # has defined these bases by here, so a hook the initializers below\n\
+         # register runs at registration, as in Rails once the framework is loaded.\n"
+    });
+    for (hook, base, site) in crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS {
+        if HOOKS_FIRED_BEFORE_MODELS.contains(hook) == before_models {
+            out.push_str(&format!("ActiveSupport.run_load_hooks(:{hook}, {base}) # {site}\n"));
+        }
+    }
+    out
+}
+
+/// Whether boot fires the framework load hooks
+/// ([`framework_load_hook_block`]): the app has initializers, or a
+/// support file or a carried railtie registers a hook.
+fn fires_framework_load_hooks(app: &App) -> bool {
+    if !app.initializer_programs.is_empty() {
+        return true;
+    }
     let mut registers = false;
     for_each_file_load_hook_registration(app, &mut |_, _| registers = true);
     // A carried railtie's body registers them too (shopify-money's
     // MoneyColumn::Railtie: `ActiveSupport.on_load(:active_record) {
     // ActiveRecord::Base.send(:include, …) }`).
-    registers = registers || railtie_registers_load_hook(app);
-    if app.initializer_programs.is_empty() && !registers {
+    registers || railtie_registers_load_hook(app)
+}
+
+/// Run each boot initializer's carried statements
+/// (`ingest::initializer_programs`) in Rails' `load_config_initializers`
+/// order, after the gems' railtie initializers and before the Finisher.
+/// Every framework load hook has fired by then
+/// ([`framework_load_hook_block`]), so a hook an initializer registers
+/// runs at registration.
+fn initializer_program_block(app: &App) -> String {
+    if app.initializer_programs.is_empty() {
         return String::new();
     }
     let mut out = String::from(
-        "# Rails fires each framework's load hook as the file defining its base\n\
-         # ends (`ActiveSupport.run_load_hooks`, at the site noted). The runtime\n\
-         # has defined these bases by here, so a hook the initializers below\n\
-         # register runs at registration, as in Rails once the framework is loaded.\n",
-    );
-    for (hook, base, site) in crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS {
-        out.push_str(&format!("ActiveSupport.run_load_hooks(:{hook}, {base}) # {site}\n"));
-    }
-    out.push_str(
         "# The boot initializers' statements (ingest::initializer_programs), file\n\
          # by file in load_config_initializers order (engines, then the app).\n\
          # A statement that raises names itself (error[initializer_statement_not_run])\n\
@@ -6890,6 +6974,35 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
 /// matches no chain prefix all return `None`, because loading the file
 /// on reference to one constant would leave the rest undefined until
 /// then. Those files keep loading at boot.
+/// A source's declaration files (`emit::ruby::declarations_by_source`,
+/// in the order its last write of each closes) with each namespace's
+/// file ahead of its children's, as Ruby running the source defines a
+/// namespace (`module AuthorizedType`) before what it nests (`module
+/// ClassMethods`). A namespace's emitted file requires the children its
+/// body reads first (`require_relative "authorized_type/class_methods"`,
+/// after `entering_program`); loading a child first instead resolves its
+/// `module AuthorizedType` reopen through the namespace's autoload, whose
+/// file then requires the child that is still loading (Ruby's "loading
+/// in progress, circular require considered harmful", which Core's
+/// StrictWarning raises). Only an ancestor is moved, outermost first,
+/// to just before its first descendant; every other file keeps its place.
+fn namespace_files_first(anchors: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(anchors.len());
+    for anchor in anchors {
+        let mut ancestors: Vec<&String> = anchors
+            .iter()
+            .filter(|other| anchor.len() > other.len() && anchor.starts_with(other.as_str()) && anchor.as_bytes()[other.len()] == b'/')
+            .collect();
+        ancestors.sort_by_key(|other| other.len());
+        for file in ancestors.into_iter().chain(std::iter::once(anchor)) {
+            if !out.contains(file) {
+                out.push(file.clone());
+            }
+        }
+    }
+    out
+}
+
 fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> {
     let stem = anchor.strip_prefix("models/")?;
     let root_segment = stem.split('/').next().unwrap_or(stem);
@@ -7124,7 +7237,17 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // file's constants have no autoload (below), so nothing else would
     // define them: config/application.rb's `require "gqlc/plain"` left
     // `Gqlc::Plain` undefined.
-    let declarations_by_source = emit::ruby::declarations_by_source(app);
+    //
+    // Each namespace's file loads ahead of its children's
+    // (`namespace_files_first`): the boot loads, SOURCE_FILES and
+    // COMPILED_GEM_FEATURES below all read this table.
+    let declarations_by_source: BTreeMap<String, Vec<String>> = emit::ruby::declarations_by_source(app)
+        .into_iter()
+        .map(|(source, anchors)| {
+            let anchors = namespace_files_first(&anchors);
+            (source, anchors)
+        })
+        .collect();
     let emitted_file = |anchor: &str| {
         let path = format!("app/{anchor}.rb");
         files.iter().any(|(p, _)| *p == path)
@@ -15038,6 +15161,26 @@ fn walk_ruby(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_namespace_file_moves_ahead_of_its_first_child_and_nothing_else_moves() {
+        let order = |anchors: &[&str]| -> Vec<String> {
+            super::namespace_files_first(&anchors.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+        };
+        // graphql-shopify 0.20.3's metrics/authorized_type.rb.
+        assert_eq!(
+            order(&["models/graphql/metrics/authorized_type/class_methods", "models/graphql/metrics/authorized_type"]),
+            ["models/graphql/metrics/authorized_type", "models/graphql/metrics/authorized_type/class_methods"]
+        );
+        // Outermost first, ahead of the first descendant; unrelated files
+        // (and a prefix that is no path segment) keep their places.
+        assert_eq!(
+            order(&["models/z", "models/a/b/c", "models/ab", "models/a/b", "models/a", "models/a/d"]),
+            ["models/z", "models/a", "models/a/b", "models/a/b/c", "models/ab", "models/a/d"]
+        );
+        let kept = ["models/a", "models/a/b", "models/c"];
+        assert_eq!(order(&kept), kept);
+    }
+
     #[test]
     fn a_written_require_stays_below_the_files_magic_comments() {
         let cases = [
