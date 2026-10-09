@@ -245,14 +245,42 @@ fn names_test_generator(node: &Node<'_>, verb: &[u8]) -> bool {
 enum Origin {
     /// In the test class body (`Macros::own`, by index).
     Own(usize),
+    /// A class method of the test class body that declares no test
+    /// itself, defined after (or instead of) a macro of its name: the one
+    /// the call runs (`Macros::own`, by index).
+    Shadow(usize),
+    /// A macro of the test class body ingest does not model, and why.
+    Unmodeled(String),
     /// In a concern the class includes: (file, def start, def end, its
     /// lexical scopes, TestGenerator is the concern's).
     Concern(String, usize, usize, Vec<String>, bool),
 }
 
+/// A class method the test class body defines (`class << self`, `def
+/// self.m`).
+struct Own<'pr> {
+    name: String,
+    def: ruby_prism::DefNode<'pr>,
+    kind: OwnKind,
+    /// Defined in `class << self`: its blocks look constants up from the
+    /// singleton class, not from the class.
+    singleton: bool,
+}
+
+enum OwnKind {
+    /// Its body declares tests.
+    Macro,
+    /// It declares none itself.
+    Plain,
+    /// A macro in a `class << self` that does more than define methods
+    /// (the first other statement).
+    Unmodeled(String),
+}
+
 /// The test macros a test class body can call.
 pub(super) struct Macros<'pr> {
-    own: Vec<(String, ruby_prism::DefNode<'pr>)>,
+    /// Every class method the body defines, in order.
+    own: Vec<Own<'pr>>,
     /// The concerns the class includes, in order: (file, macros,
     /// TestGenerator is the concern's, start of the `include`).
     #[allow(clippy::type_complexity)]
@@ -265,27 +293,37 @@ pub(super) struct Macros<'pr> {
     /// Starts of the call statements this class body makes of its own
     /// macros.
     calls: Vec<(String, usize)>,
+    /// Where the class body's statements look constants up (the class
+    /// body's own constants included).
+    cx: Option<consts::ConstCx>,
 }
 
 impl<'pr> Macros<'pr> {
     pub(super) fn of_class(class_node: &ruby_prism::ClassNode<'pr>, body: &[Node<'pr>], class: &ClassId, file: &str) -> Self {
         let mut own = Vec::new();
+        let declares = |def: &ruby_prism::DefNode<'_>| def.body().is_some_and(|b| hidden_test_declaration(&b).is_some());
         for stmt in body {
             if let Some(singleton) = stmt.as_singleton_class_node() {
-                if !singleton.expression().as_self_node().is_some() {
+                if singleton.expression().as_self_node().is_none() {
                     continue;
                 }
-                for item in singleton.body().map(flatten_statements).unwrap_or_default() {
-                    if let Some(def) = item.as_def_node().filter(|d| d.receiver().is_none()) {
-                        if def.body().is_some_and(|b| hidden_test_declaration(&b).is_some()) {
-                            own.push((constant_id_str(&def.name()).to_string(), def));
-                        }
-                    }
+                let items = singleton.body().map(flatten_statements).unwrap_or_default();
+                // `attr_accessor`, `private`, a constant: not modeled
+                // beside macros (`covers_singleton`).
+                let other = items.iter().find(|i| i.as_def_node().is_none_or(|d| d.receiver().is_some())).map(first_line);
+                for def in items.iter().filter_map(|i| i.as_def_node()).filter(|d| d.receiver().is_none()) {
+                    let kind = match (&other, declares(&def)) {
+                        (_, false) => OwnKind::Plain,
+                        (None, true) => OwnKind::Macro,
+                        (Some(other), true) => OwnKind::Unmodeled(format!(
+                            "the `class << self` that defines it does more than define methods (`{other}`)"
+                        )),
+                    };
+                    own.push(Own { name: constant_id_str(&def.name()).to_string(), def, kind, singleton: true });
                 }
             } else if let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_some_and(|r| r.as_self_node().is_some())) {
-                if def.body().is_some_and(|b| hidden_test_declaration(&b).is_some()) {
-                    own.push((constant_id_str(&def.name()).to_string(), def));
-                }
+                let kind = if declares(&def) { OwnKind::Macro } else { OwnKind::Plain };
+                own.push(Own { name: constant_id_str(&def.name()).to_string(), def, kind, singleton: false });
             }
         }
         let calls = body
@@ -335,15 +373,25 @@ impl<'pr> Macros<'pr> {
             class: class.clone(),
             class_start: class_node.location().start_offset(),
             calls,
+            cx: consts::ConstCx::of_class(class_node, body, file, 0),
         }
     }
 
     /// The macro a call of `name` at `call_at` of the class body runs:
-    /// the class's own singleton method defined last before it, else
-    /// that of the concern included last before it.
+    /// the class's own singleton method defined last before it (one that
+    /// declares no test itself when it replaces a macro), else that of
+    /// the concern included last before it.
     fn lookup(&self, name: &str, call_at: usize) -> Option<Origin> {
-        if let Some(at) = self.own.iter().rposition(|(n, def)| n == name && def.location().start_offset() < call_at) {
-            return Some(Origin::Own(at));
+        if let Some(at) = self.own.iter().rposition(|o| o.name == name && o.def.location().start_offset() < call_at) {
+            return match &self.own[at].kind {
+                OwnKind::Macro => Some(Origin::Own(at)),
+                OwnKind::Unmodeled(why) => Some(Origin::Unmodeled(why.clone())),
+                OwnKind::Plain => {
+                    let replaces = self.own.iter().any(|o| o.name == name && !matches!(o.kind, OwnKind::Plain))
+                        || self.concerns.iter().any(|c| c.3 < call_at && c.1.iter().any(|(n, ..)| n == name));
+                    replaces.then_some(Origin::Shadow(at))
+                }
+            };
         }
         for (path, macros, generator, _) in self.concerns.iter().rev().filter(|c| c.3 < call_at) {
             if let Some((_, start, end, cref)) = macros.iter().find(|(n, ..)| n == name) {
@@ -353,38 +401,63 @@ impl<'pr> Macros<'pr> {
         None
     }
 
-    /// Is the `class << self` statement `stmt` nothing but macros whose
-    /// every use in the file is a call this class body makes as a
-    /// statement (each expanded or named by `expand`)?
-    pub(super) fn covers_singleton(&self, stmt: &Node<'_>) -> bool {
-        let Some(singleton) = stmt.as_singleton_class_node() else { return false };
-        let body = singleton.body().map(flatten_statements).unwrap_or_default();
-        let mut macros = Vec::new();
-        for item in &body {
-            match item.as_def_node() {
-                Some(def) if def.body().is_some_and(|b| hidden_test_declaration(&b).is_some()) => {
-                    macros.push((constant_id_str(&def.name()).to_string(), def.name_loc().start_offset()));
-                }
-                Some(_) => {}
-                None if hidden_test_declaration(item).is_some() => return false,
-                None => {}
-            }
-        }
-        if macros.is_empty() {
-            return false;
-        }
+    /// The first use of the class method `name` (defined in the class
+    /// body) other than a call this class body makes as a statement or
+    /// one of its own definitions: `send(:gen, …)`, `self.gen`, `method
+    /// (:gen)`, a call from inside a method or block, a call before it is
+    /// defined. `None` when every use is one `expand` expands or names.
+    fn other_use(&self, name: &str) -> Option<String> {
+        let defs: Vec<usize> = self.own.iter().filter(|o| o.name == name).map(|o| o.def.name_loc().start_offset()).collect();
         sources::with_text(&self.file, |text| {
             let result = ruby_prism::parse(text.as_bytes());
-            macros.iter().all(|(name, def_at)| {
-                uses(&result.node(), name).into_iter().all(|used| match used {
-                    Use::Def(at) => at == *def_at,
-                    // A call before the definition runs no such macro.
-                    Use::Call(at) => at > *def_at && self.calls.iter().any(|(n, c)| n == name && *c == at),
-                    Use::Named => false,
-                })
+            uses(&result.node(), name).into_iter().find_map(|used| match used {
+                Use::Def(at) if defs.contains(&at) => None,
+                // A call before any definition runs no macro (Ruby raises
+                // NoMethodError as the class loads): not one `expand` expands.
+                Use::Call(at) if self.calls.iter().any(|(n, c)| n == name && *c == at) && self.lookup(name, at).is_some() => None,
+                Use::Def(at) | Use::Call(at) | Use::Named(at) => Some(use_text(text, at)),
             })
         })
-        .unwrap_or(false)
+        .unwrap_or_else(|| Some("its file is not registered".into()))
+    }
+
+    /// The `class << self` statement `stmt`, when it is nothing but
+    /// method definitions, at least one a macro whose every use is a call
+    /// this class body makes as a statement (each expanded or named by
+    /// `expand`): its other methods, for the caller to define as the
+    /// class's. `None` for any other statement.
+    pub(super) fn covers_singleton(&self, stmt: &Node<'pr>) -> Option<Vec<ruby_prism::DefNode<'pr>>> {
+        let singleton = stmt.as_singleton_class_node()?;
+        singleton.expression().as_self_node()?;
+        let start = stmt.location().start_offset();
+        let end = stmt.location().end_offset();
+        let inside = |o: &&Own<'pr>| (start..end).contains(&o.def.location().start_offset());
+        let mine: Vec<&Own<'pr>> = self.own.iter().filter(inside).collect();
+        if !mine.iter().any(|o| matches!(o.kind, OwnKind::Macro)) || mine.iter().any(|o| matches!(o.kind, OwnKind::Unmodeled(_))) {
+            return None;
+        }
+        let items = singleton.body().map(flatten_statements).unwrap_or_default();
+        if items.len() != mine.len() {
+            return None;
+        }
+        if mine.iter().filter(|o| matches!(o.kind, OwnKind::Macro)).any(|o| self.other_use(&o.name).is_some()) {
+            return None;
+        }
+        let plain: Vec<usize> =
+            mine.iter().filter(|o| matches!(o.kind, OwnKind::Plain)).map(|o| o.def.location().start_offset()).collect();
+        Some(items.iter().filter_map(|i| i.as_def_node()).filter(|d| plain.contains(&d.location().start_offset())).collect())
+    }
+
+    /// Why the tests of the `def self.m` macro `def` are not all
+    /// modeled: a use other than a class-body call statement (each of
+    /// those is expanded or named by `expand`). `None` for any other def.
+    pub(super) fn def_other_use(&self, def: &ruby_prism::DefNode<'_>) -> Option<String> {
+        let at = def.location().start_offset();
+        let own = self.own.iter().find(|o| !o.singleton && o.def.location().start_offset() == at)?;
+        if !matches!(own.kind, OwnKind::Macro) {
+            return None;
+        }
+        self.other_use(&own.name)
     }
 
     /// The tests the class-body statement `stmt` declares when it calls a
@@ -405,13 +478,27 @@ impl<'pr> Macros<'pr> {
         let class_cref = consts::cref_of(&self.file, self.class_start);
         let outcome = match &origin {
             Origin::Own(at) => {
-                let def = &self.own[*at].1;
-                if !self.generator && uses_generate_test(def) {
+                let own = &self.own[*at];
+                if !self.generator && uses_generate_test(&own.def) {
                     Err("`generate_test` is not TestGenerator's (the class does not extend it)".to_string())
                 } else {
-                    self.expand_def(def, &self.file, &call, tags, tag_consts, None)?
+                    self.expand_def(&own.def, &self.file, &call, tags, tag_consts, None, own.singleton)?
                 }
             }
+            // A method that declares nothing and calls nothing declares
+            // no test; one that calls something (`super`, another macro)
+            // may.
+            Origin::Shadow(at) => {
+                let def = &self.own[*at].def;
+                match def.body().and_then(|b| first_call(&b)) {
+                    None => Ok(Vec::new()),
+                    Some(called) => Err(format!(
+                        "the definition it runs (line {}) declares no test itself but calls `{called}`",
+                        sources::line_at(&self.file, def.location().start_offset()).map(|l| l.to_string()).unwrap_or_else(|| "?".into())
+                    )),
+                }
+            }
+            Origin::Unmodeled(why) => Err(why.clone()),
             Origin::Concern(path, start, end, macro_cref, generator) => {
                 let generator = *generator || self.generator;
                 let path = path.clone();
@@ -429,7 +516,7 @@ impl<'pr> Macros<'pr> {
                             }
                             Some(def) => {
                                 let scopes = (macro_cref.clone(), class_cref.clone().unwrap_or_default());
-                                self.expand_def(&def, &path, &call, tags, tag_consts, Some(scopes))?
+                                self.expand_def(&def, &path, &call, tags, tag_consts, Some(scopes), false)?
                             }
                         }
                     }
@@ -443,7 +530,7 @@ impl<'pr> Macros<'pr> {
                 Ok(Some(tests))
             }
             Err(why) => {
-                if let Origin::Own(_) = origin {
+                if !matches!(origin, Origin::Concern(..)) {
                     let line = sources::line_at(&self.file, call.location().start_offset())
                         .map(|l| l.to_string())
                         .unwrap_or_else(|| "?".into());
@@ -463,7 +550,8 @@ impl<'pr> Macros<'pr> {
 
     /// The tests `def` (written in `def_file`) declares when `call` runs
     /// it, or why they are not modeled. `scopes` (the macro's lexical
-    /// scopes, the class's) when it is written outside the class.
+    /// scopes, the class's) when it is written outside the class;
+    /// `singleton` when it is the class's, in `class << self`.
     #[allow(clippy::too_many_arguments)]
     fn expand_def<'d>(
         &self,
@@ -473,6 +561,7 @@ impl<'pr> Macros<'pr> {
         tags: &TestTags,
         tag_consts: &TagConstants<'d>,
         scopes: Option<(Vec<String>, Vec<String>)>,
+        singleton: bool,
     ) -> IngestResult<Result<Vec<Test>, String>>
     where
         'pr: 'd,
@@ -496,9 +585,7 @@ impl<'pr> Macros<'pr> {
                 _ => return Ok(Err(format!("its body does more than declare tests (`{}`)", first_line(stmt)))),
             }
         }
-        let cx = consts::cref_of(&self.file, self.class_start).map(|cref| {
-            Rc::new(consts::ConstCx { file: self.file.clone(), cref, local: None, includes: Vec::new(), depth: 0 })
-        });
+        let cx = self.cx.as_ref().map(|cx| Rc::new(cx.before(call.location().start_offset())));
         let bound = match test_unroll::bind_call(def, def_file, call, &self.file, cx)? {
             Ok(bound) => bound,
             Err(why) => return Ok(Err(why)),
@@ -536,6 +623,20 @@ impl<'pr> Macros<'pr> {
             };
             if let Some(why) = block_misuse(declaration, &locals, &params) {
                 return Ok(Err(why));
+            }
+            // A test's own copy of an argument is not the one object the
+            // macro's tests share: changing it in place is not modeled.
+            if let Some(block) = declaration.block() {
+                let unshared = bound.unshared();
+                if let Some((name, at)) = test_unroll::changed_in_place(&block, &unshared) {
+                    return Ok(Err(format!("a test block changes the argument `{name}` its other tests share (`{at}`)")));
+                }
+            }
+            if singleton {
+                let class_cref = consts::cref_of(&self.file, self.class_start).unwrap_or_default();
+                if let Some(why) = singleton_constants(declaration, &class_cref) {
+                    return Ok(Err(why));
+                }
             }
             if let Some((macro_cref, class_cref)) = &scopes {
                 if let Some(why) = foreign_constants(declaration, macro_cref, class_cref) {
@@ -591,8 +692,47 @@ enum Use {
     Call(usize),
     /// A call with a receiver, the name as a Symbol or String (`send`,
     /// `method`, `alias_method`), or a `send` of a name built at run
-    /// time (`send("gen_#{x}")`): a use not modeled.
-    Named,
+    /// time (`send("gen_#{x}")`): a use not modeled (its start).
+    Named(usize),
+}
+
+/// The line of `text` at `at`, trimmed, with its number.
+fn use_text(text: &str, at: usize) -> String {
+    let start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+    let line = text[..at].matches('\n').count() + 1;
+    let shown: String = text[start..end].trim().chars().take(100).collect();
+    format!("`{shown}` at line {line}")
+}
+
+/// The first method `node` calls (`super` and `yield` included).
+fn first_call(node: &Node<'_>) -> Option<String> {
+    use ruby_prism::Visit;
+    struct Scan {
+        found: Option<String>,
+    }
+    impl<'pr> Visit<'pr> for Scan {
+        fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Some(call) = node.as_call_node() {
+                self.found = Some(constant_id_str(&call.name()).to_string());
+            } else if node.as_super_node().is_some() || node.as_forwarding_super_node().is_some() {
+                self.found = Some("super".into());
+            } else if node.as_yield_node().is_some() {
+                self.found = Some("yield".into());
+            }
+        }
+        fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+            if self.found.is_none() && node.as_forwarding_super_node().is_some() {
+                self.found = Some("super".into());
+            }
+        }
+    }
+    let mut scan = Scan { found: None };
+    scan.visit(node);
+    scan.found
 }
 
 fn uses(root: &Node<'_>, name: &str) -> Vec<Use> {
@@ -606,7 +746,7 @@ fn uses(root: &Node<'_>, name: &str) -> Vec<Use> {
             if let Some(call) = node.as_call_node().filter(|c| c.name().as_slice() == self.name) {
                 self.out.push(match call.receiver() {
                     None => Use::Call(call.location().start_offset()),
-                    Some(_) => Use::Named,
+                    Some(_) => Use::Named(call.location().start_offset()),
                 });
             } else if let Some(def) = node.as_def_node().filter(|d| d.name().as_slice() == self.name) {
                 self.out.push(Use::Def(def.name_loc().start_offset()));
@@ -618,7 +758,7 @@ fn uses(root: &Node<'_>, name: &str) -> Vec<Use> {
                         .and_then(|a| a.arguments().iter().next())
                         .is_some_and(|first| first.as_symbol_node().is_none() && first.as_string_node().is_none());
                 if dynamic {
-                    self.out.push(Use::Named);
+                    self.out.push(Use::Named(call.location().start_offset()));
                 }
             }
         }
@@ -626,7 +766,7 @@ fn uses(root: &Node<'_>, name: &str) -> Vec<Use> {
             if node.as_symbol_node().is_some_and(|s| s.unescaped() == self.name)
                 || node.as_string_node().is_some_and(|s| s.unescaped() == self.name)
             {
-                self.out.push(Use::Named);
+                self.out.push(Use::Named(node.location().start_offset()));
             }
         }
     }
@@ -693,9 +833,9 @@ fn block_misuse(declaration: &ruby_prism::CallNode<'_>, locals: &[String], param
     scan.found
 }
 
-/// A constant the block of `declaration` names whose first name resolves
-/// differently from the macro's scopes than from the test class's.
-fn foreign_constants(declaration: &ruby_prism::CallNode<'_>, macro_cref: &[String], class_cref: &[String]) -> Option<String> {
+/// The first names of the constants the block of `declaration` names
+/// (`A` of `A::B`; not `::A`), each once.
+fn block_constants(declaration: &ruby_prism::CallNode<'_>) -> Vec<String> {
     use ruby_prism::Visit;
     struct Scan {
         firsts: Vec<String>,
@@ -712,14 +852,21 @@ fn foreign_constants(declaration: &ruby_prism::CallNode<'_>, macro_cref: &[Strin
             }
         }
     }
-    let block = declaration.block()?;
+    let Some(block) = declaration.block() else { return Vec::new() };
     let mut scan = Scan { firsts: Vec::new() };
     scan.visit(&block);
     scan.firsts.sort();
     scan.firsts.dedup();
-    for name in &scan.firsts {
-        let from_macro = consts::first_name(macro_cref, name);
-        let from_class = consts::first_name(class_cref, name);
+    scan.firsts
+}
+
+/// A constant the block of `declaration` names whose first name resolves
+/// differently from the macro's scopes than from the test class's (each
+/// by its lexical scopes, the innermost one's ancestors, the top level).
+fn foreign_constants(declaration: &ruby_prism::CallNode<'_>, macro_cref: &[String], class_cref: &[String]) -> Option<String> {
+    for name in &block_constants(declaration) {
+        let from_macro = consts::resolution(macro_cref, name);
+        let from_class = consts::resolution(class_cref, name);
         if from_macro == consts::Resolution::Unknown || from_macro != from_class {
             return Some(format!(
                 "its block names `{name}`, which the test class may resolve differently ({from_class:?}) from the macro ({from_macro:?})"
@@ -727,4 +874,17 @@ fn foreign_constants(declaration: &ruby_prism::CallNode<'_>, macro_cref: &[Strin
         }
     }
     None
+}
+
+/// A constant the block of `declaration` (in a method of the test
+/// class's `class << self`) names that may resolve differently there
+/// than in the test's own method: past the lexical scopes, Ruby looks in
+/// the singleton class's ancestors, not the class's (`consts::
+/// same_in_singleton`).
+fn singleton_constants(declaration: &ruby_prism::CallNode<'_>, class_cref: &[String]) -> Option<String> {
+    block_constants(declaration).into_iter().find_map(|name| {
+        consts::same_in_singleton(class_cref, &name)
+            .err()
+            .map(|why| format!("its block, in `class << self`, names `{name}`, which {why}"))
+    })
 }

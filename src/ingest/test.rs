@@ -558,6 +558,20 @@ pub(super) fn ingest_test_class(
             // can `self.<helper>(...)` it. Definitions of `def
             // setup` and `def test_*` already short-circuited above.
             if let Some(def) = stmt.as_def_node() {
+                // A `def self.m` test macro used other than by a class-body
+                // call statement (`send(:m, …)`): those tests are named.
+                if let Some(other) = macros.def_other_use(&def) {
+                    super::survey::continue_or_fail(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!(
+                            "tests declared by the class method `{}` where it is used other than called from the class body \
+                             are not modeled; they will not run (`{}`{}: {other})",
+                            constant_id_str(&def.name()),
+                            name.0,
+                            line_suffix(file, &stmt.location())
+                        ),
+                    })?;
+                }
                 let m = ingest_library_method(&def, &name, file)?;
                 helpers.push(m);
                 continue;
@@ -674,7 +688,13 @@ pub(super) fn ingest_test_class(
                 }
                 continue;
             }
-            if macros.covers_singleton(&stmt) {
+            // Its other methods are the class's (`def self.m`).
+            if let Some(defs) = macros.covers_singleton(&stmt) {
+                for def in defs {
+                    let mut m = ingest_library_method(&def, &name, file)?;
+                    m.receiver = crate::dialect::MethodReceiver::Class;
+                    helpers.push(m);
+                }
                 continue;
             }
             if let Some(offset) = hidden_test_declaration(&stmt) {
@@ -1853,7 +1873,6 @@ mod test_macros;
 /// Did ingest expand the test macro call at `offset` of `file` (its
 /// tests run under the class that calls it)? `TestMixins` names the
 /// calls it did not.
-#[allow(dead_code)]
 pub(super) fn macro_call_expanded(file: &str, offset: usize) -> bool {
     test_macros::expanded(file, offset)
 }

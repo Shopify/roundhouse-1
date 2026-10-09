@@ -11,7 +11,14 @@
 //!   (`HELPERS.keys - (SEEDS + [X])`, `Module.constants`, a constant
 //!   Array of Hashes naming modules) declares one test per element;
 //! - a macro or loop that cannot be evaluated before it runs is a named
-//!   survey gap, and the class's other tests still run.
+//!   survey gap, and the class's other tests still run;
+//! - each case below the first test is one where an earlier version
+//!   invented or silently dropped tests (an `excluding` Array argument, a
+//!   constant changed at load, an ancestor's constant, `Module#constants`
+//!   order, helpers beside a macro, a loop local assigned again, writes
+//!   after a module body, a redefined macro, `send` of a macro, element
+//!   identity, a singleton macro's constant scope, a concern macro in a
+//!   test-root helper).
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -217,7 +224,7 @@ fn minitest_version() -> String {
 /// `classes`.
 fn native_results(sources: &[&str], classes: &[&str]) -> BTreeMap<String, (String, u64)> {
     let mut oracle = format!(
-        "gem \"minitest\", \"={}\"\nrequire \"minitest/test\"\nMinitest.seed = 4242\nrequire \"json\"\nrequire \"active_support\"\nrequire \"active_support/test_case\"\nrequire \"active_support/core_ext/array/conversions\"\n{ORACLE_TAGS}\n",
+        "gem \"minitest\", \"={}\"\nrequire \"minitest/test\"\nMinitest.seed = 4242\nrequire \"json\"\nrequire \"active_support\"\nrequire \"active_support/test_case\"\nrequire \"active_support/core_ext/array/conversions\"\nrequire \"active_support/core_ext/array/access\"\n{ORACLE_TAGS}\n",
         minitest_version()
     );
     for source in sources {
@@ -394,4 +401,561 @@ end
         err.contains("tests declared by a call of the class method `generate` are not modeled; they will not run (`StrictTest` line 9: its body does more than declare tests (`puts name`))"),
         "{err}"
     );
+}
+
+// ---- The review's cases, each against native Minitest -------------
+
+/// Native Minitest's results for `files` (path, source) loaded in order,
+/// then the emitted program's (in survey mode): the index lists every
+/// native id `gapped` does not take, the run reports native's outcomes
+/// and assertion counts for them, and the survey names each of `gaps`
+/// once and records no other unmodeled test. Returns the native results.
+fn matches_native(
+    files: &[(&str, &str)],
+    classes: &[&str],
+    gapped: &dyn Fn(&str) -> bool,
+    gaps: &[&str],
+) -> BTreeMap<String, (String, u64)> {
+    let sources: Vec<String> = files
+        .iter()
+        .map(|(_, text)| text.lines().filter(|l| l.trim() != r#"require "test_helper""#).map(|l| format!("{l}\n")).collect())
+        .collect();
+    let native = native_results(&sources.iter().map(String::as_str).collect::<Vec<_>>(), classes);
+    assert!(!native.is_empty(), "native declares tests");
+
+    roundhouse::ingest::survey::activate();
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n");
+    for (path, text) in files {
+        app = app.write(path, text);
+    }
+    let (emitted, _errors) = app.emit(BuildTarget::Ruby);
+    let recorded: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    for gap in gaps {
+        assert_eq!(recorded.iter().filter(|g| g.contains(gap)).count(), 1, "{gap}\n{recorded:#?}");
+    }
+    let unmodeled = recorded.iter().filter(|g| g.contains("tests declared by") || g.contains("not modeled")).count();
+    assert_eq!(unmodeled, gaps.len(), "{recorded:#?}");
+
+    let want: BTreeMap<String, (String, u64)> =
+        native.iter().filter(|(id, _)| !gapped(id)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let listed = index(&emitted);
+    let mut indexed: Vec<String> = listed
+        .iter()
+        .filter(|(class, _)| classes.contains(&class.as_str()))
+        .flat_map(|(class, (_, tests))| tests.iter().map(move |t| format!("{class}#{t}")))
+        .collect();
+    indexed.sort();
+    assert_eq!(indexed, want.keys().cloned().collect::<Vec<_>>(), "index vs native {native:#?}");
+    assert_eq!(run_emitted(&emitted, &listed, classes), want, "emitted results vs native");
+    native
+}
+
+/// `id => (status, assertions)` from running each emitted file of
+/// `classes` that lists a test.
+fn run_emitted(
+    emitted: &std::path::Path,
+    listed: &BTreeMap<String, (String, Vec<String>)>,
+    classes: &[&str],
+) -> BTreeMap<String, (String, u64)> {
+    let mut ran = BTreeMap::new();
+    for (class, (file, tests)) in listed {
+        if tests.is_empty() || !classes.contains(&class.as_str()) {
+            continue;
+        }
+        let results = emitted.join(format!("{}.results.jsonl", file.replace('/', "_")));
+        let out = ruby()
+            .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), file])
+            .current_dir(emitted)
+            .env("ROUNDHOUSE_TEST_RESULTS", &results)
+            .env("BLOG_DB", ":memory:")
+            .output()
+            .expect("emitted CRuby");
+        let log = format!("{file}\nstdout={}\nstderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let text = std::fs::read_to_string(&results).unwrap_or_else(|e| panic!("no results: {e}\n{log}"));
+        for (id, result) in rows(&text) {
+            if id.starts_with(&format!("{class}#")) {
+                assert!(ran.insert(id.clone(), result).is_none(), "{id} ran twice\n{log}");
+            }
+        }
+    }
+    ran
+}
+
+const LEVELS: &str = r##"module Levels
+  ZED = :zed
+  ALPHA = :alpha
+  MID = :mid
+  ALL = [:a, :b, :c, :d].freeze
+end
+"##;
+
+const LV: &str = r##"module Lv
+  ZQX_NEW = 1
+  VERSION = 2
+  QQQ_ZZ = 3
+  Error = 4
+  NAME = 5
+end
+"##;
+
+/// `excluding`/`without` flatten their arguments one level, as
+/// ActiveSupport does; a loop that depends on `Module#constants`' order
+/// (an index, `first`, `join`) is a named gap, since Ruby orders them by
+/// its symbol table.
+#[test]
+fn excluding_flattens_and_constants_order_is_a_gap() {
+    let order_test = r##"class OrderTest < ActiveSupport::TestCase
+  Levels.constants.each_with_index do |c, i|
+    test "#{i} is #{c}" do
+      assert_equal c, Levels.constants[i]
+    end
+  end
+
+  [Levels.constants.join("-")].each do |joined|
+    test "joined #{joined}" do
+      assert joined
+    end
+  end
+
+  Levels::ALL.excluding([:a, :b]).each do |x|
+    test "excluding #{x}" do
+      refute_includes [:a, :b], x
+    end
+  end
+
+  Levels::ALL.without(:c, [:d]).each do |x|
+    test "without #{x}" do
+      assert x
+    end
+  end
+end
+"##;
+    let lv_test = r##"class LvOrderTest < ActiveSupport::TestCase
+  Lv.constants.each_with_index do |c, i|
+    test "#{i} #{c}" do
+      assert c
+    end
+  end
+
+  test "first is #{Lv.constants.first}" do
+    assert true
+  end
+
+  Lv.constants.each do |c|
+    test "any order #{c}" do
+      assert Lv.const_get(c)
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/levels.rb", LEVELS), ("app/models/lv.rb", LV), ("test/models/order_test.rb", order_test), ("test/models/lv_order_test.rb", lv_test)],
+        &["OrderTest", "LvOrderTest"],
+        &|id| {
+            let name = id.split_once("#test_").map_or("", |(_, n)| n);
+            name.starts_with(|c: char| c.is_ascii_digit()) || name.starts_with("joined_") || name.starts_with("first_is_")
+        },
+        &[
+            "tests declared by a loop whose order Ruby does not fix (`Module#constants`) are not modeled; they will not run (`OrderTest` line 2",
+            "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`OrderTest` line 8",
+            "tests declared by a loop whose order Ruby does not fix (`Module#constants`) are not modeled; they will not run (`LvOrderTest` line 2",
+            "(`LvOrderTest` line 8",
+        ],
+    );
+    for id in ["OrderTest#test_excluding_c", "OrderTest#test_excluding_d", "OrderTest#test_without_a", "OrderTest#test_without_b"] {
+        assert_eq!(native.get(id).map(|r| r.0.as_str()), Some("pass"), "{id}: {native:#?}");
+    }
+    assert_eq!(native.keys().filter(|id| id.starts_with("OrderTest#test_excluding_") || id.starts_with("OrderTest#test_without_")).count(), 4);
+    assert_eq!(native.keys().filter(|id| id.starts_with("LvOrderTest#test_any_order_")).count(), 5);
+}
+
+/// A loop over a constant some source changes after assigning it (`<<`,
+/// `[]=`, `concat`, `delete`, in its module or the test class) is a
+/// named gap; one nothing changes still unrolls.
+#[test]
+fn constants_changed_after_assignment_are_gaps() {
+    let kinds = r##"module Kinds
+  ALL = [:a]
+  ALL << :b
+  NAMES = { "x" => 1 }
+  NAMES["y"] = 2
+  LIST = %w[p q]
+  LIST.concat(%w[r])
+  FIXED = [:z].freeze
+end
+"##;
+    let flags = "module Flags\n  ALL = [:on, :off, :legacy]\n  ALL.delete(:legacy)\nend\n";
+    let test = r##"class MutatedConstTest < ActiveSupport::TestCase
+  Kinds::ALL.each do |k|
+    test "kind #{k}" do
+      assert k
+    end
+  end
+
+  Kinds::NAMES.each do |name, n|
+    test "name #{name}" do
+      assert n
+    end
+  end
+
+  Kinds::LIST.each do |l|
+    test "list #{l}" do
+      assert l
+    end
+  end
+
+  Kinds::FIXED.each do |f|
+    test "fixed #{f}" do
+      assert_equal :z, f
+    end
+  end
+
+  CASES = [:a]
+  CASES << :b
+  CASES.each do |c|
+    test "c #{c}" do
+      assert c
+    end
+  end
+
+  Flags::ALL.each do |f|
+    test "flag #{f}" do
+      assert_includes Flags::ALL, f
+    end
+  end
+end
+"##;
+    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/flags.rb", flags), ("test/models/mutated_const_test.rb", test)],
+        &["MutatedConstTest"],
+        &|id| !id.ends_with("#test_fixed_z"),
+        &[
+            &format!("{changed} (`MutatedConstTest` line 2, first test at line 3: `Kinds::ALL`: "),
+            &format!("{changed} (`MutatedConstTest` line 8, first test at line 9: `Kinds::NAMES`: "),
+            &format!("{changed} (`MutatedConstTest` line 14, first test at line 15: `Kinds::LIST`: "),
+            &format!("{changed} (`MutatedConstTest` line 28, first test at line 29: `MutatedConstTest::CASES`: "),
+            &format!("{changed} (`MutatedConstTest` line 34, first test at line 35: `Flags::ALL`: "),
+        ],
+    );
+    assert_eq!(native.len(), 12, "{native:#?}");
+}
+
+/// A constant the lexical scopes do not have is looked up in the
+/// class's ancestors before the top level; one an ancestor without a
+/// registered source may declare is a named gap.
+#[test]
+fn ancestor_constants_come_before_the_top_level() {
+    let helper = "class BaseModeTest < ActiveSupport::TestCase\n  MODES = [:base_x].freeze\nend\n";
+    let far_base = "class FarBase < ActiveSupport::TestCase\n  MODES = [:far].freeze\nend\n";
+    let sub = r##"require "test_helper"
+
+class SubModeTest < BaseModeTest
+  MODES.each do |m|
+    test "mode #{m}" do
+      assert_equal :base_x, m
+    end
+  end
+end
+"##;
+    let far = r##"require "test_helper"
+
+class FarModeTest < FarBase
+  MODES.each do |m|
+    test "far #{m}" do
+      assert_equal :far, m
+    end
+  end
+end
+"##;
+    matches_native(
+        &[
+            ("app/models/modes.rb", "MODES = [:global_a, :global_b].freeze\n"),
+            ("test/test_helper.rb", helper),
+            ("test/support/far_base.rb", far_base),
+            ("test/models/sub_mode_test.rb", sub),
+            ("test/models/far_mode_test.rb", far),
+        ],
+        &["SubModeTest", "FarModeTest"],
+        &|id| id.starts_with("FarModeTest#"),
+        &["tests declared by a loop over a constant an ancestor of its class may declare are not modeled; they will not run (`FarModeTest` line 4, first test at line 5: `MODES`, looked up past the ancestors of `FarModeTest`: `FarBase` is not in a registered source)"],
+    );
+}
+
+/// The methods beside a macro in `class << self` stay class methods.
+#[test]
+fn singleton_helpers_beside_a_macro_still_run() {
+    let test = r##"class HelperSingletonTest < ActiveSupport::TestCase
+  class << self
+    def gen(k)
+      test("gen #{k}") do
+        assert_equal "help", self.class.helper
+      end
+    end
+
+    def helper
+      "help"
+    end
+  end
+
+  gen(:a)
+
+  test "uses helper" do
+    assert_equal "help", self.class.helper
+  end
+end
+"##;
+    let native = matches_native(&[("test/models/helper_singleton_test.rb", test)], &["HelperSingletonTest"], &|_| false, &[]);
+    assert_eq!(native.len(), 2, "{native:#?}");
+}
+
+/// Tests share the variables of the loop body that declares them; one
+/// assigned again, or an object one changes, is a named gap.
+#[test]
+fn loop_locals_assigned_again_are_gaps() {
+    let test = r##"class LocalReassignTest < ActiveSupport::TestCase
+  [:a, :b].each do |k|
+    label = "first"
+    test "label #{k} #{label}" do
+      assert_equal "second", label
+    end
+    label = "second"
+  end
+
+  [:c].each do |k|
+    count = 1
+    test "count #{k}" do
+      count += 1
+      assert_equal 2, count
+    end
+    test "count again #{k}" do
+      count += 1
+      assert_equal 2, count
+    end
+  end
+
+  [:m].each do |k|
+    seen = []
+    test "push #{k}" do
+      seen << k
+      assert_equal [k], seen
+    end
+    test "push again #{k}" do
+      seen << k
+      assert_equal [k], seen
+    end
+  end
+
+  [:e].each do |k|
+    label = "fixed #{k}"
+    test "fixed #{k}" do
+      assert_equal "fixed e", label
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("test/models/local_reassign_test.rb", test)],
+        &["LocalReassignTest"],
+        &|id| !id.ends_with("#test_fixed_e"),
+        &[
+            "tests declared by a loop whose tests share a variable that is assigned again are not modeled; they will not run (`LocalReassignTest` line 2",
+            "tests declared by a loop whose tests share a variable that is assigned again are not modeled; they will not run (`LocalReassignTest` line 10",
+            "tests declared by a loop whose tests change an object they share are not modeled; they will not run (`LocalReassignTest` line 22",
+        ],
+    );
+    // Shared variables are why: of two tests of one iteration, the one
+    // Minitest runs second sees the other's change and fails.
+    for pair in [["count_c", "count_again_c"], ["push_m", "push_again_m"]] {
+        let failed = pair.iter().filter(|t| native[&format!("LocalReassignTest#test_{t}")].0 == "fail").count();
+        assert_eq!(failed, 1, "{pair:?}: {native:#?}");
+    }
+    assert!(["label_a_first", "label_b_first", "fixed_e"].iter().all(|t| native[&format!("LocalReassignTest#test_{t}")].0 == "pass"));
+}
+
+/// `Module#constants` is what the module's whole source defines: writes
+/// after its body (`Codes::C =`, `const_set`) make the loop a gap, and a
+/// `private_constant` is not listed.
+#[test]
+fn module_constants_count_writes_outside_the_body() {
+    let codes = "module Codes\n  A = :a\n  B = :b\nend\nCodes::C = :c\nCodes.const_set(:D, :d)\n";
+    let marks = "module Marks\n  X = :x\n  private_constant :X\n  Y = :y\nend\n";
+    let test = r##"class CodesTest < ActiveSupport::TestCase
+  Codes.constants.each do |c|
+    test "code #{c}" do
+      assert c
+    end
+  end
+
+  Marks.constants.each do |m|
+    test "mark #{m}" do
+      assert_equal :Y, m
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/codes.rb", codes), ("app/models/marks.rb", marks), ("test/models/codes_test.rb", test)],
+        &["CodesTest"],
+        &|id| id.starts_with("CodesTest#test_code_"),
+        &["(`CodesTest` line 2, first test at line 3: "],
+    );
+    assert_eq!(native.keys().filter(|id| id.starts_with("CodesTest#test_code_")).count(), 4, "{native:#?}");
+}
+
+/// The last definition of a class method is the one a call runs: a
+/// redefinition that declares nothing declares nothing.
+#[test]
+fn a_redefined_macro_declares_what_its_last_definition_does() {
+    let test = r##"class RedefTest < ActiveSupport::TestCase
+  class << self
+    def gen(k)
+      test("gen #{k}") { assert true }
+    end
+  end
+
+  class << self
+    def gen(k)
+      # replaced: declares nothing
+    end
+  end
+
+  gen(:a)
+
+  def self.other(k)
+    test("other #{k}") { assert true }
+  end
+
+  def self.other(k)
+    nil
+  end
+
+  other(:b)
+
+  test "kept" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(&[("test/models/redef_test.rb", test)], &["RedefTest"], &|_| false, &[]);
+    assert_eq!(native.keys().collect::<Vec<_>>(), ["RedefTest#test_kept"]);
+}
+
+/// A `def self.` macro used other than by a call from the class body
+/// (`send(:gen, …)`) is named; its plain calls expand.
+#[test]
+fn a_macro_used_other_than_by_a_call_is_named() {
+    let test = r##"class SelfDefTest < ActiveSupport::TestCase
+  def self.gen(k, suffix = "x")
+    test("gen #{k} #{suffix}") do
+      assert_equal "x", suffix
+      assert_kind_of Symbol, k
+    end
+  end
+
+  gen(:a)
+  gen(:b, "y")
+  send(:gen, :c)
+end
+"##;
+    matches_native(
+        &[("test/models/self_def_test.rb", test)],
+        &["SelfDefTest"],
+        &|id| id == "SelfDefTest#test_gen_c_x",
+        &["tests declared by the class method `gen` where it is used other than called from the class body are not modeled; they will not run (`SelfDefTest`, line 2: `send(:gen, :c)` at line 11)"],
+    );
+}
+
+/// Each test reads its element from the app constant, so an Array or
+/// String element is the constant's own object.
+#[test]
+fn constant_elements_keep_their_identity() {
+    let frozen = "module FrozenKinds\n  ALL = [\"a\", \"b\"].freeze\n  NESTED = [[\"x\", \"y\"]].freeze\nend\n";
+    let thawed = "module ThawedKinds\n  ALL = [\"c\"]\nend\n";
+    let test = r##"class IdentityTest < ActiveSupport::TestCase
+  FrozenKinds::ALL.each do |k|
+    test "same #{k}" do
+      assert_same FrozenKinds::ALL.find { |x| x == k }, k
+    end
+  end
+
+  FrozenKinds::NESTED.each do |pair|
+    test "pair #{pair.join}" do
+      refute_predicate pair, :frozen?
+      assert_same FrozenKinds::NESTED.first, pair
+    end
+  end
+
+  ThawedKinds::ALL.each do |k|
+    test "thawed #{k}" do
+      assert_same ThawedKinds::ALL.first, k
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/frozen_kinds.rb", frozen), ("app/models/thawed_kinds.rb", thawed), ("test/models/identity_test.rb", test)],
+        &["IdentityTest"],
+        &|_| false,
+        &[],
+    );
+    assert!(native.values().all(|(s, _)| s == "pass"), "{native:#?}");
+}
+
+/// A block in a `class << self` macro reads constants through the
+/// singleton class, not the class's includes: where they may differ,
+/// the call is a named gap.
+#[test]
+fn a_singleton_macro_block_reads_constants_through_its_singleton_class() {
+    let test = r##"class ScopeTest < ActiveSupport::TestCase
+  include LimitHelper
+
+  class << self
+    def gen(k)
+      test("gen #{k}") do
+        assert_equal 10, LIMIT
+      end
+    end
+  end
+
+  gen(:a)
+
+  test "direct" do
+    assert_equal 5, LIMIT
+  end
+end
+"##;
+    matches_native(
+        &[
+            ("config/initializers/limit.rb", "LIMIT = 10\n"),
+            ("app/models/limit_helper.rb", "module LimitHelper\n  LIMIT = 5\nend\n"),
+            ("test/models/scope_test.rb", test),
+        ],
+        &["ScopeTest"],
+        &|id| id == "ScopeTest#test_gen_a",
+        &["tests declared by a call of the class method `gen` are not modeled; they will not run (`ScopeTest` line 12: "],
+    );
+}
+
+/// A concern's macro in a helper under a test root expands with no gap,
+/// and strict ingest accepts the class.
+#[test]
+fn a_concern_macro_from_a_test_root_helper_has_no_gap() {
+    let test = "class ConcernMacroTest < ActiveSupport::TestCase\n  include Access::PermissionHelper\n\n  test_permission(Reasons, :alpha, sufficient: [:a, :b], insufficient: [:a])\nend\n";
+    let native = native_results(&[REASONS, TEST_GENERATOR, PERMISSION_HELPER, test], &["ConcernMacroTest"]);
+    assert_eq!(native.len(), 2, "{native:#?}");
+    let (emitted, _errors) = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("app/models/reasons.rb", REASONS)
+        .write("lib/test_generator.rb", TEST_GENERATOR)
+        .write("test/helpers/access/permission_helper.rb", PERMISSION_HELPER)
+        .write("test/models/concern_macro_test.rb", test)
+        .emit(BuildTarget::Ruby);
+    let listed = index(&emitted);
+    let mut tests: Vec<String> = listed["ConcernMacroTest"].1.iter().map(|t| format!("ConcernMacroTest#{t}")).collect();
+    tests.sort();
+    assert_eq!(tests, native.keys().cloned().collect::<Vec<_>>());
 }
