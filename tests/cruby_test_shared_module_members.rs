@@ -255,15 +255,17 @@ fn rows(text: &str) -> BTreeMap<String, (String, u64)> {
     map
 }
 
-/// The classes run by native Minitest on Core's pinned ActiveSupport.
-fn native() -> BTreeMap<String, (String, u64)> {
+/// `classes` run by native Minitest on Core's pinned ActiveSupport, the
+/// `support` files loaded in order, then `tests`.
+fn native(label: &str, support: &[(&str, &str)], tests: &str, classes: &[&str]) -> BTreeMap<String, (String, u64)> {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
-    let dir = std::env::temp_dir().join(format!("rh_test_shared_module_members_native_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rh_test_shared_module_members_native_{label}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    for (path, text) in SUPPORT.iter().copied().chain([("tests.rb", TESTS)]) {
+    for (path, text) in support.iter().copied().chain([("tests.rb", tests)]) {
         std::fs::write(dir.join(path), text).unwrap();
     }
+    let files: Vec<&str> = support.iter().map(|(path, _)| *path).chain(["tests.rb"]).collect();
     let program = format!(
         r##"require {oracle:?}
 RailsOracle.activate("activesupport", minitest: "5.27.0")
@@ -273,7 +275,7 @@ Minitest.seed = 4242
 require "active_support/all"
 require "active_support/test_case"
 abort "native: activesupport is not Core's" unless Gem.loaded_specs["activesupport"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)
-%w[faults_helper.rb fixtures_helper.rb options_helper.rb catalog_helper.rb tests.rb].each {{ |f| load f }}
+{files:?}.each {{ |f| load f }}
 {classes:?}.each do |class_name|
   klass = Object.const_get(class_name)
   klass.runnable_methods.sort.each do |name|
@@ -283,7 +285,6 @@ abort "native: activesupport is not Core's" unless Gem.loaded_specs["activesuppo
   end
 end
 "##,
-        classes = CLASSES,
     );
     std::fs::write(dir.join("native.rb"), program).unwrap();
     let out = Command::new("ruby")
@@ -298,9 +299,78 @@ end
     rows(&stdout)
 }
 
+/// The emitted CRuby tree's index rows for `classes` and their results,
+/// run in one process in the order of `classes`, and the emitted sources.
+fn emitted(support: &[(&str, &str)], tests: &str, classes: &[&str], native: &BTreeMap<String, (String, u64)>) -> String {
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", SCHEMA)
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/post.rb", "class Post < ApplicationRecord\nend\n")
+        .write("roundhouse.yml", "test_paths:\n  - test/support\n")
+        .write("test/models/shared_module_members_test.rb", tests);
+    for (path, text) in support {
+        app = app.write(&format!("test/support/{path}"), text);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(emitted.join("test/roundhouse_tests.json")).expect("test index")).unwrap();
+    let listed: Vec<&Value> = index["sources"].as_array().unwrap().iter().flat_map(|s| s["classes"].as_array().unwrap().iter()).collect();
+    let mut indexed: Vec<String> = listed
+        .iter()
+        .filter(|c| classes.contains(&c["class"].as_str().unwrap_or_default()))
+        .flat_map(|c| {
+            let class = c["class"].as_str().unwrap().to_string();
+            c["tests"].as_array().into_iter().flatten().map(move |t| format!("{class}#{}", t.as_str().unwrap()))
+        })
+        .collect();
+    indexed.sort();
+    assert_eq!(indexed, native.keys().cloned().collect::<Vec<_>>(), "index lists exactly the native ids:\n{index:#}");
+
+    // The classes run in one process, in the native order, so the state
+    // a module keeps is shared as natively.
+    let mut files: Vec<String> = classes
+        .iter()
+        .map(|class| {
+            listed
+                .iter()
+                .find(|c| c["class"] == *class)
+                .and_then(|c| c["file"].as_str())
+                .unwrap_or_else(|| panic!("{class} is not in the index"))
+                .to_string()
+        })
+        .collect();
+    files.dedup();
+    let mut sources = String::new();
+    for file in &files {
+        sources.push_str(&std::fs::read_to_string(emitted.join(file)).expect("emitted test file"));
+    }
+    for (path, _) in support {
+        if let Ok(text) = std::fs::read_to_string(emitted.join("test/support").join(path)) {
+            sources.push_str(&format!("\n# test/support/{path}\n{text}"));
+        }
+    }
+    let out_file = emitted.join("results.jsonl");
+    let out = emit_and_run::ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; ARGV.each {{ |f| load f }}", minitest_version())])
+        .args(&files)
+        .current_dir(&emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &out_file)
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("emitted CRuby");
+    let log = format!("{sources}\nstdout={}\nstderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{log}");
+    let text = std::fs::read_to_string(&out_file).unwrap_or_else(|e| panic!("no results: {e}\n{log}"));
+    assert_eq!(rows(&text), *native, "emitted results vs native\n{log}");
+    sources
+}
+
 #[test]
 fn a_shared_modules_own_classes_modules_and_state_run_as_natively() {
-    let native = native();
+    let native = native("members", &SUPPORT, TESTS, &CLASSES);
     let expected: BTreeMap<String, (String, u64)> = [
         ("Other::FaultsTest#test_a_helper_builds_the_module's_nested_class", 2),
         ("Other::FaultsTest#test_the_included_setup_builds_the_module's_sibling_class", 2),
@@ -314,65 +384,108 @@ fn a_shared_modules_own_classes_modules_and_state_run_as_natively() {
     .map(|(id, n)| (id.to_string(), ("pass".to_string(), *n)))
     .collect();
     assert_eq!(native, expected, "native oracle");
-
-    let mut app = emit_and_run::empty_app()
-        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
-        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
-        .write("db/schema.rb", SCHEMA)
-        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
-        .write("app/models/post.rb", "class Post < ApplicationRecord\nend\n")
-        .write("roundhouse.yml", "test_paths:\n  - test/support\n")
-        .write("test/models/shared_module_members_test.rb", TESTS);
-    for (path, text) in SUPPORT {
-        app = app.write(&format!("test/support/{path}"), text);
-    }
-    let (emitted, errors) = app.emit(BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{errors:#?}");
-
-    let index: Value = serde_json::from_str(&std::fs::read_to_string(emitted.join("test/roundhouse_tests.json")).expect("test index")).unwrap();
-    let classes: Vec<&Value> = index["sources"].as_array().unwrap().iter().flat_map(|s| s["classes"].as_array().unwrap().iter()).collect();
-    let mut indexed: Vec<String> = classes
-        .iter()
-        .filter(|c| CLASSES.contains(&c["class"].as_str().unwrap_or_default()))
-        .flat_map(|c| {
-            let class = c["class"].as_str().unwrap().to_string();
-            c["tests"].as_array().into_iter().flatten().map(move |t| format!("{class}#{}", t.as_str().unwrap()))
-        })
-        .collect();
-    indexed.sort();
-    assert_eq!(indexed, native.keys().cloned().collect::<Vec<_>>(), "index lists exactly the native ids:\n{index:#}");
-
-    // The classes run in one process, in the native order, so the state
-    // the fixtures module keeps is shared as natively.
-    let files: Vec<String> = CLASSES
-        .iter()
-        .map(|class| {
-            classes
-                .iter()
-                .find(|c| c["class"] == *class)
-                .and_then(|c| c["file"].as_str())
-                .unwrap_or_else(|| panic!("{class} is not in the index"))
-                .to_string()
-        })
-        .collect();
-    let mut sources = String::new();
-    for file in &files {
-        sources.push_str(&std::fs::read_to_string(emitted.join(file)).expect("emitted test file"));
-    }
+    let sources = emitted(&SUPPORT, TESTS, &CLASSES, &native);
     assert!(sources.contains("::Faults::Receiver.new"), "the block's bare `Receiver` is the module's lexical one:\n{sources}");
-    let out_file = emitted.join("results.jsonl");
-    let mut files = files;
-    files.dedup();
-    let out = emit_and_run::ruby()
-        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; ARGV.each {{ |f| load f }}", minitest_version())])
-        .args(&files)
-        .current_dir(&emitted)
-        .env("ROUNDHOUSE_TEST_RESULTS", &out_file)
-        .env("BLOG_DB", ":memory:")
-        .output()
-        .expect("emitted CRuby");
-    let log = format!("{sources}\nstdout={}\nstderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "{log}");
-    let text = std::fs::read_to_string(&out_file).unwrap_or_else(|e| panic!("no results: {e}\n{log}"));
-    assert_eq!(rows(&text), native, "emitted results vs native\n{log}");
+}
+
+/// A library module that includes a plain module (natively in its own
+/// ancestry, so its constants are the module's) and a concern (deferred
+/// to each includer, so not in the module's ancestry), with helpers of
+/// its own: the module keeps the plain include and its helpers, as
+/// natively, and the includer still gets both setups.
+const CONSTS_HELPER: &str = r##"module Shop
+  module Consts
+    DEPTH = 7
+  end
+
+  module DepConcern
+    extend ActiveSupport::Concern
+
+    included do
+      setup do
+        @dep = true
+      end
+    end
+  end
+end
+"##;
+
+const INC_HELPER: &str = r##"module Shop
+  module IncHelper
+    extend ActiveSupport::Concern
+    include Consts
+    include DepConcern
+
+    def self.depth
+      DEPTH
+    end
+
+    included do
+      setup do
+        @depth = IncHelper.depth
+      end
+    end
+
+    def helper_depth
+      DEPTH
+    end
+
+    private
+
+    def hidden_depth
+      DEPTH + 1
+    end
+  end
+end
+"##;
+
+const INC_TESTS: &str = r##"class IncHelperTest < ActiveSupport::TestCase
+  include Shop::IncHelper
+
+  test "the module's constants come through the plain module it includes" do
+    assert_equal 7, Shop::IncHelper::DEPTH
+    assert_equal 7, Shop::IncHelper.const_get(:DEPTH)
+  end
+
+  test "the plain module is in the module's own ancestry and the concern is not" do
+    assert Shop::IncHelper.include?(Shop::Consts)
+    refute Shop::IncHelper.include?(Shop::DepConcern)
+  end
+
+  test "the module keeps its helpers" do
+    assert_includes Shop::IncHelper.instance_methods, :helper_depth
+    assert_includes Shop::IncHelper.private_instance_methods, :hidden_depth
+    assert_includes Shop::IncHelper.instance_methods(false), :helper_depth
+  end
+
+  test "the includer runs both setups and reads the helpers" do
+    assert_equal 7, @depth
+    assert @dep
+    assert_equal 7, helper_depth
+    assert_equal 18, hidden_depth
+  end
+
+  def hidden_depth
+    super + 10
+  end
+end
+"##;
+
+#[test]
+fn a_library_modules_own_includes_and_helpers_run_as_natively() {
+    let support = [("consts_helper.rb", CONSTS_HELPER), ("inc_helper.rb", INC_HELPER)];
+    let classes = ["IncHelperTest"];
+    let native = native("includes", &support, INC_TESTS, &classes);
+    let expected: BTreeMap<String, (String, u64)> = [
+        ("IncHelperTest#test_the_module's_constants_come_through_the_plain_module_it_includes", 2),
+        ("IncHelperTest#test_the_plain_module_is_in_the_module's_own_ancestry_and_the_concern_is_not", 2),
+        // `assert_includes` asserts `include?` is there, then the member.
+        ("IncHelperTest#test_the_module_keeps_its_helpers", 6),
+        ("IncHelperTest#test_the_includer_runs_both_setups_and_reads_the_helpers", 4),
+    ]
+    .iter()
+    .map(|(id, n)| (id.to_string(), ("pass".to_string(), *n)))
+    .collect();
+    assert_eq!(native, expected, "native oracle");
+    emitted(&support, INC_TESTS, &classes, &native);
 }
