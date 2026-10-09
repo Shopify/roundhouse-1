@@ -14492,17 +14492,22 @@ fn calls_bare(src: &str, names: &[&str]) -> bool {
 /// tree carries the port. The CRuby runner calls `after_teardown`, which
 /// travels back, after each test's teardown.
 fn use_ported_time_helpers(files: &mut [(String, String)]) -> Result<(), String> {
-    const STAND_IN: &str = "  def travel_to(target)\n    ActiveSupport.travel(target.to_i - Time.now.to_i)\n    return unless block_given?\n    begin\n      yield\n    ensure\n      travel_back\n    end\n  end\n\n  def travel(duration)\n    travel_to(Time.now + duration.to_i)\n  end\n\n  def travel_back\n    ActiveSupport.travel(0)\n  end\n";
+    const TRAVEL_STAND_IN: &str = "  def travel_to(target)\n    ActiveSupport.travel(target.to_i - Time.now.to_i)\n    return unless block_given?\n    begin\n      yield\n    ensure\n      travel_back\n    end\n  end\n\n  # Rails' `travel(duration) { … }` travels for the block and back.\n  # Taking no block here dropped it unrun — a test whose body sat in the\n  # block passed without executing a line of it.\n  def travel(duration)\n    travel_to(Time.now + duration.to_i)\n    return unless block_given?\n    begin\n      yield\n    ensure\n      travel_back\n    end\n  end\n\n  def travel_back\n    ActiveSupport.travel(0)\n  end\n";
+    // The stand-in's `freeze_time` (an `ActiveSupport.freeze` instant)
+    // goes too: defined on the class, it would shadow the included port's.
+    const FREEZE_STAND_IN: &str = "  # Rails' `freeze_time`: `travel_to(Time.now)`, held still — every\n  # read until `travel_back` (the block's end, or the next test's\n  # setup) answers the same whole second.\n  def freeze_time\n    ActiveSupport.freeze(ActiveSupport.now.to_i)\n    return unless block_given?\n    begin\n      yield\n    ensure\n      travel_back\n    end\n  end\n\n";
     let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
         return Ok(());
     };
-    if helper.matches(STAND_IN).count() != 1 {
+    if helper.matches(TRAVEL_STAND_IN).count() != 1 || helper.matches(FREEZE_STAND_IN).count() != 1 {
         return Err("use_ported_time_helpers: expected one TimeHelpers stand-in in test/test_helper.rb".into());
     }
-    *helper = helper.replace(
-        STAND_IN,
-        "  # (The stand-in is replaced on this tree: the app or its tests use\n  # ActiveSupport's own TimeHelpers, runtime/active_support_testing_time_helpers.rb.)\n  include ActiveSupport::Testing::TimeHelpers\n",
-    );
+    *helper = helper
+        .replace(
+            TRAVEL_STAND_IN,
+            "  # (The stand-in is replaced on this tree: the app or its tests use\n  # ActiveSupport's own TimeHelpers, runtime/active_support_testing_time_helpers.rb.)\n  include ActiveSupport::Testing::TimeHelpers\n",
+        )
+        .replace(FREEZE_STAND_IN, "");
     Ok(())
 }
 
@@ -16547,6 +16552,7 @@ mod tests {
         use_ported_time_helpers(&mut with_harness).unwrap();
         assert!(with_harness[0].1.contains("  include ActiveSupport::Testing::TimeHelpers\n"));
         assert!(!with_harness[0].1.contains("ActiveSupport.travel(target.to_i"));
+        assert!(!with_harness[0].1.contains("ActiveSupport.freeze(ActiveSupport.now"), "the stand-in freeze_time would shadow the port's");
         assert!(use_ported_time_helpers(&mut with_harness).is_err(), "the stand-in is replaced once");
 
         drop_harness_memory_store(&mut files).unwrap();

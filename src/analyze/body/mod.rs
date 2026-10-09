@@ -4914,6 +4914,9 @@ mod runtime_base {
                 ("after_create", true),
                 ("around_save", true),
                 ("before_destroy", true),
+                // connection.rb's schema reflection and sanitizers.
+                ("sanitize_sql_like", true),
+                ("base_class", true),
             ] {
                 assert!(answers(method, class_side, true), "{method} (class side: {class_side})");
             }
@@ -4924,8 +4927,7 @@ mod runtime_base {
             for (method, class_side) in [
                 ("some_unknown_ar_api", true),
                 ("some_unknown_ar_api", false),
-                ("sanitize_sql_like", true),
-                ("base_class", true),
+                ("sanitize_sql_where_like", true),
                 // Class side only: an instance has no `table_name`.
                 ("table_name", false),
                 ("current_transaction", false),

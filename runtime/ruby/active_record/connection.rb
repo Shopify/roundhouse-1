@@ -686,7 +686,9 @@ module ActiveRecord
         raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: #{self.name}.polymorphic_class_for(#{name.inspect}): " \
           "with `store_full_class_name = false` Rails resolves the name relative to the class (compute_type), which is not ported"
       end
-      Object.const_get(name)
+      # Any constant at all: the answer is untyped by nature.
+      namespace = Object #: untyped
+      namespace.const_get(name)
     end
 
     # The model's column name => cast-type spec table. Emitted models
