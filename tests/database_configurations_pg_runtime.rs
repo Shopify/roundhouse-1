@@ -181,6 +181,8 @@ end
 
 /// The Rails classes no tree carries, refused by name.
 const REFUSED: &str = r##"class FrameworkReader
+  # Carried on the PostgreSQL tree since Core's own fixture code
+  # subclasses them (runtime/spinel/cruby/active_record_fixture_set.rb).
   def self.fixtures
     ActiveRecord::FixtureSet.reset_cache
   end
@@ -229,8 +231,6 @@ fn configurations_type_on_postgresql_and_framework_classes_are_refused_by_name()
     assert!(configurations.is_empty(), "{configurations:#?}");
     let refusals: Vec<&String> = errors.iter().copied().filter(|e| e.contains("constant not supported")).collect();
     for (name, reason) in [
-        ("ActiveRecord::FixtureSet", "Rails' fixture loader is not carried"),
-        ("ActiveRecord::Fixture::FormatError", "Rails' fixture loader is not carried"),
         ("ActiveRecord::Tasks::DatabaseTasks", "Rails' database tasks are not carried"),
         ("ActiveRecord::ConnectionAdapters::SqlTypeMetadata", "the adapter's schema reflection objects are not carried"),
         ("ActiveRecord::Reflection::AggregateReflection", "Rails' reflection classes are not carried"),
@@ -238,8 +238,9 @@ fn configurations_type_on_postgresql_and_framework_classes_are_refused_by_name()
         let expected = format!("constant not supported (all targets): {name} — {reason}");
         assert!(refusals.iter().any(|e| e.contains(&expected)), "no {expected:?} in:\n{refusals:#?}");
     }
-    assert_eq!(refusals.len(), 5, "{refusals:#?}");
+    assert_eq!(refusals.len(), 3, "{refusals:#?}");
     assert!(!errors.iter().any(|e| e.contains("ThroughReflection")), "{errors:#?}");
+    assert!(!errors.iter().any(|e| e.contains("Fixture")), "{errors:#?}");
 }
 
 /// Without the PostgreSQL runtime nothing carries them: the reads stay
@@ -252,12 +253,17 @@ fn configurations_stay_a_named_gap_without_the_postgresql_runtime() {
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
         ("app/models/configuration_reader.rb", CORE_SHAPES),
+        ("app/models/framework_reader.rb", REFUSED),
     ];
     let (_emitted, errors) = overlay(&files).emit(roundhouse::project::BuildTarget::Ruby);
     for expected in [
         "ActiveRecord::Base not supported (all targets): configurations lacks a shared runtime/lowering implementation",
         "constant not supported (all targets): ActiveRecord::DatabaseConfigurations::HashConfig",
         "constant not supported (all targets): ActiveRecord::TestFixtures",
+        "runtime_constant not supported (ruby): ActiveRecord::FixtureSet is declared by the Ruby-family runtime \
+         (runtime/active_record_fixture_set.rb), which ruby does not emit",
+        "runtime_constant not supported (ruby): ActiveRecord::Fixture::FormatError is declared by the Ruby-family runtime \
+         (runtime/active_record_fixture_set.rb), which ruby does not emit",
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "no {expected:?} in:\n{}", errors.join("\n"));
     }

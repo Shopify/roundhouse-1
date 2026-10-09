@@ -4547,6 +4547,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let callbacks = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_callbacks.rb")
         .map_err(|e| format!("read Active Record callbacks runtime: {e}"))?;
     files.push(("runtime/active_record_callbacks.rb".into(), callbacks));
+    // ActiveRecord::FixtureSet, its File and RenderContext, and
+    // ActiveRecord::Fixture (activerecord 8.2.0.alpha fixtures.rb,
+    // fixture_set/file.rb), which Active Record autoloads: an app's own
+    // fixture code subclasses them as app/models.rb loads.
+    let fixture_set = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_fixture_set.rb")
+        .map_err(|e| format!("read Active Record fixture set runtime: {e}"))?;
+    files.push(("runtime/active_record_fixture_set.rb".into(), fixture_set));
     // ActiveSupport::StringInquirer (activesupport 8.2.0.alpha
     // string_inquirer.rb), verbatim.
     let inquirer = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inquirer.rb")
@@ -4766,6 +4773,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                             "active_record_active_model",
                             "active_record_core",
                             "active_record_callbacks",
+                            "active_record_fixture_set",
                             "active_support_string_inquirer",
                         ])
                         .map(|port| format!("require_relative \"{port}\"\n")),
