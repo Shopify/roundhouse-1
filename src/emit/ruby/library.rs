@@ -8303,6 +8303,8 @@ fn emit_library_class_decl_inner(
     // bodies' constant refs into LOAD time with it — `Sound::BUILTIN`
     // calls `initialize`, which reads `Sound::Image`. Those refs would
     // otherwise be classified body-only and left to the aggregator.
+    // Only the bodies it runs (`load_time_methods`): a T::Enum's values
+    // run `initialize`, not the `graphql_type` that names other files.
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc, app);
     // State the source body writes on the class object (`@value = 1`,
     // `@value ||= 7`) is read by the constants, calls and defs between
@@ -8313,7 +8315,7 @@ fn emit_library_class_decl_inner(
     // source has it, after the defs above it; one that calls them, or an
     // initializer that does, runs those method bodies at load.
     let ordered_state = ordered_class_state(lc, app);
-    let load_time_bodies = !deferred.is_empty() || (ordered_state && initializers_call_self);
+    let load_time_methods = load_time_methods(lc, app, &deferred, ordered_state, initializers_call_self);
     if ordered_state {
         eager = (0..lc.constants.len()).collect();
         deferred.clear();
@@ -8431,7 +8433,7 @@ fn emit_library_class_decl_inner(
             .find(|(n, _)| n == first)
             .map(|(_, a)| a.clone())
             .or_else(|| require_path_for_body_const(path, app, name))?;
-        if !load_time && !load_time_bodies && anchor.starts_with("app/models/") {
+        if !load_time && anchor.starts_with("app/models/") {
             return None;
         }
         (anchor != self_anchor).then(|| relpath(&out_dir, &anchor))
@@ -8440,6 +8442,18 @@ fn emit_library_class_decl_inner(
         let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
         walk_const_paths(e, &mut paths);
         paths.iter().filter_map(|p| resolve(p, load_time)).collect()
+    };
+    // Code that runs as the file loads (a constant's value, a
+    // class-variable initializer, a method body it runs), whose stored
+    // closures do not: `OPTIONS = { type: proc { Widget } }` reads
+    // `Widget` when the proc is called (`walk_load_time_paths`).
+    let resolve_load = |e: &Expr| -> BTreeSet<String> {
+        let mut now: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
+        walk_load_time_paths(e, &mut now, &mut later);
+        let mut out: BTreeSet<String> = now.iter().filter_map(|p| resolve(p, true)).collect();
+        out.extend(later.iter().filter(|p| !now.contains(*p)).filter_map(|p| resolve(p, false)));
+        out
     };
     // Every require the file needs at its TOP: the class-body calls and
     // deferred constants (both run at load), and the method bodies.
@@ -8486,20 +8500,24 @@ fn emit_library_class_decl_inner(
     for call in lc.unknown_calls.iter().filter(|_| !railtie).filter(replayed) {
         let mut now: BTreeSet<Vec<String>> = BTreeSet::new();
         let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
-        walk_class_body_call_paths(call, &mut now, &mut later);
+        walk_load_time_paths(call, &mut now, &mut later);
         body_requires.extend(now.iter().filter_map(|p| resolve(p, true)));
         body_requires.extend(later.iter().filter(|p| !now.contains(*p)).filter_map(|p| resolve(p, false)));
     }
     for &i in &deferred {
-        body_requires.extend(resolve_all(&lc.constants[i].1, true));
+        body_requires.extend(resolve_load(&lc.constants[i].1));
     }
     // A class-variable initializer runs at load, after the constants
     // (an ordered body's go with its constants, below).
     for init in lc.class_ivar_initializers.iter().filter(|_| !ordered_state) {
-        body_requires.extend(resolve_all(init, true));
+        body_requires.extend(resolve_load(init));
     }
-    for m in &lc.methods {
-        body_requires.extend(resolve_all(&m.body, false));
+    for (i, m) in lc.methods.iter().enumerate() {
+        if load_time_methods.as_ref().is_none_or(|run| run.contains(&i)) {
+            body_requires.extend(resolve_load(&m.body));
+        } else {
+            body_requires.extend(resolve_all(&m.body, false));
+        }
     }
     // …and each eager constant's own, in order, because WHERE those go
     // matters. A class body runs top to bottom, and a required file can
@@ -8531,15 +8549,15 @@ fn emit_library_class_decl_inner(
     let per_const: Vec<BTreeSet<String>> = if ordered_state {
         Vec::new()
     } else {
-        eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect()
+        eager.iter().map(|&i| resolve_load(&lc.constants[i].1)).collect()
     };
     let readers = constant_readers(lc, app, &resolve);
     if ordered_state {
         let per_body: Vec<BTreeSet<String>> = state_body
             .iter()
             .map(|item| match item {
-                StateItem::Constant(i) => resolve_all(&lc.constants[*i].1, true),
-                StateItem::Initializer(i) => resolve_all(&lc.class_ivar_initializers[*i], true),
+                StateItem::Constant(i) => resolve_load(&lc.constants[*i].1),
+                StateItem::Initializer(i) => resolve_load(&lc.class_ivar_initializers[*i]),
                 StateItem::Method(_) => BTreeSet::new(),
             })
             .collect();
@@ -10751,6 +10769,157 @@ fn included_hook_may_define(module: &LibraryClass, method: &str) -> bool {
     };
     walk(&hook.body, Body::Hook, &visit);
     hit.get()
+}
+
+/// The methods of `lc` (indexes into `lc.methods`) whose bodies run
+/// while its file loads, so that what they reference is a load-time
+/// need of the file, like a constant's value. Only a class whose load
+/// runs its own methods has any (`partition_deferred_constants`): a
+/// constant that dispatches to the class, or, in a body written in
+/// source order, a class-variable initializer that does. They are the
+/// methods that code calls (`new` runs `initialize`; a name it sends,
+/// passes as a symbol, `method(:x)` or `&:x`), what those call in turn,
+/// and the hooks Ruby calls on its own (`to_s` for an interpolation,
+/// `hash` and `eql?` for a Hash key, and so on). A closure the code
+/// only stores runs later and adds none.
+///
+/// Core's `Merchandising::Metafields::FileReferenceType::FileTypes` is a
+/// T::Enum: its values (`Image = new("Image")`) run `initialize`, not
+/// `graphql_type` or `model_class`, whose `Merchandising::Media` and
+/// `Merchandising::GraphApi::Admin::Model3dEnvironmentImage` are read
+/// when those are called. Counting every body made the file require
+/// media.rb, and media.rb's load reaches
+/// `StoreLocalization::LocalizableContentTypes`, which requires
+/// file_reference_type.rb back: a circular require natively absent.
+///
+/// `None` when the methods that run cannot be told from the code: a
+/// dynamic dispatch (`send(name)`), or a constant that hands control to
+/// another app class at load (`Registry.build(self)`), whose code can
+/// call any method of this one. Every body then counts.
+fn load_time_methods(
+    lc: &LibraryClass,
+    app: &App,
+    deferred: &[usize],
+    ordered_state: bool,
+    initializers_call_self: bool,
+) -> Option<BTreeSet<usize>> {
+    if deferred.is_empty() && !(ordered_state && initializers_call_self) {
+        return Some(BTreeSet::new());
+    }
+    /// The methods Ruby itself calls on an object or class as code runs.
+    const IMPLICIT: &[&str] = &[
+        "initialize", "initialize_copy", "to_s", "inspect", "to_str", "to_ary", "to_a", "to_hash", "to_h",
+        "to_proc", "hash", "eql?", "==", "===", "<=>", "each", "coerce", "method_missing",
+        "respond_to_missing?", "respond_to?", "const_missing", "method_added", "singleton_method_added",
+    ];
+    const DYNAMIC: &[&str] = &[
+        "send", "public_send", "__send__", "try", "try!", "method", "public_method", "instance_method",
+        "public_instance_method",
+    ];
+    struct Walk<'a> {
+        own: crate::det::HashSet<&'a str>,
+        class_name: &'a str,
+        app: &'a App,
+        reached: BTreeSet<String>,
+        opaque: bool,
+    }
+    impl Walk<'_> {
+        fn reach(&mut self, name: &str) {
+            if self.own.contains(name) {
+                self.reached.insert(name.to_string());
+            }
+        }
+        fn is_own(&self, recv: &Option<Expr>) -> bool {
+            match recv.as_ref().map(|r| &*r.node) {
+                None | Some(ExprNode::SelfRef) => true,
+                Some(ExprNode::Const { path }) => {
+                    path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::")
+                        == self.class_name
+                }
+                _ => false,
+            }
+        }
+        /// `seed`: the constant or initializer itself, not a method
+        /// body it runs.
+        fn walk(&mut self, e: &Expr, seed: bool) {
+            match &*e.node {
+                // A closure literal is stored, not run.
+                ExprNode::Lambda { .. } => {}
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => self.reach(value.as_str()),
+                ExprNode::MethodRef { name, .. } => self.reach(name.as_str()),
+                ExprNode::Send { recv, method, args, block, .. } => {
+                    let m = method.as_str();
+                    if m == "new" && self.is_own(recv) {
+                        self.reach("initialize");
+                    }
+                    self.reach(m);
+                    if DYNAMIC.contains(&m) {
+                        match args.first().map(|a| &*a.node) {
+                            Some(ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }) => {}
+                            Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => self.reach(value),
+                            _ => self.opaque = true,
+                        }
+                    }
+                    if seed {
+                        if let Some(ExprNode::Const { path }) = recv.as_ref().map(|r| &*r.node) {
+                            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                            let name = name.trim_start_matches("::");
+                            if name != self.class_name && is_model_or_library_class(name, self.app) {
+                                self.opaque = true;
+                            }
+                        }
+                    }
+                    if let Some(r) = recv {
+                        self.walk(r, seed);
+                    }
+                    for a in args {
+                        self.walk(a, seed);
+                    }
+                    if let Some(b) = block.as_ref().filter(|_| !stores_block(recv, m)) {
+                        match &*b.node {
+                            ExprNode::Lambda { body, .. } => self.walk(body, seed),
+                            _ => self.walk(b, seed),
+                        }
+                    }
+                }
+                _ => e.node.for_each_child(&mut |child| self.walk(child, seed)),
+            }
+        }
+    }
+    let mut walk = Walk {
+        own: lc.methods.iter().map(|m| m.name.as_str()).collect(),
+        class_name: lc.name.0.as_str().trim_start_matches("::"),
+        app,
+        reached: BTreeSet::new(),
+        opaque: false,
+    };
+    for &i in deferred {
+        walk.walk(&lc.constants[i].1, true);
+    }
+    for init in &lc.class_ivar_initializers {
+        walk.walk(init, true);
+    }
+    for name in IMPLICIT {
+        walk.reach(name);
+    }
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    while let Some(name) = walk.reached.iter().find(|n| !done.contains(*n)).cloned() {
+        for m in lc.methods.iter().filter(|m| m.name.as_str() == name) {
+            walk.walk(&m.body, false);
+        }
+        done.insert(name);
+    }
+    if walk.opaque {
+        return None;
+    }
+    Some(
+        lc.methods
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| walk.reached.contains(m.name.as_str()))
+            .map(|(i, _)| i)
+            .collect(),
+    )
 }
 
 /// Split a class's constants into the ones that can be initialized
@@ -14325,8 +14494,10 @@ fn waits_on_its_constant(self_anchor: &str, anchor: &str, owner: &str, app: &App
 /// require cycle, each mapped to its cycle: the strongly connected
 /// components of more than one file, over what each class reads while
 /// its file loads. That is its superclass, its includes, its class-body
-/// calls (not a closure a call only stores), its constants' values and
-/// its class-variable initializers. A method body is read later.
+/// calls, its constants' values, its class-variable initializers (none
+/// of them the closures they only store, `walk_load_time_paths`) and
+/// the method bodies those run at load (`load_time_methods`). Any
+/// other method body is read later.
 fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
     let build = || {
         let files = require_guard_owners(app);
@@ -14356,13 +14527,23 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
             paths.extend(lc.parent.iter().map(split));
             paths.extend(lc.includes.iter().map(split));
             for call in &lc.unknown_calls {
-                walk_class_body_call_paths(call, &mut paths, &mut later);
+                walk_load_time_paths(call, &mut paths, &mut later);
             }
             for (_, value) in &lc.constants {
-                walk_const_paths(value, &mut paths);
+                walk_load_time_paths(value, &mut paths, &mut later);
             }
             for init in &lc.class_ivar_initializers {
-                walk_const_paths(init, &mut paths);
+                walk_load_time_paths(init, &mut paths, &mut later);
+            }
+            if !lc.constants.is_empty() || !lc.class_ivar_initializers.is_empty() {
+                let (_, deferred, initializers_call_self) = partition_deferred_constants(lc, app);
+                let ordered = initializers_call_self && ordered_class_state(lc, app);
+                let run = load_time_methods(lc, app, &deferred, ordered, initializers_call_self);
+                for (i, m) in lc.methods.iter().enumerate() {
+                    if run.as_ref().is_none_or(|run| run.contains(&i)) {
+                        walk_load_time_paths(&m.body, &mut paths, &mut later);
+                    }
+                }
             }
             for path in &paths {
                 let Some(to) = require_path_for_body_const(path, app, name) else { continue };
@@ -14730,158 +14911,216 @@ fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: 
     (requires, after)
 }
 
-/// A class-body call's constant references, split into the ones its
-/// load reads (`now`) and the ones inside a closure literal it only
-/// passes along (`later`): `scope :x, -> { Plan.active }` stores the
-/// lambda, so `Plan` is read when the scope runs, not when the body
-/// does. A block (`included do ... end`) may run at once, so it counts
-/// as `now`, as does everything that is not an argument.
-fn walk_class_body_call_paths(e: &Expr, now: &mut BTreeSet<Vec<String>>, later: &mut BTreeSet<Vec<String>>) {
-    match &*e.node {
-        ExprNode::Lambda { .. } => walk_const_paths(e, later),
-        ExprNode::Send { recv, args, block, .. } => {
-            if let Some(r) = recv {
-                walk_const_paths(r, now);
+/// The constant references of code that runs as its file loads (a
+/// class-body call, a constant's value, a class-variable initializer,
+/// a method body that load runs), split into the ones it reads (`now`)
+/// and the ones inside a closure it only stores (`later`). `scope :x,
+/// -> { Plan.active }` stores the lambda, and Core's Shop::Extension
+/// `mark_as_translatable :meta_title, type: proc {
+/// StoreLocalization::LocalizableContentTypes::SingleLineTextFieldType }`
+/// stores the proc, so those constants are read when the closure is
+/// called, not when the body runs; a require of their files at the top
+/// of shop.rb closed a circular require Ruby does not have.
+///
+/// Stored: a closure literal (`-> { }`), the block of `proc`, `lambda`
+/// or `Proc.new` (`stores_block`), and the block of `define_method`,
+/// which is a method body. Any other block (`included do ... end`,
+/// `map { }`) may run at once, so it is walked like the code around it,
+/// closures stored inside it included. A closure literal that a call
+/// is sent to (`-> { X }.call`) or that is applied (`-> { X }.()`) runs
+/// there, so it counts as read.
+fn walk_load_time_paths(e: &Expr, now: &mut BTreeSet<Vec<String>>, later: &mut BTreeSet<Vec<String>>) {
+    walk_paths(e, now, Some(later));
+}
+
+/// Every constant path `e` references (both halves of
+/// `walk_load_time_paths`).
+pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
+    walk_paths(e, out, None);
+}
+
+/// Whether a call's block is stored rather than run where the call
+/// stands (`walk_load_time_paths`): `proc { }`, `lambda { }` and
+/// `Proc.new { }` (also on `Kernel`), `define_method(:x) { }`, whose
+/// block is a method body, and Sorbet's `T.type_alias { }`, which
+/// sorbet-runtime (and the runtime's `SorbetRuntimeCheck.type_alias`,
+/// its lowering) evaluates on first use. Core's
+/// `Merchandising::Taxonomy::Node::Alias = T.type_alias { T.any(...,
+/// Taxonomy::Node::Decorator, ...) }` otherwise made node.rb require
+/// node/decorator.rb, whose `ACCEPTED_CLASSES = [Node, ...]` reads the
+/// node back as it loads: a circular require.
+fn stores_block(recv: &Option<Expr>, method: &str) -> bool {
+    let recv_is = |names: &[&str]| {
+        recv.as_ref().is_some_and(|r| match &*r.node {
+            ExprNode::Const { path } => {
+                let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty() && *s != "::").collect();
+                matches!(segments.as_slice(), [name] if names.contains(name))
             }
-            for a in args {
-                walk_class_body_call_paths(a, now, later);
-            }
-            if let Some(b) = block {
-                walk_const_paths(b, now);
-            }
-        }
-        ExprNode::Hash { entries, .. } => {
-            for (k, v) in entries {
-                walk_const_paths(k, now);
-                walk_class_body_call_paths(v, now, later);
-            }
-        }
-        ExprNode::Array { elements, .. } => {
-            for el in elements {
-                walk_class_body_call_paths(el, now, later);
-            }
-        }
-        _ => walk_const_paths(e, now),
+            _ => false,
+        })
+    };
+    match method {
+        "proc" | "lambda" => recv.is_none() || recv_is(&["Kernel"]),
+        "new" => recv_is(&["Proc"]),
+        "define_method" | "define_singleton_method" => true,
+        "type_alias" => recv_is(&["T", "SorbetRuntimeCheck"]),
+        _ => false,
     }
 }
 
-pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
+/// `walk_const_paths`, and with `stored` the split of
+/// `walk_load_time_paths`: what a stored closure references goes to
+/// `stored` instead of `out`.
+fn walk_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>, mut stored: Option<&mut BTreeSet<Vec<String>>>) {
+    macro_rules! walk {
+        ($child:expr) => {
+            walk_paths($child, out, stored.as_deref_mut())
+        };
+    }
+    // A block runs with the call unless the call stores it.
+    macro_rules! walk_block {
+        ($block:expr, $stores:expr) => {
+            match stored.as_deref_mut() {
+                Some(later) if $stores => walk_paths($block, later, None),
+                _ => match &*$block.node {
+                    ExprNode::Lambda { body, .. } => walk!(body),
+                    _ => walk!($block),
+                },
+            }
+        };
+    }
+    // A closure something is sent to (`-> { X }.call`, `proc { X }.call`)
+    // runs there.
+    macro_rules! walk_invoked {
+        ($child:expr) => {
+            match &*$child.node {
+                ExprNode::Lambda { body, .. } => walk!(body),
+                ExprNode::Send { recv, method, block: Some(_), .. } if stores_block(recv, method.as_str()) => {
+                    walk_paths($child, out, None)
+                }
+                _ => walk!($child),
+            }
+        };
+    }
     match &*e.node {
         ExprNode::Const { path } => {
             out.insert(path.iter().map(|s| s.as_str().to_string()).collect());
         }
-        ExprNode::Send { recv, args, block, .. } => {
+        ExprNode::Send { recv, method, args, block, .. } => {
             if let Some(r) = recv {
-                walk_const_paths(r, out);
+                walk_invoked!(r);
             }
             for a in args {
-                walk_const_paths(a, out);
+                walk!(a);
             }
             if let Some(b) = block {
-                walk_const_paths(b, out);
+                walk_block!(b, stores_block(recv, method.as_str()));
             }
         }
         ExprNode::Apply { fun, args, block } => {
-            walk_const_paths(fun, out);
+            walk_invoked!(fun);
             for a in args {
-                walk_const_paths(a, out);
+                walk!(a);
             }
             if let Some(b) = block {
-                walk_const_paths(b, out);
+                walk_block!(b, false);
             }
         }
         ExprNode::Hash { entries, .. } => {
             for (k, v) in entries {
-                walk_const_paths(k, out);
-                walk_const_paths(v, out);
+                walk!(k);
+                walk!(v);
             }
         }
         ExprNode::Array { elements, .. } => {
             for el in elements {
-                walk_const_paths(el, out);
+                walk!(el);
             }
         }
         ExprNode::StringInterp { parts } => {
             for p in parts {
                 if let InterpPart::Expr { expr } = p {
-                    walk_const_paths(expr, out);
+                    walk!(expr);
                 }
             }
         }
         ExprNode::BoolOp { left, right, .. } => {
-            walk_const_paths(left, out);
-            walk_const_paths(right, out);
+            walk!(left);
+            walk!(right);
         }
         ExprNode::Let { value, body, .. } => {
-            walk_const_paths(value, out);
-            walk_const_paths(body, out);
+            walk!(value);
+            walk!(body);
         }
-        ExprNode::Lambda { body, .. } => walk_const_paths(body, out),
+        ExprNode::Lambda { body, .. } => match stored.as_deref_mut() {
+            Some(later) => walk_paths(body, later, None),
+            None => walk!(body),
+        },
         // A type-assertion wrapper is transparent to reference edges —
         // the broadcast lowerings wrap their `Views::…` payload render
         // in `Cast { …, Str }`, and skipping it dropped the model →
         // views require.
-        ExprNode::Cast { value, .. } => walk_const_paths(value, out),
+        ExprNode::Cast { value, .. } => walk!(value),
         ExprNode::If { cond, then_branch, else_branch } => {
-            walk_const_paths(cond, out);
-            walk_const_paths(then_branch, out);
-            walk_const_paths(else_branch, out);
+            walk!(cond);
+            walk!(then_branch);
+            walk!(else_branch);
         }
         ExprNode::Case { scrutinee, arms } => {
-            walk_const_paths(scrutinee, out);
+            walk!(scrutinee);
             for arm in arms {
-                walk_const_paths(&arm.body, out);
+                walk!(&arm.body);
             }
         }
         ExprNode::Seq { exprs } => {
             for e in exprs {
-                walk_const_paths(e, out);
+                walk!(e);
             }
         }
-        ExprNode::Assign { value, .. } => walk_const_paths(value, out),
+        ExprNode::Assign { value, .. } => walk!(value),
         ExprNode::Yield { args } => {
             for a in args {
-                walk_const_paths(a, out);
+                walk!(a);
             }
         }
-        ExprNode::Raise { value } => walk_const_paths(value, out),
+        ExprNode::Raise { value } => walk!(value),
         ExprNode::RescueModifier { expr, fallback } => {
-            walk_const_paths(expr, out);
-            walk_const_paths(fallback, out);
+            walk!(expr);
+            walk!(fallback);
         }
-        ExprNode::Return { value } => walk_const_paths(value, out),
+        ExprNode::Return { value } => walk!(value),
         ExprNode::Super { args, block } => {
             for a in args.iter().flatten() {
-                walk_const_paths(a, out);
+                walk!(a);
             }
             if let Some(b) = block {
-                walk_const_paths(b, out);
+                walk_block!(b, false);
             }
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            walk_const_paths(body, out);
+            walk!(body);
             for r in rescues {
-                walk_const_paths(&r.body, out);
+                walk!(&r.body);
             }
             if let Some(e) = else_branch {
-                walk_const_paths(e, out);
+                walk!(e);
             }
             if let Some(e) = ensure {
-                walk_const_paths(e, out);
+                walk!(e);
             }
         }
-        ExprNode::Next { value: Some(v) } => walk_const_paths(v, out),
-        ExprNode::MultiAssign { value, .. } => walk_const_paths(value, out),
+        ExprNode::Next { value: Some(v) } => walk!(v),
+        ExprNode::MultiAssign { value, .. } => walk!(value),
         ExprNode::While { cond, body, .. } => {
-            walk_const_paths(cond, out);
-            walk_const_paths(body, out);
+            walk!(cond);
+            walk!(body);
         }
         ExprNode::Range { begin, end, .. } => {
             if let Some(b) = begin {
-                walk_const_paths(b, out);
+                walk!(b);
             }
             if let Some(e) = end {
-                walk_const_paths(e, out);
+                walk!(e);
             }
         }
         // Leaves and uninteresting nodes pass through.
