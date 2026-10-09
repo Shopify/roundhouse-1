@@ -189,8 +189,8 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     }
     let mut out: Vec<EmittedFile> = Vec::new();
     let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
-    // (the declaration's path, the namespace, the target, the statements' render, the marker)
-    let mut after_declarations: Vec<(PathBuf, String, String, EmittedFile, String)> = Vec::new();
+    // (the declaration's path, the namespace, the target, the statements, their render there, the marker)
+    let mut after_declarations: Vec<(PathBuf, String, String, LibraryClass, EmittedFile, String)> = Vec::new();
     for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
@@ -302,22 +302,30 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             let owner = lc.name.0.as_str().trim_start_matches("::").to_string();
             let marker = format!("# {site}: the body of `{owner}` goes on here, after `{target}`, as the source writes it");
             let rendered = emit_library_class_decl(&statements, app, path.clone());
-            after_declarations.push((path, owner, target.to_string(), rendered, marker));
+            after_declarations.push((path, owner, target.to_string(), statements, rendered, marker));
         }
         for file in files {
             merge_at_path(&mut out, &mut at_path, file);
         }
     }
     // After every declaration's own file, so each follows its body.
-    for (path, owner, target, file, marker) in after_declarations {
+    for (path, owner, target, statements, file, marker) in after_declarations {
+        // Statements written elsewhere (a load hook `App::class_load_hooks`
+        // places after the declaration) leave the reopen empty: nothing
+        // to write, here or in the namespace's file.
+        if !reopen_has_body(&file.content, &owner) {
+            continue;
+        }
         let spliced = at_path.get(&path).and_then(|&j| spliced_into_namespace(&out[j].content, &owner, &target, &file.content, &marker));
         match spliced {
             Some(content) => out[at_path[&path]].content = content,
             // Where it cannot be written in place, it stays in the
-            // namespace's file, as before.
+            // namespace's file, as before, rendered from that file:
+            // its requires are relative to where they run.
             None => {
                 let own = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(&owner)));
-                merge_at_path(&mut out, &mut at_path, EmittedFile { path: own, ..file });
+                let file = emit_library_class_decl(&statements, app, own);
+                merge_at_path(&mut out, &mut at_path, file);
             }
         }
     }
@@ -336,14 +344,21 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     let segments: Vec<&str> = owner.split("::").collect();
     let depth = segments.len();
     let pad = |k: usize| "  ".repeat(k);
-    let headers: Vec<String> = segments.iter().enumerate().map(|(k, seg)| format!("{}module {seg}", pad(k))).collect();
+    // A namespace header is a `module` or a `class` line (`class
+    // Taxonomy < ApplicationRecord`), the same in both files.
+    let is_header = |l: &str, k: usize, seg: &str| {
+        l.strip_prefix(&pad(k)).is_some_and(|rest| {
+            rest == format!("module {seg}") || rest == format!("class {seg}") || rest.starts_with(&format!("class {seg} < "))
+        })
+    };
     // The statements' render: anything above its headers (requires),
     // then the headers, its body, and the closing `end`s.
     let lines: Vec<&str> = rendered.lines().collect();
-    let first = lines.iter().position(|l| *l == headers[0])?;
-    if lines.len() < first + depth || lines[first..first + depth].iter().zip(&headers).any(|(l, h)| l != h) {
+    let first = lines.iter().position(|l| is_header(l, 0, segments[0]))?;
+    if lines.len() < first + depth || (0..depth).any(|k| !is_header(lines[first + k], k, segments[k])) {
         return None;
     }
+    let headers: Vec<&str> = lines[first..first + depth].to_vec();
     let body = unwrapped(&lines[first..], depth)?;
     let above: Vec<String> = lines[..first].iter().filter(|l| !l.trim().is_empty()).map(|l| format!("{}{l}", pad(depth))).collect();
     // The declaration's file: the same headers, then the declaration.
@@ -372,6 +387,17 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     let mut joined = out.join("\n");
     joined.push('\n');
     Some(joined)
+}
+
+/// Whether `rendered`, a reopen of the namespace `owner`, writes
+/// anything inside its headers.
+fn reopen_has_body(rendered: &str, owner: &str) -> bool {
+    let depth = owner.split("::").count();
+    let lines: Vec<&str> = rendered.lines().collect();
+    let Some(first) = lines.iter().position(|l| l.starts_with("module ") || l.starts_with("class ")) else {
+        return false;
+    };
+    unwrapped(&lines[first..], depth).is_some_and(|body| !body.trim().is_empty())
 }
 
 /// Adds `file` to the rendered files, after the content already
@@ -9836,7 +9862,29 @@ fn emit_library_class_decl_inner(
         }
         .unwrap();
     };
-    let override_places: Vec<usize> = lc.visibility_overrides.iter().map(after_late).collect();
+    // One the source has below a deferred constant goes after the last
+    // of them above it, as `calls_after_deferred`: apps_runtime's
+    // placeholders.rb writes `STATIC = Static.new.freeze` and then
+    // `private_class_method :new`. Written first, the nested subclass's
+    // inherited `new` was already private: NoMethodError at boot.
+    let override_after_deferred = |o: &crate::dialect::VisibilityOverride| -> Option<usize> {
+        deferred
+            .iter()
+            .copied()
+            .filter(|_| !railtie)
+            .filter(|&i| {
+                let value = &lc.constants[i].1;
+                !value.span.is_synthetic() && !o.span.is_synthetic() && value.span.file == o.span.file && value.span.start < o.span.start
+            })
+            .max_by_key(|&i| lc.constants[i].1.span.start)
+    };
+    let deferred_override_places: Vec<Option<usize>> = lc.visibility_overrides.iter().map(override_after_deferred).collect();
+    let override_places: Vec<usize> = lc
+        .visibility_overrides
+        .iter()
+        .zip(&deferred_override_places)
+        .map(|(o, d)| if d.is_some() { usize::MAX } else { after_late(o) })
+        .collect();
     let overrides_at = |at: usize| {
         lc.visibility_overrides.iter().zip(&override_places).filter(move |(_, place)| **place == at).map(|(o, _)| o)
     };
@@ -9878,6 +9926,9 @@ fn emit_library_class_decl_inner(
                         writeln!(s, "{body_pad}{line}").unwrap();
                     }
                 }
+            }
+            for (o, _) in lc.visibility_overrides.iter().zip(&deferred_override_places).filter(|(_, d)| **d == Some(i)) {
+                write_override(&mut s, o);
             }
         }
         NestedPlacement::place(&lc.name, &mut s, |_| true);
@@ -13854,13 +13905,23 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
         return file_owner(&owner, app);
     }
     let segments: Vec<&str> = name.split("::").collect();
+    // Written apart from an enclosing class, it may still share a file
+    // with one nested deeper: apps_runtime's database/placeholders.rb
+    // writes `class Static < Placeholders` inside `class Placeholders`,
+    // apart from database.rb's `class Database`. Given a file of its
+    // own, `STATIC = Static.new` in Placeholders' body ran before it.
+    let mut apart_from_outer = false;
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
         if owns_a_file(&prefix, app) {
             let mut own = body_files(name, app);
             own.extend(declared_files(name, app));
             if written_apart(&own, &prefix, app) {
-                return name.to_string();
+                apart_from_outer = true;
+                continue;
+            }
+            if apart_from_outer {
+                return file_owner(&prefix, app);
             }
             // A class with no source spans of its own (the ingest's
             // CurrentAttributes lowering generates every method of
