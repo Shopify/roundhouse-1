@@ -2781,6 +2781,9 @@ end
     app.sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&sources, &app.sources);
     app.source_index_required = !app.sources.is_empty();
+    // A file-level `Dir[...].each { |f| require_relative f }` is the
+    // requires of the files it matches, read off the registered tree.
+    expand_glob_requires(&mut app);
     // What the gem sources require from the gem home, read now that
     // their files are registered.
     if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
@@ -3062,6 +3065,64 @@ end
     keep_carried_body_statements(&mut app);
     app.singleton_scoped_classes = singleton_scoped_classes(&app);
     Ok(app)
+}
+
+/// A file program's top-level glob requires
+/// (`autoload_glob::file_glob_requires`) as the `ProgramItem::Require`s
+/// they are, one per matched file of the tree, in `Dir`'s order.
+/// buyer-risk-ml 2.51.11's entry reaches 27 of its 30 files only through
+/// `Dir[File.join(__dir__, "buyer-risk-ml/**/*.rb")].each { |file|
+/// require_relative file }`: run as written, the emitted statement globbed
+/// the working directory and matched nothing, so their programs never ran
+/// and `BuyerRiskMl::Keys`, `LightGBMModel`, `ThresholdLoader` and the
+/// rest were defined only where an app file happened to name them (a
+/// gem's constants have no autoload).
+fn expand_glob_requires(app: &mut App) {
+    use crate::app::ProgramItem;
+    let listing: Vec<String> = app.sources.iter().map(|s| s.path.clone()).collect();
+    let texts: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
+    let mut carried: Vec<crate::span::Span> = Vec::new();
+    for program in &mut app.file_programs {
+        let statement = |item: &ProgramItem| matches!(item, ProgramItem::Statement(_) | ProgramItem::NotCarried { .. });
+        if !program.items.iter().any(statement) {
+            continue;
+        }
+        let Some(text) = texts.get(program.source.as_str()) else { continue };
+        if !text.contains("Dir[") && !text.contains("Dir.glob") {
+            continue;
+        }
+        let loops = super::autoload_glob::file_glob_requires(text, &program.source, &listing);
+        if loops.is_empty() {
+            continue;
+        }
+        let mut items = Vec::with_capacity(program.items.len());
+        for item in std::mem::take(&mut program.items) {
+            // A statement the expression ingest named as not carried is
+            // read here all the same: its shape is the loop's.
+            let span = match &item {
+                ProgramItem::Statement(expr) => expr.span,
+                ProgramItem::NotCarried { span, .. } => *span,
+                _ => {
+                    items.push(item);
+                    continue;
+                }
+            };
+            match loops.iter().find(|(start, _)| *start == span.start as usize) {
+                Some((_, features)) => {
+                    if matches!(item, ProgramItem::NotCarried { .. }) {
+                        carried.push(span);
+                    }
+                    items.extend(
+                        features.iter().map(|feature| ProgramItem::Require { span, feature: feature.clone(), relative: true }),
+                    )
+                }
+                None => items.push(item),
+            }
+        }
+        program.items = items;
+    }
+    // Its gap was reported as the file was walked (`report_not_carried`).
+    app.file_statement_gaps.retain(|gap| !carried.contains(&gap.span));
 }
 
 /// `App::singleton_scoped_classes`: the library classes a source file
