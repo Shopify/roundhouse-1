@@ -843,6 +843,9 @@ pub(super) fn refusal(detail: String) -> crate::diagnostic::DiagnosticKind {
 /// cast that cannot fail (`T.let(nil, T.nilable(Name))`) still reads
 /// through it.
 pub(crate) fn settle_type_aliases(app: &mut crate::App) {
+    // First, so an application's type arguments (which may name these
+    // aliases) are gone before the reads below are counted.
+    erase_generic_applications(app);
     let mut found: Vec<(crate::ident::ClassId, Symbol, Expr)> = Vec::new();
     for lc in &app.library_classes {
         for (name, value) in &lc.constants {
@@ -924,4 +927,241 @@ pub(crate) fn settle_type_aliases(app: &mut crate::App) {
         });
     }
     app.sorbet_type_aliases = found;
+}
+
+/// A generic's type application, `Handle[Rules]`, as sorbet-runtime runs
+/// it: the class itself. `T::Generic#[]` is `def [](*types); self; end`
+/// (sorbet-runtime 0.6.13502 generic.rb), so
+/// `InstructionHandle[QuantityRules].new(NAME)` builds an
+/// `InstructionHandle`. The annotations pass drops the `extend
+/// T::Generic` that answers `[]` ([`super::library_class::is_sorbet_annotation_mixin`]),
+/// and the kept application raised NoMethodError at load (Core's
+/// checkouts/one/instructions/merchandise/quantity_rules.rb:16).
+///
+/// Each `G[...]` whose receiver constant resolves to such a class is
+/// written as `G`. Its arguments are type expressions sorbet has already
+/// resolved (`T::Boolean`, `T.untyped`, a `type_member` constant), none of
+/// which the tree carries as a value.
+///
+/// Such a class declares `extend T::Generic` in its own body, or
+/// inherits from one, and does not define its own class-side `[]` (nor
+/// does an ancestor between it and the declaring class). The receiver
+/// resolves the way Ruby's lexical lookup reads a written path, from the
+/// innermost enclosing namespace of the body outward; a nearer class of
+/// the same name shadows a farther generic one.
+pub(crate) fn erase_generic_applications(app: &mut crate::App) {
+    let declared = generic_declarations(&app.sources);
+    if declared.is_empty() {
+        return;
+    }
+    // Every class the app defines, with its parent and whether it
+    // answers `[]` itself.
+    struct Class {
+        parent: Option<String>,
+        own_index: bool,
+    }
+    let mut classes: crate::det::HashMap<String, Class> = crate::det::HashMap::default();
+    let class_index = |m: &crate::dialect::MethodDef| {
+        m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "[]"
+    };
+    let namespace = |name: &str| name.rsplit_once("::").map(|(ns, _)| ns.to_string()).unwrap_or_default();
+    let mut parents: Vec<(String, String, String)> = Vec::new();
+    for lc in &app.library_classes {
+        let name = lc.name.0.as_str().to_string();
+        if let Some(parent) = &lc.parent {
+            parents.push((name.clone(), parent.0.as_str().to_string(), namespace(&name)));
+        }
+        let own_index = lc.methods.iter().any(class_index);
+        let entry = classes.entry(name).or_insert(Class { parent: None, own_index: false });
+        entry.own_index |= own_index;
+    }
+    for model in &app.models {
+        let name = model.name.0.as_str().to_string();
+        if let Some(parent) = &model.parent {
+            parents.push((name.clone(), parent.0.as_str().to_string(), namespace(&name)));
+        }
+        let own_index = model.body.iter().any(|item| {
+            matches!(item, crate::dialect::ModelBodyItem::Method { method, .. } if class_index(method))
+        });
+        let entry = classes.entry(name).or_insert(Class { parent: None, own_index: false });
+        entry.own_index |= own_index;
+    }
+    for name in &declared {
+        classes.entry(name.clone()).or_insert(Class { parent: None, own_index: false });
+    }
+    let known: crate::det::HashSet<String> = classes.keys().cloned().collect();
+    for (name, parent, scope) in parents {
+        let path: Vec<Symbol> = parent.split("::").map(Symbol::from).collect();
+        let resolved = resolve_written(&path, &scope, &known);
+        if let (Some(resolved), Some(class)) = (resolved, classes.get_mut(&name))
+            && resolved != name
+        {
+            class.parent = Some(resolved);
+        }
+    }
+    // Answers `T::Generic#[]`: no own `[]`, and the declaring class is
+    // itself or an ancestor reached without passing one that has its own.
+    let applies_self = |name: &str| {
+        let mut at = Some(name.to_string());
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(current) = at.take() {
+            if seen.contains(&current) {
+                return false;
+            }
+            let Some(class) = classes.get(&current) else { return false };
+            if class.own_index {
+                return false;
+            }
+            if declared.contains(&current) {
+                return true;
+            }
+            at = class.parent.clone();
+            seen.push(current);
+        }
+        false
+    };
+    let generic: crate::det::HashSet<String> = known.iter().filter(|name| applies_self(name)).cloned().collect();
+    if generic.is_empty() {
+        return;
+    }
+    let mut rewrite = |owner: Option<&crate::ident::ClassId>, body: &mut Expr| {
+        let scope = owner.map(|o| o.0.as_str()).unwrap_or("");
+        erase_in(body, scope, &known, &generic);
+    };
+    crate::lower::for_each_owned_hook_body(app, &mut rewrite);
+    for tm in &mut app.test_modules {
+        let scope = tm.name.0.as_str().to_string();
+        let f = |e: &mut Expr| erase_in(e, &scope, &known, &generic);
+        if let Some(setup) = tm.setup.as_mut() {
+            f(setup);
+        }
+        for test in &mut tm.tests {
+            f(&mut test.body);
+        }
+        for (_, value) in &mut tm.constants {
+            f(value);
+        }
+        for method in &mut tm.helpers {
+            f(&mut method.body);
+            for default in method.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                f(default);
+            }
+        }
+        for class in &mut tm.inner_classes {
+            let scope = class.name.0.as_str().to_string();
+            let f = |e: &mut Expr| erase_in(e, &scope, &known, &generic);
+            for method in &mut class.methods {
+                f(&mut method.body);
+                for default in method.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                    f(default);
+                }
+            }
+            for (_, value) in &mut class.constants {
+                f(value);
+            }
+            for call in &mut class.unknown_calls {
+                f(call);
+            }
+            for initializer in &mut class.class_ivar_initializers {
+                f(initializer);
+            }
+        }
+    }
+}
+
+/// `G[...]` → `G` throughout `expr`, for a `G` that resolves from
+/// `scope` to a class in `generic`.
+fn erase_in(
+    expr: &mut Expr,
+    scope: &str,
+    known: &crate::det::HashSet<String>,
+    generic: &crate::det::HashSet<String>,
+) {
+    expr.node.for_each_child_mut(&mut |child| erase_in(child, scope, known, generic));
+    let ExprNode::Send { recv: Some(recv), method, block: None, .. } = &*expr.node else { return };
+    if method.as_str() != "[]" {
+        return;
+    }
+    let ExprNode::Const { path } = &*recv.node else { return };
+    if resolve_written(path, scope, known).is_some_and(|name| generic.contains(&name)) {
+        let ExprNode::Send { recv: Some(recv), .. } = std::mem::replace(&mut *expr.node, ExprNode::Lit { value: Literal::Nil })
+        else {
+            unreachable!()
+        };
+        *expr = recv;
+    }
+}
+
+/// The class a written constant path names from a body in `scope`: a
+/// rooted `::A::B` is the top-level `A::B`; otherwise the innermost
+/// `scope` prefix under which the path names a class in `known`.
+fn resolve_written(path: &[Symbol], scope: &str, known: &crate::det::HashSet<String>) -> Option<String> {
+    let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    let written = path.iter().skip(usize::from(rooted)).map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    if written.is_empty() {
+        return None;
+    }
+    if rooted {
+        return known.contains(&written).then_some(written);
+    }
+    let segments: Vec<&str> = if scope.is_empty() { Vec::new() } else { scope.split("::").collect() };
+    (0..=segments.len()).rev().find_map(|n| {
+        let name = if n == 0 { written.clone() } else { format!("{}::{written}", segments[..n].join("::")) };
+        known.contains(&name).then_some(name)
+    })
+}
+
+/// The qualified names of the classes and modules whose own body
+/// declares `extend T::Generic` (or `extend(::T::Generic)`, alone or
+/// beside other modules), across the app's sources.
+fn generic_declarations(sources: &[crate::span::SourceFile]) -> crate::det::HashSet<String> {
+    fn extends_generic(stmt: &Node<'_>) -> bool {
+        let Some(call) = stmt.as_call_node() else { return false };
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "extend" {
+            return false;
+        }
+        call.arguments().is_some_and(|args| {
+            args.arguments().iter().any(|arg| {
+                super::util::constant_path_segments_strs(&arg).is_some_and(|path| path == ["T", "Generic"])
+            })
+        })
+    }
+    fn walk(node: &Node<'_>, scope: &[String], out: &mut crate::det::HashSet<String>) {
+        if let Some(program) = node.as_program_node() {
+            return walk(&program.statements().as_node(), scope, out);
+        }
+        if let Some(statements) = node.as_statements_node() {
+            for stmt in statements.body().iter() {
+                walk(&stmt, scope, out);
+            }
+            return;
+        }
+        let (path, body) = if let Some(class) = node.as_class_node() {
+            (super::util::class_name_path(&class), class.body())
+        } else if let Some(module) = node.as_module_node() {
+            (super::util::module_name_path(&module), module.body())
+        } else {
+            return;
+        };
+        let Some(path) = path else { return };
+        let mut inner = scope.to_vec();
+        inner.extend(path);
+        let Some(body) = body else { return };
+        let statements = super::util::flatten_statements(body);
+        if statements.iter().any(extends_generic) {
+            out.insert(inner.join("::"));
+        }
+        for stmt in &statements {
+            walk(stmt, &inner, out);
+        }
+    }
+    let mut out = crate::det::HashSet::default();
+    for source in sources {
+        if !source.text.contains("T::Generic") {
+            continue;
+        }
+        let result = ruby_prism::parse(source.text.as_bytes());
+        walk(&result.node(), &[], &mut out);
+    }
+    out
 }
