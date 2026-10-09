@@ -17,9 +17,13 @@
 //! - `T::Array[X]`, `T::Hash[K, V]`, `T::Set`, `T::Range`,
 //!   `T::Enumerable`, `T::Enumerator` (and its `Lazy` / `Chain`),
 //!   `T::Class`, `T::Module` check the outer class only, as sorbet does;
-//!   their arguments only spell the message, so an argument may be a
-//!   proc type (`T::Hash[Symbol, T.proc.returns(T.untyped)]`), which
-//!   sorbet names `T.proc.params().returns(T.untyped)`;
+//!   their arguments only spell the message;
+//! - a proc type `T.proc.params(a: X).returns(Y)` (or `.void`, with an
+//!   optional `.bind(Z)`) is sorbet's `T::Types::Proc`, whose `valid?`
+//!   is `obj.is_a?(::Proc)`: the parameter and return types only spell
+//!   the message (`T.proc.params(a: X).returns(Y)`, `<VOID>` for
+//!   `void`), at the top as in a generic's arguments
+//!   (`T::Hash[Symbol, T.proc.returns(T.untyped)]`);
 //! - a user generic `Foo[X]` is `Foo`: `T::Generic#[]` answers `self`;
 //! - `T.class_of(C)` is `C.singleton_class`; `T.untyped` / `T.anything`
 //!   accept everything;
@@ -31,11 +35,12 @@
 //!   that length whose every element passes the type at its position.
 //!
 //! A form sorbet checks some other way, or that names sorbet-runtime's
-//! own constants (`T.proc` outside a generic's arguments, `T.self_type`, `T.attached_class`,
-//! `T.type_parameter`, a splat in a tuple shape, ...), is refused
+//! own constants (`T.self_type`, `T.attached_class`, `T.type_parameter`,
+//! a splat in a tuple shape, `T::Sig::WithoutRuntime`, ...), is refused
 //! at the site by name ("sorbet type check"), never skipped. A check that
 //! provably passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
-//! `T::Array[...]`, ...) is the value alone, as is `checked: false`.
+//! `T::Array[...]`, a `->(x) { ... }` literal into a proc type, ...) is the
+//! value alone, as is `checked: false`.
 //! `project` refuses the lowered call on every tree but CRuby / JRuby.
 
 use ruby_prism::Node;
@@ -83,8 +88,9 @@ enum SorbetType {
     /// `[Integer, String]`: sorbet's `T::Types::FixedArray`, an Array
     /// of that length whose each element passes its position's type.
     FixedArray(Vec<SorbetType>),
-    /// `T.proc.params(a: X).returns(Y)` (`None` for `.void`), as a
-    /// generic's argument: sorbet's `T::Types::Proc`, read for its name.
+    /// `T.proc.params(a: X).returns(Y)` (`None` for `.void`): sorbet's
+    /// `T::Types::Proc`, which passes any Proc; the parameter and
+    /// return types are read for its name.
     Proc { params: Vec<(String, SorbetType)>, returns: Option<Box<SorbetType>> },
 }
 
@@ -199,6 +205,12 @@ fn passes_statically(value: &Node<'_>, ty: &SorbetType) -> bool {
     if value.as_true_node().is_some() || value.as_false_node().is_some() {
         return members.iter().any(|m| matches!(m, SorbetType::Boolean));
     }
+    // `->(x) { ... }` is a Proc, which is all `T::Types::Proc#valid?`
+    // asks (hedwig's `T.let(->(_job) { false }, T.proc.params(job:
+    // Hedwig::Job).returns(T::Boolean))`).
+    if value.as_lambda_node().is_some() {
+        return members.iter().any(|m| matches!(m, SorbetType::Proc { .. }));
+    }
     false
 }
 
@@ -247,10 +259,10 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
     read_type_at(node, file, false)
 }
 
-/// `read_type`; `named` inside a stdlib generic's arguments, which
-/// sorbet's `valid?` never checks (`TypedHash#valid?` is
-/// `obj.is_a?(Hash)`), so there a type is read for its name alone and
-/// may be a proc type.
+/// `read_type`; `named` inside a stdlib generic's or a proc type's
+/// arguments, which sorbet's `valid?` never checks (`TypedHash#valid?`
+/// is `obj.is_a?(Hash)`, `T::Types::Proc#valid?` `obj.is_a?(Proc)`), so
+/// there a type is read for its name alone.
 fn read_type_at(node: &Node<'_>, file: &str, named: bool) -> IngestResult<Result<SorbetType, String>> {
     let text = || String::from_utf8_lossy(node.location().as_slice()).into_owned();
     if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
@@ -285,10 +297,7 @@ fn read_type_at(node: &Node<'_>, file: &str, named: bool) -> IngestResult<Result
         return Ok(Err(format!("`{}` is not a type expression this check reads", text())));
     };
     if rooted_at_t_proc(&call) {
-        if named {
-            return read_proc(&call, file);
-        }
-        return Ok(Err(format!("`{}` is a proc type, which sorbet checks by arity and signature", text())));
+        return read_proc(&call, file);
     }
     if call.block().is_some() {
         return Ok(Err(format!("`{}` takes a block, which no type this check reads does", text())));
@@ -318,7 +327,6 @@ fn read_type_at(node: &Node<'_>, file: &str, named: bool) -> IngestResult<Result
                     Ok(SorbetType::ClassOf(super::expr::ingest_expr(class, file)?))
                 }
             }
-            ("proc", _) => Err(format!("`{}` is a proc type, which sorbet checks by arity and signature", text())),
             ("self_type", _) => Err(format!("`{}` is `T.self_type`, which depends on the receiver", text())),
             ("attached_class", _) => Err(format!("`{}` is `T.attached_class`, which depends on the receiver", text())),
             ("type_parameter", _) => Err(format!("`{}` is a method type parameter, which sorbet-runtime does not erase the same way", text())),
@@ -410,11 +418,11 @@ fn read_tuple(array: &ruby_prism::ArrayNode<'_>, file: &str, named: bool) -> Ing
     Ok(Ok(SorbetType::FixedArray(types)))
 }
 
-/// A proc type as a generic's argument, for its name: sorbet-runtime's
-/// `T.proc` builder (`private/methods/decl_builder.rb`) takes `bind`,
-/// `params` (keywords only) and then `returns(X)` or `void`, and
-/// `T::Types::Proc#name` spells `T.proc.params(a: X).returns(Y)`
-/// (`<VOID>` for `void`; the bind is not in the name).
+/// A proc type: sorbet-runtime's `T.proc` builder
+/// (`private/methods/decl_builder.rb`) takes `bind`, `params` (keywords
+/// only) and then `returns(X)` or `void`; `T::Types::Proc#valid?` is
+/// `obj.is_a?(::Proc)` and its `name` spells `T.proc.params(a:
+/// X).returns(Y)` (`<VOID>` for `void`; the bind is not in the name).
 fn read_proc(call: &ruby_prism::CallNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
     /// Each builder step, innermost (`proc`) first: its name, its
     /// arguments and whether it takes a block; `false` when the chain is

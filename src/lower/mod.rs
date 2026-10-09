@@ -613,8 +613,9 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // running second leaves exactly the sites it declined, which is the
     // division of labour intended.
     ("assoc_attr_key", &["update_kwargs"]),
-    // `obj.extend Mod` on an instance -> a raise stub with the report.
-    // Consumes a shape no pass produces or reads; no constraints.
+    // `obj.extend Mod` on an instance -> a raise stub with the report
+    // (none on a PostgreSQL app, whose CRuby tree runs it). Consumes a
+    // shape no pass produces or reads; no constraints.
     ("object_extend", &[]),
     // A parameter written after its binder (`user = users(user) unless
     // user.is_a? User`, `id = id.to_i`) -> a fresh local, so AOT does
@@ -691,6 +692,13 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // chain that stays dynamic — and on a relation-less target that is
     // now an error (issue #76), not a suppressed warning.
     ("relation_residue", &["duration", "group_count"]),
+    // PostgreSQL apps only (their one tree is CRuby's): a Module
+    // protocol send the analyzer refused for want of a proven class
+    // receiver (`base.class_eval { ... }` in an `extended(base)` hook)
+    // is emitted as written, and CRuby answers it. Last, so no pass
+    // reads a lifted site as a typed call; it reads nothing any pass
+    // writes but the refusal itself.
+    ("cruby_module_protocol", &["relation_residue"]),
 ];
 
 /// True iff `POST_ANALYZE_PASS_ORDER` is a valid topological order —
@@ -1006,6 +1014,8 @@ pub fn apply_post_analyze_lowerings(
         relation_residue::apply_relation_residue_ledger(app, registry)
     }));
     ran!("relation_residue");
+    object_extend::apply_cruby_module_protocol(app);
+    ran!("cruby_module_protocol");
     #[cfg(debug_assertions)]
     debug_assert_eq!(
         executed,

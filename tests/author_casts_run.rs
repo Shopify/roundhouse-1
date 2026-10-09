@@ -493,7 +493,9 @@ fn a_cast_the_value_backs_still_grounds() {
 #[test]
 fn an_uncheckable_type_is_refused_by_name() {
     for (body, reason) in [
-        ("T.let(@values.first, T.proc.returns(Integer))", "proc type"),
+        // A proc type is checked by its class (tests/cruby_runnable_reflection.rs);
+        // one sorbet's builder rejects stays refused.
+        ("T.let(@values.first, T.proc.params(x: Integer))", "proc type without `returns` or `void`"),
         ("T.let(@values.first, T.self_type)", "T.self_type"),
         ("T.cast(@values.first, T.attached_class)", "T.attached_class"),
         ("T.let(@values.first, [Integer, *[String]])", "splats an array into a tuple shape"),
