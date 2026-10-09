@@ -839,3 +839,32 @@ module ActiveSupport
   end
 end
 BigDecimal.prepend(ActiveSupport::BigDecimalWithDefaultFormat)
+
+# activesupport gem_version.rb and version.rb, from Shopify/rails
+# 5813559f4aed (8.2.0.alpha), which is the Rails Core runs
+# (docs/RAILS_VERSION.md). Code branches on the framework's version
+# when it loads, before any app code runs. active_model_serializers
+# 0.9.13 does `if ActiveSupport::VERSION::STRING < "5.1"`. The value
+# Core's Rails reports is the one to answer, so the comparison picks the
+# branch native Core takes. `ActiveSupport.version` is a `Gem::Version`,
+# which compares with a version String (`>= "7.2.0.alpha"`).
+module ActiveSupport
+  # Returns the currently loaded version of Active Support as a `Gem::Version`.
+  def self.gem_version
+    Gem::Version.new VERSION::STRING
+  end
+
+  module VERSION
+    MAJOR = 8
+    MINOR = 2
+    TINY  = 0
+    PRE   = "alpha"
+
+    STRING = [MAJOR, MINOR, TINY, PRE].compact.join(".")
+  end
+
+  # Returns the currently loaded version of Active Support as a `Gem::Version`.
+  def self.version
+    gem_version
+  end
+end
