@@ -210,6 +210,14 @@ module ActiveModel
     # false, default: "-" end`, run as Concern#append_features runs it:
     # once, and not again for a class that already has the module.
     def self.append_features(base)
+      # A module includer is a concern natively (an app concern is lowered
+      # without its extend): Concern#append_features defers to its includers.
+      unless base.is_a?(Class)
+        base.extend(ActiveSupport::Concern) if defined?(ActiveSupport::Concern) && !base.instance_variable_defined?(:@_dependencies)
+        return super unless base.instance_variable_defined?(:@_dependencies)
+        base.instance_variable_get(:@_dependencies) << self
+        return false
+      end
       return false if base < self
       super
       base.extend ClassMethods
