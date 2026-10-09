@@ -3828,41 +3828,70 @@ fn block_signature(params_node: Option<Node<'_>>, file: &str) -> IngestResult<cr
 /// memo|`) takes a fresh name and adds `k, v = <it>` to `destructures`,
 /// which binds as Ruby's block does (an Array, else `to_ary`, else the
 /// value as the first name). Dropping it left the body reading unbound
-/// `k` and `v` and shifted `memo` onto the pair. Nested and splatting
-/// destructures are refused, not dropped.
+/// `k` and `v` and shifted `memo` onto the pair. A nested one
+/// (`|(a, (b, c))|`) binds its inner pattern through a fresh name of its
+/// own the same way, after the outer one. Splatting destructures are
+/// refused, not dropped.
 fn positional_param(node: &Node<'_>, destructures: &mut Vec<Expr>, file: &str) -> IngestResult<Option<Symbol>> {
     if let Some(rp) = node.as_required_parameter_node() {
         return Ok(Some(Symbol::from(constant_id_str(&rp.name()))));
     }
     let Some(mt) = node.as_multi_target_node() else { return Ok(None) };
-    let mut targets = Vec::new();
-    for left in mt.lefts().iter() {
-        let Some(rp) = left.as_required_parameter_node() else {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "nested destructuring block parameter `|(a, (b, c))|`".into(),
-            });
-        };
-        targets.push(crate::expr::LValue::Var {
-            id: crate::ident::VarId(0),
-            name: Symbol::from(constant_id_str(&rp.name())),
-        });
+    let span = super::util::node_span(node, file);
+    let name = destructure_param_name(&mt.location(), span.start);
+    destructure_param(&mt, &name, span, destructures, file)?;
+    Ok(Some(name))
+}
+
+/// A fresh local for a destructuring block parameter at `start`, one the
+/// source does not spell.
+fn destructure_param_name(location: &ruby_prism::Location<'_>, start: u32) -> Symbol {
+    let mut name = format!("__param_{start}");
+    while super::sources::generated_local_is_reserved(location, &name) {
+        name.push('_');
     }
+    Symbol::from(name)
+}
+
+/// `<targets> = <name>` for one destructuring pattern, then each nested
+/// pattern's own assignment from the fresh name it binds to.
+fn destructure_param(
+    mt: &ruby_prism::MultiTargetNode<'_>,
+    name: &Symbol,
+    span: crate::span::Span,
+    destructures: &mut Vec<Expr>,
+    file: &str,
+) -> IngestResult<()> {
     if mt.rest().is_some() || !mt.rights().is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: "splatting destructuring block parameter `|(a, *b)|`".into(),
         });
     }
-    let span = super::util::node_span(node, file);
-    let mut name = format!("__param_{}", span.start);
-    while super::sources::generated_local_is_reserved(&mt.location(), &name) {
-        name.push('_');
+    let mut targets = Vec::new();
+    let mut nested = Vec::new();
+    for left in mt.lefts().iter() {
+        let target = if let Some(rp) = left.as_required_parameter_node() {
+            Symbol::from(constant_id_str(&rp.name()))
+        } else if let Some(inner) = left.as_multi_target_node() {
+            let inner_span = super::util::node_span(&left, file);
+            let inner_name = destructure_param_name(&inner.location(), inner_span.start);
+            nested.push((inner, inner_name.clone(), inner_span));
+            inner_name
+        } else {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "destructuring block parameter with a target other than a name or a nested pattern".into(),
+            });
+        };
+        targets.push(crate::expr::LValue::Var { id: crate::ident::VarId(0), name: target });
     }
-    let name = Symbol::from(name);
     let value = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
     destructures.push(Expr::new(span, ExprNode::MultiAssign { targets, value }));
-    Ok(Some(name))
+    for (inner, inner_name, inner_span) in nested {
+        destructure_param(&inner, &inner_name, inner_span, destructures, file)?;
+    }
+    Ok(())
 }
 
 /// `body` after the assignments of its destructuring parameters.

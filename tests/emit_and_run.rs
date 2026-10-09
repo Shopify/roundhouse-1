@@ -9810,23 +9810,23 @@ fn a_jump_that_stays_inside_an_assertion_block_runs_as_written() {
     }
 }
 
-/// A nested destructuring target is refused by name at ingest rather
-/// than lowered with its block's assertions dropped: its statement is a
-/// refusal at its own site, which raises when the test reaches it.
+/// A nested destructuring target (`(out, err), extra = capture_io do …
+/// end`) binds as Ruby's multi-write does (upstream 4228ed837 desugars it
+/// through a temp; this tree refused it by name before), and the
+/// assertions in its block run where they are written: a passing one
+/// lets the block finish, a failing one stops it and fails the test.
 #[test]
-fn a_nested_destructuring_target_is_refused_by_name() {
-    let tree = [
-        ("app/.keep", ""),
-        ("test/test_helper.rb", "require \"active_support\"\n"),
-        ("test/models/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    (out, err), extra = capture_io do\n      assert_equal 1, 2\n    end\n  end\nend\n"),
-    ]
-    .into_iter()
-    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
-    .collect();
-    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("a refused statement keeps its test");
-    let ir = format!("{:?}", app.test_modules);
-    assert!(ir.contains("IngestRefused { detail: \"unsupported multi-write target"), "{ir}");
-    assert!(!ir.contains("assert_equal"), "the refused statement's block is not lowered: {ir}");
+fn a_nested_destructuring_target_binds_and_keeps_its_block_assertions() {
+    let pass = "  test \"t\" do\n    (out, err), extra = capture_io do\n      $stdout.puts \"a\"\n      $stderr.puts \"b\"\n      assert_equal 2, 1 + 1\n      Widget.hit\n    end\n    assert_equal \"a\\n\", out\n    assert_nil err\n    assert_equal \"b\\n\", extra\n    assert_equal 1, Widget.hits\n  end\n";
+    let run = destructured_block_app("nested_target", pass).run_test("test/models/widget_test.rb");
+    run.assert_passes();
+    assert!(run.stdout.contains("F3 nested_target HITS=1\n"), "{}", run.stdout);
+
+    let fail = "  test \"t\" do\n    (out, err), extra = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n";
+    let run = destructured_block_app("nested_target_fail", fail).run_test("test/models/widget_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert!(!run.success, "the failing assertion passed\n{}", run.stdout);
+    assert!(run.stdout.contains("F3 nested_target_fail HITS=0\n"), "{}", run.stdout);
 }
 
 const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(*, &blk)\n    blk ? blk.call : :none\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(*rest)\n    [rest.size, super(rest.first)]\n  end\nend\n";
