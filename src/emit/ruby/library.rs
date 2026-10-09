@@ -13976,8 +13976,12 @@ fn top_level_requires(source: &crate::span::SourceFile) -> Vec<(String, bool, u3
 /// Each class or module whose file carries the top-level requires of an
 /// app source (`authored_requires`), mapped to those sources (indices
 /// into `app.sources`). Only a source with no file program qualifies,
-/// since a program keeps its requires itself (`emit_file_program`). The
-/// file is that of each class the source writes a body into (`file_owner`).
+/// since a program keeps its requires itself (`emit_file_program`).
+/// So does a boot initializer or environment file: its holder's
+/// `run_initializer` / `run_environment` carries each require where it
+/// stands (`RoundhouseAutoload.require_source`), after the statements
+/// before it, so the file's requires must not also open the holder's
+/// file. The file is that of each class the source writes a body into (`file_owner`).
 /// When the source only declares empty classes, it is the file of the
 /// innermost one.
 ///
@@ -13988,6 +13992,17 @@ fn top_level_requires(source: &crate::span::SourceFile) -> Vec<(String, bool, u3
 fn authored_require_sources(app: &App) -> std::rc::Rc<HashMap<String, Vec<usize>>> {
     let build = || {
         let programs: BTreeSet<&str> = app.file_programs.iter().map(|p| p.source.as_str()).collect();
+        let holders: BTreeSet<&str> = app
+            .initializer_programs
+            .iter()
+            .map(|p| p.holder.0.as_str())
+            .chain(app.environment_programs.iter().filter_map(|p| p.holder.as_ref().map(|h| h.0.as_str())))
+            .collect();
+        let boot_programs: BTreeSet<usize> = holders
+            .iter()
+            .flat_map(|holder| body_files(holder, app))
+            .filter_map(|file| (file as usize).checked_sub(1))
+            .collect();
         let ids: HashMap<&str, usize> = app.sources.iter().enumerate().map(|(i, s)| (s.path.as_str(), i)).collect();
         let mut listed: Vec<(usize, Vec<&str>)> = Vec::new();
         for (source, names) in &app.library_class_files {
@@ -14012,6 +14027,7 @@ fn authored_require_sources(app: &App) -> std::rc::Rc<HashMap<String, Vec<usize>
         for (i, names) in listed {
             let source = &app.sources[i];
             if programs.contains(source.path.as_str())
+                || boot_programs.contains(&i)
                 || !source.text.contains("require")
                 || top_level_requires(source).is_empty()
             {
