@@ -151,6 +151,17 @@ fn runtime_answers_at_class_body(name: &str, answered: bool) -> bool {
     }
 }
 
+/// What a lowered model with a compiled table answers about it on the
+/// class side, as Active Record does from the first class-body
+/// statement: the synthesized `def self.table_name` / `_table_sql`
+/// (`schema::push_schema_methods`), and `primary_key` (synthesized when
+/// the model names one, else the runtime base's `"id"`). A replayed
+/// macro call is a class-body statement, which the Ruby family writes
+/// below the class's methods (`collect_class_attr_initializers`), so a
+/// macro reading these finds them: Core's `database_documentation`-style
+/// macros and `record_table`-style helpers that read `table_name`.
+const SCHEMA_CLASS_METHODS: &[&str] = &["table_name", "_table_sql", "primary_key"];
+
 /// `validates_presence_of`, `validates_uniqueness_of`, ...
 fn is_model_dsl(name: &str) -> bool {
     MODEL_DSL.contains(&name)
@@ -209,6 +220,9 @@ pub(crate) struct ClassSide<'a> {
     /// ([`base_include_class_modules`]); read when a call is not
     /// answered nearer.
     base: std::cell::OnceCell<Vec<(&'a LibraryClass, &'a LibraryClass)>>,
+    /// Whether the class, or a model ancestor, has a compiled table, so
+    /// it answers [`SCHEMA_CLASS_METHODS`].
+    schema: bool,
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -263,6 +277,7 @@ impl<'a> ClassSide<'a> {
         let mut side = Self::new(&model.name, own, body_statements(model).collect(), model.parent.as_ref(), app);
         side.claimed = &model.claimed_body_calls;
         side.declared = super::macro_associations::declaring_calls(model);
+        side.schema |= app.schema.tables.contains_key(&model.table.0);
         side
     }
 
@@ -287,7 +302,18 @@ impl<'a> ClassSide<'a> {
                 _ => break,
             }
         }
-        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[], declared: Vec::new(), base: std::cell::OnceCell::new() };
+        let schema = chain.iter().any(|m| app.schema.tables.contains_key(&m.table.0));
+        let mut side = Self {
+            owner,
+            app,
+            own,
+            chain,
+            extended: Vec::new(),
+            claimed: &[],
+            declared: Vec::new(),
+            base: std::cell::OnceCell::new(),
+            schema,
+        };
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
         for call in body.into_iter().chain(ancestor_bodies) {
@@ -807,6 +833,9 @@ impl<'s, 'a> Walk<'s, 'a> {
             return walked;
         }
         if CLASS_SIDE_BUILTINS.contains(&name) {
+            return Ok(());
+        }
+        if self.side.schema && SCHEMA_CLASS_METHODS.contains(&name) {
             return Ok(());
         }
         Err(format!("{} calls `{name}`, which the lowered `{}` does not define", self.via(), self.side.owner.0.as_str()))

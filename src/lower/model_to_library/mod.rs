@@ -600,7 +600,8 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
     // base does not, so a model that runs the module's class side
     // (`callback_dsl_calls`) includes the port itself, ahead of its own
     // mixins as the base's include is, and keeps those calls in body
-    // order beside its prepends.
+    // order beside its prepends. A gem port's class macro calls
+    // (`gem_port_macro_calls`) are class-body statements.
     let callbacks = callback_dsl_calls(model, models);
     let port_macros = gem_port_macro_calls(model, models);
     let mut includes = crate::analyze::model_includes(model);
@@ -615,11 +616,7 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
             crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
         })
-        .filter(|expr| {
-            is_constant_prepend(expr)
-                || callbacks.iter().any(|c| std::ptr::eq(*c, *expr))
-                || port_macros.iter().any(|c| std::ptr::eq(*c, *expr))
-        })
+        .filter(|expr| is_constant_prepend(expr) || callbacks.iter().any(|c| std::ptr::eq(*c, *expr)))
         .cloned()
         .collect();
     LibraryClass {
@@ -637,7 +634,7 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
         origin: None,
         constants: collect_model_constants(model),
         unknown_calls,
-        class_ivar_initializers: collect_class_attr_initializers(model),
+        class_ivar_initializers: collect_class_attr_initializers(model, &port_macros),
         visibility_overrides: model.visibility_overrides.clone(),
     }
 }
@@ -661,8 +658,31 @@ pub(crate) fn is_constant_prepend(expr: &Expr) -> bool {
 /// `Model::class_attr_defaults` → class ivar writes emitted once on the
 /// model class object, then the body's `ModelBodyItem::ClassBody`
 /// statements in source order (class_attribute and `cattr_*`/`mattr_*`
-/// seeds, class-side writes, carried `included do` statements).
-fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
+/// seeds, class-side writes, carried `included do` statements), with
+/// the gem port's class macro calls (`gem_port_macro_calls`) among them
+/// where the body has them.
+///
+/// Active Record answers `table_name`, `primary_key`, `ignored_columns`
+/// and the rest of the model's schema from its first class-body
+/// statement on; the lowered model answers them from the class methods
+/// it synthesizes from the compiled table (`table_name`, `_table_sql`,
+/// `_compiled_ignored_columns`, ...), and the runtime base's
+/// `ignored_columns=` and `query_constraints` check against those. So
+/// each statement here that calls a class method (a macro, a
+/// class-side write through a writer: the Ruby family writes these, and
+/// every class-body statement after the first of them, below the
+/// class's methods) is a call of that method in the IR:
+///
+/// - `self.ignored_columns += [..]` is Ruby's `self.ignored_columns=(
+///   self.ignored_columns + [..])`, the same call `self.ignored_columns
+///   = [..]` is ([`class_side_write_as_call`]). Core's 271 models with
+///   the `+=` form wrote it above `def self._compiled_ignored_columns`,
+///   and the write raised at class load ("the compiled table leaves out
+///   only []").
+/// - Core's 235 `database_documentation do |dd| ... end` port macro calls
+///   read `table_name`. Kept beside the model's mixins they were written
+///   above an eager constant, and so above `def self.table_name`.
+fn collect_class_attr_initializers(model: &Model, port_macros: &[&Expr]) -> Vec<Expr> {
     model
         .class_attr_defaults
         .iter()
@@ -675,16 +695,35 @@ fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
                 },
             )
         })
-        .chain(class_body_statements(model).cloned())
+        .chain(model.body.iter().filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::ClassBody { expr, .. } => Some(class_side_write_as_call(expr)),
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } if port_macros.iter().any(|c| std::ptr::eq(*c, expr)) => {
+                Some(expr.clone())
+            }
+            _ => None,
+        }))
         .collect()
 }
 
-/// The model body's `ModelBodyItem::ClassBody` statements, in order.
-pub(crate) fn class_body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
-    model.body.iter().filter_map(|item| match item {
-        crate::dialect::ModelBodyItem::ClassBody { expr, .. } => Some(expr),
-        _ => None,
-    })
+/// `self.x op= v` for an arithmetic or bitwise `op` (`+=`, `-=`, `|=`,
+/// ...) as the writer call Ruby makes of it, `self.x=(self.x op v)`:
+/// the shape `self.x = v` already has. Anything else as it is.
+/// (`||=` and `&&=` call the writer only on one branch.)
+pub(crate) fn class_side_write_as_call(expr: &Expr) -> Expr {
+    use crate::expr::{LValue, OpAssignOp};
+    let ExprNode::OpAssign { target: LValue::Attr { recv, name }, op, value } = &*expr.node else {
+        return expr.clone();
+    };
+    if !matches!(&*recv.node, ExprNode::SelfRef) || matches!(op, OpAssignOp::OrOr | OpAssignOp::AndAnd) {
+        return expr.clone();
+    }
+    let send = |recv: Option<Expr>, method: Symbol, args: Vec<Expr>| {
+        Expr::new(expr.span, ExprNode::Send { recv, method, args, block: None, parenthesized: false })
+    };
+    let read = send(Some(recv.clone()), name.clone(), Vec::new());
+    let operator = op.as_ruby().trim_end_matches('=');
+    let combined = send(Some(read), Symbol::from(operator), vec![value.clone()]);
+    send(Some(recv.clone()), Symbol::from(format!("{}=", name.as_str())), vec![combined])
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -1295,10 +1334,10 @@ fn callbacks_port_methods() -> &'static [String] {
 /// model ancestor includes that module: Core's 230 `database_documentation
 /// do |dd| ... end` under `include
 /// DatabaseDocumentation::ModelMetadata::Metadata`. `model_class` carries
-/// them into the lowered class beside the include, and the Ruby family
-/// replays them through the port (`emit::ruby::library::
-/// runtime_mixin_macro_calls`) in body order; a tree without the port
-/// file refuses the include. A class method of the model's own, or an
+/// them into the lowered class as class-body statements in body order
+/// (`collect_class_attr_initializers`), which the Ruby family writes
+/// below the synthesized `table_name` they read; a tree without the
+/// port file refuses the include. A class method of the model's own, or an
 /// ancestor's, of the same name answers instead, so its call is not one.
 pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Vec<&'a Expr> {
     let mut chain: Vec<&Model> = vec![model];
