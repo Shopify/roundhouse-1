@@ -67,11 +67,13 @@ fn non_nil_assertions_require_runtime_support() {
     refuses("T.must_because(1) { |x| \"present\" }", "non-nil assertion");
 }
 
-/// The nil check the three non-nil assertions lower to runs on the
-/// Ruby-family trees (tests/non_nil_assertions_run.rs runs it). Other
-/// targets refuse each site by name, rather than emitting a check that
-/// does not run there: TypeScript wrote the generated local undeclared
-/// and threw a plain Error where sorbet raises TypeError.
+/// The nil test the three non-nil assertions lower to (sorbet's raising
+/// check for the two calls, an unchecked test that keeps the typer's
+/// narrowing for `#: as !nil`) runs on the Ruby-family trees
+/// (tests/non_nil_assertions_run.rs runs it). Other targets refuse each
+/// site by name, rather than emitting a test that does not run there:
+/// TypeScript wrote the generated local undeclared and threw a plain
+/// Error where sorbet raises TypeError.
 #[test]
 fn non_nil_assertion_checks_are_refused_where_the_tree_cannot_run_them() {
     for body in [
