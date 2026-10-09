@@ -388,6 +388,38 @@ module ActiveSupport
       Duration.new(-@seconds, parts, @order.dup)
     end
 
+    def +@
+      self
+    end
+
+    # activesupport 8.2 `Duration#*`: a number (or another Duration's
+    # value) scales the value and each part (`30.minutes * 2` is "60
+    # minutes"). The CRuby overlay also answers `2 * 30.minutes` through
+    # Rails' Scalar coercion; this port keeps its Integer `coerce`.
+    def *(other)
+      unless other.is_a?(Duration) || other.is_a?(Numeric)
+        raise TypeError, "no implicit conversion of #{other.class} into ActiveSupport::Duration"
+      end
+      factor = Duration.value_of(other)
+      parts = []
+      @parts.each { |v| parts << (v.nil? ? nil : v * factor) }
+      Duration.new(@seconds * factor, parts, @order.dup)
+    end
+
+    # activesupport 8.2 `Duration#/`: a number divides the value and each
+    # part (`1.hour / 2` is 1800 seconds, its `hours` part 1 / 2 = 0
+    # dropping); a Duration divides value by value into a plain number
+    # (`1.hour / 30.minutes` is 2).
+    def /(other)
+      return @seconds / other.seconds if other.is_a?(Duration)
+      unless other.is_a?(Numeric)
+        raise TypeError, "no implicit conversion of #{other.class} into ActiveSupport::Duration"
+      end
+      parts = []
+      @parts.each { |v| parts << (v.nil? ? nil : v / other) }
+      Duration.new(@seconds / other, parts, @order.dup)
+    end
+
     # activesupport 8.2 `Duration#inspect`: its parts in PARTS order, a
     # unit of 1 singular, joined as `to_sentence(locale: false)` joins
     # ("1 day, 2 hours, and 5 minutes"); "<value> seconds" with none.

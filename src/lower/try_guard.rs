@@ -49,6 +49,25 @@
 //! The bound that keeps this honest is that `m` is a LITERAL at every
 //! corpus site (`:username`, `"is_moderator"`). A computed method name
 //! is left as a plain `try` send for the analyzer to report.
+//!
+//! THE POSTGRESQL CRUBY TREE ASKS `respond_to?` ITSELF. A PostgreSQL
+//! app has one target, the CRuby tree (`project::ruby_family_files`
+//! refuses the rest), and that tree loads activesupport's own
+//! `Object#try` / `NilClass#try` before any app code
+//! (`runtime/spinel/active_support_tryable.rb`, required from boot.rb by
+//! `project::apply_postgres_bootstrap`). There every `try` and `try!`
+//! stays the send it was written as. The closed-world narrowing is an
+//! approximation the runtime does not need, and it is wrong in both
+//! directions on Core:
+//!
+//! * past MAX_ARMS it kept the nil guard, so Core's
+//!   `error.try(:error_source_path)` (`ShopifyErrors::AttributionBuilder`,
+//!   over a RuntimeError, with many app classes answering the name)
+//!   became `error && error.error_source_path` and every reported error
+//!   turned into a secondary NoMethodError;
+//! * the class set it narrows over is app classes only, so a gem's or
+//!   the runtime's object that does answer the name (or a name that only
+//!   a gem defines) read as nil.
 
 use crate::det::{HashMap, HashSet};
 
@@ -109,7 +128,7 @@ pub fn apply_try_guard_lowering(app: &mut App) {
 
 fn rewrite(
     expr: &mut Expr,
-    definers: &HashMap<Symbol, HashSet<Symbol>>,
+    definers: &TryDefiners,
     parents: &HashMap<Symbol, Symbol>,
 ) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, definers, parents));
@@ -118,9 +137,14 @@ fn rewrite(
 
 pub(crate) fn rewrite_node(
     expr: &mut Expr,
-    definers: &HashMap<Symbol, HashSet<Symbol>>,
+    definers: &TryDefiners,
     parents: &HashMap<Symbol, Symbol>,
 ) {
+    // The tree defines `Object#try` itself: the send is the behaviour.
+    if definers.runtime_tryable {
+        return;
+    }
+    let definers = &definers.by_name;
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else {
         return;
     };
@@ -347,8 +371,35 @@ fn is_a(span: crate::span::Span, recv: &Expr, klass: &Symbol) -> Expr {
 /// a class that does not answer, so the guard is not optional.
 const SYNTHESIZED_ON_EVERY_MODEL: [&str; 1] = ["to_gid_param"];
 
+/// What `rewrite_node` decides from: which app classes define each
+/// name, or that the tree carries activesupport's `Object#try` and no
+/// site is rewritten at all.
+pub(crate) struct TryDefiners {
+    /// method name -> the app classes defining it as an INSTANCE method.
+    /// Empty when `runtime_tryable`: nothing reads it.
+    by_name: HashMap<Symbol, HashSet<Symbol>>,
+    /// The app's primary database is PostgreSQL, so its one target is
+    /// the CRuby tree, which loads `runtime/active_support_tryable.rb`
+    /// (activesupport 8.2 `core_ext/object/try.rb`) before app code.
+    runtime_tryable: bool,
+}
+
+/// Whether the app's tree carries activesupport's `Object#try`: the
+/// PostgreSQL CRuby tree, the only tree a PostgreSQL app emits.
+fn runtime_tryable(app: &App) -> bool {
+    app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+}
+
+/// The definer table, or the mark that the tree answers `try` itself.
+pub(crate) fn collect_definers(app: &App) -> TryDefiners {
+    if runtime_tryable(app) {
+        return TryDefiners { by_name: HashMap::default(), runtime_tryable: true };
+    }
+    TryDefiners { by_name: definers_by_name(app), runtime_tryable: false }
+}
+
 /// method name -> the app classes defining it as an INSTANCE method.
-pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
+fn definers_by_name(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
     let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::default();
     for m in &app.models {
         let owner = m.name.0.clone();
@@ -374,9 +425,13 @@ pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
     out
 }
 
-/// class -> superclass, over models and library classes both.
+/// class -> superclass, over models and library classes both. Empty
+/// where the tree answers `try` itself (`runtime_tryable`).
 pub(crate) fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
     let mut out = HashMap::default();
+    if runtime_tryable(app) {
+        return out;
+    }
     for m in &app.models {
         if let Some(p) = &m.parent {
             out.insert(m.name.0.clone(), p.0.clone());
