@@ -8274,23 +8274,29 @@ pub(super) fn is_rails_engine_class(class: &ruby_prism::ClassNode<'_>) -> bool {
 /// (engine.rb:596 `set_load_path`). Read from the application's class
 /// body in config/application.rb and from each engine's `Rails::Engine`
 /// subclass (its root the engine's directory, `engine_dirs`): a statement
-/// of the body, or of an `if Rails.env.test?` there (Core's config/application.rb:208-211,
-/// `components/*/lib/*/engine.rb`). An engine without one adds nothing
+/// of the body, or of an `if Rails.env.test?` or a `case Rails.env` `when "test"`
+/// there (Core's config/application.rb:208-211, `components/*/lib/*/engine.rb`). An engine without one adds nothing
 /// (Core's access_and_auth/login_with_shop), and a directory the tree
 /// does not have is skipped, as `set_load_path` skips it. Not read: a
 /// path under another condition, or one written other than as a literal.
 fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[PathBuf]) -> Vec<PathBuf> {
     use ruby_prism::Node;
-    fn rails_env_test(node: &Node<'_>) -> bool {
-        let Some(call) = node.as_call_node() else { return false };
-        if super::util::constant_id_str(&call.name()) != "test?" || call.arguments().is_some() {
-            return false;
-        }
-        call.receiver().and_then(|r| r.as_call_node()).is_some_and(|env| {
+    // `Rails.env` (`::Rails.env`).
+    fn rails_env(node: &Node<'_>) -> bool {
+        node.as_call_node().is_some_and(|env| {
             super::util::constant_id_str(&env.name()) == "env"
                 && env.arguments().is_none()
-                && env.receiver().and_then(|r| super::util::constant_path_of(&r)).is_some_and(|p| p.join("::") == "Rails")
+                && env.receiver().and_then(|r| super::util::constant_path_of(&r)).is_some_and(|p| {
+                    p.iter().map(String::as_str).skip_while(|s| s.is_empty()).eq(["Rails"])
+                })
         })
+    }
+    // `Rails.env.test?`.
+    fn rails_env_test(node: &Node<'_>) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        super::util::constant_id_str(&call.name()) == "test?"
+            && call.arguments().is_none()
+            && call.receiver().is_some_and(|r| rails_env(&r))
     }
     // `paths.add("test", load_path: true)` / `config.paths.add(…)`.
     fn load_path_entry(node: &Node<'_>) -> Option<String> {
@@ -8331,6 +8337,18 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
                 if rails_env_test(&branch.predicate()) {
                     if let Some(then) = branch.statements() {
                         body_entries(then.as_node(), out);
+                    }
+                }
+            } else if let Some(case) = stmt.as_case_node() {
+                // `case Rails.env when "test"` (Core's
+                // markets/platform/lib/markets/platform/engine.rb:9):
+                // Rails.env is a String, which a "test" condition matches.
+                if case.predicate().is_some_and(|p| rails_env(&p)) {
+                    for when in case.conditions().iter().filter_map(|c| c.as_when_node()) {
+                        let test = when.conditions().iter().any(|c| c.as_string_node().is_some_and(|s| s.unescaped() == b"test"));
+                        if let (true, Some(then)) = (test, when.statements()) {
+                            body_entries(then.as_node(), out);
+                        }
                     }
                 }
             }

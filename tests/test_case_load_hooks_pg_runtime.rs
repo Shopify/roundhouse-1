@@ -434,7 +434,9 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// the application's `config.paths.add("test/support", load_path: true)`
 /// under `if Rails.env.test?` (Core's config/application.rb:208-211)
 /// adds one, and a file below both `test` and `test/support` answers
-/// both features.
+/// both features. A `case Rails.env` `when "test"` branch counts (Core's
+/// markets/platform/lib/markets/platform/engine.rb:9); its `when
+/// "development"` branch does not.
 #[test]
 fn the_test_load_path_is_rails_test_and_each_load_path_entry() {
     let application = r#"require "rails"
@@ -450,14 +452,28 @@ module HooksApp
 end
 "#;
     let plain_engine = "module Plain\n  class Engine < ::Rails::Engine\n  end\nend\n";
-    let lock = "PATH\n  remote: components/plain\n  specs:\n    plain (0.1.0)\n\nPATH\n  remote: components/widgets\n  specs:\n    widgets (0.1.0)\n\nDEPENDENCIES\n  plain!\n  widgets!\n";
+    let cased_engine = r#"module Cased
+  class Engine < ::Rails::Engine
+    case Rails.env
+    when "development"
+      paths.add("test/dev_support", load_path: true)
+    when "test"
+      paths.add("test/support", load_path: true)
+    end
+  end
+end
+"#;
+    let lock = "PATH\n  remote: components/cased\n  specs:\n    cased (0.1.0)\n\nPATH\n  remote: components/plain\n  specs:\n    plain (0.1.0)\n\nPATH\n  remote: components/widgets\n  specs:\n    widgets (0.1.0)\n\nDEPENDENCIES\n  cased!\n  plain!\n  widgets!\n";
     let (emitted, errors) = overlay()
         .write("config/application.rb", application)
         .write("Gemfile.lock", lock)
         .write(
             "roundhouse.yml",
-            "database_adapter: postgresql\ntest_paths:\n  - test/support\n  - components/widgets/test/support\n  - components/plain/test/support\n",
+            "database_adapter: postgresql\ntest_paths:\n  - test/support\n  - components/widgets/test/support\n  - components/plain/test/support\n  - components/cased/test/support\n  - components/cased/test/dev_support\n",
         )
+        .write("components/cased/lib/cased/engine.rb", cased_engine)
+        .write("components/cased/test/support/helpers/cased_helper.rb", "module CasedHelper\nend\n")
+        .write("components/cased/test/dev_support/dev_helper.rb", "module DevHelper\nend\n")
         .write("components/plain/lib/plain/engine.rb", plain_engine)
         .write("components/plain/test/support/helpers/plain_helper.rb", "module PlainHelper\nend\n")
         .emit(BuildTarget::Ruby);
@@ -465,8 +481,18 @@ end
     let models = std::fs::read_to_string(emitted.join("app/models.rb")).expect("models");
     let table = &models[models.find("TEST_LOAD_PATH_FEATURES = {").expect("table")..];
     let table = &table[..table.find("}.freeze").expect("table end")];
+    // Both are carried, and neither is on the test load path.
+    let carried = walk(&emitted.join("app/models"))
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for module in ["module PlainHelper", "module DevHelper", "module CasedHelper"] {
+        assert!(carried.contains(module), "{module} not carried");
+    }
     assert!(!table.contains("plain_helper"), "{table}");
-    for feature in ["support/helpers/hook_helper", "helpers/hook_helper", "support/helpers/widget_setup"] {
+    assert!(!table.contains("dev_helper"), "{table}");
+    for feature in ["support/helpers/hook_helper", "helpers/hook_helper", "support/helpers/widget_setup", "helpers/cased_helper"] {
         assert!(table.contains(&format!("\"{feature}\" =>")), "{feature}: {table}");
     }
 }
