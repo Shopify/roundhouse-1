@@ -2477,6 +2477,122 @@ struct DeclBody {
     discarded: Vec<Discarded>,
 }
 
+/// Why an `attr_*` statement whose names [`attr_declared_names`] cannot
+/// read is not carried (`Discarded`).
+const ATTR_SPLAT_UNREAD: &str = "an `attr_*` declaration splatting a list the ingest cannot read";
+
+/// The names an `attr_reader` / `attr_writer` / `attr_accessor` call
+/// declares, in order: each symbol or string argument (Ruby takes both),
+/// and each splat of a list known where the call stands. `None` when an
+/// argument is neither (a splat of a method call, a local, a constant
+/// of another scope): the caller names the statement rather than drop
+/// the names it would declare.
+///
+/// A splat reads a list literal of symbols and strings, and a constant
+/// of the same body assigned one above the call (`constants`, in body
+/// order; the latest assignment is the one Ruby reads). Over those, the
+/// list operations Core's declarations use: `.freeze`, `a + b`, `a | b`
+/// (union, first occurrence kept) and `HASH.keys` of a hash literal with
+/// symbol or string keys (zendesk/user.rb's
+/// `attr_accessor(*(ALLOWED_ATTRIBUTES + USER_FIELDS.keys))`).
+fn attr_declared_names(
+    call: &ruby_prism::CallNode<'_>,
+    constants: &[(Symbol, Expr)],
+    file: &str,
+) -> Option<Vec<Symbol>> {
+    let mut names: Vec<Symbol> = Vec::new();
+    for arg in call.arguments().iter().flat_map(|args| args.arguments().iter()) {
+        if let Some(name) = super::util::symbol_or_string_value(&arg) {
+            names.push(Symbol::from(name));
+            continue;
+        }
+        let splat = arg.as_splat_node()?;
+        let list = ingest_expr(&splat.expression()?, file).ok()?;
+        names.extend(literal_name_list(&list, constants, 0)?.into_iter().map(Symbol::from));
+    }
+    Some(names)
+}
+
+/// The symbols and strings `expr` evaluates to as a list
+/// ([`attr_declared_names`]), or `None` when it is not one known here.
+fn literal_name_list(expr: &Expr, constants: &[(Symbol, Expr)], depth: usize) -> Option<Vec<String>> {
+    if depth > 16 {
+        return None;
+    }
+    match &*expr.node {
+        ExprNode::Array { elements, .. } => {
+            let mut out = Vec::new();
+            for element in elements {
+                match &*element.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => out.push(value.as_str().to_string()),
+                    ExprNode::Lit { value: Literal::Str { value } } => out.push(value.clone()),
+                    ExprNode::Splat { value } => out.extend(literal_name_list(value, constants, depth + 1)?),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        ExprNode::Seq { exprs } if exprs.len() == 1 => literal_name_list(&exprs[0], constants, depth + 1),
+        ExprNode::Cast { value, .. } => literal_name_list(value, constants, depth + 1),
+        ExprNode::Const { path } if path.len() == 1 => {
+            let (_, value) = constants.iter().rev().find(|(name, _)| name == &path[0])?;
+            literal_name_list(value, constants, depth + 1)
+        }
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => match (method.as_str(), args.as_slice()) {
+            ("freeze" | "dup" | "to_a", []) => literal_name_list(recv, constants, depth + 1),
+            ("keys", []) => literal_hash_keys(recv, constants, depth + 1),
+            ("+", [other]) => {
+                let mut out = literal_name_list(recv, constants, depth + 1)?;
+                out.extend(literal_name_list(other, constants, depth + 1)?);
+                Some(out)
+            }
+            ("|", [other]) => {
+                let mut out: Vec<String> = Vec::new();
+                let left = literal_name_list(recv, constants, depth + 1)?;
+                let right = literal_name_list(other, constants, depth + 1)?;
+                for name in left.into_iter().chain(right) {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The keys of a hash literal of symbol or string keys `expr` evaluates
+/// to, in order ([`literal_name_list`]).
+fn literal_hash_keys(expr: &Expr, constants: &[(Symbol, Expr)], depth: usize) -> Option<Vec<String>> {
+    if depth > 16 {
+        return None;
+    }
+    match &*expr.node {
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .map(|(key, _)| match &*key.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+        ExprNode::Seq { exprs } if exprs.len() == 1 => literal_hash_keys(&exprs[0], constants, depth + 1),
+        ExprNode::Cast { value, .. } => literal_hash_keys(value, constants, depth + 1),
+        ExprNode::Const { path } if path.len() == 1 => {
+            let (_, value) = constants.iter().rev().find(|(name, _)| name == &path[0])?;
+            literal_hash_keys(value, constants, depth + 1)
+        }
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if args.is_empty() && matches!(method.as_str(), "freeze" | "dup") =>
+        {
+            literal_hash_keys(recv, constants, depth + 1)
+        }
+        _ => None,
+    }
+}
+
 /// A class or module body statement the walk does not carry.
 #[derive(Clone)]
 struct Discarded {
@@ -3421,6 +3537,10 @@ fn walk_decl_body_in<'pr>(
     // body (named directives after each def) does not give it, so such a
     // statement is not captured (`body_statement`).
     let mut default_visibility_nonpublic = false;
+    // Which one: the visibility an `attr_*` splat's names take
+    // (`attr_declared_names`), which the visibility pass, reading only
+    // literal names, records none for.
+    let mut default_visibility = crate::dialect::MethodVisibility::Public;
     // Body statements are captured (`expr::BODY_STATEMENT`) in a
     // declaration's own body, and in its `class << self`, where they run
     // on the singleton class (`expr::SINGLETON_BODY`).
@@ -3554,6 +3674,11 @@ fn walk_decl_body_in<'pr>(
             {
                 module_function_active = false;
                 default_visibility_nonpublic = constant_id_str(&call.name()) != "public";
+                default_visibility = match constant_id_str(&call.name()) {
+                    "private" => crate::dialect::MethodVisibility::Private,
+                    "protected" => crate::dialect::MethodVisibility::Protected,
+                    _ => crate::dialect::MethodVisibility::Public,
+                };
             }
             continue;
         }
@@ -4187,10 +4312,22 @@ fn walk_decl_body_in<'pr>(
                         }
                         // A `cattr_*` in `class << self` or a `class_methods`
                         // block keeps the class-side ivar pair it had.
-                        let names: Vec<Symbol> = call
-                            .arguments()
-                            .map(|args| args.arguments().iter().filter_map(|arg| symbol_value(&arg)).map(Symbol::from).collect())
-                            .unwrap_or_default();
+                        //
+                        // `attr_reader(*PUBLIC_ATTRIBUTES)` (country_db's
+                        // Country, Zone and LocalizationKeys) declares the
+                        // names of a list the body already holds
+                        // (`attr_splat_names`). One the ingest cannot read
+                        // was dropped with no diagnostic, and every read of
+                        // `country.format_extended_v2` was a NameError; it
+                        // is named in the file's program now, and written
+                        // back in place where the emitted body can carry it.
+                        let Some(names) = attr_declared_names(&call, &out.constants, file) else {
+                            out.discarded.push(Discarded::of(&statement, ATTR_SPLAT_UNREAD));
+                            if captures_statements && !default_visibility_nonpublic && !module_function_active {
+                                out.unknown_calls.extend(body_statement(&statement, file));
+                            }
+                            continue;
+                        };
                         // Under `extend self` the accessors are module
                         // methods too, as its `def`s are.
                         let recv = if is_class_attr || force_class_receiver || extend_self_active {
@@ -4211,6 +4348,7 @@ fn walk_decl_body_in<'pr>(
                             if want_reader {
                                 let mut method = synth_attr_reader(owner, name, recv);
                                 method.name_span = name_span;
+                                method.visibility = default_visibility;
                                 visibility.apply(&statement, &mut method);
                                 // Skip when a `def` of this name already
                                 // walked (unusual order); a later `def`
@@ -4224,6 +4362,7 @@ fn walk_decl_body_in<'pr>(
                             if want_writer {
                                 let mut method = synth_attr_writer(owner, name, recv);
                                 method.name_span = name_span;
+                                method.visibility = default_visibility;
                                 visibility.apply(&statement, &mut method);
                                 if !out.methods.iter().any(|e| {
                                     e.name == method.name && e.receiver == method.receiver
