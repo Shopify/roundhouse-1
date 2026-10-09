@@ -115,6 +115,11 @@ struct Decl {
     /// an includer's class body that declare tests when called
     /// (`test_macros`).
     macros: Vec<String>,
+    /// Its `def teardown`, as `BodyTeardown::def`: its body's, or one its
+    /// `included do` block defines on the includer.
+    teardown: Option<bool>,
+    /// The modules its `included do` block includes in the includer.
+    block_includes: Vec<IncludeRef>,
 }
 
 /// A class with a superclass: a test class may get all of its tests from
@@ -200,8 +205,9 @@ struct Table {
     setup_fn: Option<Expr>,
     teardown_fn: Option<Expr>,
     /// The other modules it includes, flattened through shared test
-    /// modules, in source order.
-    passthrough: Vec<String>,
+    /// modules, in source order, and where each shared test module
+    /// stands among them.
+    passthrough: Vec<OutInclude>,
     /// For a class: the shared test modules its superclass chain already
     /// has. `Concern#append_features` returns early on them (`base <
     /// self`), so their `included do` blocks do not run again.
@@ -219,6 +225,18 @@ impl Table {
             None => self.slots.push((name.to_string(), slot)),
         }
     }
+}
+
+/// One `include` of the emitted class, in the order it writes them.
+#[derive(Clone, Debug, PartialEq)]
+enum OutInclude {
+    /// A module other than a shared test one, as the class includes it.
+    Module(String),
+    /// Where a shared test module (by index) stands: the module of the
+    /// definitions of it a `super` reaches (`RoundhouseSuper…`), if it has
+    /// any, is included there, so the lookup finds them where Ruby finds
+    /// the module.
+    Spliced(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
@@ -254,6 +272,8 @@ pub(super) struct TestMixins {
     block_teardowns: bool,
     /// `block_summary` of each of `mixins`.
     summaries: Vec<BlockSummary>,
+    /// `decls` by name: every declaration of each module.
+    module_index: Map<String, Vec<usize>>,
 }
 
 /// What a concern's `included do` block does on the class, as far as a
@@ -281,7 +301,36 @@ struct AncestorTeardown {
     /// Its `def teardown`, as `BodyTeardown::def`. One an `included do`
     /// block defines counts as not ending in `super`.
     def: Option<bool>,
+    /// The modules its body includes, through what they include in turn
+    /// (`TestMixins::module_teardowns`).
+    modules: Vec<ModuleTeardown>,
 }
+
+/// A module in a test class's ancestry, as far as its `def teardown` goes.
+#[derive(Clone, Debug)]
+struct ModuleTeardown {
+    /// As a test file declares it, else as written.
+    name: String,
+    /// A test file declares it, so the scan read its `def teardown`; or it
+    /// is one of `NO_TEARDOWN`.
+    known: bool,
+    /// Its `def teardown`, as `Decl::teardown`.
+    def: Option<bool>,
+}
+
+/// Modules of Ruby and of the testing gems Core uses (minitest 5.27,
+/// ActiveSupport, mocha) that a test class includes and that define no
+/// `teardown` (checked against those gems): what they bring cannot change
+/// the `def teardown` chain.
+const NO_TEARDOWN: &[&str] = &[
+    "Kernel",
+    "Minitest::Assertions",
+    "ActiveSupport::Testing::Assertions",
+    "ActiveSupport::Testing::TimeHelpers",
+    "ActiveSupport::Testing::ErrorReporterAssertions",
+    "ActiveSupport::Testing::ConstantStubbing",
+    "Mocha::API",
+];
 
 /// What a test class inherits from the test classes the scan read above
 /// it.
@@ -375,6 +424,9 @@ impl TestMixins {
         self.tables = tables;
         for (i, c) in self.classes.iter().enumerate() {
             self.class_index.entry(c.name.clone()).or_insert(i);
+        }
+        for (i, d) in self.decls.iter().enumerate() {
+            self.module_index.entry(d.name.clone()).or_default().push(i);
         }
         self.summaries = (0..self.mixins.len()).map(|k| self.block_summary(k)).collect();
         self.block_teardowns = self.summaries.iter().any(|s| s.callbacks);
@@ -554,6 +606,7 @@ impl TestMixins {
                 callbacks: c.teardown.callbacks,
                 spliced: false,
                 def: c.teardown.def,
+                modules: self.module_teardowns(&c.includes, &c.nesting),
             };
             self.simulate_includes(&mut table, &c.includes, &c.nesting, &mut a, 0);
             classes.push(a);
@@ -581,6 +634,45 @@ impl TestMixins {
                 }
             }
         }
+    }
+
+    /// The modules including `refs` (written in a body with `nesting`)
+    /// brings into a class's ancestry: each, and what it includes, its
+    /// `included do` block included, in turn. One no test file declares
+    /// is not `known`, nor is what it includes.
+    fn module_teardowns(&self, refs: &[IncludeRef], nesting: &[String]) -> Vec<ModuleTeardown> {
+        let mut out: Vec<ModuleTeardown> = Vec::new();
+        let mut stack: Vec<(IncludeRef, Vec<String>)> = refs.iter().map(|r| (r.clone(), nesting.to_vec())).collect();
+        stack.reverse();
+        while let Some((r, nesting)) = stack.pop() {
+            if out.len() > 256 {
+                break;
+            }
+            let found = candidates(&r, &nesting).into_iter().find_map(|c| self.module_index.get(&c).map(|d| (c, d)));
+            let Some((name, decls)) = found else {
+                let name = r.written();
+                if !out.iter().any(|m| m.name == name) {
+                    let known = NO_TEARDOWN.contains(&name.as_str());
+                    out.push(ModuleTeardown { name, known, def: None });
+                }
+                continue;
+            };
+            if out.iter().any(|m| m.name == name) {
+                continue;
+            }
+            let mut def: Option<bool> = None;
+            let mut inner: Vec<(IncludeRef, Vec<String>)> = Vec::new();
+            for &i in decls {
+                let d = &self.decls[i];
+                if let Some(ok) = d.teardown {
+                    def = Some(def.unwrap_or(true) && ok);
+                }
+                inner.extend(d.includes.iter().chain(&d.block_includes).map(|r| (r.clone(), d.nesting.clone())));
+            }
+            out.push(ModuleTeardown { name, known: true, def });
+            stack.extend(inner.into_iter().rev());
+        }
+        out
     }
 
     /// The statements of `k`'s `included do` block that matter to a
@@ -669,10 +761,12 @@ impl TestMixins {
                                 if t.deps.contains(k) {
                                     Vec::new()
                                 } else {
-                                    flat_passthrough(*k, tables)
+                                    let mut flat = flat_passthrough(*k, tables);
+                                    flat.push(OutInclude::Spliced(*k));
+                                    flat
                                 }
                             }
-                            None => vec![self.qualify(r, &m.nesting)],
+                            None => vec![OutInclude::Module(self.qualify(r, &m.nesting))],
                         };
                         for inc in flat {
                             if !t.passthrough.contains(&inc) {
@@ -823,10 +917,12 @@ impl TestMixins {
         };
         let superclass = class.superclass().and_then(|n| IncludeRef::of(&n));
         let ancestry = self.ancestry(superclass.as_ref(), &nesting[1..]);
+        let stmts = class.body().map(flatten_statements).unwrap_or_default();
+        let own_modules = self.module_teardowns(&body_includes(&stmts), &nesting);
         if !self.may_include_shared(tm) {
             // A subclass of a spliced class: only its teardown matters.
             let own = class_def_teardown(tm).map(|b| ends_in_super(&b));
-            return check_teardown_chain(tm.teardown_blocks, own, &ancestry).map_err(refuse);
+            return check_teardown_chain(tm.teardown_blocks, own, &own_modules, &ancestry).map_err(refuse);
         }
         let mut walk = ClassWalk {
             reg: self,
@@ -847,9 +943,9 @@ impl TestMixins {
             includes_out: Vec::new(),
             used: Vec::new(),
         };
-        let stmts = class.body().map(flatten_statements).unwrap_or_default();
         walk.walk(stmts, file, false, Some(&class)).map_err(refuse)?;
-        check_teardown_chain(!walk.teardowns.is_empty(), walk.def_teardown(tm).map(|b| ends_in_super(&b)), &ancestry).map_err(refuse)?;
+        let own = walk.def_teardown(tm).map(|b| ends_in_super(&b));
+        check_teardown_chain(!walk.teardowns.is_empty(), own, &own_modules, &ancestry).map_err(refuse)?;
         if walk.used.is_empty() {
             return Ok(());
         }
@@ -911,13 +1007,15 @@ struct ClassWalk<'a> {
     /// last of its name, and only while no later class-body `def`
     /// replaced it.
     block_helpers: Vec<MethodDef>,
-    /// The names the class body has `def`ined so far.
-    class_defs: Vec<String>,
+    /// The methods the class body has `def`ined so far, as (name,
+    /// receiver): `def self.label` and `def label` are different methods.
+    class_defs: Vec<(String, MethodReceiver)>,
     /// The class-body defs a later `included do` block's def replaced:
     /// the block's definition is the class's (`ingest_test_class` kept
     /// the class body's in `tm.helpers`).
-    block_wins: Vec<String>,
-    includes_out: Vec<String>,
+    block_wins: Vec<(String, MethodReceiver)>,
+    /// What the emitted class includes, in order (`OutInclude`).
+    includes_out: Vec<OutInclude>,
     /// Every shared test module included, directly or not.
     used: Vec<usize>,
 }
@@ -937,6 +1035,9 @@ impl ClassWalk<'_> {
         let mut items = Vec::new();
         class_body_items(stmts, file, &consts, &mut items).map_err(message)?;
         let mut saved: Vec<(Vec<(String, String)>, Vec<(String, String)>)> = Vec::new();
+        // The default visibility of the block's defs: `class_eval` starts
+        // public, and a bare `private` there makes the later defs private.
+        let mut visibility = MethodVisibility::Public;
         for item in items {
             let stmt = match item {
                 BodyItem::Stmt(stmt) => stmt,
@@ -1017,16 +1118,51 @@ impl ClassWalk<'_> {
                 if call.receiver().is_none() {
                     match constant_id_str(&call.name()) {
                         "include" => {
-                            let refs: Vec<IncludeRef> =
-                                call.arguments().map(|a| a.arguments().iter().filter_map(|n| IncludeRef::of(&n)).collect()).unwrap_or_default();
+                            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                            let refs: Vec<IncludeRef> = args.iter().filter_map(IncludeRef::of).collect();
+                            if in_block && refs.len() != args.len() {
+                                return Err(format!(
+                                    "the `included do` block {} includes a module that is not a constant, which the shared-test splice does not model",
+                                    at(file, stmt.location().start_offset())
+                                ));
+                            }
                             self.include(refs)?;
                             continue;
                         }
                         "setup" if call.block().is_some() => {
+                            if call.arguments().is_some() || call.block().and_then(|b| b.as_block_node()).is_none() {
+                                return Err(format!(
+                                    "the `setup` {} passes arguments or a block argument (`prepend: true` runs it before the callbacks registered earlier), which the shared-test splice does not model",
+                                    at(file, stmt.location().start_offset())
+                                ));
+                            }
                             if let Some(body) = ingest_setup_declaration(&stmt, file).map_err(message)? {
                                 self.setups.push(body);
                                 self.block_setup |= in_block;
                             }
+                            continue;
+                        }
+                        // `setup :name, …`: each a callback that calls the
+                        // method, as `set_callback` registers a symbol.
+                        "setup" => {
+                            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                            let names: Vec<String> = args
+                                .iter()
+                                .filter_map(|a| a.as_symbol_node())
+                                .map(|n| String::from_utf8_lossy(n.unescaped()).into_owned())
+                                .collect();
+                            if args.is_empty() || names.len() != args.len() {
+                                return Err(format!(
+                                    "the `setup` {} is not `setup do … end` or `setup :name, …`, which the shared-test splice does not model",
+                                    at(file, stmt.location().start_offset())
+                                ));
+                            }
+                            for name in names {
+                                self.setups.push(self::call(&name));
+                            }
+                            // `ingest_test_class` kept no callback for it:
+                            // the class's setup is rebuilt from `setups`.
+                            self.block_setup = true;
                             continue;
                         }
                         // `teardown :name` and other forms are refused by
@@ -1048,23 +1184,33 @@ impl ClassWalk<'_> {
             // (which `class_eval` runs on the class where the include
             // stands).
             if !in_block {
-                if let Some(def) = instance_def(&stmt) {
-                    let name = constant_id_str(&def.name()).to_string();
-                    self.block_helpers.retain(|m| m.name.as_str() != name);
-                    self.block_wins.retain(|n| *n != name);
-                    if !self.class_defs.contains(&name) {
-                        self.class_defs.push(name);
+                if let Some(key) = body_def_key(&stmt) {
+                    self.block_helpers.retain(|m| !(m.name.as_str() == key.0 && m.receiver == key.1));
+                    self.block_wins.retain(|k| *k != key);
+                    if !self.class_defs.contains(&key) {
+                        self.class_defs.push(key);
                     }
                 }
             }
             if in_block {
-                if let Some(def) = stmt.as_def_node() {
-                    let method = ingest_library_method(&def, &self.class, file).map_err(message)?;
-                    let name = method.name.to_string();
-                    if self.class_defs.contains(&name) && !self.block_wins.contains(&name) {
-                        self.block_wins.push(name);
+                if let Some(level) = bare_visibility(&stmt) {
+                    visibility = level;
+                    continue;
+                }
+                let def = match stmt.as_def_node() {
+                    Some(def) => Some((def, None)),
+                    None => instance_def(&stmt).map(|def| (def, stmt.as_call_node().and_then(|c| visibility_of(constant_id_str(&c.name()))))),
+                };
+                if let Some((def, written)) = def {
+                    let mut method = ingest_library_method(&def, &self.class, file).map_err(message)?;
+                    if method.receiver == MethodReceiver::Instance {
+                        method.visibility = written.unwrap_or(visibility);
                     }
-                    self.block_helpers.retain(|m| m.name != method.name);
+                    let key = (method.name.to_string(), method.receiver);
+                    if self.class_defs.contains(&key) && !self.block_wins.contains(&key) {
+                        self.block_wins.push(key);
+                    }
+                    self.block_helpers.retain(|m| !(m.name == method.name && m.receiver == method.receiver));
                     self.block_helpers.push(method);
                     continue;
                 }
@@ -1074,6 +1220,18 @@ impl ClassWalk<'_> {
                         at(file, stmt.location().start_offset())
                     ));
                 }
+                if is_extend_declarative(&stmt) {
+                    // Every test class already has it (`ActiveSupport::TestCase`).
+                    continue;
+                }
+                let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
+                let first = text.lines().next().unwrap_or_default();
+                let shown: String = first.chars().take(60).collect();
+                return Err(format!(
+                    "the `included do` block {} runs `{shown}{}` on the class, which the shared-test splice does not model",
+                    at(file, stmt.location().start_offset()),
+                    if shown.len() < text.len() { "…" } else { "" }
+                ));
             }
         }
         Ok(())
@@ -1083,7 +1241,7 @@ impl ClassWalk<'_> {
     /// `included do` block's when no later class-body def replaced it,
     /// else the class body's own.
     fn def_teardown(&self, tm: &TestModule) -> Option<Expr> {
-        match self.block_helpers.iter().find(|m| m.name.as_str() == "teardown") {
+        match self.block_helpers.iter().find(|m| m.name.as_str() == "teardown" && m.receiver == MethodReceiver::Instance) {
             Some(m) => Some(m.body.clone()),
             None => class_def_teardown(tm),
         }
@@ -1110,12 +1268,16 @@ impl ClassWalk<'_> {
         for (r, k) in refs.iter().zip(&resolved).rev() {
             let flat = match k {
                 Some(k) => match table_of(self.tables, *k) {
-                    Ok(_) => flat_passthrough(*k, self.tables),
+                    Ok(_) => {
+                        let mut flat = flat_passthrough(*k, self.tables);
+                        flat.push(OutInclude::Spliced(*k));
+                        flat
+                    }
                     Err(why) => {
                         return Err(format!("includes shared tests `{}`, not modeled: {why}", self.reg.mixins[*k].name))
                     }
                 },
-                None => vec![r.written()],
+                None => vec![OutInclude::Module(r.written())],
             };
             for inc in flat {
                 if !self.includes_out.contains(&inc) {
@@ -1215,7 +1377,7 @@ impl ClassWalk<'_> {
                 first.entry(name).or_insert(public);
             };
             let public = |h: &MethodDef| h.visibility == MethodVisibility::Public;
-            for h in class_helpers.iter().chain(block_helpers.iter()) {
+            for h in class_helpers.iter().chain(block_helpers.iter()).filter(|h| h.receiver == MethodReceiver::Instance) {
                 note(h.name.to_string(), public(h));
             }
             for &m in &t.mro {
@@ -1339,19 +1501,24 @@ impl ClassWalk<'_> {
         // kept in a module of its own the class includes, in the same
         // lookup order, so the chain runs as it does natively.
         let mut helpers = class_helpers.clone();
-        let mut chains: Vec<(String, Vec<(Option<usize>, MethodDef)>)> = Vec::new();
-        let add = |owner: Option<usize>, h: MethodDef, chains: &mut Vec<(String, Vec<(Option<usize>, MethodDef)>)>| {
-            let name = h.name.to_string();
-            match chains.iter_mut().find(|(n, _)| *n == name) {
+        // Keyed by (name, receiver): `def self.label` is not `def label`.
+        type Chains = Vec<((String, MethodReceiver), Vec<(Option<usize>, MethodDef)>)>;
+        let mut chains: Chains = Vec::new();
+        let add = |owner: Option<usize>, h: MethodDef, chains: &mut Chains| {
+            let key = (h.name.to_string(), h.receiver);
+            match chains.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, defs)) => defs.push((owner, h)),
-                None => chains.push((name, vec![(owner, h)])),
+                None => chains.push((key, vec![(owner, h)])),
             }
         };
         for h in &class_helpers {
             add(None, h.clone(), &mut chains);
         }
+        // A concern block's defs are the class's own (`class_eval` ran
+        // them on it), unless a later class-body def replaced them.
         for h in block_helpers {
-            if !class_helpers.iter().any(|own| own.name == h.name) {
+            if !class_helpers.iter().any(|own| own.name == h.name && own.receiver == h.receiver) {
+                helpers.push(h.clone());
                 add(None, h, &mut chains);
             }
         }
@@ -1370,8 +1537,8 @@ impl ClassWalk<'_> {
             }
         }
         let mut supers: Vec<(usize, Vec<MethodDef>)> = Vec::new();
-        for (name, defs) in chains {
-            if seen.contains(&name) {
+        for ((name, receiver), defs) in chains {
+            if receiver == MethodReceiver::Instance && seen.contains(&name) {
                 continue;
             }
             let (winner_owner, winner) = &defs[0];
@@ -1391,7 +1558,7 @@ impl ClassWalk<'_> {
             }
         }
         let mut inner_classes = tm.inner_classes.clone();
-        let mut super_includes: Vec<String> = Vec::new();
+        let mut super_includes: Vec<(usize, String)> = Vec::new();
         for &m in t.mro.iter().rev() {
             let Some((_, defs)) = supers.iter().find(|(o, _)| *o == m) else { continue };
             let short = format!("RoundhouseSuper{}", reg.mixins[m].name.replace("::", "_"));
@@ -1405,7 +1572,7 @@ impl ClassWalk<'_> {
                 })
                 .collect();
             inner_classes.push(super_module(full, methods));
-            super_includes.push(short);
+            super_includes.push((m, short));
         }
 
         // Constants: a module's own, read by bare name in its bodies.
@@ -1459,7 +1626,22 @@ impl ClassWalk<'_> {
         out.tests = tests;
         out.helpers = helpers;
         out.constants = constants;
-        out.includes = includes_out.into_iter().chain(super_includes).map(|i| ClassId(Symbol::from(i.as_str()))).collect();
+        // Each `RoundhouseSuper…` where its shared module's include stands,
+        // so a plain module included after the shared one still comes
+        // first in the lookup; one placed nowhere is included last.
+        let mut includes: Vec<String> = Vec::new();
+        for inc in includes_out {
+            match inc {
+                OutInclude::Module(name) => includes.push(name),
+                OutInclude::Spliced(m) => {
+                    if let Some(i) = super_includes.iter().position(|(o, _)| *o == m) {
+                        includes.push(super_includes.remove(i).1);
+                    }
+                }
+            }
+        }
+        includes.extend(super_includes.into_iter().map(|(_, short)| short));
+        out.includes = includes.into_iter().map(|i| ClassId(Symbol::from(i.as_str()))).collect();
         out.inner_classes = inner_classes;
         if setup.is_some() {
             out.setup = setup;
@@ -1510,15 +1692,15 @@ fn merge_teardowns(
     tm: &TestModule,
     teardowns: Vec<Expr>,
     block_helpers: &mut Vec<MethodDef>,
-    block_wins: &[String],
+    block_wins: &[(String, MethodReceiver)],
     class: &ClassId,
 ) -> Result<(Vec<MethodDef>, bool), String> {
     let mut helpers = tm.helpers.clone();
-    helpers.retain(|h| !block_wins.iter().any(|n| n == h.name.as_str()));
+    helpers.retain(|h| !block_wins.iter().any(|(n, r)| n == h.name.as_str() && *r == h.receiver));
     if teardowns.is_empty() {
         return Ok((helpers, tm.teardown_def));
     }
-    let is_teardown = |m: &MethodDef| m.name.as_str() == "teardown";
+    let is_teardown = |m: &MethodDef| m.name.as_str() == "teardown" && m.receiver == MethodReceiver::Instance;
     let mut name_span = Span::synthetic();
     let mut def_part: Option<Expr> = None;
     // The class body's `teardown` (`ingest_test_class` merged its blocks
@@ -1724,11 +1906,23 @@ fn ends_in_super(e: &Expr) -> bool {
 /// class in the chain may register callbacks, every `def teardown` below
 /// it must end by calling `super`, and one that `ingest_test_class`
 /// merged (a class with no shared modules) must not replace a def above
-/// it. `src/analyze/test_teardown.rs` says the same of the classes this
-/// does not see; here the class is refused by name, so none of its ids
-/// is listed. `own_callbacks`: the class registers callbacks; `own_def`:
-/// its own `def teardown`, as `BodyTeardown::def`.
-fn check_teardown_chain(own_callbacks: bool, own_def: Option<bool>, ancestry: &Ancestry) -> Result<(), String> {
+/// it. The modules included below that class sit in the def chain before
+/// its teardown too, so each `def teardown` they define must also end in
+/// `super`; one no test file declares may define one, so it is refused
+/// too, unless it is one of `NO_TEARDOWN`. A module the class with the
+/// callbacks, or a class above it, already includes is not included again
+/// (Ruby skips an ancestor), so it does not count below. `src/analyze/
+/// test_teardown.rs` says the same of the classes this does not see; here
+/// the class is refused by name, so none of its ids is listed.
+/// `own_callbacks`: the class registers callbacks; `own_def`: its own
+/// `def teardown`, as `BodyTeardown::def`; `own_modules`: the modules its
+/// body includes (`TestMixins::module_teardowns`).
+fn check_teardown_chain(
+    own_callbacks: bool,
+    own_def: Option<bool>,
+    own_modules: &[ModuleTeardown],
+    ancestry: &Ancestry,
+) -> Result<(), String> {
     let Some(k) = ancestry.classes.iter().position(|a| a.callbacks) else { return Ok(()) };
     let base = &ancestry.classes[k];
     if own_callbacks {
@@ -1755,6 +1949,30 @@ fn check_teardown_chain(own_callbacks: bool, own_def: Option<bool>, ancestry: &A
             a.name, base.name
         ));
     }
+    let above: Vec<&ModuleTeardown> = ancestry.classes[k..].iter().flat_map(|a| a.modules.iter()).collect();
+    let below = std::iter::once((None, own_modules)).chain(ancestry.classes[..k].iter().map(|a| (Some(a.name.as_str()), a.modules.as_slice())));
+    for (owner, modules) in below {
+        let by = |m: &ModuleTeardown| match owner {
+            None => format!("`{}`, which it includes,", m.name),
+            Some(c) => format!("`{}`, which its base class `{c}` includes,", m.name),
+        };
+        for m in modules.iter().filter(|m| !above.iter().any(|a| a.name == m.name)) {
+            if !m.known {
+                return Err(format!(
+                    "the module {} is not one a test file declares, so whether a `def teardown` of it lets the teardown callbacks of its base class `{}` run after the whole `def teardown` chain, as Rails runs them, is not known",
+                    by(m),
+                    base.name
+                ));
+            }
+            if m.def == Some(false) {
+                return Err(format!(
+                    "the `def teardown` of the module {} does not end by calling `super`, so the teardown callbacks of its base class `{}` would not run after the whole `def teardown` chain as Rails runs them",
+                    by(m),
+                    base.name
+                ));
+            }
+        }
+    }
     if !base.spliced && base.def.is_none() {
         if let Some(a) = ancestry.classes[k + 1..].iter().find(|a| a.def.is_some()) {
             return Err(format!(
@@ -1762,8 +1980,61 @@ fn check_teardown_chain(own_callbacks: bool, own_def: Option<bool>, ancestry: &A
                 base.name, a.name
             ));
         }
+        if let Some(m) = above.iter().find(|m| m.def.is_some()) {
+            return Err(format!(
+                "the teardown blocks of its base class `{}` replace the `def teardown` of the module `{}`, which Rails would still run after each test",
+                base.name, m.name
+            ));
+        }
     }
     Ok(())
+}
+
+/// A class body's `def` as (name, receiver): an instance method
+/// (`instance_def`) or `def self.…`.
+fn body_def_key(stmt: &Node<'_>) -> Option<(String, MethodReceiver)> {
+    if let Some(def) = instance_def(stmt) {
+        return Some((constant_id_str(&def.name()).to_string(), MethodReceiver::Instance));
+    }
+    let def = stmt.as_def_node()?;
+    def.receiver()?.as_self_node()?;
+    Some((constant_id_str(&def.name()).to_string(), MethodReceiver::Class))
+}
+
+fn visibility_of(name: &str) -> Option<MethodVisibility> {
+    match name {
+        "private" => Some(MethodVisibility::Private),
+        "protected" => Some(MethodVisibility::Protected),
+        "public" => Some(MethodVisibility::Public),
+        _ => None,
+    }
+}
+
+/// `extend ActiveSupport::Testing::Declarative`.
+fn is_extend_declarative(stmt: &Node<'_>) -> bool {
+    let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && c.block().is_none()) else { return false };
+    if constant_id_str(&call.name()) != "extend" {
+        return false;
+    }
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    match args.as_slice() {
+        [arg] => IncludeRef::of(arg).is_some_and(|r| r.written() == "ActiveSupport::Testing::Declarative"),
+        _ => false,
+    }
+}
+
+/// The modules a class body's `include` statements name.
+fn body_includes(stmts: &[Node<'_>]) -> Vec<IncludeRef> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none()) else { continue };
+        if constant_id_str(&call.name()) == "include" {
+            if let Some(args) = call.arguments() {
+                out.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)));
+            }
+        }
+    }
+    out
 }
 
 /// A class or module body's instance-method `def`: bare, or written
@@ -1791,13 +2062,15 @@ fn def_ends_in_super(def: &ruby_prism::DefNode<'_>) -> bool {
 }
 
 /// The modules other than shared test ones that including `k` brings,
-/// in the order the emitted class includes them: a Concern's deferred
-/// dependencies first, as `Concern#append_features` includes them first.
-fn flat_passthrough(k: usize, tables: &Tables) -> Vec<String> {
+/// in the order the emitted class includes them, with where each shared
+/// test module stands among them (`k` itself last, which the caller
+/// adds): a Concern's deferred dependencies first, as
+/// `Concern#append_features` includes them first.
+fn flat_passthrough(k: usize, tables: &Tables) -> Vec<OutInclude> {
     let Ok(kt) = table_of(tables, k) else { return Vec::new() };
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<OutInclude> = Vec::new();
     for &d in &kt.deps {
-        for inc in flat_passthrough(d, tables) {
+        for inc in flat_passthrough(d, tables).into_iter().chain([OutInclude::Spliced(d)]) {
             if !out.contains(&inc) {
                 out.push(inc);
             }
@@ -1914,6 +2187,8 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
         declares: false,
         provider: name == "SharedTests" && is_shared_tests_provider(&stmts),
         macros: Vec::new(),
+        teardown: None,
+        block_includes: Vec::new(),
     };
     let mut class_defs: Vec<ruby_prism::DefNode<'_>> = Vec::new();
     // A `def test_…` after a bare `private`/`protected`, or written as
@@ -1939,6 +2214,9 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
         if !non_public_def(stmt, hidden) && (is_test_declaration_shape(stmt) || hidden_test_declaration(stmt).is_some()) {
             decl.declares = true;
         }
+        if let Some(def) = instance_def(stmt) {
+            note_teardown(&def, &mut decl.teardown);
+        }
         if let Some(call) = stmt.as_call_node() {
             if call.receiver().is_none() {
                 match constant_id_str(&call.name()) {
@@ -1947,14 +2225,29 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
                             decl.includes.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)));
                         }
                     }
+                    "included" if call.block().is_some() => {
+                        let body = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body());
+                        for s in body.map(flatten_statements).unwrap_or_default() {
+                            if let Some(def) = instance_def(&s) {
+                                note_teardown(&def, &mut decl.teardown);
+                            }
+                            let Some(c) = s.as_call_node().filter(|c| c.receiver().is_none()) else { continue };
+                            if constant_id_str(&c.name()) == "include" {
+                                if let Some(args) = c.arguments() {
+                                    decl.block_includes.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)));
+                                }
+                            }
+                        }
+                        if included_block_declares(&call) {
+                            decl.declares = true;
+                        }
+                    }
                     "class_methods" => {
                         let body = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body());
                         class_defs.extend(body.map(flatten_statements).unwrap_or_default().iter().filter_map(|n| n.as_def_node()));
                     }
-                    "included" | "tag" | "setup" | "teardown" | "generate_tests" if call.block().is_some() => {
-                        if constant_id_str(&call.name()) != "included" || included_block_declares(&call) {
-                            decl.declares = true;
-                        }
+                    "tag" | "setup" | "teardown" | "generate_tests" if call.block().is_some() => {
+                        decl.declares = true;
                     }
                     _ => {}
                 }
@@ -1963,6 +2256,14 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
     }
     decl.macros = test_macros(&class_defs);
     out.push(decl);
+}
+
+/// A module's `def teardown` (`def`), as `Decl::teardown`: every one it
+/// or its `included do` block defines must end in `super`.
+fn note_teardown(def: &ruby_prism::DefNode<'_>, teardown: &mut Option<bool>) {
+    if def.name().as_slice() == b"teardown" {
+        *teardown = Some(teardown.unwrap_or(true) && def_ends_in_super(def));
+    }
 }
 
 /// The methods of `defs` (a module's class methods for its includers)
@@ -2829,5 +3130,117 @@ end
         assert!(later.contains("from_included_block") && !later.contains("from_class_body"), "{later}");
         let earlier = def_part("class DefTest < ActiveSupport::TestCase\n  include BlockDef\n  def teardown\n    @from = :from_class_body\n  end\nend\n");
         assert!(earlier.contains("from_class_body") && !earlier.contains("from_included_block"), "{earlier}");
+    }
+
+    #[test]
+    fn a_module_below_the_callbacks_needs_a_def_teardown_that_ends_in_super() {
+        let modules = "module BadCleanup\n  def teardown\n    super\n    @log << :bad\n  end\nend\n\nmodule GoodCleanup\n  def teardown\n    @log << :good\n    super\n  end\nend\n\nmodule Wrapper\n  include BadCleanup\nend\n";
+        let check = |sub: &str| {
+            let class = format!("class BaseLogTest < ActiveSupport::TestCase\n  include Logging\nend\n\n{sub}");
+            run(&[("logging.rb", LOGGING), ("cleanup.rb", modules), ("log_test.rb", class.as_str())], "log_test.rb")
+        };
+        let err = |sub: &str| check(sub).unwrap_err();
+        let ok = |sub: &str| check(sub).unwrap();
+        // Its def runs code after `super`: after the base's callbacks.
+        let e = err("class SubLogTest < BaseLogTest\n  include BadCleanup\nend\n");
+        assert!(e.contains("test class `SubLogTest` refused") && e.contains("the module `BadCleanup`, which it includes, does not end by calling `super`"), "{e}");
+        // Through a module that includes it.
+        let e = err("class SubLogTest < BaseLogTest\n  include Wrapper\nend\n");
+        assert!(e.contains("the module `BadCleanup`, which it includes"), "{e}");
+        // In a class between it and the base (refused itself as well).
+        let e = err("class MidLogTest < BaseLogTest\n  include BadCleanup\nend\n");
+        assert!(e.contains("test class `MidLogTest` refused"), "{e}");
+        let ancestor = |name: &str, callbacks: bool, modules: Vec<ModuleTeardown>| AncestorTeardown {
+            name: name.into(),
+            callbacks,
+            spliced: callbacks,
+            def: None,
+            modules,
+        };
+        let bad = ModuleTeardown { name: "BadCleanup".into(), known: true, def: Some(false) };
+        let ancestry = Ancestry {
+            mixins: Vec::new(),
+            classes: vec![ancestor("MidLogTest", false, vec![bad.clone()]), ancestor("BaseLogTest", true, Vec::new())],
+        };
+        let e = check_teardown_chain(false, None, &[], &ancestry).unwrap_err();
+        assert!(e.contains("the module `BadCleanup`, which its base class `MidLogTest` includes, does not end"), "{e}");
+        // Not when the class with the callbacks includes it already.
+        let ancestry = Ancestry {
+            mixins: Vec::new(),
+            classes: vec![ancestor("MidLogTest", false, vec![bad.clone()]), ancestor("BaseLogTest", true, vec![bad])],
+        };
+        check_teardown_chain(false, None, &[], &ancestry).unwrap();
+        // One no test file declares may have such a def.
+        let e = err("class SubLogTest < BaseLogTest\n  include LibCleanup\nend\n");
+        assert!(e.contains("the module `LibCleanup`, which it includes, is not one a test file declares"), "{e}");
+        // A def ending in `super`, a gem module without one, and a module
+        // the base already includes (Ruby does not include it again) keep
+        // the base's callbacks last.
+        ok("class SubLogTest < BaseLogTest\n  include GoodCleanup\n  include ActiveSupport::Testing::TimeHelpers\n  test \"x\" do\n    assert true\n  end\nend\n");
+        run(
+            &[
+                ("logging.rb", LOGGING),
+                ("cleanup.rb", modules),
+                ("log_test.rb", "class BaseLogTest < ActiveSupport::TestCase\n  include BadCleanup\n  include Logging\nend\n\nclass SubLogTest < BaseLogTest\n  include BadCleanup\nend\n"),
+            ],
+            "log_test.rb",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_concern_def_teardown_below_the_callbacks_is_checked_too() {
+        let shared = "module SharedDef\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @log << :shared\n    end\n  end\n  def teardown\n    super\n    @log << :shared_def\n  end\nend\n";
+        let class = "class BaseLogTest < ActiveSupport::TestCase\n  include Logging\nend\n\nclass SubLogTest < BaseLogTest\n  include SharedDef\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let err = run(&[("logging.rb", LOGGING), ("shared_def.rb", shared), ("log_test.rb", class)], "log_test.rb").unwrap_err();
+        assert!(err.contains("test class `SubLogTest` refused") && err.contains("the module `SharedDef`, which it includes, does not end"), "{err}");
+    }
+
+    #[test]
+    fn an_included_singleton_def_leaves_the_instance_def_of_its_name() {
+        let label = "module SelfLabel\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @labelled = true\n    end\n    def self.label\n      :class_method\n    end\n  end\nend\n";
+        let class = "class LabelTest < ActiveSupport::TestCase\n  def label\n    :instance\n  end\n  include SelfLabel\n  test \"x\" do\n    assert_equal :instance, label\n  end\nend\n";
+        let tms = run(&[("self_label.rb", label), ("label_test.rb", class)], "label_test.rb").unwrap();
+        let labels: Vec<MethodReceiver> = tms[0].helpers.iter().filter(|h| h.name.as_str() == "label").map(|h| h.receiver).collect();
+        assert!(labels.contains(&MethodReceiver::Instance) && labels.contains(&MethodReceiver::Class), "{:?}", tms[0].helpers);
+    }
+
+    #[test]
+    fn a_super_module_is_included_where_its_shared_module_stands() {
+        let shared = "module SharedDef\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @log = [:setup]\n    end\n  end\n  def teardown\n    super\n    @log << :shared_def\n  end\nend\n";
+        let class = "class OrderTest < ActiveSupport::TestCase\n  include SharedDef\n  include PlainDef\n  teardown do\n    @done = true\n  end\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let tms = run(&[("shared_def.rb", shared), ("order_test.rb", class)], "order_test.rb").unwrap();
+        let includes: Vec<&str> = tms[0].includes.iter().map(|i| i.0.as_str()).collect();
+        // `include PlainDef` last: it comes first in the lookup, as natively.
+        assert_eq!(includes, ["RoundhouseSuperSharedDef", "PlainDef"]);
+    }
+
+    #[test]
+    fn setup_symbols_and_visibility_in_an_included_block_are_the_classs() {
+        let module = "module SymSetup\n  extend ActiveSupport::Concern\n  included do\n    extend ActiveSupport::Testing::Declarative\n    setup :first_step, :second_step\n    setup(:third_step)\n    test \"from the block\" do\n      assert true\n    end\n    private\n    def hidden\n      :hidden\n    end\n    public def shown\n      :shown\n    end\n    private def other\n      :other\n    end\n  end\n  def first_step\n    @steps = [:first]\n  end\n  def second_step\n    @steps << :second\n  end\n  def third_step\n    @steps << :third\n  end\nend\n";
+        let class = "class SymTest < ActiveSupport::TestCase\n  include SymSetup\nend\n";
+        let tms = run(&[("sym_setup.rb", module), ("sym_test.rb", class)], "sym_test.rb").unwrap();
+        let setup = format!("{:?}", tms[0].setup.as_ref().expect("a rebuilt setup"));
+        let at = |name: &str| setup.find(&format!("method: Symbol({name:?})")).unwrap_or_else(|| panic!("{name} in {setup}"));
+        assert!(at("first_step") < at("second_step") && at("second_step") < at("third_step"), "{setup}");
+        let visibility = |name: &str| helper(&tms[0], name).map(|h| h.visibility);
+        assert_eq!(visibility("hidden"), Some(MethodVisibility::Private));
+        assert_eq!(visibility("shown"), Some(MethodVisibility::Public));
+        assert_eq!(visibility("other"), Some(MethodVisibility::Private));
+    }
+
+    #[test]
+    fn unmodeled_included_block_statements_are_refused_by_name() {
+        for (stmt, why) in [
+            ("cattr_accessor :flavor", "runs `cattr_accessor :flavor` on the class"),
+            ("setup(prepend: true) do\n      @x = 1\n    end", "passes arguments or a block argument"),
+            ("include helpers_module", "includes a module that is not a constant"),
+            ("setup \"named\"", "is not `setup do … end` or `setup :name, …`"),
+        ] {
+            let module = format!("module Odd\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @a = 1\n    end\n    {stmt}\n  end\nend\n");
+            let class = "class OddTest < ActiveSupport::TestCase\n  include Odd\n  test \"x\" do\n    assert true\n  end\nend\n";
+            let err = run(&[("odd.rb", module.as_str()), ("odd_test.rb", class)], "odd_test.rb").unwrap_err();
+            assert!(err.contains("test class `OddTest` refused") && err.contains(why), "{stmt}: {err}");
+        }
     }
 }

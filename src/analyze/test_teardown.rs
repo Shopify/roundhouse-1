@@ -14,10 +14,12 @@
 //! part, or `super`, then its callbacks, which a concern's `included do`
 //! block may register too. That method always reaches the def chain
 //! (`teardown_def`). The splice checks those chains itself
-//! (`check_teardown_chain`), with the callbacks the concerns register,
-//! which this pass cannot see, and refuses the class at ingest, so it is
-//! a named survey gap rather than a listed class; the rebuilt classes it
-//! lists pass the checks here.
+//! (`check_teardown_chain`), with the callbacks the concerns register and
+//! the `def teardown` of each module included below them, which this pass
+//! cannot see, and refuses the class at ingest, so it is a named survey
+//! gap rather than a listed class; the rebuilt classes it lists pass the
+//! checks here. A chain with no spliced class is this pass's alone, and
+//! it does not see the modules either.
 
 use crate::det::HashMap;
 
