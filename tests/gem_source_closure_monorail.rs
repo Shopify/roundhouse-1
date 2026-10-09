@@ -7,11 +7,12 @@
 //! `include Monorail::Assertions` was error[gem_requires_rails] (38 load
 //! rows), and Monorail::Assertions was uninitialized (20 rows).
 //!
-//! The emitted boot is not there yet, so bin/gem-sources.rb holds monorail
-//! (its closure names the `Object.const_set` over Core's lib/monorail/):
-//! RoundhouseAutoload has set an implicit Monorail module before the boot
-//! list loads the gem, and Core's StrictWarning raises Ruby's "already
-//! initialized constant Monorail" (the ignored tests below).
+//! Until e2e round 6 bin/gem-sources.rb held monorail: RoundhouseAutoload
+//! set an implicit Monorail module before the boot list loaded the gem, and
+//! Core's StrictWarning raised Ruby's "already initialized constant
+//! Monorail". An implicit namespace is now an autoload that sets its module
+//! on first reference, as Zeitwerk's is, so the gem's `const_set` replaces
+//! the autoload silently. The assertions test is still ignored (below).
 //!
 //! Core's own lib/monorail/ reopens the gem's constant: config/environments/
 //! test.rb requires "monorail/shitlist" (`module Monorail; class
@@ -132,22 +133,21 @@ fn a_gem_over_a_gem_source_carried_as_source_is_not_refused() {
 }
 
 /// The emitted boot loads the compiled monorail entry (Bundler.require)
-/// after RoundhouseAutoload has registered Object's children, so the
-/// entry's `Object.const_set` replaces the implicit `Monorail` module set
-/// for lib/monorail/ and Ruby warns "already initialized constant
-/// Monorail", where native Rails, which sets up Zeitwerk after
-/// Bundler.require, does not. The run still has one Monorail, the gem's.
+/// after RoundhouseAutoload has registered Object's children; the entry's
+/// `Object.const_set` replaces lib/monorail/'s implicit autoload, and the
+/// app's Monorail::Shitlist registers on the gem's module. The run has one
+/// Monorail, the gem's.
 #[test]
 fn a_gem_over_a_gem_source_runs_its_alias_in_emitted_ruby() {
     app(CARRIED).run_test("test/models/event_test.rb").assert_passes();
 }
 
-/// Not yet: under native Rails Zeitwerk sets up lib/monorail/ after
-/// Bundler.require, so Monorail is the gem's constant with no warning; the
-/// emitted boot replaces its implicit module with a warning, which Core's
-/// StrictWarning (config/boot.rb's Warning hook) raises at boot.
+/// Under native Rails Zeitwerk sets up lib/monorail/ after Bundler.require,
+/// so Monorail is the gem's constant with no warning. The emitted boot
+/// registers lib/monorail/ first, so its implicit namespace must not be
+/// defined before first reference, or the gem's `const_set` warns, which
+/// Core's StrictWarning (config/boot.rb's Warning hook) raises at boot.
 #[test]
-#[ignore = "RoundhouseAutoload sets an implicit Monorail before the boot list runs the gem's const_set"]
 fn a_gem_over_a_gem_source_aliases_without_a_constant_warning() {
     let run = app(CARRIED).run_test("test/models/event_test.rb");
     run.assert_passes();

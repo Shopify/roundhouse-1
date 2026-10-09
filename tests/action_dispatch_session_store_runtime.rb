@@ -77,6 +77,8 @@ ensure
 end
 
 show("rack", Rack.release)
+# identity_client's SessionClass: `defined?(ActionDispatch::Http::Session)`.
+show("Http::Session", [defined?(ActionDispatch::Http::Session), ActionDispatch::Http::Session.is_a?(Class), ActionDispatch::Http::Session.method_defined?(:[])])
 store_class = ActionDispatch::Session::AbstractStore
 show("AbstractStore ancestors", store_class.ancestors.take_while { |a| a != Object }.map(&:name))
 show("AbstractSecureStore ancestors", ActionDispatch::Session::AbstractSecureStore.ancestors.take_while { |a| a != Object }.map(&:name))
