@@ -31,7 +31,13 @@
 //!   constant: `first`, `to_a`, a block call's result, an unfrozen String
 //!   another constant holds; a constant passed on, `class_methods` from
 //!   outside the concern, a test class declared in another file, a macro
-//!   called from an `included` block, by `send("gen")` or `method(:gen)`).
+//!   called from an `included` block, by `send("gen")` or `method(:gen)`;
+//!   `constants` defined again in a module body, `class << self`, under
+//!   `extend self` / `module_function`, by `define_method`, in a mixed-in
+//!   module or by a `class Module` reopen; a change through a literal
+//!   `constantize` / `safe_constantize`; a nested class's superclass that
+//!   writes a constant; a change to a constant or module found by a name
+//!   not known before the program runs).
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -2132,4 +2138,393 @@ fn a_test_class_reopened_in_its_file_is_named() {
         &["test class `SameFileTest` refused: it is declared by more than one class body in this file, which is not modeled; its tests would not run (`SameFileTest`, lines 1, 7)"],
     );
     assert!(native.contains_key("SameFileTest#test_same_kept"), "{native:#?}");
+}
+
+/// A test file of one loop over each of `modules`' `constants`
+/// (`{M}Test`, 8 lines each: the loop at line 8k + 2, its test at 8k +
+/// 3) and, when `kinds` is given, a loop over `Kinds::ALL` after them.
+fn module_loops(modules: &[&str], kinds: bool) -> String {
+    let mut test = String::new();
+    for m in modules {
+        test.push_str(&format!(
+            "class {m}Test < ActiveSupport::TestCase\n  {m}.constants.each do |c|\n    test \"c #{{c}}\" do\n      assert c\n    end\n  end\nend\n\n"
+        ));
+    }
+    if kinds {
+        test.push_str("class KindsTest < ActiveSupport::TestCase\n  Kinds::ALL.each do |k|\n    test \"k #{k}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n");
+    }
+    test
+}
+
+/// `{kind} (`{M}Test` line …: `{M}.constants`: {why})` for the `k`th
+/// loop of `module_loops`.
+fn module_gap(kind: &str, k: usize, module: &str, why: &str) -> String {
+    format!("{kind} (`{module}Test` line {}, first test at line {}: `{module}.constants`: {why})", 8 * k + 2, 8 * k + 3)
+}
+
+/// `Mod.constants` is a method call: a module that defines `constants`
+/// for itself (`def self.constants`, in `class << self`, under `extend
+/// self` or `module_function`, `define_singleton_method`) answers with
+/// what that returns, not with what its body declares. Each is a gap;
+/// and since one such definition may reach any module (through an
+/// `extend` of a module found by name), so is every other module's loop
+/// in the program. A loop over a frozen literal reads no method.
+#[test]
+fn constants_defined_again_in_a_module_body_are_gaps() {
+    let modules = r##"module M6
+  A = 1
+  def self.constants(inherit = true)
+    super + [:VIRTUAL]
+  end
+end
+
+module M7
+  A = 1
+  class << self
+    def constants(*)
+      [:ONLY]
+    end
+  end
+end
+
+module M8
+  extend self
+  A = 1
+  def constants(*)
+    [:FAKE]
+  end
+end
+
+module M9
+  A = 1
+  module_function
+
+  def constants(*)
+    [:MF]
+  end
+end
+
+module M11
+  A = 1
+  module_function def constants(*) = [:MFD]
+end
+
+module M12
+  A = 1
+  define_singleton_method(:constants) { |*| [:DSM] }
+end
+
+module M13
+  A = 1
+end
+
+module Kinds
+  ALL = %i[a b].freeze
+end
+"##;
+    let names = ["M6", "M7", "M8", "M9", "M11", "M12", "M13"];
+    let test = module_loops(&names, true);
+    let classes: Vec<String> = names.iter().map(|n| format!("{n}Test")).chain(["KindsTest".to_string()]).collect();
+    let defines = |k: usize, m: &str, line: u32| {
+        module_gap(MODULE_BODY, k, m, &format!("its body defines `constants` (line {line}), which `Module#constants` answers with"))
+    };
+    let native = matches_native(
+        &[("app/models/ov.rb", modules), ("test/models/m_test.rb", &test)],
+        &classes.iter().map(String::as_str).collect::<Vec<_>>(),
+        &|id| !id.starts_with("KindsTest#"),
+        &[
+            &defines(0, "M6", 3),
+            &defines(1, "M7", 11),
+            &defines(2, "M8", 20),
+            &defines(3, "M9", 29),
+            &defines(4, "M11", 36),
+            &module_gap(MODULE_BODY, 5, "M12", "its body runs `define_singleton_method(:constants) { |*| [:DSM] }` (line 41), not listed as adding no constant"),
+            &module_gap(REOPENED, 6, "M13", "`constants` may be defined again at `def self.constants(inherit = true)` (app/models/ov.rb line 3)"),
+        ],
+    );
+    for id in ["M6Test#test_c_VIRTUAL", "M7Test#test_c_ONLY", "M8Test#test_c_FAKE", "M9Test#test_c_MF", "M11Test#test_c_MFD", "M12Test#test_c_DSM", "KindsTest#test_k_b"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// `constants` defined again outside the module's body, for every module
+/// (`class Module` reopened) or for one found by a name not known before
+/// it runs (`name.constantize.extend(ConstPatch)`), or named for a
+/// `define_method`/`delegate`: every `Mod.constants` loop is a gap,
+/// while `Module` reopened only to wrap `autoload` (Core's boot
+/// instrumentation) and a loop over a frozen literal are not.
+#[test]
+fn constants_defined_again_anywhere_are_gaps() {
+    let kinds = "module Global\n  A = 1\nend\n\nmodule Kinds\n  ALL = %i[a b].freeze\nend\n";
+    let reopen = r##"class Module
+  alias_method :constants_before_extra, :constants
+
+  def constants(inherit = true)
+    constants_before_extra(inherit) + (name == "Global" ? [:EXTRA] : [])
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_module.rb", reopen), ("test/models/m_test.rb", &module_loops(&["Global"], true))],
+        &["GlobalTest", "KindsTest"],
+        &|id| id.starts_with("GlobalTest#"),
+        &[&module_gap(REOPENED, 0, "Global", "`constants` may be defined again at `def constants(inherit = true)` (app/models/zz_module.rb line 4)")],
+    );
+    assert!(native.contains_key("GlobalTest#test_c_EXTRA"), "{native:#?}");
+
+    let kinds = "module M14\n  A = 1\nend\n\nmodule Kinds\n  ALL = %i[a b].freeze\nend\n";
+    let patch = r##"module ConstPatch
+  def constants(inherit = true)
+    super + [:PATCHED]
+  end
+end
+
+["M", "14"].join.constantize.extend(ConstPatch)
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_patch.rb", patch), ("test/models/m_test.rb", &module_loops(&["M14"], true))],
+        &["M14Test", "KindsTest"],
+        &|id| id.starts_with("M14Test#"),
+        &[&module_gap(REOPENED, 0, "M14", "`constants` may be defined again at `def constants(inherit = true)` (app/models/zz_patch.rb line 2)")],
+    );
+    assert!(native.contains_key("M14Test#test_c_PATCHED"), "{native:#?}");
+
+    let kinds = "module M15\n  A = 1\nend\n\nmodule Kinds\n  ALL = %i[a b].freeze\nend\n";
+    let patch = r##"module Patch2
+end
+
+module Fwd
+  delegate :constants, to: :Patch2
+end
+
+["M", "15"].join.constantize.extend(Fwd)
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_patch.rb", patch), ("test/models/m_test.rb", &module_loops(&["M15"], true))],
+        &["M15Test", "KindsTest"],
+        &|id| id.starts_with("M15Test#"),
+        &[&module_gap(REOPENED, 0, "M15", "`constants` may be defined again at `delegate :constants, to: :Patch2` (app/models/zz_patch.rb line 5)")],
+    );
+    assert!(!native.contains_key("M15Test#test_c_A"), "{native:#?}");
+
+    // Core's `config/boot_instrumentation.rb`, and names that define nothing.
+    let kinds = "module M16\n  A = 1\nend\n\nmodule Kinds\n  ALL = %i[a b].freeze\nend\n";
+    let wrap = r##"class Module
+  alias_method :autoload_without_wrap, :autoload
+
+  def autoload(name, path)
+    autoload_without_wrap(name, path)
+  end
+end
+
+READS = { constants: 1 }.freeze
+READS.fetch(:constants)
+M16.respond_to?(:constants)
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_wrap.rb", wrap), ("test/models/m_test.rb", &module_loops(&["M16"], true))],
+        &["M16Test", "KindsTest"],
+        &|_| false,
+        &[],
+    );
+    assert!(native.contains_key("M16Test#test_c_A"), "{native:#?}");
+}
+
+/// `"Kinds::ALL".constantize` (`safe_constantize`,
+/// `ActiveSupport::Inflector.constantize("…")`) is `Object.const_get` of
+/// the path: a change through it is a change of the constant it names,
+/// as through `Object.const_get(:K17)`; a read through it is not.
+#[test]
+fn changes_through_a_literal_constantize_are_gaps() {
+    let kinds = r##"# frozen_string_literal: true
+
+module K10
+  TEN = %i[a b]
+end
+
+module K12
+  A = 1
+end
+
+module K14
+  FOURTEEN = %i[a b]
+end
+
+module K15
+  FIFTEEN = %i[a b]
+end
+
+module K17
+  A = 1
+end
+
+module K18
+  EIGHTEEN = %i[a b]
+end
+
+module K19
+  A = 1
+end
+"##;
+    let changes = r##"# frozen_string_literal: true
+
+"K10::TEN".constantize << :c
+"K12".constantize.const_set(:B, 2)
+ActiveSupport::Inflector.constantize("K14::FOURTEEN") << :c
+"::K15::FIFTEEN".safe_constantize.push(:c)
+Object.const_get(:K17).const_set(:B, 2)
+"K18::EIGHTEEN".constantize.include?(:a)
+"K19".constantize.constants
+"##;
+    let lists = [("K10", "TEN"), ("K14", "FOURTEEN"), ("K15", "FIFTEEN"), ("K18", "EIGHTEEN")];
+    let mut test = module_loops(&["K12", "K17", "K19"], false);
+    for (m, c) in lists {
+        test.push_str(&format!(
+            "class {m}Test < ActiveSupport::TestCase\n  {m}::{c}.each do |k|\n    test \"k #{{k}}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n\n"
+        ));
+    }
+    let classes = ["K12Test", "K17Test", "K19Test", "K10Test", "K14Test", "K15Test", "K18Test"];
+    let used = |k: usize, full: &str, line: u32, text: &str| {
+        let m = full.split("::").next().unwrap();
+        format!("{USED} (`{m}Test` line {}, first test at line {}: `{full}`: `{text}` (app/models/zz_mut.rb line {line}))", 8 * k + 2, 8 * k + 3)
+    };
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", changes), ("test/models/k_test.rb", &test)],
+        &classes,
+        &|id| !(id.starts_with("K18Test#") || id.starts_with("K19Test#")),
+        &[
+            &module_gap(REOPENED, 0, "K12", "`K12` may be changed at `\"K12\".constantize.const_set(:B, 2)` (app/models/zz_mut.rb line 4)"),
+            &module_gap(REOPENED, 1, "K17", "`K17` may be changed at `Object.const_get(:K17).const_set(:B, 2)` (app/models/zz_mut.rb line 7)"),
+            &used(3, "K10::TEN", 3, "\"K10::TEN\".constantize << :c"),
+            &used(4, "K14::FOURTEEN", 5, "ActiveSupport::Inflector.constantize(\"K14::FOURTEEN\") << :c"),
+            &used(5, "K15::FIFTEEN", 6, "\"::K15::FIFTEEN\".safe_constantize.push(:c)"),
+        ],
+    );
+    for id in ["K10Test#test_k_c", "K12Test#test_c_B", "K14Test#test_k_c", "K15Test#test_k_c", "K17Test#test_c_B", "K18Test#test_k_b"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A nested class's superclass expression runs in the module body:
+/// `class Foo < Class.new { Z = 1 }` and `class Foo < (Z = Object)` add
+/// `Z`. `class Foo < Struct.new(:a)` adds nothing.
+#[test]
+fn a_nested_class_superclass_that_writes_a_constant_is_a_gap() {
+    let modules = r##"module M1
+  A = 1
+  class Foo < Class.new { Z = 1 }
+  end
+end
+
+module M5
+  A = 1
+  class Foo < (Z = Object)
+  end
+end
+
+module M31
+  A = 1
+  class Foo < Struct.new(:a)
+  end
+end
+"##;
+    let runs = |k: usize, m: &str, text: &str, line: u32| {
+        module_gap(MODULE_BODY, k, m, &format!("its body runs `{text}` (line {line}), not listed as adding no constant"))
+    };
+    let native = matches_native(
+        &[("app/models/mods.rb", modules), ("test/models/m_test.rb", &module_loops(&["M1", "M5", "M31"], false))],
+        &["M1Test", "M5Test", "M31Test"],
+        &|id| !id.starts_with("M31Test#"),
+        &[&runs(0, "M1", "class Foo < Class.new { Z = 1 }", 3), &runs(1, "M5", "class Foo < (Z = Object)", 9)],
+    );
+    for id in ["M1Test#test_c_Z", "M5Test#test_c_Z", "M31Test#test_c_Foo"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// Code that looks a constant up by a name not known before it runs
+/// (`Object.const_get(name)`, `name.constantize`) may find any constant:
+/// a change it makes to what it finds is a gap for each loop whose shape
+/// allows no such change. `<<` on it: an unfrozen collection's loop
+/// (a frozen literal's is not); `const_set` on it: a module's
+/// `constants` loop, and a loop over a constant of the name it sets;
+/// `<<` on its `first`: a loop over nested collections. Reads (`each`
+/// that only reads, `include?`, `constants`) are not. What it is passed
+/// to, returns or keeps is not followed.
+#[test]
+fn changes_to_a_constant_found_by_a_computed_name_are_gaps() {
+    let kinds = "# frozen_string_literal: true\n\nmodule M50\n  A = 1\nend\n\nmodule Kinds\n  ALL = %i[a b]\n  NESTED = [[:a], [:b]].freeze\n  FROZEN = %i[a b].freeze\nend\n";
+    let mut test = module_loops(&["M50"], false);
+    for (name, c, k, body) in [
+        ("All", "ALL", "k", "assert_kind_of Symbol, k"),
+        ("Nested", "NESTED", "k.join", "assert_kind_of Array, k"),
+        ("Frozen", "FROZEN", "k", "assert_kind_of Symbol, k"),
+    ] {
+        test.push_str(&format!(
+            "class {name}Test < ActiveSupport::TestCase\n  Kinds::{c}.each do |k|\n    test \"k #{{{k}}}\" do\n      {body}\n    end\n  end\nend\n\n"
+        ));
+    }
+    let classes = ["M50Test", "AllTest", "NestedTest", "FrozenTest"];
+    let found = |class: &str, k: usize, full: &str, text: &str, line: u32| {
+        format!(
+            "{USED} (`{class}` line {}, first test at line {}: `{full}`: a constant looked up by a name not known before it runs is changed at `{text}` (app/models/zz_mut.rb line {line}))",
+            8 * k + 2,
+            8 * k + 3
+        )
+    };
+
+    let pushes = "# frozen_string_literal: true\n\nname = [\"Kinds\", \"ALL\"].join(\"::\")\nObject.const_get(name) << :c\n";
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", pushes), ("test/models/k_test.rb", &test)],
+        &classes,
+        &|id| id.starts_with("AllTest#") || id.starts_with("NestedTest#"),
+        &[
+            &found("AllTest", 1, "Kinds::ALL", "Object.const_get(name) << :c", 4),
+            &found("NestedTest", 2, "Kinds::NESTED", "Object.const_get(name) << :c", 4),
+        ],
+    );
+    assert!(native.contains_key("AllTest#test_k_c"), "{native:#?}");
+
+    let sets = "# frozen_string_literal: true\n\nmod = [\"M\", \"50\"].join\nmod.safe_constantize.const_set(:B, 2)\n";
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", sets), ("test/models/k_test.rb", &test)],
+        &classes,
+        &|id| id.starts_with("M50Test#"),
+        &[&module_gap(
+            REOPENED,
+            0,
+            "M50",
+            "a module looked up by a name not known before it runs is changed at `mod.safe_constantize.const_set(:B, 2)` (app/models/zz_mut.rb line 4)",
+        )],
+    );
+    assert!(native.contains_key("M50Test#test_c_B"), "{native:#?}");
+
+    let parts = "# frozen_string_literal: true\n\nlist = [\"Kinds\", \"NESTED\"].join(\"::\").constantize\nlist.first << :c\nObject.const_get(\"Kinds::#{:ALL}\").each { |k| k.to_s }\n[\"M\", \"50\"].join.constantize.constants\n";
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", parts), ("test/models/k_test.rb", &test)],
+        &classes,
+        &|id| id.starts_with("NestedTest#"),
+        &[&found("NestedTest", 2, "Kinds::NESTED", "list = [\"Kinds\", \"NESTED\"].join(\"::\").constantize", 3)],
+    );
+    assert!(native.contains_key("NestedTest#test_k_ac"), "{native:#?}");
+
+    // A constant of one name bound again (a mention of its name, as
+    // `const_set(:FROZEN)` on any module is): loops over constants of
+    // other names are not changed.
+    let rebinds = "# frozen_string_literal: true\n\nmod = [\"Kin\", \"ds\"].join\nmod.constantize.const_set(:FROZEN, %i[x].freeze)\n";
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", rebinds), ("test/models/k_test.rb", &test)],
+        &classes,
+        &|id| id.starts_with("M50Test#") || id.starts_with("FrozenTest#"),
+        &[
+            &module_gap(
+                REOPENED,
+                0,
+                "M50",
+                "a module looked up by a name not known before it runs is changed at `mod.constantize.const_set(:FROZEN, %i[x].freeze)` (app/models/zz_mut.rb line 4)",
+            ),
+            &format!("{USED} (`FrozenTest` line 26, first test at line 27: `Kinds::FROZEN`: `mod.constantize.const_set(:FROZEN, %i[x].freeze)` (app/models/zz_mut.rb line 4))"),
+        ],
+    );
+    assert!(native.contains_key("FrozenTest#test_k_x"), "{native:#?}");
 }
