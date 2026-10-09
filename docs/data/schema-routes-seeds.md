@@ -83,9 +83,11 @@ DDL, so that dialect returns an error for it. Postgres renders what
 ingest kept, so it shares the current ingest and IR limits.
 `schema.rb` ingest drops `array: true`; an index's `order:` and
 `opclass:`, and expression indexes; precision on `numeric`,
-`datetime` and `time`; a `limit:` of 1 or 2 on an `integer` column
-(so no `smallint`; 5 to 8 is a `bigint`, as in Rails); and schema
-qualifiers. The key forms the
+`datetime` and `time`; and schema qualifiers. An `integer` `limit:` of 1
+or 2 still normalizes to `ColumnType::Integer` for ordinary typing, but
+its original smallint width is retained as negative evidence for generated
+int4 results; 3 and 4 are exact PostgreSQL `integer`, and 5 to 8 normalize
+to `bigint`, as in Rails. The key forms the
 PostgreSQL dumper writes are read as the keys they name: `id: :serial`
 is an `integer` key, and a hash-valued `id: { type: :string, limit:
 32 }` keeps its type and limit. And the folds below
@@ -175,19 +177,39 @@ checking and cannot reach current SQLite project emission. Use
 source-expression mode is not a database selector and does not enable
 PostgreSQL model persistence or a PostgreSQL application target.
 
+That PostgreSQL DDL mode also accepts `::integer`, `::int4`, and
+`CAST(... AS integer/int4)` only when the cast input is text, such as
+`(payload ->> 'count'::text)::integer`. The declared generated result must
+be an exact PostgreSQL int4. It does not admit integer-column operands,
+integer literals, arithmetic, or other numeric casts; any `coalesce` input
+must still satisfy the existing text-only rules. Because ordinary typing folds
+several source widths into `ColumnType::Integer`,
+`schema.rb` integer limits 1 and 2, and `structure.sql` `smallint`/`int2`,
+`serial`/`serial4`, and integer types with typmods retain negative width
+evidence and are refused as generated int4 results. Bare `integer`, `int`,
+and `int4`, and Rails limits 3 and 4, remain eligible. This does not change
+ordinary model typing or rendered SQLite types. In `structure.sql`, a
+qualified integer type is considered exact only as unquoted `pg_catalog.int4`;
+`integer` and `int` are unqualified SQL grammar aliases, not catalog type
+names. The parser otherwise keeps its ordinary normalized type but refuses
+generated int4 output because another schema can define a domain or type
+with the same name.
+
 That explicit PostgreSQL DDL mode also accepts `->` and `->>` when the left
 operand is an exact `json` or `jsonb` column and the selector is a SQL string
 literal (including Rails' `'key'::text` form) or a decimal array index
 with an optional leading minus, within the full signed int4 range.
 The operators can be chained; `->` may produce an intermediate JSON value,
-but the final expression must use `->>` to produce the supported text result.
+and `->>` produces text. That text can be the generated result or feed the
+explicit int4 cast described above.
 Expressions remain verbatim, so PostgreSQL preserves the source JSON type's
 behavior. The default application ingest remains portable, and SQLite DDL
 validation rejects a schema imported in PostgreSQL mode. This adds no
 PostgreSQL model persistence and leaves the shared serialized-text
 `JsonColumn` model path unchanged.
 
-Other PostgreSQL operators, casts to non-text types, other functions,
+Other PostgreSQL operators, casts to non-text types apart from the bounded
+text-to-int4 casts above, other functions,
 generated-column references, defaults, generated keys/timestamps,
 length-limited casts or operand types remain explicit errors. A table must
 contain an ordinary column. Source types normalized to text for ordinary model

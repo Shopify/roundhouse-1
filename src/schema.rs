@@ -77,6 +77,15 @@ pub struct Column {
     /// sparse so well-represented ordinary types retain their serialized form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_text_compatible: Option<bool>,
+    /// Ingest-only evidence for generated integer-expression validation.
+    /// Integer-like source types such as `smallint`, `serial`, and types
+    /// with discarded typmods normalize to `ColumnType::Integer`, but are
+    /// not faithful PostgreSQL `int4` results. `Some(false)` retains that
+    /// negative evidence; `None` means the normalized type is sufficient.
+    /// This stays sparse so ordinary integer columns keep their serialized
+    /// form and application typing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_int4_compatible: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

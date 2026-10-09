@@ -461,6 +461,7 @@ mod tests {
         render_schema_statements_for(&schema, dialect).expect("render")
     }
 
+    /// Builds a plain schema column without generated expressions or source-type provenance.
     fn column(name: &str, col_type: ColumnType, nullable: bool, primary_key: bool) -> Column {
         Column {
             name: Symbol::from(name),
@@ -470,6 +471,7 @@ mod tests {
             primary_key,
             generated: None,
             generated_text_compatible: None,
+            generated_int4_compatible: None,
         }
     }
 

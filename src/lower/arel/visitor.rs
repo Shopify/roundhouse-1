@@ -1491,6 +1491,7 @@ mod tests {
     use indexmap::IndexMap;
 
     // Two-column "articles" table: id (Int), title (Str).
+    /// Creates the articles schema and model identifier used by Arel visitor tests.
     fn fixture_schema() -> (Schema, ClassId) {
         let mut tables = IndexMap::new();
         tables.insert(
@@ -1506,6 +1507,7 @@ mod tests {
                         primary_key: true,
                         generated: None,
                         generated_text_compatible: None,
+                        generated_int4_compatible: None,
                     },
                     Column {
                         name: Symbol::from("title"),
@@ -1515,6 +1517,7 @@ mod tests {
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
+                        generated_int4_compatible: None,
                     },
                 ],
                 indexes: vec![],

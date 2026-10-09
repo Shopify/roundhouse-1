@@ -553,6 +553,8 @@ fn parse_column_def(
         .ok_or_else(|| unsupported_col(file, table, &col_name, type_phrase))?;
     let generated_text_compatible = has_nonportable_text_source_type(type_phrase, enum_types)
         .then_some(false);
+    let generated_int4_compatible =
+        has_nonportable_int4_source_type(type_phrase).then_some(false);
 
     Ok(Some(Column {
         name: Symbol::from(col_name),
@@ -562,6 +564,7 @@ fn parse_column_def(
         primary_key: false,
         generated,
         generated_text_compatible,
+        generated_int4_compatible,
     }))
 }
 
@@ -602,6 +605,32 @@ fn has_nonportable_text_source_type(
     ) || enum_types.contains(base_name)
         || (base_name == "text" && first_type_modifier.is_some())
         || (text_or_json_alias && qualified_non_builtin)
+}
+
+/// Preserve the negative integer-width evidence that `ColumnType::Integer`
+/// cannot express. PostgreSQL `smallint`/`int2`, sequence-backed `serial`
+/// aliases, and integer typmods are not exact int4 results. Unqualified
+/// `integer`/`int`/`int4` spellings are accepted by the SQL grammar,
+/// but only `pg_catalog.int4` is a valid qualified catalog spelling.
+fn has_nonportable_int4_source_type(type_phrase: &str) -> bool {
+    let (source_type, _, _) = strip_parens_capture_nums(type_phrase);
+    let (qualifier, base) = match source_type.rsplit_once('.') {
+        Some((schema, name)) => (Some(schema), name),
+        None => (None, source_type.as_str()),
+    };
+    if matches!(base, "smallint" | "int2" | "serial" | "serial4") {
+        return true;
+    }
+    if matches!(base, "integer" | "int") {
+        // PostgreSQL has no qualified type names for these SQL grammar
+        // aliases, including under pg_catalog.
+        return qualifier.is_some() || type_phrase.contains('(');
+    }
+    if base == "int4" {
+        return type_phrase.contains('(')
+            || qualifier.is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"));
+    }
+    false
 }
 
 fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> IngestError {
