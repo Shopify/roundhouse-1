@@ -155,9 +155,9 @@ pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Emit Ruby-family syntax while retaining diagnostics and typed primitive
-/// semantics, including the no-block form of String#bytes with literal &nil.
-pub fn emit_expr(e: &Expr) -> String {
+/// The raise `emit_expr` writes for a site a diagnostic replaced, or
+/// `None` for a site that emits as itself.
+fn diagnostic_stub(e: &Expr) -> Option<String> {
     // A site a lowering replaced with a stub — `lower::object_extend`,
     // the arel `ColumnSpec::Named` placeholder — renders as the raise
     // the report describes, so the program fails THERE with the reason
@@ -184,7 +184,7 @@ pub fn emit_expr(e: &Expr) -> String {
         // operand. A bare command-style `raise` is not valid there.
         let stub = crate::emit::diagnostics::StubStyle::Raise
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
-        return format!("({stub})");
+        return Some(format!("({stub})"));
     }
     // A statement ingest refused (`ingest_statement_list`). NotImplementedError
     // is a ScriptError, so an app's `rescue => e` does not swallow the gap.
@@ -192,7 +192,16 @@ pub fn emit_expr(e: &Expr) -> String {
     if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &e.diagnostic {
         let text = format!("roundhouse: {}", crate::diagnostic::Diagnostic::stub_text(kind));
         let quoted = text.replace('\\', "\\\\").replace('\'', "\\'");
-        return format!("(::Kernel.raise(::NotImplementedError, '{quoted}'))");
+        return Some(format!("(::Kernel.raise(::NotImplementedError, '{quoted}'))"));
+    }
+    None
+}
+
+/// Emit Ruby-family syntax while retaining diagnostics and typed primitive
+/// semantics, including the no-block form of String#bytes with literal &nil.
+pub fn emit_expr(e: &Expr) -> String {
+    if let Some(stub) = diagnostic_stub(e) {
+        return stub;
     }
     if crate::emit::shared::string_bytes::materializes_array(e) {
         if let ExprNode::Send { recv, method, args, parenthesized, .. } = &*e.node {
@@ -2238,6 +2247,20 @@ fn emit_match_arm(arm: &crate::expr::MatchArm) -> String {
 /// ingest identically.
 fn emit_match_pattern(p: &crate::expr::MatchPattern) -> String {
     use crate::expr::{HashRest, MatchPattern};
+    // A value or constant the emit refused (a constant the tree does not
+    // carry) renders as a raise, which a pattern cannot hold bare: pinned,
+    // `^(raise "…")`, it parses, and testing that arm raises the named
+    // refusal where Ruby would raise NameError.
+    let refused = match p {
+        MatchPattern::Value { expr } => diagnostic_stub(expr),
+        MatchPattern::Array { constant: Some(c), .. }
+        | MatchPattern::Find { constant: Some(c), .. }
+        | MatchPattern::Hash { constant: Some(c), .. } => diagnostic_stub(c),
+        _ => None,
+    };
+    if let Some(stub) = refused {
+        return format!("^{stub}");
+    }
     match p {
         MatchPattern::Nil => "nil".to_string(),
         MatchPattern::Bind { name } => name.to_string(),

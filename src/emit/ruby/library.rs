@@ -189,8 +189,8 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     }
     let mut out: Vec<EmittedFile> = Vec::new();
     let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
-    // (the declaration's path, the namespace, the target, the statements' render, the marker)
-    let mut after_declarations: Vec<(PathBuf, String, String, EmittedFile, String)> = Vec::new();
+    // (the declaration's path, the namespace, the target, the statements, their render there, the marker)
+    let mut after_declarations: Vec<(PathBuf, String, String, LibraryClass, EmittedFile, String)> = Vec::new();
     for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
@@ -302,22 +302,30 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             let owner = lc.name.0.as_str().trim_start_matches("::").to_string();
             let marker = format!("# {site}: the body of `{owner}` goes on here, after `{target}`, as the source writes it");
             let rendered = emit_library_class_decl(&statements, app, path.clone());
-            after_declarations.push((path, owner, target.to_string(), rendered, marker));
+            after_declarations.push((path, owner, target.to_string(), statements, rendered, marker));
         }
         for file in files {
             merge_at_path(&mut out, &mut at_path, file);
         }
     }
     // After every declaration's own file, so each follows its body.
-    for (path, owner, target, file, marker) in after_declarations {
+    for (path, owner, target, statements, file, marker) in after_declarations {
+        // Statements written elsewhere (a load hook `App::class_load_hooks`
+        // places after the declaration) leave the reopen empty: nothing
+        // to write, here or in the namespace's file.
+        if !reopen_has_body(&file.content, &owner) {
+            continue;
+        }
         let spliced = at_path.get(&path).and_then(|&j| spliced_into_namespace(&out[j].content, &owner, &target, &file.content, &marker));
         match spliced {
             Some(content) => out[at_path[&path]].content = content,
             // Where it cannot be written in place, it stays in the
-            // namespace's file, as before.
+            // namespace's file, as before, rendered from that file:
+            // its requires are relative to where they run.
             None => {
                 let own = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(&owner)));
-                merge_at_path(&mut out, &mut at_path, EmittedFile { path: own, ..file });
+                let file = emit_library_class_decl(&statements, app, own);
+                merge_at_path(&mut out, &mut at_path, file);
             }
         }
     }
@@ -336,14 +344,21 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     let segments: Vec<&str> = owner.split("::").collect();
     let depth = segments.len();
     let pad = |k: usize| "  ".repeat(k);
-    let headers: Vec<String> = segments.iter().enumerate().map(|(k, seg)| format!("{}module {seg}", pad(k))).collect();
+    // A namespace header is a `module` or a `class` line (`class
+    // Taxonomy < ApplicationRecord`), the same in both files.
+    let is_header = |l: &str, k: usize, seg: &str| {
+        l.strip_prefix(&pad(k)).is_some_and(|rest| {
+            rest == format!("module {seg}") || rest == format!("class {seg}") || rest.starts_with(&format!("class {seg} < "))
+        })
+    };
     // The statements' render: anything above its headers (requires),
     // then the headers, its body, and the closing `end`s.
     let lines: Vec<&str> = rendered.lines().collect();
-    let first = lines.iter().position(|l| *l == headers[0])?;
-    if lines.len() < first + depth || lines[first..first + depth].iter().zip(&headers).any(|(l, h)| l != h) {
+    let first = lines.iter().position(|l| is_header(l, 0, segments[0]))?;
+    if lines.len() < first + depth || (0..depth).any(|k| !is_header(lines[first + k], k, segments[k])) {
         return None;
     }
+    let headers: Vec<&str> = lines[first..first + depth].to_vec();
     let body = unwrapped(&lines[first..], depth)?;
     let above: Vec<String> = lines[..first].iter().filter(|l| !l.trim().is_empty()).map(|l| format!("{}{l}", pad(depth))).collect();
     // The declaration's file: the same headers, then the declaration.
@@ -372,6 +387,17 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     let mut joined = out.join("\n");
     joined.push('\n');
     Some(joined)
+}
+
+/// Whether `rendered`, a reopen of the namespace `owner`, writes
+/// anything inside its headers.
+fn reopen_has_body(rendered: &str, owner: &str) -> bool {
+    let depth = owner.split("::").count();
+    let lines: Vec<&str> = rendered.lines().collect();
+    let Some(first) = lines.iter().position(|l| l.starts_with("module ") || l.starts_with("class ")) else {
+        return false;
+    };
+    unwrapped(&lines[first..], depth).is_some_and(|body| !body.trim().is_empty())
 }
 
 /// Adds `file` to the rendered files, after the content already
@@ -514,6 +540,13 @@ fn nested_blocks(
     inline: Option<&Path>,
 ) -> NestedBlocks {
     let depth = parent.name.0.as_str().split("::").count();
+    // A kid nested in another kid (`Update::Input::VariantInput` under
+    // `Update`) is written inside that kid's block, where the source has
+    // it, so the enclosing class's body (`field :variants,
+    // [VariantInput]`) runs after it as natively. A block of its own
+    // after the enclosing one ran that body first: NameError at load.
+    let (kids, hosted) = hosted_kids(kids);
+    let kids = &kids[..];
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
     // where the base must already be defined — the requirement the
@@ -607,7 +640,20 @@ fn nested_blocks(
         let render = || emit_library_class_decl(kid, app, rb_path.clone());
         // The file the blocks run in: a `__dir__` read in a child
         // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
-        let rendered = super::expr::with_spliced_into(parent_rb, render);
+        let own_kids = hosted.iter().find(|(host, _)| std::ptr::eq(*host, *kid)).map_or(&[][..], |(_, d)| d.as_slice());
+        let rendered = if own_kids.is_empty() {
+            super::expr::with_spliced_into(parent_rb, render)
+        } else {
+            // Its own kids go into its render the way it goes into the
+            // parent's: their requires rebased onto its path, which the
+            // lines below rebase again onto the parent's.
+            let inner = nested_blocks(kid, own_kids, app, parent_rb, inline);
+            let placing = NestedPlacement::install(kid, &inner);
+            let mut files = vec![super::expr::with_spliced_into(parent_rb, render)];
+            let unplaced = placing.finish();
+            splice_nested(&mut files, kid, &inner, &unplaced);
+            files.remove(0)
+        };
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
         // class, not buried inside a class body where they would still
@@ -671,13 +717,80 @@ fn nested_blocks(
         // were resolved inside the child's enclosing segments, which
         // are the parent's followed by the child's own — the position
         // it is spliced into.
-        let sidecar = super::rbs::emit_library_class_rbs(kid, &rb_path, app);
-        let lines: Vec<&str> = sidecar.content.lines().collect();
-        if let Some(block) = unwrapped(&lines, depth) {
-            sidecar_blocks.push(block);
+        // Its own kids' sidecars stay blocks of the parent's, as before:
+        // each names its enclosing classes in its wrapper.
+        for each in std::iter::once(*kid).chain(own_kids.iter().copied()) {
+            let path = inline.map_or_else(
+                || PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(each.name.0.as_str()))),
+                Path::to_path_buf,
+            );
+            let sidecar = super::rbs::emit_library_class_rbs(each, &path, app);
+            let lines: Vec<&str> = sidecar.content.lines().collect();
+            if let Some(block) = unwrapped(&lines, depth) {
+                sidecar_blocks.push(block);
+            }
         }
     }
     NestedBlocks { blocks, names, sidecar_blocks, hoisted }
+}
+
+/// `kids` split into those no other kid encloses, and, for each of
+/// those that encloses some, the kids nested in it (at any depth), in
+/// their order. Of several declarations of the enclosing name (a class
+/// reopened in the file), the host is the last one the source writes
+/// above the nested kid (`first_span`), else the last one.
+fn hosted_kids<'a>(kids: &[&'a LibraryClass]) -> (Vec<&'a LibraryClass>, Vec<(&'a LibraryClass, Vec<&'a LibraryClass>)>) {
+    let encloses = |outer: &str, inner: &str| inner.len() > outer.len() + 2 && inner.starts_with(outer) && inner[outer.len()..].starts_with("::");
+    let host_of = |k: &LibraryClass| -> Option<&'a LibraryClass> {
+        let own = k.name.0.as_str();
+        // The outermost enclosing kid: it hosts every level below it.
+        let outer = kids
+            .iter()
+            .filter(|c| encloses(c.name.0.as_str(), own))
+            .map(|c| c.name.0.as_str())
+            .min_by_key(|n| n.len())?;
+        let at = first_span(k);
+        let candidates: Vec<&'a LibraryClass> = kids.iter().copied().filter(|c| c.name.0.as_str() == outer).collect();
+        candidates
+            .iter()
+            .rev()
+            .find(|c| matches!((first_span(c), at), (Some(h), Some(a)) if h.file == a.file && h.start < a.start))
+            .or(candidates.last())
+            .copied()
+    };
+    let mut direct: Vec<&'a LibraryClass> = Vec::new();
+    let mut hosted: Vec<(&'a LibraryClass, Vec<&'a LibraryClass>)> = Vec::new();
+    for &k in kids {
+        match host_of(k) {
+            None => direct.push(k),
+            Some(host) => match hosted.iter_mut().find(|(h, _)| std::ptr::eq(*h, host)) {
+                Some((_, list)) => list.push(k),
+                None => hosted.push((host, vec![k])),
+            },
+        }
+    }
+    (direct, hosted)
+}
+
+/// The first real source position of `lc`'s body: its superclass, a
+/// method, a constant, a class-body call. `None` when it has none or
+/// they span several files.
+fn first_span(lc: &LibraryClass) -> Option<crate::span::Span> {
+    let spans = std::iter::once(lc.parent_span)
+        .chain(lc.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
+        .chain(lc.constants.iter().map(|(_, e)| e.span))
+        .chain(lc.unknown_calls.iter().map(|e| e.span))
+        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
+        .filter(|span| span.file.0 != 0 && *span != crate::span::Span::synthetic());
+    let mut first: Option<crate::span::Span> = None;
+    for span in spans {
+        match first {
+            Some(f) if f.file != span.file => return None,
+            Some(f) if f.start <= span.start => {}
+            _ => first = Some(span),
+        }
+    }
+    first
 }
 
 /// The classes of `App::singleton_scoped_classes` the Ruby family writes
@@ -757,21 +870,7 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::s
     if mixes_in(parent, &kid.name) {
         return None;
     }
-    let spans = std::iter::once(kid.parent_span)
-        .chain(kid.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
-        .chain(kid.constants.iter().map(|(_, e)| e.span))
-        .chain(kid.unknown_calls.iter().map(|e| e.span))
-        .chain(kid.class_ivar_initializers.iter().map(|e| e.span))
-        .filter(|span| span.file.0 != 0 && *span != crate::span::Span::synthetic());
-    let mut first: Option<crate::span::Span> = None;
-    for span in spans {
-        match first {
-            Some(f) if f.file != span.file => return None,
-            Some(f) if f.start <= span.start => {}
-            _ => first = Some(span),
-        }
-    }
-    let first = first?;
+    let first = first_span(kid)?;
     parent
         .constants
         .iter()
@@ -8548,6 +8647,9 @@ fn emit_library_class_decl_inner(
             requires.push(rel);
         }
     }
+    // What the header itself needs (the superclasses, a runtime reopen's
+    // file) is required above it; the body's needs follow.
+    let header_requires: BTreeSet<String> = requires.iter().cloned().collect();
     // `include`d modules must be LOADED before the `include` executes at
     // class-definition time — unlike body const-refs (request-time), so we
     // require them even when they're same-dir siblings (plain Ruby has no
@@ -8789,6 +8891,27 @@ fn emit_library_class_decl_inner(
     }
     body_requires.retain(|r| !requires.contains(r));
     requires.extend(body_requires);
+    // A body need in this file's own load-time require cycle
+    // (`load_cycle_components`) is required inside the body, right after
+    // the header, where natively its autoload runs: this class is then
+    // defined, and the file it loads, reaching back for it, finds it
+    // (`require_line`'s guard) instead of requiring this file while it
+    // loads, Ruby's circular require. Core's payments/vault
+    // LegacyPaymentInstrument: its `CLASS_MAPPING` reads the classes
+    // that include it, each of which requires it at the top of its file.
+    let in_body: Vec<String> = if super::expr::native_keywords() {
+        let cycles = load_cycle_components(app);
+        let own = cycles.get(&self_anchor);
+        requires
+            .iter()
+            .filter(|r| !header_requires.contains(*r))
+            .filter(|r| own.is_some() && cycles.get(&anchor_of_relative(&out_dir, r)) == own)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    requires.retain(|r| !in_body.contains(r));
     // The source's own top-level requires first, as Ruby runs them
     // before the body (`authored_requires`). A load-time need that one
     // of them already loads is not repeated.
@@ -8916,6 +9039,12 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
+    for r in &in_body {
+        writeln!(s, "{body_pad}{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
+    }
+    if !in_body.is_empty() {
+        writeln!(s).unwrap();
+    }
     if let Some((module, retargeted)) = &generated_attributes {
         let inner_pad = format!("{body_pad}  ");
         writeln!(s, "{body_pad}module GeneratedAttributeMethods").unwrap();
@@ -9742,7 +9871,29 @@ fn emit_library_class_decl_inner(
         }
         .unwrap();
     };
-    let override_places: Vec<usize> = lc.visibility_overrides.iter().map(after_late).collect();
+    // One the source has below a deferred constant goes after the last
+    // of them above it, as `calls_after_deferred`: apps_runtime's
+    // placeholders.rb writes `STATIC = Static.new.freeze` and then
+    // `private_class_method :new`. Written first, the nested subclass's
+    // inherited `new` was already private: NoMethodError at boot.
+    let override_after_deferred = |o: &crate::dialect::VisibilityOverride| -> Option<usize> {
+        deferred
+            .iter()
+            .copied()
+            .filter(|_| !railtie)
+            .filter(|&i| {
+                let value = &lc.constants[i].1;
+                !value.span.is_synthetic() && !o.span.is_synthetic() && value.span.file == o.span.file && value.span.start < o.span.start
+            })
+            .max_by_key(|&i| lc.constants[i].1.span.start)
+    };
+    let deferred_override_places: Vec<Option<usize>> = lc.visibility_overrides.iter().map(override_after_deferred).collect();
+    let override_places: Vec<usize> = lc
+        .visibility_overrides
+        .iter()
+        .zip(&deferred_override_places)
+        .map(|(o, d)| if d.is_some() { usize::MAX } else { after_late(o) })
+        .collect();
     let overrides_at = |at: usize| {
         lc.visibility_overrides.iter().zip(&override_places).filter(move |(_, place)| **place == at).map(|(o, _)| o)
     };
@@ -9784,6 +9935,9 @@ fn emit_library_class_decl_inner(
                         writeln!(s, "{body_pad}{line}").unwrap();
                     }
                 }
+            }
+            for (o, _) in lc.visibility_overrides.iter().zip(&deferred_override_places).filter(|(_, d)| **d == Some(i)) {
+                write_override(&mut s, o);
             }
         }
         NestedPlacement::place(&lc.name, &mut s, |_| true);
@@ -13760,13 +13914,23 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
         return file_owner(&owner, app);
     }
     let segments: Vec<&str> = name.split("::").collect();
+    // Written apart from an enclosing class, it may still share a file
+    // with one nested deeper: apps_runtime's database/placeholders.rb
+    // writes `class Static < Placeholders` inside `class Placeholders`,
+    // apart from database.rb's `class Database`. Given a file of its
+    // own, `STATIC = Static.new` in Placeholders' body ran before it.
+    let mut apart_from_outer = false;
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
         if owns_a_file(&prefix, app) {
             let mut own = body_files(name, app);
             own.extend(declared_files(name, app));
             if written_apart(&own, &prefix, app) {
-                return name.to_string();
+                apart_from_outer = true;
+                continue;
+            }
+            if apart_from_outer {
+                return file_owner(&prefix, app);
             }
             // A class with no source spans of its own (the ingest's
             // CurrentAttributes lowering generates every method of
@@ -14863,6 +15027,33 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
                     if run.as_ref().is_none_or(|run| run.contains(&i)) {
                         walk_load_time_paths(&m.body, &mut paths, &mut later);
                     }
+                }
+            }
+            for path in &paths {
+                let Some(to) = require_path_for_body_const(path, app, name) else { continue };
+                if to != from && files.contains_key(&to) {
+                    let from_id = node(&from, &mut ids, &mut edges);
+                    let to_id = node(&to, &mut ids, &mut edges);
+                    edges[from_id].insert(to_id);
+                }
+            }
+        }
+        // A model's file reads its superclass and what its body runs at
+        // load: its `include`s and the other statements carried as
+        // written. Core's payments/vault models each include
+        // LegacyPaymentInstrument, whose `CLASS_MAPPING` reads them back.
+        for model in &app.models {
+            let name = model.name.0.as_str();
+            let from = format!("app/models/{}", crate::naming::underscore(&file_owner(name, app)));
+            if !files.contains_key(&from) {
+                continue;
+            }
+            let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+            let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
+            paths.extend(model.parent.iter().map(split));
+            for item in &model.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } = item {
+                    walk_load_time_paths(expr, &mut paths, &mut later);
                 }
             }
             for path in &paths {
