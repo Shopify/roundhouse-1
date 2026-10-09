@@ -463,6 +463,7 @@ pub(super) fn ingest_test_class(
     if let Some(class_body) = class.body() {
         let stmts = flatten_statements(class_body);
         let consts = TagConstants::of(&stmts);
+        let macros = test_macros::Macros::of_class(class, &stmts, &name, file);
         let mut items = Vec::new();
         class_body_items(stmts, file, &consts, &mut items)?;
         for item in items {
@@ -663,6 +664,19 @@ pub(super) fn ingest_test_class(
             // A loop over a literal is unrolled; anything else is refused
             // as that statement alone, so the class's other tests still
             // run (strict ingest fails on it).
+            //
+            // A call of a test macro is expanded (`test_macros`); the
+            // `class << self` defining macros the body only calls that way
+            // declares nothing itself.
+            if let Some(declared) = macros.expand(&stmt, &test_tags, &consts)? {
+                for test in declared {
+                    declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                }
+                continue;
+            }
+            if macros.covers_singleton(&stmt) {
+                continue;
+            }
             if let Some(offset) = hidden_test_declaration(&stmt) {
                 for test in test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &consts)? {
                     declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
@@ -1724,10 +1738,26 @@ fn dsl_test<'pr>(
     tags: &TestTags,
     consts: &TagConstants<'pr>,
 ) -> IngestResult<Result<Test, (String, String)>> {
-    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let args: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    dsl_test_tagged(call, args.get(1..).unwrap_or_default(), name, prelude, file, tags, consts)
+}
+
+/// `dsl_test` of a call whose arguments after the name are not the
+/// tags TestTags#test takes (TestGenerator's `generate_test(name,
+/// location, tags:)`): `tag_args` are.
+#[allow(clippy::type_complexity)]
+fn dsl_test_tagged<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    tag_args: &[Node<'pr>],
+    name: String,
+    prelude: Vec<Expr>,
+    file: &str,
+    tags: &TestTags,
+    consts: &TagConstants<'pr>,
+) -> IngestResult<Result<Test, (String, String)>> {
     // TestTags#test(name, tags = nil): the class's tags, merged with the
     // test's own.
-    let (own_tags, toggle_flags) = match args.get(1..).unwrap_or_default() {
+    let (own_tags, toggle_flags) = match tag_args {
         [] => (Vec::new(), false),
         [arg] if arg.as_nil_node().is_some() => (Vec::new(), false),
         // A tags argument TestTags' name cannot be known from: the
@@ -1816,6 +1846,17 @@ fn blockless_test_body(name: &str, span: Span) -> Expr {
 
 #[path = "test_unroll.rs"]
 mod test_unroll;
+
+#[path = "test_macros.rs"]
+mod test_macros;
+
+/// Did ingest expand the test macro call at `offset` of `file` (its
+/// tests run under the class that calls it)? `TestMixins` names the
+/// calls it did not.
+#[allow(dead_code)]
+pub(super) fn macro_call_expanded(file: &str, offset: usize) -> bool {
+    test_macros::expanded(file, offset)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2093,15 +2134,29 @@ end
         assert!(gaps[0].contains("(`NamesTest` line 2: test \"from a proc\""), "{}", gaps[0]);
     }
 
-    // TestGenerator's `generate_test` declares a test (by `test`), in the
-    // class body or in a `class << self` macro: a named gap, not lost.
+    // TestGenerator's `generate_test` in the class body is a named gap; in
+    // a `class << self` macro it is expanded at each call
+    // (`test_macros`), and a call that cannot be expanded is named.
     #[test]
-    fn a_generate_test_is_a_named_gap() {
+    fn a_generate_test_is_a_named_gap_unless_a_macro_call_expands() {
         let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  generate_test(\"made\") do\n    assert true\n  end\n  test \"kept\" do\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "gen_test.rb").unwrap_err().to_string();
         assert!(err.contains("tests declared by TestGenerator's `generate_test` are not modeled"), "{err}");
-        let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "gen_test.rb").unwrap_err().to_string();
+        let src = "class NamesTest < ActiveSupport::TestCase\n  extend TestGenerator\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
+        let names: Vec<String> = method_names(src).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["test_checks_a", "test_kept"]);
+        // (Each source its own path: the registry keeps a path's first
+        // text.) Without `extend TestGenerator`, `generate_test` is not its.
+        let src = "class GenTest < ActiveSupport::TestCase\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
+        let err = ingest_test_files(src.as_bytes(), "gen_plain_test.rb").unwrap_err().to_string();
+        assert!(
+            err.contains("tests declared by a call of the class method `checks` are not modeled; they will not run (`GenTest` line 8: `generate_test` is not TestGenerator's"),
+            "{err}"
+        );
+        // A call before the macro is defined runs no macro (native
+        // raises NoMethodError): nothing is expanded, the macro is named.
+        let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  checks :a\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\nend\n";
+        let err = ingest_test_files(src.as_bytes(), "gen_late_test.rb").unwrap_err().to_string();
         assert!(err.contains("a `class << self` method that declares tests when called") && err.contains("`checks`"), "{err}");
     }
 
