@@ -330,31 +330,45 @@ fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
 /// test "#{x}" do … end end`, or a `test` whose name is not a string
 /// literal), as its offset. Nested classes and method bodies are not
 /// searched: a class is its own suite, and a method's body runs when
-/// called, not at class load. Nor is a `class << self` body: a `def
-/// test_…` there is a class method, which Minitest does not run.
+/// called, not at class load. In a `class << self` body a `def test_…`
+/// is a class method, which Minitest does not run, so its name is no
+/// test; a `test` there, or in the body of a method there (a macro that
+/// declares tests where it is called), is (`test_unroll::declare_hidden`
+/// names either).
 fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     use ruby_prism::Visit;
-    struct Find(Option<usize>);
+    struct Find {
+        found: Option<usize>,
+        singleton: usize,
+    }
     impl<'pr> Visit<'pr> for Find {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            if self.0.is_none() && is_test_declaration_shape(&node.as_node()) {
-                self.0 = Some(node.location().start_offset());
+            if self.found.is_none() && is_test_declaration_shape(&node.as_node()) {
+                self.found = Some(node.location().start_offset());
                 return;
             }
             ruby_prism::visit_call_node(self, node);
         }
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
-            if self.0.is_none() && is_test_declaration_shape(&node.as_node()) {
-                self.0 = Some(node.location().start_offset());
+            if self.singleton > 0 {
+                ruby_prism::visit_def_node(self, node);
+                return;
+            }
+            if self.found.is_none() && is_test_declaration_shape(&node.as_node()) {
+                self.found = Some(node.location().start_offset());
             }
         }
         fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
         fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
-        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            self.singleton += 1;
+            ruby_prism::visit_singleton_class_node(self, node);
+            self.singleton -= 1;
+        }
     }
-    let mut find = Find(None);
+    let mut find = Find { found: None, singleton: 0 };
     find.visit(stmt);
-    find.0
+    find.found
 }
 
 /// A helper class or module of a test file (one beside the test class,
@@ -464,45 +478,8 @@ fn ingest_test_class(
                 continue;
             }
             if let Some(test) = ingest_test_declaration(&stmt, file, &test_tags, &consts)? {
-                // A ToggleFlagsHelper `flags:` test defines no method of
-                // its name natively, only `_FLAGS:` variants run under
-                // flag configurations, which are not modeled: it is left
-                // out, by name, rather than emitted under a name native
-                // never defines (where it could shadow a sibling).
-                if test.toggle_flags {
-                    let line = line_suffix(file, &stmt.location());
-                    super::survey::continue_or_fail(IngestError::Unsupported {
-                        file: file.into(),
-                        message: format!(
-                            "a ToggleFlagsHelper `flags:` test is not modeled: natively it defines no test of its \
-                             own name, only `_FLAGS:<flag>:ON/OFF` variants, each run under its flag configuration; \
-                             none is emitted (`{}`, test {:?}, not `{}`{line})",
-                            name.0, test.name, test.method_name
-                        ),
-                    })?;
-                    continue;
-                }
                 let is_def = stmt.as_def_node().is_some();
-                defined_tests.push((test.method_name.clone(), !is_def));
-                match tests.iter().position(|t| t.method_name == test.method_name) {
-                    // Ruby redefines a `def` of the same name in place.
-                    Some(at) if is_def => tests[at] = test,
-                    // ActiveSupport::Testing::Declarative#test raises
-                    // while the class body loads.
-                    Some(_) => {
-                        return Err(IngestError::Unsupported {
-                            file: file.into(),
-                            message: format!(
-                                "a test name is declared twice, which ActiveSupport raises on as the class body \
-                                 loads; its tests would not run (`{} is already defined in {}`{})",
-                                test.method_name,
-                                name.0,
-                                line_suffix(file, &stmt.location())
-                            ),
-                        })
-                    }
-                    None => tests.push(test),
-                }
+                declare_test(&mut tests, &mut defined_tests, test, is_def, &name, file, &stmt.location())?;
                 continue;
             }
             if let Some(body) = ingest_teardown_block(&stmt, file)? {
@@ -655,6 +632,17 @@ fn ingest_test_class(
                     }
                     continue;
                 }
+                // `CASES = [...].each do |c| test … end`: the loop's tests,
+                // and the constant its receiver (`each` returns it).
+                if let Some(offset) = hidden_test_declaration(&cw.value()) {
+                    if let (Some(const_name), Some(receiver)) = (const_name, test_unroll::loop_receiver(&cw.value())) {
+                        constants.push((const_name, ingest_expr(&receiver, file)?));
+                    }
+                    for test in test_unroll::declare_hidden(&cw.value(), offset, class, &name, file, &test_tags, &consts)? {
+                        declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                    }
+                    continue;
+                }
                 if let Some(const_name) = const_name {
                     let value = ingest_expr(&cw.value(), file)?;
                     constants.push((const_name, value));
@@ -663,16 +651,14 @@ fn ingest_test_class(
             }
             // Any other class-body statement is not modeled. One that
             // declares tests (`%w[a b].each { |x| test "#{x}" do … end }`,
-            // a `test` named by a non-literal) would lose them silently,
-            // so the class is refused instead.
+            // a `test` named by a non-literal) would lose them silently.
+            // A loop over a literal is unrolled; anything else is refused
+            // as that statement alone, so the class's other tests still
+            // run (strict ingest fails on it).
             if let Some(offset) = hidden_test_declaration(&stmt) {
-                let line = super::sources::line_at(file, offset).map(|l| format!(" at line {l}")).unwrap_or_default();
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: format!(
-                        "a test declared{line} by a class-body statement ingest does not model (a computed name, a loop or a block); its tests would not run"
-                    ),
-                });
+                for test in test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &consts)? {
+                    declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                }
             }
         }
     }
@@ -1204,6 +1190,61 @@ fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
     false
 }
 
+/// Add a test the class body declares as it loads, by a `def`
+/// (`is_def`) or by ActiveSupport's `test` (a literal statement, or one
+/// iteration of an unrolled loop), at `at`. A later `def` replaces an
+/// earlier one in place, as Ruby does; a second `test` of a name raises
+/// as ActiveSupport does. `defined_tests` records every name defined,
+/// for `refuse_inherited_test_redefinitions`.
+///
+/// A ToggleFlagsHelper `flags:` test defines no method of its name
+/// natively, only `_FLAGS:` variants run under flag configurations,
+/// which are not modeled: it is left out, by name, rather than emitted
+/// under a name native never defines (where it could shadow a sibling).
+fn declare_test(
+    tests: &mut Vec<Test>,
+    defined_tests: &mut Vec<(String, bool)>,
+    test: Test,
+    is_def: bool,
+    class: &ClassId,
+    file: &str,
+    at: &ruby_prism::Location<'_>,
+) -> IngestResult<()> {
+    if test.toggle_flags {
+        let line = line_suffix(file, at);
+        return super::survey::continue_or_fail(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "a ToggleFlagsHelper `flags:` test is not modeled: natively it defines no test of its \
+                 own name, only `_FLAGS:<flag>:ON/OFF` variants, each run under its flag configuration; \
+                 none is emitted (`{}`, test {:?}, not `{}`{line})",
+                class.0, test.name, test.method_name
+            ),
+        });
+    }
+    defined_tests.push((test.method_name.clone(), !is_def));
+    match tests.iter().position(|t| t.method_name == test.method_name) {
+        // Ruby redefines a `def` of the same name in place.
+        Some(existing) if is_def => tests[existing] = test,
+        // ActiveSupport::Testing::Declarative#test raises while the
+        // class body loads.
+        Some(_) => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "a test name is declared twice, which ActiveSupport raises on as the class body \
+                     loads; its tests would not run (`{} is already defined in {}`{})",
+                    test.method_name,
+                    class.0,
+                    line_suffix(file, at)
+                ),
+            })
+        }
+        None => tests.push(test),
+    }
+    Ok(())
+}
+
 /// Recognize `setup do ... end` (Call with method=setup, block body)
 /// and `def setup; ...; end` (DefNode named setup). Returns the body
 /// expression in either case. Other shapes return Ok(None).
@@ -1559,9 +1600,10 @@ fn class_body_items<'pr>(
 /// Recognize a single test declaration. Two shapes are supported:
 ///
 ///   `test "name" do ... end`  — Rails AS::TestCase DSL. Test name is the
-///                                string argument verbatim. An optional
-///                                literal tags Hash (`test "x", slow:
-///                                true do`) is Core's TestTags: the
+///                                string argument's text, adjacent
+///                                literals (`"a " \ "b"`) joined. An
+///                                optional literal tags Hash (`test "x",
+///                                slow: true do`) is Core's TestTags: the
 ///                                method name carries the tags.
 ///   `def test_*; ...; end`    — vanilla Minitest. Test name is the
 ///                                method name with the `test_` prefix
@@ -1573,18 +1615,22 @@ fn class_body_items<'pr>(
 /// Either way `method_name` is the method Minitest runs: the `def`'s
 /// name, or ActiveSupport's `test_` name over the tagged name.
 ///
-/// Returns `None` for any other statement shape (intentional — we
-/// silently drop unrecognized body items rather than error; they'll
-/// surface when the test tries to reference something that isn't
-/// emitted).
+/// Returns `None` for any other statement, including a `test` whose
+/// name is computed or whose tags or block are not modeled: the class
+/// body loop names that statement as a gap (`test_unroll::
+/// declare_hidden`), or unrolls the loop that declares it.
 fn ingest_test_declaration<'pr>(
     stmt: &Node<'pr>,
     file: &str,
     tags: &TestTags,
     consts: &TagConstants<'pr>,
 ) -> IngestResult<Option<Test>> {
-    // `def test_*; ...; end` form (vanilla Minitest).
+    // `def test_*; ...; end` form (vanilla Minitest). `def self.test_*`
+    // is a class method, which Minitest never runs.
     if let Some(def) = stmt.as_def_node() {
+        if def.receiver().is_some() {
+            return Ok(None);
+        }
         let name_bytes = def.name().as_slice();
         let Some(method_name) = std::str::from_utf8(name_bytes).ok() else {
             return Ok(None);
@@ -1613,42 +1659,68 @@ fn ingest_test_declaration<'pr>(
         return Ok(None);
     }
 
-    // First positional argument: the test's name as a string literal.
+    // First positional argument: the test's name, known before the code
+    // runs.
     let Some(args) = call.arguments() else {
         return Ok(None);
     };
-    let args: Vec<Node<'_>> = args.arguments().iter().collect();
-    let Some(first_arg) = args.first() else {
+    let Some(first_arg) = args.arguments().iter().next() else {
         return Ok(None);
     };
-    let Some(string_node) = first_arg.as_string_node() else {
+    let Some(name) = test_unroll::static_string(&first_arg) else {
         return Ok(None);
     };
-    let name = String::from_utf8_lossy(string_node.unescaped()).into_owned();
+    Ok(dsl_test(&call, name, Vec::new(), file, tags, consts)?.ok())
+}
+
+/// `test name, tags do … end` (`call`) as the test it defines, its name
+/// already known: TestTags' name over the class's tags merged with the
+/// test's own, and the block's body after `prelude` (the bindings an
+/// unrolled loop gives it). Without a block ActiveSupport defines a test
+/// that flunks. `Err((what, detail))` when the tags or the block are not
+/// modeled; the caller names the statement.
+#[allow(clippy::type_complexity)]
+fn dsl_test<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    name: String,
+    prelude: Vec<Expr>,
+    file: &str,
+    tags: &TestTags,
+    consts: &TagConstants<'pr>,
+) -> IngestResult<Result<Test, (String, String)>> {
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     // TestTags#test(name, tags = nil): the class's tags, merged with the
     // test's own.
-    let (own_tags, toggle_flags) = match &args[1..] {
+    let (own_tags, toggle_flags) = match args.get(1..).unwrap_or_default() {
         [] => (Vec::new(), false),
         [arg] if arg.as_nil_node().is_some() => (Vec::new(), false),
-        [arg] => literal_tags(consts.resolve(arg).unwrap_or(arg), file)?.ok_or_else(|| IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "a test's tags argument is neither a literal Hash nor a constant the class body assigns a literal \
-                 Hash to above it: TestTags puts each tag in the Minitest method name, which is not known before \
-                 the code runs (test {name:?}, tags `{}`{})",
-                source_excerpt(arg),
-                line_suffix(file, &call.location())
-            ),
-        })?,
+        // A tags argument TestTags' name cannot be known from: the
+        // statement is named as a gap by the caller.
+        [arg] => {
+            let not_literal = || {
+                (
+                    "tags are not literal".to_string(),
+                    format!(
+                        "test {name:?}, tags `{}`: neither a literal Hash nor a constant the class body assigns a \
+                         literal Hash to above it; TestTags puts each tag in the Minitest method name",
+                        source_excerpt(arg)
+                    ),
+                )
+            };
+            match literal_tags(consts.resolve(arg).unwrap_or(arg), file) {
+                Ok(Some(found)) => found,
+                Ok(None) => return Ok(Err(not_literal())),
+                Err(IngestError::Unsupported { message, .. }) => {
+                    return Ok(Err(("tags are not literal".into(), format!("test {name:?}: {message}"))))
+                }
+                Err(other) => return Err(other),
+            }
+        }
         _ => {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: format!(
-                    "a test with more than a name and one tags Hash is not modeled: TestTags#test takes a name \
-                     and one tags Hash (test {name:?}{})",
-                    line_suffix(file, &call.location())
-                ),
-            })
+            return Ok(Err((
+                "arguments are not a name and one tags Hash".into(),
+                format!("test {name:?}: TestTags#test takes a name and one tags Hash"),
+            )))
         }
     };
     let mut all_tags = tags.tags.clone();
@@ -1666,23 +1738,30 @@ fn ingest_test_declaration<'pr>(
             // `test "x", &blk`: the method is the block's, which is not
             // known here.
             None => {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: format!(
-                        "a test passed a block argument is not modeled: its body is whatever the block is when \
-                         the class body runs (test {name:?}{})",
-                        line_suffix(file, &call.location())
-                    ),
-                })
+                return Ok(Err((
+                    "block is passed with `&`".into(),
+                    format!("test {name:?}: its body is whatever the block is when the class body runs"),
+                )))
             }
         },
         // ActiveSupport::Testing::Declarative#test without a block
         // defines a test that flunks, naming the test as TestTags
         // passed it on (with its tags).
-        None => blockless_test_body(&tagged_name, super::util::node_span(stmt, file)),
+        None => blockless_test_body(&tagged_name, super::util::node_span(&call.as_node(), file)),
+    };
+    let body = if prelude.is_empty() {
+        body
+    } else {
+        let span = body.span;
+        let mut exprs = prelude;
+        match &*body.node {
+            ExprNode::Seq { exprs: inner } => exprs.extend(inner.iter().cloned()),
+            _ => exprs.push(body),
+        }
+        Expr::new(span, ExprNode::Seq { exprs })
     };
 
-    Ok(Some(Test { name, body, method_name, toggle_flags }))
+    Ok(Ok(Test { name, body, method_name, toggle_flags }))
 }
 
 /// The body ActiveSupport::Testing::Declarative#test defines for a
@@ -1698,6 +1777,9 @@ fn blockless_test_body(name: &str, span: Span) -> Expr {
         ExprNode::Send { recv: None, method: Symbol::from("flunk"), args: vec![message], block: None, parenthesized: true },
     )
 }
+
+#[path = "test_unroll.rs"]
+mod test_unroll;
 
 #[cfg(test)]
 mod tests {
@@ -1962,9 +2044,17 @@ end
             }
             other => panic!("{other:?}"),
         }
-        let src = "class NamesTest < ActiveSupport::TestCase\n  test \"from a proc\", &BODY\nend\n";
+        // `test "x", &blk` is that statement's gap: strict ingest fails,
+        // the survey records it and keeps the class's other tests.
+        let src = "class NamesTest < ActiveSupport::TestCase\n  test \"from a proc\", &BODY\n  test \"kept\" do\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
-        assert!(err.contains("a test passed a block argument is not modeled"), "{err}");
+        assert!(err.contains("tests declared by a `test` whose block is passed with `&` are not modeled"), "{err}");
+        crate::ingest::survey::activate();
+        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("survey");
+        let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+        assert_eq!(tms[0].tests.iter().map(|t| t.method_name.as_str()).collect::<Vec<_>>(), ["test_kept"]);
+        assert_eq!(gaps.len(), 1, "{gaps:#?}");
+        assert!(gaps[0].contains("(`NamesTest` line 2: test \"from a proc\""), "{}", gaps[0]);
     }
 
     // TestTags' persistent rename aliases `test_x` onto the name the
@@ -2014,7 +2104,8 @@ end
         assert!(err.contains("a test `tag` with 0 arguments is not modeled"), "{err}");
         let src = "class NamesTest < ActiveSupport::TestCase\n  test \"b\", owner_tags do\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
-        assert!(err.contains("a test's tags argument is neither a literal Hash nor a constant"), "{err}");
+        assert!(err.contains("tests declared by a `test` whose tags are not literal are not modeled"), "{err}");
+        assert!(err.contains("tags `owner_tags`: neither a literal Hash nor a constant"), "{err}");
     }
 
     // A subclass whose tests are all inside `tag … do` blocks is a test

@@ -13,6 +13,9 @@
 //!   path, and the second written replaced the first;
 //! - a class inside an `if` was not collected at all, and nothing said so.
 //!
+//! Inside a collected class, a statement that declares tests ingest does
+//! not model is named by itself; the class's other tests still run.
+//!
 //! The authored file also maps to several emitted files (one per class),
 //! so the emitted `test/roundhouse_tests.json` index names all of them
 //! for a runner that is given the authored file.
@@ -179,7 +182,20 @@ fn a_test_class_ingest_cannot_reach_is_refused_by_name() {
         "test class refused: it is declared inside a conditional, which is not modeled; its tests would not run"
     );
 
-    let src = "class LoopTest < ActiveSupport::TestCase\n  %w[a b].each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";
+    // A loop over a collection ingest cannot see declares tests whose
+    // names are not known before the code runs: strict ingest names the
+    // statement (survey mode records it and keeps the class's other tests;
+    // see tests/cruby_test_unroll.rs).
+    let src = "class LoopTest < ActiveSupport::TestCase\n  Item::ALL.each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";
     let err = roundhouse::ingest::ingest_test_files(src.as_bytes(), "loop_test.rb").unwrap_err().to_string();
-    assert!(err.contains("test class `LoopTest` refused: a test declared at line 3"), "{err}");
+    assert!(
+        err.contains("tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`LoopTest` line 2, first test at line 3"),
+        "{err}"
+    );
+
+    // Over a literal, the loop's tests are each declared by name.
+    let src = "class LoopTest < ActiveSupport::TestCase\n  %w[a b].each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";
+    let modules = roundhouse::ingest::ingest_test_files(src.as_bytes(), "loop_test.rb").expect("unrolled");
+    let names: Vec<&str> = modules[0].tests.iter().map(|t| t.method_name.as_str()).collect();
+    assert_eq!(names, ["test_a", "test_b"]);
 }
