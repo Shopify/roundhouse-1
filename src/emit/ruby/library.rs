@@ -12023,17 +12023,231 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
     if !defs.iter().any(|(_, span)| above(*span)) {
         return Some(None);
     }
+    // A constant the emitted body writes above the defs commutes with a
+    // statement that only defines methods (`only_defines`) when its value
+    // calls nothing on the class, which could reach those methods:
+    // identity_client's `LEGACY_METHODS = LEGACY_ATTR_WRITERS + [...]`
+    // below its `LEGACY_ATTR_WRITERS.each do |a| define_method(...) end`.
+    let defines_only = only_defines(call);
     let later_effect = lc
         .constants
         .iter()
+        .filter(|(_, value)| !(defines_only && !calls_on_self(value)))
         .map(|(_, value)| value.span)
-        .chain(lc.unknown_calls.iter().filter(|c| !is_body_statement(c)).map(|c| c.span))
+        .chain(
+            lc.unknown_calls
+                .iter()
+                .filter(|c| !is_body_statement(c) && !(defines_only && defines_apart(lc, call, c)))
+                .map(|c| c.span),
+        )
         .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
         .any(below);
     if later_effect {
         return None;
     }
     Some(Some(defs.iter().find(|(_, span)| below(*span)).map(|(i, _)| *i).unwrap_or(lc.methods.len())))
+}
+
+/// Whether all `call` does as the body loads is define methods: it
+/// iterates (`each` and kin) and calls `define_method`, `alias_method`,
+/// an `attr_*` or `delegate` on the class, building their arguments from literals,
+/// locals, constants and interpolation. A `define_method` block is a
+/// method body, run later. It mutates nothing another body statement or
+/// constant reads.
+fn only_defines(call: &Expr) -> bool {
+    fn walk(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv, method, args, block, .. } => {
+                let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+                let defines = on_self
+                    && matches!(
+                        method.as_str(),
+                        "define_method" | "alias_method" | "attr_reader" | "attr_writer" | "attr_accessor" | "delegate"
+                    );
+                let iterates = recv.is_some()
+                    && matches!(method.as_str(), "each" | "each_with_index" | "each_pair" | "each_key" | "each_value");
+                let pure = recv.is_some() && matches!(method.as_str(), "to_s" | "to_sym" | "freeze");
+                if !(defines || iterates || pure) {
+                    return false;
+                }
+                recv.as_ref().is_none_or(walk)
+                    && args.iter().all(walk)
+                    && (method.as_str() == "define_method" || block.as_ref().is_none_or(walk))
+            }
+            ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::Var { .. } | ExprNode::SelfRef => true,
+            _ => {
+                let mut ok = matches!(
+                    &*e.node,
+                    ExprNode::Lambda { .. }
+                        | ExprNode::Seq { .. }
+                        | ExprNode::StringInterp { .. }
+                        | ExprNode::Array { .. }
+                        | ExprNode::Splat { .. }
+                        | ExprNode::Hash { .. }
+                );
+                if ok {
+                    e.node.for_each_child(&mut |child| ok = ok && walk(child));
+                }
+                ok
+            }
+        }
+    }
+    walk(call)
+}
+
+/// Whether `statement`, which only defines methods (`only_defines`),
+/// and `later`, a replayed call that only defines methods too (`delegate`,
+/// on the class or its singleton, or what `only_defines` admits), define
+/// names known to be disjoint, so neither replaces the other's method and
+/// their order does not matter: identity_client's `delegate(*LEGACY_METHODS,
+/// to: :default_config)` below its `LEGACY_ATTR_WRITERS.each do |attr|
+/// define_method("#{attr}=") … end`.
+fn defines_apart(lc: &LibraryClass, statement: &Expr, later: &Expr) -> bool {
+    let is_delegate = matches!(
+        &*later.node,
+        ExprNode::Send { recv, method, .. } if method.as_str() == "delegate"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Send { recv: None, method, args, .. }
+                if method.as_str() == "singleton_class" && args.is_empty()))
+    );
+    if !is_delegate && !only_defines(later) {
+        return false;
+    }
+    let (Some(ours), Some(theirs)) = (defined_names(lc, statement, &[]), defined_names(lc, later, &[])) else {
+        return false;
+    };
+    ours.iter().all(|name| !theirs.contains(name))
+}
+
+/// The names of the methods `call` defines as the body loads, when each
+/// is known: a `define_method`, `alias_method`, `attr_*` or `delegate`
+/// whose names are literals, interpolations of a loop's variable, or a
+/// constant of the class bound to a literal list (`literal_names`), and
+/// an `each` over such a list.
+fn defined_names(lc: &LibraryClass, call: &Expr, env: &[(Symbol, String)]) -> Option<Vec<String>> {
+    match &*call.node {
+        ExprNode::Send { recv, method, args, block, .. } => match method.as_str() {
+            "define_method" | "alias_method" => Some(vec![name_value(args.first()?, env)?]),
+            "attr_reader" | "attr_writer" | "attr_accessor" => {
+                let mut names = Vec::new();
+                for a in args {
+                    let n = name_value(a, env)?;
+                    if method.as_str() != "attr_writer" {
+                        names.push(n.clone());
+                    }
+                    if method.as_str() != "attr_reader" {
+                        names.push(format!("{n}="));
+                    }
+                }
+                Some(names)
+            }
+            "delegate" => {
+                let mut names = Vec::new();
+                for a in args {
+                    match &*a.node {
+                        ExprNode::Hash { entries, .. } => {
+                            // `prefix:` renames every forwarder.
+                            let prefixed = entries.iter().any(|(k, _)| {
+                                matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "prefix")
+                            });
+                            if prefixed {
+                                return None;
+                            }
+                        }
+                        ExprNode::Splat { value } => names.extend(literal_names(lc, value, 0)?),
+                        _ => names.push(name_value(a, env)?),
+                    }
+                }
+                Some(names)
+            }
+            "each" if args.is_empty() => {
+                let list = literal_names(lc, recv.as_ref()?, 0)?;
+                let ExprNode::Lambda { params, body, .. } = &*block.as_ref()?.node else { return None };
+                let [param] = params.as_slice() else { return None };
+                let mut names = Vec::new();
+                for item in list {
+                    let mut env = env.to_vec();
+                    env.push((param.clone(), item));
+                    names.extend(defined_names(lc, body, &env)?);
+                }
+                Some(names)
+            }
+            _ => None,
+        },
+        ExprNode::Seq { exprs } => {
+            let mut names = Vec::new();
+            for e in exprs {
+                names.extend(defined_names(lc, e, env)?);
+            }
+            Some(names)
+        }
+        _ => None,
+    }
+}
+
+/// A method name `e` evaluates to: a String or Symbol literal, or an
+/// interpolation of literal text and loop variables bound in `env`.
+fn name_value(e: &Expr, env: &[(Symbol, String)]) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Var { name, .. } => env.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone()),
+        ExprNode::StringInterp { parts } => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    crate::expr::InterpPart::Text { value } => out.push_str(value),
+                    crate::expr::InterpPart::Expr { expr } => out.push_str(&name_value(expr, env)?),
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The Strings and Symbols of a literal list: an Array literal of them,
+/// a constant of `lc` bound to one, their `+`, or a `freeze` of one.
+fn literal_names(lc: &LibraryClass, e: &Expr, depth: usize) -> Option<Vec<String>> {
+    if depth > 8 {
+        return None;
+    }
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().map(|el| name_value(el, &[])).collect(),
+        ExprNode::Const { path } => {
+            let [name] = path.as_slice() else { return None };
+            let mut bound = lc.constants.iter().filter(|(n, _)| n == name);
+            let (_, value) = bound.next()?;
+            if bound.next().is_some() {
+                return None;
+            }
+            literal_names(lc, value, depth + 1)
+        }
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } => match (method.as_str(), args.as_slice()) {
+            ("+", [other]) => {
+                let mut names = literal_names(lc, r, depth + 1)?;
+                names.extend(literal_names(lc, other, depth + 1)?);
+                Some(names)
+            }
+            ("freeze", []) => literal_names(lc, r, depth + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `value` calls anything on the class (no receiver, or `self`).
+fn calls_on_self(value: &Expr) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, found: &mut bool) {
+        if let ExprNode::Send { recv, .. } = &*e.node
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |child| walk(child, found));
+    }
+    walk(value, &mut found);
+    found
 }
 
 /// Whether `call` includes, extends or prepends: the emitted body writes
@@ -12058,6 +12272,9 @@ fn statement_mixes_in(call: &Expr) -> bool {
 /// and `Kernel` give every class, so the call runs the same on any base.
 const ANY_CLASS_SELF_CALLS: &[&str] = &[
     "define_method", "include", "extend", "prepend", "alias_method", "attr_reader", "attr_writer", "attr_accessor",
+    // ActiveSupport's, which the Ruby family's runtime gives every
+    // Module (runtime/spinel/module_delegate.rb).
+    "delegate",
     "const_get", "const_set", "const_defined?", "constants", "remove_const", "private_constant", "public_constant",
     "instance_method", "public_instance_method", "instance_methods", "public_instance_methods",
     "private_instance_methods", "protected_instance_methods", "method_defined?", "public_method_defined?",

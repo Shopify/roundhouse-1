@@ -3553,6 +3553,18 @@ fn walk_decl_body_in<'pr>(
             e
         })
     };
+    // A call on a constant or on `self` in `class << self`: a body
+    // statement (`expr::SINGLETON_BODY`), written back inside a `class <<
+    // self` of its own where the source has it, or named in the file's
+    // program where it is not (`DeclBody::discarded`), like a call on a
+    // computed receiver there.
+    // (`capturable`: no bare `private` or `module_function` above it.)
+    let singleton_statement = |statement: &ruby_prism::Node<'_>, capturable: bool, out: &mut DeclBody| {
+        out.discarded.push(Discarded::of(statement, "a call in `class << self`"));
+        if capturable {
+            out.unknown_calls.extend(body_statement(statement, file));
+        }
+    };
     // Names from the `module_function :a, :b` form, plus the positions
     // of the direct `def`s in this body they may promote. Tracking
     // positions (rather than searching `methods` by name at the end)
@@ -4471,7 +4483,40 @@ fn walk_decl_body_in<'pr>(
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
-                            if let Ok(mut e) = ingest_expr(&stmt, file) {
+                            // Any other call in `class << self` runs
+                            // with the singleton class as `self`: a body
+                            // statement there (`singleton_statement`),
+                            // not a call on the class.
+                            //
+                            // So is a `delegate` whose names it splats
+                            // from a list (identity_client's
+                            // `delegate(*LEGACY_METHODS, to: :default_config)`):
+                            // `ingest::delegate` expands literal names
+                            // only, and the Ruby family's `Module#delegate`
+                            // (runtime/spinel/module_delegate.rb) defines
+                            // the class methods as the statement runs.
+                            let splats = call
+                                .arguments()
+                                .is_some_and(|a| a.arguments().iter().any(|arg| arg.as_splat_node().is_some()));
+                            if force_class_receiver
+                                && captures_statements
+                                && (kw == "delegate" && splats
+                                    || !matches!(
+                                    kw,
+                                    "delegate"
+                                        | "alias_method"
+                                        | "def_delegators"
+                                        | "def_delegator"
+                                        | "def_instance_delegators"
+                                        | "def_instance_delegator"
+                                ))
+                            {
+                                singleton_statement(
+                                    &statement,
+                                    !default_visibility_nonpublic && !module_function_active,
+                                    &mut out,
+                                );
+                            } else if let Ok(mut e) = ingest_expr(&stmt, file) {
                                 // `delegate` inside `class << self` is a
                                 // call on the singleton class: Rails
                                 // defines the forwarders as class
@@ -4530,7 +4575,12 @@ fn walk_decl_body_in<'pr>(
                 // subclasses at load time (`must explicitly call
                 // self.default_success = …`) rejects the emitted class
                 // outright, so the tree stops there.
-                if let Ok(e) = ingest_expr(&stmt, file) {
+                //
+                // In `class << self` `self` is the singleton class: the
+                // call is a body statement run there (`singleton_statement`).
+                if force_class_receiver && captures_statements {
+                    singleton_statement(&statement, !default_visibility_nonpublic && !module_function_active, &mut out);
+                } else if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
             } else if super::util::is_constant_receiver_call(&call) {
@@ -4540,7 +4590,16 @@ fn walk_decl_body_in<'pr>(
                 // dropped with no diagnostic. Captured like any class-body
                 // call: replayed where the body is replayed, reported as
                 // dropped everywhere else.
-                if let Ok(e) = ingest_expr(&stmt, file) {
+                //
+                // In `class << self` it is a body statement run on the
+                // singleton class (`singleton_statement`): identity_client's
+                // `LEGACY_ATTR_WRITERS.each do |attr| define_method("#{attr}=")
+                // … end` there reads the singleton's own constant and
+                // defines class methods, where a replay in the class body
+                // raised NameError on the constant.
+                if force_class_receiver && captures_statements {
+                    singleton_statement(&statement, !default_visibility_nonpublic && !module_function_active, &mut out);
+                } else if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
             } else if !glob_autoload_loops.contains(&statement.location().start_offset()) {

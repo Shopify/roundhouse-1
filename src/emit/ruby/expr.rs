@@ -127,6 +127,8 @@ pub(super) fn with_spliced_into<R>(out_path: &std::path::Path, f: impl FnOnce() 
 /// `File.expand_path("../../components/x/lib/boot_lib.rb", __dir__)`.
 /// The app root maps to the output root, so walks up from `__FILE__`
 /// land on the files carried there, whatever the process's cwd.
+/// `::File`: inside `module Rack` a bare `File` is rack's `Rack::File`
+/// (rack-oauth2's `VERSION = ::File.read(::File.join(::File.dirname(__FILE__), ...))`).
 fn source_file_path(e: &Expr) -> Option<String> {
     if e.decisions & crate::expr::SOURCE_FILE_PATH == 0 {
         return None;
@@ -139,7 +141,7 @@ fn source_file_path(e: &Expr) -> Option<String> {
     let ups = out.parent().map_or(0, |d| d.components().count());
     let rel = format!("{}{}", "../".repeat(ups), value);
     Some(format!(
-        "File.expand_path({}, __dir__)",
+        "::File.expand_path({}, __dir__)",
         emit_node(&ExprNode::Lit { value: Literal::Str { value: rel } })
     ))
 }
