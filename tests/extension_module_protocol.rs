@@ -5,8 +5,15 @@
 //! `SymbolEnum#symbol_enum` calls `define_method`, and
 //! `AttributeOptions#valid_options` reads `constants`. When nothing
 //! includes M, extends a value with it, or extends from inside a method,
-//! `check` admits the protocol there. Any of those uses gives `self` an
-//! instance, so the refusal stays.
+//! `check` types M's methods class side.
+//!
+//! Those uses give `self` an instance too, and alone they keep the
+//! refusal. Beside a class's `extend M` (Core's `Denormalize` includes
+//! the `AcceleratedBelongsTo` that ApplicationRecord extends), a
+//! Module-only call on implicit self is still admitted: an instance
+//! that got M has no such method unless its class defines one, so there
+//! the call raises NoMethodError in Ruby and in the emitted tree alike,
+//! and Module's answer on the extender is the only value it returns.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,17 +63,39 @@ fn a_hook_extending_its_base_counts_as_a_class_extend() {
     assert!(ok, "{text}");
 }
 
+const INSTANCE_SIDE_USES: [&str; 3] = [
+    "class Plain\n  include Macros\nend\n",
+    "class Plain\n  def self.build = Object.new.extend(Macros)\nend\n",
+    "class Plain\n  def adopt\n    extend Macros\n  end\nend\n",
+];
+
 #[test]
-fn any_instance_side_use_keeps_the_refusal() {
-    for (path, other) in [
-        ("lib/plain.rb", "class Plain\n  include Macros\nend\n"),
-        ("lib/plain.rb", "class Plain\n  def self.build = Object.new.extend(Macros)\nend\n"),
-        ("lib/plain.rb", "class Plain\n  def adopt\n    extend Macros\n  end\nend\n"),
-    ] {
-        let (ok, text) = check(&[("lib/gadget.rb", GADGET), (path, other)]);
+fn instance_side_uses_alone_keep_the_refusal() {
+    for other in INSTANCE_SIDE_USES {
+        let (ok, text) = check(&[("lib/plain.rb", other)]);
         assert!(!ok, "accepted with {other}: {text}");
         assert!(text.contains("Module protocol not supported"), "{other}: {text}");
     }
+}
+
+#[test]
+fn a_class_extend_beside_instance_side_uses_admits_module_only_calls() {
+    for other in INSTANCE_SIDE_USES {
+        let (ok, text) = check(&[("lib/gadget.rb", GADGET), ("lib/plain.rb", other)]);
+        assert!(ok, "refused with {other}: {text}");
+        assert!(!text.contains("Module protocol"), "{other}: {text}");
+    }
+}
+
+/// An app class that declares one of the names as an instance method
+/// could be the includer that answers it, so that name stays refused.
+#[test]
+fn an_app_instance_method_of_the_name_keeps_its_refusal() {
+    let other = "class Plain\n  include Macros\nend\n\nclass Recorder\n  def define_method(name) = name\nend\n";
+    let (ok, text) = check(&[("lib/gadget.rb", GADGET), ("lib/plain.rb", other)]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("define_method requires a proven"), "{text}");
+    assert!(!text.contains("class_eval requires") && !text.contains("const_defined? requires"), "{text}");
 }
 
 #[test]

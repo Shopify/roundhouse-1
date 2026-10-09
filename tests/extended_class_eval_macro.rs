@@ -202,3 +202,134 @@ fn the_included_hook_s_reader_is_a_method_of_the_includer_for_analysis() {
         .content;
     assert!(!emitted.contains("def id") && !emitted.contains("def name"), "{emitted}");
 }
+
+/// Core's `AcceleratedBelongsTo#accelerated_readonly_belongs_to` shape:
+/// a module classes `extend` defines a method with a `class_eval`
+/// heredoc carrying `__FILE__, __LINE__ + 1`, then aliases it with
+/// `alias_method` on implicit self. ApplicationRecord's `extend
+/// AcceleratedBelongsTo` makes both run on the model class.
+const ACCEL: &str = r##"module Accel
+  def accel(name)
+    class_eval <<~RUBY, __FILE__, __LINE__ + 1
+      def #{name}_x; 1; end
+    RUBY
+    alias_method :"#{name}_y", :"#{name}_x"
+  end
+end
+"##;
+
+const ACCEL_CLASS: &str = r##"class Accelerated
+  extend Accel
+  accel :foo
+end
+"##;
+
+const ACCEL_SCRIPT: &str = r##"p [Accelerated.new.foo_x, Accelerated.new.foo_y, Accelerated.new.foo_y == 1]
+p Accelerated.public_instance_methods(false).sort
+"##;
+
+fn assert_no_module_protocol_refusal(run: &emit_and_run::Run) {
+    let module = std::fs::read_to_string(run.emitted.join("app/models/accel.rb")).expect("emitted accel.rb");
+    assert!(!module.contains("Module protocol not supported"), "{module}");
+    assert!(module.contains("class_eval") && module.contains("alias_method"), "{module}");
+}
+
+#[test]
+fn an_extended_module_s_heredoc_and_alias_method_define_the_class_s_methods() {
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{ACCEL}\n{ACCEL_CLASS}\n{ACCEL_SCRIPT}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "[1, 1, true]\n[:foo_x, :foo_y]\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    let run = emit_and_run::empty_app()
+        .write("app/models/accel.rb", ACCEL)
+        .write("app/models/accelerated.rb", ACCEL_CLASS)
+        .run_ruby(ACCEL_SCRIPT);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    assert_no_module_protocol_refusal(&run);
+}
+
+/// Core's `Denormalize` concern also runs `include AcceleratedBelongsTo`
+/// from its `included do` block, so the module is included as well as
+/// extended, and ApplicationRecord's instances get the macro as an
+/// instance method. The class side still defines the methods; on an
+/// instance the `class_eval` raises NoMethodError, in Ruby and in the
+/// emitted tree alike. The concern form makes the class the module's
+/// sole includer (its methods type with that class's instance as self);
+/// the hook form leaves the module its own self.
+const DENORM_CONCERN: &str = r##"module Denorm
+  extend ActiveSupport::Concern
+
+  included do
+    include Accel
+  end
+end
+"##;
+
+const DENORM_HOOK: &str = r##"module Denorm
+  def self.included(base)
+    base.include(Accel)
+  end
+end
+"##;
+
+const DENORM_CLASS: &str = r##"class Accelerated
+  extend Accel
+  include Denorm
+  accel :foo
+end
+"##;
+
+const DENORM_SCRIPT: &str = r##"p [Accelerated.new.foo_x, Accelerated.new.foo_y, Accelerated.new.respond_to?(:accel)]
+begin
+  Accelerated.new.accel(:bar)
+rescue NoMethodError => e
+  p [e.class, e.name, Accelerated.method_defined?(:bar_x)]
+end
+"##;
+
+#[test]
+fn a_module_also_included_still_runs_as_the_extending_class_s_macro() {
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{ACCEL}\n{DENORM_HOOK}\n{DENORM_CLASS}\n{DENORM_SCRIPT}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "[1, 1, true]\n[NoMethodError, :class_eval, false]\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    for denorm in [DENORM_CONCERN, DENORM_HOOK] {
+        let run = emit_and_run::empty_app()
+            .write("app/models/accel.rb", ACCEL)
+            .write("app/models/denorm.rb", denorm)
+            .write("app/models/accelerated.rb", DENORM_CLASS)
+            .run_ruby(DENORM_SCRIPT);
+        run.assert_passes();
+        assert_eq!(run.stdout, expected, "{denorm}");
+        assert_no_module_protocol_refusal(&run);
+    }
+}
+
+/// Included only, the module's methods never run with a class as self:
+/// both Module-protocol calls stay refused.
+#[test]
+fn a_module_nothing_extends_keeps_the_refusal() {
+    for denorm in [DENORM_CONCERN, DENORM_HOOK] {
+        let run = emit_and_run::empty_app()
+            .write("app/models/accel.rb", ACCEL)
+            .write("app/models/denorm.rb", denorm)
+            .write("app/models/accelerated.rb", "class Accelerated\n  include Denorm\nend\n")
+            .run_ruby("p Accelerated.new.respond_to?(:accel)");
+        for method in ["class_eval", "alias_method"] {
+            assert!(
+                run.errors.iter().any(|e| e.contains("Module protocol not supported") && e.contains(method)),
+                "{method} accepted with {denorm}: {:?}",
+                run.errors
+            );
+        }
+    }
+}
