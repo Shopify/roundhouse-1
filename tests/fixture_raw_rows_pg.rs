@@ -285,12 +285,12 @@ fn faster_fixtures_rows_leave_ignored_column_keys_to_the_live_table() {
     let north_id = roundhouse::lower::fixtures::fixture_identify("north");
     assert!(
         garages.contains(&format!(
-            r#"insert_fixture_rows("garages", {{ "id" => "integer", "layout" => "jsonb" }}, [], [{{ "layout" => {{ "bays" => 3, "doors" => ["front", "side"] }}, "legacy_code" => "G-1", "keeper" => "alice", "id" => {north_id} }}], faster_fixtures: true)"#
+            r#"insert_fixture_rows("garages", {{ "id" => "integer", "layout" => "jsonb" }}, [], [{{ "layout" => {{ "bays" => 3, "doors" => ["front", "side"] }}, "legacy_code" => "G-1", "keeper" => "alice", "id" => {north_id} }}], faster_fixtures: true, model: "Garage")"#
         )),
         "{garages}"
     );
     let cars = read(&out, "test/fixtures/cars.rb");
-    assert!(cars.contains("faster_fixtures: true)"), "{cars}");
+    assert!(cars.contains(r#"faster_fixtures: true, model: "Car")"#), "{cars}");
 }
 
 #[test]
