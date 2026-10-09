@@ -9053,6 +9053,35 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
         }
     }
+    // A file Zeitwerk manages whose constant a gem's own file defined
+    // first (`RoundhouseAutoload.shadowed?`) is never loaded natively: the
+    // constant is defined, so nothing autoloads it, and every reference
+    // finds the gem's. The tree also requires it where a file depends on
+    // the constant (a `require_relative` header, `require_through`), so the
+    // file itself declines, ahead of its program's requires: its program
+    // and its declarations file, both keyed by the autoload's file. Loaded,
+    // the in-repo proto-shopify engine's owner_type.rb reassigned the
+    // native proto gem's `Proto::Shopify::Payments::Owner::OwnerType::
+    // UNSPECIFIED` ("already initialized constant", which Core's
+    // StrictWarning raises).
+    let index: crate::det::HashMap<String, usize> = files.iter().enumerate().map(|(i, (p, _))| (p.clone(), i)).collect();
+    let mut guarded: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for children in namespaces.values() {
+        for child in children.values() {
+            let Some(file) = child.file.as_ref().filter(|_| child.path_named) else { continue };
+            let key = as_loaded(file);
+            guarded.entry(format!("app/{file}.rb")).or_insert_with(|| key.clone());
+            guarded.entry(format!("app/{key}.rb")).or_insert(key);
+        }
+    }
+    for (path, key) in &guarded {
+        let Some(&at) = index.get(path) else { continue };
+        let content = &mut files[at].1;
+        let comments: Vec<&str> = content.split_inclusive('\n').take_while(|l| l.starts_with('#')).collect();
+        let header_lines = comments.iter().position(|l| l.trim_end().ends_with("else at boot (app/models.rb).")).map_or(comments.len(), |i| i + 1);
+        let header: usize = comments[..header_lines].iter().map(|l| l.len()).sum();
+        content.insert_str(header, &format!("return if defined?(RoundhouseAutoload) && RoundhouseAutoload.shadowed_file?({key:?})\n"));
+    }
     for (anchor, cpath) in &callback_files {
         let file = format!("app/{anchor}.rb");
         if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {

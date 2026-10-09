@@ -2769,6 +2769,33 @@ fn resolve_assoc_read(
         .map(|(owner_model, (target, fk))| (owner_model, target, fk))
 }
 
+/// Add the association's FK to a constructor's kwargs literal. Rails
+/// assigns the owner's key over caller attrs (`initialize_attributes`
+/// never skips the FK), so the FK goes last. When the caller already
+/// passes that key, as Core's `fo_line_item.fulfillment_item_states
+/// .create!(…, fulfillment_order_line_item_id: fo_line_item.id)` does,
+/// appending writes a duplicate literal key, and Ruby warns "key … is
+/// duplicated and overwritten" at parse time (strict_warnings turns that
+/// into an offense). The owner's value wins either way, so a caller
+/// entry whose value is a plain read is replaced in place. An effectful
+/// caller value keeps the duplicate form, which still evaluates it.
+fn merge_fk_entry(entries: &mut Vec<(Expr, Expr)>, fk_entry: (Expr, Expr)) {
+    let ExprNode::Lit { value: Literal::Sym { value: fk } } = &*fk_entry.0.node else {
+        entries.push(fk_entry);
+        return;
+    };
+    let same_key = |k: &Expr| matches!(&*k.node,
+        ExprNode::Lit { value: Literal::Sym { value } } if value == fk);
+    if let Some(slot) = entries
+        .iter_mut()
+        .find(|(k, v)| same_key(k) && super::case_lambda::is_pure_read(v))
+    {
+        slot.1 = fk_entry.1;
+        return;
+    }
+    entries.push(fk_entry);
+}
+
 /// May the seed take this owner expression apart and read `<owner>.id`
 /// from it?
 ///
@@ -4123,7 +4150,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 match &*args[0].node {
                                     ExprNode::Hash { entries, kwargs: true } => {
                                         let mut entries = entries.clone();
-                                        entries.push(fk_entry);
+                                        merge_fk_entry(&mut entries, fk_entry);
                                         Some(vec![syn(
                                             span,
                                             ExprNode::Hash { entries, kwargs: true },
@@ -4149,7 +4176,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                         match &*margs[0].node {
                                             ExprNode::Hash { entries, kwargs: true } => {
                                                 let mut entries = entries.clone();
-                                                entries.push(fk_entry);
+                                                merge_fk_entry(&mut entries, fk_entry);
                                                 Some(vec![syn(
                                                     span,
                                                     ExprNode::Send {
@@ -5556,6 +5583,69 @@ mod tests {
                 ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "user_id"),
             "the appended key should be the foreign key, got {:?}",
             entries[1].0.node
+        );
+    }
+
+    /// A caller that already passes the FK (`bans.create!(user_id: uid)`)
+    /// gets the owner's value in that slot instead of a second literal
+    /// `user_id:` key, which Ruby warns about at parse time (Core's
+    /// strict_warnings makes that an offense).
+    #[test]
+    fn assoc_constructor_with_caller_fk_does_not_duplicate_the_key() {
+        let user = ingest(
+            "class User < ApplicationRecord\n  has_many :bans\nend\n",
+            "app/models/user.rb",
+        );
+        let ban = ingest(
+            "class Ban < ApplicationRecord\n  belongs_to :user\nend\n",
+            "app/models/ban.rb",
+        );
+        let models_v = vec![user, ban];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let assocs = build_assoc_registry(&models_v);
+        let sym = |s: &str| Expr::new(span(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(s) } });
+        let var = |i: u32, s: &str| Expr::new(span(), ExprNode::Var { id: VarId(i), name: Symbol::from(s) });
+        let read = Expr::new(
+            span(),
+            ExprNode::Send { recv: None, method: Symbol::from("bans"), args: vec![], block: None, parenthesized: false },
+        );
+        let mut expr = Expr::new(
+            span(),
+            ExprNode::Send {
+                recv: Some(read),
+                method: Symbol::from("create!"),
+                args: vec![Expr::new(
+                    span(),
+                    ExprNode::Hash {
+                        entries: vec![(sym("user_id"), var(1, "uid")), (sym("ip_address"), var(0, "ip"))],
+                        kwargs: true,
+                    },
+                )],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        let owner = ClassId(Symbol::from("User"));
+        rewrite_call_site(&mut expr, &regs(&scopes, &models, &assocs), None, Some(&owner));
+        let ExprNode::Send { args, .. } = &*expr.node else {
+            panic!("expected Send, got {:?}", expr.node);
+        };
+        let ExprNode::Hash { entries, .. } = &*args[0].node else {
+            panic!("expected a kwargs hash, got {:?}", args[0].node);
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .map(|(k, _)| match &*k.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["user_id", "ip_address"], "one user_id key, in the caller's slot");
+        assert!(
+            !matches!(&*entries[0].1.node, ExprNode::Var { name, .. } if name.as_str() == "uid"),
+            "the owner's key wins, as Rails' initialize_attributes assigns it: got {:?}",
+            entries[0].1.node
         );
     }
 

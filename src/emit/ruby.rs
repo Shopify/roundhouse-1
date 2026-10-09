@@ -1493,7 +1493,7 @@ pub fn emit_with_assertions(
             // after the class's mixins, the others at the end of the class.
             if !module.body_statements.is_empty() {
                 if minitest {
-                    emitted.content = splice_test_body_statements(&emitted.content, &module.body_statements, module.source_file.as_deref().unwrap_or(class_name), &test_rb_path);
+                    emitted.content = splice_test_body_statements(&emitted.content, class_name, &module.body_statements, module.source_file.as_deref().unwrap_or(class_name), &test_rb_path);
                 } else {
                     for statement in &module.body_statements {
                         crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
@@ -1527,7 +1527,7 @@ pub fn emit_with_assertions(
                     writeln!(consts_block, "  {} = {}", name.as_str(), value_s).unwrap();
                 }
                 consts_block.push('\n');
-                emitted.content = splice_after_class_header(&emitted.content, &consts_block);
+                emitted.content = splice_after_class_header(&emitted.content, class_name, &consts_block);
             }
             // Inner classes and modules (declared inside the test
             // class body in Ruby — `class Validatable; include …; end`
@@ -2059,7 +2059,7 @@ fn strip_require_headers(content: &str) -> String {
 /// class, as a file program's statement is (`RoundhouseAutoload.
 /// file_statement`); a local variable write stays bare, in the class
 /// body's scope, for the statements after it.
-fn splice_test_body_statements(content: &str, statements: &[crate::dialect::TestBodyStatement], source: &str, rb_path: &std::path::Path) -> String {
+fn splice_test_body_statements(content: &str, class_name: &str, statements: &[crate::dialect::TestBodyStatement], source: &str, rb_path: &std::path::Path) -> String {
     let (mut setup_marked, mut teardown_marked) = (false, false);
     let mut render = |group: &[&crate::dialect::TestBodyStatement]| -> String {
         let mut out = String::new();
@@ -2099,7 +2099,7 @@ fn splice_test_body_statements(content: &str, statements: &[crate::dialect::Test
     let head = render(&head);
     let tail = render(&tail);
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
-    let Some(header) = lines.iter().position(|l| l.trim_start().starts_with("class ")) else {
+    let Some(header) = test_class_header(&lines, class_name) else {
         debug_assert!(false, "no class header to splice body statements into:\n{content}");
         return content.to_string();
     };
@@ -2149,12 +2149,14 @@ fn splice_test_body_statements(content: &str, statements: &[crate::dialect::Test
     out
 }
 
-fn splice_after_class_header(content: &str, block: &str) -> String {
+fn splice_after_class_header(content: &str, class_name: &str, block: &str) -> String {
     let mut out = String::with_capacity(content.len() + block.len());
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let header = test_class_header(&lines, class_name);
     let mut done = false;
-    for line in content.split_inclusive('\n') {
+    for (at, line) in lines.iter().enumerate() {
         out.push_str(line);
-        if !done && line.trim_start().starts_with("class ") {
+        if !done && Some(at) == header {
             let indent = &line[..line.len() - line.trim_start().len()];
             for b in block.split_inclusive('\n') {
                 if b.trim().is_empty() {
@@ -2169,6 +2171,45 @@ fn splice_after_class_header(content: &str, block: &str) -> String {
     }
     debug_assert!(done, "no class header to splice constants after:\n{content}");
     out
+}
+
+/// The line that opens `class_name` itself in its emitted test file. A
+/// nested test class (`class PlaybookActionTest::ApprovedTacticAction
+/// StillRunningTest < PlaybookActionTest` in the source) is written
+/// inside a reopen of its outer class, so the first `class` line is the
+/// OUTER one. Its constants and class-body statements belong in the
+/// inner class: on the outer, each split file of the same authored file
+/// reassigned `PlaybookActionTest::TACTIC_INSTANCE_ID` ("already
+/// initialized constant") and every sibling read the last file's value.
+/// Walks the `module`/`class` headers along the name's segments
+/// (a header may name several, `class A::B`); falls back to the first
+/// `class` line.
+fn test_class_header(lines: &[&str], class_name: &str) -> Option<usize> {
+    let segments: Vec<&str> = class_name.trim_start_matches("::").split("::").collect();
+    let mut matched = 0usize;
+    let mut header = None;
+    for (at, line) in lines.iter().enumerate() {
+        if matched == segments.len() {
+            break;
+        }
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("class ").or_else(|| trimmed.strip_prefix("module ")) else {
+            continue;
+        };
+        let name = rest
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '<')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("::");
+        let parts: Vec<&str> = name.split("::").collect();
+        if segments[matched..].starts_with(&parts) {
+            matched += parts.len();
+            if matched == segments.len() && trimmed.starts_with("class ") {
+                header = Some(at);
+            }
+        }
+    }
+    header.or_else(|| lines.iter().position(|l| l.trim_start().starts_with("class ")))
 }
 
 fn splice_after_requires(content: &str, block: &str) -> String {
@@ -2618,5 +2659,56 @@ mod declaration_program_header_tests {
             out,
             "require_relative \"../test_helper\"\nrequire \"bigdecimal\"\nrequire_relative \"../../app/models/shop\"\nrequire_relative \"../../app/models/roundhouse_files/lib/testing/toggle_flags_helper\"\n\nclass FooTest < TestBase\n  require_relative \"../../app/models/toggle_flags_helper\"\nend\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod nested_test_class_splice_tests {
+    use super::{splice_after_class_header, splice_test_body_statements};
+    use crate::dialect::TestBodyStatement;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::Symbol;
+    use crate::span::Span;
+
+    const NESTED: &str = "require_relative \"../test_helper\"\nclass PlaybookActionTest < TestBase\n  class ApprovedTest < PlaybookActionTest\n    def test_a\n    end\n  end\nend\n";
+
+    // Each split file of `playbook_action_test.rb` reopens the outer
+    // class; a nested class's `TACTIC_INSTANCE_ID = …` went into that
+    // reopen, so two loaded split files reassigned
+    // `PlaybookActionTest::TACTIC_INSTANCE_ID` ("already initialized
+    // constant"). It belongs in the nested class, as in the source.
+    #[test]
+    fn nested_test_class_constants_go_in_the_nested_class() {
+        let out = splice_after_class_header(NESTED, "PlaybookActionTest::ApprovedTest", "  TACTIC_INSTANCE_ID = \"x\"\n\n");
+        assert_eq!(
+            out,
+            "require_relative \"../test_helper\"\nclass PlaybookActionTest < TestBase\n  class ApprovedTest < PlaybookActionTest\n    TACTIC_INSTANCE_ID = \"x\"\n\n    def test_a\n    end\n  end\nend\n"
+        );
+        // A module namespace and a compound header resolve the same way.
+        let out = splice_after_class_header("module A\n  class B::C < X\n  end\nend\n", "A::B::C", "  K = 1\n");
+        assert_eq!(out, "module A\n  class B::C < X\n    K = 1\n  end\nend\n");
+        // A top-level class keeps the first header.
+        let out = splice_after_class_header("class FooTest < TestBase\nend\n", "FooTest", "  K = 1\n");
+        assert_eq!(out, "class FooTest < TestBase\n  K = 1\nend\n");
+    }
+
+    #[test]
+    fn nested_test_class_body_statements_go_in_the_nested_class() {
+        let call = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("use_gcs"),
+                args: vec![Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 1 } })],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        let statement = TestBodyStatement { expr: call, line: 3, after_definitions: false, after_setup_blocks: false, after_teardown_blocks: false };
+        let out = splice_test_body_statements(NESTED, "PlaybookActionTest::ApprovedTest", &[statement], "t.rb", std::path::Path::new("test/models/t.rb"));
+        let at = out.find("use_gcs").expect(&out);
+        let inner = out.find("class ApprovedTest").unwrap();
+        assert!(at > inner, "statement should run in the nested class:\n{out}");
+        assert!(out.contains("\n    RoundhouseTestCallbacks.class_body_statement(self, \"t.rb:3\") { use_gcs(1) }\n"), "got:\n{out}");
     }
 }
