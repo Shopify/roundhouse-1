@@ -49,6 +49,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
     ("runtime/spinel/active_support_json.rb", "runtime/active_support_json.rb"),
     ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
+    ("runtime/spinel/active_model_attribute.rb", "runtime/active_model_attribute.rb"),
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
     ("runtime/spinel/active_support_deprecation.rb", "runtime/active_support_deprecation.rb"),

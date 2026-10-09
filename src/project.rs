@@ -3754,6 +3754,19 @@ fn ruby_family_files(
             crate::runtime_files::read_to_string("runtime/spinel/active_model_type.rb")
                 .map_err(|e| format!("read runtime/spinel/active_model_type.rb: {e}"))?,
         ));
+        // ActiveModel::Attribute and its private subclasses (FromDatabase,
+        // FromUser, Uninitialized, ...), ported from activemodel 8.2.0.alpha
+        // (see the file's header; tests/active_model_attribute_runtime.rb
+        // holds it to native ActiveModel). A YAML coder's allow-list names
+        // them where the app serializes columns (Core's VersionedSerializer
+        // constantizes each at class-body time), and their database and
+        // user values go through these types. gem_facades.rb requires it
+        // after the types.
+        files.push((
+            "runtime/active_model_attribute.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_model_attribute.rb")
+                .map_err(|e| format!("read runtime/spinel/active_model_attribute.rb: {e}"))?,
+        ));
     }
     // ActiveModel::Validator / EachValidator / BlockValidator, ported from
     // activemodel 8.2.0.alpha (see the file's header). Ruby-family only
@@ -3990,7 +4003,7 @@ fn ruby_family_files(
         gem_facades
     };
     let gem_facades = if carries_types {
-        format!("{gem_facades}require_relative \"active_model_type\"\n")
+        format!("{gem_facades}require_relative \"active_model_type\"\nrequire_relative \"active_model_attribute\"\n")
     } else {
         gem_facades
     };
@@ -11603,7 +11616,7 @@ fn spinel_files_with_assertions(
     files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
     // And for the attribute types, pushed back by the two ruby-family
     // forks where the app names one.
-    files.retain(|(p, _)| p != "runtime/active_model_type.rb");
+    files.retain(|(p, _)| p != "runtime/active_model_type.rb" && p != "runtime/active_model_attribute.rb");
     // And for the validator bases, pushed back the same way.
     files.retain(|(p, _)| p != "runtime/active_model_validator.rb");
     // And for useragent's Version (the gem's own code: a `self.new`
