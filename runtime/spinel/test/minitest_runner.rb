@@ -967,7 +967,9 @@ module RoundhouseTestRunner
     if test
       # Live: a phase's failure is visible to the next (mocha_verify's
       # passed? check), as Minitest's failures list is.
-      test.__roundhouse_errors = errors
+      # A test class that does not descend from TestBase (a bare
+      # Minitest::Test the emitter kept) has no such writer.
+      test.__roundhouse_errors = errors if test.respond_to?(:__roundhouse_errors=)
       capture(errors, "setup") do
         yield if block_given?
         test.__roundhouse_setup_fixtures

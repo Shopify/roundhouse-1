@@ -1345,6 +1345,21 @@ module ActionView
   end
 end
 
+# `ActiveJob::TestCase` (activejob lib/active_job/test_case.rb): the
+# base test class with ActiveJob::TestHelper, then the
+# `:active_job_test_case` load hooks, so an app's
+# `ActiveSupport.on_load(:active_job_test_case) { include Helpers }`
+# reaches it, before or after this file loads. TestBase already
+# includes the helper; the include keeps Rails' ancestry. The hooks run
+# where the tree carries lazy_load_hooks (the PostgreSQL CRuby tree).
+module ActiveJob
+  class TestCase < TestBase
+    include ActiveJob::TestHelper
+
+    ActiveSupport.run_load_hooks(:active_job_test_case, self) if defined?(ActiveSupport::LazyLoadHooks)
+  end
+end
+
 module ActionCable
   module Channel
     # `ActionCable::Channel::TestCase` — Rails' way of exercising a

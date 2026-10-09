@@ -147,5 +147,115 @@ module ActiveRecord
     def saved_changes: () -> Hash[String, untyped]
     def changes_to_save: () -> Hash[String, untyped]
     def attribute_was: (String name) -> untyped
+    # Validations declared at run time (RuntimeValidations below).
+    @marked_for_destruction: bool?
+    def self.validate: (*untyped args) ?{ (?untyped) -> untyped } -> nil
+    def self.validates: (*untyped attributes) -> nil
+    def self.validates!: (*untyped attributes) -> nil
+    def self.validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
+    def self.validates_each: (*untyped attr_names) { (untyped, untyped, untyped) -> untyped } -> nil
+    def self.validates_absence_of: (*untyped attr_names) -> nil
+    def self.validates_acceptance_of: (*untyped attr_names) -> nil
+    def self.validates_associated: (*untyped attr_names) -> nil
+    def self.validates_comparison_of: (*untyped attr_names) -> nil
+    def self.validates_confirmation_of: (*untyped attr_names) -> nil
+    def self.validates_exclusion_of: (*untyped attr_names) -> nil
+    def self.validates_format_of: (*untyped attr_names) -> nil
+    def self.validates_inclusion_of: (*untyped attr_names) -> nil
+    def self.validates_length_of: (*untyped attr_names) -> nil
+    def self.validates_size_of: (*untyped attr_names) -> nil
+    def self.validates_numericality_of: (*untyped attr_names) -> nil
+    def self.validates_presence_of: (*untyped attr_names) -> nil
+    def self.validates_uniqueness_of: (*untyped attr_names) -> nil
+    def self._validators: () -> Hash[untyped, Array[untyped]]
+    def self.validators: () -> Array[untyped]
+    def self.validators_on: (*untyped attributes) -> Array[untyped]
+    def self.i18n_scope: () -> Symbol
+    def self.lookup_ancestors: () -> Array[untyped]
+    def self.human_attribute_name: (untyped attribute, ?Hash[Symbol, untyped] options) -> untyped
+    def self.model_name: () -> untyped
+    def model_name: () -> untyped
+    def read_attribute_for_validation: (untyped attribute) -> untyped
+    def self._reflect_on_association: (untyped association) -> untyped
+    def marked_for_destruction?: () -> bool
+    def errors: () -> Array[String]
+  end
+
+  # The validate chain for run-time registrations (connection.rb).
+  module RuntimeValidations
+    EMPTY: Array[untyped]
+    COMPILED: ActiveRecord::RuntimeValidations::CompiledEntry
+    self.@generation: Integer
+    self.@context_predicates: Hash[Array[untyped], ActiveRecord::RuntimeValidations::OnContext]
+    def self.validate: (untyped klass, Array[untyped] args, untyped block) -> nil
+    def self.validates: (untyped klass, Array[untyped] attributes, bool strict) -> nil
+    def self.validates_with: (untyped klass, Array[untyped] args, untyped block) -> nil
+    def self.validates_each: (untyped klass, Array[untyped] attr_names, untyped block) -> nil
+    def self.helper: (untyped klass, String name, Array[untyped] attr_names) -> nil
+    def self.validator_class: (untyped klass, String name) -> untyped
+    def self.validator_namespaces: () -> Array[untyped]
+    def self.validators_of: (untyped klass) -> Hash[untyped, Array[untyped]]
+    def self.new_list: (Hash[untyped, Array[untyped]] hash, untyped key) -> Array[untyped]
+    def self.all_validators: (untyped klass) -> Array[untyped]
+    def self.validators_on: (untyped klass, Array[untyped] attributes) -> Array[untyped]
+    def self.registrations: (untyped klass) -> Array[ActiveRecord::RuntimeValidations::Entry]
+    def self.run: (untyped record) -> nil
+    def self.chain: (untyped klass) -> Array[ActiveRecord::RuntimeValidations::Entry | ActiveRecord::RuntimeValidations::CompiledEntry]?
+    def self.build: (untyped klass) -> Array[ActiveRecord::RuntimeValidations::Entry | ActiveRecord::RuntimeValidations::CompiledEntry]?
+    def self.apply: (Array[ActiveRecord::RuntimeValidations::Entry | ActiveRecord::RuntimeValidations::CompiledEntry] chain, ActiveRecord::RuntimeValidations::Entry entry) -> nil
+    def self.compiled_owner: (untyped klass) -> untyped
+    def self.lookup_ancestors: (untyped klass) -> Array[untyped]
+    def self.human_attribute_name: (untyped klass, untyped attribute, untyped options) -> untyped
+    def self.model_name: (untyped klass) -> untyped
+    def self.read_attribute: (untyped record, untyped attribute) -> untyped
+    def self.reflect_on_association: (untyped klass, untyped association) -> untyped
+    def self.extract_options!: (Array[untyped] args) -> Hash[Symbol, untyped]
+    def self.conditionals: (untyped value) -> Array[untyped]
+    def self.context_predicate: (untyped context) -> ActiveRecord::RuntimeValidations::OnContext
+    def self.merge_attributes: (Array[untyped] attr_names) -> Hash[untyped, untyped]
+    def self.parse_validates_options: (untyped options) -> Hash[Symbol, untyped]
+    def self.merge_validates_options: (Hash[Symbol, untyped] defaults, Hash[Symbol, untyped] validator_options) -> Hash[untyped, untyped]
+    def self.port!: (String port, String what) -> nil
+    def self.accumulator: (Array[String] errors, untyped record) -> Array[String]
+    def self.plain_array?: (untyped value) -> bool
+    def self.add_error: (untyped errors, untyped attribute, untyped type, Hash[Symbol, untyped] options) -> untyped
+
+    module Errors
+      def add: (untyped attribute, ?untyped type, **untyped options) -> untyped
+    end
+
+    class Entry
+      @filter: untyped
+      @if: Array[untyped]
+      @unless: Array[untyped]
+      @prepend: bool
+      def initialize: (untyped filter, Array[untyped] if_conditions, Array[untyped] unless_conditions, bool prepend) -> void
+      def filter: () -> untyped
+      def prepend?: () -> bool
+      def compiled?: () -> bool
+      def duplicates?: (untyped other) -> bool
+      def run: (untyped record) -> nil
+      def self.call: (untyped filter, untyped record) -> untyped
+    end
+
+    class OnContext
+      @contexts: Array[untyped]
+      def initialize: (Array[untyped] contexts) -> void
+      def validate: (untyped record) -> bool
+    end
+
+    class ExceptOnContext
+      @contexts: Array[untyped]
+      def initialize: (Array[untyped] contexts) -> void
+      def validate: (untyped record) -> bool
+    end
+
+    class CompiledEntry
+      def filter: () -> nil
+      def prepend?: () -> bool
+      def compiled?: () -> bool
+      def duplicates?: (untyped _other) -> bool
+      def run: (untyped record) -> nil
+    end
   end
 end
