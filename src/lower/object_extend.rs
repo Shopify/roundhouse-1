@@ -51,6 +51,20 @@
 //! `base.extend(Podding::Verifier::LazyLoadingConcern) unless
 //! Rails.application.config.eager_load`); stubbing that call dropped
 //! the verifier and raised in every sharded model's class body.
+//!
+//! The stub is a statement of its own wherever it lands: a `nil` alone
+//! in an `if`/`unless` branch reads as an empty branch to the emitter,
+//! so `obj.extend(M) unless obj < M` came out as `nil if obj < M`, the
+//! raise and the report's site both gone. The site stub is wrapped in a
+//! one-statement sequence, which no branch reads as empty.
+//!
+//! A PostgreSQL app's one tree is CRuby's (`project::ruby_family_files`
+//! refuses every other flavor for it), which has every object's
+//! singleton class: `obj.extend(M)` runs as written there, `M.extended`
+//! hook included, so nothing is stubbed (Core's row-level-access
+//! `FilterManager#register_filter`: `model.extend(ActiveRecordFilterExtension)
+//! unless model < ActiveRecordFilterExtension`). The same tree answers
+//! Module protocol on any receiver itself ([`apply_cruby_module_protocol`]).
 
 use crate::app::App;
 use crate::det::HashSet;
@@ -66,6 +80,9 @@ const DETAIL: &str = "mixing a module into one live object needs a per-object me
 
 pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    if cruby_tree(app) {
+        return diags;
+    }
     let class_extends = module_hook_extends(app);
     super::for_each_hook_body(app, &mut |e| stub_except(e, &class_extends, &mut diags));
     for view in &mut app.views {
@@ -106,7 +123,20 @@ fn stub_except(expr: &mut Expr, class_extends: &HashSet<Span>, diags: &mut Vec<D
     let mut d = Diagnostic::unsupported(expr.span, None, CONSTRUCT, DETAIL);
     d.severity = Severity::Warning;
     diags.push(d);
-    *expr = stub_expr(expr.span);
+    *expr = site_stub(expr.span);
+}
+
+/// Whether the app's one tree is CRuby's: a PostgreSQL app, which
+/// `project::ruby_family_files` emits for the CRuby flavor only.
+fn cruby_tree(app: &App) -> bool {
+    app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+}
+
+/// The stub where a call stood: [`stub_expr`] as the one statement of a
+/// sequence, so an `if`/`unless` branch holding it is not an empty
+/// branch the emitter drops (`nil if cond` in place of the raise).
+fn site_stub(span: Span) -> Expr {
+    Expr::new(span, ExprNode::Seq { exprs: vec![stub_expr(span)] })
 }
 
 /// A nil carrying the report — the ruby emitter renders it as the raise.
@@ -270,6 +300,46 @@ fn restub(expr: &mut Expr, class_extends: &HashSet<Span>, diags: &mut Vec<Diagno
         let mut d = Diagnostic::unsupported(expr.span, None, CONSTRUCT, DETAIL);
         d.severity = Severity::Warning;
         diags.push(d);
-        *expr = stub_expr(expr.span);
+        *expr = site_stub(expr.span);
     }
 }
+
+/// On the CRuby tree, Module protocol runs as written.
+///
+/// The analyzer refuses `recv.class_eval { ... }`, `recv.const_get(:X)`,
+/// `recv.define_method`, `recv.method_defined?(:m)` and the rest of
+/// Module's own surface ("Module protocol ... requires a proven
+/// class/module object receiver") when it cannot prove `recv` is a
+/// class or module: a target without a runtime class graph has nothing
+/// to answer them on. CRuby has: on a module the call does what Ruby
+/// does, and on any other object it raises the NoMethodError Ruby
+/// raises. So on a PostgreSQL app, whose one tree is CRuby's, the
+/// refusal is lifted and the authored call is emitted. Core reaches
+/// most of these through a hook's parameter (`def self.extended(base)
+/// base.class_eval do def _example? ... end end end`, customers'
+/// `ExampleCustomer`) or a guarded value (`model.include(M) unless
+/// model < M`).
+///
+/// Last of the post-analyze passes, so no pass reads a lifted site as
+/// a typed call; `roundhouse check`, which runs no lowering, still
+/// reports each site, as it does for every construct a strict target
+/// cannot take.
+pub fn apply_cruby_module_protocol(app: &mut App) {
+    if !cruby_tree(app) {
+        return;
+    }
+    fn lift(expr: &mut Expr) {
+        expr.node.for_each_child_mut(&mut lift);
+        if matches!(&*expr.node, ExprNode::Send { .. })
+            && matches!(&expr.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. })
+                if construct.as_str() == MODULE_PROTOCOL)
+        {
+            expr.diagnostic = None;
+        }
+    }
+    super::for_each_forwarding_body(app, &mut lift);
+}
+
+/// The construct the analyzer refuses Module protocol under
+/// (`analyze::body`, "requires a proven class/module object receiver").
+const MODULE_PROTOCOL: &str = "Module protocol";

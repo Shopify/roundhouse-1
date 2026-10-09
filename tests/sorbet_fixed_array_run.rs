@@ -176,7 +176,7 @@ fn tuple_shapes_check_like_the_native_run() {
 fn an_unreadable_tuple_is_refused_by_name() {
     for (body, reason) in [
         ("T.let(@values.first, [Integer, *[String]])", "splats an array into a tuple shape"),
-        ("T.let(@values.first, [Integer, T.proc.returns(Integer)])", "proc type"),
+        ("T.let(@values.first, [Integer, T.proc.params(x: Integer)])", "proc type without `returns` or `void`"),
     ] {
         let lib = format!("class Odd\n  def initialize(values)\n    @values = values\n  end\n\n  def odd\n    {body}\n  end\nend\n");
         let (_, errors) = emit_and_run::empty_app()
