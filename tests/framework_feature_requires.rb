@@ -58,7 +58,7 @@ if MODE == "refusals"
   $LOAD_PATH.push(inner)
   %w[
     active_support/all active_support/core_ext/hash
-    active_support/core_ext/integer/time active_support/core_ext action_dispatch/testing/integration rails/no_such_feature.rb
+    active_support/core_ext/date/zones active_support/core_ext action_dispatch/testing/integration rails/no_such_feature.rb
     active_model_serializers_probe probe_missing/active_support active_support/probe_inner
   ].each do |feature|
     require feature

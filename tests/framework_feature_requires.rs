@@ -448,7 +448,7 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     // Every other Rails feature with no port (Integer#months, the whole
     // core_ext set): by name, not as a plain
     // `cannot load such file`, which is left to everything else.
-    for feature in ["active_support/core_ext/integer/time", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
+    for feature in ["active_support/core_ext/date/zones", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
         let line = format!(
             "{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded\n"
         );
