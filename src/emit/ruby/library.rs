@@ -13232,7 +13232,26 @@ pub(super) fn emit_file_program(
                 ProgramItem::Require { span, feature, relative } => {
                     let table = sources.get_or_insert_with(|| carried_sources(app));
                     let site = statement_site(app, *span);
-                    match program_require_source(rel, feature, *relative, table) {
+                    let resolved = program_require_source(rel, feature, *relative, table);
+                    // A gem file requiring itself (carriers_db's
+                    // country_index.rb, `require "carriers_db/country_index"`):
+                    // the file is loading, so natively the require is a
+                    // circular no-op that answers false, and its $VERBOSE
+                    // warning is located at RubyGems' `<internal:` require
+                    // or the gem's installed path, both of which Core's
+                    // StrictWarning exempts. In the emitted tree a
+                    // `require` wrapper in a plain file (the boot survey's
+                    // Kernel hook) is the location, and the warning raised
+                    // at boot. An app file's own self-require is kept.
+                    if let Some(Ok((source, _))) = &resolved {
+                        if source.trim_start_matches('/') == rel.trim_start_matches('/')
+                            && app.gem_source_dirs.iter().any(|dir| rel.trim_start_matches('/').starts_with(dir.as_str()))
+                        {
+                            writeln!(s, "{pad}# {site}: `require{} {feature:?}` names this gem file itself, which is loading: Ruby's circular require, a no-op", if *relative { "_relative" } else { "" }).unwrap();
+                            continue;
+                        }
+                    }
+                    match resolved {
                         Some(Ok((source, anchor))) => {
                             // A file that only reopens what another
                             // program defines loads nothing of its own.
@@ -13248,9 +13267,17 @@ pub(super) fn emit_file_program(
                                 }
                                 None => vec![anchor],
                             };
+                            // A gem source's require keeps Ruby's circular
+                            // no-op for a file still loading
+                            // (`RoundhouseAutoload.require_gem_file`).
+                            let gem_file = app.gem_source_dirs.iter().any(|dir| rel.trim_start_matches('/').starts_with(dir.as_str()));
                             for anchor in anchors {
                                 if loaded.insert(anchor.clone()) {
-                                    require_anchor(s, &anchor);
+                                    if gem_file {
+                                        writeln!(s, "{pad}RoundhouseAutoload.require_gem_file({anchor:?})").unwrap();
+                                    } else {
+                                        require_anchor(s, &anchor);
+                                    }
                                 }
                             }
                         }
@@ -13610,8 +13637,24 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
         if owns_a_file(&prefix, app) {
-            if written_apart(name, &prefix, app) {
+            let mut own = body_files(name, app);
+            own.extend(declared_files(name, app));
+            if written_apart(&own, &prefix, app) {
                 return name.to_string();
+            }
+            // A class with no source spans of its own (the ingest's
+            // CurrentAttributes lowering generates every method of
+            // `class Current < ActiveSupport::CurrentAttributes`) was
+            // written where its nearest enclosing class that keeps a file
+            // apart was: Core's `Markets::ShopScope::Cached::Current`, in
+            // shop_scope/cached.rb. In the outermost class's file it
+            // opened `class Cached` there, which autoloaded cached.rb,
+            // whose require of shop_scope.rb was then a circular require.
+            if own.is_empty() {
+                let apart = (i + 1..segments.len() - 1).rev().map(|j| segments[..=j].join("::")).find(|inner| owns_a_file(inner, app) && file_owner(inner, app) == *inner);
+                if let Some(inner) = apart {
+                    return inner;
+                }
             }
             return prefix;
         }
@@ -13656,9 +13699,9 @@ fn singleton_scope_owner(name: &str, app: &App) -> Option<String> {
 /// empty body once ingested, and still the owner's file. A file that
 /// declares both and adds nothing to the owner only reopens it around
 /// the nested class.
-fn written_apart(name: &str, owner: &str, app: &App) -> bool {
-    let mut child = body_files(name, app);
-    child.extend(declared_files(name, app));
+///
+/// `child`: the nested class's files, its body's and each declaring it.
+fn written_apart(child: &crate::det::HashSet<u32>, owner: &str, app: &App) -> bool {
     let mut parent = body_files(owner, app);
     parent.extend(declared_files(owner, app).into_iter().filter(|file| !child.contains(file)));
     !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)

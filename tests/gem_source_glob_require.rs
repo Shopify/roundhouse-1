@@ -103,7 +103,9 @@ fn a_gem_sources_glob_require_is_the_requires_of_its_files_in_dir_order() {
     assert!(!entry.contains("Dir["), "{entry}");
     let required: Vec<&str> = entry
         .lines()
-        .filter_map(|l| l.strip_prefix(&format!("require RoundhouseAutoload.path(\"models/roundhouse_files/{LIB}/globgem/")))
+        // A gem file's require of another (RoundhouseAutoload.require_gem_file:
+        // `require`, quiet where Ruby's would be a circular no-op).
+        .filter_map(|l| l.strip_prefix(&format!("RoundhouseAutoload.require_gem_file(\"models/roundhouse_files/{LIB}/globgem/")))
         .map(|l| l.trim_end_matches("\")"))
         .collect();
     assert_eq!(required, native, "{entry}");

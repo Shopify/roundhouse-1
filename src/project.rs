@@ -9673,6 +9673,26 @@ const AUTOLOAD_RUNTIME: &str = r##"
     require path(file)
   end
 
+  # A gem source's require of a file of the tree that is loading now (on
+  # this thread's stack as a required file's top, not yet a loaded
+  # feature): carriers_db.rb's detector.rb requiring analyzers/checksum.rb,
+  # which requires "carriers_db" back. Natively a circular require of an
+  # installed gem's files: a no-op answering false, whose $VERBOSE warning
+  # is located at RubyGems' `<internal:` require or the gem's installed
+  # path, which Core's StrictWarning exempts. In the emitted tree a
+  # `require` wrapper in a plain file (the boot survey's Kernel hook) is
+  # its location and it raised, so the no-op is kept without the warning.
+  # Any other require runs as written.
+  def self.require_gem_file(file)
+    full = path(file)
+    real = File.exist?(full) ? File.realpath(full) : full
+    if !$LOADED_FEATURES.include?(full) && !$LOADED_FEATURES.include?(real) &&
+        caller_locations.any? { |l| l.label == "<top (required)>" && (l.absolute_path == full || l.absolute_path == real) }
+      return false
+    end
+    require full
+  end
+
   # A file-level statement of a support file's program: runs it, and
   # names one that fails (the rest of the file goes on, as the emitted
   # app has not ported everything a statement may reach).
