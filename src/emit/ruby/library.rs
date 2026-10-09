@@ -191,6 +191,8 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
     // (the declaration's path, the namespace, the target, the statements, their render there, the marker)
     let mut after_declarations: Vec<(PathBuf, String, String, LibraryClass, EmittedFile, String)> = Vec::new();
+    // (the declaration's path, the constants, their render there, whether they go before it)
+    let mut beside_declarations: Vec<(PathBuf, LibraryClass, EmittedFile, bool)> = Vec::new();
     for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
@@ -209,6 +211,37 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             .enumerate()
             .filter_map(|(j, (n, _))| constant_file(lc.name.0.as_str(), n.as_str(), app).map(|stem| (j, stem)))
             .collect();
+        // A namespace constant a required file writes beside a nested
+        // declaration loads with that declaration's file (`nested_file_constant`).
+        let beside: Vec<(usize, String, bool)> = lc
+            .constants
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j))
+            .filter_map(|(j, (n, _))| nested_file_constant(lc, n.as_str(), app).map(|(stem, before)| (j, stem, before)))
+            .collect();
+        // Not one a constant left in the namespace's file reads at load:
+        // that file would read it before it is defined.
+        let beside: Vec<(usize, String, bool)> = {
+            let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+            for (j, (_, value)) in lc.constants.iter().enumerate() {
+                if !beside.iter().any(|(k, _, _)| *k == j) {
+                    walk_const_paths(value, &mut paths);
+                }
+            }
+            let owner = lc.name.0.as_str().trim_start_matches("::");
+            let read = |name: &str| {
+                paths.iter().any(|p| match p.split_last() {
+                    Some((last, prefix)) => last == name && (prefix.is_empty() || prefix.join("::").trim_start_matches("::") == owner),
+                    None => false,
+                })
+            };
+            if beside.iter().any(|(j, _, _)| read(lc.constants[*j].0.as_str())) {
+                Vec::new()
+            } else {
+                beside
+            }
+        };
         // And a namespace statement the source wrote in a nested
         // declaration's file goes after that declaration (`statement_file`).
         let moved: Vec<(usize, String)> = lc
@@ -218,7 +251,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             .filter_map(|(j, call)| statement_file(lc.name.0.as_str(), call, app).map(|target| (j, target)))
             .collect();
         let without_apart;
-        let lc = if apart.is_empty() && moved.is_empty() {
+        let lc = if apart.is_empty() && moved.is_empty() && beside.is_empty() {
             lc
         } else {
             let mut copy = lc.clone();
@@ -226,7 +259,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
                 .constants
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j))
+                .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j) && !beside.iter().any(|(k, _, _)| k == j))
                 .map(|(_, c)| c.clone())
                 .collect();
             copy.unknown_calls = lc
@@ -272,6 +305,34 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             };
             files.extend(emit_library_class_pair(&constant, app, PathBuf::from(format!("app/models/{stem}.rb"))));
         }
+        let mut stems: Vec<(&str, bool)> = Vec::new();
+        for (_, stem, before) in &beside {
+            if !stems.contains(&(stem.as_str(), *before)) {
+                stems.push((stem, *before));
+            }
+        }
+        for (stem, before) in stems {
+            let constants = LibraryClass {
+                includes: Vec::new(),
+                methods: Vec::new(),
+                class_ivar_initializers: Vec::new(),
+                nullable_columns: Vec::new(),
+                constants: beside
+                    .iter()
+                    .filter(|(_, s, b)| s == stem && *b == before)
+                    .map(|(j, _, _)| lcs[i].constants[*j].clone())
+                    .collect(),
+                unknown_calls: Vec::new(),
+                visibility_overrides: Vec::new(),
+                method_aliases: Vec::new(),
+                top_level_constants: Vec::new(),
+                conditional_definitions: Vec::new(),
+                ..lc.clone()
+            };
+            let path = PathBuf::from(format!("app/models/{stem}.rb"));
+            let rendered = emit_library_class_decl(&constants, app, path.clone());
+            beside_declarations.push((path, constants, rendered, before));
+        }
         let mut targets: Vec<&str> = Vec::new();
         for (_, target) in &moved {
             if !targets.contains(&target.as_str()) {
@@ -306,6 +367,26 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         }
         for file in files {
             merge_at_path(&mut out, &mut at_path, file);
+        }
+    }
+    // Each into its declaration's file, above or below it as the source
+    // writes them; with no such file, back into the namespace's.
+    for (path, constants, file, before) in beside_declarations {
+        match at_path.get(&path) {
+            Some(&j) if before => {
+                let mut content = file.content;
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push('\n');
+                content.push_str(&out[j].content);
+                out[j].content = content;
+            }
+            Some(_) => merge_at_path(&mut out, &mut at_path, file),
+            None => {
+                let own = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(constants.name.0.as_str())));
+                merge_at_path(&mut out, &mut at_path, emit_library_class_decl(&constants, app, own));
+            }
         }
     }
     // After every declaration's own file, so each follows its body.
@@ -856,6 +937,12 @@ fn in_singleton_scopes(block: &str, depth: usize, kid: &str) -> String {
 /// in the same file. `None` (a block spliced after the header) when it
 /// is above them all, has no real span, or spans several files.
 ///
+/// Or below one of the parent's class-body calls: Core's
+/// customer_foundations/phone_number.rb writes `attribute(:value,
+/// :string)` and then `class Valid < PhoneNumber`, whose `inherited`
+/// hook copies the attributes the parent has so far; spliced after the
+/// header, `Valid` had none, and its `transform(:value, …)` raised.
+///
 /// A module the parent mixes in keeps its place after the header too:
 /// the emitted body opens with its includes, and a replayed `prepend`
 /// or `extend` stands before the first constant below the call, which
@@ -871,10 +958,8 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::s
         return None;
     }
     let first = first_span(kid)?;
-    parent
-        .constants
-        .iter()
-        .any(|(_, value)| value.span.file == first.file && value.span != crate::span::Span::synthetic() && value.span.start < first.start)
+    let above = |span: &crate::span::Span| span.file == first.file && *span != crate::span::Span::synthetic() && span.start < first.start;
+    (parent.constants.iter().any(|(_, value)| above(&value.span)) || parent.unknown_calls.iter().any(|call| above(&call.span)))
         .then_some(first)
 }
 
@@ -9565,13 +9650,24 @@ fn emit_library_class_decl_inner(
         })
         .collect();
     // One below every eagerly written constant: after them, unless a
-    // constant written after the methods is above it too.
-    NestedPlacement::place(&lc.name, &mut s, |kid| {
-        !deferred.iter().any(|&i| {
+    // constant written after the methods is above it too, or a
+    // class-body call written below them (`nested_position`), which it
+    // follows.
+    let below_deferred = |kid: &crate::span::Span| {
+        deferred.iter().any(|&i| {
             let at = lc.constants[i].1.span;
             at != crate::span::Span::synthetic() && at.file == kid.file && at.start < kid.start
         })
-    });
+    };
+    let below_call = |kid: &crate::span::Span| {
+        lc.unknown_calls.iter().any(|call| {
+            !leading.contains(&call.span)
+                && call.span != crate::span::Span::synthetic()
+                && call.span.file == kid.file
+                && call.span.start < kid.start
+        })
+    };
+    NestedPlacement::place(&lc.name, &mut s, |kid| !below_deferred(kid) && !below_call(kid));
     if !eager.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -9685,6 +9781,13 @@ fn emit_library_class_decl_inner(
     let mut sources: Option<std::rc::Rc<CarriedSources>> = None;
     for effect in &body_effects {
         flush_late(&mut s, Some(effect.span));
+        // A nested class the source writes above this call, below an
+        // earlier one.
+        if !railtie && effect.span != crate::span::Span::synthetic() {
+            NestedPlacement::place(&lc.name, &mut s, |kid| {
+                kid.file == effect.span.file && kid.start < effect.span.start && !below_deferred(kid)
+            });
+        }
         let text = if railtie {
             super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
         } else {
@@ -9709,6 +9812,9 @@ fn emit_library_class_decl_inner(
     }
     // The rest: below every body effect, above the methods.
     flush_late(&mut s, None);
+    if !railtie {
+        NestedPlacement::place(&lc.name, &mut s, |kid| !below_deferred(kid));
+    }
     if !replayed.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -14113,6 +14219,80 @@ fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
         None => false,
     });
     (!reads_sibling).then_some(stem)
+}
+
+/// The emitted file stem (`identity_client/bearer_token_authorization`)
+/// of the nested declaration beside which a required source file writes
+/// the namespace module `lc`'s `constant`, and whether the source writes
+/// the constant above that declaration. identity_client 59.3.0's
+/// rails/bearer_token_authorization.rb:
+///
+/// ```ruby
+/// module IdentityClient
+///   MARKER_PATTERN = /#{BearerMarkerIdentifier::SUPPORTED_MARKERS.map { … }.join("|")}/
+///   module BearerTokenAuthorization
+/// ```
+///
+/// lib/identity_client.rb opens `module IdentityClient`, then requires
+/// bearer_marker_identifier.rb before this file. Ingest merges every
+/// reopen of the module into one, so the constant was written into the
+/// namespace's file, which the entry's opening `module IdentityClient`
+/// loads: it read `BearerMarkerIdentifier` before its file loaded
+/// (NameError). Requiring the file loads its declarations
+/// (`CarriedSources::declarations`), so the constant goes into the
+/// first of them when it is written above it, else after the last.
+///
+/// Only where requiring the file does not load the namespace's own file
+/// (another file's program defines the namespace, as the gem's entry
+/// does), for a module that keeps a file of its own (as
+/// `constant_file`, which places a constant an autoloader maps).
+fn nested_file_constant(lc: &LibraryClass, constant: &str, app: &App) -> Option<(String, bool)> {
+    let owner = lc.name.0.as_str().trim_start_matches("::");
+    let classes = library_classes_named(owner, app);
+    if classes.is_empty()
+        || !classes.iter().all(|c| c.is_module && c.origin.is_none())
+        || is_model_named(owner, app)
+        || file_owner(owner, app) != owner
+        || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
+        || lc.top_level_constants.iter().any(|t| t.name.as_str() == constant)
+    {
+        return None;
+    }
+    let value = lc.constants.iter().find(|(n, _)| n.as_str() == constant).map(|(_, v)| v)?;
+    let file = value.span.file.0;
+    let source = app.sources.get((file as usize).checked_sub(1)?)?;
+    let rel = relative_source_path(app, &source.path);
+    let carried = carried_sources(app);
+    let anchors = carried.declarations.get(rel)?;
+    let own = format!("models/{}", super::library_file_stem(owner, app));
+    if anchors.contains(&own) {
+        return None;
+    }
+    let prefix = format!("{own}/");
+    let nested: Vec<&str> = anchors.iter().filter_map(|a| a.strip_prefix("models/").filter(|_| a.starts_with(&prefix))).collect();
+    let (first, last) = (*nested.first()?, *nested.last()?);
+    // Where the first of them starts in the file: its earliest span.
+    let mut start: Option<u32> = None;
+    let names = format!("{owner}::");
+    for c in app.library_classes.iter().filter(|c| {
+        let name = c.name.0.as_str().trim_start_matches("::");
+        name.starts_with(&names) && super::library_file_stem(name, app) == first
+    }) {
+        let mut see = |span: Span| {
+            if span.file.0 == file {
+                start = Some(start.map_or(span.start, |s| s.min(span.start)));
+            }
+        };
+        see(c.parent_span);
+        c.methods.iter().for_each(|m| see(m.name_span));
+        c.constants.iter().for_each(|(_, v)| see(v.span));
+        c.unknown_calls.iter().chain(&c.class_ivar_initializers).for_each(|e| see(e.span));
+    }
+    match start {
+        Some(at) if value.span.start < at => Some((first.to_string(), true)),
+        _ => Some((last.to_string(), false)),
+    }
 }
 
 /// The nested declaration (`Metafields::Owners::Registry`) in whose
