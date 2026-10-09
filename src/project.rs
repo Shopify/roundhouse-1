@@ -4640,7 +4640,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
         "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
-        "active_support_time_change",
+        "active_support_time_change", "active_support_time_zone",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -5405,6 +5405,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/numeric/conversions", &["active_support_numeric_conversions"]),
     ("active_support/core_ext/integer/time", &["active_support_integer_time"]),
     ("active_support/core_ext/big_decimal/conversions", &["active_support_big_decimal_conversions"]),
+    ("active_support/values/time_zone", &["active_support_time_zone"]),
     ("active_support/number_helper", &["active_support_number_helper"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
@@ -5488,6 +5489,12 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         feature: "active_support/core_ext/time/calculations",
         ports: &["active_support_time_change"],
         calls: &[".change"],
+        at_require_rails: false,
+    },
+    BootCoreExtension {
+        feature: "active_support/values/time_zone",
+        ports: &["active_support_time_zone"],
+        calls: &["ActiveSupport::TimeZone"],
         at_require_rails: false,
     },
 ];
@@ -11992,6 +11999,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_numeric_time.rb"
         && p != "runtime/active_support_integer_time.rb"
         && p != "runtime/active_support_time_change.rb"
+        && p != "runtime/active_support_time_zone.rb"
         && p != "runtime/active_support_big_decimal_conversions.rb"
         && p != "runtime/active_support_number_helper.rb"
         && p != "runtime/active_support_numeric_conversions.rb"
