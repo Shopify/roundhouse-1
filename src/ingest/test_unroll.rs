@@ -34,20 +34,35 @@
 //!   (anything but `each`), is a named gap.
 //! - what no constant's name tells, across every registered source and
 //!   the test sources not registered yet (`Wide`): a `constants` or
-//!   `const_get` a module may answer with that its body does not show
-//!   (`def constants` anywhere, `define_method`/`alias`/`delegate` of
-//!   one, a mixed-in module, `class Module` reopened) is a named gap for
-//!   every `Module#constants` loop; a constant or module looked up by a
-//!   name not known before the code runs (`const_get(name)`,
-//!   `name.constantize`, `names.map(&:constantize)`) and changed there is
-//!   a named gap for every loop that change may reach. A literal String's
+//!   `const_get` a module may answer with that its body does not show is
+//!   a named gap for every `Module#constants` loop. That is a definition
+//!   (`def`, `alias`, `define_method`/`alias_method`/`delegate`/a stub of
+//!   a literal name, a name in an Array) on `Module`, `Class` or a module
+//!   `EXTENDS` lists, in a block or method whose `self` is not known, on
+//!   a receiver not known, or in a module that may be mixed into one not
+//!   written there (`base.extend(Patch)`); `class Module` reopened; a
+//!   visibility change of one. A module's own singleton (`def
+//!   self.constants`) is its own loop's gap; a Symbol code only returns
+//!   or passes on (`def category = :constants`) defines nothing. A
+//!   constant or module looked up by a name not known before the code
+//!   runs (`const_get(name)`, `name.constantize`,
+//!   `names.map(&:constantize)`) and changed there is a named gap for
+//!   every loop that change may reach: with a literal head
+//!   (`"GraphApi::#{x}"`, or a same-class method whose every return is
+//!   one) only a constant under that head, an ancestor of a module there,
+//!   or one passed on or aliased (`Origin`, `reaches`). A literal String's
 //!   `constantize` is a use of the constant it names. What is done to a
-//!   value found by a computed name is followed through calls on it and a
-//!   local assigned in the same scope; a value passed on, returned or
-//!   stored in an instance variable is not followed, a computed module's
-//!   `const_set` of a computed name counts as a change of that module
-//!   (not of every constant it may bind again), and a stub in a test's
-//!   own code (`stubs`, `expects`) is not counted.
+//!   value found by a computed name is followed through calls on it (and
+//!   `each`/`tap`, which return it), `||`, `&&`, a branch's value, and a
+//!   local assigned in the same scope; a value passed on, returned, given
+//!   to `case` or stored in an instance variable is not followed, a
+//!   computed module's `const_set` of a computed name counts as a change
+//!   of that module (not of every constant it may bind again), and a stub
+//!   in a test's own code (`stubs`, `expects`) is not counted. Not
+//!   followed either: a method defined by a name not literal
+//!   (`names.each { |n| define_method(n) }`), and a module reached as
+//!   what a call returns or yields (`Mod.module_parent`, a method of its
+//!   own that returns or yields `self`).
 //!
 //! Native tests of one iteration share its closure; each emitted test
 //! sets its own copy (`x = <element>`). An element read from an app
@@ -2446,7 +2461,7 @@ pub(super) mod consts {
         if let Some((path, at)) = redefinition() {
             return refuse(REOPENED, format!("`{module}.constants`: `constants` may be defined again at {}", describe_at(&path, at)));
         }
-        if let Some((path, at)) = computed_change(|e| e.module) {
+        if let Some((path, at)) = computed_change(|e| e.module, |_| module.to_string()) {
             return refuse(
                 REOPENED,
                 format!("`{module}.constants`: a module looked up by a name not known before it runs is changed at {}", describe_at(&path, at)),
@@ -3563,7 +3578,12 @@ pub(super) mod consts {
             }
         }
         let changed = |e: &Effect| !shape.allows(e.need) && e.named.as_deref().is_none_or(|n| n == name);
-        if let Some((path, at)) = computed_change(changed) {
+        // `mod.const_set(:ALL, …)` binds a constant of the module found.
+        let found = |e: &Effect| match (&e.need, &e.named) {
+            (Need::Rebind, Some(_)) => full.rsplit_once("::").map_or("Object", |(owner, _)| owner).to_string(),
+            _ => full.to_string(),
+        };
+        if let Some((path, at)) = computed_change(changed, found) {
             return refuse(
                 USED,
                 format!("`{full}`: a constant looked up by a name not known before it runs is changed at {}", describe_at(&path, at)),
@@ -3659,6 +3679,17 @@ pub(super) mod consts {
         /// `KA = Kinds`: the full name of the constant it is the value of,
         /// where the lexical scopes are certain.
         alias: Option<String>,
+        /// A mixin (`Use::Mixin`) into a module not written there: a
+        /// receiver not known (`base.extend(M)`), a call in a method or a
+        /// block, or `include`/`prepend` into a module (whose instance
+        /// methods a module that extends it gets) or into a receiver.
+        /// Not `extend M` in a body, or `include M` in a class body.
+        open_mixin: bool,
+        /// A mixin by `include`/`prepend` (into instances, not `extend`).
+        includes: bool,
+        /// The superclass of a `class` (`class X < M`), whose constants
+        /// `X::NAME` reaches.
+        superclass: bool,
     }
 
     /// Where a mention of a module (or class) puts it.
@@ -3996,15 +4027,106 @@ pub(super) mod consts {
     /// and changes what it finds.
     #[derive(Clone, Debug, Default)]
     struct Wide {
-        /// `def constants` anywhere, `alias`/`define_method`/`delegate`
-        /// … of one, a String evaluated that has the name, `Module` (or a
-        /// module `EXTENDS` lists) reopened by anything but plain
-        /// definitions, or changed by a call (`Module.prepend(…)`).
-        redefines: Vec<usize>,
+        /// `def constants`, `alias`/`define_method`/`delegate` … of one
+        /// (`WIDE_NAMES`), where it puts the method (`Definee`); a String
+        /// evaluated that has the name, `Module` (or a module `EXTENDS`
+        /// lists) reopened by anything but plain definitions, or changed
+        /// by a call (`Module.prepend(…)`): `Definee::Any`.
+        redefines: Vec<(usize, Definee)>,
         /// `Object.const_get(name)`, `name.constantize`,
-        /// `names.map(&:constantize)`, and what is done to what it finds
-        /// there (`computed_need`).
-        lookups: Vec<(usize, Effect)>,
+        /// `names.map(&:constantize)`, what is done to what it finds
+        /// there (`computed_need`), and what it may find (`Origin`).
+        lookups: Vec<(usize, Effect, Origin)>,
+    }
+
+    /// Where a definition of a `WIDE_NAMES` method puts it, when that may
+    /// be where `Mod.constants` of a module other than its own finds it
+    /// (`definee`). Not a module's own singleton (`def self.constants`,
+    /// `class << self`, `define_singleton_method` in its body, `def
+    /// Mod.constants`), which its own checks see (`body_constants`, a use
+    /// of `Mod` that may change it), nor the top level's (`Object`'s,
+    /// which `Module#constants` comes before).
+    #[derive(Clone, Debug, PartialEq)]
+    enum Definee {
+        /// Every module (`Module`, `Class`, a module `EXTENDS` lists), or
+        /// one not known here: in a block that may be run in another
+        /// module (`included do`, `Module.new do`), by a call in a method
+        /// (whose `self` may be a module that extends it, or one found by
+        /// a name not known before it runs), on a receiver not known; or
+        /// a visibility change (`private_class_method :constants`), which
+        /// a module's body check takes as declaring nothing.
+        Any,
+        /// The instance methods of the module (or class) of this name:
+        /// those of a module that extends it, which counts where it may be
+        /// mixed into a module not written there, and a class's, where it
+        /// may be a `Module` subclass (`methods_reach`).
+        Methods(String),
+    }
+
+    /// What a definition of a `WIDE_NAMES` method defines it for, before
+    /// `definee` tells where that is.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Defines {
+        /// `def constants`, `alias constants all`: the module the code is
+        /// written in (through any `def` around it).
+        Lexical,
+        /// `define_method(:constants)`, `alias_method`, `attr_reader`,
+        /// `delegate`, `def_delegator`, `remove_method`: `self`'s
+        /// instance methods.
+        Instance,
+        /// `define_singleton_method(:constants)`, `def self.constants`,
+        /// `def_single_delegator`, a stub: `self`'s own.
+        Singleton,
+    }
+
+    /// The `Defines` of a call that defines (or changes) a method it is
+    /// given the name of; `Some(None)` for a visibility change
+    /// (`Definee::Any`); `None` for a call that defines none.
+    fn definer(method: &str) -> Option<Option<Defines>> {
+        match method {
+            "define_method" | "alias_method" | "attr_reader" | "attr_writer" | "attr_accessor" | "attr" | "delegate"
+            | "def_delegator" | "def_delegators" | "def_instance_delegator" | "def_instance_delegators"
+            | "instance_delegate" | "remove_method" | "undef_method" | "stub_any_instance" => Some(Some(Defines::Instance)),
+            "define_singleton_method" | "def_single_delegator" | "def_single_delegators" | "single_delegate" | "stubs"
+            | "stub" | "expects" => Some(Some(Defines::Singleton)),
+            "module_function" | "public" | "private" | "protected" | "public_class_method" | "private_class_method" => {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// Calls whose block runs with the `self` around it, as it is written.
+    const SELF_KEEPING: &[&str] = &[
+        "each", "each_with_index", "each_with_object", "each_pair", "each_key", "each_value", "map", "flat_map",
+        "collect", "select", "filter", "filter_map", "reject", "times", "upto", "downto", "step", "inject", "reduce",
+        "zip", "tap",
+    ];
+
+    /// What a constant looked up by a name not known before it runs may
+    /// be. `Object.const_get("A::#{x}")` (and `constantize`, which runs
+    /// it) looks `A` up at the top level and each later name in the
+    /// module before it and that module's ancestors, never at the top
+    /// level again: it finds a constant under `A` (`reaches`).
+    #[derive(Clone, Debug, PartialEq)]
+    enum Origin {
+        /// Any constant.
+        Any,
+        /// A String with one of these heads.
+        Heads(Vec<Head>),
+        /// What a method of this name called on `self` returns, where the
+        /// class's body defines it: every definition of the name in the
+        /// sources (`helper_heads`).
+        Helper(String),
+    }
+
+    /// The literal start of a constant path a String names: the path
+    /// itself (`"GraphApi"`), or, when `open`, a module under which a
+    /// path not known follows (`"GraphApi::#{x}"`).
+    #[derive(Clone, Debug, PartialEq)]
+    struct Head {
+        path: Vec<String>,
+        open: bool,
     }
 
     /// The methods a source defining again anywhere may make a module's
@@ -4013,13 +4135,6 @@ pub(super) mod consts {
     /// its constants by name. (`const_defined?` and
     /// `const_source_location` answer neither.)
     const WIDE_NAMES: &[&str] = &["constants", "const_get"];
-
-    /// Calls that name a method without defining it.
-    const NAME_READS: &[&str] = &[
-        "respond_to?", "method", "public_method", "singleton_method", "instance_method", "public_instance_method",
-        "method_defined?", "public_method_defined?", "private_method_defined?", "protected_method_defined?",
-        "assert_respond_to", "refute_respond_to",
-    ];
 
     /// A statement of a `Module` (or `EXTENDS` module) body reopened, or
     /// of a `refine Module` block, that defines only methods it names:
@@ -4074,6 +4189,9 @@ pub(super) mod consts {
         "const_set", "remove_const", "autoload", "include", "prepend", "class_eval", "module_eval", "class_exec",
         "module_exec", "instance_eval", "instance_exec", "send", "public_send", "__send__",
     ];
+
+    /// Calls that, given a block, return what they are called on.
+    const RETURNS_RECEIVER: &[&str] = &["each", "each_with_index", "each_pair", "each_key", "each_value", "reverse_each", "tap"];
 
     /// Calls on a `singleton_class` that only read it.
     const SINGLETON_READS: &[&str] =
@@ -4167,6 +4285,10 @@ pub(super) mod consts {
             return Step::Part(need, false);
         }
         let changes = call.block().is_some_and(|b| block_changes(&b));
+        // `each { … }` and `tap { … }` return what they are called on.
+        if !changes && call.block().is_some_and(|b| b.as_block_node().is_some()) && RETURNS_RECEIVER.contains(&name) {
+            return Step::Part(need, false);
+        }
         if fresh {
             // A block given the constants found.
             return Step::Done(changes.then(|| Effect::new(Need::Object, true)));
@@ -4226,12 +4348,37 @@ pub(super) mod consts {
             }
             if let Some(stmts) = parent.as_statements_node() {
                 let last = stmts.body().iter().last().is_some_and(|s| span_of(&s) == span);
-                if last && i > 0 && parents[i - 1].as_parentheses_node().is_some() {
+                let holder = i.checked_sub(1).map(|j| &parents[j]);
+                if last && holder.is_some_and(|h| h.as_parentheses_node().is_some() || h.as_begin_node().is_some_and(|b| b.rescue_clause().is_none())) {
+                    i -= 1;
+                    span = span_of(&parents[i]);
+                    continue;
+                }
+                // The value of a branch: `c ? Object.const_get(n) : nil`,
+                // `if …; Object.const_get(n); else …; end`.
+                let branch = |j: usize| parents[j].as_if_node().is_some() || parents[j].as_unless_node().is_some();
+                if last && holder.is_some_and(|h| h.as_else_node().is_some()) && i >= 2 && branch(i - 2) {
+                    i -= 2;
+                    span = span_of(&parents[i]);
+                    continue;
+                }
+                if last && i >= 1 && branch(i - 1) {
                     i -= 1;
                     span = span_of(&parents[i]);
                     continue;
                 }
                 return Vec::new();
+            }
+            // An `elsif`'s value is its `if`'s.
+            if parent.as_if_node().is_some_and(|f| f.subsequent().is_some_and(|s| span_of(&s) == span)) {
+                span = span_of(parent);
+                continue;
+            }
+            // `Object.const_get(n) || []`, `c && Object.const_get(n)`.
+            let operand = parent.as_or_node().map(|o| (o.left(), o.right())).or_else(|| parent.as_and_node().map(|a| (a.left(), a.right())));
+            if operand.is_some_and(|(l, r)| span_of(&l) == span || span_of(&r) == span) {
+                span = span_of(parent);
+                continue;
             }
             if let Some(path) = parent.as_constant_path_node() {
                 let whole = span_of(parent);
@@ -4239,7 +4386,12 @@ pub(super) mod consts {
                 let written = path.parent().is_some_and(|p| span_of(&p) == span) && target.is_some();
                 return if written && need > Need::Always && !singleton { vec![path_written(&path)] } else { Vec::new() };
             }
-            if let Some(write) = parent.as_local_variable_write_node().filter(|w| span_of(&w.value()) == span) {
+            let written = parent
+                .as_local_variable_write_node()
+                .filter(|w| span_of(&w.value()) == span)
+                .map(|w| w.name())
+                .or_else(|| parent.as_local_variable_or_write_node().filter(|w| span_of(&w.value()) == span).map(|w| w.name()));
+            if let Some(local) = written {
                 let scope = parents[..i].iter().rev().find(|p| {
                     matches!(
                         p,
@@ -4252,7 +4404,7 @@ pub(super) mod consts {
                             | Node::ProgramNode { .. }
                     )
                 });
-                let local = constant_id_str(&write.name()).to_string();
+                let local = constant_id_str(&local).to_string();
                 return scope.map_or_else(Vec::new, |scope| local_effect(scope, &local, (need, singleton)));
             }
             return Vec::new();
@@ -4357,7 +4509,20 @@ pub(super) mod consts {
             }
             fn push(&mut self, at: usize, qualifier: Option<Vec<String>>, rooted: bool, need: Need, method: String, used: Use) {
                 let cref = if qualifier.is_some() { self.cref(at) } else { None };
-                self.out.push(Site { path: self.path.to_string(), at, qualifier, rooted, cref, need, method, used, alias: None });
+                self.out.push(Site {
+                    path: self.path.to_string(),
+                    at,
+                    qualifier,
+                    rooted,
+                    cref,
+                    need,
+                    method,
+                    used,
+                    alias: None,
+                    open_mixin: false,
+                    includes: false,
+                    superclass: false,
+                });
             }
             fn mention(&mut self, node: &Node<'pr>, qualifier: Option<Vec<String>>, rooted: bool) {
                 let (need, method) = classify(&self.parents, node);
@@ -4375,10 +4540,168 @@ pub(super) mod consts {
                             None => name.to_string(),
                         })
                     });
+                let open_mixin = used == Use::Mixin && self.open_mixin();
+                let includes = used == Use::Mixin
+                    && self.parents.len().checked_sub(2).and_then(|i| self.parents[i].as_call_node()).is_some_and(|c| constant_id_str(&c.name()) != "extend");
+                let superclass = self
+                    .parents
+                    .last()
+                    .and_then(|p| p.as_class_node())
+                    .is_some_and(|c| c.superclass().is_some_and(|s| span_of(&s) == span_of(node)));
                 self.push(at, qualifier, rooted, need, method, used);
                 if let Some(site) = self.out.last_mut() {
                     site.alias = alias;
+                    site.open_mixin = open_mixin;
+                    site.includes = includes;
+                    site.superclass = superclass;
                 }
+            }
+            /// For a mention given to `include`/`extend`/`prepend` (the
+            /// innermost of `parents` its arguments): is the module it is
+            /// mixed into one not written there (`Site::open_mixin`)?
+            fn open_mixin(&self) -> bool {
+                let n = self.parents.len();
+                let Some(call) = n.checked_sub(2).and_then(|i| self.parents[i].as_call_node()) else { return true };
+                let instance = constant_id_str(&call.name()) != "extend";
+                match call.receiver() {
+                    // `Y.extend(M)`: a use of `Y` its own uses see.
+                    Some(r) if segments(&r).is_some() => instance,
+                    Some(r) if r.as_self_node().is_none() => true,
+                    _ => {
+                        let body = n >= 4
+                            && self.parents[n - 3].as_statements_node().is_some()
+                            && (self.parents[n - 4].as_class_node().is_some() || self.parents[n - 4].as_module_node().is_some());
+                        !body || (instance && self.parents[n - 4].as_module_node().is_some())
+                    }
+                }
+            }
+            /// Where a definition `kind` written inside the innermost
+            /// `depth` of `parents` puts the method (`Definee`).
+            fn definee(&self, depth: usize, kind: Defines) -> Option<Definee> {
+                let parents = &self.parents[..depth];
+                let scope = |n: &Node<'_>| matches!(n, Node::ModuleNode { .. } | Node::ClassNode { .. } | Node::SingletonClassNode { .. });
+                for j in (0..parents.len()).rev() {
+                    let p = &parents[j];
+                    match p {
+                        // A nested `def` defines where the one around it is.
+                        Node::DefNode { .. } if kind == Defines::Lexical => {}
+                        Node::DefNode { .. } | Node::LambdaNode { .. } => return Some(Definee::Any),
+                        Node::BlockNode { .. } => {
+                            let call = j.checked_sub(1).and_then(|k| parents[k].as_call_node());
+                            if !call.is_some_and(|c| c.receiver().is_some() && SELF_KEEPING.contains(&constant_id_str(&c.name()))) {
+                                return Some(Definee::Any);
+                            }
+                        }
+                        Node::SingletonClassNode { .. } => {
+                            let expression = p.as_singleton_class_node()?.expression();
+                            let in_body = expression.as_self_node().is_some()
+                                && j >= 2
+                                && parents[j - 1].as_statements_node().is_some()
+                                && matches!(parents[j - 2], Node::ModuleNode { .. } | Node::ClassNode { .. });
+                            // `class << self` in a body: the module's own;
+                            // `class << Mod`: a use of `Mod` its checks see.
+                            return if in_body || segments(&expression).is_some() { None } else { Some(Definee::Any) };
+                        }
+                        Node::ModuleNode { .. } | Node::ClassNode { .. } => {
+                            let k = parents[..=j].iter().filter(|n| scope(n)).count();
+                            let Some((full, exact, _)) = k.checked_sub(1).and_then(|k| self.scopes.get(k)) else {
+                                return Some(Definee::Any);
+                            };
+                            if !exact || every_modules(full) {
+                                return Some(Definee::Any);
+                            }
+                            return (kind != Defines::Singleton).then(|| Definee::Methods(full.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            /// What the lookup `call` (running `method` with `args`) may
+            /// find: a String with a literal head given to
+            /// `Object.const_get`, `constantize` (`"GraphApi::#{x}".constantize`,
+            /// `ActiveSupport::Inflector.constantize(…)`), or one a
+            /// same-class method returns (`helper`); else any constant.
+            /// `Mod.const_get` looks its first name up in `Mod` too.
+            fn origin(&self, call: &ruby_prism::CallNode<'pr>, method: &str, args: &[Node<'pr>]) -> Origin {
+                let receiver = call.receiver();
+                let named = |r: &Option<Node<'pr>>, names: &[&[&str]]| {
+                    r.as_ref().and_then(segments).is_some_and(|(segs, _)| names.iter().any(|n| segs.iter().map(String::as_str).eq(n.iter().copied())))
+                };
+                match method {
+                    "const_get" if named(&receiver, &[&["Object"]]) => args.first().map_or(Origin::Any, |a| self.origin_of(a)),
+                    "constantize" | "safe_constantize" if args.is_empty() => receiver.map_or(Origin::Any, |r| self.origin_of(&r)),
+                    "constantize" | "safe_constantize" if named(&receiver, &[&["Inflector"], &["ActiveSupport", "Inflector"]]) => {
+                        args.first().map_or(Origin::Any, |a| self.origin_of(a))
+                    }
+                    _ => Origin::Any,
+                }
+            }
+            /// What the name `arg` a lookup is given may be (`origin`).
+            fn origin_of(&self, arg: &Node<'pr>) -> Origin {
+                if let Some(parens) = arg.as_parentheses_node() {
+                    return match parens.body().map(flatten_statements).unwrap_or_default().as_slice() {
+                        [only] => self.origin_of(only),
+                        _ => Origin::Any,
+                    };
+                }
+                if let Some(head) = interpolated_head(arg) {
+                    return Origin::Heads(vec![head]);
+                }
+                match arg.as_call_node().and_then(|c| self.helper(&c)) {
+                    Some(m) => Origin::Helper(m),
+                    None => Origin::Any,
+                }
+            }
+            /// `m(…)` (or `self.m(…)`, no block) called in an instance
+            /// method of a `class`/`module` body that defines `m` once
+            /// (no receiver): its name, whose definitions `helper_heads`
+            /// reads.
+            fn helper(&self, call: &ruby_prism::CallNode<'pr>) -> Option<String> {
+                const VISIBILITY: &[&str] = &["private", "protected", "public"];
+                if call.block().is_some() || call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+                    return None;
+                }
+                let m = constant_id_str(&call.name()).to_string();
+                let j = self.parents.iter().rposition(|p| {
+                    matches!(
+                        p,
+                        Node::DefNode { .. }
+                            | Node::BlockNode { .. }
+                            | Node::LambdaNode { .. }
+                            | Node::ClassNode { .. }
+                            | Node::ModuleNode { .. }
+                            | Node::SingletonClassNode { .. }
+                    )
+                })?;
+                self.parents[j].as_def_node().filter(|d| d.receiver().is_none())?;
+                let visibility = |n: &Node<'_>| {
+                    n.as_call_node().is_some_and(|c| c.receiver().is_none() && VISIBILITY.contains(&constant_id_str(&c.name())))
+                };
+                let mut k = j.checked_sub(1)?;
+                if self.parents[k].as_arguments_node().is_some() {
+                    if !visibility(self.parents.get(k.checked_sub(1)?)?) {
+                        return None;
+                    }
+                    k = k.checked_sub(2)?;
+                }
+                self.parents[k].as_statements_node()?;
+                let owner = &self.parents[k.checked_sub(1)?];
+                let body = owner.as_class_node().map(|c| c.body()).or_else(|| owner.as_module_node().map(|m| m.body()))?;
+                let defs = body
+                    .map(flatten_statements)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|s| {
+                        let def = s.as_def_node().or_else(|| {
+                            s.as_call_node()
+                                .filter(|_| visibility(s))
+                                .and_then(|c| c.arguments()?.arguments().iter().next()?.as_def_node())
+                        });
+                        def.is_some_and(|d| d.receiver().is_none() && constant_id_str(&d.name()) == m)
+                    })
+                    .count();
+                (defs == 1).then_some(m)
             }
             /// A declaration's name (`class Levels::ALL`), not a read.
             fn declared(&self, node: &Node<'pr>) -> bool {
@@ -4467,17 +4790,28 @@ pub(super) mod consts {
             /// `Wide`'s part of `node`.
             fn wide_node(&mut self, node: &Node<'pr>) {
                 let at = node.location().start_offset();
+                let depth = self.parents.len();
                 if let Some(def) = node.as_def_node() {
                     if WIDE_NAMES.contains(&constant_id_str(&def.name())) {
-                        self.found.redefines.push(at);
+                        let definee = match def.receiver() {
+                            None => self.definee(depth, Defines::Lexical),
+                            Some(r) if r.as_self_node().is_some() => self.definee(depth, Defines::Singleton),
+                            // `def Mod.constants`: a use of `Mod` its checks see.
+                            Some(r) if segments(&r).is_some() => None,
+                            Some(_) => Some(Definee::Any),
+                        };
+                        self.found.redefines.extend(definee.map(|d| (at, d)));
                     }
                     return;
                 }
                 if let Some(alias) = node.as_alias_method_node() {
                     // `alias constants all`; an interpolated name is not known.
-                    if literal_text(&alias.new_name()).is_none_or(|n| WIDE_NAMES.contains(&n.as_str())) {
-                        self.found.redefines.push(at);
-                    }
+                    let definee = match literal_text(&alias.new_name()) {
+                        Some(n) if !WIDE_NAMES.contains(&n.as_str()) => None,
+                        Some(_) => self.definee(depth, Defines::Lexical),
+                        None => Some(Definee::Any),
+                    };
+                    self.found.redefines.extend(definee.map(|d| (at, d)));
                     return;
                 }
                 let opened = node
@@ -4487,7 +4821,7 @@ pub(super) mod consts {
                 if let Some((path, body)) = opened {
                     if self.opened(&path).is_some_and(|full| every_modules(&full)) {
                         if let Some(stmt) = body.map(flatten_statements).unwrap_or_default().iter().find(|s| !names_its_methods(s)) {
-                            self.found.redefines.push(stmt.location().start_offset());
+                            self.found.redefines.push((stmt.location().start_offset(), Definee::Any));
                         }
                     }
                     return;
@@ -4503,17 +4837,17 @@ pub(super) mod consts {
                 }
                 let every = |n: &Node<'_>| segments(n).is_some_and(|(segs, _)| every_modules(&segs.join("::")));
                 if call.receiver().is_some_and(|r| every(&r)) && REOPENERS.contains(&method.as_str()) {
-                    self.found.redefines.push(at);
+                    self.found.redefines.push((at, Definee::Any));
                 }
                 if method == "refine" && args.first().is_some_and(every) {
                     let body = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body());
                     if body.map(flatten_statements).unwrap_or_default().iter().any(|s| !names_its_methods(s)) {
-                        self.found.redefines.push(at);
+                        self.found.redefines.push((at, Definee::Any));
                     }
                 }
                 let spoken = |a: &Node<'_>| string_text(a).is_some_and(|t| WIDE_NAMES.iter().any(|m| has_word(&t, m)));
                 if EVALS.contains(&method.as_str()) && args.iter().any(spoken) {
-                    self.found.redefines.push(at);
+                    self.found.redefines.push((at, Definee::Any));
                 }
                 let computed = match method.as_str() {
                     "const_get" => args.first().is_some_and(|a| literal_text(a).is_none()),
@@ -4524,73 +4858,97 @@ pub(super) mod consts {
                     _ => false,
                 };
                 if computed {
+                    let origin = self.origin(&call, &method, &args);
                     let effects = computed_need(&self.parents, node, Need::Object);
-                    self.found.lookups.extend(effects.into_iter().map(|e| (at, e)));
+                    self.found.lookups.extend(effects.into_iter().map(|e| (at, e, origin.clone())));
                 }
                 // `names.map(&:constantize)`: the constants found, in a new
                 // collection.
                 let by_symbol = call.block().and_then(|b| b.as_block_argument_node()).and_then(|b| b.expression()).and_then(|e| literal_text(&e));
                 if by_symbol.is_some_and(|m| matches!(m.as_str(), "constantize" | "safe_constantize" | "const_get")) {
                     let effects = computed_need(&self.parents, node, Need::Always);
-                    self.found.lookups.extend(effects.into_iter().map(|e| (at, e)));
+                    self.found.lookups.extend(effects.into_iter().map(|e| (at, e, Origin::Any)));
                 }
             }
-            /// `:constants` (or `:const_get`, `WIDE_NAMES`) as code may
-            /// give it to `define_method`, `alias_method`, `delegate`, a
-            /// stub run as the file loads, or keep it for one; or a String
-            /// of one given to a call that defines a method by name. Not a
-            /// Hash key, a `when`, the old name of an alias, or one a call
-            /// only asks about
-            /// (`respond_to?(:constants)`, `NAME_READS`), compares
-            /// (`assert_equal`, `TESTS`), reads (`[]`, `fetch`) or sends
-            /// (`send(:const_get, :X)`); not a stub's in a test's code,
-            /// which is undone before the next test, and runs after every
-            /// class body.
+            /// `:constants` (or `:const_get`, `WIDE_NAMES`, or a String of
+            /// one) given to a call that defines a method by name
+            /// (`definer`: `define_method`, `alias_method :constants, …`,
+            /// `delegate`, a stub run as the file loads, `send(:define_method,
+            /// :constants)`), where it puts it (`definee`); or an element of
+            /// an Array, which code may give one (`Definee::Any`). Not a
+            /// Symbol code only returns, keeps or passes to another call
+            /// (`def category = :constants`, `respond_to?(:constants)`,
+            /// `send(:const_get, :X)`), a Hash key, a `when`, an alias's
+            /// names (`wide_node` counts the alias), a stub's in a test's
+            /// code, which is undone before the next test and runs after
+            /// every class body. A name such a call is given by a
+            /// variable (`names.each { |n| define_method(n) }`) is not
+            /// followed.
             fn wide_name(&mut self, node: &Node<'pr>) {
-                const DEFINERS: &[&str] = &[
-                    "define_method", "define_singleton_method", "alias_method", "delegate", "def_delegator",
-                    "def_delegators", "def_instance_delegator", "def_instance_delegators", "def_single_delegator",
-                    "def_single_delegators", "instance_delegate", "single_delegate", "module_function", "public",
-                    "private", "protected", "public_class_method", "private_class_method", "attr_reader",
-                    "attr_writer", "attr_accessor", "attr", "remove_method", "undef_method", "stubs", "stub", "expects",
-                ];
                 const STUBS: &[&str] = &["stubs", "stub", "expects", "stub_any_instance"];
-                const ASKS: &[&str] = &["[]", "fetch", "dig", "key?", "has_key?", "require", "require_relative", "load"];
                 if !literal_text(node).is_some_and(|t| WIDE_NAMES.contains(&t.as_str())) {
+                    return;
+                }
+                let at = node.location().start_offset();
+                let span = span_of(node);
+                let depth = self.parents.len();
+                let parent = self.parents.last();
+                if parent.is_some_and(|p| {
+                    p.as_assoc_node().is_some_and(|a| span_of(&a.key()) == span)
+                        || p.as_when_node().is_some()
+                        || p.as_alias_method_node().is_some()
+                }) {
+                    return;
+                }
+                if parent.is_some_and(|p| p.as_array_node().is_some()) {
+                    self.found.redefines.push((at, Definee::Any));
                     return;
                 }
                 let call = match self.parents.as_slice() {
                     [.., call, args] if args.as_arguments_node().is_some() => call.as_call_node(),
                     _ => None,
                 };
-                let parent = self.parents.last();
-                if parent.is_some_and(|p| {
-                    p.as_assoc_node().is_some_and(|a| span_of(&a.key()) == span_of(node))
-                        || p.as_when_node().is_some()
-                        || p.as_alias_method_node().is_some_and(|a| span_of(&a.old_name()) == span_of(node))
-                }) {
+                let Some(call) = call else { return };
+                let args: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                let first = args.first().is_some_and(|a| span_of(a) == span);
+                let mut method = constant_id_str(&call.name()).to_string();
+                if matches!(method.as_str(), "send" | "public_send" | "__send__" | "try" | "try!") {
+                    // `send(:const_get, :X)` calls it.
+                    match args.first().and_then(literal_text) {
+                        Some(sent) if !first => method = sent,
+                        _ => return,
+                    }
+                }
+                // `alias_method :new, :constants` defines `new`.
+                if method == "alias_method" && !first {
                     return;
                 }
-                if let Some(call) = &call {
-                    let method = constant_id_str(&call.name());
-                    let first = call.arguments().and_then(|a| a.arguments().iter().next()).is_some_and(|a| span_of(&a) == span_of(node));
-                    let in_code = self.parents.iter().any(|p| matches!(p, Node::DefNode { .. } | Node::BlockNode { .. } | Node::LambdaNode { .. }));
-                    // `alias_method :new, :constants` defines `new`.
-                    if NAME_READS.contains(&method)
-                        || TESTS.contains(&method)
-                        || ASKS.contains(&method)
-                        || (matches!(method, "send" | "public_send" | "__send__" | "alias_method") && first == (method != "alias_method"))
-                        || (STUBS.contains(&method) && in_code)
-                    {
-                        return;
-                    }
-                    if node.as_string_node().is_some() && !DEFINERS.contains(&method) {
-                        return;
-                    }
-                } else if node.as_string_node().is_some() && !parent.is_some_and(|p| p.as_array_node().is_some()) {
+                let in_code = self.parents.iter().any(|p| matches!(p, Node::DefNode { .. } | Node::BlockNode { .. } | Node::LambdaNode { .. }));
+                if STUBS.contains(&method.as_str()) && in_code {
                     return;
                 }
-                self.found.redefines.push(node.location().start_offset());
+                let Some(kind) = definer(&method) else { return };
+                let Some(kind) = kind else {
+                    self.found.redefines.push((at, Definee::Any));
+                    return;
+                };
+                let definee = match call.receiver() {
+                    None => self.definee(depth - 2, kind),
+                    Some(r) if r.as_self_node().is_some() => self.definee(depth - 2, kind),
+                    Some(r) => match segments(&r) {
+                        Some((segs, _)) if every_modules(&segs.join("::")) => Some(Definee::Any),
+                        // `Mod.define_singleton_method(:constants)`: a use of
+                        // `Mod` its checks see.
+                        Some(_) if kind == Defines::Singleton => None,
+                        // `Mod.define_method(:constants)`, where `Mod` is the
+                        // module of that name.
+                        Some((segs, rooted)) if rooted || self.cref(at).is_some_and(|c| c.is_empty()) => {
+                            Some(Definee::Methods(segs.join("::")))
+                        }
+                        _ => Some(Definee::Any),
+                    },
+                };
+                self.found.redefines.extend(definee.map(|d| (at, d)));
             }
             /// `X, ALL = …`, `rescue => ALL`: the constant bound again.
             fn target(&mut self, node: &Node<'pr>) {
@@ -4928,6 +5286,13 @@ pub(super) mod consts {
             _ => false,
         };
         if qualifier.first().is_some_and(|f| f == "Object") && (site.rooted || top_object()) {
+            // A module a source mixes into `Object` has its constants
+            // there too (`Object.include(Kinds)`: `Object::ALL` is
+            // `Kinds::ALL`).
+            let after = qualifier.get(1).map_or(name, String::as_str);
+            if name != "Object" && (changed_from_outside("Object", Reach::Ancestry).is_some() || mixed_into_object(after)) {
+                return None;
+            }
             let top = Site { qualifier: Some(qualifier[1..].to_vec()), rooted: true, ..site.clone() };
             return denotes(&top, name);
         }
@@ -4966,6 +5331,48 @@ pub(super) mod consts {
             }
         }
         Some(Some(full))
+    }
+
+    /// May a module that declares `name` (or an ancestor of one) be mixed
+    /// into `Object` where no mention of `Object` shows it: `class
+    /// Object` reopened (`include Kinds` in its body); an `include` or
+    /// `prepend` of the module whose target is not written there (at the
+    /// top level `include Kinds` is `Object`'s, and in a module's body it
+    /// reaches what includes that module); the module passed on or
+    /// aliased (`send(:include, Kinds)`, `KA = Kinds`)?
+    fn mixed_into_object(name: &str) -> bool {
+        thread_local! {
+            static ASKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        if !decls("Object").is_empty() || !late_decls("Object").is_empty() {
+            return true;
+        }
+        // A cycle of such questions (`A::B` and `B::A`) is not certain.
+        if ASKED.with(|a| a.borrow().iter().any(|n| n == name)) {
+            return true;
+        }
+        let owners: Vec<String> = decls(name)
+            .into_iter()
+            .chain(late_decls(name))
+            .flat_map(|d| d.names)
+            .filter_map(|n| n.strip_suffix(name)?.strip_suffix("::").map(str::to_string))
+            .filter(|owner| !owner.is_empty())
+            .collect();
+        ASKED.with(|a| a.borrow_mut().push(name.to_string()));
+        let mixed = owners.iter().any(|owner| {
+            let seg = owner.rsplit("::").next().unwrap_or(owner);
+            sites_of(seg).iter().any(|s| {
+                relevant(s, owner)
+                    && match &s.used {
+                        Use::Assigned | Use::Escapes => true,
+                        Use::Mixin => s.includes && s.open_mixin,
+                        Use::Call { .. } => RETURNS_SELF.contains(&s.method.as_str()),
+                        Use::Read | Use::Adds => false,
+                    }
+            })
+        });
+        ASKED.with(|a| a.borrow_mut().pop());
+        mixed
     }
 
     /// A path whose first name no registered source declares is through a
@@ -5086,7 +5493,8 @@ pub(super) mod consts {
             let (files, _) = late_sources(None);
             Some(files.iter().filter_map(|(path, text)| Some((path.clone(), wide_of(text, path)?))).collect::<Vec<_>>())
         };
-        WIDE.with(|w| {
+        // `pick` reads other caches: it runs on a copy.
+        let all: Vec<(String, Wide)> = WIDE.with(|w| {
             let mut w = w.borrow_mut();
             if w.registry != registry || (w.seen > 0 && sources::path_of(FileId(w.seen)).is_none()) {
                 *w = WideCache { registry: registry.clone(), late: w.late.take(), ..WideCache::default() };
@@ -5102,24 +5510,312 @@ pub(super) mod consts {
                 w.seen = id;
                 id += 1;
             }
-            let registered = w.found.iter().find_map(|(path, f)| pick(f).map(|at| (path.clone(), at)));
-            registered.or_else(|| {
-                let late = w.late.as_ref()?;
-                late.1.iter().filter(|(path, _)| !is_registered(path)).find_map(|(path, f)| pick(f).map(|at| (path.clone(), at)))
+            let late = w.late.as_ref().map(|l| l.1.iter().filter(|(path, _)| !is_registered(path)).cloned().collect::<Vec<_>>()).unwrap_or_default();
+            w.found.iter().cloned().chain(late).collect()
+        });
+        all.iter().find_map(|(path, f)| pick(f).map(|at| (path.clone(), at)))
+    }
+
+    /// Where a source may define a method `Mod.constants` answers with
+    /// again (`Wide::redefines`), where that may reach another module.
+    fn redefinition() -> Option<(String, usize)> {
+        wide_find(|w| {
+            w.redefines
+                .iter()
+                .find(|(_, definee)| match definee {
+                    Definee::Any => true,
+                    Definee::Methods(module) => methods_reach(module),
+                })
+                .map(|(at, _)| *at)
+        })
+    }
+
+    /// May the instance methods of `module` be methods of a module other
+    /// than one whose own uses show it? A module's, where it is mixed in
+    /// not as a body's own `extend` or a class body's `include` (a
+    /// receiver not known, `include` into a module, which a module may
+    /// extend), passed on or aliased, or called in a way that may change
+    /// it (`Mod.extend_object(x)`); a class's, unless every declaration
+    /// of it is a certain `class` with no superclass (whose instances are
+    /// no modules).
+    fn methods_reach(module: &str) -> bool {
+        if every_modules(module) {
+            return true;
+        }
+        let last = module.rsplit("::").next().unwrap_or(module);
+        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == module)).collect();
+        if !all.is_empty() && all.iter().all(|d| d.kind == Kind::Class) {
+            let plain = |d: &Decl| {
+                d.certain
+                    && d.names.len() == 1
+                    && with_any_text(&d.path, |text| {
+                        let result = ruby_prism::parse(text.as_bytes());
+                        let root = result.node();
+                        node_at(&root, d.start, d.end).and_then(|n| n.as_class_node().map(|c| c.superclass().is_none())).unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            };
+            return !all.iter().all(plain);
+        }
+        sites_of(last).iter().any(|s| {
+            relevant(s, module)
+                && match &s.used {
+                    Use::Assigned | Use::Escapes => true,
+                    Use::Mixin => s.open_mixin,
+                    Use::Call { .. } => changes(s, Reach::Methods),
+                    Use::Read | Use::Adds => false,
+                }
+        })
+    }
+
+    /// Where code changes a constant it looks up by a name not known
+    /// before it runs, as `changed` tells from the `Effect`, where what
+    /// it finds may be the constant (or module) `found` gives for it.
+    fn computed_change(changed: impl Fn(&Effect) -> bool, found: impl Fn(&Effect) -> String) -> Option<(String, usize)> {
+        wide_find(|w| w.lookups.iter().find(|(_, effect, origin)| changed(effect) && reaches(origin, &found(effect))).map(|(at, _, _)| *at))
+    }
+
+    /// May a lookup of `origin` find the constant `found`? Under a head
+    /// (`"GraphApi::#{x}"`) it finds `GraphApi`'s own constants (each
+    /// head name a module of its own, `own_module`), and those an ancestor of a
+    /// module there has, which may be anything mixed in or a superclass,
+    /// or (through a class, whose ancestors `Object` is) of `Kernel` and
+    /// what is mixed into `Object`; or anything passed on or aliased
+    /// there (`leaks`).
+    fn reaches(origin: &Origin, found: &str) -> bool {
+        let heads = match origin {
+            Origin::Any => return true,
+            Origin::Heads(heads) => heads.clone(),
+            Origin::Helper(method) => match helper_heads(method) {
+                Some(heads) => heads,
+                None => return true,
+            },
+        };
+        if found.starts_with('?') || found.starts_with("Kernel::") || found.starts_with("BasicObject::") {
+            return true;
+        }
+        let under = |h: &Head| {
+            let uncertain = (1..=h.path.len()).any(|k| !own_module(&h.path[..k].join("::")));
+            let joined = h.path.join("::");
+            uncertain || if h.open { found.starts_with(&format!("{joined}::")) } else { found == joined }
+        };
+        heads.iter().any(under) || leaks(found)
+    }
+
+    /// Is `full` a module (or class) of its own, not another one bound to
+    /// the name: every source that may declare it (a test source not
+    /// registered yet too, such as Core's `module GraphApi` around a
+    /// test class) opens it with `module`/`class`, none assigns it.
+    fn own_module(full: &str) -> bool {
+        let last = full.rsplit("::").next().unwrap_or(full);
+        let all: Vec<Decl> = decls(last).into_iter().chain(late_decls(last)).filter(|d| d.names.iter().any(|n| n == full)).collect();
+        !all.is_empty() && all.iter().all(|d| d.kind != Kind::Const)
+    }
+
+    /// Calls on a module that return it or give it to code (as a block's
+    /// `self` or argument).
+    const RETURNS_SELF: &[&str] = &[
+        "itself", "tap", "then", "yield_self", "dup", "clone", "freeze", "send", "public_send", "__send__", "try", "try!",
+        "instance_eval", "instance_exec", "class_eval", "module_eval", "class_exec", "module_exec",
+    ];
+
+    /// May `found` be reached as a constant of another module: it or a
+    /// module it is under aliased or passed on (where `const_set` may put
+    /// it anywhere), or a module it is under mixed in, a superclass, or
+    /// asked for one of its constants (`Mod.const_get(:X)`)?
+    fn leaks(found: &str) -> bool {
+        let segs: Vec<&str> = found.split("::").collect();
+        (1..=segs.len()).any(|k| {
+            let prefix = segs[..k].join("::");
+            let proper = k < segs.len();
+            sites_of(segs[k - 1]).iter().any(|s| {
+                relevant(s, &prefix)
+                    && match &s.used {
+                        Use::Assigned | Use::Escapes => true,
+                        Use::Mixin => proper,
+                        Use::Read => proper && s.superclass,
+                        Use::Call { .. } => RETURNS_SELF.contains(&s.method.as_str()) || (proper && s.method == "const_get"),
+                        Use::Adds => false,
+                    }
             })
         })
     }
 
-    /// Where a source may define a method `Mod.constants` answers with
-    /// again (`Wide::redefines`).
-    fn redefinition() -> Option<(String, usize)> {
-        wide_find(|w| w.redefines.first().copied())
+    /// The head of an interpolated String (or Symbol) given to a lookup:
+    /// its literal start up to the last `::`, when that is a path of
+    /// constant names (`"GraphApi::#{x}"`, `"::A::B#{x}"`).
+    fn interpolated_head(node: &Node<'_>) -> Option<Head> {
+        let parts: Vec<Node<'_>> = match (node.as_interpolated_string_node(), node.as_interpolated_symbol_node()) {
+            (Some(s), _) => s.parts().iter().collect(),
+            (_, Some(s)) => s.parts().iter().collect(),
+            _ => return None,
+        };
+        let mut text = String::new();
+        for part in &parts {
+            match part.as_string_node() {
+                Some(s) => text.push_str(&String::from_utf8_lossy(s.unescaped())),
+                None => break,
+            }
+        }
+        let text = text.strip_prefix("::").unwrap_or(&text);
+        let (head, _) = text.rsplit_once("::")?;
+        Some(Head { path: constant_names(head)?, open: true })
     }
 
-    /// Where code changes a constant it looks up by a name not known
-    /// before it runs, as `changed` tells from the `Effect`.
-    fn computed_change(changed: impl Fn(&Effect) -> bool) -> Option<(String, usize)> {
-        wide_find(|w| w.lookups.iter().find(|(_, effect)| changed(effect)).map(|(at, _)| *at))
+    /// `"A::B"` as the names of a constant path, when each is one.
+    fn constant_names(text: &str) -> Option<Vec<String>> {
+        let text = text.strip_prefix("::").unwrap_or(text);
+        let names: Vec<String> = text.split("::").map(str::to_string).collect();
+        let valid = |n: &String| {
+            n.as_bytes().first().is_some_and(u8::is_ascii_uppercase) && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        };
+        names.iter().all(valid).then_some(names)
+    }
+
+    /// The heads of what the method `def` returns: every `return`'s and
+    /// its last statement's value a String with a head (`"GraphApi"`,
+    /// `"GraphApi::#{x}"`), through `if`/`unless` branches and
+    /// parentheses. `None` for any other value, a `rescue`/`ensure`
+    /// body, or no body.
+    fn def_heads(def: &ruby_prism::DefNode<'_>) -> Option<Vec<Head>> {
+        use ruby_prism::Visit;
+        struct Returns {
+            heads: Option<Vec<Head>>,
+        }
+        impl<'pr> Visit<'pr> for Returns {
+            fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+                let args: Vec<Node<'pr>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                let found = match args.as_slice() {
+                    [only] => value_heads(only),
+                    _ => None,
+                };
+                match (found, self.heads.as_mut()) {
+                    (Some(found), Some(heads)) => heads.extend(found),
+                    _ => self.heads = None,
+                }
+                ruby_prism::visit_return_node(self, node);
+            }
+            // A nested method's or a lambda's `return` is its own.
+            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+            fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        }
+        let body = def.body()?;
+        if body.as_begin_node().is_some() {
+            return None;
+        }
+        let mut returns = Returns { heads: Some(Vec::new()) };
+        returns.visit(&body);
+        let mut heads = returns.heads?;
+        heads.extend(value_heads(&body)?);
+        Some(heads)
+    }
+
+    /// The heads of the value of `node` (`def_heads`): a `return` gives
+    /// none here (its own are counted).
+    fn value_heads(node: &Node<'_>) -> Option<Vec<Head>> {
+        if let Some(stmts) = node.as_statements_node() {
+            return value_heads(&stmts.body().iter().last()?);
+        }
+        if let Some(parens) = node.as_parentheses_node() {
+            return value_heads(&parens.body()?);
+        }
+        if let Some(s) = node.as_string_node() {
+            let path = constant_names(&String::from_utf8_lossy(s.unescaped()))?;
+            return Some(vec![Head { path, open: false }]);
+        }
+        if node.as_interpolated_string_node().is_some() {
+            return Some(vec![interpolated_head(node)?]);
+        }
+        if node.as_return_node().is_some() {
+            return Some(Vec::new());
+        }
+        let branches = |then: Option<ruby_prism::StatementsNode<'_>>, other: Option<Node<'_>>| -> Option<Vec<Head>> {
+            let mut heads = value_heads(&then?.as_node())?;
+            let other = other?;
+            let other = match other.as_else_node() {
+                Some(e) => value_heads(&e.statements()?.as_node())?,
+                None => value_heads(&other)?,
+            };
+            heads.extend(other);
+            Some(heads)
+        };
+        if let Some(f) = node.as_if_node() {
+            return branches(f.statements(), f.subsequent());
+        }
+        if let Some(u) = node.as_unless_node() {
+            return branches(u.statements(), u.else_clause().map(|e| e.as_node()));
+        }
+        None
+    }
+
+    thread_local! {
+        /// `helper_heads` by method name, for a registry, how many sources
+        /// it has, and the late sources' root.
+        static HELPERS: RefCell<(Option<(Option<(String, usize)>, usize, Option<String>)>, HashMap<String, Option<Vec<Head>>>)> =
+            RefCell::new((None, HashMap::new()));
+    }
+
+    /// The heads of what a call of `method` on `self` may return: those of
+    /// every `def` of the name in the registered sources and the test
+    /// sources not registered now (`def_heads`). `None` when one has no
+    /// head, or a source names the method otherwise (`define_method(:m)`,
+    /// `alias_method :m, …`, `send(:m)`), which may define it again.
+    fn helper_heads(method: &str) -> Option<Vec<Head>> {
+        use ruby_prism::Visit;
+        struct Scan<'a> {
+            method: &'a str,
+            heads: Option<Vec<Head>>,
+            defs: usize,
+        }
+        impl<'pr> Visit<'pr> for Scan<'_> {
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                if let Some(def) = node.as_def_node().filter(|d| constant_id_str(&d.name()) == self.method) {
+                    self.defs += 1;
+                    match (def_heads(&def), self.heads.as_mut()) {
+                        (Some(found), Some(heads)) => heads.extend(found),
+                        _ => self.heads = None,
+                    }
+                }
+            }
+            fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
+                if literal_text(&node).is_some_and(|t| t == self.method) {
+                    self.heads = None;
+                }
+            }
+        }
+        let ids = files_with(method, 0);
+        let key = (registry_key(), ids.len(), late_root());
+        if let Some(found) = HELPERS.with(|h| {
+            let h = h.borrow();
+            (h.0.as_ref() == Some(&key)).then(|| h.1.get(method).cloned()).flatten()
+        }) {
+            return found;
+        }
+        let mut scan = Scan { method, heads: Some(Vec::new()), defs: 0 };
+        let mut read = |text: &str| {
+            if has_word(text, method) {
+                let result = ruby_prism::parse(text.as_bytes());
+                scan.visit(&result.node());
+            }
+        };
+        for id in ids {
+            if let Some(path) = sources::path_of(FileId(id)) {
+                sources::with_text(&path, |text| read(text));
+            }
+        }
+        let (files, late) = late_sources(Some(method));
+        for i in late {
+            read(&files[i].1);
+        }
+        let found = if scan.defs == 0 { None } else { scan.heads };
+        HELPERS.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.0.as_ref() != Some(&key) {
+                *h = (Some(key), HashMap::new());
+            }
+            h.1.insert(method.to_string(), found.clone());
+        });
+        found
     }
 
     // ---- Test sources not registered yet -----------------------------

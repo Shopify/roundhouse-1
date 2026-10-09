@@ -37,7 +37,12 @@
 //!   module or by a `class Module` reopen; a change through a literal
 //!   `constantize` / `safe_constantize`; a nested class's superclass that
 //!   writes a constant; a change to a constant or module found by a name
-//!   not known before the program runs).
+//!   not known before the program runs, followed through `||`, a branch,
+//!   safe navigation and `each { … }`; a module mixed into `Object`
+//!   reached through `Object::`). Precision cases list what native lists:
+//!   a Symbol `:constants` only returned, a module's own `constants`, and
+//!   a computed name under a literal head (`"GraphApi::#{x}"`, or a
+//!   same-class helper's), which reaches only the loops under it.
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -2165,10 +2170,11 @@ fn module_gap(kind: &str, k: usize, module: &str, why: &str) -> String {
 /// `Mod.constants` is a method call: a module that defines `constants`
 /// for itself (`def self.constants`, in `class << self`, under `extend
 /// self` or `module_function`, `define_singleton_method`) answers with
-/// what that returns, not with what its body declares. Each is a gap;
-/// and since one such definition may reach any module (through an
-/// `extend` of a module found by name), so is every other module's loop
-/// in the program. A loop over a frozen literal reads no method.
+/// what that returns, not with what its body declares. Each is a gap.
+/// None of them is a method of another module (each is its own
+/// singleton's, or an instance method of a module nothing else mixes
+/// in), so `M13` beside them is listed, as native finds it; a loop over
+/// a frozen literal reads no method.
 #[test]
 fn constants_defined_again_in_a_module_body_are_gaps() {
     let modules = r##"module M6
@@ -2231,7 +2237,7 @@ end
     let native = matches_native(
         &[("app/models/ov.rb", modules), ("test/models/m_test.rb", &test)],
         &classes.iter().map(String::as_str).collect::<Vec<_>>(),
-        &|id| !id.starts_with("KindsTest#"),
+        &|id| !id.starts_with("KindsTest#") && !id.starts_with("M13Test#"),
         &[
             &defines(0, "M6", 3),
             &defines(1, "M7", 11),
@@ -2239,10 +2245,9 @@ end
             &defines(3, "M9", 29),
             &defines(4, "M11", 36),
             &module_gap(MODULE_BODY, 5, "M12", "its body runs `define_singleton_method(:constants) { |*| [:DSM] }` (line 41), not listed as adding no constant"),
-            &module_gap(REOPENED, 6, "M13", "`constants` may be defined again at `def self.constants(inherit = true)` (app/models/ov.rb line 3)"),
         ],
     );
-    for id in ["M6Test#test_c_VIRTUAL", "M7Test#test_c_ONLY", "M8Test#test_c_FAKE", "M9Test#test_c_MF", "M11Test#test_c_MFD", "M12Test#test_c_DSM", "KindsTest#test_k_b"] {
+    for id in ["M6Test#test_c_VIRTUAL", "M7Test#test_c_ONLY", "M8Test#test_c_FAKE", "M9Test#test_c_MF", "M11Test#test_c_MFD", "M12Test#test_c_DSM", "M13Test#test_c_A", "KindsTest#test_k_b"] {
         assert!(native.contains_key(id), "{id}: {native:#?}");
     }
 }
@@ -2527,4 +2532,451 @@ fn changes_to_a_constant_found_by_a_computed_name_are_gaps() {
         ],
     );
     assert!(native.contains_key("FrozenTest#test_k_x"), "{native:#?}");
+}
+
+/// A Symbol named `constants` that only names it (Core's CI snapshotter
+/// returns `:constants` as its category), a class's own `def constants`
+/// (whose instances are no modules), a module's own singleton method or
+/// `extend self` method, and a `delegate`/`define_method` in a module
+/// nothing mixes in define no method another module's `constants`
+/// answers with: other modules' loops are listed, as native finds them.
+/// The same `define_method` in a module extended into one found by a
+/// computed name is a gap.
+#[test]
+fn names_of_reflection_methods_that_reach_no_other_module_are_not_gaps() {
+    let kinds = "module M70\n  A = 1\nend\n\nmodule M71\n  B = 1\nend\n";
+    let names = r##"# Core's CI snapshotter names its category `:constants`.
+class Snapshot
+  def category
+    :constants
+  end
+
+  def constants
+    [:SNAP]
+  end
+end
+
+module OwnOnly
+  extend self
+
+  def constants(*)
+    [:OWN]
+  end
+end
+
+module Single
+  def self.constants(*)
+    [:SINGLE]
+  end
+end
+
+module Unused
+  delegate :constants, to: :itself
+  define_method(:const_get) { |*| nil }
+end
+
+OwnOnly.respond_to?(:constants)
+Single.method(:constants)
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_names.rb", names), ("test/models/m_test.rb", &module_loops(&["M70", "M71"], false))],
+        &["M70Test", "M71Test"],
+        &|_| false,
+        &[],
+    );
+    for id in ["M70Test#test_c_A", "M71Test#test_c_B"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+
+    let kinds = "module M72\n  A = 1\nend\n";
+    let patch = r##"module Patch72
+  define_method(:constants) { |*| [:P72] }
+end
+
+["M", "72"].join.constantize.extend(Patch72)
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_patch.rb", patch), ("test/models/m_test.rb", &module_loops(&["M72"], false))],
+        &["M72Test"],
+        &|_| true,
+        &[&module_gap(REOPENED, 0, "M72", "`constants` may be defined again at `define_method(:constants) { |*| [:P72] }` (app/models/zz_patch.rb line 2)")],
+    );
+    assert!(native.contains_key("M72Test#test_c_P72"), "{native:#?}");
+}
+
+/// The loops of `head_test`: `M80.constants`, `GraphApi80.constants`,
+/// `GraphApi80::Admin.constants`, `GraphApi80::Admin::LIST` and
+/// `Kinds::ALL` (8 lines each).
+const HEAD_TEST: &str = r##"class M80Test < ActiveSupport::TestCase
+  M80.constants.each do |c|
+    test "c #{c}" do
+      assert c
+    end
+  end
+end
+
+class GraphTest < ActiveSupport::TestCase
+  GraphApi80.constants.each do |c|
+    test "c #{c}" do
+      assert c
+    end
+  end
+end
+
+class AdminTest < ActiveSupport::TestCase
+  GraphApi80::Admin.constants.each do |c|
+    test "c #{c}" do
+      assert c
+    end
+  end
+end
+
+class ListTest < ActiveSupport::TestCase
+  GraphApi80::Admin::LIST.each do |k|
+    test "k #{k}" do
+      assert_kind_of Symbol, k
+    end
+  end
+end
+
+class KindsTest < ActiveSupport::TestCase
+  Kinds::ALL.each do |k|
+    test "k #{k}" do
+      assert_kind_of Symbol, k
+    end
+  end
+end
+"##;
+
+/// `{gap} (`{class}` line …: `{what}`: {kind} looked up by a name not
+/// known before it runs is changed at `{text}` (app/models/zz_mut.rb line
+/// {line}))` for the `k`th loop of an 8-line-per-class test file.
+fn computed_gap(gap: &str, class: &str, k: usize, what: &str, text: &str, line: u32) -> String {
+    let kind = if gap == REOPENED { "a module" } else { "a constant" };
+    format!(
+        "{gap} (`{class}` line {}, first test at line {}: `{what}`: {kind} looked up by a name not known before it runs is changed at `{text}` (app/models/zz_mut.rb line {line}))",
+        8 * k + 2,
+        8 * k + 3
+    )
+}
+
+/// `Object.const_get("A::#{x}")` (and `constantize`) looks `A` up at the
+/// top level and each later name in the module before it and that
+/// module's ancestors, never at the top level again: what it finds is
+/// under `A` (an ancestor's constant through `A::B`'s mixin, here
+/// `Shared82::LIST` through `GraphApi82::Admin`). A same-class method
+/// whose every return value has a literal head (Core's
+/// `ConnectionSchemaBuilder#get_schema_name`: `"GraphApi::#{x}"` or
+/// `"GraphApi"`) gives that head. A change through such a lookup is a gap
+/// only for the loops under it; one whose name has no provable head gaps
+/// every loop it may change.
+#[test]
+fn a_computed_name_with_a_literal_head_reaches_only_under_it() {
+    let kinds = r##"module M80
+  A = 1
+end
+
+module GraphApi80
+  module Admin
+    B = 1
+    LIST = %i[a]
+  end
+end
+
+module Kinds
+  ALL = %i[a b]
+end
+"##;
+    let classes = ["M80Test", "GraphTest", "AdminTest", "ListTest", "KindsTest"];
+    let headed = r##"class Builder80
+  def build(kind)
+    schema = schema_name(kind).safe_constantize
+    schema.const_set(:Added, 1)
+    Object.const_get("GraphApi80::#{kind}").const_set(:More, 2)
+    Object.const_get("GraphApi80::#{kind}::LIST") << :c
+  end
+
+  private
+
+  def schema_name(kind)
+    if kind == "x"
+      return "GraphApi80::#{kind}"
+    end
+
+    "GraphApi80"
+  end
+end
+
+Builder80.new.build("Admin")
+"##;
+    let native = matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", headed), ("test/models/k_test.rb", HEAD_TEST)],
+        &classes,
+        &|id| ["GraphTest#", "AdminTest#", "ListTest#"].iter().any(|c| id.starts_with(c)),
+        &[
+            &computed_gap(REOPENED, "GraphTest", 1, "GraphApi80.constants", "schema = schema_name(kind).safe_constantize", 3),
+            &computed_gap(REOPENED, "AdminTest", 2, "GraphApi80::Admin.constants", "schema = schema_name(kind).safe_constantize", 3),
+            &computed_gap(USED, "ListTest", 3, "GraphApi80::Admin::LIST", "Object.const_get(\"GraphApi80::#{kind}::LIST\") << :c", 6),
+        ],
+    );
+    for id in ["M80Test#test_c_A", "GraphTest#test_c_Added", "AdminTest#test_c_More", "ListTest#test_k_c", "KindsTest#test_k_b"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+
+    // A helper that returns what it is given: no head.
+    let unheaded = r##"class Builder81
+  def build(kind)
+    schema_name(kind).safe_constantize.const_set(:Added, 1)
+  end
+
+  private
+
+  def schema_name(kind)
+    kind.to_s
+  end
+end
+
+Builder81.new.build("GraphApi80")
+"##;
+    let text = "schema_name(kind).safe_constantize.const_set(:Added, 1)";
+    matches_native(
+        &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", unheaded), ("test/models/k_test.rb", HEAD_TEST)],
+        &classes,
+        &|id| ["M80Test#", "GraphTest#", "AdminTest#"].iter().any(|c| id.starts_with(c)),
+        &[
+            &computed_gap(REOPENED, "M80Test", 0, "M80.constants", text, 3),
+            &computed_gap(REOPENED, "GraphTest", 1, "GraphApi80.constants", text, 3),
+            &computed_gap(REOPENED, "AdminTest", 2, "GraphApi80::Admin.constants", text, 3),
+        ],
+    );
+
+    let shared = r##"module Shared82
+  LIST = %i[a]
+end
+
+module GraphApi82
+  module Admin
+    include Shared82
+  end
+end
+
+module Kinds
+  ALL = %i[a b]
+end
+"##;
+    let through = "name = \"LIST\"\nObject.const_get(\"GraphApi82::Admin::#{name}\") << :c\n";
+    let test = "class SharedTest < ActiveSupport::TestCase\n  Shared82::LIST.each do |k|\n    test \"k #{k}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n\nclass KindsTest < ActiveSupport::TestCase\n  Kinds::ALL.each do |k|\n    test \"k #{k}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n";
+    let native = matches_native(
+        &[("app/models/kinds.rb", shared), ("app/models/zz_mut.rb", through), ("test/models/k_test.rb", test)],
+        &["SharedTest", "KindsTest"],
+        &|id| id.starts_with("SharedTest#"),
+        &[&computed_gap(USED, "SharedTest", 0, "Shared82::LIST", "Object.const_get(\"GraphApi82::Admin::#{name}\") << :c", 2)],
+    );
+    assert!(native.contains_key("SharedTest#test_k_c"), "{native:#?}");
+}
+
+/// A module mixed into `Object` has its constants there:
+/// `Object.include(Kinds)` makes `Object::ALL` (and `::Object::ALL`,
+/// `Object.const_get(:ALL)`) `Kinds::ALL`, so a change through one is a
+/// gap for a loop over it. So does `class Object` reopened, a top-level
+/// `include` (which is `Object`'s), the module passed on
+/// (`send(:include, Kinds)`), and a module that has the first name after
+/// `Object::` (`include Outer` makes `Object::Inner` `Outer::Inner`).
+#[test]
+fn a_module_mixed_into_object_is_reached_through_object() {
+    let kinds = "module Kinds\n  ALL = %i[a b]\nend\n\nmodule Outer\n  module Inner\n    LIST = %i[a b]\n  end\nend\n";
+    let loops = |class: &str, list: &str| {
+        format!("class {class} < ActiveSupport::TestCase\n  {list}.each do |k|\n    test \"k #{{k}}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n")
+    };
+    let test = format!("{}\n{}", loops("KindsTest", "Kinds::ALL"), loops("InnerTest", "Outer::Inner::LIST"));
+    for (mutation, text, gapped, list) in [
+        ("Object.include(Kinds)\nObject::ALL << :c\n", "Object::ALL << :c", "KindsTest", "Kinds::ALL"),
+        ("Object.prepend(Kinds)\n::Object::ALL.push(:c)\n", "::Object::ALL.push(:c)", "KindsTest", "Kinds::ALL"),
+        ("class Object\n  include Kinds\nend\nObject.const_get(:ALL) << :c\n", "Object.const_get(:ALL) << :c", "KindsTest", "Kinds::ALL"),
+        ("class Object\n  include Kinds\nend\nObject::ALL << :c\n", "Object::ALL << :c", "KindsTest", "Kinds::ALL"),
+        ("include Kinds\nObject::ALL << :c\n", "Object::ALL << :c", "KindsTest", "Kinds::ALL"),
+        ("send(:include, Kinds)\nObject::ALL << :c\n", "Object::ALL << :c", "KindsTest", "Kinds::ALL"),
+        ("include Outer\nObject::Inner::LIST << :c\n", "Object::Inner::LIST << :c", "InnerTest", "Outer::Inner::LIST"),
+    ] {
+        let line = mutation.lines().count();
+        let first = if gapped == "KindsTest" { 2 } else { 10 };
+        // An emitted app whose source reopens `class Object` does not
+        // boot yet (`RoundhouseAutoload.register` recurses): there only
+        // the gapped class, which runs nothing, is compared.
+        let classes: &[&str] = if mutation.starts_with("class Object") { &["KindsTest"] } else { &["KindsTest", "InnerTest"] };
+        let native = matches_native(
+            &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", mutation), ("test/models/k_test.rb", &test)],
+            classes,
+            &|id| id.starts_with(&format!("{gapped}#")),
+            &[&format!(
+                "{USED} (`{gapped}` line {first}, first test at line {}: `{list}`: `{text}` (app/models/zz_mut.rb line {line}))",
+                first + 1
+            )],
+        );
+        assert!(native.contains_key(&format!("{gapped}#test_k_c")), "{mutation}: {native:#?}");
+    }
+}
+
+/// What a constant found by a computed name becomes is followed through
+/// `||`, a branch's value (`c ? nil : Object.const_get(n)`), parentheses,
+/// safe navigation and `each { … }` (which returns its receiver): a
+/// change there is a gap for an unfrozen collection's loop, not for a
+/// frozen one's.
+#[test]
+fn a_computed_lookup_is_followed_through_its_value() {
+    let kinds = "# frozen_string_literal: true\n\nmodule Kinds\n  ALL = %i[a b]\n  FROZEN = %i[a b].freeze\nend\n";
+    let test = "class AllTest < ActiveSupport::TestCase\n  Kinds::ALL.each do |k|\n    test \"k #{k}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n\nclass FrozenTest < ActiveSupport::TestCase\n  Kinds::FROZEN.each do |k|\n    test \"k #{k}\" do\n      assert_kind_of Symbol, k\n    end\n  end\nend\n";
+    let name = "# frozen_string_literal: true\n\nNAME = [\"Kinds\", \"ALL\"].join(\"::\")\n";
+    for (change, text) in [
+        ("(NAME.empty? ? nil : Object.const_get(NAME))&.push(:c)\n", "(NAME.empty? ? nil : Object.const_get(NAME))&.push(:c)"),
+        ("x = Object.const_get(NAME) || []\nx << :c\n", "x = Object.const_get(NAME) || []"),
+        ("Object.const_get(NAME).each { |k| k }.push(:c)\n", "Object.const_get(NAME).each { |k| k }.push(:c)"),
+        ("list = if NAME.empty?\n  []\nelse\n  NAME.constantize\nend\nlist << :c\n", "NAME.constantize"),
+    ] {
+        let source = format!("{name}{change}");
+        let line = source.lines().position(|l| l.contains(text)).unwrap() as u32 + 1;
+        let native = matches_native(
+            &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", &source), ("test/models/k_test.rb", test)],
+            &["AllTest", "FrozenTest"],
+            &|id| id.starts_with("AllTest#"),
+            &[&computed_gap(USED, "AllTest", 0, "Kinds::ALL", text, line)],
+        );
+        assert!(native.contains_key("AllTest#test_k_c"), "{change}: {native:#?}");
+    }
+}
+
+/// Core's own case: `Inventory::AdjustmentReasons.constants` beside
+/// `GraphApi::ConnectionSchemaBuilder`, which `const_set`s into a module
+/// `get_schema_name` names (always under `GraphApi`), and the CI
+/// snapshotter, whose category is the Symbol `:constants`. Neither
+/// reaches `Inventory::AdjustmentReasons`: its loop is listed, as native
+/// finds it.
+#[test]
+fn a_core_module_loop_beside_a_schema_builder_and_a_category_symbol_is_listed() {
+    let reasons = r##"# frozen_string_literal: true
+
+module Inventory
+  module AdjustmentReasons
+    CORRECTION = :correction
+    DAMAGED = :damaged
+    OTHER = :other
+
+    class << self
+      def public_reasons
+        Set[CORRECTION, DAMAGED]
+      end
+    end
+  end
+end
+"##;
+    let builder = r##"# frozen_string_literal: true
+
+module GraphApi
+  module Admin
+  end
+
+  class ConnectionSchemaBuilder
+    def after_define(field)
+      args_visibility = {}
+
+      sort_key_type = proc do
+        sort_key_enum_name = build_sort_key_enums_name(field)
+        existing_sort_key_type = sort_key_enum_name.safe_constantize # rubocop:disable Sorbet/ConstantsFromStrings
+
+        if existing_sort_key_type && args_visibility[:sortable_enum] &&
+            existing_sort_key_type.visibility&.visibility != args_visibility[:sortable_enum]
+          raise "Visibility mismatch detected for #{sort_key_enum_name} type."
+        end
+
+        existing_sort_key_type || build_sorting_enum(field)
+      end
+
+      sort_key_type.call
+    end
+
+    private
+
+    def build_sorting_enum(field)
+      schema_module = get_schema_name(field).safe_constantize # rubocop:disable Sorbet/ConstantsFromStrings
+
+      enum_type = Class.new
+
+      raise ArgumentError, "Could not find module #{schema_module}" unless schema_module
+
+      schema_module.const_set(:ProductSortKeys, enum_type)
+    end
+
+    def build_sort_key_enums_name(field)
+      schema_name = get_schema_name(field)
+      "#{schema_name}::ProductSortKeys"
+    end
+
+    def get_schema_name(field)
+      matches = field.to_s.match(/GraphApi::(\w+)::/)
+
+      if matches && matches[1]
+        return "GraphApi::#{matches[1]}"
+      end
+
+      "GraphApi"
+    end
+  end
+end
+
+GraphApi::ConnectionSchemaBuilder.new.after_define("GraphApi::Admin::Products")
+"##;
+    let snapshotter = r##"# frozen_string_literal: true
+
+module Ci
+  module Snapshotter
+    class Constants
+      def category
+        :constants
+      end
+
+      def capture
+        { names: Object.constants.map(&:to_s).sort }
+      end
+    end
+  end
+end
+"##;
+    let test = r##"module Inventory
+  class AdjustmentPresenterTest < ActiveSupport::TestCase
+    AdjustmentReasons.constants.each do |adjustment_reason|
+      test "#{adjustment_reason} has a code" do
+        reason_code = AdjustmentReasons.const_get(adjustment_reason)
+        assert_kind_of Symbol, reason_code
+      end
+    end
+  end
+end
+"##;
+    // Core's tests reopen `GraphApi` around their classes, in test
+    // sources registered after this one: it is still a module of its own.
+    let graph_test = r##"module GraphApi
+  module Admin
+    class ProductInputTest < ActiveSupport::TestCase
+      test "admin is a module" do
+        assert_kind_of Module, GraphApi::Admin
+      end
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/inventory/adjustment_reasons.rb", reasons),
+            ("app/graphql/graph_api/connection_schema_builder.rb", builder),
+            ("app/models/ci/snapshotter/constants.rb", snapshotter),
+            ("test/models/inventory/adjustment_presenter_test.rb", test),
+            ("test/models/merchandising/graph_api/admin/product_input_test.rb", graph_test),
+        ],
+        &["Inventory::AdjustmentPresenterTest", "GraphApi::Admin::ProductInputTest"],
+        &|_| false,
+        &[],
+    );
+    for id in ["Inventory::AdjustmentPresenterTest#test_CORRECTION_has_a_code", "GraphApi::Admin::ProductInputTest#test_admin_is_a_module"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
 }
