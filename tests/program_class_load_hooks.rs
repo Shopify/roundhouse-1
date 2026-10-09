@@ -152,7 +152,7 @@ fn a_class_body_hook_runs_after_its_files_requires_and_a_file_level_hook_once() 
             .unwrap_or_else(|| panic!("no `{needle}` in the program:\n{program}"))
     };
     let hook = line("ActiveSupport.run_load_hooks(:hookkit, Hookkit)");
-    assert!(line("require RoundhouseAutoload.path(\"models/hookkit/configuration/dequeue_decorator\")") < hook, "{program}");
+    assert!(line("RoundhouseAutoload.require_gem_file(\"models/hookkit/configuration/dequeue_decorator\")") < hook, "{program}");
     let declarations = program
         .lines()
         .position(|line| {

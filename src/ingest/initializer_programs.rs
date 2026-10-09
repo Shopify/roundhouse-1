@@ -214,6 +214,29 @@ struct SiteWalk<'a> {
 }
 
 impl SiteWalk<'_> {
+    /// The class a call in the body of namespace `nesting` ends: the
+    /// namespace, unless the file is the one Zeitwerk loads for a
+    /// declaration this body wrote before the call (`last`). Core's
+    /// optimization/rollouts/changeset_registry.rb ends `module Rollouts`
+    /// with `ActiveSupport.run_load_hooks(:rollout_changesets_registry,
+    /// Optimization::Rollouts)` after `module ChangesetRegistry`: natively
+    /// it fires when ChangesetRegistry's file loads. Ending the namespace's
+    /// file, it fired at the first `Optimization::Rollouts::…` reference
+    /// (another class body's include), and the hook's on_load block then
+    /// loaded the file still loading: a circular require.
+    fn namespace_owner(&self, nesting: &[String], last: Option<&str>) -> String {
+        let namespace = nesting.join("::");
+        let stem = self.rel.strip_suffix(".rb").unwrap_or(self.rel);
+        let names_file = |name: &str| {
+            let path = crate::naming::underscore(name);
+            stem == path || stem.ends_with(&format!("/{path}"))
+        };
+        match last {
+            Some(last) if !names_file(&namespace) && names_file(last) => last.to_string(),
+            _ => namespace,
+        }
+    }
+
     /// `nesting` is the enclosing class/module path; `last` the last
     /// top-level declaration of the file, for a file-level call.
     fn body(&mut self, stmts: Vec<Node<'_>>, nesting: &[String], mut last: Option<String>) {
@@ -237,11 +260,13 @@ impl SiteWalk<'_> {
                 continue;
             }
             let Some((name, literal, base)) = run_load_hooks_call(&stmt, self.src) else { continue };
-            let owner = if nesting.is_empty() { last.clone() } else { Some(nesting.join("::")) };
+            let owner = if nesting.is_empty() { last.clone() } else { Some(self.namespace_owner(nesting, last.as_deref())) };
             let base = match base {
                 Base::Default => "Object".to_string(),
+                // `self` in a namespace's body is the namespace, whichever
+                // file the call ends.
                 Base::SelfRef => match &owner {
-                    Some(o) if !nesting.is_empty() => o.clone(),
+                    Some(_) if !nesting.is_empty() => nesting.join("::"),
                     // `self` at a file's top level is `main`.
                     _ => continue,
                 },

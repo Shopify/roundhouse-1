@@ -6394,6 +6394,37 @@ fn apply_class_load_hooks(files: &mut [(String, String)], app: &App) {
             );
             continue;
         };
+        // A namespace body the file goes on with after its declaration
+        // (`emit::ruby::library::spliced_into_namespace`'s marker) that
+        // the source writes below the call runs after it, as Ruby runs
+        // registry.rb's `run_load_hooks` before the `if` below it. (The
+        // marker names its first statement's line, the call's own when
+        // the call is the body's first.)
+        let (hook_file, hook_line) = hook.site.rsplit_once(':').map_or((hook.site.as_str(), 0), |(f, l)| (f, l.parse::<usize>().unwrap_or(0)));
+        let below = content.lines().scan(0usize, |at, line| {
+            let start = *at;
+            *at += line.len() + 1;
+            Some((start, line))
+        }).find(|(_, line)| {
+            let text = line.trim_start();
+            text.strip_prefix("# ")
+                .and_then(|rest| rest.strip_prefix(hook_file))
+                .and_then(|rest| rest.strip_prefix(':'))
+                .and_then(|rest| rest.split_once(':'))
+                .is_some_and(|(l, tail)| tail.starts_with(" the body of `") && l.parse::<usize>().is_ok_and(|l| l >= hook_line))
+        });
+        if let Some((at, line)) = below {
+            let pad = &line[..line.len() - line.trim_start().len()];
+            content.insert_str(
+                at,
+                &format!(
+                    "{pad}# {}: the class body's `ActiveSupport.run_load_hooks`, after the body\n\
+                     {pad}ActiveSupport.run_load_hooks({}, {})\n\n",
+                    hook.site, hook.hook_literal, hook.base
+                ),
+            );
+            continue;
+        }
         if !content.ends_with('\n') {
             content.push('\n');
         }
@@ -7558,12 +7589,27 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     let mut lines: Vec<(usize, &str)> = Vec::new();
     // Inside a skipped file-level constant's value.
     let mut in_file_constant = false;
+    // Inside a namespace's statements written after the file's
+    // declaration (`emit::ruby::library::spliced_into_namespace`), at
+    // this indent: they define no constant, and run as the file loads,
+    // as Zeitwerk loads registry.rb for `Registry`.
+    let mut namespace_statements: Option<usize> = None;
     for line in content.lines() {
         let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if let Some(at) = namespace_statements {
+            if trimmed.is_empty() || indent >= at {
+                continue;
+            }
+            namespace_statements = None;
+        }
+        if trimmed.starts_with("# ") && trimmed.contains(": the body of `") && trimmed.contains("` goes on here, after `") {
+            namespace_statements = Some(indent);
+            continue;
+        }
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let indent = line.len() - trimmed.len();
         // Top-level requires are load-time deps, not constants: the leading
         // ones, and those between the halves of a class body the emitter
         // split around a cycle (`emit_library_class_decl_inner`: close,
@@ -9684,13 +9730,18 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # its location and it raised, so the no-op is kept without the warning.
   # Any other require runs as written.
   def self.require_gem_file(file)
+    return false if loading?(file)
+    require path(file)
+  end
+
+  # Whether `file` (an anchor, `models/x`) is loading now: on this
+  # thread's stack as a required file's top, and not yet a loaded
+  # feature. Requiring it is Ruby's circular require: a no-op that warns.
+  def self.loading?(file)
     full = path(file)
     real = File.exist?(full) ? File.realpath(full) : full
-    if !$LOADED_FEATURES.include?(full) && !$LOADED_FEATURES.include?(real) &&
-        caller_locations.any? { |l| l.label == "<top (required)>" && (l.absolute_path == full || l.absolute_path == real) }
-      return false
-    end
-    require full
+    !$LOADED_FEATURES.include?(full) && !$LOADED_FEATURES.include?(real) &&
+      caller_locations.any? { |l| l.label == "<top (required)>" && (l.absolute_path == full || l.absolute_path == real) }
   end
 
   # A file-level statement of a support file's program: runs it, and

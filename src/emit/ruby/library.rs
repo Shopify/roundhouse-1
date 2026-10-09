@@ -189,6 +189,8 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     }
     let mut out: Vec<EmittedFile> = Vec::new();
     let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
+    // (the declaration's path, the namespace, the target, the statements' render, the marker)
+    let mut after_declarations: Vec<(PathBuf, String, String, EmittedFile, String)> = Vec::new();
     for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
@@ -207,8 +209,16 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             .enumerate()
             .filter_map(|(j, (n, _))| constant_file(lc.name.0.as_str(), n.as_str(), app).map(|stem| (j, stem)))
             .collect();
+        // And a namespace statement the source wrote in a nested
+        // declaration's file goes after that declaration (`statement_file`).
+        let moved: Vec<(usize, String)> = lc
+            .unknown_calls
+            .iter()
+            .enumerate()
+            .filter_map(|(j, call)| statement_file(lc.name.0.as_str(), call, app).map(|target| (j, target)))
+            .collect();
         let without_apart;
-        let lc = if apart.is_empty() {
+        let lc = if apart.is_empty() && moved.is_empty() {
             lc
         } else {
             let mut copy = lc.clone();
@@ -217,6 +227,13 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j))
+                .map(|(_, c)| c.clone())
+                .collect();
+            copy.unknown_calls = lc
+                .unknown_calls
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| !moved.iter().any(|(k, _)| k == j))
                 .map(|(_, c)| c.clone())
                 .collect();
             without_apart = copy;
@@ -255,25 +272,125 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             };
             files.extend(emit_library_class_pair(&constant, app, PathBuf::from(format!("app/models/{stem}.rb"))));
         }
+        let mut targets: Vec<&str> = Vec::new();
+        for (_, target) in &moved {
+            if !targets.contains(&target.as_str()) {
+                targets.push(target);
+            }
+        }
+        for target in targets {
+            let statements = LibraryClass {
+                includes: Vec::new(),
+                methods: Vec::new(),
+                class_ivar_initializers: Vec::new(),
+                nullable_columns: Vec::new(),
+                constants: Vec::new(),
+                unknown_calls: moved.iter().filter(|(_, t)| t == target).map(|(j, _)| lcs[i].unknown_calls[*j].clone()).collect(),
+                visibility_overrides: Vec::new(),
+                method_aliases: Vec::new(),
+                top_level_constants: Vec::new(),
+                conditional_definitions: Vec::new(),
+                ..lc.clone()
+            };
+            let path = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(target)));
+            let first = statements.unknown_calls.iter().map(|c| c.span).min_by_key(|s| s.start).unwrap_or_default();
+            let site = app
+                .sources
+                .get(first.file.0 as usize - 1)
+                .map(|source| format!("{}:{}", relative_source_path(app, &source.path), source.line_col(first.start).0))
+                .unwrap_or_default();
+            let owner = lc.name.0.as_str().trim_start_matches("::").to_string();
+            let marker = format!("# {site}: the body of `{owner}` goes on here, after `{target}`, as the source writes it");
+            let rendered = emit_library_class_decl(&statements, app, path.clone());
+            after_declarations.push((path, owner, target.to_string(), rendered, marker));
+        }
         for file in files {
-            match at_path.get(&file.path) {
-                Some(&j) => {
-                    let merged = &mut out[j].content;
-                    if !merged.ends_with('\n') {
-                        merged.push('\n');
-                    }
-                    merged.push('\n');
-                    merged.push_str(&file.content);
-                }
-                None => {
-                    at_path.insert(file.path.clone(), out.len());
-                    out.push(file);
-                }
+            merge_at_path(&mut out, &mut at_path, file);
+        }
+    }
+    // After every declaration's own file, so each follows its body.
+    for (path, owner, target, file, marker) in after_declarations {
+        let spliced = at_path.get(&path).and_then(|&j| spliced_into_namespace(&out[j].content, &owner, &target, &file.content, &marker));
+        match spliced {
+            Some(content) => out[at_path[&path]].content = content,
+            // Where it cannot be written in place, it stays in the
+            // namespace's file, as before.
+            None => {
+                let own = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(&owner)));
+                merge_at_path(&mut out, &mut at_path, EmittedFile { path: own, ..file });
             }
         }
     }
     crate::timings::lap("emit library: render");
     out
+}
+
+/// `content`, a nested declaration's file that wraps it in its
+/// namespace's `module` headers (`module Metafields` / `module Owners` /
+/// `module Registry`), with the namespace's own statements (`rendered`,
+/// a reopen of the namespace) written after the declaration inside the
+/// namespace's last `end`s, as the source writes them, under `marker`.
+/// `None` when either file has another shape (a compact
+/// `module Metafields::Owners::Registry`, a class wrapper).
+fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &str, marker: &str) -> Option<String> {
+    let segments: Vec<&str> = owner.split("::").collect();
+    let depth = segments.len();
+    let pad = |k: usize| "  ".repeat(k);
+    let headers: Vec<String> = segments.iter().enumerate().map(|(k, seg)| format!("{}module {seg}", pad(k))).collect();
+    // The statements' render: anything above its headers (requires),
+    // then the headers, its body, and the closing `end`s.
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first = lines.iter().position(|l| *l == headers[0])?;
+    if lines.len() < first + depth || lines[first..first + depth].iter().zip(&headers).any(|(l, h)| l != h) {
+        return None;
+    }
+    let body = unwrapped(&lines[first..], depth)?;
+    let above: Vec<String> = lines[..first].iter().filter(|l| !l.trim().is_empty()).map(|l| format!("{}{l}", pad(depth))).collect();
+    // The declaration's file: the same headers, then the declaration.
+    let own: Vec<&str> = content.lines().collect();
+    let start = own.iter().position(|l| *l == headers[0])?;
+    if own.len() < start + depth + 1 || own[start..start + depth].iter().zip(&headers).any(|(l, h)| l != h) {
+        return None;
+    }
+    let leaf = target.rsplit("::").next()?;
+    let declaration = own[start + depth].strip_prefix(&pad(depth))?;
+    if !(declaration == format!("module {leaf}") || declaration.starts_with(&format!("class {leaf} ")) || declaration == format!("class {leaf}")) {
+        return None;
+    }
+    // Its last lines are the namespace's `end`s, innermost first.
+    let last = own.iter().rposition(|l| !l.trim().is_empty())?;
+    let close = (last + 1).checked_sub(depth)?;
+    if (0..depth).any(|k| own[close + k] != format!("{}end", pad(depth - 1 - k))) {
+        return None;
+    }
+    let mut out: Vec<String> = own[..close].iter().map(|l| l.to_string()).collect();
+    out.push(String::new());
+    out.push(format!("{}{marker}", pad(depth)));
+    out.extend(above);
+    out.push(body);
+    out.extend(own[close..].iter().map(|l| l.to_string()));
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    Some(joined)
+}
+
+/// Adds `file` to the rendered files, after the content already
+/// rendered at its path (several declarations share one path).
+fn merge_at_path(out: &mut Vec<EmittedFile>, at_path: &mut crate::det::HashMap<PathBuf, usize>, file: EmittedFile) {
+    match at_path.get(&file.path) {
+        Some(&j) => {
+            let merged = &mut out[j].content;
+            if !merged.ends_with('\n') {
+                merged.push('\n');
+            }
+            merged.push('\n');
+            merged.push_str(&file.content);
+        }
+        None => {
+            at_path.insert(file.path.clone(), out.len());
+            out.push(file);
+        }
+    }
 }
 
 /// A child's `require_relative` target, expressed from its parent's
@@ -13809,6 +13926,77 @@ fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
     (!reads_sibling).then_some(stem)
 }
 
+/// The nested declaration (`Metafields::Owners::Registry`) in whose
+/// file a namespace module's class-level statement was written, when
+/// that is the file an autoloader maps to the declaration and not the
+/// namespace's own. Core's metafields/owners/registry.rb:
+///
+/// ```ruby
+/// module Metafields
+///   module Owners
+///     module Registry … end
+///
+///     if Rails.application.config.consider_all_requests_local
+///       OwnerConfigurationChecks.raise_on_unexpected_empty_access_scopes
+/// ```
+///
+/// Natively the `if` runs when registry.rb loads. Ingest merges every
+/// reopen of the module into one, so it was written into the namespace's
+/// file and ran at the first `Metafields::Owners::…` reference (another
+/// class body's `include Metafields::Owners::AbstractOwner`): the checks
+/// loaded the registry early, and its load hook's blocks loaded a model
+/// requiring a file still loading, a circular require. The statement is
+/// written after the declaration's body in the declaration's file, in a
+/// reopening of the namespace, wherever in that file the source wrote it.
+///
+/// Only for a module that keeps a file of its own (as `constant_file`),
+/// and a declaration that keeps its own file (`file_owner`).
+fn statement_file(owner: &str, call: &Expr, app: &App) -> Option<String> {
+    let file = call.span.file.0;
+    if file == 0 {
+        return None;
+    }
+    let classes = library_classes_named(owner, app);
+    if classes.is_empty()
+        || !classes.iter().all(|c| c.is_module && c.origin.is_none())
+        || is_model_named(owner, app)
+        || file_owner(owner, app) != owner
+    {
+        return None;
+    }
+    let namespace = crate::naming::underscore(owner);
+    let source = app.sources.get(file as usize - 1)?;
+    let source_stem = source.path.strip_suffix(".rb")?;
+    if source_stem == namespace || source_stem.ends_with(&format!("/{namespace}")) {
+        return None;
+    }
+    let at = if source_stem.starts_with(&format!("{namespace}/")) {
+        0
+    } else {
+        source_stem.rfind(&format!("/{namespace}/"))? + 1
+    };
+    let stem = &source_stem[at..];
+    let dir = relative_source_path(app, &source_stem[..at]).trim_matches('/').to_string();
+    let segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    let n = segments.len();
+    let autoloaded = (n >= 2 && segments[n - 2] == "app")
+        || (n >= 3 && segments[n - 1] == "concerns" && segments[n - 3] == "app")
+        || app.zeitwerk_loaders.iter().any(|l| relative_source_path(app, &l.root).trim_matches('/') == dir);
+    if !autoloaded {
+        return None;
+    }
+    let prefix = format!("{owner}::");
+    app.library_classes
+        .iter()
+        .map(|c| c.name.0.as_str().trim_start_matches("::"))
+        .filter(|name| name.starts_with(&prefix) && crate::naming::underscore(name) == stem)
+        .find(|name| {
+            file_owner(name, app) == *name
+                && (declared_files(name, app).contains(&file) || body_files(name, app).contains(&file))
+        })
+        .map(str::to_string)
+}
+
 /// The file of a constant `path` names, read from `self_name`, when it
 /// is a namespace constant that has a file of its own (`constant_file`):
 /// the qualified spelling, or a bare one resolved through the lexical
@@ -14178,6 +14366,29 @@ fn is_core_class_name(name: &str) -> bool {
 /// the requirer's `out_dir`, so a single mapping serves every output kind.
 /// Same-dir siblings (other models, library_classes) drop because Ruby's
 /// load path covers them; unknowns drop silently.
+/// Whether `nested`, a class with a file of its own, is a subclass of
+/// the class `outer` it is nested in, which on the Ruby family loads by
+/// its autoload where `outer`'s body reads it (Zeitwerk's order: the
+/// outer class is defined by then), not by a require above `outer`'s
+/// class: Core's `Markets::Region` body reads `Markets::Region::Country`
+/// (`< Markets::Region`), whose file needs region.rb's class first.
+fn autoloads_as_nested_subclass(nested: &str, outer: &str, app: &App) -> bool {
+    if outer.is_empty() || !super::expr::native_keywords() || !nested.strip_prefix(outer).is_some_and(|rest| rest.starts_with("::")) {
+        return false;
+    }
+    let classes = library_classes_named(nested, app);
+    let parents = app
+        .models
+        .iter()
+        .filter(|m| m.name.0.as_str() == nested)
+        .filter_map(|m| m.parent.as_ref())
+        .chain(classes.iter().filter_map(|lc| lc.parent.as_ref()));
+    parents.into_iter().any(|parent| {
+        let parent = parent.0.as_str().trim_start_matches("::");
+        parent == outer || outer.ends_with(&format!("::{parent}"))
+    })
+}
+
 fn require_path_for_body_const(
     path: &[String],
     app: &App,
@@ -14220,7 +14431,7 @@ fn require_path_for_body_const(
         // parent's — and when that is the file being emitted, there is
         // nothing to require: the class is already in it.
         let owner = file_owner(&joined, app);
-        if owner == self_name {
+        if owner == self_name || (owner == joined && autoloads_as_nested_subclass(&joined, self_name, app)) {
             return None;
         }
         return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
@@ -14515,15 +14726,31 @@ fn split_require_relative(line: &str) -> Option<(&str, &str)> {
 /// checked first, without loading it (`hook_namespace_pending`). While
 /// its autoload is pending, the body's reference loads it, and the hook
 /// it runs finds the requiring class defined.
+///
+/// A file nested under the required one's path (`markets/region/country`
+/// requiring `markets/region`: its superclass, or the class its header
+/// reopens) skips the require while that file is loading
+/// (`RoundhouseAutoload.loading?`): natively the enclosing class's file
+/// is the one loading first, and a nested class's file never requires it
+/// back. Core's `Markets::Region` reads `Markets::Region::Country.name`
+/// in its body; country.rb's require of region.rb was then a circular
+/// require (Ruby's no-op, with the warning StrictWarning raises).
 fn require_line(out_dir: &Path, rel: &str, self_anchor: &str, app: &App) -> String {
     if super::expr::native_keywords() {
         let anchor = anchor_of_relative(out_dir, rel);
+        let mut condition = Vec::new();
         if let Some(Some(owner)) = require_guard_owners(app).get(&anchor) {
             if waits_on_its_constant(self_anchor, &anchor, owner, app) {
-                let mut condition = hook_namespace_pending(owner, app);
+                condition = hook_namespace_pending(owner, app);
                 condition.push(format!("defined?(::{owner})"));
-                return format!("require_relative {rel:?} unless {}", condition.join(" || "));
             }
+        }
+        if self_anchor.strip_prefix(anchor.as_str()).is_some_and(|rest| rest.starts_with('/')) {
+            let file = anchor.strip_prefix("app/").unwrap_or(&anchor);
+            condition.push(format!("(defined?(RoundhouseAutoload) && RoundhouseAutoload.loading?({file:?}))"));
+        }
+        if !condition.is_empty() {
+            return format!("require_relative {rel:?} unless {}", condition.join(" || "));
         }
     }
     format!("require_relative {rel:?}")
