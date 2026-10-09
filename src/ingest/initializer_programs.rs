@@ -426,7 +426,21 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
                     },
                     Err(reason) => super::initializers::refuse(&file, start, end, reason),
                 },
-                Verdict::Deferred { refused: inner_refused, kept: inner_kept } => {
+                Verdict::Deferred { refused: mut inner_refused, kept: mut inner_kept } => {
+                    // A module the hook's block defines, carried as the
+                    // top-level module it is (`hoist_hook_modules`), is
+                    // read where the block defines it.
+                    let hoisted = hoist_hook_modules(app, &stmt, &file);
+                    if !hoisted.is_empty() {
+                        inner_refused.retain(|(s, e, _)| {
+                            let defined = hoisted.iter().any(|(start, _)| start == s);
+                            if defined {
+                                inner_kept.push((*s, *e));
+                            }
+                            !defined
+                        });
+                        inner_kept.sort_unstable();
+                    }
                     if inner_kept.is_empty() {
                         // Every statement of the block is refused: the
                         // survey reports the call with the first reason.
@@ -451,6 +465,7 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
                             for (s, e, reason) in inner_refused {
                                 super::initializers::refuse(&file, s, e, reason);
                             }
+                            app.library_classes.extend(hoisted.into_iter().map(|(_, lc)| lc));
                             for &(s, e) in &inner_kept {
                                 super::initializers::consume(&file, s, e);
                             }
@@ -483,6 +498,54 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
         });
     }
     app.framework_load_hooks = framework.into_values().collect();
+}
+
+/// `ActiveSupport.on_load(:hook) do module X … end … end` (Core's
+/// essentials/config/initializers/shopify_session.rb:42, whose
+/// `:active_support_test_case` block defines
+/// `ActionControllerLikelySessionStore` and extends
+/// `ActionController::Metal` with it): `module` in a block defines its
+/// constant at the block's lexical scope, the file's top level, and
+/// lazy_load_hooks' `class_eval` of the block does not move it. Each such
+/// module is carried as the library class it would be at the top level,
+/// as `on_load_reopen` carries one a lib file's hook defines, and the
+/// block reads its constant where it defines it
+/// (`initializers::define`, the DEFINITIONS rule above), so the hook's
+/// later statements find it. Only a module with a one-segment literal
+/// name the tree has no class or module of; a class in a block (a model
+/// reopen, Core's model_extensions.rb) or a module the tree or the
+/// runtime already has (a reopen) stays refused by name. Each carried
+/// statement's start, with its module, for the caller to keep only when
+/// it carries the hook.
+fn hoist_hook_modules(app: &App, stmt: &Node<'_>, file: &str) -> Vec<(usize, LibraryClass)> {
+    let mut hoisted = Vec::new();
+    let Some(call) = stmt.as_call_node() else { return hoisted };
+    if constant_id_str(&call.name()) != "on_load"
+        || call.receiver().and_then(|r| super::util::constant_path_of(&r)).map(|p| p.join("::")).as_deref()
+            != Some("ActiveSupport")
+    {
+        return hoisted;
+    }
+    let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) else { return hoisted };
+    for inner in flatten_statements(body) {
+        let Some(module) = inner.as_module_node() else { continue };
+        let Some(path) = module_name_path(&module) else { continue };
+        let [name] = path.as_slice() else { continue };
+        let taken = app.library_classes.iter().any(|c| c.name.0.as_str() == name)
+            || app.models.iter().any(|m| m.name.0.as_str() == name)
+            || app.controllers.iter().any(|c| c.name.0.as_str() == name)
+            || crate::analyze::runtime_reads::is_runtime_declared_namespace(name)
+            || hoisted.iter().any(|(_, c): &(usize, LibraryClass)| c.name.0.as_str() == name);
+        if taken {
+            continue;
+        }
+        if let Ok(lc) = super::library_class::library_class_from_module_node_with_scope(&module, &[], file) {
+            let start = inner.location().start_offset();
+            super::initializers::define(file, start, name);
+            hoisted.push((start, lc));
+        }
+    }
+    hoisted
 }
 
 /// `Rails.autoloaders.main.on_load_lifted("Cpath", "site")`: the check a

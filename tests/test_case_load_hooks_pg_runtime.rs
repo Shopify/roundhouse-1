@@ -75,6 +75,19 @@ end
 /// (Core's `components/*/lib/*/engine.rb`), and loads a lib patch that
 /// registers a controller-case hook first (Core's
 /// essentials/lib/patches/action_dispatch_url_for_param_filter.rb:81).
+/// Core's essentials/config/initializers/shopify_session.rb:42: the
+/// block defines a module, a top-level one as Ruby defines it, and
+/// extends a controller base with it.
+const SESSION_INITIALIZER: &str = r#"ActiveSupport.on_load(:active_support_test_case) do
+  module ControllerLikelySessionStore
+    def likely_session_store
+      :buyer
+    end
+  end
+  ActionController::Base.extend(ControllerLikelySessionStore)
+end
+"#;
+
 const ENGINE: &str = r#"require "widgets/test_patch"
 
 module Widgets
@@ -135,6 +148,12 @@ class HookOrderTest < ActiveSupport::TestCase
     assert_kind_of HookHelper, self
     assert_not_kind_of WidgetPatch, self
     assert_equal ["active_support_test_case fixtures=false"], HookLog.lines
+  end
+
+  test "a module the hook block defines is a top level module" do
+    assert_equal :buyer, ActionController::Base.likely_session_store
+    assert_equal "ControllerLikelySessionStore", ControllerLikelySessionStore.name
+    assert Object.const_defined?(:ControllerLikelySessionStore, false)
   end
 end
 "#;
@@ -222,6 +241,7 @@ fn files() -> Vec<(&'static str, String)> {
         ("app/models/note.rb", "class Note < ApplicationRecord\nend\n".into()),
         ("app/models/hook_log.rb", HOOK_LOG.into()),
         ("config/initializers/test_hooks.rb", INITIALIZER.into()),
+        ("config/initializers/session_store.rb", SESSION_INITIALIZER.into()),
         ("components/widgets/lib/widgets/engine.rb", ENGINE.into()),
         ("components/widgets/lib/widgets/test_patch.rb", TEST_PATCH.into()),
         ("components/widgets/config/initializers/widget_hooks.rb", ENGINE_INITIALIZER.into()),
@@ -335,9 +355,10 @@ exit(ok ? 0 : 1)
 
 /// What native Rails answers (Shopify/rails 5813559f, checked on the task
 /// PostgreSQL), so two identical wrong answers still fail.
-const EXPECTED: [(&str, &str, u64); 6] = [
+const EXPECTED: [(&str, &str, u64); 7] = [
     ("BehaviorHookTest#test_including_the_view_case_behavior_runs_its_hooks_on_the_includer", "pass", 1),
     ("ControllerHookTest#test_controller_hook_helpers_reach_the_test_in_registration_order", "pass", 4),
+    ("HookOrderTest#test_a_module_the_hook_block_defines_is_a_top_level_module", "pass", 3),
     ("HookOrderTest#test_hook_helper_reaches_the_test", "pass", 1),
     ("HookOrderTest#test_only_the_active_support_hooks_ran", "pass", 3),
     ("JobHookTest#test_the_job_case_hooks_ran_as_it_loaded", "pass", 2),
@@ -413,6 +434,17 @@ fn test_case_hooks_are_carried_and_fired_where_rails_test_help_fires_them() {
         .collect::<Vec<_>>();
     assert_eq!(patch.len(), 1, "{patch:#?}");
     assert!(patch[0].1.contains("ActiveSupport.on_load(:action_controller_test_case)"), "{patch:#?}");
+    // The module the session hook's block defines is carried as the
+    // top-level module it is, read where the block defines it, before
+    // the block's `extend` of it.
+    let session = read("app/models/roundhouse_initializer_config_initializers_session_store.rb");
+    let module_read = session.find("ControllerLikelySessionStore\n").unwrap_or_else(|| panic!("{session}"));
+    let extend = session.find("ActionController::Base.extend(ControllerLikelySessionStore)").unwrap_or_else(|| panic!("{session}"));
+    assert!(module_read < extend, "{session}");
+    assert!(!session.contains("defined inside a method or block"), "{session}");
+    let module = read("app/models/controller_likely_session_store.rb");
+    assert!(module.contains("module ControllerLikelySessionStore"), "{module}");
+    assert!(module.contains("def likely_session_store"), "{module}");
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
