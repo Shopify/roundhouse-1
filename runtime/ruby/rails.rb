@@ -129,6 +129,9 @@ module Rails
 
   # One logger per process, as Rails.logger is: a gem that keeps it
   # (hashie's railtie `Hashie.logger = Rails.logger`) holds the same one.
+  # This is the strict targets' logger. The CRuby and JRuby trees replace
+  # this reader in rails_configuration.rb with Rails' own: an
+  # ActiveSupport::Logger on log/<env>.log (railties' initialize_logger).
   def self.logger
     @logger ||= Logger.new
   end
@@ -399,7 +402,11 @@ module Rails
     end
   end
 
-  # `Rails.logger` — a real logger, to stderr, one line per call.
+  # `Rails.logger` — a real logger, to stderr, one line per call, on
+  # the strict targets. On the CRuby and JRuby trees Rails.logger is
+  # Rails' file logger instead (runtime/spinel/rails_configuration.rb):
+  # there a test environment may turn every Kernel#warn into an error
+  # (Core's StrictWarning), and Rails' log lines never go through it.
   #
   # It was a no-op until 2026-08-31, and the no-op had a measured cost:
   # every `Rails.logger.error` an app writes into a `rescue` is the
