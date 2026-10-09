@@ -435,6 +435,16 @@ module ActiveRecord
       sanitize_sql(statement)
     end
 
+    # sanitization.rb's sanitize_sql_like: `string` with each `%` and `_`
+    # (and the escape character itself) escaped for a LIKE pattern.
+    def self.sanitize_sql_like(string, escape_character = "\\")
+      if string.include?(escape_character) && escape_character != "%" && escape_character != "_"
+        string = string.gsub(escape_character, '\0\0')
+      end
+
+      string.gsub(/(?=[%_])/, escape_character)
+    end
+
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with
     # ROLLBACK + re-raise on any exception. Flat transactions only: the
     # corpus never nests (a nested BEGIN would error in SQLite rather
@@ -576,7 +586,60 @@ module ActiveRecord
     def self.abstract_class?
       @abstract_class == true
     end
-    
+
+    # inheritance.rb's base_class: the class right below Base or below an
+    # abstract class (Base for Base itself), whose table and name an STI
+    # subclass shares. Rails computes it when the class is created; here
+    # it is computed on the call from the same rule.
+    def self.base_class
+      return self if equal?(ActiveRecord::Base)
+      parent = superclass #: untyped
+      parent.equal?(ActiveRecord::Base) || parent.abstract_class? ? self : parent.base_class
+    end
+
+    def self.base_class?
+      base_class.equal?(self)
+    end
+
+    # inheritance.rb `class_attribute :store_full_class_name, default:
+    # true`: the class's own value once assigned, else its superclass's.
+    def self.store_full_class_name
+      return @store_full_class_name if @__store_full_class_name_assigned
+      return true if equal?(ActiveRecord::Base)
+      parent = superclass #: untyped
+      parent.store_full_class_name
+    end
+
+    def self.store_full_class_name=(value)
+      @__store_full_class_name_assigned = true
+      @store_full_class_name = value
+    end
+
+    def self.store_full_class_name?
+      store_full_class_name ? true : false
+    end
+
+    # inheritance.rb's polymorphic_name: the value a polymorphic
+    # association's `_type` column stores for this class.
+    def self.polymorphic_name
+      full = base_class.name.to_s
+      return full if store_full_class_name
+      i = full.rindex("::")
+      i ? full[(i + 2)..] : full
+    end
+
+    # inheritance.rb's polymorphic_class_for: the class a stored `_type`
+    # value names (`constantize`, which is `Object.const_get`). The
+    # demodulized form (`store_full_class_name = false`, Rails'
+    # compute_type) is not ported.
+    def self.polymorphic_class_for(name)
+      unless store_full_class_name
+        raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: #{self.name}.polymorphic_class_for(#{name.inspect}): " \
+          "with `store_full_class_name = false` Rails resolves the name relative to the class (compute_type), which is not ported"
+      end
+      Object.const_get(name)
+    end
+
     # The model's column name => cast-type spec table. Emitted models
     # override it from the schema (emit::ruby::attribute_api). The base and
     # an abstract class have no table, so no columns; any other class
@@ -1313,10 +1376,36 @@ module ActiveRecord
       nil
     end
 
-    def has_attribute?(name)
-      return false unless self.class.schema_columns.include?(name)
+    # attribute_methods.rb's has_attribute? (a String or Symbol name, an
+    # alias read as its column) over _has_attribute? (the attribute
+    # set's String key): a schema column the row carries.
+    def has_attribute?(attr_name)
+      attr_name = attr_name.to_s
+      attr_name = self.class.attribute_aliases[attr_name] || attr_name
+      _has_attribute?(attr_name)
+    end
+
+    def _has_attribute?(attr_name)
+      return false unless attr_name.is_a?(String)
+      column = attr_name.to_sym
+      return false unless self.class.schema_columns.include?(column)
       unloaded = @__unloaded_columns
-      unloaded.nil? || !unloaded.include?(name)
+      unloaded.nil? || !unloaded.include?(column)
+    end
+
+    # The class-level forms: does the model's attribute set (its schema
+    # columns) have the attribute.
+    def self.has_attribute?(attr_name)
+      attr_name = attr_name.to_s
+      attr_name = attribute_aliases[attr_name] || attr_name
+      _has_attribute?(attr_name)
+    end
+
+    def self._has_attribute?(attr_name)
+      if equal?(ActiveRecord::Base) || abstract_class?
+        raise ActiveRecord::TableNotSpecified, "#{self} has no table configured. Set one with #{self}.table_name="
+      end
+      attr_name.is_a?(String) && schema_columns.include?(attr_name.to_sym)
     end
 
     # The pending diff: current attributes against the baseline the

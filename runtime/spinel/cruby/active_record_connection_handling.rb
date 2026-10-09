@@ -39,8 +39,15 @@
 # a model's statement runs on the connection Rails' `connection_pool`
 # names for it, under the current role and shard.
 #
+# The schema cache (schema_cache.rb: SchemaCache, SchemaReflection,
+# BoundSchemaReflection) holds each table's columns, read lazily from the
+# catalog, and Base's columns_hash / columns / column_names /
+# content_columns / column_for_attribute (model_schema.rb and its
+# SchemaContext#load_schema!) read them through the class's pool.
+#
 # Not ported (each raises NotImplementedError naming it at the call):
-# the schema cache, query cache control on a pool, async query
+# loading or dumping a schema cache file, its primary keys, data
+# sources and indexes, query cache control on a pool, async query
 # executors, `shard_selector`, `connects_to` with a block, `reaper`, and
 # `ActiveRecord.permanent_connection_checkout = :disallowed/:deprecated`.
 require "set"
@@ -404,8 +411,192 @@ module ActiveRecord
         end
       end
 
+      # pool_config.rb: the configuration's schema reflection, shared by
+      # the pools built from it. No dump file is read
+      # (`lazy_schema_cache_path`): the cache fills from the catalog.
+      attr_writer :schema_reflection
+
       def schema_reflection
-        raise NotImplementedError, "PoolConfig#schema_reflection: the schema cache is not ported (the runtime's schema is compiled)"
+        @schema_reflection ||= SchemaReflection.new(nil)
+      end
+    end
+
+    # schema_cache.rb's SchemaCache, filled lazily from the live catalog
+    # (the adapter's `columns`, a "SCHEMA" query) per table name: the
+    # columns, by name, of each table a model or the app asks about.
+    # Loading or dumping a cache file (`_load_from`, `dump_to`,
+    # `init_with` / `encode_with`), primary keys, data sources and
+    # indexes are not ported and refuse by name.
+    class SchemaCache
+      def initialize # :nodoc:
+        @columns = {}
+        @columns_hash = {}
+        @primary_keys = {}
+        @data_sources = {}
+        @indexes = {}
+        @version = nil
+      end
+
+      def cached?(table_name)
+        @columns.key?(table_name)
+      end
+
+      def columns(pool, table_name)
+        @columns.fetch(table_name) do
+          pool.with_connection do |connection|
+            @columns[table_name.dup.freeze] = connection.columns(table_name).freeze
+          end
+        end
+      end
+
+      def columns_hash(pool, table_name)
+        @columns_hash.fetch(table_name) do
+          hash = {}
+          columns(pool, table_name).each { |column| hash[column.name] = column }
+          @columns_hash[table_name.dup.freeze] = hash.freeze
+        end
+      end
+
+      def columns_hash?(_pool, table_name)
+        @columns_hash.key?(table_name)
+      end
+
+      def size
+        [@columns, @columns_hash, @primary_keys, @data_sources].sum(&:size)
+      end
+
+      def clear_data_source_cache!(_connection, name)
+        @columns.delete name
+        @columns_hash.delete name
+        @primary_keys.delete name
+        @data_sources.delete name
+        @indexes.delete name
+      end
+
+      %i[primary_keys data_source_exists? add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
+        define_method(name) do |*|
+          raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: ActiveRecord::ConnectionAdapters::SchemaCache##{name}: " \
+            "this runtime's schema cache holds only the columns it reads from the catalog"
+        end
+      end
+    end
+
+    # schema_cache.rb's SchemaReflection: the configuration's cache, over
+    # one SchemaCache. `cache_path` is kept and not read.
+    class SchemaReflection
+      def initialize(cache_path, cache = nil)
+        @cache = cache
+        @cache_path = cache_path
+      end
+
+      def set_schema_cache(cache)
+        @cache = cache
+      end
+
+      def clear!
+        @cache = empty_cache
+        nil
+      end
+
+      def load!(pool)
+        cache(pool)
+        self
+      end
+
+      def cached?(table_name)
+        @cache&.cached?(table_name)
+      end
+
+      def columns(pool, table_name)
+        cache(pool).columns(pool, table_name)
+      end
+
+      def columns_hash(pool, table_name)
+        cache(pool).columns_hash(pool, table_name)
+      end
+
+      def columns_hash?(pool, table_name)
+        cache(pool).columns_hash?(pool, table_name)
+      end
+
+      def size(pool)
+        cache(pool).size
+      end
+
+      def clear_data_source_cache!(pool, name)
+        return if @cache.nil?
+
+        cache(pool).clear_data_source_cache!(pool, name)
+      end
+
+      %i[primary_keys data_source_exists? add data_sources indexes version database_version].each do |name|
+        define_method(name) { |pool, *args| cache(pool).public_send(name, pool, *args) }
+      end
+
+      def dump_to(pool, filename)
+        cache(pool).dump_to(pool, filename)
+      end
+
+      private
+        def empty_cache
+          SchemaCache.new
+        end
+
+        def cache(pool)
+          @cache ||= empty_cache
+        end
+    end
+
+    # schema_cache.rb's BoundSchemaReflection: a SchemaReflection bound to
+    # the pool its reads check a connection out of.
+    class BoundSchemaReflection
+      def initialize(abstract_schema_reflection, pool)
+        @schema_reflection = abstract_schema_reflection
+        @pool = pool
+      end
+
+      def clear!
+        @schema_reflection.clear!
+      end
+
+      def load!
+        @schema_reflection.load!(@pool)
+      end
+
+      def cached?(table_name)
+        @schema_reflection.cached?(table_name)
+      end
+
+      def columns(table_name)
+        @schema_reflection.columns(@pool, table_name)
+      end
+
+      def columns_hash(table_name)
+        @schema_reflection.columns_hash(@pool, table_name)
+      end
+
+      def columns_hash?(table_name)
+        @schema_reflection.columns_hash?(@pool, table_name)
+      end
+
+      def size
+        @schema_reflection.size(@pool)
+      end
+
+      def clear_data_source_cache!(name)
+        @schema_reflection.clear_data_source_cache!(@pool, name)
+      end
+
+      %i[primary_keys data_source_exists? add data_sources indexes].each do |name|
+        define_method(name) { |table_name| @schema_reflection.public_send(name, @pool, table_name) }
+      end
+
+      %i[version database_version].each do |name|
+        define_method(name) { @schema_reflection.public_send(name, @pool) }
+      end
+
+      def dump_to(filename)
+        @schema_reflection.dump_to(@pool, filename)
       end
     end
 
@@ -604,12 +795,19 @@ module ActiveRecord
         nil
       end
 
+      # connection_pool.rb: the pool configuration's schema reflection,
+      # bound to this pool (SchemaCache above).
       def schema_cache
-        raise NotImplementedError, "ConnectionPool#schema_cache: the schema cache is not ported (the runtime's schema is compiled)"
+        @schema_cache ||= BoundSchemaReflection.new(schema_reflection, self)
       end
 
       def schema_reflection
-        raise NotImplementedError, "ConnectionPool#schema_reflection: the schema cache is not ported (the runtime's schema is compiled)"
+        pool_config.schema_reflection
+      end
+
+      def schema_reflection=(schema_reflection)
+        pool_config.schema_reflection = schema_reflection
+        @schema_cache = nil
       end
 
       def enable_query_cache!
@@ -965,6 +1163,106 @@ module ActiveRecord
 
       def schema_cache # :nodoc:
         connection_pool.schema_cache
+      end
+
+      # model_schema.rb over SchemaContext#load_schema!: the table's
+      # columns from the class's pool's schema cache, less the class's
+      # `ignored_columns` (`only_columns` is not modeled), once per class.
+      # The compiled accessors do not depend on them.
+      def columns_hash # :nodoc:
+        __rh_load_schema[:columns_hash]
+      end
+
+      def columns
+        __rh_load_schema[:columns]
+      end
+
+      def column_names
+        __rh_load_schema[:column_names]
+      end
+
+      # Returns an array of column objects where the primary id, all
+      # columns ending in "_id" or "_count", and columns used for single
+      # table inheritance have been removed.
+      def content_columns
+        __rh_load_schema[:content_columns]
+      end
+
+      def column_for_attribute(name)
+        name = name.to_s
+        columns_hash.fetch(name) do
+          ConnectionAdapters::NullColumn.new(name)
+        end
+      end
+
+      def __rh_load_schema # :nodoc:
+        @__rh_schema ||= begin
+          if equal?(Base) || abstract_class?
+            raise ActiveRecord::TableNotSpecified, "#{self} has no table configured. Set one with #{self}.table_name="
+          end
+
+          columns_hash = connection_pool.schema_cache.columns_hash(table_name)
+          ignored = ignored_columns.map(&:to_s)
+          unless ignored.empty?
+            columns_hash = columns_hash.reject { |name, _| ignored.include?(name) }
+          end
+          columns_hash = columns_hash.freeze
+          columns = columns_hash.values.freeze
+          column_names = columns.map(&:name).freeze
+          content_columns = columns.reject do |c|
+            Array(primary_key).include?(c.name) ||
+              c.name == inheritance_column ||
+              c.name.end_with?("_id", "_count")
+          end.freeze
+          { columns_hash: columns_hash, columns: columns, column_names: column_names, content_columns: content_columns }.freeze
+        end
+      end
+
+      # reflection.rb's reflect_on_all_associations(macro = nil): every
+      # association reflection of the class, a superclass's before its own
+      # and a redeclared name at its last declaration, as Rails'
+      # `_reflections` inherits and merges; with `macro`, those of that
+      # macro. The reflections are the compiled association registry's:
+      # each model's `reflect_on_association` builds its own declarations'
+      # table on first call (`@__roundhouse_reflections`,
+      # emit::ruby::library::apply_association_reflections) and hands any
+      # other name to its superclass. Where the tree emits no registry (no
+      # body calls reflect_on_association), the list is refused by name
+      # rather than answered empty. (CRuby only: the registry is read
+      # through `singleton_methods` and `instance_variable_get`.)
+      def reflect_on_all_associations(macro = nil)
+        chain = [] #: Array[untyped]
+        klass = self #: untyped
+        until klass.nil? || klass.equal?(ActiveRecord::Base)
+          chain.unshift(klass)
+          klass = klass.superclass
+        end
+        registry = false
+        reflections = {} #: Hash[Symbol, untyped]
+        chain.each do |c|
+          next unless c.singleton_methods(false).include?(:reflect_on_association)
+          table = c.instance_variable_get(:@__roundhouse_reflections)
+          if table.nil?
+            # Builds the class's table; the name is declared nowhere.
+            c.reflect_on_association(:__roundhouse_reflect_on_all_associations)
+            table = c.instance_variable_get(:@__roundhouse_reflections)
+          end
+          unless table.is_a?(Hash)
+            raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: #{name}.reflect_on_all_associations: " \
+              "#{c.name}.reflect_on_association is not the compiled association registry, so its associations cannot be listed"
+          end
+          registry = true
+          table.each do |assoc_name, reflection|
+            reflections.delete(assoc_name)
+            reflections[assoc_name] = reflection
+          end
+        end
+        unless registry
+          raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: #{name}.reflect_on_all_associations: " \
+            "this tree emits no association registry (reflect_on_association) for #{name}"
+        end
+        list = reflections.values
+        macro ? list.select { |reflection| reflection.macro == macro } : list
       end
 
       def shard_keys
