@@ -3,13 +3,12 @@
 //! against the same program run natively on Core's sorbet-runtime
 //! (CORE_GEM_HOME, the gem Core bundles).
 //!
-//! The two sorbet calls agree with sorbet-runtime on every observation:
-//! a present value (`false` included) passes through, evaluated once, and
+//! Every observation agrees with the native run. The two sorbet calls: a
+//! present value (`false` included) passes through, evaluated once, and
 //! nil raises TypeError with sorbet's message. `T.must_because`'s reason
-//! runs only on nil, in the caller's scope. `#: as !nil` agrees on present
-//! values. On nil it is the one pinned divergence: natively the comment
-//! is inert and nil runs on, and the emitted tree raises TypeError at the
-//! assertion (tests/rbs_as_not_nil_check.rs says why).
+//! runs only on nil, in the caller's scope. `#: as !nil` is a comment to
+//! Ruby: a present value passes through, evaluated once, and nil runs on
+//! (tests/rbs_as_not_nil_check.rs).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -79,10 +78,8 @@ seen("because_do present") { Counter.new([false]).because_do }
 seen("because_do nil") { Counter.new([]).because_do }
 seen("comment present") { c = Counter.new([5]); [c.comment_first, c.reads] }
 seen("comment chained") { Counter.new([6]).comment_chained }
-"##;
-
-/// The one observation `#: as !nil` is allowed to differ on: nil.
-const COMMENT_NIL: &str = r##"seen("comment nil") { Counter.new([]).comment_first }
+seen("comment nil") { c = Counter.new([]); [c.comment_first, c.reads] }
+seen("comment chained nil") { Counter.new([]).comment_chained }
 "##;
 
 fn app() -> emit_and_run::Overlay {
@@ -118,15 +115,13 @@ fn native(script: &str) -> String {
 
 #[test]
 fn non_nil_assertions_answer_like_sorbet_runtime() {
-    let script = format!("{SCRIPT}{COMMENT_NIL}");
-    let emitted = app().run_ruby(&script);
+    let emitted = app().run_ruby(SCRIPT);
     emitted.assert_passes();
-    let native = native(&script);
+    let native = native(SCRIPT);
     let (emitted_lines, native_lines): (Vec<&str>, Vec<&str>) = (emitted.stdout.lines().collect(), native.lines().collect());
-    assert_eq!(emitted_lines.len(), 12, "emitted:\n{}", emitted.stdout);
-    assert_eq!(native_lines.len(), 12, "native:\n{native}");
-    // Every observation but the last agrees with sorbet-runtime.
-    assert_eq!(emitted_lines[..11], native_lines[..11], "emitted:\n{}\nnative:\n{native}", emitted.stdout);
+    assert_eq!(emitted_lines.len(), 13, "emitted:\n{}", emitted.stdout);
+    assert_eq!(native_lines.len(), 13, "native:\n{native}");
+    assert_eq!(emitted_lines, native_lines, "emitted:\n{}\nnative:\n{native}", emitted.stdout);
     for expected in [
         "must present: [3, 1]",
         "must false: false",
@@ -139,23 +134,24 @@ fn non_nil_assertions_answer_like_sorbet_runtime() {
         "because_do nil: [\"TypeError\", \"Unexpected `nil` because the counts are empty\"]",
         "comment present: [5, 1]",
         "comment chained: \"6\"",
+        "comment nil: [nil, 1]",
+        "comment chained nil: \"\"",
     ] {
         assert!(emitted_lines.contains(&expected), "missing {expected:?} in\n{}", emitted.stdout);
     }
-    // The pinned divergence: nil runs on natively, the tree stops it.
-    assert_eq!(native_lines[11], "comment nil: nil");
-    assert_eq!(emitted_lines[11], "comment nil: [\"TypeError\", \"Passed `nil` into `#: as !nil`\"]");
 }
 
 /// The emitted Ruby keeps the receiver and adds the check once per
-/// assertion: a written value's own trailing comment and the write's are
-/// one comment, not two checks.
+/// sorbet assertion, and none for `#: as !nil`: a written value's own
+/// trailing comment and the write's are one comment, read once.
 #[test]
 fn each_assertion_is_one_check_in_the_emitted_ruby() {
     let (emitted, errors) = app().emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let counter = std::fs::read_to_string(emitted.join("app/models/counter.rb")).unwrap();
-    assert_eq!(counter.matches("Passed `nil` into `#: as !nil`").count(), 2, "{counter}");
+    assert_eq!(counter.matches("#: as !nil").count(), 0, "{counter}");
+    assert_eq!(counter.matches("raise(").count(), 3, "{counter}");
+    assert_eq!(counter.matches("= read).nil?").count(), 4, "{counter}");
     assert_eq!(counter.matches("Passed `nil` into T.must\"").count(), 1, "{counter}");
     assert_eq!(counter.matches("Unexpected `nil` because ").count(), 2, "{counter}");
     assert!(counter.contains("= read).nil?"), "the receiver is evaluated as written: {counter}");

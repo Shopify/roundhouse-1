@@ -220,7 +220,27 @@ pub(super) fn wrapped_declaration<'pr>(node: &Node<'pr>) -> Option<CallNode<'pr>
     literal.then_some(inner)
 }
 
+/// `module_function def helper … end`: the `def` evaluates to its name,
+/// so this is `def helper … end` followed by `module_function :helper`.
+/// Ruby makes the instance method private and gives the module a public
+/// singleton copy of it (Core's `GraphApi::ContextBasedVisibility` is
+/// nothing but two of these). The def, when its argument is exactly one
+/// receiverless `def`; a `def self.x` argument names a singleton method,
+/// which `module_function` cannot find (NameError), and is left alone.
+pub(super) fn module_function_definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'pr>> {
+    let call = node.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != "module_function" {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    arg.as_def_node().filter(|def| def.receiver().is_none())
+}
+
 pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'pr>> {
+    if let Some(def) = module_function_definition(node) {
+        return Some(def);
+    }
     if let Some(call) = node.as_call_node() {
         if marker(&call) && call.receiver().is_none() && call.block().is_none() {
             if let Some(args) = call.arguments() {
@@ -296,6 +316,17 @@ impl Visibility {
     /// after `module_function` copied it to the class side.
     pub(super) fn class_side_changed(&self, name: &str) -> bool {
         self.changed.contains(&(true, name.to_string()))
+    }
+
+    /// The instance-side visibility recorded for `method` at `statement`,
+    /// ignoring a `module_function` class copy's: the private instance
+    /// method `module_function def x` leaves behind (`apply` prefers the
+    /// copy once a class-method visibility change named it).
+    pub(super) fn apply_instance(&self, statement: &Node<'_>, method: &mut MethodDef) {
+        let offset = statement.location().start_offset();
+        if let Some(value) = self.values.get(&(offset, method.name.to_string())) {
+            method.visibility = *value;
+        }
     }
 
     pub(super) fn apply(&self, statement: &Node<'_>, method: &mut MethodDef) {
@@ -585,6 +616,7 @@ impl Visibility {
                     body.is_some_and(|body| {
                         super::util::flatten_statements(body).iter().any(|stmt| {
                             stmt.as_def_node().is_some()
+                                || module_function_definition(stmt).is_some()
                                 || stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c))
                         })
                     })
@@ -766,6 +798,12 @@ impl Visibility {
                 let Some(def) = definition(stmt) else {
                     return Err(Self::unsupported(file, Self::conditional_branch_refusal(stmt)));
                 };
+                if module_function_definition(stmt).is_some() {
+                    return Err(Self::unsupported(
+                        file,
+                        "a load-time conditional definition under `module_function` is not modeled",
+                    ));
+                }
                 let inline = match stmt.as_call_node() {
                     Some(call) => match constant_id_str(&call.name()) {
                         "public" => Some(MethodVisibility::Public),
@@ -876,6 +914,7 @@ impl Visibility {
             let offset = statement.location().start_offset();
             STATEMENT.set(Some((offset, statement.location().end_offset())));
             let def = definition(&statement);
+            let module_function_def = module_function_definition(&statement).is_some();
             let node = &statement;
             let mut inline = None;
             if let Some(call) = statement.as_call_node().filter(marker) {
@@ -970,6 +1009,20 @@ impl Visibility {
                 }
             }
             if let Some(def) = def {
+                if module_function_def && class_side {
+                    // A singleton class or class-method carrier is a Class
+                    // body, where `module_function` is undefined.
+                    return Err(Self::unsupported(
+                        file,
+                        "module_function on a nested singleton level or class-method carrier is not modeled",
+                    ));
+                }
+                if module_function_def {
+                    // `module_function def x`: the instance method is
+                    // private whatever the default, and its class copy
+                    // public.
+                    inline = Some(MethodVisibility::Private);
+                }
                 if let Some(inner) = super::library_class::included_hook_class_methods_body(&def) {
                     self.walk_carrier(Some(inner), file, false)?;
                     continue;
@@ -1006,7 +1059,7 @@ impl Visibility {
                     }
                 });
                 self.define(offset, name.clone(), side, visibility, file)?;
-                if module_function && !side {
+                if (module_function || module_function_def) && !side {
                     // The library walk keeps one class-side method and looks
                     // visibility up by the def offset. A later instance
                     // `private :name` must not clobber that class copy, so

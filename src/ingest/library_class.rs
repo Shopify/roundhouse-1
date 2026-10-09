@@ -3543,6 +3543,8 @@ fn walk_decl_body_in<'pr>(
             .map(|d| d.as_node())
             .or_else(|| visibility::wrapped_declaration(&statement).map(|c| c.as_node()));
         let stmt = definition.as_ref().unwrap_or(&statement);
+        // `module_function def x … end` (`visibility::module_function_definition`).
+        let module_function_def = visibility::module_function_definition(&statement).is_some();
         if definition.is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
             // Only bare instance-visibility markers end Ruby's module_function
             // mode. Named and inline forms don't change that lexical mode.
@@ -3743,7 +3745,22 @@ fn walk_decl_body_in<'pr>(
                 (None, None) => unreachable!(),
             };
             visibility.apply(&statement, &mut m);
-            if module_function_active && m.receiver == MethodReceiver::Instance {
+            // `module_function def x` is the def and then `module_function
+            // :x`: Ruby keeps the instance method, made private, beside the
+            // module's public copy. Both are kept, so `Mod.x(...)` and an
+            // includer's bare `x(...)` each find theirs, and the includer's
+            // method lookup reaches the module's `x` as Ruby's does. The
+            // copy's visibility is the instance side's, which a later
+            // `public :x` can change.
+            let instance_copy = (module_function_def
+                && !force_class_receiver
+                && m.receiver == MethodReceiver::Instance)
+                .then(|| {
+                    let mut copy = m.clone();
+                    visibility.apply_instance(&statement, &mut copy);
+                    copy
+                });
+            if (module_function_active || module_function_def) && m.receiver == MethodReceiver::Instance {
                 // The retained singleton copy is public even if the original
                 // instance definition is private/protected, unless
                 // `private_class_method` / `public_class_method` already
@@ -3755,7 +3772,7 @@ fn walk_decl_body_in<'pr>(
                     m.visibility = crate::dialect::MethodVisibility::Public;
                 }
             }
-            if force_class_receiver || module_function_active || extend_self_active {
+            if force_class_receiver || module_function_active || module_function_def || extend_self_active {
                 m.receiver = MethodReceiver::Class;
             }
             // A real `def` replaces a synthesized attr_* half of the
@@ -3808,6 +3825,7 @@ fn walk_decl_body_in<'pr>(
                 direct_def_positions.push(out.methods.len());
                 out.methods.push(m);
             }
+            out.methods.extend(instance_copy);
             continue;
         }
         // `class << self ... end` — singleton class block. Body

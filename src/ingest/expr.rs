@@ -385,8 +385,8 @@ fn sorbet_assertion_is_must(node: &Node<'_>) -> bool {
 /// evaluated once: a local read is tested directly, anything else is
 /// bound to a generated local inside the condition,
 /// `if (__must_N = x).nil? then raise ... else __must_N end`, so the
-/// else side reads it with nil narrowed away. `#: as !nil` lowers to the
-/// same check (`type_ascription::ascribe_trailing`) with its own message.
+/// else side reads it with nil narrowed away. `#: as !nil` checks
+/// nothing (`type_ascription::not_nil_ascription`).
 /// `project::is_nil_assertion_check` recognizes the shape, which only the
 /// Ruby-family trees run.
 pub(super) fn must_check(span: Span, value: Expr, location: &ruby_prism::Location<'_>, message: &str) -> Expr {

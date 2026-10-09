@@ -9912,17 +9912,24 @@ fn report_unsupported_harness_calls(app: &App, target: BuildTarget, files: &[(St
     }
 }
 
-/// The nil check `ingest::expr::must_check` lowers `T.must`,
-/// `T.must_because` and `#: as !nil` to, by its shape:
-/// `if <value>.nil? then raise(TypeError.new(<sorbet's message>)) else
-/// <value> end`. Recognized by shape, not by a decision bit, because
-/// lowering rebuilds the nodes of a model method's body.
+/// The nil check `ingest::expr::must_check` lowers `T.must` and
+/// `T.must_because` to, by its shape: `if <value>.nil? then
+/// raise(TypeError.new(<sorbet's message>)) else <value> end`; and the
+/// unchecked nil test `#: as !nil` lowers to
+/// (`ingest::type_ascription::not_nil_ascription`), whose nil side is
+/// the tested value cast to `bot` rather than a raise. Both bind a
+/// generated local in the condition. Recognized by shape, not by a
+/// decision bit, because lowering rebuilds the nodes of a model method's
+/// body.
 fn is_nil_assertion_check(expr: &crate::expr::Expr) -> bool {
     use crate::expr::{ExprNode, InterpPart, Literal};
     let ExprNode::If { cond, then_branch, .. } = &*expr.node else { return false };
     let ExprNode::Send { recv: Some(_), method, args, .. } = &*cond.node else { return false };
     if method.as_str() != "nil?" || !args.is_empty() {
         return false;
+    }
+    if matches!(&*then_branch.node, ExprNode::Cast { value, target_ty: crate::ty::Ty::Bottom } if matches!(&*value.node, ExprNode::Var { .. })) {
+        return true;
     }
     let ExprNode::Send { recv: None, method, args, .. } = &*then_branch.node else { return false };
     let [error] = args.as_slice() else { return false };
@@ -10252,17 +10259,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 );
             }
         }
-        // The nil check of `T.must`, `T.must_because` and `#: as !nil`
-        // raises sorbet-runtime's TypeError and binds the value it tests
-        // to a generated local inside its condition. The Ruby-family
-        // trees run it as written. The others have neither: TypeScript
-        // emits that local undeclared and throws a plain Error.
+        // The nil test of `T.must`, `T.must_because` and `#: as !nil`
+        // binds the value it tests to a generated local inside its
+        // condition, and the two sorbet calls raise sorbet-runtime's
+        // TypeError. The Ruby-family trees run it as written. The others
+        // have neither: TypeScript emits that local undeclared and throws
+        // a plain Error.
         if !matches!(target, "ruby" | "jruby" | "spinel" | "roda") && is_nil_assertion_check(expr) {
             emit::diagnostics::report_unsupported(
                 expr.span,
                 target,
                 "non-nil assertion",
-                format!("the nil check `T.must`, `T.must_because` and `#: as !nil` lower to runs on the Ruby-family trees, not {target}"),
+                format!("the nil test `T.must`, `T.must_because` and `#: as !nil` lower to runs on the Ruby-family trees, not {target}"),
             );
         }
         // sorbet-runtime's class check `T.let` / `T.cast` / `T.bind` /
