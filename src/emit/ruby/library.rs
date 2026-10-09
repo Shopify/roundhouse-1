@@ -12093,9 +12093,14 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
 /// `M` for a bare `extend M` naming the app's own module, as Ruby
 /// resolves the constant from `lc`'s namespace outwards (`extend
 /// ClassMethods` inside `module Cs; class Base` is `Cs::ClassMethods`).
+/// A rooted `extend ::A::B` (its path's empty first segment) is the
+/// top-level `A::B` only: Core's CompanyMetafieldOwner is `class << self;
+/// include ::Metafields::Owners::AbstractOwner`, and joined with its root
+/// that named no module, so the `extend` was dropped from the emit.
 fn resolve_app_module<'a>(lc: &LibraryClass, path: &[Symbol], app: &'a App) -> Option<&'a LibraryClass> {
-    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-    let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    let written = path.iter().skip(usize::from(rooted)).map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let scope: Vec<&str> = if rooted { Vec::new() } else { lc.name.0.as_str().split("::").collect() };
     (0..=scope.len()).rev().find_map(|n| {
         let name = if n == 0 { written.clone() } else { format!("{}::{written}", scope[..n].join("::")) };
         library_classes_named(&name, app).into_iter().find(|c| c.is_module && c.origin.is_none())

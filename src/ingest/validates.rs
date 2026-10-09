@@ -1376,9 +1376,15 @@ fn custom_validator(
         hash.retain(|(hk, _)| !matches!(&*hk.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == k));
         hash.push((sym(k), value));
     }
-    let class = format!("{}Validator", crate::naming::camelize(key));
+    // Rails names the class `"#{key.to_s.camelize}Validator"` and
+    // `const_get`s it from the model (activemodel validations/validates.rb):
+    // a namespaced key camelizes each `/` segment, so
+    // `"store_localization/locale_code": true` is
+    // `StoreLocalization::LocaleCodeValidator`, a path, not one name.
+    let class = format!("{}Validator", crate::naming::camelize_path(key));
+    let path: Vec<Symbol> = class.split("::").map(Symbol::from).collect();
     let rule = ValidationRule::With {
-        validator: Expr::new(s, ExprNode::Const { path: vec![Symbol::from(class.as_str())] }),
+        validator: Expr::new(s, ExprNode::Const { path }),
         options: Some(Expr::new(s, ExprNode::Hash { entries: hash, kwargs: false })),
         if_method: None,
         unless_method: None,
