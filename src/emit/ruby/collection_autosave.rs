@@ -80,6 +80,24 @@
 //! `owner.<name> << record` saves through on a saved owner
 //! (`Association.concat`).
 //!
+//! The save is entered through Rails' own name. Rails defines a public
+//! `autosave_associated_records_for_<name>(*args)` per association
+//! (`define_non_cyclic_method`, with its `@_already_called` loop guard)
+//! and registers that name as the after_create / after_update callback,
+//! so an app that wraps it (`alias_method` then `define_method`, as
+//! Core's `Podding::Database::DeferCallback#defer_autosave_to_after_transaction`
+//! does at class load) changes what the save runs. Emitted the same way:
+//! the hooks call `autosave_associated_records_for_<name>`, defined
+//! unless the model defines it, and it reads whether the owner was new
+//! from `@new_record_before_save`, which the save sets around the write
+//! as Rails' `around_save_collection_association` does (a nested save of
+//! the same record sees false; a call after the save, such as a deferred
+//! one after commit, sees the restored value). A has_one gets the same
+//! entry point (`save_has_one_association`): its held record is saved
+//! when it is new or its key is not the owner's (`_record_changed?`);
+//! with `autosave: true` the entry point is the save its after_save
+//! already runs (`_autosave_<name>`).
+//!
 //! Differences: the after-commit callbacks run before the COMMIT rather
 //! than after it, and a record's attribute changes are not rewound on
 //! rollback (Rails' are re-marked dirty). `autosave: true`
@@ -93,6 +111,23 @@ use crate::dialect::{Association, LibraryClass, MethodReceiver, Model};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
+
+/// One has_one whose held record the owner's save saves
+/// (`save_has_one_association`).
+struct Single {
+    span: Span,
+    name: Symbol,
+    foreign_key: Symbol,
+    inverse: Option<Symbol>,
+    /// `autosave: true`: the lowering's `_autosave_<name>` in after_save
+    /// is the save (`model_to_library::associations`).
+    autosave: bool,
+}
+
+/// Rails' entry point for an association's save callback.
+fn entry_point(name: &Symbol) -> String {
+    format!("autosave_associated_records_for_{}", name.as_str())
+}
 
 /// One has_many this pass validates and saves.
 struct Collection {
@@ -147,7 +182,30 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
                 })
             })
             .collect();
-        if collections.is_empty() {
+        let singles: Vec<Single> = model
+            .spanned_associations()
+            .filter_map(|(span, assoc)| {
+                let Association::HasOne { name, target, foreign_key, foreign_key_explicit, as_interface, scope, autosave, .. } =
+                    assoc
+                else {
+                    return None;
+                };
+                let inverse = if *foreign_key_explicit || scope.is_some() || as_interface.is_some() {
+                    None
+                } else {
+                    inverse_of(app, model, target, foreign_key)
+                };
+                let saved_by_lowering = *autosave && defines(lc, &format!("_autosave_{}", name.as_str()));
+                (memoizes(lc, name) && (saved_by_lowering || !*autosave)).then(|| Single {
+                    span,
+                    name: name.clone(),
+                    foreign_key: foreign_key.clone(),
+                    inverse,
+                    autosave: *autosave,
+                })
+            })
+            .collect();
+        if collections.is_empty() && singles.is_empty() {
             continue;
         }
         let owner_type = base_class_name(app, model);
@@ -157,13 +215,29 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
                 src.push_str(&validate_records_source(c));
             }
             src.push_str(&save_records_source(c));
+            if !defines(lc, &entry_point(&c.name)) {
+                let inner = format!("_autosave_associated_records_for_{}(@new_record_before_save == true)", c.name.as_str());
+                src.push_str(&entry_point_source(&c.name, &inner));
+            }
         }
-        src.push_str(&insert_record_source(&collections, &owner_type));
-        let overrides_save = lc.methods.iter().any(|m| {
-            m.name.as_str() == "save_after_validation" && m.receiver == MethodReceiver::Instance && m.params.is_empty()
-        });
-        if !overrides_save {
-            src.push_str(&save_after_validation_source(&collections));
+        for s in &singles {
+            let inner = if s.autosave {
+                format!("_autosave_{}", s.name.as_str())
+            } else {
+                src.push_str(&save_has_one_source(s));
+                format!("_save_has_one_association_{}", s.name.as_str())
+            };
+            if !defines(lc, &entry_point(&s.name)) {
+                src.push_str(&entry_point_source(&s.name, &inner));
+            }
+        }
+        let overrides_save = defines(lc, "save_after_validation");
+        if !collections.is_empty() {
+            src.push_str(&insert_record_source(&collections, &owner_type));
+            src.push_str(AROUND_SAVE);
+            if !overrides_save {
+                src.push_str(&save_after_validation_source(&collections));
+            }
         }
         let inverses: Vec<&Collection> = collections.iter().filter(|c| c.inverse.is_some()).collect();
         if !inverses.is_empty() {
@@ -181,6 +255,11 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         let methods = crate::runtime_src::parse_methods(&src)
             .unwrap_or_else(|e| panic!("collection_autosave: generated source failed to parse: {e}\n{src}"));
         for mut m in methods {
+            // `parse_methods` reads `*args` as a plain positional; the
+            // entry point takes any arguments, as Rails' does.
+            if m.name.as_str().starts_with("autosave_associated_records_for_") {
+                m.params = vec![crate::dialect::Param::rest(Symbol::from("args"))];
+            }
             for prefix in ["_validate_associated_records_for_", "_autosave_associated_records_for_"] {
                 if let Some(name) = m.name.as_str().strip_prefix(prefix) {
                     let name = Symbol::from(name);
@@ -189,6 +268,11 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             }
             m.enclosing_class = Some(lc.name.0.clone());
             lc.methods.push(m);
+        }
+        // The model's own `save_after_validation` keeps its body, inside
+        // the same state the generated one sets.
+        if overrides_save && !collections.is_empty() {
+            around_save_collection_association(lc);
         }
 
         if validates {
@@ -212,15 +296,34 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             stmts.push(call("_ensure_no_duplicate_errors", None));
             *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
         }
-        for (hook_name, was_new) in [("after_create", true), ("after_update", false)] {
+        // Rails' `after_create save_method` / `after_update save_method`,
+        // by name, in declaration order, ahead of the callbacks the
+        // model's body adds after them.
+        let mut saved: Vec<(Span, &Symbol)> = collections.iter().map(|c| (c.span, &c.name)).collect();
+        saved.extend(singles.iter().filter(|s| !s.autosave).map(|s| (s.span, &s.name)));
+        let order: Vec<&Symbol> = model
+            .spanned_associations()
+            .filter_map(|(span, assoc)| saved.iter().find(|(s, n)| *s == span && *n == assoc.name()).map(|(_, n)| *n))
+            .collect();
+        for hook_name in ["after_create", "after_update"] {
             let at = hook(lc, hook_name);
             let body = &mut lc.methods[at].body;
             let mut stmts = statements(body);
-            for (i, c) in collections.iter().enumerate() {
-                let flag = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: was_new } });
-                stmts.insert(i, call(&format!("_autosave_associated_records_for_{}", c.name.as_str()), Some(flag)));
+            for (i, name) in order.iter().enumerate() {
+                stmts.insert(i, call(&entry_point(name), None));
             }
             *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
+        }
+        // An `autosave: true` has_one keeps its save where the lowering
+        // folded it (after_save), entered by Rails' name.
+        for s in singles.iter().filter(|s| s.autosave) {
+            let lowered = format!("_autosave_{}", s.name.as_str());
+            let entry = entry_point(&s.name);
+            for m in lc.methods.iter_mut().filter(|m| {
+                m.name.as_str() == "after_save" && m.receiver == MethodReceiver::Instance && m.params.is_empty()
+            }) {
+                rename_bare_calls(&mut m.body, &lowered, &entry);
+            }
         }
     }
 }
@@ -387,6 +490,8 @@ fn insert_record_source(collections: &[Collection], owner_type: &str) -> String 
 /// record that does not save is passed over (`saved` stays true); with
 /// it the owner gains the association's error and RecordInvalid, which
 /// the owner's `save` answers as false (`save_after_validation_source`).
+/// It answers the records it went through (Rails' `records.each`), nil
+/// when the association was never loaded.
 fn save_records_source(c: &Collection) -> String {
     let n = c.name.as_str();
     let save = if c.validate {
@@ -405,7 +510,7 @@ fn save_records_source(c: &Collection) -> String {
   records.each do |record|
     next if record.destroyed?
 {save}  end
-  nil
+  records
 end
 "#
     )
@@ -415,13 +520,129 @@ end
 /// saves its records holds some (`Association.saving`): a failed record
 /// save rolls the owner's INSERT or UPDATE back and `save` answers
 /// false. With none loaded nothing but the owner is written, so the
-/// save goes as before.
+/// save goes as before. Either way inside Rails'
+/// `around_save_collection_association` (`AROUND_SAVE`).
 fn save_after_validation_source(collections: &[Collection]) -> String {
     let loaded: Vec<String> = collections.iter().map(|c| format!("@{}_loaded == true", c.name.as_str())).collect();
     format!(
-        "def save_after_validation\n  return super() unless {}\n  \
-         ActiveRecord::Associations::Association.saving(self) {{ super() }}\nend\n",
+        "def save_after_validation\n  _around_save_collection_association do\n    if {}\n      \
+         ActiveRecord::Associations::Association.saving(self) {{ super() }}\n    else\n      super()\n    end\n  end\nend\n",
         loaded.join(" || ")
+    )
+}
+
+/// Rails' `around_save_collection_association`: whether the owner is
+/// new for this save, which the collections' entry points read (a nested
+/// save of the same record is not), restored once it is done.
+const AROUND_SAVE: &str = r#"def _around_save_collection_association
+  previously_new_record_before_save = (@new_record_before_save ||= false)
+  @new_record_before_save = !previously_new_record_before_save && new_record?
+  yield
+ensure
+  @new_record_before_save = previously_new_record_before_save
+end
+"#;
+
+/// The model's own `save_after_validation`, its body run inside
+/// `_around_save_collection_association` as the generated one is.
+fn around_save_collection_association(lc: &mut LibraryClass) {
+    const PLACEHOLDER: &str = "__roundhouse_save_after_validation_body";
+    let Some(m) = lc.methods.iter_mut().find(|m| {
+        m.name.as_str() == "save_after_validation" && m.receiver == MethodReceiver::Instance && m.params.is_empty()
+    }) else {
+        return;
+    };
+    let template = format!("def save_after_validation\n  _around_save_collection_association do\n    {PLACEHOLDER}\n  end\nend\n");
+    let mut wrapper = crate::runtime_src::parse_methods(&template)
+        .ok()
+        .and_then(|mut ms| ms.pop())
+        .map(|m| m.body)
+        .expect("generated save wrapper parses");
+    let mut body = Some(m.body.clone());
+    replace_bare_call(&mut wrapper, PLACEHOLDER, &mut body);
+    if body.is_none() {
+        wrapper.span = m.body.span;
+        m.body = wrapper;
+    }
+}
+
+/// Replaces the first receiverless, argumentless call to `name` in
+/// `expr` with `with` (taken).
+fn replace_bare_call(expr: &mut Expr, name: &str, with: &mut Option<Expr>) {
+    if with.is_none() {
+        return;
+    }
+    if matches!(&*expr.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+        if method.as_str() == name && args.is_empty())
+    {
+        *expr = with.take().expect("checked above");
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| replace_bare_call(c, name, with));
+}
+
+/// Renames each receiverless, argumentless call to `from` in `expr`.
+fn rename_bare_calls(expr: &mut Expr, from: &str, to: &str) {
+    expr.node.for_each_child_mut(&mut |c| rename_bare_calls(c, from, to));
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node
+        && method.as_str() == from
+        && args.is_empty()
+    {
+        *method = Symbol::from(to);
+    }
+}
+
+/// Whether the model defines the no-argument instance method `name`.
+fn defines(lc: &LibraryClass, name: &str) -> bool {
+    lc.methods.iter().any(|m| m.name.as_str() == name && m.receiver == MethodReceiver::Instance)
+}
+
+/// Rails' `define_non_cyclic_method`: the public entry point
+/// `autosave_associated_records_for_<name>(*args)`, which runs `inner`
+/// unless a call of it is already running on this record.
+fn entry_point_source(name: &Symbol, inner: &str) -> String {
+    let m = entry_point(name);
+    format!(
+        r#"def {m}(*args)
+  result = true
+  @_already_called ||= {{}}
+  unless @_already_called[:{m}]
+    begin
+      @_already_called[:{m}] = true
+      result = {inner}
+    ensure
+      @_already_called[:{m}] = false
+    end
+  end
+  result
+end
+"#
+    )
+}
+
+/// Rails' `save_has_one_association` for a has_one without `autosave:`
+/// over the record the reader holds: saved (validated) when it is new,
+/// its key is not the owner's or a change of its key is pending
+/// (`_record_changed?`), after the owner's key and the inverse are set
+/// on it. It answers whether it saved, nil when nothing was to save.
+fn save_has_one_source(s: &Single) -> String {
+    let n = s.name.as_str();
+    let fk = s.foreign_key.as_str();
+    let inverse = match &s.inverse {
+        Some(inverse) => format!("  record.{} = self\n", inverse.as_str()),
+        None => String::new(),
+    };
+    format!(
+        r#"def _save_has_one_association_{n}
+  return nil unless @{n}_loaded == true
+  record = @{n}_cache
+  return nil if record.nil? || record.destroyed?
+  key = id
+  return nil unless record.new_record? || record.{fk} != key || record.attribute_changed?({fk:?})
+  record.{fk} = key unless record.{fk} == key
+{inverse}  record.save
+end
+"#
     )
 }
 
