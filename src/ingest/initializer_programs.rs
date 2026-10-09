@@ -106,6 +106,16 @@ pub const TEST_LOAD_HOOKS: &[(&str, &str, &str)] = &[
     ("active_job_test_case", "ActiveJob::TestCase", "activejob/lib/active_job/test_case.rb:9"),
 ];
 
+/// The [`TEST_LOAD_HOOKS`] Rails fires in its base's `Behavior`'s
+/// `included do`, with the includer, rather than in the base's class
+/// body: actionpack test_case.rb:611 (ActionController::TestCase::Behavior),
+/// testing/integration.rb:693 (ActionDispatch::IntegrationTest::Behavior),
+/// actionview test_case.rb:256 (ActionView::TestCase::Behavior). A test
+/// that includes `Behavior` itself (Core's
+/// components/developer_dashboard check_box_test.rb `include
+/// ActionView::TestCase::Behavior`) gets the hooks run on its own class.
+pub const TEST_BEHAVIOR_HOOKS: &[&str] = &["action_controller_test_case", "action_dispatch_integration_test", "action_view_test_case"];
+
 /// Calls whose block Rails runs later, and whose value nobody reads: the
 /// block's statements are carried one by one.
 const DEFERRED: &[&str] =
@@ -614,6 +624,13 @@ pub(super) fn guard_block_body(expr: &mut Expr, refused: &[u32], labels: &BTreeM
     let mut kept = Vec::new();
     for s in stmts {
         if refused.contains(&s.span.start) {
+            continue;
+        }
+        // A `#: self as T` comment is no statement: Ruby never runs it.
+        // It stays a statement of the body itself, where the typer reads
+        // it for the statements after it and the emitter drops it.
+        if crate::expr::is_self_binding(&s) {
+            kept.push(s);
             continue;
         }
         let label = labels.get(&s.span.start).cloned().unwrap_or_else(|| "initializer statement".into());

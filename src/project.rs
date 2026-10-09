@@ -5668,14 +5668,17 @@ fn framework_load_hook_block(app: &App, before_models: bool) -> String {
 /// on every writing pool, runtime/spinel/cruby/test/active_record_test_fixtures.rb).
 ///
 /// The other test bases are autoloads Rails loads where code first names
-/// one, a test's superclass, and each base's file ends firing its hooks.
-/// The runtime test helper defines them up front, so each base's hooks
-/// fire when the first class descends from it
-/// (`ActiveSupport::LazyLoadHooks.run_when_subclassed`), after those of
-/// the bases its file requires: action_view/test_case.rb requires
+/// one, a test's superclass, and each base's file fires its hooks as it
+/// loads. The runtime test helper defines them up front, so each base's
+/// hooks fire when the first class descends from it
+/// (`ActiveSupport::LazyLoadHooks.run_when_loaded`), after those of the
+/// bases its file requires: action_view/test_case.rb requires
 /// action_controller/test_case. A process that never loads a base never
-/// runs its hooks, as in Rails. Not modeled: a reference that does not
-/// subclass (Core's test/support/initializers/sprockets_debug.rb
+/// runs its hooks, as in Rails. The hooks Rails fires in the base's
+/// `Behavior`'s `included do` ([`TEST_BEHAVIOR_HOOKS`]) run as well on
+/// each other class that includes `Behavior`, with that class. Not
+/// modeled: a reference that neither subclasses nor includes (Core's
+/// test/support/initializers/sprockets_debug.rb
 /// `ActionView::TestCase.prepend(...)`), which in Rails loads the base
 /// and fires its hooks then, fires them here at the first subclass.
 ///
@@ -5692,6 +5695,7 @@ fn framework_load_hook_block(app: &App, before_models: bool) -> String {
 /// registration, as in Rails.
 ///
 /// [`TEST_LOAD_HOOKS`]: crate::ingest::initializer_programs::TEST_LOAD_HOOKS
+/// [`TEST_BEHAVIOR_HOOKS`]: crate::ingest::initializer_programs::TEST_BEHAVIOR_HOOKS
 fn test_case_load_hooks_block() -> String {
     let (first, rest) = crate::ingest::initializer_programs::TEST_LOAD_HOOKS.split_first().expect("TEST_LOAD_HOOKS");
     let (hook, _base, site) = first;
@@ -5708,13 +5712,15 @@ fn test_case_load_hooks_block() -> String {
          # at once: `include ActiveRecord::TestFixtures`.\n\
          TestBase.include(ActiveRecord::TestFixtures)\n\
          # The other test bases load where code first names one, a test's\n\
-         # superclass: their hooks fire as the first class descends from one.\n\
+         # superclass: their hooks fire as the first class descends from one,\n\
+         # and a Behavior hook on each class that includes the base's Behavior.\n\
          if defined?(ActiveSupport::LazyLoadHooks)\n"
     );
     for (hook, base, site) in rest {
         // action_view/test_case.rb requires action_controller/test_case.
         let after = if *hook == "action_view_test_case" { ", after: [:action_controller_test_case]" } else { "" };
-        out.push_str(&format!("  ActiveSupport::LazyLoadHooks.run_when_subclassed(:{hook}, {base}, {site:?}{after}) if defined?({base})\n"));
+        let behavior = if crate::ingest::initializer_programs::TEST_BEHAVIOR_HOOKS.contains(hook) { ", behavior: true" } else { "" };
+        out.push_str(&format!("  ActiveSupport::LazyLoadHooks.run_when_loaded(:{hook}, {base}, {site:?}{after}{behavior}) if defined?({base})\n"));
     }
     out.push_str("end\n");
     out
@@ -8010,6 +8016,16 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let list = |names: &mut dyn Iterator<Item = &str>| -> String {
         names.map(|n| format!("    {n:?},\n")).collect()
     };
+    // A test-support file below a `test` directory of the test load path
+    // (`App::test_load_roots`) is no autoload path's: native eager loading
+    // never loads it, and only a `require` does (`TEST_LOAD_PATH_FEATURES`).
+    let test_support_program = |anchor: &str| {
+        anchor.strip_prefix("models/roundhouse_files/").is_some_and(|rel| {
+            app.test_load_roots
+                .iter()
+                .any(|root| rel.starts_with(root.as_str()) && root.split('/').any(|segment| segment == "test"))
+        })
+    };
     let unreached: Vec<&String> = program_anchors
         .iter()
         .filter(|p| {
@@ -8017,6 +8033,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 && !autoloaded.contains(*p)
                 && !boot_programs.iter().any(|(b, _)| b == *p)
                 && !railtie_files.iter().any(|(_, r)| r == *p)
+                && !test_support_program(p)
         })
         .collect();
     write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().map(String::as_str))).unwrap();
@@ -8715,7 +8732,10 @@ fn compiled_gem_features(
 /// `test/support` on `$LOAD_PATH` in the test environment, and a hook's
 /// or a support file's `require "support/helpers/…"` loads from there;
 /// the emitted tree has no such directories, so the `require` loads the
-/// emitted files (`COMPILED_GEM_REQUIRE`) when `Rails.env.test?`. A
+/// emitted files (`COMPILED_GEM_REQUIRE`) when `Rails.env.test?`. The
+/// roots are the test `$LOAD_PATH`'s own (`ingest::app::rails_test_load_path`:
+/// `test`, and each engine's and the application's `paths.add(…,
+/// load_path: true)`). A
 /// feature two roots' carried files answer is left out: Ruby loads the
 /// one first on `$LOAD_PATH`, an order the engines' load decides, and
 /// its `require` goes on to Kernel's, which raises LoadError where it
@@ -8736,14 +8756,17 @@ fn test_load_path_features(
         .map(|rel| format!("{rel}.rb"));
     let sources: std::collections::BTreeSet<String> = declarations_by_source.keys().cloned().chain(programs).collect();
     for rel in &sources {
-        let Some(feature) = app
+        // A file below two roots (`test/` and `test/support/`) is a
+        // feature of each.
+        let features: Vec<&str> = app
             .test_load_roots
             .iter()
-            .find_map(|root| rel.strip_prefix(root.as_str()))
-            .and_then(|rest| rest.strip_suffix(".rb"))
-        else {
+            .filter_map(|root| rel.strip_prefix(root.as_str()))
+            .filter_map(|rest| rest.strip_suffix(".rb"))
+            .collect();
+        if features.is_empty() {
             continue;
-        };
+        }
         let program = format!("models/roundhouse_files/{}", rel.strip_suffix(".rb").unwrap_or(rel));
         let loads: Vec<String> = if program_anchors.contains(&program) {
             vec![program]
@@ -8751,7 +8774,9 @@ fn test_load_path_features(
             declarations_by_source.get(rel).into_iter().flatten().filter(|a| emitted_file(a)).cloned().collect()
         };
         if !loads.is_empty() {
-            found.entry(feature.to_string()).or_default().push(loads);
+            for feature in features {
+                found.entry(feature.to_string()).or_default().push(loads.clone());
+            }
         }
     }
     found.into_iter().filter(|(_, hits)| hits.len() == 1).filter_map(|(f, mut hits)| hits.pop().map(|h| (f, h))).collect()

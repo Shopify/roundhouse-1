@@ -77,6 +77,29 @@ pub(crate) fn is_harness_namespace(name: &str) -> bool {
     harness_namespaces().contains(name)
 }
 
+/// Whether the emitted Ruby-family test harness defines the class or
+/// module `name`, for a declared type naming it: a namespaced path
+/// runtime/spinel/test/test_helper.rb declares (`ActiveJob::TestCase`,
+/// `ActionView::TestCase`), or a Rails test base the CRuby tree declares
+/// ahead of boot (`emit::ruby::MINITEST_TEST_CASES`:
+/// `ActiveSupport::TestCase`, `ActionController::TestCase`). Core's test
+/// hooks and helpers write `#: self as singleton(ActiveJob::TestCase)`
+/// (components/platform/search_platform/config/initializers/active_job_test_case.rb);
+/// Ruby never evaluates the annotation, and the block runs only where the
+/// test helper fires the hook, on the tree that defines the base.
+pub(crate) fn is_harness_declared_type(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            let cases = crate::emit::ruby::MINITEST_TEST_CASES;
+            let mut names = declared_namespaces(cases);
+            names.extend(crate::analyze::runtime_reads::declared_constants(cases));
+            names
+        })
+        .contains(name)
+        || is_harness_namespace(name)
+}
+
 struct Scope {
     /// The modules around the test class, innermost first (`Shop`).
     enclosing: Vec<String>,

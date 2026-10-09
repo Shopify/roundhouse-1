@@ -192,6 +192,19 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
 /// Not this shape, and read by this pass instead: a hook it carries as a
 /// reopen of the hooked class ([`hook_class`]), and a block that
 /// declares a class or module (a reopen, or a module defined in it).
+///
+/// A test-case hook ([`TEST_LOAD_HOOKS`]) on a PostgreSQL tree is this
+/// shape even where [`hook_class`] names its base (Core's
+/// essentials/lib/patches/action_dispatch_url_for_param_filter.rb:81
+/// `on_load(:action_controller_test_case) { include
+/// TestParametersReservedParams }`): the emitted test helper fires those
+/// hooks where Rails does (`project::test_case_load_hooks_block`), so
+/// the lib file's hook runs there, in registration order with the
+/// initializers' and engines' hooks for the same base, not as a reopen
+/// at boot ahead of them. Other trees, which have no lazy_load_hooks
+/// port, keep the reopen.
+///
+/// [`TEST_LOAD_HOOKS`]: super::initializer_programs::TEST_LOAD_HOOKS
 pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
     if constant_id_str(&call.name()) != "on_load"
         || call.receiver().and_then(|r| constant_path_of(&r)).map(|p| p.join("::")).as_deref() != Some("ActiveSupport")
@@ -204,12 +217,40 @@ pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
         return false;
     };
     let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
-    if hook_class(&hook).is_some() {
+    if hook_class(&hook).is_some() && !deferred_test_hook(&hook) {
         return false;
     }
     block.body().is_none_or(|body| {
         find_all_classes_with_scope(&body).is_empty() && find_all_modules_with_scope(&body).is_empty()
     })
+}
+
+thread_local! {
+    /// Set for the ingest of a PostgreSQL tree ([`defer_test_hooks`]).
+    static DEFER_TEST_HOOKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the previous [`defer_test_hooks`] setting when dropped.
+pub(super) struct DeferTestHooks(bool);
+
+impl Drop for DeferTestHooks {
+    fn drop(&mut self) {
+        DEFER_TEST_HOOKS.with(|cell| cell.set(self.0));
+    }
+}
+
+/// For the ingest of one tree: whether its test-case hooks are
+/// registered as written ([`registered_as_written`]), which a PostgreSQL
+/// tree's are.
+pub(super) fn defer_test_hooks(postgresql: bool) -> DeferTestHooks {
+    DeferTestHooks(DEFER_TEST_HOOKS.with(|cell| cell.replace(postgresql)))
+}
+
+/// A test-case hook the ingest registers as written rather than reopening
+/// its base ([`registered_as_written`]).
+fn deferred_test_hook(hook: &str) -> bool {
+    DEFER_TEST_HOOKS.with(|cell| cell.get())
+        && super::initializer_programs::TEST_LOAD_HOOKS.iter().any(|(name, _, _)| *name == hook)
 }
 
 /// The framework class a load hook hands its block, for the hooks whose
