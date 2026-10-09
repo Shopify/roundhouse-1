@@ -1108,7 +1108,18 @@ pub fn emit_with_assertions(
     // + `Object.const_get` scan, which violates the spinel subset).
     // Same `fixture_lcs` is reused below for the per-fixture file emit
     // and for `fixture_extras` synthesized siblings.
-    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes(app);
+    //
+    // The PostgreSQL CRuby tree (TestReset::FixtureSets below) loads each
+    // set as Rails does, as raw table rows; the other trees build and save
+    // a model per record.
+    let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
+    let fixture_set_reset = minitest
+        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+    let mut fixture_lcs = if fixture_set_reset {
+        crate::lower::fixture_to_library::lower_fixtures_to_raw_row_library_classes(app)
+    } else {
+        crate::lower::lower_fixtures_to_library_classes(app)
+    };
     // Same vestige as the view pipeline above, for the same reason:
     // fixture classes are synthesized here, after the shared post-
     // analyze hooks have already run over the App, so an ERB tag's
@@ -1166,10 +1177,7 @@ pub fn emit_with_assertions(
     // tables before each test touched every model (Core: 1,421 of them,
     // an autoload each) and ran an unmodelled table's DELETE on
     // ActiveRecord::Base's pool, which Core points at a replica.
-    let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
-    let test_reset = if minitest
-        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
-    {
+    let test_reset = if fixture_set_reset {
         TestReset::FixtureSets(fixture_set_rows(app, &fixture_lcs))
     } else {
         TestReset::Truncate(truncate_lines.clone())
@@ -2290,6 +2298,7 @@ fn fixture_set_rows(app: &App, fixture_lcs: &[LibraryClass]) -> Vec<FixtureSetRo
         .iter()
         .map(|f| (format!("{}Fixtures", crate::naming::camelize(f.name.as_str())), f))
         .collect();
+    let tables = crate::lower::fixtures::fixture_table_names(app);
     fixture_lcs
         .iter()
         .filter_map(|lc| {
@@ -2298,11 +2307,11 @@ fn fixture_set_rows(app: &App, fixture_lcs: &[LibraryClass]) -> Vec<FixtureSetRo
             debug_assert!(fixture.is_some(), "fixture module {module} has no fixture");
             let fixture = fixture?;
             let class = fixture.class_id();
-            let table = app
-                .models
-                .iter()
-                .find(|m| m.name == class)
-                .map(|m| m.table.0.as_str().to_string())
+            // The table the set's rows insert into, by the app's loader:
+            // `_fixture: table_name`, an STI subclass's base table.
+            let table = tables
+                .get(&fixture.name)
+                .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| fixture.name.as_str().to_string());
             Some(FixtureSetRow {
                 set: fixture.path.as_str().to_string(),

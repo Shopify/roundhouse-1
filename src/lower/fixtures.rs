@@ -13,6 +13,8 @@
 //! Crystal might emit DB.exec. That's per-target.
 
 use crate::dialect::{Association, Fixture, FixtureValue, Model};
+use crate::schema::ColumnType;
+use indexmap::IndexMap;
 use crate::expr::Expr;
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
@@ -402,4 +404,635 @@ pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Raw fixture rows: the CRuby PostgreSQL tree.
+//
+// Rails loads a fixture set as table rows: `ActiveRecord::FixtureSet`
+// turns each YAML record into a column → value Hash, and
+// `insert_fixtures_set` writes them with one multi-row INSERT per table,
+// casting each value through its column's type. No model is
+// instantiated, so no writer, callback or validation runs. The plan
+// below is that row, resolved at compile time where the YAML decides it
+// (ids, references, enum labels), and left to the runtime's column cast
+// where it does not (ERB values, `now`). The CRuby runtime inserts it
+// (`ActiveRecord::TestFixtures.insert_fixture_rows`).
+
+/// Which loader's rules decide a set's table, ids and references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureRules {
+    /// Rails' `ActiveRecord::FixtureSet` (TableRow): the model's table,
+    /// enum labels mapped, `belongs_to` names resolved through the model.
+    Rails,
+    /// Shopify Core's `FasterFixtures::FixtureSet`, which Core's tests
+    /// load fixtures with: the table is `_fixture: table_name` or the
+    /// set name, `island` is stamped, a reference resolves through the
+    /// table's `<name>_id` column first, and enum labels are not mapped.
+    FasterFixtures,
+}
+
+/// The app's fixture loader. Core carries `FasterFixtures::FixtureSet`
+/// (components/platform/essentials/lib/platform/testing/faster_fixtures),
+/// and its test boot loads every set through it; every other app loads
+/// through Rails.
+pub fn fixture_rules(app: &App) -> FixtureRules {
+    let faster = app
+        .library_classes
+        .iter()
+        .any(|lc| lc.name.0.as_str().trim_start_matches("::") == "FasterFixtures::FixtureSet");
+    if faster { FixtureRules::FasterFixtures } else { FixtureRules::Rails }
+}
+
+/// One value of a raw fixture row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RawFixtureValue {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    /// An integer wider than `i64`, as its decimal digits.
+    BigInt(String),
+    Float(f64),
+    Str(String),
+    /// A YAML mapping or sequence, in source order: the column cast
+    /// decides (JSON for a json column, a YAML dump for a text one).
+    Structured(serde_yaml_ng::Value),
+    /// A `<%= … %>` value, cast by the runtime.
+    Ruby(Expr),
+    /// A reference whose label an ERB tag produces: the runtime turns it
+    /// into the referenced row's id (`identify`, by the column's type).
+    /// `integer_passes` is FasterFixtures' rule that an Integer is the id.
+    RubyReference { value: Expr, uuid: bool, integer_passes: bool },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawFixtureRow {
+    pub label: Symbol,
+    /// Column → value, in YAML order with generated keys after.
+    pub values: IndexMap<Symbol, RawFixtureValue>,
+    /// What the label's accessor passes to `<Model>.find`: one value, or
+    /// (for a composite-key model) the key's values in order.
+    pub find_key: Vec<RawFixtureValue>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawFixtureSet {
+    /// The flattened set name (`fulfillments_batches`): the module name.
+    pub name: Symbol,
+    /// Rails' set name (`fulfillments/batches`).
+    pub path: Symbol,
+    pub class: ClassId,
+    pub table: Symbol,
+    /// The table's writable columns with their cast type
+    /// (`column_cast_type`), in schema order. `None` when the schema has
+    /// no such table.
+    pub columns: Option<Vec<(Symbol, &'static str)>>,
+    /// The timestamp columns the loader fills with `now` when a row
+    /// omits them.
+    pub timestamps: Vec<Symbol>,
+    /// `<Model>.find` takes the key as an Array.
+    pub composite_find: bool,
+    pub rows: Vec<RawFixtureRow>,
+    pub preamble: Vec<Expr>,
+    /// Refusals the set raises, by name, when it loads (the first one).
+    pub errors: Vec<String>,
+}
+
+/// Rails' `ActiveRecord::FixtureSet::MAX_ID`.
+const FIXTURE_MAX_ID: u32 = (1 << 30) - 1;
+
+/// `ActiveRecord::FixtureSet.identify(label)`: `Zlib.crc32(label) % MAX_ID`.
+pub fn fixture_identify(label: &str) -> i64 {
+    i64::from(crc32(label.as_bytes()) % FIXTURE_MAX_ID)
+}
+
+/// `ActiveRecord::FixtureSet.identify(label, :uuid)`:
+/// `Digest::UUID.uuid_v5(Digest::UUID::OID_NAMESPACE, label)`.
+pub fn fixture_identify_uuid(label: &str) -> String {
+    const OID_NAMESPACE: [u8; 16] = [
+        0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    ];
+    let mut input = OID_NAMESPACE.to_vec();
+    input.extend_from_slice(label.as_bytes());
+    let mut d = sha1(&input);
+    d[6] = (d[6] & 0x0f) | 0x50;
+    d[8] = (d[8] & 0x3f) | 0x80;
+    let hex: String = d[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+fn identify_value(label: &str, uuid: bool) -> RawFixtureValue {
+    if uuid {
+        RawFixtureValue::Str(fixture_identify_uuid(label))
+    } else {
+        RawFixtureValue::Int(fixture_identify(label))
+    }
+}
+
+/// zlib's CRC-32 (IEEE 802.3, reflected).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// SHA-1 (FIPS 180-4), for `uuid_v5`.
+fn sha1(message: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+    let mut data = message.to_vec();
+    let bit_len = (message.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in data.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// The cast the runtime applies to a column's fixture value, by the
+/// ActiveModel type Rails' PostgreSQL adapter looks up for it.
+pub fn column_cast_type(col: &ColumnType) -> &'static str {
+    match col {
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } => "integer",
+        ColumnType::Float => "float",
+        ColumnType::Decimal { .. } => "decimal",
+        ColumnType::String { .. } | ColumnType::Text => "string",
+        ColumnType::Boolean => "boolean",
+        ColumnType::Date => "date",
+        ColumnType::DateTime => "datetime",
+        ColumnType::Time => "time",
+        ColumnType::Binary => "binary",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
+        ColumnType::Uuid => "uuid",
+    }
+}
+
+/// The app's models by name, and each library class's parent: an STI
+/// subclass is a library class, not a Model, and loads through its base.
+struct ModelIndex<'a> {
+    models: crate::det::HashMap<&'a ClassId, &'a Model>,
+    parents: crate::det::HashMap<&'a ClassId, &'a ClassId>,
+}
+
+impl<'a> ModelIndex<'a> {
+    fn new(app: &'a App) -> Self {
+        let mut models = crate::det::HashMap::default();
+        for m in &app.models {
+            models.entry(&m.name).or_insert(m);
+        }
+        let mut parents = crate::det::HashMap::default();
+        for lc in &app.library_classes {
+            if let Some(parent) = &lc.parent {
+                parents.entry(&lc.name).or_insert(parent);
+            }
+        }
+        ModelIndex { models, parents }
+    }
+
+    /// The model `class` is, or the model it descends from.
+    fn model_for(&self, class: &ClassId) -> Option<&'a Model> {
+        if let Some(m) = self.models.get(class) {
+            return Some(m);
+        }
+        let mut cursor = class;
+        for _ in 0..16 {
+            let parent = self.parents.get(cursor)?;
+            if let Some(m) = self.models.get(parent) {
+                return Some(m);
+            }
+            cursor = parent;
+        }
+        None
+    }
+}
+
+/// The set's model: `_fixture: model_class`, else the path's class (an
+/// STI subclass answers its base model, whose table and associations it
+/// shares).
+fn fixture_model<'a>(fixture: &Fixture, index: &ModelIndex<'a>) -> Option<&'a Model> {
+    index.model_for(&fixture.class_id())
+}
+
+/// The model's table, as Rails' `table_name` answers it: an STI
+/// subclass's rows live in its base class's table.
+fn model_table(model: &Model, app: &App) -> Symbol {
+    let mut current = model;
+    for _ in 0..64 {
+        if app.schema.tables.contains_key(&current.table.0) {
+            return current.table.0.clone();
+        }
+        let Some(parent) = current
+            .parent
+            .as_ref()
+            .and_then(|p| app.models.iter().find(|m| &m.name == p))
+        else {
+            break;
+        };
+        current = parent;
+    }
+    model.table.0.clone()
+}
+
+/// The table a set's rows insert into. `_fixture: table_name` first (a
+/// FasterFixtures key); then, under Rails, the model's table (an STI
+/// subclass's base table); else Rails' `default_fixture_table_name`,
+/// the set name with `/` as `_`, which is what FasterFixtures uses.
+fn fixture_table_name(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, rules: FixtureRules) -> Symbol {
+    if let Some(table) = &fixture.table_name {
+        return table.clone();
+    }
+    if rules == FixtureRules::Rails {
+        if let Some(model) = fixture_model(fixture, index) {
+            return model_table(model, app);
+        }
+    }
+    fixture.name.clone()
+}
+
+/// Each set's table (`fixture_table_name`), by set name.
+pub fn fixture_table_names(app: &App) -> crate::det::HashMap<Symbol, Symbol> {
+    let rules = fixture_rules(app);
+    let index = ModelIndex::new(app);
+    app.fixtures
+        .iter()
+        .map(|f| (f.name.clone(), fixture_table_name(f, app, &index, rules)))
+        .collect()
+}
+
+/// Every set's raw rows, in declaration order.
+pub fn lower_fixture_rows(app: &App) -> Vec<RawFixtureSet> {
+    let rules = fixture_rules(app);
+    let index = ModelIndex::new(app);
+    app.fixtures.iter().map(|f| lower_raw_fixture_set(f, app, &index, rules)).collect()
+}
+
+const TIMESTAMP_COLUMNS: [&str; 4] = ["created_at", "created_on", "updated_at", "updated_on"];
+
+fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, rules: FixtureRules) -> RawFixtureSet {
+    let class = fixture.class_id();
+    let model = fixture_model(fixture, index);
+    let table_name = fixture_table_name(fixture, app, index, rules);
+    let table = app.schema.tables.get(&table_name);
+    let mut errors = Vec::new();
+    // Rails' PostgreSQL adapter supports virtual columns, so a generated
+    // column is not one the INSERT can name.
+    let columns: Option<Vec<(Symbol, &'static str)>> = table.map(|t| {
+        t.columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .map(|c| (c.name.clone(), column_cast_type(&c.col_type)))
+            .collect()
+    });
+    if table.is_none() {
+        errors.push(format!(
+            "roundhouse: fixture set `{}`: table `{}` is not in this tree's schema",
+            fixture.path, table_name
+        ));
+    }
+    let col_type = |name: &str| -> Option<&'static str> {
+        columns.as_ref()?.iter().find(|(c, _)| c.as_str() == name).map(|(_, t)| *t)
+    };
+    let has_col = |name: &str| col_type(name).is_some();
+    let defaulted: Vec<Symbol> = table
+        .map(|t| t.columns.iter().filter(|c| c.default.is_some()).map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+
+    // Rails fills timestamps for a model that records them; FasterFixtures
+    // for every table that has the columns.
+    let timestamps: Vec<Symbol> = if rules == FixtureRules::FasterFixtures || model.is_some() {
+        TIMESTAMP_COLUMNS.iter().filter(|c| has_col(c)).map(|c| Symbol::from(*c)).collect()
+    } else {
+        Vec::new()
+    };
+
+    // The table's key, as the schema cache answers `primary_keys`.
+    let table_pk: Vec<Symbol> = table
+        .map(|t| {
+            if !t.primary_key_columns.is_empty() {
+                t.primary_key_columns.clone()
+            } else {
+                t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect()
+            }
+        })
+        .unwrap_or_default();
+    // The model's key, which `find` takes.
+    let model_pk: Vec<Symbol> = match model {
+        Some(m) if !m.composite_primary_key.is_empty() => m.composite_primary_key.clone(),
+        Some(m) => vec![m.primary_key.clone().unwrap_or_else(|| Symbol::from("id"))],
+        None if table_pk.len() > 1 => table_pk.clone(),
+        None => vec![table_pk.first().cloned().unwrap_or_else(|| Symbol::from("id"))],
+    };
+    let composite_find = model_pk.len() > 1;
+
+    let mut rows = Vec::new();
+    for (label, fields) in &fixture.records {
+        let mut row: IndexMap<Symbol, RawFixtureValue> = IndexMap::new();
+        for (key, value) in fields {
+            let v = match value {
+                FixtureValue::Scalar(raw) => scalar_fixture_value(fixture, label, key, raw),
+                FixtureValue::Ruby(expr) => RawFixtureValue::Ruby(expr.clone()),
+            };
+            row.insert(key.clone(), v);
+        }
+        match rules {
+            FixtureRules::FasterFixtures => faster_fixtures_row(
+                fixture, label, &mut row, model, &table_pk, &defaulted, &col_type, &mut errors,
+            ),
+            FixtureRules::Rails => rails_row(label, &mut row, model, &model_pk, &col_type),
+        }
+        let find_key = model_pk
+            .iter()
+            .map(|k| match row.get(k) {
+                Some(RawFixtureValue::Ruby(_) | RawFixtureValue::RubyReference { .. }) | None => {
+                    RawFixtureValue::Nil
+                }
+                Some(v) => v.clone(),
+            })
+            .collect();
+        rows.push(RawFixtureRow { label: label.clone(), values: row, find_key });
+    }
+
+    RawFixtureSet {
+        name: fixture.name.clone(),
+        path: fixture.path.clone(),
+        class,
+        table: table_name,
+        columns,
+        timestamps,
+        composite_find,
+        rows,
+        preamble: fixture.preamble.clone(),
+        errors,
+    }
+}
+
+/// A YAML scalar as the value Psych loaded: `records` keeps the text,
+/// `scalar_kinds` the type. Rails interpolates `$LABEL` into strings.
+fn scalar_fixture_value(fixture: &Fixture, label: &Symbol, key: &Symbol, raw: &str) -> RawFixtureValue {
+    use crate::dialect::FixtureScalarKind as K;
+    match fixture.scalar_kind(label, key) {
+        Some(K::Null) => RawFixtureValue::Nil,
+        Some(K::Bool) => RawFixtureValue::Bool(raw == "true"),
+        Some(K::Int) => raw
+            .parse::<i64>()
+            .map(RawFixtureValue::Int)
+            .unwrap_or_else(|_| RawFixtureValue::BigInt(raw.to_string())),
+        Some(K::Float) => match raw.parse::<f64>() {
+            Ok(f) if f.is_finite() => RawFixtureValue::Float(f),
+            _ => RawFixtureValue::Str(raw.to_string()),
+        },
+        // `records` keeps it as JSON text, which YAML reads back with
+        // its keys in source order.
+        Some(K::Mapping | K::Sequence) => serde_yaml_ng::from_str::<serde_yaml_ng::Value>(raw)
+            .map(RawFixtureValue::Structured)
+            .unwrap_or_else(|_| RawFixtureValue::Str(raw.to_string())),
+        None => RawFixtureValue::Str(raw.replace("$LABEL", label.as_str())),
+    }
+}
+
+/// `FasterFixtures::FixtureSet#read_fixture_files` and `#table_rows`.
+#[allow(clippy::too_many_arguments)]
+fn faster_fixtures_row(
+    fixture: &Fixture,
+    label: &Symbol,
+    row: &mut IndexMap<Symbol, RawFixtureValue>,
+    model: Option<&Model>,
+    table_pk: &[Symbol],
+    defaulted: &[Symbol],
+    col_type: &dyn Fn(&str) -> Option<&'static str>,
+    errors: &mut Vec<String>,
+) {
+    let has_col = |name: &str| col_type(name).is_some();
+    let is_uuid = |name: &str| col_type(name) == Some("uuid");
+    let absent = |row: &IndexMap<Symbol, RawFixtureValue>, k: &str| {
+        matches!(row.get(&Symbol::from(k)), None | Some(RawFixtureValue::Nil))
+    };
+    // stamp_default_shop_island: ISLAND_COLUMN "island", DEFAULT_ISLAND 0.
+    if has_col("island") && absent(row, "island") {
+        row.insert(Symbol::from("island"), RawFixtureValue::Int(0));
+    }
+    // default_identifier_column: the single key, or "id" for a composite one.
+    let pk_name: Option<Symbol> = match table_pk {
+        [] => None,
+        [one] => Some(one.clone()),
+        _ => Some(Symbol::from("id")),
+    };
+    match &pk_name {
+        Some(pk) if has_col(pk.as_str()) => {
+            if absent(row, pk.as_str()) {
+                row.insert(pk.clone(), identify_value(label.as_str(), is_uuid(pk.as_str())));
+            }
+        }
+        _ if table_pk.len() > 1 => {
+            // A composite key without an `id` column: every key column
+            // comes from the YAML (an association key, or a column default).
+            let missing: Vec<&str> = table_pk
+                .iter()
+                .filter(|c| {
+                    !row.contains_key(*c)
+                        && !(c.as_str() == "shop_id" && row.contains_key(&Symbol::from("shop")))
+                        && !defaulted.contains(c)
+                })
+                .map(|c| c.as_str())
+                .collect();
+            if !missing.is_empty() {
+                errors.push(format!(
+                    "Fixture \"{label}\" in {} is missing primary key column(s): {}. Tables with a composite primary key and no `id` column require all PK columns to be provided in the fixture YAML, either as columns or via association keys (columns with database defaults are exempt).",
+                    fixture.path,
+                    missing.join(", ")
+                ));
+            }
+        }
+        _ => {}
+    }
+    if pk_name.as_ref().map(|p| p.as_str()) != Some("id") && has_col("id") && !row.contains_key(&Symbol::from("id")) {
+        row.insert(Symbol::from("id"), identify_value(label.as_str(), is_uuid("id")));
+    }
+
+    // table_rows: a key that names no column is a reference — through the
+    // `<key>_id` column, else the association's one writable foreign key.
+    let keys: Vec<Symbol> = row.keys().filter(|k| !has_col(k.as_str())).cloned().collect();
+    for key in keys {
+        let mut fk_id = format!("{key}_id");
+        let mut fk_type = format!("{key}_type");
+        if !has_col(&fk_id) {
+            let assoc = model.and_then(|m| {
+                m.associations().find_map(|a| match a {
+                    Association::BelongsTo { name, foreign_key, .. } if name == &key => Some(foreign_key.clone()),
+                    _ => None,
+                })
+            });
+            match assoc {
+                Some(fk) if has_col(fk.as_str()) => {
+                    fk_id = fk.as_str().to_string();
+                    fk_type = format!("{key}_type");
+                }
+                _ => continue,
+            }
+        }
+        let Some(value) = row.shift_remove(&key) else { continue };
+        let uuid = is_uuid(&fk_id);
+        let resolved = match value {
+            RawFixtureValue::Nil | RawFixtureValue::Bool(false) => continue,
+            RawFixtureValue::Int(i) => RawFixtureValue::Int(i),
+            RawFixtureValue::BigInt(s) => RawFixtureValue::BigInt(s),
+            RawFixtureValue::Str(s) => {
+                if let Some((target, class)) = polymorphic_fixture_value(&s) {
+                    row.insert(Symbol::from(fk_type.as_str()), RawFixtureValue::Str(class));
+                    identify_value(&target, uuid)
+                } else {
+                    identify_value(&s, uuid)
+                }
+            }
+            RawFixtureValue::Ruby(expr) => {
+                RawFixtureValue::RubyReference { value: expr, uuid, integer_passes: true }
+            }
+            other => {
+                let text = match &other {
+                    RawFixtureValue::Bool(b) => b.to_string(),
+                    RawFixtureValue::Float(f) => f.to_string(),
+                    RawFixtureValue::Structured(v) => serde_json::to_string(v).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                identify_value(&text, uuid)
+            }
+        };
+        row.insert(Symbol::from(fk_id.as_str()), resolved);
+    }
+}
+
+/// FasterFixtures' POLYMORPHIC_VALUE, `/^(\S+)\s*\(([^\)]*)\)\s*$/`.
+fn polymorphic_fixture_value(s: &str) -> Option<(String, String)> {
+    let trimmed = s.trim_end();
+    let inner = trimmed.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    let (head, class) = (&inner[..open], &inner[open + 1..]);
+    if class.contains(')') {
+        return None;
+    }
+    let target = head.trim_end();
+    if target.is_empty() || target.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((target.to_string(), class.to_string()))
+}
+
+/// Rails' `TableRow#fill_row_model_attributes` (key, enums, belongs_to).
+fn rails_row(
+    label: &Symbol,
+    row: &mut IndexMap<Symbol, RawFixtureValue>,
+    model: Option<&Model>,
+    model_pk: &[Symbol],
+    col_type: &dyn Fn(&str) -> Option<&'static str>,
+) {
+    let Some(model) = model else { return };
+    let has_col = |name: &str| col_type(name).is_some();
+    let is_uuid = |name: &str| col_type(name) == Some("uuid");
+    // generate_primary_key / generate_composite_primary_key.
+    if model_pk.len() > 1 {
+        let id = fixture_identify(label.as_str());
+        for (index, column) in model_pk.iter().enumerate() {
+            if has_col(column.as_str()) && !row.contains_key(column) {
+                let value = ((i128::from(id) << index) % i128::from(FIXTURE_MAX_ID)) as i64;
+                row.insert(column.clone(), RawFixtureValue::Int(value));
+            }
+        }
+    } else if let Some(pk) = model_pk.first() {
+        if has_col(pk.as_str()) && !row.contains_key(pk) {
+            row.insert(pk.clone(), identify_value(label.as_str(), is_uuid(pk.as_str())));
+        }
+    }
+    // resolve_enums: a label becomes its stored value.
+    for (column, mapping) in &model.enums {
+        if let Some(RawFixtureValue::Str(raw)) = row.get(column) {
+            if let Some((_, stored)) = mapping.iter().find(|(l, _)| l == raw) {
+                let stored = match stored {
+                    crate::expr::Literal::Int { value } => RawFixtureValue::Int(*value),
+                    crate::expr::Literal::Str { value } => RawFixtureValue::Str(value.clone()),
+                    _ => continue,
+                };
+                row.insert(column.clone(), stored);
+            }
+        }
+    }
+    // resolve_sti_reflections: a belongs_to name is its foreign key.
+    for assoc in model.associations() {
+        let Association::BelongsTo { name, foreign_key, polymorphic, .. } = assoc else { continue };
+        if name == foreign_key || !row.contains_key(name) {
+            continue;
+        }
+        let value = row.shift_remove(name).expect("present");
+        let uuid = is_uuid(foreign_key.as_str());
+        let resolved = match value {
+            RawFixtureValue::Nil | RawFixtureValue::Bool(false) => continue,
+            RawFixtureValue::Str(mut s) => {
+                if *polymorphic {
+                    if let Some(open) = s.rfind('(') {
+                        let tail = s[open + 1..].trim_end();
+                        if let Some(class) = tail.strip_suffix(')') {
+                            if !class.contains(')') {
+                                row.insert(Symbol::from(format!("{name}_type")), RawFixtureValue::Str(class.to_string()));
+                                s = s[..open].trim_end().to_string();
+                            }
+                        }
+                    }
+                }
+                identify_value(&s, uuid)
+            }
+            RawFixtureValue::Int(i) => identify_value(&i.to_string(), uuid),
+            RawFixtureValue::Ruby(expr) => {
+                RawFixtureValue::RubyReference { value: expr, uuid, integer_passes: false }
+            }
+            other => {
+                let text = match &other {
+                    RawFixtureValue::Bool(b) => b.to_string(),
+                    RawFixtureValue::Float(f) => f.to_string(),
+                    RawFixtureValue::BigInt(s) => s.clone(),
+                    RawFixtureValue::Structured(v) => serde_json::to_string(v).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                identify_value(&text, uuid)
+            }
+        };
+        row.insert(foreign_key.clone(), resolved);
+    }
 }
