@@ -316,3 +316,193 @@ fn unmodeled_file_level_loader_calls_are_refused_at_their_lines() {
         assert!(text.contains(expected), "missing {expected}:\n{text}");
     }
 }
+
+/// dux-event-reporter 0.4.1's shape (`lib/dux/event_reporter.rb`): the
+/// gem's namespace module builds its own loader with
+/// `Zeitwerk::Loader.new`, tags it, roots it at the gem's
+/// `event_reporter/` directory as that module (`push_dir(dir,
+/// namespace: self)`), ignores the version file the entry requires
+/// itself, and sets it up.
+const DUX_ENTRY: &str = r#"require "zeitwerk"
+
+module Dux
+  module EventReporter
+    LOADER = Zeitwerk::Loader.new
+    private_constant :LOADER
+
+    LOADER.tag = "dux-event-reporter"
+    LOADER.push_dir(File.expand_path("event_reporter", __dir__), namespace: self)
+    LOADER.ignore(File.expand_path("event_reporter/version.rb", __dir__))
+    LOADER.setup
+  end
+end
+
+require_relative "event_reporter/version"
+
+module Dux
+  module EventReporter
+    def self.loader
+      LOADER
+    end
+  end
+end
+"#;
+
+/// Zeitwerk would expect `Dux::EventReporter::Version` here, which is
+/// why the gem ignores the file.
+const DUX_VERSION: &str = r#"module Dux
+  module EventReporter
+    VERSION = "0.4.1"
+  end
+end
+"#;
+
+const DUX_FOO: &str = r##"module Dux
+  module EventReporter
+    class Foo
+      def self.hi = "foo #{VERSION}"
+    end
+  end
+end
+"##;
+
+const DUX_REPORT: &str = r#"out = []
+out << Dux::EventReporter.autoload?(:Foo).nil?
+out << Dux::EventReporter::Foo.hi
+out << Dux::EventReporter::VERSION
+out << defined?(Dux::EventReporter::Version).inspect
+out << Dux::EventReporter.loader.eager_load.inspect
+puts out.join("|")
+"#;
+
+/// Every `RoundhouseAutoload.loader("Name")` an emitted file holds,
+/// with the file.
+fn emitted_loader_handles(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rb") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("RoundhouseAutoload.loader(\"") {
+                let tail = &rest[at + "RoundhouseAutoload.loader(\"".len()..];
+                let end = tail.find('"').unwrap();
+                out.push((tail[..end].to_string(), path.display().to_string()));
+                rest = &tail[end..];
+            }
+        }
+    }
+    out
+}
+
+/// The files the generated `LOADERS` lists for `name`, `None` when it
+/// has no entry.
+fn loaders_entry(models: &str, name: &str) -> Option<Vec<String>> {
+    let table = &models[models.find("  LOADERS = {\n")?..];
+    let table = &table[..table.find("  }.freeze\n")?];
+    let key = format!("    {name:?} => [\n");
+    let body = &table[table.find(&key)? + key.len()..];
+    let body = &body[..body.find("    ].freeze,")?];
+    Some(body.lines().map(|l| l.trim().trim_end_matches(',').trim_matches('"').to_string()).collect())
+}
+
+#[test]
+fn a_new_loader_rooted_at_a_namespace_dir_autoloads_it_and_is_registered() {
+    let files = [
+        ("gems/dux-event-reporter/lib/dux/event_reporter.rb", DUX_ENTRY),
+        ("gems/dux-event-reporter/lib/dux/event_reporter/version.rb", DUX_VERSION),
+        ("gems/dux-event-reporter/lib/dux/event_reporter/foo.rb", DUX_FOO),
+    ];
+    let native_root = std::env::temp_dir().join(format!("roundhouse-zeitwerk-dux-native-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&native_root);
+    for (path, text) in files {
+        let file = native_root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let native = emit_and_run::ruby()
+        .arg("-I")
+        .arg(native_root.join("gems/dux-event-reporter/lib"))
+        .arg("-e")
+        .arg(format!("require \"dux/event_reporter\"\n{DUX_REPORT}"))
+        .output()
+        .expect("spawn ruby");
+    let _ = std::fs::remove_dir_all(&native_root);
+    assert!(native.status.success(), "native oracle failed:\n{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(expected.trim(), "false|foo 0.4.1|0.4.1|nil|nil", "native oracle");
+
+    // The gem's lib is a support root; the first reference to
+    // `Dux::EventReporter` loads the entry, where the oracle requires it.
+    let mut overlay = emit_and_run::real_blog().edit(
+        "Gemfile.lock",
+        "GEM\n  remote: https://rubygems.org/\n",
+        "PATH\n  remote: gems/dux-event-reporter\n  specs:\n    dux-event-reporter (0.4.1)\n\nGEM\n  remote: https://rubygems.org/\n",
+    );
+    for (path, text) in files {
+        overlay = overlay.write(path, text);
+    }
+    let run = overlay.run_ruby(DUX_REPORT);
+    assert!(run.errors.is_empty(), "{}", run.errors.join("\n"));
+    assert!(run.success, "emitted program failed in {}:\n{}", run.emitted.display(), run.stderr);
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+    let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).unwrap();
+    let managed = loaders_entry(&models, "Dux::EventReporter::LOADER")
+        .unwrap_or_else(|| panic!("no LOADERS entry for Dux::EventReporter::LOADER:\n{models}"));
+    assert!(managed.iter().any(|f| f == "models/dux/event_reporter/foo"), "{managed:?}");
+    // The ignored version file is the entry's own require, not the loader's.
+    assert!(!managed.iter().any(|f| f.contains("version")), "{managed:?}");
+    // A handle the tree holds is a loader the tree registers.
+    let handles = emitted_loader_handles(&run.emitted);
+    assert!(handles.iter().any(|(name, _)| name == "Dux::EventReporter::LOADER"), "{handles:?}");
+    for (name, file) in &handles {
+        assert!(loaders_entry(&models, name).is_some(), "{file} holds a handle for unregistered loader {name}");
+    }
+}
+
+/// A `Zeitwerk::Loader.new` whose root this compile cannot read is
+/// refused at its own line, so no handle names a loader the tree does
+/// not register; `tag=` of a computed value and a `namespace:` Ruby
+/// would reject are refused at theirs.
+#[test]
+fn a_new_loader_without_a_modeled_root_is_refused_at_its_line() {
+    let root = std::env::temp_dir().join(format!("roundhouse-zeitwerk-new-refused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let entry = "module Fn\n  BARE = Zeitwerk::Loader.new\n  BARE.setup\n  COMPUTED = Zeitwerk::Loader.new\n  COMPUTED.push_dir(Dir.pwd)\n  COMPUTED.setup\n  TAGGED = Zeitwerk::Loader.new\n  TAGGED.push_dir(File.join(__dir__, \"fn\"), namespace: self)\n  TAGGED.tag = name\n  TAGGED.setup\n  RELATIVE = Zeitwerk::Loader.new\n  RELATIVE.push_dir(File.join(__dir__, \"fn\"), namespace: Parts)\nend\n\nLOADER = Zeitwerk::Loader.new\nLOADER.push_dir(\"#{__dir__}/fn\", namespace: self)\n";
+    for (path, text) in [
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("Gemfile.lock", "PATH\n  remote: gems/fn\n  specs:\n    fn (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n"),
+        ("gems/fn/lib/fn.rb", entry),
+        ("gems/fn/lib/fn/widget.rb", "module Fn\n  class Widget\n  end\nend\n"),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg(&root).output().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    for expected in [
+        "fn.rb:2:10: error[ingest_unsupported]: `Zeitwerk::Loader.new` with no `push_dir` on it later in the same body is not modeled",
+        "fn.rb:4:14: error[ingest_unsupported]: `Zeitwerk::Loader.new` whose `push_dir` is not modeled: `Zeitwerk::Loader#push_dir` of a path that is not a literal under `__dir__` is not modeled",
+        "fn.rb:9:3: error[ingest_unsupported]: `Zeitwerk::Loader#tag=` of anything but a literal string is not modeled",
+        "fn.rb:11:14: error[ingest_unsupported]: `Zeitwerk::Loader.new` whose `push_dir` is not modeled: `Zeitwerk::Loader#push_dir` with a relative constant `namespace:` in a class body",
+        "fn.rb:15:10: error[ingest_unsupported]: `Zeitwerk::Loader.new` whose `push_dir` is not modeled: `Zeitwerk::Loader#push_dir` with `namespace: self` at file level raises",
+    ] {
+        assert!(text.contains(expected), "missing {expected}:\n{text}");
+    }
+    // The calls on a refused loader never run (its constant raises
+    // first), so they add nothing.
+    for line in [3, 5, 6, 12, 16] {
+        assert!(!text.contains(&format!("fn.rb:{line}:")), "line {line} reported:\n{text}");
+    }
+}

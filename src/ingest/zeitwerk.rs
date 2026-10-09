@@ -23,7 +23,20 @@
 //! ```
 //!
 //! (shopify_errors and schema-migrations hold theirs in a local,
-//! `loader = Zeitwerk::Loader.for_gem`).
+//! `loader = Zeitwerk::Loader.for_gem`), and a gem's namespace module
+//! can build one by hand (dux-event-reporter 0.4.1's
+//! `lib/dux/event_reporter.rb`):
+//!
+//! ```ruby
+//! module Dux
+//!   module EventReporter
+//!     LOADER = Zeitwerk::Loader.new
+//!     private_constant :LOADER
+//!     LOADER.tag = "dux-event-reporter"
+//!     LOADER.push_dir(File.expand_path("event_reporter", __dir__), namespace: self)
+//!     LOADER.ignore(File.expand_path("event_reporter/version.rb", __dir__))
+//!     LOADER.setup
+//! ```
 //!
 //! The emitted tree does not run Zeitwerk. The gem's `lib/` is already a
 //! support root, so its files are carried and the generated
@@ -31,14 +44,24 @@
 //! Zeitwerk's own model (`project::apply_models_autoload`). What the
 //! loader adds is read here, statically: its root directory (the calling
 //! file's directory for `for_gem` and `for_gem_extension`, the `push_dir`
-//! argument for `Loader.new`), its root namespace (`Object`, or the
-//! module `for_gem_extension` names), the paths it ignores, its literal
+//! argument for `Loader.new`), its root namespace (`Object`, the module
+//! `for_gem_extension` names, or `push_dir`'s `namespace:`: `self` in a
+//! class body, or a constant), the paths it ignores, its literal
 //! inflection overrides, whether it is set up, and the directories it
 //! eager-loads. A file under an ignored path, or under a loader that is
 //! never set up, is not autoloaded or eager-loaded, exactly as Zeitwerk
-//! leaves it alone. The loader itself becomes the generated
-//! `RoundhouseAutoload.loader` handle, whose `eager_load` loads the
-//! loader's files.
+//! leaves it alone. `tag=` of a literal only names the loader in
+//! Zeitwerk's logs, which the compiled loader does not write. The loader
+//! itself becomes the generated `RoundhouseAutoload.loader` handle, whose
+//! `eager_load` loads the loader's files.
+//!
+//! A handle is only ever emitted for a loader the generated `LOADERS`
+//! registers, so every declared loader has its root when it is declared.
+//! `Zeitwerk::Loader.new` has none of its own: its declaration reads the
+//! first `push_dir` on it among the later statements of the same body. A
+//! `Loader.new` with no such `push_dir`, or with one this does not model,
+//! is refused at the constructor; the calls on a refused loader add
+//! nothing, since its own refusal raises before any of them runs.
 //!
 //! `eager_load_dir(dir)` stays at its site as a call on the handle with
 //! the directory's namespace, which this compiles with the loader's
@@ -89,9 +112,11 @@ pub(super) struct LoaderDecl {
     /// `local@app/relative/file.rb` for a file-level local.
     pub constant: String,
     /// The directory it manages, absolute like the walk's entries.
-    pub root: Option<PathBuf>,
+    pub root: PathBuf,
     /// The root directory's namespace (`["GraphQL"]` for
-    /// `for_gem_extension(GraphQL)`); empty for `Object`.
+    /// `for_gem_extension(GraphQL)`, `["Dux", "EventReporter"]` for
+    /// `push_dir(dir, namespace: self)` in that module); empty for
+    /// `Object`.
     pub namespace: Vec<String>,
     /// Paths (file or directory) it ignores, absolute.
     pub ignores: Vec<PathBuf>,
@@ -103,29 +128,56 @@ pub(super) struct LoaderDecl {
     pub eager_dirs: Vec<PathBuf>,
 }
 
+/// A loader constructor the walk has seen, under its handle name.
+#[derive(Clone, Debug, PartialEq)]
+enum Declared {
+    /// Compiled: the handle the constant or local holds is registered.
+    Modeled(LoaderDecl),
+    /// Refused at its constructor; no handle names it.
+    Refused(String),
+}
+
+impl Declared {
+    fn key(&self) -> &str {
+        match self {
+            Declared::Modeled(decl) => &decl.constant,
+            Declared::Refused(key) => key,
+        }
+    }
+}
+
 thread_local! {
-    static LOADERS: RefCell<Vec<LoaderDecl>> = const { RefCell::new(Vec::new()) };
+    static LOADERS: RefCell<Vec<Declared>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Every loader declared since the last drain, deduplicated (a file can
 /// be walked twice: as a model's nested classes and as library classes).
 pub(super) fn drain() -> Vec<LoaderDecl> {
-    let mut all = LOADERS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let all = LOADERS.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let mut out: Vec<LoaderDecl> = Vec::new();
-    for decl in all.drain(..) {
-        if !out.contains(&decl) {
-            out.push(decl);
+    for declared in all {
+        if let Declared::Modeled(decl) = declared {
+            if !out.contains(&decl) {
+                out.push(decl);
+            }
         }
     }
     out
 }
 
 fn with_loader<R>(constant: &str, f: impl FnOnce(&mut LoaderDecl) -> R) -> Option<R> {
-    LOADERS.with(|l| l.borrow_mut().iter_mut().rev().find(|d| d.constant == constant).map(f))
+    LOADERS.with(|l| match l.borrow_mut().iter_mut().rev().find(|d| d.key() == constant) {
+        Some(Declared::Modeled(decl)) => Some(f(decl)),
+        _ => None,
+    })
 }
 
-fn is_loader(constant: &str) -> bool {
-    LOADERS.with(|l| l.borrow().iter().any(|d| d.constant == constant))
+/// What the walk last declared under `constant`: `Some(true)` for a
+/// refused constructor, `Some(false)` for a compiled loader.
+fn declared(constant: &str) -> Option<bool> {
+    LOADERS.with(|l| {
+        l.borrow().iter().rev().find(|d| d.key() == constant).map(|d| matches!(d, Declared::Refused(_)))
+    })
 }
 
 /// Record a new loader. A second walk of the same file declares the
@@ -134,9 +186,48 @@ fn is_loader(constant: &str) -> bool {
 fn declare(decl: LoaderDecl) {
     LOADERS.with(|l| {
         let mut loaders = l.borrow_mut();
-        loaders.retain(|d| !(d.constant == decl.constant && d.root == decl.root && d.namespace == decl.namespace));
-        loaders.push(decl);
+        loaders.retain(|d| match d {
+            Declared::Modeled(d) => {
+                !(d.constant == decl.constant && d.root == decl.root && d.namespace == decl.namespace)
+            }
+            Declared::Refused(key) => *key != decl.constant,
+        });
+        loaders.push(Declared::Modeled(decl));
     });
+}
+
+/// Record a constructor refused under `key`, so the calls on it that
+/// follow are known to be calls on a loader that never exists.
+fn declare_refused(key: &str) {
+    LOADERS.with(|l| {
+        let mut loaders = l.borrow_mut();
+        loaders.retain(|d| !matches!(d, Declared::Refused(k) if k == key));
+        loaders.push(Declared::Refused(key.to_string()));
+    });
+}
+
+/// Where a loader is written: a class body (`self` is its owner) or a
+/// file's top level (`self` is main, and a local can hold the loader).
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    Body(&'a ClassId),
+    File,
+}
+
+/// The handle name a receiver refers to in `scope`: a constant (the
+/// owner's, in a class body), or a file-level local.
+fn key_of(receiver: &Node<'_>, scope: Scope<'_>, file: &str) -> Option<String> {
+    if let Some(name) = receiver.as_constant_read_node() {
+        let name = constant_id_str(&name.name());
+        return Some(match scope {
+            Scope::Body(owner) => qualified(owner, name),
+            Scope::File => name.to_string(),
+        });
+    }
+    match scope {
+        Scope::File => receiver.as_local_variable_read_node().map(|local| local_key(constant_id_str(&local.name()), file)),
+        Scope::Body(_) => None,
+    }
 }
 
 fn qualified(owner: &ClassId, name: &str) -> String {
@@ -195,21 +286,28 @@ fn is_zeitwerk_loader(node: Option<Node<'_>>) -> bool {
     })
 }
 
-/// Declare the loader `value` creates under `key`. `None` when `value`
-/// is not a `Zeitwerk::Loader` constructor; otherwise the value the
-/// constant or local holds: the generated handle, or a refusal for a
-/// form that is not modeled.
-fn declare_loader(value: &Node<'_>, key: &str, file: &str) -> Option<Expr> {
+/// Declare the loader `value` creates under `key`; `write` is the
+/// statement assigning it. `None` when `value` is not a
+/// `Zeitwerk::Loader` constructor; otherwise the value the constant or
+/// local holds: the generated handle of a loader declared with its root,
+/// or a refusal for a form that is not modeled.
+fn declare_loader(value: &Node<'_>, key: &str, file: &str, write: &Node<'_>, scope: Scope<'_>) -> Option<Expr> {
     let call = value.as_call_node()?;
     if !is_zeitwerk_loader(call.receiver()) {
         return None;
     }
+    let refused = |detail: String| {
+        declare_refused(key);
+        Some(refusal(value, file, detail))
+    };
     let method = constant_id_str(&call.name());
     let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     if call.block().is_some() {
-        return Some(refusal(value, file, format!("`Zeitwerk::Loader.{method}` with a block is not modeled")));
+        return refused(format!("`Zeitwerk::Loader.{method}` with a block is not modeled"));
     }
-    let calling_dir = || Path::new(file).parent().map(Path::to_path_buf);
+    let Some(calling_dir) = Path::new(file).parent().map(Path::to_path_buf) else {
+        return refused(format!("`Zeitwerk::Loader.{method}` in a file with no directory is not modeled"));
+    };
     let (root, namespace) = match method {
         // `for_gem` manages the calling file's directory.
         "for_gem" => {
@@ -224,15 +322,13 @@ fn declare_loader(value: &Node<'_>, key: &str, file: &str) -> Option<Expr> {
                     })
                 });
                 if !only_warn_option {
-                    return Some(refusal(
-                        value,
-                        file,
+                    return refused(
                         "`Zeitwerk::Loader.for_gem` argument other than a literal `warn_on_extra_files:` is not modeled"
                             .into(),
-                    ));
+                    );
                 }
             }
-            (calling_dir(), Vec::new())
+            (calling_dir, Vec::new())
         }
         // `for_gem_extension(Namespace)`: the calling file's directory,
         // as that namespace (zeitwerk 2.8.2 loader.rb:436, `push_dir(root_dir,
@@ -245,19 +341,38 @@ fn declare_loader(value: &Node<'_>, key: &str, file: &str) -> Option<Expr> {
                 _ => None,
             };
             let Some(namespace) = namespace else {
-                return Some(refusal(
-                    value,
-                    file,
+                return refused(
                     "`Zeitwerk::Loader.for_gem_extension` of anything but a constant naming the namespace is not modeled"
                         .into(),
-                ));
+                );
             };
             let namespace: Vec<String> = namespace.into_iter().filter(|s| !s.is_empty()).collect();
-            (calling_dir(), namespace)
+            (calling_dir, namespace)
         }
-        "new" if args.is_empty() => (None, Vec::new()),
+        // `Loader.new` has no root until `push_dir` adds one: the first
+        // `push_dir` on it later in the same body.
+        "new" if args.is_empty() => match following_push_dir(write, key, file, scope) {
+            Following::Root(root) => root,
+            Following::Refused(detail) => {
+                return refused(format!("`Zeitwerk::Loader.new` whose `push_dir` is not modeled: {detail}"));
+            }
+            Following::Absent => {
+                return refused(
+                    "`Zeitwerk::Loader.new` with no `push_dir` on it later in the same body is not modeled \
+                     (the compiled loader is read from the root directory `push_dir` gives it)"
+                        .into(),
+                );
+            }
+            Following::Unreadable => {
+                return refused(
+                    "`Zeitwerk::Loader.new` in a file whose source text is not registered is not modeled \
+                     (its later `push_dir` cannot be read)"
+                        .into(),
+                );
+            }
+        },
         other => {
-            return Some(refusal(value, file, format!("`Zeitwerk::Loader.{other}` is not modeled")));
+            return refused(format!("`Zeitwerk::Loader.{other}` is not modeled"));
         }
     };
     declare(LoaderDecl {
@@ -272,6 +387,142 @@ fn declare_loader(value: &Node<'_>, key: &str, file: &str) -> Option<Expr> {
     Some(handle(key, span_of(value, file)))
 }
 
+/// What [`following_push_dir`] finds for a `Loader.new`.
+enum Following {
+    /// The root directory and namespace the first later `push_dir` adds.
+    Root((PathBuf, Vec<String>)),
+    /// That `push_dir` is not modeled, and why.
+    Refused(String),
+    /// No later statement of the body calls `push_dir` on the loader, or
+    /// the write is not a statement of a body.
+    Absent,
+    /// The file's text is not registered, so the body cannot be read again.
+    Unreadable,
+}
+
+/// The first statement after `write` in the body holding it that calls
+/// `push_dir` on the loader `key`.
+///
+/// The walk hands this module one statement at a time, so the body is
+/// read again from the file's registered text.
+fn following_push_dir(write: &Node<'_>, key: &str, file: &str, scope: Scope<'_>) -> Following {
+    struct Body<'a, 's> {
+        write: (usize, usize),
+        key: &'a str,
+        file: &'a str,
+        scope: Scope<'s>,
+        found: Option<Option<Result<(PathBuf, Vec<String>), String>>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Body<'_, '_> {
+        fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+            if self.found.is_some() {
+                return;
+            }
+            let body: Vec<Node<'pr>> = node.body().iter().collect();
+            let at = body.iter().position(|stmt| {
+                (stmt.location().start_offset(), stmt.location().end_offset()) == self.write
+            });
+            let Some(at) = at else {
+                ruby_prism::visit_statements_node(self, node);
+                return;
+            };
+            self.found = Some(body[at + 1..].iter().find_map(|stmt| {
+                let call = stmt.as_call_node()?;
+                if constant_id_str(&call.name()) != "push_dir" {
+                    return None;
+                }
+                let on_loader = call.receiver().and_then(|r| key_of(&r, self.scope, self.file));
+                (on_loader.as_deref() == Some(self.key)).then(|| push_dir_root(&call, self.file, self.scope))
+            }));
+        }
+    }
+    let loc = write.location();
+    let mut body =
+        Body { write: (loc.start_offset(), loc.end_offset()), key, file, scope, found: None };
+    let read = super::sources::with_text(file, |text| {
+        let parsed = ruby_prism::parse(text.as_bytes());
+        ruby_prism::Visit::visit(&mut body, &parsed.node());
+    });
+    match (read, body.found.flatten()) {
+        (None, _) => Following::Unreadable,
+        (Some(()), Some(Ok(root))) => Following::Root(root),
+        (Some(()), Some(Err(detail))) => Following::Refused(detail),
+        (Some(()), None) => Following::Absent,
+    }
+}
+
+/// `push_dir(path)` or `push_dir(path, namespace: ns)` (zeitwerk 2.8.2
+/// loader/config.rb:129): the absolute root it adds and the root's
+/// namespace, or why the call is not modeled.
+fn push_dir_root(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+    scope: Scope<'_>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if call.block().is_some() {
+        return Err("`Zeitwerk::Loader#push_dir` with a block is not modeled".into());
+    }
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let (path, options) = match args.as_slice() {
+        [path] => (path, None),
+        [path, options] if options.as_keyword_hash_node().is_some() => (path, options.as_keyword_hash_node()),
+        _ => {
+            return Err(
+                "`Zeitwerk::Loader#push_dir` with arguments other than a path and `namespace:` is not modeled".into()
+            );
+        }
+    };
+    let Some(path) = literal_path(path, file) else {
+        return Err("`Zeitwerk::Loader#push_dir` of a path that is not a literal under `__dir__` is not modeled".into());
+    };
+    let mut namespace = Vec::new();
+    for element in options.iter().flat_map(|hash| hash.elements().iter()) {
+        let keyword = element.as_assoc_node().and_then(|assoc| {
+            (super::util::symbol_value(&assoc.key()).as_deref() == Some("namespace")).then(|| assoc.value())
+        });
+        let Some(value) = keyword else {
+            return Err(
+                "`Zeitwerk::Loader#push_dir` with a keyword other than `namespace:` raises ArgumentError, which is \
+                 not modeled"
+                    .into(),
+            );
+        };
+        namespace = push_dir_namespace(&value, scope)?;
+    }
+    Ok((path, namespace))
+}
+
+/// `push_dir`'s `namespace:` as a constant path, empty for `Object`.
+/// `self` is the class body's module; at file level it is main, which
+/// Zeitwerk rejects. A constant is read as written at file level and
+/// when rooted (`::Name`); a relative one in a class body resolves
+/// lexically, which is not modeled.
+fn push_dir_namespace(value: &Node<'_>, scope: Scope<'_>) -> Result<Vec<String>, String> {
+    if value.as_self_node().is_some() {
+        return match scope {
+            Scope::Body(owner) => Ok(owner.0.as_str().split("::").map(str::to_string).collect()),
+            Scope::File => Err("`Zeitwerk::Loader#push_dir` with `namespace: self` at file level raises \
+                                Zeitwerk::Error (main is not a class or module object), which is not modeled"
+                .into()),
+        };
+    }
+    fn static_path(node: &Node<'_>) -> bool {
+        node.as_constant_read_node().is_some()
+            || node.as_constant_path_node().is_some_and(|p| p.parent().is_none_or(|parent| static_path(&parent)))
+    }
+    if static_path(value) {
+        let rooted = value.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
+        if rooted || matches!(scope, Scope::File) {
+            let path = constant_path_of(value).unwrap_or_default();
+            return Ok(if path == ["Object"] { Vec::new() } else { path });
+        }
+        return Err("`Zeitwerk::Loader#push_dir` with a relative constant `namespace:` in a class body (resolved \
+                    lexically) is not modeled; `self` or a rooted `::Name` is"
+            .into());
+    }
+    Err("`Zeitwerk::Loader#push_dir` with a `namespace:` other than `self` or a constant is not modeled".into())
+}
+
 /// `NAME = Zeitwerk::Loader.for_gem` / `.for_gem_extension(Ns)` /
 /// `Zeitwerk::Loader.new`, in a class body (`owner`) or at file level
 /// (`owner` empty: the constant is Object's). `None` when the value is
@@ -283,7 +534,8 @@ pub(super) fn loader_constant(
     file: &str,
 ) -> Option<Expr> {
     let constant = qualified(owner, constant_id_str(&write.name()));
-    declare_loader(&write.value(), &constant, file)
+    let scope = if owner.0.as_str().is_empty() { Scope::File } else { Scope::Body(owner) };
+    declare_loader(&write.value(), &constant, file, &write.as_node(), scope)
 }
 
 /// What a call on a loader means.
@@ -301,10 +553,7 @@ enum Applied {
 /// one. `Some(None)` when it is applied statically; `Some(Some(refusal))`
 /// for a loader call that is not modeled, to keep at its site.
 pub(super) fn loader_call(stmt: &Node<'_>, owner: &ClassId, file: &str) -> Option<Option<Expr>> {
-    let key_of = |receiver: &Node<'_>| {
-        receiver.as_constant_read_node().map(|name| qualified(owner, constant_id_str(&name.name())))
-    };
-    match apply(stmt, file, &key_of, false)? {
+    match apply(stmt, file, Scope::Body(owner))? {
         Applied::Static => Some(None),
         Applied::Runs(_) => unreachable!("a class-body loader call never runs at its site"),
         Applied::Refused(detail) => Some(Some(refusal(stmt, file, detail))),
@@ -319,7 +568,7 @@ pub(super) fn file_loader_statement(stmt: &Node<'_>, file: &str) -> Option<Optio
     use crate::app::ProgramItem;
     if let Some(write) = stmt.as_local_variable_write_node() {
         let key = local_key(constant_id_str(&write.name()), file);
-        let value = declare_loader(&write.value(), &key, file)?;
+        let value = declare_loader(&write.value(), &key, file, stmt, Scope::File)?;
         let mut assign = super::expr::ingest_expr(stmt, file).ok()?;
         if let ExprNode::Assign { target: LValue::Var { .. }, value: written } = &mut *assign.node {
             *written = value;
@@ -328,13 +577,7 @@ pub(super) fn file_loader_statement(stmt: &Node<'_>, file: &str) -> Option<Optio
         }
         return Some(Some(ProgramItem::Statement(assign)));
     }
-    let key_of = |receiver: &Node<'_>| {
-        if let Some(name) = receiver.as_constant_read_node() {
-            return Some(constant_id_str(&name.name()).to_string());
-        }
-        receiver.as_local_variable_read_node().map(|local| local_key(constant_id_str(&local.name()), file))
-    };
-    Some(match apply(stmt, file, &key_of, true)? {
+    Some(match apply(stmt, file, Scope::File)? {
         Applied::Static => None,
         Applied::Runs(expr) => Some(ProgramItem::Statement(expr)),
         Applied::Refused(message) => Some(ProgramItem::NotCarried {
@@ -357,20 +600,24 @@ pub(super) fn file_loader_statement(stmt: &Node<'_>, file: &str) -> Option<Optio
 
 /// A call `stmt` on a loader: the innermost receiver of a chain
 /// (`LOADER.inflector.inflect(…)` calls `inflector` on it), resolved to a
-/// declared loader by `key_of`. `None` when `stmt` is not one.
-fn apply(stmt: &Node<'_>, file: &str, key_of: &dyn Fn(&Node<'_>) -> Option<String>, file_level: bool) -> Option<Applied> {
+/// declared loader in `scope`. `None` when `stmt` is not one.
+fn apply(stmt: &Node<'_>, file: &str, scope: Scope<'_>) -> Option<Applied> {
     let outer = stmt.as_call_node()?;
     let mut call = stmt.as_call_node()?;
     let key = loop {
         let receiver = call.receiver()?;
-        if let Some(key) = key_of(&receiver) {
+        if let Some(key) = key_of(&receiver, scope, file) {
             break key;
         }
         call = receiver.as_call_node()?;
     };
-    if !is_loader(&key) {
-        return None;
+    // A call on a refused constructor's loader: the constructor's refusal
+    // raises where the loader would be created, before this runs, and it
+    // already names the loader.
+    if declared(&key)? {
+        return Some(Applied::Static);
     }
+    let file_level = matches!(scope, Scope::File);
     let method = constant_id_str(&call.name());
     let chained = call.location().end_offset() != stmt.location().end_offset();
     if chained {
@@ -434,21 +681,34 @@ fn apply(stmt: &Node<'_>, file: &str, key_of: &dyn Fn(&Node<'_>) -> Option<Strin
             });
             Some(Applied::Static)
         }
-        "push_dir" if args.len() == 1 => {
-            let Some(path) = literal_path(&args[0], file) else {
-                return Some(Applied::Refused(
-                    "`Zeitwerk::Loader#push_dir` of a path that is not a literal under `__dir__` is not modeled".into(),
-                ));
+        // The root a `Loader.new` was declared with (`following_push_dir`),
+        // or a `for_gem` loader's own directory again; Zeitwerk maps the
+        // directory to the namespace given last.
+        "push_dir" => {
+            let (path, namespace) = match push_dir_root(&call, file, scope) {
+                Ok(root) => root,
+                Err(detail) => return Some(Applied::Refused(detail)),
             };
-            let second_root = with_loader(&key, |d| {
-                let second = d.root.as_ref().is_some_and(|root| *root != path);
-                d.root.get_or_insert(path);
-                second
+            let same_root = with_loader(&key, |d| {
+                let same = d.root == path;
+                if same {
+                    d.namespace = namespace;
+                }
+                same
             });
-            if second_root == Some(true) {
+            if same_root == Some(false) {
                 return Some(Applied::Refused("a Zeitwerk loader with more than one root directory is not modeled".into()));
             }
             Some(Applied::Static)
+        }
+        // Zeitwerk's `tag=` (loader/config.rb:160) only names the loader in
+        // its log lines, which the compiled loader does not write.
+        "tag=" if args.len() == 1 => {
+            if string_value(&args[0]).is_some() || super::util::symbol_value(&args[0]).is_some() {
+                Some(Applied::Static)
+            } else {
+                Some(Applied::Refused("`Zeitwerk::Loader#tag=` of anything but a literal string is not modeled".into()))
+            }
         }
         "eager_load_dir" if args.len() == 1 && file_level => {
             let Some(path) = literal_path(&args[0], file) else {
@@ -457,7 +717,7 @@ fn apply(stmt: &Node<'_>, file: &str, key_of: &dyn Fn(&Node<'_>) -> Option<Strin
                         .into(),
                 ));
             };
-            let decl = LOADERS.with(|l| l.borrow().iter().rev().find(|d| d.constant == key).cloned())?;
+            let decl = with_loader(&key, |d| d.clone())?;
             Some(eager_load_dir(&decl, &key, &path, stmt, file))
         }
         other => Some(Applied::Refused(format!("`Zeitwerk::Loader#{other}` is not modeled"))),
@@ -516,9 +776,7 @@ fn eager_load_dir(decl: &LoaderDecl, key: &str, path: &Path, stmt: &Node<'_>, fi
                 .into(),
         );
     }
-    let Some(root) = decl.root.as_ref() else {
-        return Applied::Refused("`Zeitwerk::Loader#eager_load_dir` on a loader with no root directory is not modeled".into());
-    };
+    let root = &decl.root;
     if decl.ignores.iter().any(|ignore| path.starts_with(ignore)) {
         return Applied::Static;
     }
@@ -626,11 +884,23 @@ fn literal_path(node: &Node<'_>, file: &str) -> Option<PathBuf> {
 /// the classes it manages, and the classes no loader autoloads (under an
 /// ignored path, or under a loader that is never set up). `files` is
 /// every support file the walk ingested with the classes it produced.
+///
+/// A class a skipped file only reopens is not left alone:
+/// dux-event-reporter ignores its `event_reporter/version.rb`, which
+/// opens the loader's own namespace `Dux::EventReporter` to set
+/// `VERSION`. Zeitwerk leaves that file's constant path unmapped, not
+/// the namespace the gem's entry defines, so a class a file outside the
+/// skipped set also defines stays registered.
 pub(super) fn resolve(decls: &[LoaderDecl], files: &[(PathBuf, Vec<ClassId>)]) -> Vec<crate::app::ZeitwerkLoader> {
     decls
         .iter()
-        .filter_map(|decl| {
-            let root = decl.root.as_ref()?;
+        .map(|decl| {
+            let root = &decl.root;
+            let skipped = |path: &Path| {
+                path.starts_with(root) && (!decl.setup || decl.ignores.iter().any(|ignore| path.starts_with(ignore)))
+            };
+            let defined_elsewhere: std::collections::BTreeSet<&ClassId> =
+                files.iter().filter(|(path, _)| !skipped(path)).flat_map(|(_, classes)| classes.iter()).collect();
             let mut managed = Vec::new();
             let mut ignored = Vec::new();
             let mut managed_files: Vec<(&PathBuf, &Vec<ClassId>)> = Vec::new();
@@ -638,9 +908,8 @@ pub(super) fn resolve(decls: &[LoaderDecl], files: &[(PathBuf, Vec<ClassId>)]) -
                 if !path.starts_with(root) {
                     continue;
                 }
-                let skip = !decl.setup || decl.ignores.iter().any(|ignore| path.starts_with(ignore));
-                if skip {
-                    ignored.extend(classes.iter().cloned());
+                if skipped(path) {
+                    ignored.extend(classes.iter().filter(|c| !defined_elsewhere.contains(c)).cloned());
                 } else {
                     managed.extend(classes.iter().cloned());
                     managed_files.push((path, classes));
@@ -661,13 +930,13 @@ pub(super) fn resolve(decls: &[LoaderDecl], files: &[(PathBuf, Vec<ClassId>)]) -
                     Some(crate::app::ZeitwerkEagerDir { dir: key, sources, classes })
                 })
                 .collect();
-            Some(crate::app::ZeitwerkLoader {
+            crate::app::ZeitwerkLoader {
                 constant: decl.constant.clone(),
                 root: root.display().to_string(),
                 managed,
                 ignored,
                 eager_dirs,
-            })
+            }
         })
         .collect()
 }
