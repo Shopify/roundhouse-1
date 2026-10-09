@@ -4994,12 +4994,17 @@ fn retarget_module_function_calls(expr: &mut Expr, owner: &ClassId, promoted: &[
     if recv.is_some() || !promoted.iter().any(|p| p == method) {
         return;
     }
-    *recv = Some(Expr::new(
+    // The receiver borrows the call's span, where the source wrote no
+    // constant: marked generated, it resolves as the owner's exact name
+    // (Core's TrackCurrent.extended read `tracked_classes`).
+    let mut owner_read = Expr::new(
         expr.span,
         ExprNode::Const {
             path: vec![owner.0.clone()],
         },
-    ));
+    );
+    owner_read.decisions |= crate::expr::GENERATED_CONST_REF;
+    *recv = Some(owner_read);
 }
 
 /// Synthesize the writer pair for `attr_writer` / `attr_accessor`,

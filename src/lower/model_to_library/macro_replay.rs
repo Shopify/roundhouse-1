@@ -262,6 +262,20 @@ fn extends_self(m: &LibraryClass) -> bool {
     m.unknown_calls.iter().any(|c| extend_args(c).is_some_and(|args| matches!(args, [a] if matches!(&*a.node, ExprNode::SelfRef))))
 }
 
+/// Does `super` in module `m`'s `extended` hook reach only Ruby's
+/// `Module#extended`, a no-op? It does while the module's singleton
+/// extends nothing but itself and sorbet's markers.
+fn hook_super_is_module_default(m: &LibraryClass) -> bool {
+    m.unknown_calls.iter().filter_map(|c| extend_args(c)).flatten().all(|a| match &*a.node {
+        ExprNode::SelfRef => true,
+        ExprNode::Const { path } => {
+            let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            matches!(written.as_str(), "T::Sig" | "T::Helpers" | "T::Generic")
+        }
+        _ => false,
+    })
+}
+
 /// Module `m`'s `self.extended(base)` hook.
 fn extended_hook(m: &LibraryClass) -> Option<&MethodDef> {
     let named = |d: &&MethodDef| d.name.as_str() == "extended";
@@ -477,6 +491,7 @@ impl<'a> ClassSide<'a> {
         let label = format!("{}.extended", m.name.0.as_str());
         let mut walk = Walk::new(self, &label);
         walk.allow_static = true;
+        walk.default_super = hook_super_is_module_default(m);
         walk.in_progress = in_progress.clone();
         let mut aliases: Vec<String> = hook.params.first().map(|p| p.name.as_str().to_string()).into_iter().collect();
         let result = walk.expr(&hook.body, &mut aliases);
@@ -759,6 +774,9 @@ struct Walk<'s, 'a> {
     /// An `extended` hook's `belongs_to_required_by_default` write is
     /// applied statically rather than refused.
     allow_static: bool,
+    /// The walked `extended` hook's own `super` is Ruby's no-op
+    /// `Module#extended` ([`hook_super_is_module_default`]).
+    default_super: bool,
     statics: Vec<bool>,
     /// Modules whose `extended` hook is being walked.
     in_progress: Vec<&'a ClassId>,
@@ -776,6 +794,7 @@ impl<'s, 'a> Walk<'s, 'a> {
             seen: vec![root.to_string()],
             path: vec![root.to_string()],
             allow_static: false,
+            default_super: false,
             statics: Vec::new(),
             in_progress: Vec::new(),
             answered: false,
@@ -881,6 +900,13 @@ impl<'s, 'a> Walk<'s, 'a> {
                     self.self_call(name.as_str().trim_end_matches('='))?;
                 }
                 self.self_call(&writer)
+            }
+            // Core's TrackCurrent.extended ends in `super`.
+            ExprNode::Super { args, .. } if self.default_super && self.path.len() == 1 => {
+                for arg in args.iter().flatten() {
+                    self.expr(arg, aliases)?;
+                }
+                Ok(())
             }
             ExprNode::Super { .. } => Err(format!("{} calls `super`", self.via())),
             ExprNode::Lambda { .. } => Ok(()),
