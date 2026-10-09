@@ -27,6 +27,7 @@
 mod broadcasts;
 mod process_action;
 pub mod params;
+pub mod params_wrapper;
 pub mod rewrites;
 pub mod util;
 
@@ -276,6 +277,10 @@ pub struct LowerControllerOptions<'a> {
     /// (`ParamsSpecs::mark_file_fields`). Empty (the default) types
     /// every field a String, which is what it was before.
     pub models: &'a [crate::dialect::Model],
+    /// `App::wrap_parameters_by_default` - Rails' ParamsWrapper default
+    /// for every controller. Read only when the tree
+    /// `FormatBreadth::wraps_json_params`.
+    pub wrap_parameters_by_default: bool,
 }
 
 pub fn lower_controllers_with_arel_views_assocs_and_routes(
@@ -294,6 +299,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
         route_id_segments,
         inferred_params,
         models,
+        wrap_parameters_by_default,
     } = opts;
     // `None` (every wrapper's default) means the projection stays
     // purely shape-directed — what it was before this table existed.
@@ -326,7 +332,19 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             // `None` → legacy: every public method is an action.
             let routed = routed_by_controller
                 .map(|m| m.get(&controller.name).cloned().unwrap_or_default());
-            let methods = build_methods(controller, controllers, &params_specs, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params);
+            // Rails' ParamsWrapper, decided here for the whole ancestry.
+            let wrapper = if format_breadth.wraps_json_params {
+                self::params_wrapper::wrapper_spec(
+                    controller,
+                    &ancestor_chain(controller, controllers),
+                    models,
+                    schema,
+                    wrap_parameters_by_default,
+                )
+            } else {
+                None
+            };
+            let methods = build_methods(controller, controllers, &params_specs, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params, wrapper.as_ref());
             all_methods.push((methods, controller));
         }
         subclass_template_hooks(&mut all_methods, controllers, &view_ivars, &partials);
@@ -611,6 +629,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         &partials,
         FormatBreadth::NARROW,
         &crate::det::HashMap::default(),
+        None,
         None,
     );
     methods.extend(collect_attr_accessor_methods(controller));
@@ -1020,6 +1039,8 @@ fn build_methods(
     format_breadth: FormatBreadth,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
     inferred_params: Option<&crate::det::HashMap<crate::app::ParamKey, Vec<Ty>>>,
+    // Rails' ParamsWrapper for this controller, when its requests get one.
+    wrapper: Option<&self::params_wrapper::WrapperSpec>,
 ) -> Vec<MethodDef> {
     let mut methods: Vec<MethodDef> = controller.class_methods().cloned().collect();
 
@@ -1213,7 +1234,17 @@ fn build_methods(
             &privs,
             /*own_privs_inlined=*/ inlining_ordered,
         );
-        pending_dispatcher = Some(preamble);
+        let (mut stmts, wraps) = preamble;
+        // ParamsWrapper runs before every callback in Rails (it wraps
+        // `process_action` outside them), so it leads as `Lead` — not a
+        // filter `Block` with empty guards.
+        if let Some(spec) = wrapper {
+            stmts.insert(
+                0,
+                PreambleStmt::Lead { body: self::params_wrapper::wrap_statement(spec) },
+            );
+        }
+        pending_dispatcher = Some((stmts, wraps));
     }
 
     // Actions BEFORE the dispatcher: a deferred action hands its

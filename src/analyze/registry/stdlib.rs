@@ -812,8 +812,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `Timeout.timeout` / `rescue Timeout::Error` — Campfire unfurl
         // deadline and TimeLimitedVideoPreviewer#capture.
         "Timeout::Error",
+        // `rescue EOFError` around `readpartial` on a pipe or a pty.
+        "EOFError",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
+    }
+    // `rescue Errno::ENOENT` / `Errno::EIO`: every Errno class that both
+    // CRuby (on every POSIX platform) and Spinel's runtime define. The
+    // lookup is by exact name, so the family is registered whole.
+    register_stdlib_class(classes, "Errno", &[], &[]);
+    for name in ERRNO_CLASSES {
+        register_stdlib_class(classes, &format!("Errno::{name}"), &[], &exception_surface);
     }
     // CRuby's own core and default-gem classes, which only the CRuby and
     // JRuby trees load natively ([`CRUBY_ONLY_STDLIB`]).
@@ -999,16 +1008,42 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Timeout.timeout`, and `IO.popen` / `copy_stream` live in the
     // send special-cases (`body/send.rs`) — catalog entries would win
     // before those cases and kill unit-aware `clock_gettime` (Float for
-    // `:millisecond`). `IO::NULL` is an empty ClassId the way `URI::HTTP` is. Instance methods on an `IO` handle still belong here.
+    // `:millisecond`). `IO::NULL` is an empty ClassId the way `URI::HTTP`
+    // is; its value type comes from Ruby's signatures (`stdlib_rbs`).
+    // Instance methods on an `IO` handle still belong here. `winsize` /
+    // `winsize=` wait on carrying `require "io/console"` into the
+    // emitted tree; admitting them without that load is check-quiet /
+    // runtime `NoMethodError`.
     let io = Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![] };
     register_stdlib_class(classes, "IO", &[], &[
         ("pid", Ty::Int),
         ("read", Ty::Str),
+        ("readpartial", Ty::Str),
+        ("write", Ty::Int),
+        ("closed?", Ty::Bool),
         ("rewind", Ty::Int),
         ("binmode", io.clone()),
         ("close", Ty::Nil),
     ]);
     register_stdlib_class(classes, "IO::NULL", &[], &[]);
+    // `File < IO` — Ruby's hierarchy (not a PTY detail). File's class
+    // methods are registered earlier; the parent is set once `IO` exists
+    // so instance methods (`readpartial`, `closed?`, …) resolve on a
+    // File handle, including `PTY.spawn`'s reader/writer.
+    classes
+        .get_mut(&ClassId(Symbol::from("File")))
+        .expect("File registered above")
+        .parent = Some(ClassId(Symbol::from("IO")));
+    // `require "pty"`. `PTY.spawn`'s return is a send special case: its
+    // block form answers nil; block yields are typed in `block_params_for`.
+    register_stdlib_class(classes, "PTY", &[], &[]);
+    // A default gem a booted Rails app has already loaded; the BUNDLED
+    // row emits its require.
+    register_stdlib_class(classes, "Shellwords", &[
+        ("escape", Ty::Str), ("shellescape", Ty::Str),
+        ("join", Ty::Str), ("shelljoin", Ty::Str),
+        ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
+    ], &[]);
     // `Process` and its clock ids are registered above as a module with
     // Integer constants (what Ruby answers), not as empty ClassIds.
     // Module Const only — `timeout` return is the send special-case.
@@ -1204,3 +1239,17 @@ fn register_stdlib_class(
             .or_insert_with(|| ty.clone());
     }
 }
+
+/// The Errno classes CRuby defines on every POSIX platform that Spinel's
+/// runtime (`lib/sp_exc.c`) defines too.
+const ERRNO_CLASSES: &[&str] = &[
+    "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF",
+    "ECHILD", "EAGAIN", "ENOMEM", "EACCES", "EFAULT", "EBUSY", "EEXIST", "EXDEV", "ENODEV",
+    "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "EFBIG", "ENOSPC", "ESPIPE",
+    "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE", "EDEADLK", "ENAMETOOLONG", "ENOLCK",
+    "ENOSYS", "ENOTEMPTY", "ELOOP", "ENOTSOCK", "EMSGSIZE", "EPROTOTYPE", "ENOPROTOOPT",
+    "EPROTONOSUPPORT", "ENOTSUP", "EOPNOTSUPP", "EAFNOSUPPORT", "EADDRINUSE",
+    "EADDRNOTAVAIL", "ENETDOWN", "ENETUNREACH", "ENETRESET", "ECONNABORTED", "ECONNRESET",
+    "ENOBUFS", "EISCONN", "ENOTCONN", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH",
+    "EALREADY", "EINPROGRESS", "ESTALE", "EDQUOT", "ECANCELED", "EOVERFLOW", "EILSEQ",
+];

@@ -303,6 +303,11 @@ pub(in crate::analyze) fn register(
             request.instance_methods.insert(Symbol::from(m), Ty::Bool);
         }
         request.instance_methods.insert(Symbol::from("port"), Ty::Int);
+        // nil at the scheme's standard port (campfire's default_url_options).
+        request.instance_methods.insert(
+            Symbol::from("optional_port"),
+            Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        );
         // Rack env accessors and the parameter/header views Rails exposes on every
         // request. `POST`/`GET` are the raw form/query hashes; the header
         // readers are Rack env lookups.

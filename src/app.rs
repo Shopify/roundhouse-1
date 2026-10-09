@@ -742,6 +742,15 @@ pub struct App {
     /// built by hand in tests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<crate::span::SourceFile>,
+    /// Rails' ParamsWrapper default for every controller: wrap a JSON
+    /// body under the controller's model name. On when
+    /// `config.load_defaults` is 7.0 or later (Rails sets
+    /// `action_controller.wrap_parameters_by_default`), unless that key
+    /// is set explicitly, or when an initializer calls
+    /// `wrap_parameters format: [:json]` (the pre-7.0 generator).
+    /// Read by `lower::controller_to_library::params_wrapper`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wrap_parameters_by_default: bool,
     /// Rubydex answers for `sources`, resolved while ingest finished.
     /// The analyzer resolves the sources itself when this is absent.
     #[serde(skip)]
@@ -1456,6 +1465,7 @@ impl App {
             view_feeders: HashMap::default(),
             controller_resolutions: HashMap::default(),
             sources: Vec::new(),
+            wrap_parameters_by_default: false,
             const_resolver: Default::default(),
             dropped_files: Vec::new(),
             sorbet_type_aliases: Vec::new(),

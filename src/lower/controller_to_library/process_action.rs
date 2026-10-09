@@ -16,6 +16,8 @@ use super::util::method_name_for_action;
 /// method defined on this controller or an ancestor (`authenticate_user`
 /// on ApplicationController firing for every subclass action); `Block`
 /// inlines a block-form filter's body (`before_action { @page = page }`).
+/// `Lead` is not a filter: an always-on head of `process_action`
+/// (ParamsWrapper) that Rails runs outside the callback chain.
 /// `halt_check` appends `return if performed?` after the statement —
 /// Rails' halting semantics: a filter that renders or redirects skips
 /// the action. It's set only when the filter body can respond, so
@@ -37,6 +39,8 @@ pub(super) enum PreambleStmt {
         unless_cond_expr: Option<Expr>,
         halt_check: bool,
     },
+    /// Always-on head of `process_action` — not a before_action.
+    Lead { body: Expr },
 }
 
 /// Build the `process_action(action_name)` dispatcher:
@@ -105,6 +109,7 @@ pub(super) fn dispatcher_bodies<'a>(
                 out.push(body);
                 out.extend([if_cond_expr, unless_cond_expr].into_iter().flatten());
             }
+            PreambleStmt::Lead { body } => out.push(body),
         }
     }
     out.extend(wraps.around.iter().flat_map(filter_guards));
@@ -179,6 +184,7 @@ pub(super) fn synthesize_process_action(
                 };
                 (stmt, *halt_check)
             }
+            PreambleStmt::Lead { body } => (body.clone(), false),
         };
         stmts.push(stmt);
         if halt_check {
@@ -244,6 +250,8 @@ pub(super) fn synthesize_process_action(
                     }),
                     None => body.clone(),
                 },
+                // `Lead` is preamble-only; after filters never carry one.
+                PreambleStmt::Lead { body } => body.clone(),
             });
         }
     }

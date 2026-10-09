@@ -30,10 +30,14 @@ module ActionDispatch
   class Request
     attr_reader :env
     attr_accessor :params
+    # The body's params alone - see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    attr_accessor :request_parameters
 
     def initialize(env, params = {})
       @env = env
       @params = params
+      @request_parameters = {}
       @session_options = {}
     end
 
@@ -113,6 +117,17 @@ module ActionDispatch
 
     def protocol
       ssl? ? "https://" : "http://"
+    end
+
+    # Twin of the shared class's: the port from the Host header, nil at
+    # the scheme's standard one (campfire's default_url_options).
+    def optional_port
+      h = host
+      sep = h.rindex(":")
+      return nil if sep.nil? || h.end_with?("]")
+      port = h[(sep + 1)..].to_i
+      return nil if port == 0 || port == (ssl? ? 443 : 80)
+      port
     end
 
     def base_url

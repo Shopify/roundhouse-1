@@ -132,6 +132,7 @@ fn decide_harvested_return(existing: &Ty, new: Ty) -> HarvestWrite {
         return HarvestWrite::Keep;
     }
     if let Some(untied) = untie_recursive_return(existing, &new) {
+        super::fixpoint_check::note_untie_cut();
         if existing == &untied {
             return HarvestWrite::Keep;
         }

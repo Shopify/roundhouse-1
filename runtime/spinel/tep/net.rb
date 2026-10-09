@@ -87,12 +87,22 @@ module Sock
   # Pinned by tests/spinel_body_drain_bytes.rb.
   def self.sphttp_drain_body(fd, n)
     out = +""
-    while out.bytesize < n
-      chunk = Sock.sp_net_recv_some(fd, n - out.bytesize)
-      if chunk.bytesize == 0
-        break   # peer closed mid-body
+    io = IO.for_fd(fd, autoclose: false)
+    begin
+      while out.bytesize < n
+        # Match the other two drains' per-read deadline. EOF or timeout
+        # discards this incomplete drain; Request checks the byte count.
+        if io.wait_readable(5).nil?
+          return ""
+        end
+        chunk = Sock.sp_net_recv_some(fd, n - out.bytesize)
+        if chunk.bytesize == 0
+          return ""
+        end
+        out = out + chunk
       end
-      out = out + chunk
+    ensure
+      io.close
     end
     out
   end

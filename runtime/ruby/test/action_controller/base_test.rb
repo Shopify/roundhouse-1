@@ -58,6 +58,24 @@ class ActionControllerBaseTest < Minitest::Test
     assert_equal 200, @controller.status
   end
 
+  def test_response_content_type_can_be_assigned
+    @controller.response.content_type = "text/vnd.turbo-stream.html"
+    assert_equal "text/vnd.turbo-stream.html", @controller.content_type
+  end
+
+  def test_response_body_can_be_assigned
+    @controller.response.response_body = "<p>body</p>"
+    assert_equal "<p>body</p>", @controller.body
+    assert_equal "<p>body</p>", @controller.response_body
+    assert @controller.performed?
+  end
+
+  def test_nil_response_body_clears_the_body_without_performing
+    @controller.response.response_body = nil
+    assert_equal "", @controller.body
+    refute @controller.performed?
+  end
+
   # `render(..., status: 422)` (Integer literal) is no longer part of the
   # public API. `status:` is monomorphic Symbol — callers needing an
   # explicit integer code coerce at the call site. The contraction

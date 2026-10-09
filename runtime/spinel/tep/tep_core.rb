@@ -42,8 +42,8 @@ module Tep
   # rule — it rejects any Content-Length matching /[^\d]/ — so no sign,
   # no junk after the number; `.to_i` let both through ("12abc" read as
   # 12, "-1" as a length that drained nothing). "" is what an absent
-  # header reads as through str_hash, and Puma reads an empty value as
-  # zero too.
+  # header reads as through str_hash. Parser rejects an explicitly empty
+  # Content-Length before it can be confused with an absent header.
   #
   # Leading zeros are skipped, so a zero-padded value reads as its value
   # (Puma's `.to_i` does the same). More than 18 SIGNIFICANT digits

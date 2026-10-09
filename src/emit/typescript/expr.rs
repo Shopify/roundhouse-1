@@ -266,6 +266,57 @@ fn const_decl(name: &str, init: Js) -> JsStmt {
     })
 }
 
+/// Ruby Int / Int floors (`-7 / 2 == -4`); JS `/` yields a float.
+fn floor_int_div(span: Span, lhs: Js, rhs: Js) -> Js {
+    Js::call(
+        span,
+        Js::member(Span::synthetic(), synth_ident("Math"), "floor"),
+        vec![Js::binary(span, "/", lhs, rhs)],
+    )
+}
+
+/// Ruby Int % Int takes the divisor's sign (`-7 % 3 == 2`); JS `%`
+/// takes the dividend's. Add the divisor only when the signs differ
+/// (`((a % b) + b) % b` can round the intermediate sum past 2**53); a
+/// zero remainder returns a literal `0` so JS's `-0` never leaks.
+/// Operands are call arguments (not consts inside a sync IIFE) so an
+/// `await` in either side stays in the enclosing async method.
+fn floor_int_mod(span: Span, lhs: Js, rhs: Js) -> Js {
+    let b = || synth_ident("__b");
+    let m = || synth_ident("__m");
+    let zero = || Js::num(span, "0");
+    let signs_differ = Js::binary(
+        span,
+        "!==",
+        Js::binary(span, "<", m(), zero()),
+        Js::binary(span, "<", b(), zero()),
+    );
+    let floored = Js::synth(JsExpr::Ternary {
+        cond: Js::binary(span, "===", m(), zero()),
+        then: zero(),
+        else_: Js::synth(JsExpr::Ternary {
+            cond: signs_differ,
+            then: Js::binary(span, "+", m(), b()),
+            else_: m(),
+        }),
+    });
+    Js::call(
+        span,
+        Js::synth(JsExpr::Arrow {
+            params: vec![js_param("__a"), js_param("__b")],
+            body: ArrowBody::Block(vec![
+                const_decl(
+                    "__m",
+                    Js::binary(span, "%", synth_ident("__a"), synth_ident("__b")),
+                ),
+                JsStmt::synth(JsStmtNode::Return(Some(floored))),
+            ]),
+            is_async: false,
+        }),
+        vec![lhs, rhs],
+    )
+}
+
 fn return_stmt(value: Option<Js>) -> JsStmt {
     JsStmt::synth(JsStmtNode::Return(value))
 }
@@ -2417,15 +2468,33 @@ fn js_send_inner(
                     });
                     return Js::call(span, shell, vec![js_expr(r), js_expr(&args[0])]);
                 }
-                // `arr.sort` (no block) → JS Array#sort with default
-                // comparator on a fresh copy. JS's default sort is
-                // string-coerced (matches Ruby's sort for strings,
-                // diverges for numbers but those need an explicit
-                // comparator anyway).
+                // `arr.sort` (no block) → JS Array#sort on a fresh copy.
+                // JS's default comparator is string-coerced: right for
+                // strings, wrong for numbers (`[10, 9, 1].sort()` is
+                // `[1, 10, 9]`). A numeric element type gets the
+                // `(a, b) => a - b` comparator Ruby's `<=>` amounts to.
                 "sort" if args.is_empty() => {
                     let copy =
                         Js::new(span, JsExpr::Array(vec![Js::synth(JsExpr::Spread(js_expr(r)))]));
-                    return Js::method_call(span, copy, "sort", vec![]);
+                    let numeric = matches!(
+                        strip_nullable(r.ty.as_ref()),
+                        Some(Ty::Array { elem }) if matches!(**elem, Ty::Int | Ty::Float)
+                    );
+                    let cmp = if numeric {
+                        vec![Js::synth(JsExpr::Arrow {
+                            params: vec![js_param("a"), js_param("b")],
+                            body: ArrowBody::Expr(Js::binary(
+                                Span::synthetic(),
+                                "-",
+                                synth_ident("a"),
+                                synth_ident("b"),
+                            )),
+                            is_async: false,
+                        })]
+                    } else {
+                        vec![]
+                    };
+                    return Js::method_call(span, copy, "sort", cmp);
                 }
                 // Ruby's `Array#join` with no args uses `$,` as the
                 // separator (defaults to nil → ""). JS's
@@ -2560,11 +2629,11 @@ fn js_send_inner(
                         vec![js_expr(&args[0]), js_expr(&args[1])],
                     );
                 }
-                // `s.gsub(pat, repl)` → `s.replace(pat_with_g, repl)`.
-                // Ruby gsub replaces every match; JS replace defaults
-                // to first only — the regex needs a `g` flag. Patch
-                // it inline when the pattern is a regex literal;
-                // otherwise wrap with a runtime g-flag enforcer.
+                // `s.gsub(pat, repl)` — Ruby replaces every match.
+                // String patterns use `replaceAll`; regex patterns use
+                // `replace` with a `g` flag (literal patched inline, or
+                // a runtime enforcer). Empty literal `""` becomes
+                // `replace(/(?:)/gu, …)` so steps are by code point.
                 // Hash replacements (`s.gsub(re, MAP)`) wrap in a
                 // lookup callback `m => MAP[m]`.
                 "gsub" if args.len() == 2 => {
@@ -2605,65 +2674,7 @@ fn js_send_inner(
                             );
                         }
                     }
-                    let pat_js = if let ExprNode::Lit {
-                        value: Literal::Regex { pattern, flags },
-                    } = &*args[0].node
-                    {
-                        let new_flags = if flags.contains('g') {
-                            flags.clone()
-                        } else {
-                            format!("{flags}g")
-                        };
-                        Js::new(
-                            args[0].span,
-                            JsExpr::Regex {
-                                pattern: translate_ruby_regex_anchors(pattern),
-                                flags: new_flags,
-                            },
-                        )
-                    } else {
-                        // Runtime check — covers Const refs to regex
-                        // constants (`HTML_ESCAPE_PATTERN`) whose type
-                        // isn't visible at emit time.
-                        let raw = || js_expr(&args[0]);
-                        let needs_flag = Js::binary(
-                            Span::synthetic(),
-                            "&&",
-                            Js::binary(
-                                Span::synthetic(),
-                                "instanceof",
-                                raw(),
-                                synth_ident("RegExp"),
-                            ),
-                            Js::unary(
-                                Span::synthetic(),
-                                "!",
-                                Js::method_call(
-                                    Span::synthetic(),
-                                    Js::member(Span::synthetic(), raw(), "flags"),
-                                    "includes",
-                                    vec![Js::str(Span::synthetic(), "g")],
-                                ),
-                            ),
-                        );
-                        let with_flag = Js::synth(JsExpr::New {
-                            callee: synth_ident("RegExp"),
-                            args: vec![
-                                Js::member(Span::synthetic(), raw(), "source"),
-                                Js::binary(
-                                    Span::synthetic(),
-                                    "+",
-                                    Js::member(Span::synthetic(), raw(), "flags"),
-                                    Js::str(Span::synthetic(), "g"),
-                                ),
-                            ],
-                        });
-                        Js::synth(JsExpr::Ternary {
-                            cond: needs_flag,
-                            then: with_flag,
-                            else_: raw(),
-                        })
-                    };
+                    let (pat_js, method) = gsub_pattern_and_method(&args[0]);
                     let repl_js = if matches!(args[1].ty.as_ref(), Some(Ty::Hash { .. })) {
                         Js::synth(JsExpr::Arrow {
                             params: vec![JsParam {
@@ -2681,7 +2692,7 @@ fn js_send_inner(
                     } else {
                         js_expr(&args[1])
                     };
-                    return Js::method_call(span, js_expr(r), "replace", vec![pat_js, repl_js]);
+                    return Js::method_call(span, js_expr(r), method, vec![pat_js, repl_js]);
                 }
                 // `s.tr(from, to)` — character translation. Limited
                 // to single-char from/to (covers framework Ruby's
@@ -2918,6 +2929,53 @@ fn js_send_inner(
                 _ => {}
             }
         }
+        // Array `&` / `|`: TS's `&`/`|` are bitwise. Dedupe through a
+        // `Set` (insertion-ordered, like Ruby's result); `&` then keeps
+        // what the rhs includes.
+        if method == "&" || method == "|" {
+            use crate::emit::shared::set_op::{classify_set_op, SetOpCase};
+            let dedup = |items: Vec<Js>| {
+                Js::synth(JsExpr::Array(vec![Js::synth(JsExpr::Spread(Js::synth(
+                    JsExpr::New {
+                        callee: synth_ident("Set"),
+                        args: vec![Js::synth(JsExpr::Array(items))],
+                    },
+                )))]))
+            };
+            match classify_set_op(method, r, arg) {
+                SetOpCase::ArrayIntersect { .. } => {
+                    // Bind both operands as IIFE params so the rhs is
+                    // evaluated once (not per element), lhs first.
+                    let pred = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("x")],
+                        body: ArrowBody::Expr(Js::method_call(
+                            Span::synthetic(),
+                            synth_ident("__r"),
+                            "includes",
+                            vec![synth_ident("x")],
+                        )),
+                        is_async: false,
+                    });
+                    let lhs = dedup(vec![Js::synth(JsExpr::Spread(synth_ident("__l")))]);
+                    let body = Js::method_call(Span::synthetic(), lhs, "filter", vec![pred]);
+                    let f = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("__l"), js_param("__r")],
+                        body: ArrowBody::Expr(body),
+                        is_async: false,
+                    });
+                    return Js::call(span, f, vec![js_expr(r), js_expr(arg)]);
+                }
+                SetOpCase::ArrayUnion { .. } => {
+                    let mut out = dedup(vec![
+                        Js::synth(JsExpr::Spread(js_expr(r))),
+                        Js::synth(JsExpr::Spread(js_expr(arg))),
+                    ]);
+                    out.span = span;
+                    return out;
+                }
+                SetOpCase::Unknown => {}
+            }
+        }
         // `-` dispatch: TS's native `-` handles numerics. Array set-
         // difference uses filter + includes. Incompatible pairs refuse.
         if method == "-" {
@@ -2975,14 +3033,21 @@ fn js_send_inner(
             }
         }
         // `/` and `**` dispatch: TS has both as native operators. Only
-        // Incompatible pairs need special handling.
+        // Incompatible pairs need special handling, plus Int / Int:
+        // Ruby floors it (`-7 / 2 == -4`), JS `/` yields a float.
         if method == "/" || method == "**" {
             use crate::emit::shared::div_pow::{classify_div_pow, DivPowCase};
-            if matches!(classify_div_pow(r, arg), DivPowCase::Incompatible) {
-                return iife_throw_msg(
-                    span,
-                    &format!("roundhouse: `{method}` with incompatible operand types"),
-                );
+            match classify_div_pow(r, arg) {
+                DivPowCase::Incompatible => {
+                    return iife_throw_msg(
+                        span,
+                        &format!("roundhouse: `{method}` with incompatible operand types"),
+                    );
+                }
+                DivPowCase::IntFloor if method == "/" => {
+                    return floor_int_div(span, js_expr(r), js_expr(arg));
+                }
+                _ => {}
             }
         }
         // `%` dispatch: TS has native `%` for numerics; Str % args
@@ -2998,6 +3063,9 @@ fn js_send_inner(
                 }
                 ModuloCase::Incompatible => {
                     return iife_throw_msg(span, "roundhouse: % with incompatible operand types");
+                }
+                ModuloCase::IntFloor => {
+                    return floor_int_mod(span, js_expr(r), js_expr(arg));
                 }
                 _ => {}
             }
@@ -3028,6 +3096,18 @@ fn js_send_inner(
                     _ => unreachable!(),
                 };
             }
+        }
+        // Ruby `Array#==` compares elements; JS `===` on two arrays
+        // compares references, so `[2, 4] == xs` was false for every
+        // `xs` and every `assert_equal [..], …` raised. When either
+        // side is an Array, compare lengths and elements instead.
+        // Element comparison stays `===`: right for the scalar arrays
+        // these comparisons carry.
+        if matches!(method, "==" | "!=")
+            && (matches!(r.ty, Some(Ty::Array { .. })) || matches!(arg.ty, Some(Ty::Array { .. })))
+        {
+            let eq = array_eq(span, js_expr(r), js_expr(arg));
+            return if method == "==" { eq } else { Js::unary(span, "!", eq) };
         }
         if let Some(op) = ts_binop(method) {
             return Js::binary(span, op, js_expr(r), js_expr(arg));
@@ -3239,6 +3319,101 @@ pub(super) fn js_literal(span: Span, lit: &Literal) -> Js {
     }
 }
 
+
+/// Classify a `gsub` pattern into the JS pattern expression and the
+/// method name (`replace` vs `replaceAll`).
+///
+/// - Empty literal `""` → `/(?:)/gu` + `replace` (code-point steps;
+///   `replaceAll("", …)` would split surrogate pairs). Non-literal
+///   empty Str still uses `replaceAll` — covering that needs a runtime
+///   branch on every dynamic gsub.
+/// - Typed non-empty String → `replaceAll` (every occurrence).
+/// - Regex literal → `replace` with a `g` flag patched in.
+/// - Anything else → runtime g-flag enforcer + `replace`.
+fn gsub_pattern_and_method(pat: &Expr) -> (Js, &'static str) {
+    if matches!(
+        &*pat.node,
+        ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()
+    ) {
+        return (
+            Js::new(
+                pat.span,
+                JsExpr::Regex {
+                    pattern: "(?:)".into(),
+                    flags: "gu".into(),
+                },
+            ),
+            "replace",
+        );
+    }
+    if matches!(strip_nullable(pat.ty.as_ref()), Some(Ty::Str)) {
+        return (js_expr(pat), "replaceAll");
+    }
+    if let ExprNode::Lit {
+        value: Literal::Regex { pattern, flags },
+    } = &*pat.node
+    {
+        let new_flags = if flags.contains('g') {
+            flags.clone()
+        } else {
+            format!("{flags}g")
+        };
+        return (
+            Js::new(
+                pat.span,
+                JsExpr::Regex {
+                    pattern: translate_ruby_regex_anchors(pattern),
+                    flags: new_flags,
+                },
+            ),
+            "replace",
+        );
+    }
+    // Runtime check — covers Const refs to regex constants
+    // (`HTML_ESCAPE_PATTERN`) whose type isn't visible at emit time.
+    let raw = || js_expr(pat);
+    let needs_flag = Js::binary(
+        Span::synthetic(),
+        "&&",
+        Js::binary(
+            Span::synthetic(),
+            "instanceof",
+            raw(),
+            synth_ident("RegExp"),
+        ),
+        Js::unary(
+            Span::synthetic(),
+            "!",
+            Js::method_call(
+                Span::synthetic(),
+                Js::member(Span::synthetic(), raw(), "flags"),
+                "includes",
+                vec![Js::str(Span::synthetic(), "g")],
+            ),
+        ),
+    );
+    let with_flag = Js::synth(JsExpr::New {
+        callee: synth_ident("RegExp"),
+        args: vec![
+            Js::member(Span::synthetic(), raw(), "source"),
+            Js::binary(
+                Span::synthetic(),
+                "+",
+                Js::member(Span::synthetic(), raw(), "flags"),
+                Js::str(Span::synthetic(), "g"),
+            ),
+        ],
+    });
+    (
+        Js::synth(JsExpr::Ternary {
+            cond: needs_flag,
+            then: with_flag,
+            else_: raw(),
+        }),
+        "replace",
+    )
+}
+
 /// Walk a Ruby regex source, replacing string-boundary anchors with
 /// JS line-boundary anchors. Handles `\\` escapes so a literal
 /// backslash followed by `A`/`z`/`Z` doesn't get clobbered.
@@ -3270,6 +3445,17 @@ fn translate_ruby_regex_anchors(pattern: &str) -> String {
         }
     }
     out
+}
+
+/// Element-wise Array equality, each operand evaluated once. Nested
+/// arrays recurse (Ruby `[[2]] == [[2]]`), and a non-array operand
+/// (scalar, `nil`) compares with `===` instead of reading `.length`.
+const ARRAY_EQ_FN: &str = "(function eq(a: any, b: any): boolean { \
+return Array.isArray(a) && Array.isArray(b) \
+? a.length === b.length && a.every((x, i) => eq(x, b[i])) : a === b; })";
+
+fn array_eq(span: Span, l: Js, r: Js) -> Js {
+    Js::call(span, Js::synth(JsExpr::Raw(ARRAY_EQ_FN.into())), vec![l, r])
 }
 
 fn ts_binop(method: &str) -> Option<&'static str> {
@@ -3463,6 +3649,54 @@ mod async_hof_tests {
             !out.starts_with("await (async () => {"),
             "sync profile must not rewrite, got: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod array_eq_tests {
+    //! `assert_equal [2, 4], xs` lowers to `[2, 4] != xs`; `!==` on two
+    //! JS arrays compares references, so it raised for every `xs`.
+
+    use super::*;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::{Symbol, VarId};
+    use crate::span::Span;
+
+    fn ints() -> Ty {
+        Ty::Array { elem: Box::new(Ty::Int) }
+    }
+
+    fn cmp(method: &str, actual_ty: Option<Ty>) -> String {
+        let lit = |v| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: v } });
+        let mut expected = Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![lit(2), lit(4)], style: Default::default() });
+        expected.ty = Some(ints());
+        let mut actual = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from("xs") });
+        actual.ty = actual_ty;
+        emit_expr(&Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(expected),
+                method: Symbol::from(method),
+                args: vec![actual],
+                block: None,
+                parenthesized: false,
+            },
+        ))
+    }
+
+    #[test]
+    fn array_equality_compares_elements() {
+        let eq = format!("{ARRAY_EQ_FN}([2, 4], xs)");
+        assert_eq!(cmp("==", Some(ints())), eq);
+        assert_eq!(cmp("!=", Some(ints())), format!("!{eq}"));
+        // The literal alone is enough: the actual is often a call the
+        // test typer leaves untyped.
+        assert_eq!(cmp("!=", None), format!("!{eq}"));
+        // Nested arrays recurse; a non-array operand (nil) is `===`
+        // rather than a `.length` read.
+        assert!(ARRAY_EQ_FN.contains("eq(x, b[i])"));
+        assert!(ARRAY_EQ_FN.contains("Array.isArray(a) && Array.isArray(b)"));
+        assert!(ARRAY_EQ_FN.contains(": a === b"));
     }
 }
 

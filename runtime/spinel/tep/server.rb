@@ -171,7 +171,7 @@ module Tep
         send_simple(client, refusal, refusal == 413 ? "request body too large" : "bad request")
         return false
       end
-      req.consume_body(client)
+      return false unless req.consume_body(client)
       res = Response.new
       begin
         @app.dispatch(req, res)
@@ -270,12 +270,14 @@ module Tep
       head + "\r\n"
     end
 
+    # bytesize, as write_response: a multibyte `msg` would otherwise
+    # announce fewer bytes than the page carries.
     def send_simple(client, status, msg)
       reason = Tep.reason(status)
       body = "<h1>" + status.to_s + " " + reason + "</h1><p>" + msg + "</p>\n"
       head = "HTTP/1.0 " + status.to_s + " " + reason + "\r\n" +
              "Content-Type: text/html; charset=utf-8\r\n" +
-             "Content-Length: " + body.length.to_s + "\r\n" +
+             "Content-Length: " + body.bytesize.to_s + "\r\n" +
              "Connection: close\r\n\r\n"
       Sock.sphttp_write_str(client, head + body)
     end

@@ -954,6 +954,86 @@ fn resolve_runtime_sig_conflicts(files: &mut [(String, String)]) -> Result<(), S
     Ok(())
 }
 
+/// A plain class the app declares outside the Rails base classes
+/// (`app/models/probe.rb` holding `class Probe`, or one under
+/// `app/lib`/`lib`) is an `app.library_classes` entry. The ruby family
+/// and TypeScript emit those; the other emitters only emit the library
+/// classes they lower themselves (views, fixtures, tests), so the
+/// class is silently missing while the tests and controllers that
+/// call it are emitted, and the build fails later on an unknown name.
+/// Report each one per target until those emitters carry them.
+///
+/// The gate is a denylist of targets that already emit plain library
+/// classes (fail-closed for new `BuildTarget`s), matching sibling
+/// `report_*` polarity. Roda is intentionally not on that list: its
+/// spike emit never walks `app.library_classes`, so a PORO would stay
+/// silently dropped under an allowlist of today's non-emitters.
+///
+/// Mixin modules are not reported: their bodies are spliced into the
+/// including models by the shared lowering. Synthesized classes
+/// (`origin` set) belong to the lowerer that made them. Classes whose
+/// ancestry reaches a framework base (`ApplicationJob < ActiveJob::Base`,
+/// `ApplicationMailer < ActionMailer::Base` and their subclasses) are
+/// not plain Ruby and are left to the job and mailer handling.
+fn target_emits_app_library_classes(target: BuildTarget) -> bool {
+    matches!(
+        target,
+        BuildTarget::Blog
+            | BuildTarget::Ruby
+            | BuildTarget::Jruby
+            | BuildTarget::Spinel
+            | BuildTarget::Typescript
+            | BuildTarget::TypescriptWorker
+        // Roda omitted: spike emit does not walk `app.library_classes`.
+    )
+}
+
+fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
+    if target_emits_app_library_classes(target) {
+        return;
+    }
+    for lc in &app.library_classes {
+        if lc.is_module || lc.origin.is_some() || !is_plain_ruby_class(app, lc) {
+            continue;
+        }
+        let span = lc
+            .methods
+            .first()
+            .map(|m| m.name_span)
+            .unwrap_or_else(crate::span::Span::synthetic);
+        emit::diagnostics::report_unsupported(
+            span,
+            target.as_str(),
+            "plain Ruby class",
+            format!(
+                "class `{}` is not emitted for this target (the ruby and typescript emits carry it)",
+                lc.name.0.as_str()
+            ),
+        );
+    }
+}
+
+/// True when every ancestor of `lc` is another app library class (or
+/// explicit `Object`), so the chain ends at `Object` rather than a
+/// framework / gem / stdlib base. Explicit `Object` is treated as the
+/// same terminal as an omitted superclass; other unknown parents reject.
+fn is_plain_ruby_class(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
+    let mut parent = lc.parent.as_ref();
+    let mut hops = 0;
+    while let Some(p) = parent {
+        hops += 1;
+        if hops > app.library_classes.len() {
+            return false;
+        }
+        match app.library_classes.iter().find(|c| c.name == *p) {
+            Some(c) => parent = c.parent.as_ref(),
+            None if p.0.as_str() == "Object" => parent = None,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// A non-integer primary key (`create_table …, id: :uuid`,
 /// `primary_key: "identifier", id: :string`) is carried end to end by
 /// the ruby-shape emit — CRuby, JRuby and Spinel: the analyzer types
@@ -1830,6 +1910,7 @@ pub fn target_files(
     report_unsupported_keys(app, target);
     report_inherited_visibility_overrides(app, target);
     report_test_helper_connection(app, target);
+    report_unemitted_library_classes(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
     report_self_bindings(app, target);
@@ -6521,24 +6602,24 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
     for model in &app.global_id_locate_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let find = global_id_find(app, name);
         generated.push_str(&format!(
             "    def self.locate_{suffix}(gid_param)\n\
              \x20     parts = parts_from(gid_param)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
-             \x20     {name}.find(cast_id(parts[2]))\n\
+             {find}\
              \x20   end\n",
         ));
     }
     for model in &app.global_id_locate_signed_models {
         let name = model.as_str();
         let suffix = crate::lower::global_id_locate::entry_point_suffix(name);
+        let find = global_id_find(app, name);
         generated.push_str(&format!(
             "    def self.locate_signed_{suffix}(sgid, purpose)\n\
              \x20     parts = parts_from_signed(sgid, purpose)\n\
              \x20     return nil if parts.nil?\n\
-             \x20     return nil unless parts[1] == \"{name}\"\n\n\
-             \x20     {name}.find(cast_id(parts[2]))\n\
+             {find}\
              \x20   end\n",
         ));
     }
@@ -6553,6 +6634,41 @@ fn apply_global_id_locate(files: &mut [(String, String)], app: &App) {
         let end = start + rel_end + TAIL.len();
         content.replace_range(start..end, &generated);
     }
+}
+
+/// The name check and finder shared by both `locate_*` entry points.
+///
+/// An STI base also accepts its known subclasses' names: Rails mints an
+/// STI row's GlobalID with the row's own class, and `only: Room` admits
+/// every descendant. Nothing is constantized from the wire — the names
+/// are the closed set `sti_scope` stamped on the base model. The finder
+/// stays the base's (hydration is base-classed), so a subclass name is
+/// confirmed against the row: the record must mint that same name, or
+/// `Rooms::Open/<id of a plain Room>` would answer the plain room where
+/// Rails' scoped `Rooms::Open.find` finds nothing.
+fn global_id_find(app: &App, base: &str) -> String {
+    let subclasses = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == base)
+        .map(|model| model.sti_subclass_names.as_slice())
+        .unwrap_or_default();
+    let allowed = std::iter::once(base)
+        .chain(subclasses.iter().map(|name| name.0.as_str()))
+        .map(|name| format!("parts[1] == \"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    if subclasses.is_empty() {
+        return format!(
+            "      return nil unless {allowed}\n\n      {base}.find(cast_id(parts[2]))\n"
+        );
+    }
+    format!(
+        "      return nil unless {allowed}\n\n\
+         \x20     record = {base}.find(cast_id(parts[2]))\n\
+         \x20     return nil unless record.to_gid_param == GlobalID.param(parts[1], record.id)\n\n\
+         \x20     record\n"
+    )
 }
 
 /// Write `ActionText::Attachable.locate(model_name, id)` into
@@ -13881,7 +13997,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)], stdlib: &[(&str, &st
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 15] = [
+const BUNDLED: [(&str, &str); 17] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -13932,6 +14048,17 @@ const BUNDLED: [(&str, &str); 15] = [
     // TimeLimitedVideoPreviewer#capture. Default gem on CRuby/JRuby;
     // Spinel takes `runtime/ruby/timeout.rb` via spinel_files.
     ("Timeout", "timeout"),
+    // `Shellwords.escape`: a default gem that a booted Rails 8.1 app has
+    // already loaded, so apps call it without a require. INERT on our
+    // trees: `runtime/spinel/shellwords.rb` defines the module (no
+    // String/Array reopen — packages/shellwords' reopen makes
+    // String#split a PolyArray and the Rails tree fails C compile), so
+    // the program-defined-constant clause below drops the row.
+    ("Shellwords", "shellwords"),
+    // `PTY.spawn`: the app writes `require "pty"` (Rails does not load
+    // it), but an app file reaches the tree without its requires.
+    // Spinel takes `packages/pty`.
+    ("PTY", "pty"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,

@@ -98,6 +98,11 @@ fn abstract_class_write(value: bool) -> Expr {
 
 /// `name = name.to_sym if name.is_a?(::String)` ahead of the `case`.
 fn accept_string_name(m: &mut MethodDef) {
+    // A column-free table's reader and writer are a bare `nil` (no
+    // `case` to normalize the name for).
+    if !matches!(&*m.body.node, ExprNode::Case { .. }) {
+        return;
+    }
     let Some(param) = m.params.first() else { return };
     let name = param.name.clone();
     let var = || sp(ExprNode::Var { id: VarId(0), name: name.clone() });

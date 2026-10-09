@@ -1563,9 +1563,10 @@ module RequestDispatch
   # body under `Content-Type: application/json`, and the app reads
   # them back as params because Rails parses that body. The harness
   # hands the params to the controller directly — the parse Rails does
-  # on the way in — and sets the content type and format the encoder
-  # would; a controller that reads the raw body sees an empty one.
-  # campfire's direct-upload tests are the corpus's use.
+  # on the way in — and sets the content type, format, and
+  # `request_parameters` (body alone) the encoder would; a controller
+  # that reads the raw body sees an empty one. campfire's direct-upload
+  # tests are the corpus's use.
   def get(path, params: {}, headers: {}, env: {}, as: nil)
     dispatch_request("GET", path, params, headers.merge(env), as)
   end
@@ -1812,6 +1813,21 @@ module RequestDispatch
     env["QUERY_STRING"]   = request_query
     controller.request = ActionDispatch::Request.for(env, merged)
     controller.request.body = request_body
+    # Body params alone — what ParamsWrapper copies from. Production
+    # dispatchers fill this from the parsed JSON body; the harness
+    # skipped the parse, so without this a wrap under `as: :json`
+    # would nest an empty hash and break flat `params.expect`.
+    if as == :json && !params.is_a?(String)
+      body_params = {}
+      params.each do |k, v|
+        if v.is_a?(Hash)
+          body_params[k.to_s] = stringify_keys(v)
+        else
+          body_params[k.to_s] = v
+        end
+      end
+      controller.request.request_parameters = body_params
+    end
     # Raw query for path-option redirects that keep it — same slot every
     # target's dispatcher seeds (`query_string` on the controller).
     controller.query_string = request_query

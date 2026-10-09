@@ -45,6 +45,12 @@ fn bytes_block_has_escaping_break(e: &Expr) -> bool {
     }
 }
 
+/// A forwarded `&local` whose binding may be nil at runtime — Ruby then
+/// passes no block. Bare `Nil` is handled separately as definite absence.
+fn forwarded_block_may_be_nil(ty: &Ty) -> bool {
+    matches!(ty, Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)))
+}
+
 mod diagnostic;
 mod deps;
 pub(crate) use deps::{class_set_key, Classes, DepKey, DepRecorder, Mix};
@@ -2486,6 +2492,19 @@ impl<'a> BodyTyper<'a> {
                     match &*b.node {
                         ExprNode::Lambda { body, .. } => body.ty.clone(),
                         ExprNode::MethodRef { .. } => Some(method_ref_ty),
+                        // Forwarded proc (`&callback`): Var in the block
+                        // slot, no body to type. Presence must still reach
+                        // dispatch — `PTY.spawn` with a block answers nil.
+                        // A nil local (`callback = nil; …(&callback)`) is
+                        // Ruby's no-block path, as is a literal `&nil`.
+                        // A nilable local is refined for `PTY.spawn` after
+                        // dispatch (Tuple | Nil); leave presence absent
+                        // here so `String#bytes(&maybe)` stays the array.
+                        ExprNode::Var { name, .. } => match ctx.local_bindings.get(name) {
+                            Some(Ty::Nil) => None,
+                            Some(ty) if forwarded_block_may_be_nil(ty) => None,
+                            _ => Some(Ty::Untyped),
+                        },
                         _ => None,
                     }
                 } else {
@@ -2682,6 +2701,25 @@ impl<'a> BodyTyper<'a> {
                     && recv_ty.as_ref().is_some_and(instance_shaped);
                 let dispatched =
                     self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver);
+                // `PTY.spawn(..., &maybe)` when `maybe` is nilable: Ruby
+                // may take the block (nil) or not (tuple). Presence was
+                // left absent above so other methods keep their no-block
+                // answer; widen the spawn result here.
+                if method.as_str() == "spawn"
+                    && matches!(&recv_ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "PTY")
+                    && let Some(b) = block.as_ref()
+                    && let ExprNode::Var { name, .. } = &*b.node
+                    && ctx
+                        .local_bindings
+                        .get(name)
+                        .is_some_and(forwarded_block_may_be_nil)
+                {
+                    let file = Ty::Class { id: ClassId(Symbol::from("File")), args: vec![] };
+                    return union_of(
+                        Ty::Tuple { elems: vec![file.clone(), file, Ty::Int] },
+                        Ty::Nil,
+                    );
+                }
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")

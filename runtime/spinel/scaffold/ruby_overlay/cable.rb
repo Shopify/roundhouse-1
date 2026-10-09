@@ -387,7 +387,9 @@ module Cable
       conns = SUBS[stream]
       return nil if conns.nil? || conns.empty?
 
-      message_json = JSON.generate(message)
+      # As Rails writes it: ActiveSupport::JSON escapes `<`, `>` and `&`
+      # inside strings, which plain JSON.generate does not (#619).
+      message_json = JsonBuilder.escape_html_entities(JSON.generate(message))
       frames = {}
 
       conns.dup.each do |conn|

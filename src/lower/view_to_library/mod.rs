@@ -486,9 +486,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     // A partial's locals are its interface: every `locals:` key any call
     // site passes becomes a trailing nil-default param (sorted; see
     // render_locals_keys). Names already on the signature as the record
-    // or flash/defined? extras are skipped here; closure ivars are
-    // dropped after append by `drop_closure_names` (raw key vs
-    // `safe_local` name).
+    // or flash/defined? extras are skipped here.
     let mut extra_params = extra_params;
     if is_partial {
         let keys_map = &lx.locals_keys;
@@ -499,8 +497,16 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
                 }
             }
         }
-        drop_closure_names(&mut extra_params, &closure_ivars);
     }
+    // Closure ivars are dropped after append by `drop_closure_names` (raw
+    // key vs `safe_local` name) — for every view kind, not just partials.
+    // An action view's or a layout's `typed` params already include its
+    // closure ivars (above); a `defined?(@x)` marker or a `locals:` key
+    // naming that same ivar must not also append it as a nil-default
+    // extra, or the emitted method takes `x` twice — a duplicate
+    // argument name, which is a Ruby syntax error (#389's sibling: that
+    // one was partials only, this is every kind).
+    drop_closure_names(&mut extra_params, &closure_ivars);
 
     // A bound form local is NOT interface (see `partial_form_bindings`):
     // render_locals_keys already filters the locals channel, and this

@@ -321,6 +321,12 @@ fn constructor_contract<'a>(
         return Some(ConstructorContract::UnknownLookup);
     }
     if inherits_unmodeled_constructor_lookup(contracts, owner, &mut HashSet::default()) {
+        // An unmodeled mixin with no source constructor anywhere in the
+        // modeled lookup chain: nothing was flattened that a verbatim
+        // keyword call could mis-bind to, so keep the call as written.
+        if !declares_source_constructor(contracts, owner, &mut HashSet::default()) {
+            return None;
+        }
         return Some(ConstructorContract::UnknownLookup);
     }
     if let Some((method, _)) = contracts.declaration(
@@ -338,6 +344,31 @@ fn constructor_contract<'a>(
     } else {
         Some(ConstructorContract::Initialize(method))
     }
+}
+
+fn declares_source_constructor(
+    contracts: &SourceContractIndex<'_>,
+    owner: &ClassId,
+    seen: &mut HashSet<ClassId>,
+) -> bool {
+    if !seen.insert(owner.clone()) {
+        return false;
+    }
+    contracts.unmodeled_constructor_lookup.contains(owner)
+        || contracts
+            .instance
+            .contains_key(&(owner.clone(), Symbol::from("initialize")))
+        || contracts
+            .class
+            .contains_key(&(owner.clone(), Symbol::from("new")))
+        || contracts
+            .includes(owner)
+            .iter()
+            .filter(|included| contracts.modules.contains(*included))
+            .any(|included| declares_source_constructor(contracts, included, seen))
+        || contracts
+            .parent(owner)
+            .is_some_and(|parent| declares_source_constructor(contracts, parent, seen))
 }
 
 fn inherits_unmodeled_constructor_lookup(

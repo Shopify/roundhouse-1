@@ -48,7 +48,22 @@ module Tep
         colon = line.index(":")
         unless colon.nil?
           name  = line[0, colon].downcase
-          value = line[colon + 1, line.length - colon - 1].strip
+          value = line[colon + 1, line.length - colon - 1]
+          if name == "content-length"
+            # Only SP and HTAB are field whitespace. String#strip would
+            # hide an invalid trailing NUL, CR, LF, VT or FF.
+            value = value.gsub(/\A[ \t]+|[ \t]+\z/, "")
+            # Validate before assignment: a later field must not hide an
+            # invalid value or a different length (RFC 9112, 6.3 rule 5).
+            if value.length == 0 || Tep.decimal_byte_count(value) < 0
+              return nil
+            end
+            if req.req_headers.key?(name) && req.req_headers[name] != value
+              return nil
+            end
+          else
+            value = value.strip
+          end
           req.req_headers[name] = value
         end
         i += 1

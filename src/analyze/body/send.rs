@@ -544,6 +544,16 @@ impl<'a> BodyTyper<'a> {
             Ty::Class { id, .. } if id.0.as_str() == "CSV" && method.as_str() == "generate" => {
                 Some(vec![recv_ty.clone()])
             }
+            // `PTY.spawn(...) { |r, w, pid| ... }` yields the same three
+            // values the non-block form answers as a Tuple.
+            Ty::Class { id, .. }
+                if class_object_receiver
+                    && id.0.as_str() == "PTY"
+                    && method.as_str() == "spawn" =>
+            {
+                let file = Ty::Class { id: ClassId(Symbol::from("File")), args: vec![] };
+                Some(vec![file.clone(), file, Ty::Int])
+            }
             // ActiveModel::Errors iteration yields an Error to the block,
             // as the Array of its Errors does (`expr::errors_enumerable`).
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
@@ -1718,6 +1728,19 @@ impl<'a> BodyTyper<'a> {
                 // Timeout::Error. Campfire unfurl + video previewer.
                 if id.0.as_str() == "Timeout" && method.as_str() == "timeout" {
                     return Ty::Untyped;
+                }
+                // `r, w, pid = PTY.spawn(env, *cmd)`: the pty's reader
+                // and writer and the child's pid. With a block — brace,
+                // `do`, or forwarded `&callback` — CRuby yields those
+                // and answers nil. `block_ret.is_some()` is presence
+                // (forwarded procs carry `Untyped`); not only a typed
+                // lambda body.
+                if id.0.as_str() == "PTY" && method.as_str() == "spawn" {
+                    if block_ret.is_some() {
+                        return Ty::Nil;
+                    }
+                    let file = || Ty::Class { id: ClassId(Symbol::from("File")), args: vec![] };
+                    return Ty::Tuple { elems: vec![file(), file(), Ty::Int] };
                 }
                 // `IO.popen` / `IO.copy_stream` — capture path; popen is
                 // polymorphic (block vs handle), copy_stream answers bytes.

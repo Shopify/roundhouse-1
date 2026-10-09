@@ -748,7 +748,8 @@ fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema, dialect:
 }
 
 /// `def self.delete_all` — bulk DELETE with ActiveRecord semantics:
-/// rows go, the autoincrement counter stays (`_adapter_truncate` is
+/// rows go, the affected-row count comes back, the autoincrement
+/// counter stays (`_adapter_truncate` is
 /// the sequence-resetting sibling, for test setup). A PUBLIC name —
 /// this per-model override shadows `Base.delete_all`'s
 /// adapter-routing default, so strict targets go Db-direct like every
@@ -777,14 +778,24 @@ fn synth_delete_all(owner: &ClassId, table: &Table, dialect: SqlDialect) -> Meth
             parenthesized: true,
         },
     );
+    // Rails returns the affected-row count; `Db.changes` reads it off
+    // the `exec` just issued.
+    let changes = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const { path: vec![Symbol::from("Db")] },
+            )),
+            method: Symbol::from("changes"),
+            args: vec![],
+            block: None,
+            parenthesized: true,
+        },
+    );
     let body = Expr::new(
         Span::synthetic(),
-        ExprNode::Seq {
-            exprs: vec![
-                exec,
-                Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
-            ],
-        },
+        ExprNode::Seq { exprs: vec![exec, changes] },
     );
 
     MethodDef {
@@ -796,7 +807,7 @@ fn synth_delete_all(owner: &ClassId, table: &Table, dialect: SqlDialect) -> Meth
         receiver: MethodReceiver::Class,
         params: vec![],
         body,
-        signature: Some(fn_sig(vec![], Ty::Nil)),
+        signature: Some(fn_sig(vec![], Ty::Int)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,

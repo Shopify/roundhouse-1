@@ -29,6 +29,11 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+# Module-only Shellwords — packages/shellwords reopens String/Array and
+# poisons String#split (PolyArray → C compile fail). See
+# runtime/spinel/shellwords.rb; defining the module drops BUNDLED's
+# require "shellwords".
+require_relative "runtime/shellwords"
 require_relative "runtime/json_impl"
 # JsonBuilder — the JSON encoding primitives the Jbuilder lowerer
 # emits calls to (`Views::Articles.article_json` etc.). Separate from
@@ -40,6 +45,9 @@ require_relative "runtime/json_builder"
 # calls these instead of open-coding `is_a?` narrowing per field, so the
 # type test lives in one transpiled body rather than in generated code
 # whose shape each emitter has to recognize.
+# Mime - `Params.wrap` asks the registry whether a request body is JSON
+# (Rails' own synonyms and parameters included).
+require_relative "runtime/mime"
 require_relative "runtime/params"
 # ActionText::Content — the coder behind a `has_rich_text` attribute.
 # The RichText RECORD is an ordinary lowered model (it has a table);

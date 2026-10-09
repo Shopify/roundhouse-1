@@ -158,6 +158,7 @@ module Tep
 
     # Pull any remaining body bytes from `client_fd` up to the
     # advertised Content-Length, then merge form fields into @req_params.
+    # Returns false on an incomplete body, true after a complete one.
     # Called once per request by the server right after Parser.parse
     # populates the request headers + the body bytes already in the
     # recv buffer.
@@ -176,8 +177,12 @@ module Tep
         rest = Sock.sphttp_drain_body(client_fd, cl - already)
         @raw_body = @raw_body + rest
       end
+      # RFC 9112, 6.3 rule 6: never parse or dispatch a partial body.
+      if @raw_body.bytesize < cl
+        return false
+      end
       parse_body_params
-      0
+      true
     end
 
     # The body's form fields into @req_params: urlencoded pairs, or the
@@ -249,16 +254,20 @@ module Tep
       while @raw_body.bytesize < cl
         ready = Tep::Scheduler.io_wait(client_fd, Tep::Scheduler::READ, 5)
         if ready == 0
-          break   # timeout -- client never finished sending
+          return false   # timeout -- client never finished sending
         end
         chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize)
         if chunk.bytesize == 0
-          break   # peer closed mid-body
+          return false   # peer closed mid-body
         end
         @raw_body = @raw_body + chunk
       end
+      # RFC 9112, 6.3 rule 6: never parse or dispatch a partial body.
+      if @raw_body.bytesize < cl
+        return false
+      end
       parse_body_params
-      0
+      true
     end
 
     # Body drain for Tep::Server::Threaded, whose client fd is
@@ -274,16 +283,20 @@ module Tep
       while @raw_body.bytesize < cl
         ready = io.wait_readable(5)
         if ready.nil?
-          break   # timeout -- client never finished sending
+          return false   # timeout -- client never finished sending
         end
         chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize)
         if chunk.bytesize == 0
-          break   # peer closed mid-body
+          return false   # peer closed mid-body
         end
         @raw_body = @raw_body + chunk
       end
+      # RFC 9112, 6.3 rule 6: never parse or dispatch a partial body.
+      if @raw_body.bytesize < cl
+        return false
+      end
       parse_body_params
-      0
+      true
     end
   end
 end

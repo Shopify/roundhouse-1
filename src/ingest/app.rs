@@ -1275,6 +1275,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // `ActiveRecord.run_after_transaction_callbacks_in_order_defined`:
     // Rails' default without an application.rb that sets it.
     let mut transaction_callbacks_in_order = false;
+    // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
+    app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
         let file = app_config_path.display().to_string();
@@ -5555,6 +5557,16 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
 /// exist everywhere would be worse than not modeling them at all.
 const REFINEMENT_MACROS: &[&str] = &["using"];
 
+/// `wrap_parameters` in a form ParamsWrapper's lowering reads
+/// (`false`, a name, a model, `format:`/`include:`/`exclude:`/`name:`):
+/// consumed by `lower::controller_to_library::params_wrapper`, so not a
+/// survey line. Any other form keeps the line, and the lowering does not
+/// guess at it.
+fn is_recognized_wrap_parameters(method: &str, args: &[crate::expr::Expr]) -> bool {
+    method == "wrap_parameters"
+        && crate::lower::controller_to_library::params_wrapper::is_recognized_wrap_parameters_call(args)
+}
+
 /// A receiverless, blockless call left in a controller's class body
 /// after every consumer has run is a macro roundhouse does not
 /// recognize — `rate_limit`, say. Its effect (a guard, a filter, a
@@ -5579,7 +5591,7 @@ fn report_unrecognized_controller_macros(app: &App) {
         };
         for item in &controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else {
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
                 continue;
             };
             if CONSUMED_CONTROLLER_MACROS.contains(&method.as_str()) {
@@ -5610,6 +5622,9 @@ fn report_unrecognized_controller_macros(app: &App) {
             // `build_sourced_filter_chain` seeds its ivars with, so this
             // exclusion is exactly as wide as the support actually is.
             if super::controller::lambda_filter_target(expr).is_some() {
+                continue;
+            }
+            if is_recognized_wrap_parameters(method.as_str(), args) {
                 continue;
             }
             let file = file_of(expr.span.file);
@@ -11300,6 +11315,85 @@ fn extract_transaction_callback_config(source: &[u8]) -> TransactionCallbackConf
         first_saved_instances: values[2],
         unsupported,
     }
+}
+
+/// Whether Rails wraps a JSON body for every controller by default
+/// (`App::wrap_parameters_by_default`). Railtie soup, read by line scan
+/// as `extract_config_time_zone` reads it, in Rails' own precedence:
+/// `config.load_defaults` 7.0+ switches the key on; an explicit
+/// `config.action_controller.wrap_parameters_by_default = …` (application
+/// or an initializer) wins over that; and the pre-7.0 generator's
+/// initializer, `wrap_parameters format: [:json]` inside
+/// `on_load(:action_controller)`, wraps for every controller too.
+fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.starts_with('#'))
+            .collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut default = false;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(rest) = line.strip_prefix("config.load_defaults") {
+                // `config.load_defaults 8.1` and `config.load_defaults(8.1)`.
+                let version: String = rest
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(v) = version.parse::<f64>() {
+                    default = v >= 7.0;
+                }
+            }
+        }
+        files.push(lines);
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir) {
+        if let Ok(paths) = read_rb_files(vfs, &init_dir) {
+            for path in paths {
+                if let Ok(source) = vfs.read(&path) {
+                    files.push(code_lines(&source));
+                }
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
+            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+            if rest.starts_with("true") {
+                default = true;
+            } else if rest.starts_with("false") {
+                default = false;
+            }
+        } else if let Some(rest) = line.strip_prefix("wrap_parameters format:") {
+            // Receiverless only — `WidgetsController.wrap_parameters …` is
+            // that controller's call, not the app-wide on_load default.
+            // Format alone (the pre-7 generator); `include:` / `exclude:` /
+            // `name:` on the same line are not modeled as the app default.
+            if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
+                continue;
+            }
+            // Exact `:json` / `json` entry — not a substring of `:json_api`.
+            default = wrap_parameters_format_includes_json(rest);
+        }
+    }
+    default
+}
+
+/// Whether a `wrap_parameters format: …` argument list names `:json`
+/// exactly (Rails' ParamsWrapper check), not a longer synonym such as
+/// `:json_api`.
+fn wrap_parameters_format_includes_json(rest: &str) -> bool {
+    rest.split(|c: char| matches!(c, ',' | '[' | ']' | '(' | ')' | ' ' | '\t'))
+        .map(|tok| tok.trim().trim_matches(|c| c == '"' || c == '\''))
+        .any(|tok| tok == ":json" || tok == "json")
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {

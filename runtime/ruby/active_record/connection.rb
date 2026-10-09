@@ -439,7 +439,15 @@ module ActiveRecord
     # ROLLBACK + re-raise on any exception. Flat transactions only: the
     # corpus never nests (a nested BEGIN would error in SQLite rather
     # than silently join, which is the honest failure).
-    def self.transaction
+    #
+    # `isolation:`, `requires_new:`, and `joinable:` are Rails'
+    # `DatabaseStatements#transaction` keyword options (the same three
+    # `with_lock` forwards — see base.rb). All three are accepted and
+    # ignored: no isolation levels, and no SAVEPOINT-backed nesting
+    # under this flat implementation. They exist on the signature so a
+    # call that passes them (directly, or via `with_lock`) doesn't
+    # raise `ArgumentError`.
+    def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       Db.exec("BEGIN")
       begin
         result = yield
@@ -449,6 +457,15 @@ module ActiveRecord
         Db.exec("ROLLBACK")
         raise e
       end
+    end
+
+    # `Model.delete_all` for a model without the lowerer-emitted
+    # override: the rows the DELETE removed, read off the statement
+    # rather than counted beforehand. Ruby-family-only because
+    # `changes` is — see base.rb's default.
+    def self.delete_all
+      ActiveRecord.adapter.delete_all(table_name)
+      ActiveRecord.adapter.changes
     end
 
     # `Model.update_counters(id, col: delta, …)` — atomic column

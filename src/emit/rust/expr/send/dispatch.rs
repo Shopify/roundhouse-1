@@ -57,6 +57,7 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         }
         ("Db", "escape_bool_opt") => Some(vec![Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }]),
         ("Db", "last_insert_rowid") => Some(vec![]),
+        ("Db", "changes") => Some(vec![]),
         // `Broadcasts::method(HashMap<String, Value>)` — the lowerer
         // emits kwargs as a HashMap; the runtime shim accepts that
         // shape and pulls named fields out.

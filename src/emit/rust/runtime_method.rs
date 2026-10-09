@@ -256,7 +256,14 @@ fn rt_emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                     }
                     return format!("{ls_cast} / {rs_cast}");
                 }
-                DivPowCase::Numeric => {
+                DivPowCase::IntFloor if method == "/" => {
+                    return crate::emit::rust::shared::int_floor_div_mod(
+                        crate::emit::rust::shared::FloorOp::Div,
+                        &ls,
+                        &rs,
+                    );
+                }
+                DivPowCase::IntFloor | DivPowCase::Numeric => {
                     if method == "**" {
                         // Pick integer-vs-float pow based on lhs type.
                         let is_float = matches!(r.ty.as_ref(), Some(Ty::Float));
@@ -265,7 +272,7 @@ fn rt_emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                         let rs_cast = if is_float { rs } else { format!("{rs} as u32") };
                         return format!("{ls}.{pow_m}({rs_cast})");
                     }
-                    // `/` falls through to native.
+                    // Float `/` (Numeric) falls through to native.
                 }
                 DivPowCase::Incompatible => {
                     return format!(
@@ -297,6 +304,13 @@ fn rt_emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 }
                 ModuloCase::Incompatible => {
                     return r#"panic!("roundhouse: % with incompatible operand types")"#.to_string();
+                }
+                ModuloCase::IntFloor => {
+                    return crate::emit::rust::shared::int_floor_div_mod(
+                        crate::emit::rust::shared::FloorOp::Mod,
+                        &ls,
+                        &rs,
+                    );
                 }
                 ModuloCase::Numeric | ModuloCase::Unknown => {}
             }

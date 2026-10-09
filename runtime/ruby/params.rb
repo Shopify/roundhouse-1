@@ -94,6 +94,45 @@ module Params
     value
   end
 
+  # Rails' ParamsWrapper, the per-request half (the compiler decided the
+  # rest: whether this controller wraps, the key, the keys copied). When
+  # the request's body is JSON and `params` has no `key` yet, the BODY
+  # params - never the query string or the path - are copied under
+  # `key`: only `include` when `use_include`, else every key but
+  # `exclude` and Rails' own `authenticity_token _method utf8`. The
+  # top-level keys stay where they are, as in Rails.
+  def self.wrap(params, request, key, use_include, include, exclude)
+    # A controller driven without a request (a test calling
+    # `process_action` directly) has no body to wrap.
+    return params if request.nil?
+    return params if params.key?(key)
+    content_type = request.env.fetch("CONTENT_TYPE", "").to_s
+    return params if content_type.empty?
+    begin
+      return params unless Mime::Type.lookup(content_type).to_sym == :json
+    rescue Mime::Type::InvalidMimeType
+      return params
+    end
+    body = request.request_parameters
+    wrapped = {}
+    if use_include
+      i = 0
+      while i < include.length
+        name = include[i]
+        wrapped[name] = body.fetch(name, "") if body.key?(name)
+        i = i + 1
+      end
+    else
+      body.each do |name, value|
+        next if exclude.include?(name)
+        next if name == "authenticity_token" || name == "_method" || name == "utf8"
+        wrapped[name] = value
+      end
+    end
+    params[key] = wrapped
+    params
+  end
+
   # `params.expect(key => [fields])`'s refusal, answered before the
   # typed factory reads the resource: `params` back unchanged, or
   # `ParameterMissing` (400 when the app does not rescue it). Rails

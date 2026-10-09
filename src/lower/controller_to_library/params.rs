@@ -1827,16 +1827,26 @@ fn synth_index_read(spec: &ParamsSpec) -> MethodDef {
         })
         .collect();
 
-    let body = expr(
-        ExprNode::Case {
-            scrutinee: expr(
-                ExprNode::Var { id: VarId(0), name: key.clone() },
-                Some(Ty::Sym),
-            ),
-            arms,
-        },
-        Some(Ty::Untyped),
-    );
+    // A `case` with zero arms has no `when` clause at all, which is a
+    // Ruby syntax error — reachable here whenever every permitted key is
+    // non-scalar (`permit(widget_ids: [])`, nothing else) and so `fields`
+    // drops to empty (see `tests/params_all_non_scalar_keys.rs`). `key`
+    // is then unused; the body is just `nil`, same signature, same
+    // `Ty::Untyped` result.
+    let body = if arms.is_empty() {
+        expr(ExprNode::Lit { value: Literal::Nil }, Some(Ty::Untyped))
+    } else {
+        expr(
+            ExprNode::Case {
+                scrutinee: expr(
+                    ExprNode::Var { id: VarId(0), name: key.clone() },
+                    Some(Ty::Sym),
+                ),
+                arms,
+            },
+            Some(Ty::Untyped),
+        )
+    };
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,

@@ -64,16 +64,24 @@ pub struct FormatBreadth {
     /// `Params` primitives, so a missing resource reads as `{}` there
     /// (ledgered in docs/pipeline/runtime.md).
     pub raises_param_missing: bool,
+    /// The tree wraps a JSON request body under the controller's model
+    /// name, as Rails' ParamsWrapper does (`Params.wrap`, and the body
+    /// params the ruby-family dispatchers hand the request). The strict
+    /// targets read no JSON body (Rust, Python) or no body params apart
+    /// (TypeScript), so they do not.
+    pub wraps_json_params: bool,
 }
 
 impl FormatBreadth {
     /// html only (plus the simple-`render :sym` json arms) — the emit
     /// paths that don't recognize `request_format` at all.
-    pub const NARROW: Self = Self { json_any: false, rss: false, raises_param_missing: false };
+    pub const NARROW: Self = Self { json_any: false, rss: false, raises_param_missing: false, wraps_json_params: false };
     /// The spinel/AOT tree: rss dispatch, no JsonRender.
-    pub const RSS_ONLY: Self = Self { json_any: false, rss: true, raises_param_missing: true };
+    pub const RSS_ONLY: Self =
+        Self { json_any: false, rss: true, raises_param_missing: true, wraps_json_params: true };
     /// The CRuby/JRuby trees, whose overlay answers the full surface.
-    pub const FULL: Self = Self { json_any: true, rss: true, raises_param_missing: true };
+    pub const FULL: Self =
+        Self { json_any: true, rss: true, raises_param_missing: true, wraps_json_params: true };
 }
 
 /// Format-dispatching variant of `unwrap_respond_to`.

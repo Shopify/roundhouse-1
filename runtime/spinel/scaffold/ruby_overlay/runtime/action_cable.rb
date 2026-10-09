@@ -224,7 +224,7 @@ module ActionCable
 
     def broadcasts(stream)
       Broadcasts.log.select { |entry| entry[:stream] == stream }.map do |entry|
-        JSON.generate(payload_of(entry))
+        JsonBuilder.escape_html_entities(JSON.generate(payload_of(entry)))
       end
     end
 

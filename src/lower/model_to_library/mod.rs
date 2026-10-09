@@ -2266,14 +2266,30 @@ pub(crate) fn push_scope_methods(
         // `__rel` is an optional POSITIONAL param — it must precede any
         // keyword params in the def (`def recent(user = nil, __rel = …,
         // unmerged: true)`), or the signature is a syntax error.
-        let insert_at = params
-            .iter()
-            .position(|p| p.keyword)
-            .unwrap_or(params.len());
-        params.insert(
-            insert_at,
-            Param::with_default(rel_param.clone(), relation_new_self()),
-        );
+        //
+        // A REST param (`*tags`) is the same exception `insert_rel_param`
+        // (the emit-side twin of this function, for user-written
+        // relation-taking class methods) has: an optional positional
+        // can't follow a splat, so `__rel` goes in as an optional
+        // KEYWORD instead, ahead of any `**opts`. `parse_scope` drops a
+        // scope lambda's splat today, so `scope.params` never actually
+        // carries a rest param yet — this branch is dead until that
+        // changes (a separate, later fix) — but kept here so the two
+        // insertion sites stay consistent rather than silently diverging
+        // the day it does.
+        if params.iter().any(|p| p.rest && !p.keyword) {
+            let at = params.iter().position(|p| p.rest && p.keyword).unwrap_or(params.len());
+            params.insert(at, Param::keyword(rel_param.clone(), Some(relation_new_self())));
+        } else {
+            let insert_at = params
+                .iter()
+                .position(|p| p.keyword)
+                .unwrap_or(params.len());
+            params.insert(
+                insert_at,
+                Param::with_default(rel_param.clone(), relation_new_self()),
+            );
+        }
 
         let mut body = scope.body.clone();
         crate::lower::scope_chain::rewrite_scope_body(
@@ -2643,6 +2659,15 @@ fn build_class_info_with_finder_inputs(
                 Ty::Class { .. } => true,
                 Ty::Union { variants } => variants.iter().any(|ty| matches!(ty, Ty::Class { .. }))
                     && variants.iter().all(|ty| matches!(ty, Ty::Class { .. } | Ty::Nil)),
+                // An Array of scalars carries no key coercion or
+                // record identity to repeat, and without it a test's
+                // `assert_equal [2, 4], Model.evens` reads an untyped
+                // call: the `.to_a` the assertion lowering adds stays
+                // a dynamic send no typed target defines on its list.
+                Ty::Array { elem } => matches!(
+                    **elem,
+                    Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool
+                ),
                 _ => false,
             })
         else {
@@ -3554,6 +3579,28 @@ mod tests {
             callable.signature = None;
             callable.body.ty = Some(ty);
             assert!(!article_info(&app, &methods).instance_methods.contains_key(&Symbol::from("callable")));
+        }
+    }
+
+    /// A test body types `Article.evens` from this registry; without the
+    /// entry `assert_equal [2, 4], Article.evens` compared against an
+    /// untyped call, and its `.to_a` reached typed targets as a dynamic
+    /// send their lists do not define.
+    #[test]
+    fn scalar_array_body_type_is_registered_but_not_an_untyped_one() {
+        let app = app("  def self.evens\n    [1, 2].map { |x| x * 2 }\n  end");
+        let mut methods = article_methods(&app);
+        let ints = Ty::Array { elem: Box::new(Ty::Int) };
+        for (ty, kept) in [(ints.clone(), true), (Ty::Array { elem: Box::new(Ty::Untyped) }, false)] {
+            let evens = methods.iter_mut().find(|m| m.name.as_str() == "evens").unwrap();
+            evens.signature = None;
+            evens.body.ty = Some(ty);
+            let got = article_info(&app, &methods).class_methods.get(&Symbol::from("evens")).cloned();
+            match got {
+                Some(Ty::Fn { ret, .. }) if kept => assert_eq!(*ret, ints),
+                None if !kept => {}
+                other => panic!("unexpected registry entry: {other:?}"),
+            }
         }
     }
 

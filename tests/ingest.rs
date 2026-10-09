@@ -2716,3 +2716,50 @@ fn parameters_after_a_rest_are_popped_off_it() {
         assert_eq!(first, second, "{} is not a fixed point", String::from_utf8_lossy(source));
     }
 }
+
+/// `wrap_parameters` in a form the ParamsWrapper lowering reads (`false`,
+/// `format:`, a name, a model, `include:`/`exclude:`) is consumed without a
+/// survey line; a form it cannot read (a method call as the argument)
+/// stays ledgered, and the lowering leaves that controller unwrapped.
+#[test]
+fn recognized_wrap_parameters_forms_are_consumed_others_stay_in_the_survey() {
+    use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
+    use roundhouse::det::HashMap;
+    use std::path::PathBuf;
+
+    let files: &[(&str, &str)] = &[
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::API\n  wrap_parameters false\nend\n",
+        ),
+        (
+            "app/controllers/widgets_controller.rb",
+            "class WidgetsController < ApplicationController\n  wrap_parameters format: [:json], include: [:name]\nend\n",
+        ),
+        (
+            "app/controllers/gadgets_controller.rb",
+            "class GadgetsController < ApplicationController\n  wrap_parameters wrapper_options\nend\n",
+        ),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
+        .collect();
+
+    survey::activate();
+    let result = ingest_app_from_tree(tree);
+    let gaps = survey::drain();
+    result.expect("survey-mode ingest succeeds");
+
+    let wrap_gaps: Vec<(String, String)> = gaps
+        .iter()
+        .filter_map(|g| match g {
+            IngestError::Unsupported { file, message } if message.contains("`wrap_parameters`") => {
+                Some((file.clone(), message.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wrap_gaps.len(), 1, "only the unreadable form is a gap: {wrap_gaps:?}");
+    assert!(wrap_gaps[0].0.to_lowercase().contains("gadgets"), "{wrap_gaps:?}");
+}

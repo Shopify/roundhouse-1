@@ -629,10 +629,16 @@ module ActiveRecord
 
     # Bulk DELETE without instantiating records or running callbacks —
     # ActiveRecord's `Model.delete_all` (used by seeds/tests for table
-    # resets; `Relation#delete_all` covers the scoped form).
+    # resets; `Relation#delete_all` covers the scoped form). Returns
+    # the affected-row count, as Rails does. This default is the
+    # compile surface: the strict targets' adapter contract has no
+    # `changes`, and their models carry the lowerer-emitted Db-direct
+    # override, so the count is read before the delete. The
+    # ruby-family connection.rb reopen answers with the exact count.
     def self.delete_all
+      n = _adapter_count
       ActiveRecord.adapter.delete_all(table_name)
-      nil
+      n
     end
 
     def self.destroy_all
@@ -1065,6 +1071,51 @@ module ActiveRecord
       # success, self unchanged when the row has been deleted.
       _adapter_reload
       self
+    end
+
+    # `#lock!` (`ActiveRecord::Locking::Pessimistic#lock!`) — reloads
+    # the record with a row lock and answers self. SQLite is a single
+    # writer with no `SELECT … FOR UPDATE` support, so inside a
+    # transaction a plain `reload` already gives the guarantee Rails
+    # extracts from the row lock: the enclosing `BEGIN` serializes
+    # writers, so nothing can land between this read and a following
+    # write in the same transaction. A Postgres adapter would spell
+    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
+    # runtime keeps the Rails signature — `lock` may be `true` or a
+    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
+    # doesn't need either under SQLite; both are accepted and ignored.
+    def lock!(lock = true)
+      reload
+    end
+
+    # `#with_lock` (`ActiveRecord::Locking::Pessimistic#with_lock`) —
+    # locks the record, then runs the block inside a transaction,
+    # answering the block's value. Dispatches through
+    # `self.class.transaction` (same `self.class.` pattern as
+    # `schema_columns` elsewhere in this file) rather than a bare
+    # `transaction`: Base has no instance-level transaction delegator
+    # like Rails' `ActiveRecord::Transactions#transaction`, only the
+    # class one in connection.rb. An exception raised in the block
+    # rolls the transaction back and re-raises, same as `transaction`
+    # itself.
+    #
+    # Rails' own shape (`ActiveRecord::Locking::Pessimistic#with_lock`)
+    # is `args.extract_options!` for the trailing transaction-options
+    # Hash, then the lock clause (`true` when nothing is left).
+    # `extract_options!` itself is an ActiveSupport `Array` extension
+    # this runtime doesn't carry, so the same split is spelled out by
+    # hand: pop a trailing Hash, default the rest to `true`.
+    def with_lock(*args)
+      transaction_opts = args.last.is_a?(Hash) ? args.pop : {}
+      lock = args.empty? ? true : args.first
+      self.class.transaction(
+        isolation: transaction_opts[:isolation],
+        requires_new: transaction_opts[:requires_new],
+        joinable: transaction_opts.key?(:joinable) ? transaction_opts[:joinable] : true
+      ) do
+        lock!(lock)
+        yield
+      end
     end
 
     # ---- Lifecycle hooks (no-ops; subclasses override) --------------

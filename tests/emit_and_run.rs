@@ -13,6 +13,8 @@ mod class_attribute;
 mod integer_query_find_by;
 #[path = "emit_and_run/strong_params.rs"]
 mod strong_params;
+#[path = "emit_and_run/params_wrapper.rs"]
+mod params_wrapper;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
@@ -22,10 +24,22 @@ mod runtime_block_signature;
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/cable_broadcast_json.rs"]
+mod cable_broadcast_json_contract;
+#[path = "emit_and_run/cable_broadcast_json.rs"]
+mod cable_broadcast_json;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
 #[path = "support/delegate_association.rs"]
 mod delegate_association;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "emit_and_run/io_process_constants.rs"]
+mod io_process_constants;
+#[path = "emit_and_run/request_optional_port.rs"]
+mod request_optional_port;
+#[path = "emit_and_run/sti_global_id.rs"]
+mod sti_global_id;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -10448,5 +10462,88 @@ fn an_initializer_class_read_through_brackets_runs() {
 raise article.banner.inspect unless article.banner == "Welcome: Brackets"
 "#,
         )
+        .assert_passes();
+}
+
+/// Array `&` and `|` are set intersection and union in Ruby. The
+/// typed targets used to print their native operators: bitwise on
+/// TypeScript (two arrays coerce to `0`), a `TypeError` on Python
+/// lists, and a `.&(…)` method call that Rust cannot parse.
+fn array_set_operators_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.common_ids\n    [1, 2, 2, 3] & [2, 3, 4]\n  end\n\n  def self.either_ids\n    [3, 1, 1] | [2, 1]\n  end\n",
+        )
+        .write(
+            "test/models/set_ops_test.rb",
+            "require \"test_helper\"\n\nclass SetOpsTest < ActiveSupport::TestCase\n  test \"array set operators\" do\n    assert_equal [2, 3], Article.common_ids\n    assert_equal [3, 1, 2], Article.either_ids\n  end\nend\n",
+        )
+}
+
+#[test]
+fn array_set_operators_run() {
+    array_set_operators_app()
+        .run_test("test/models/set_ops_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn array_set_operators_are_not_native_infix_on_typed_targets() {
+    use roundhouse::project::BuildTarget;
+    for (target, file, intersect, union) in [
+        (
+            BuildTarget::Typescript,
+            "app/models/article.ts",
+            "((__l, __r) => [...new Set([...__l])].filter(x => __r.includes(x)))([1, 2, 2, 3], [2, 3, 4])",
+            "[...new Set([...[3, 1, 1], ...[2, 1]])]",
+        ),
+        (
+            BuildTarget::Python,
+            "app/v2/models.py",
+            "(lambda __l, __r, __eq: [x for i, x in enumerate(__l) if any(__eq(x, y) for y in __r) and not any(__eq(x, y) for y in __l[:i])])([1, 2, 2, 3], [2, 3, 4], lambda a, b: type(a) is type(b) and a == b)",
+            "(lambda __a, __eq: [x for i, x in enumerate(__a) if not any(__eq(x, y) for y in __a[:i])])([*[3, 1, 1], *[2, 1]], lambda a, b: type(a) is type(b) and a == b)",
+        ),
+        (
+            BuildTarget::Rust,
+            "src/models/article.rs",
+            "if __rhs.contains(x) && !__out.contains(x)",
+            "for x in __lhs.iter().chain(__rhs.iter())",
+        ),
+    ] {
+        let (tree, errors) = array_set_operators_app().emit(target);
+        assert!(errors.is_empty(), "{target:?}: {errors:?}");
+        let src = std::fs::read_to_string(tree.join(file))
+            .unwrap_or_else(|e| panic!("{target:?}: read {file}: {e}"));
+        assert!(src.contains(intersect), "{target:?} `&`:\n{src}");
+        assert!(src.contains(union), "{target:?} `|`:\n{src}");
+    }
+}
+
+/// `Model.delete_all` returns the affected-row count, as Rails does —
+/// the class form and the scoped `Relation` form alike. The class form
+/// used to type as `Int` while running to `nil`.
+#[test]
+fn delete_all_returns_affected_row_count() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/article_delete_all_test.rb",
+            r#"require "test_helper"
+
+class ArticleDeleteAllTest < ActiveSupport::TestCase
+  test "delete_all returns the number of rows deleted" do
+    Comment.delete_all
+    Article.delete_all
+    3.times { |i| Article.create!(title: "gone-#{i}", body: "Body text here") }
+    Article.create!(title: "kept", body: "Body text here")
+    assert_equal 3, Article.where("title LIKE 'gone-%'").delete_all
+    assert_equal 1, Article.delete_all
+    assert_equal 0, Article.delete_all
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_delete_all_test.rb")
         .assert_passes();
 }

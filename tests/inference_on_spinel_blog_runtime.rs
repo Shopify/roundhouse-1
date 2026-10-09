@@ -365,7 +365,14 @@ fn untyped_subexpressions_baseline() {
     // ignored_columns=, the _attribute_* / _cast_primary_key /
     // _primary_key_from_database helpers, the error_classes.rb
     // constructors), and what only they feed.
-    const CEILING: usize = 546;
+    // Pessimistic locking (#644 / #671), upstream 523 -> 529 (+6), MEASURED;
+    // merged over the held ceiling of 546 above: 546 + 6. The six
+    // new sites are `with_lock`'s `*args` split (the trailing options
+    // Hash and the lock clause) and the `isolation:` / `requires_new:` /
+    // `joinable:` pass-through into `transaction`, all accepted and
+    // ignored under SQLite. Its RBS-paired methods keep the gradual
+    // `untyped` escape `self.transaction` already has.
+    const CEILING: usize = 552;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

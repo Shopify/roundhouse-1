@@ -48,6 +48,11 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+# Module-only Shellwords — packages/shellwords reopens String/Array and
+# poisons String#split (PolyArray → C compile fail). See
+# runtime/spinel/shellwords.rb; defining the module drops BUNDLED's
+# require "shellwords".
+require_relative "runtime/shellwords"
 require_relative "runtime/json_impl"
 # JsonBuilder — the JSON encoding primitives the Jbuilder lowerer
 # emits calls to (`Views::Articles.article_json` etc.). Separate from
@@ -58,6 +63,9 @@ require_relative "runtime/json_builder"
 # entry points need it: the CRuby target uses this overlay, and patching
 # only the spinel one leaves `<Resource>Params.from_raw` reaching an
 # undefined constant on every request that carries params.
+# Mime - `Params.wrap` asks the registry whether a request body is JSON
+# (Rails' own synonyms and parameters included).
+require_relative "runtime/mime"
 require_relative "runtime/params"
 # ActionText::Content — see the spinel scaffold's main.rb. Both entry
 # points need it: a `has_rich_text` model's `body` reader constructs

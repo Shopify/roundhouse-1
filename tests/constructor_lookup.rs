@@ -646,3 +646,44 @@ end
         "an unresolved short name with competing constructor owners must not silently retain unsafe keyword binding: {diagnostics:#?}"
     );
 }
+
+#[test]
+fn unresolved_mixin_without_a_source_constructor_keeps_the_call_verbatim() {
+    let source = r#"
+class MixinOnlyConstructor
+  include UnresolvedConstructorMixin
+end
+
+class MixinOnlyCaller
+  def self.build
+    MixinOnlyConstructor.new(label: "value", step: 2) { |row| row }
+  end
+end
+"#;
+    let classes =
+        ingest_library_classes(source.as_bytes(), "mixin_only_constructor.rb").expect("ingest");
+    let mut app = App::new();
+    app.library_classes.extend(classes);
+    let diagnostics = roundhouse::session::analyze_and_lower(&mut app);
+    assert!(
+        !diagnostics.iter().any(|diagnostic| matches!(
+            &diagnostic.kind,
+            roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                if construct.as_str() == "constructor keyword arguments"
+        )),
+        "nothing in source was flattened, so the call keeps its Ruby binding: {diagnostics:#?}"
+    );
+    let emitted = roundhouse::emit::ruby::emit_library(&app)
+        .into_iter()
+        .map(|file| file.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        emitted.contains("MixinOnlyConstructor.new(label: \"value\", step: 2)"),
+        "{emitted}"
+    );
+    assert!(
+        !emitted.contains("constructor keyword arguments not supported"),
+        "{emitted}"
+    );
+}

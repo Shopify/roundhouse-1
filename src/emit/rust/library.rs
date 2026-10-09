@@ -1231,3 +1231,36 @@ end
         );
     }
 }
+
+#[cfg(test)]
+mod numeric_unary_emit_tests {
+    use super::emit_library_class;
+
+    fn emit(ruby: &str, rbs: &str) -> String {
+        let classes = crate::runtime_src::parse_library_with_rbs(ruby.as_bytes(), rbs, "unary.rb")
+            .expect("snippet parses and types");
+        let mut app = crate::App::new();
+        app.library_classes = classes;
+        crate::lower::numeric_unary::apply_numeric_unary_lowering(&mut app);
+        crate::emit::rust::decide::decide_classes(&mut app.library_classes);
+        crate::emit::rust::expr::with_emit_ctx(crate::emit::rust::EmitCtx::default(), || {
+            app.library_classes.iter().map(|c| emit_library_class(c).expect("emits")).collect()
+        })
+    }
+
+    /// `-n` is a `-@` send; it used to come out as the method call
+    /// `n.-@()`, which does not parse. `(-5).abs` lost its parens, and
+    /// `-5_i64.abs()` is `-(5_i64.abs())`: -5, with no error anywhere.
+    #[test]
+    fn negation_is_arithmetic_and_negative_receivers_keep_parens() {
+        let out = emit(
+            "module Unary\n  def self.neg(n)\n    -n\n  end\n  def self.neg_sum(n)\n    -(n + 4)\n  end\n  def self.pos(n)\n    +n\n  end\n  def self.neg_abs\n    (-5).abs\n  end\n  def self.diff_abs(n)\n    (n - 10).abs\n  end\nend\n",
+            "module Unary\n  def self.neg: (Integer n) -> Integer\n  def self.neg_sum: (Integer n) -> Integer\n  def self.pos: (Integer n) -> Integer\n  def self.neg_abs: () -> Integer\n  def self.diff_abs: (Integer n) -> Integer\nend\n",
+        );
+        assert!(!out.contains("-@") && !out.contains("+@"), "operator method leaked:\n{out}");
+        assert!(out.contains("n * -1_i64"), "`-n` not lowered:\n{out}");
+        assert!(out.contains("(n + 4_i64) * -1_i64"), "`-(n + 4)` re-associated:\n{out}");
+        assert!(out.contains("(-5_i64).abs()"), "negative receiver lost its parens:\n{out}");
+        assert!(out.contains("(n - 10_i64).abs()"), "infix receiver lost its parens:\n{out}");
+    }
+}

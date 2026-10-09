@@ -50,8 +50,10 @@ const MAX_NODES: usize = 512;
 pub(super) fn bound(ty: Ty) -> Ty {
     let mut budget = MAX_NODES;
     if fits(&ty, MAX_DEPTH, &mut budget) {
+        super::fixpoint_check::note_bound(false);
         return ty;
     }
+    super::fixpoint_check::note_bound(true);
     let mut limit = measure(&ty).0.min(MAX_DEPTH);
     loop {
         let cut = cut(&ty, limit);

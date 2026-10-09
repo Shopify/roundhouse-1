@@ -630,8 +630,11 @@ module Cable
       if id.length == 0
         return nil   # no subscriber has named this stream yet
       end
+      # The fragment as Rails writes it: ActiveSupport::JSON escapes `<`,
+      # `>` and `&` inside strings (`\u003cturbo-stream ...`), which plain
+      # JSON.generate does not. Same text as the overlay's `Registry.deliver`.
       envelope = "{\"identifier\":" + JSON.generate(id) +
-                 ",\"message\":" + JSON.generate(fragment) + "}"
+                 ",\"message\":" + JsonBuilder.escape_html_entities(JSON.generate(fragment)) + "}"
       Tep::Broadcast.publish(stream, envelope)
       nil
     end

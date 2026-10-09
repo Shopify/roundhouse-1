@@ -127,6 +127,10 @@ module ActionDispatch
     attr_accessor :host
     attr_reader :format
     attr_accessor :env
+    # Rails' `request_parameters`: the BODY's params alone, without the
+    # query string or the path captures. ParamsWrapper copies from these
+    # (`Params.wrap`); the dispatcher fills them.
+    attr_accessor :request_parameters
 
     def initialize
       @remote_ip = "127.0.0.1"
@@ -140,6 +144,7 @@ module ActionDispatch
       @body = +""
       @body_io = nil
       @env = {}
+      @request_parameters = {}
       # `@params` too, and for a reason `@env` shows: `Request.for`
       # COPIES into both (`params.each { |k, v| r.params[k] = v }`),
       # which READS the slot before anything writes it. Unset, that read
@@ -249,6 +254,20 @@ module ActionDispatch
       return true if @env.fetch("HTTPS", "").to_s == "on"
       forwarded = @env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s
       forwarded.split(",").first.to_s.strip.downcase == "https"
+    end
+
+    # Rails' `request.optional_port`: the port, unless it is the
+    # scheme's standard one (80, or 443 over TLS) — then nil, so a URL
+    # built from it carries no `:port`. `@host` is the Host header,
+    # port included, which is how `base_url` uses it. campfire's
+    # `default_url_options` passes it as `port:`.
+    def optional_port
+      sep = @host.rindex(":")
+      return nil if sep.nil? || @host.end_with?("]")
+      port = @host[(sep + 1)..].to_s.to_i
+      return nil if port == 0
+      return nil if port == (ssl? ? 443 : 80)
+      port
     end
 
     # `request.protocol` — the scheme WITH its `://`, as Rails spells it.

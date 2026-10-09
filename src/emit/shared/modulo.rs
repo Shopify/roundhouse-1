@@ -13,14 +13,18 @@
 //!
 //! NOTE: `%` on a numeric pair in Ruby follows the sign of the
 //! divisor (`-7 % 3 = 2`); C/Rust/Go/JS `%` follows the sign of the
-//! dividend (`-7 % 3 = -1`). Tolerated for now; rework when a
-//! fixture forces the distinction.
+//! dividend (`-7 % 3 = -1`). Truncating targets match
+//! [`ModuloCase::IntFloor`] and emit the floored form for Int % Int.
 
 use crate::expr::Expr;
 use crate::ty::Ty;
 
 pub enum ModuloCase {
-    /// Int % Int or Float % Float — emit as native `%`.
+    /// Int % Int — Ruby takes the divisor's sign (`-7 % 3 == 2`).
+    /// Truncating targets emit a floored form; targets whose native
+    /// `%` already matches (Python) keep native.
+    IntFloor,
+    /// Float % Float — emit as native `%` (or `math.Mod` / `fmod`).
     Numeric,
     /// Int % Float or Float % Int — most targets auto-coerce; Rust
     /// and Go need explicit casts on the Int side.
@@ -50,7 +54,8 @@ pub fn classify_modulo(lhs: &Expr, rhs: &Expr) -> ModuloCase {
     let rhs_ty = rhs_ty.unwrap();
 
     match (lhs_ty, rhs_ty) {
-        (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => ModuloCase::Numeric,
+        (Ty::Int, Ty::Int) => ModuloCase::IntFloor,
+        (Ty::Float, Ty::Float) => ModuloCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => ModuloCase::NumericPromote,
         (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
             ModuloCase::NumericPromote
@@ -99,10 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn int_mod_int_is_numeric() {
+    fn int_mod_int_is_int_floor() {
         assert!(matches!(
             classify_modulo(&int_lit(7), &int_lit(3)),
-            ModuloCase::Numeric
+            ModuloCase::IntFloor
         ));
     }
 

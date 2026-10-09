@@ -213,7 +213,7 @@ module Tep
           return false
         end
 
-        req.consume_body_via_scheduler(client)
+        return false unless req.consume_body_via_scheduler(client)
 
         res = Response.new
         begin
@@ -356,10 +356,12 @@ module Tep
         0
       end
 
+      # bytesize, as write_response: a multibyte `msg` would otherwise
+      # announce fewer bytes than are written.
       def self.send_simple(client, status, msg)
         reason = Tep.reason(status)
         head = "HTTP/1.0 " + status.to_s + " " + reason + "\r\n" +
-               "Content-Length: " + msg.length.to_s + "\r\n" +
+               "Content-Length: " + msg.bytesize.to_s + "\r\n" +
                "Connection: close\r\n\r\n" + msg
         Sock.sphttp_write_str(client, head)
         0

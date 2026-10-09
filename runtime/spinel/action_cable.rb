@@ -186,12 +186,12 @@ module ActionCable
         if entry[:action] == :message
           out << entry[:payload].to_s
         else
-          out << JSON.generate(Broadcasts.render_fragment(
+          out << JsonBuilder.escape_html_entities(JSON.generate(Broadcasts.render_fragment(
             action: entry[:action],
             target: entry[:target],
             html: entry[:html],
             attributes: entry[:attributes].to_s,
-          ))
+          )))
         end
       end
       out
@@ -234,24 +234,19 @@ module ActionCable
     SERVER
   end
 
-  # Render a raw-publish payload to JSON object text.
+  # Render a raw-publish payload to JSON text, as Rails does: Action
+  # Cable encodes the payload with ActiveSupport::JSON, so a String,
+  # a Symbol, nil, a Float or a nested Hash or Array is written as JSON
+  # (not with `to_s`), and `<`, `>` and `&` inside strings come out as
+  # `\u003c`, `\u003e`, `\u0026`. `JSON.generate` walks the value
+  # whatever it holds; `escape_html_entities` adds Rails' escapes. The
+  # CRuby overlay's transport writes the same text (`Registry.deliver`).
   #
-  # Integer-valued because that is the whole surface an ingested app has
-  # asked for so far (campfire's two call sites are `{room_id: <id>}` and
-  # `{roomId: <id>}`). Widening it is a monomorphization decision, not a
-  # cast: give the emitter one element type per container and it stays a
-  # struct field; make it a bag and every target pays.
+  # The payload was Integer-valued only (`value.to_s`), which is what
+  # campfire's two call sites need; a terminal relayed over a channel
+  # broadcasts String output, which came out as invalid JSON (#619).
   def self.payload_json(payload)
-    out = "{"
-    first = true
-    payload.each do |key, value|
-      if !first
-        out = out + ","
-      end
-      first = false
-      out = out + JSON.generate(key.to_s) + ":" + value.to_s
-    end
-    out + "}"
+    JsonBuilder.escape_html_entities(JSON.generate(payload))
   end
 
   module Channel

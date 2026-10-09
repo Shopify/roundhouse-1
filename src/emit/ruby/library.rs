@@ -1649,11 +1649,49 @@ fn push_assoc_scope_skip(model: &crate::ident::ClassId, method: &Symbol, reason:
 /// method every call site now passes a relation to. Placement is before
 /// the first keyword in both, since `def f(__rel = …, k:)` is the only
 /// legal ordering.
-fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol) -> bool {
+///
+/// A method with a REST param (`*tags`) is the exception: an optional
+/// POSITIONAL can't follow a splat (`def f(*tags, __rel = …)` is a
+/// syntax error — no slot for it to default INTO), so there `__rel`
+/// becomes an optional KEYWORD instead (`def f(*tags, __rel: …)`,
+/// legal after a splat), typed as the Relation rather than Untyped so
+/// the `.rbs` reads `?__rel: ActiveRecord::Relation` instead of
+/// `?__rel: untyped` — nothing else about the method declares
+/// keywords, so Untyped would be the only typed thing losing its type.
+/// It goes ahead of a `**opts` (`def f(*tags, __rel: …, **opts)`), the
+/// only thing a keyword can't follow; a `&blk` lives in `block_param`,
+/// not `params`, and is rendered last anyway. A method without a rest
+/// param is untouched: same positional-with-default as always.
+fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol, owner: &ClassId) -> bool {
     if m.params.iter().any(|p| p.forwarding) {
         crate::emit::diagnostics::report_unsupported(m.name_span, "ruby", "full argument forwarding",
             "full forwarding cannot use the relation-threading argument ABI");
         return false;
+    }
+    let has_rest = m.params.iter().any(|p| p.rest && !p.keyword);
+    if has_rest {
+        let at = m.params.iter().position(|p| p.rest && p.keyword).unwrap_or(m.params.len());
+        m.params.insert(
+            at,
+            crate::dialect::Param::keyword(
+                rel_param.clone(),
+                Some(crate::lower::model_to_library::relation_new_self()),
+            ),
+        );
+        if let Some(Ty::Fn { params, .. }) = &mut m.signature {
+            let at = params
+                .iter()
+                .position(|p| {
+                    matches!(p.kind, crate::ty::ParamKind::KeywordRest | crate::ty::ParamKind::Block)
+                })
+                .unwrap_or(params.len());
+            params.insert(at, crate::ty::Param {
+                name: rel_param.clone(),
+                ty: Ty::Relation { of: owner.clone() },
+                kind: crate::ty::ParamKind::Keyword { required: false },
+            });
+        }
+        return true;
     }
     let insert_at = m.params.iter().position(|p| p.keyword).unwrap_or(m.params.len());
     m.params.insert(
@@ -1663,7 +1701,7 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol) -> bo
             crate::lower::model_to_library::relation_new_self(),
         ),
     );
-    if let Some(crate::ty::Ty::Fn { params, .. }) = &mut m.signature {
+    if let Some(Ty::Fn { params, .. }) = &mut m.signature {
         let at = params
             .iter()
             .position(|p| matches!(p.kind, crate::ty::ParamKind::Keyword { .. }))
@@ -1672,7 +1710,7 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol) -> bo
             at,
             crate::ty::Param {
                 name: rel_param.clone(),
-                ty: crate::ty::Ty::Untyped,
+                ty: Ty::Untyped,
                 kind: crate::ty::ParamKind::Optional,
             },
         );
@@ -1923,7 +1961,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     // scope's __rel is not last.
                     && !m.params.iter().any(|p| p.as_str() == "__rel")
                 {
-                    if !insert_rel_param(m, &rel_param) { continue; }
+                    if !insert_rel_param(m, &rel_param, &lc.name) { continue; }
                     crate::lower::scope_chain::rewrite_scope_body(
                         &mut m.body,
                         &lc.name,
@@ -1962,7 +2000,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 {
                     continue;
                 }
-                if !insert_rel_param(m, &rel_param) { continue; }
+                if !insert_rel_param(m, &rel_param, &lc.name) { continue; }
                 if creates {
                     crate::lower::scope_chain::merge_scope_attributes(
                         &mut m.body,
@@ -5181,9 +5219,11 @@ fn rewrite_helper_calls(
         }
         if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
             let m = method.as_str();
-            if (m == "request" || m == "cookies" || m == "session" || m == "flash"
-                || m == "params")
+            if (m == "request" || m == "controller" || m == "cookies" || m == "session"
+                || m == "flash" || m == "params")
                 && args.is_empty()
+                && (m != "controller"
+                    || (!own_methods.contains(method) && !own_params.contains(method)))
             {
                 let span = expr.span;
                 let current = Expr::new(
@@ -5195,8 +5235,8 @@ fn rewrite_helper_calls(
                         ],
                     },
                 );
-                let (recv, meth) = if m == "request" {
-                    (current, Symbol::from("request"))
+                let (recv, meth) = if m == "request" || m == "controller" {
+                    (current, method.clone())
                 } else {
                     (
                         Expr::new(
@@ -15777,5 +15817,138 @@ fn rewrite_raw_helper_calls(e: &mut Expr, sites: &BTreeSet<(Symbol, usize)>) {
         let i = *idx;
         *method = Symbol::from(format!("{}_raw", method.as_str()));
         args[i] = inner;
+    }
+}
+
+#[cfg(test)]
+mod insert_rel_param_tests {
+    use super::*;
+    use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility, Param};
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ty::ParamKind;
+
+    fn bare_method(params: Vec<Param>, signature: Option<Ty>) -> MethodDef {
+        MethodDef {
+            visibility: MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("those_tagged"),
+            receiver: MethodReceiver::Class,
+            params,
+            body: Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            signature,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(Symbol::from("Widget")),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        }
+    }
+
+    /// The decided fix, at the type level: a rest-param method's `__rel`
+    /// is a KEYWORD in `m.params` (a default, not a positional default —
+    /// the only legal ordering after a splat), and in the `Ty::Fn`
+    /// signature it is `ParamKind::Keyword { required: false }`, typed
+    /// as the owning model's `Relation` — NOT `Ty::Untyped` — so a
+    /// target whose `.rbs` DOES read the signature (unlike this
+    /// fixture's own, which the general stamping pass declines to give
+    /// one; see `tests/relation_rest_param_class_method.rs`) writes
+    /// `?__rel: ActiveRecord::Relation`, matching every other typed slot
+    /// on the method instead of losing its type to the one param this
+    /// fix touches.
+    #[test]
+    fn rest_param_method_gets_rel_as_a_typed_keyword_in_params_and_signature() {
+        let owner = ClassId(Symbol::from("Widget"));
+        let params = vec![Param::rest(Symbol::from("tags"))];
+        let sig = Ty::Fn {
+            params: vec![crate::ty::Param {
+                name: Symbol::from("tags"),
+                ty: Ty::Untyped,
+                kind: ParamKind::Rest,
+            }],
+            block: None,
+            ret: Box::new(Ty::Untyped),
+            effects: crate::effect::EffectSet::pure(),
+        };
+        let mut m = bare_method(params, Some(sig));
+        let rel_param = Symbol::from("__rel");
+        assert!(insert_rel_param(&mut m, &rel_param, &owner));
+
+        let rel = m.params.iter().find(|p| p.name == rel_param).expect("__rel param");
+        assert!(rel.keyword, "a keyword, not a positional, after a splat: {rel:?}");
+        assert!(!rel.rest);
+        assert!(rel.default.is_some(), "optional: carries a default");
+
+        let Some(Ty::Fn { params, .. }) = &m.signature else {
+            panic!("the signature must not be dropped");
+        };
+        let rel_ty_param = params.iter().find(|p| p.name == rel_param).expect("__rel in signature");
+        assert_eq!(rel_ty_param.kind, ParamKind::Keyword { required: false });
+        assert_eq!(rel_ty_param.ty, Ty::Relation { of: owner });
+    }
+
+    /// The untouched case: no rest param, `__rel` stays exactly what it
+    /// always was — a positional with a default, inserted before any
+    /// keywords, typed `Untyped` in the signature (unchanged from
+    /// before this fix).
+    #[test]
+    fn non_rest_method_keeps_the_untyped_positional_default() {
+        let owner = ClassId(Symbol::from("Widget"));
+        let params = vec![Param::positional(Symbol::from("user"))];
+        let sig = Ty::Fn {
+            params: vec![crate::ty::Param {
+                name: Symbol::from("user"),
+                ty: Ty::Untyped,
+                kind: ParamKind::Required,
+            }],
+            block: None,
+            ret: Box::new(Ty::Untyped),
+            effects: crate::effect::EffectSet::pure(),
+        };
+        let mut m = bare_method(params, Some(sig));
+        let rel_param = Symbol::from("__rel");
+        assert!(insert_rel_param(&mut m, &rel_param, &owner));
+
+        let rel = m.params.iter().find(|p| p.name == rel_param).expect("__rel param");
+        assert!(!rel.keyword, "unchanged: still a positional-with-default: {rel:?}");
+        assert!(rel.default.is_some());
+
+        let Some(Ty::Fn { params, .. }) = &m.signature else {
+            panic!("the signature must not be dropped");
+        };
+        let rel_ty_param = params.iter().find(|p| p.name == rel_param).expect("__rel in signature");
+        assert_eq!(rel_ty_param.kind, ParamKind::Optional);
+        assert_eq!(rel_ty_param.ty, Ty::Untyped, "unchanged: still Untyped, not Relation");
+    }
+
+    /// `def f(*tags, **opts)`: no keyword may follow `**opts`, so `__rel:`
+    /// goes ahead of it, in the params and in the signature.
+    #[test]
+    fn rest_and_kwrest_method_gets_rel_ahead_of_the_kwrest() {
+        let owner = ClassId(Symbol::from("Widget"));
+        let kwrest = Param { keyword: true, ..Param::rest(Symbol::from("opts")) };
+        let params = vec![Param::rest(Symbol::from("tags")), kwrest];
+        let sig = Ty::Fn {
+            params: vec![
+                crate::ty::Param { name: Symbol::from("tags"), ty: Ty::Untyped, kind: ParamKind::Rest },
+                crate::ty::Param { name: Symbol::from("opts"), ty: Ty::Untyped, kind: ParamKind::KeywordRest },
+            ],
+            block: None,
+            ret: Box::new(Ty::Untyped),
+            effects: crate::effect::EffectSet::pure(),
+        };
+        let mut m = bare_method(params, Some(sig));
+        let rel_param = Symbol::from("__rel");
+        assert!(insert_rel_param(&mut m, &rel_param, &owner));
+
+        let names: Vec<&str> = m.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["tags", "__rel", "opts"]);
+        let Some(Ty::Fn { params, .. }) = &m.signature else {
+            panic!("the signature must not be dropped");
+        };
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["tags", "__rel", "opts"]);
     }
 }

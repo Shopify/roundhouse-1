@@ -305,3 +305,28 @@ fn runtime_corpus_phase1_gap_survey() {
     );
     eprintln!("{report}");
 }
+
+/// Ruby methods whose same-named JS native means something else.
+/// `Array#sort` on numbers needs a numeric comparator (JS's default
+/// compares as strings, so `[10, 9, 1].sort()` is `[1, 10, 9]`).
+/// `String#gsub` with a String pattern replaces every occurrence
+/// (`replaceAll`); an empty literal pattern uses `replace(/(?:)/gu, …)`
+/// so steps are by code point (not UTF-16 units).
+#[test]
+fn native_semantics_follow_ruby() {
+    let methods = parse_methods_with_rbs(
+        "module Natives\n  def sorted(xs)\n    xs.sort\n  end\n  def words(xs)\n    xs.sort\n  end\n  def swap(s)\n    s.gsub(\"l\", \"L\")\n  end\n  def swap_rx(s)\n    s.gsub(/l+/, \"L\")\n  end\n  def spread(s)\n    s.gsub(\"\", \"-\")\n  end\nend\n",
+        "module Natives\n  def sorted: (Array[Integer]) -> Array[Integer]\n  def words: (Array[String]) -> Array[String]\n  def swap: (String) -> String\n  def swap_rx: (String) -> String\n  def spread: (String) -> String\nend\n",
+    )
+    .expect("parse");
+    let sorted = emit_method(&methods[0]);
+    let words = emit_method(&methods[1]);
+    let swap = emit_method(&methods[2]);
+    let swap_rx = emit_method(&methods[3]);
+    let spread = emit_method(&methods[4]);
+    assert!(sorted.contains("[...xs].sort((a, b) => a - b)"), "numeric sort:\n{sorted}");
+    assert!(words.contains("[...xs].sort()"), "string sort keeps the default:\n{words}");
+    assert!(swap.contains("s.replaceAll(\"l\", \"L\")"), "string gsub:\n{swap}");
+    assert!(swap_rx.contains("s.replace(/l+/g, \"L\")"), "regex gsub:\n{swap_rx}");
+    assert!(spread.contains("s.replace(/(?:)/gu, \"-\")"), "empty gsub:\n{spread}");
+}

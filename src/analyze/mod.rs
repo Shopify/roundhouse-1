@@ -70,6 +70,7 @@ mod filter_targets;
 pub mod graphql;
 mod harvest_return;
 mod fixpoint_bound;
+mod fixpoint_check;
 mod fixpoint_rounds;
 pub use fixpoint_rounds::{FixpointRounds, LoopEnd};
 mod dirty_retype;
@@ -229,6 +230,8 @@ pub struct Analyzer {
     /// `analyze_expr` walks.
     controller_action_meta_cache:
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
+    /// What the opt-in fixpoint canaries saw (`fixpoint_check`).
+    fixpoint_checks: fixpoint_check::Checks,
 }
 
 /// One library class's method body returns, as `method_return_ty` read
@@ -1431,6 +1434,7 @@ impl Analyzer {
             view_seeds: None,
             callers_by_target: HashMap::default(),
             controller_action_meta_cache: HashMap::default(),
+            fixpoint_checks: fixpoint_check::Checks::default(),
         }
     }
 
@@ -1548,6 +1552,7 @@ impl Analyzer {
         self.setup_scan = Default::default();
         self.return_cache = Vec::new();
         self.incremental = incremental::Incremental::new(self.incremental.mode);
+        self.fixpoint_checks = fixpoint_check::Checks::start();
         // An unresolvable include is a load-time error, not an open method
         // surface. Keep it in the class-body ledger even when no method is called.
         app.gem_boundary.refused_includes.clear();
@@ -1761,6 +1766,17 @@ impl Analyzer {
                 )
             });
         }
+        let round_inputs = fixpoint_check::RoundInputs {
+            dynamic_render_ivars: &dynamic_render_ivars,
+            existing_view_names: &existing_view_names,
+            module_methods: &module_methods,
+            module_includes: &module_includes,
+            parent_link_by_name: &parent_link_by_name,
+        };
+        if fixpoint_check::verify_on() {
+            self.verify_round(app, &round_inputs, fixpoint_check::Loop::Production, None);
+            prev_hints = self.capture_dirty_hints();
+        }
 
         // Intermediate rounds skip views/tests: production does not
         // read test helper returns, and unifying from still-untyped view
@@ -1839,6 +1855,14 @@ impl Analyzer {
         }
         if fixpoint_debug::enabled() {
             fixpoint_debug::report("absorb entry vs production", &production_sig, &self.capture_inference_sig());
+        }
+        if fixpoint_check::verify_on() {
+            self.verify_round(
+                app,
+                &round_inputs,
+                fixpoint_check::Loop::ViewsAndTests,
+                production_view_params.as_mut(),
+            );
         }
         if !self.inference_matches(&production_sig) {
             rounds.absorb = LoopEnd::RanToCap;
@@ -1931,6 +1955,14 @@ impl Analyzer {
                 )
             });
         }
+        if fixpoint_check::verify_on() {
+            self.verify_round(
+                app,
+                &round_inputs,
+                fixpoint_check::Loop::Absorb,
+                production_view_params.as_mut(),
+            );
+        }
         self.fixpoint_rounds = rounds;
         crate::timings::note(format_args!("fixpoint rounds: {}", self.fixpoint_rounds));
         // Wave 12 types views once against production-only helper
@@ -2022,6 +2054,7 @@ impl Analyzer {
         self.type_rails_application_body(app);
 
         self.stamp_inferred_method_signatures(app);
+        self.report_fixpoint_checks(app);
     }
 
     /// Type the bodies of `direct :name do |…| … end` helpers, with the

@@ -39,12 +39,22 @@ mod class_attribute;
 mod class_configuration;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/cable_broadcast_json.rs"]
+mod cable_broadcast_json_contract;
+#[path = "spinel_toolchain/cable_broadcast_json.rs"]
+mod cable_broadcast_json;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
 #[path = "support/native_http.rs"]
 mod native_http;
 #[path = "spinel_toolchain/strong_params.rs"]
 mod strong_params;
+#[path = "spinel_toolchain/params_wrapper.rs"]
+mod params_wrapper;
+#[path = "support/io_process_constants.rs"]
+mod io_process_constants_contract;
+#[path = "spinel_toolchain/io_process_constants.rs"]
+mod io_process_constants;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]

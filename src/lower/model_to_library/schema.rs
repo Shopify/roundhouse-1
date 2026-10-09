@@ -3371,13 +3371,23 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
         })
         .collect();
 
-    let body = Expr::new(
-        Span::synthetic(),
-        ExprNode::Case {
-            scrutinee: var_ref(name.clone()),
-            arms,
-        },
-    );
+    // An armless `case` (no columns at all) is a Ruby syntax error.
+    // `table.columns` is empty for a degenerate `create_table ..., id:
+    // false do |t| end` — the column-list twin of the controller-side
+    // `synth_index_read`'s bug when its permit list has no scalar keys
+    // (`tests/params_all_non_scalar_keys.rs`). Same `Ty::Untyped`
+    // signature either way.
+    let body = if arms.is_empty() {
+        nil_lit()
+    } else {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Case {
+                scrutinee: var_ref(name.clone()),
+                arms,
+            },
+        )
+    };
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -3619,13 +3629,37 @@ fn synth_index_write(owner: &ClassId, table: &Table, model: &Model) -> MethodDef
         })
         .collect();
 
-    let body = Expr::new(
-        Span::synthetic(),
-        ExprNode::Case {
-            scrutinee: var_ref(name.clone()),
-            arms,
-        },
-    );
+    // Same armless-`case` gap as the reader right above (empty
+    // `table.columns`): nothing to assign, so the natural no-op body is
+    // a bare `nil`, discarding both `name` and `value` — Ruby doesn't
+    // require a method to use its params, so this stays a legal `[]=`
+    // that always and harmlessly declines the write (the actual
+    // behavior Rails' own `[]=` has on an unknown attribute: raise, not
+    // silently no-op, but THIS method is unreachable in practice — a
+    // column-free table has no model code that could call `[]=` with a
+    // real column name — so the choice here is simply "parses, does
+    // nothing", not an attempt to match Rails' semantics).
+    // Same armless-`case` gap as the reader right above (empty
+    // `table.columns`): nothing to assign, so the natural no-op body is
+    // a bare `nil`, discarding both `name` and `value` — Ruby doesn't
+    // require a method to use its params, so this stays a legal `[]=`
+    // that always and harmlessly declines the write (the actual
+    // behavior Rails' own `[]=` has on an unknown attribute: raise, not
+    // silently no-op, but THIS method is unreachable in practice — a
+    // column-free table has no model code that could call `[]=` with a
+    // real column name — so the choice here is simply "parses, does
+    // nothing", not an attempt to match Rails' semantics).
+    let body = if arms.is_empty() {
+        nil_lit()
+    } else {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Case {
+                scrutinee: var_ref(name.clone()),
+                arms,
+            },
+        )
+    };
 
     // Value/return types are a union of every column's type. Crystal
     // needs the value param annotated with this union so the per-arm
