@@ -3,7 +3,9 @@
 # rewrites SQL, calls Rails, or substitutes another database adapter.
 require "pg"
 require "bigdecimal"
+require "bigdecimal/util"
 require "date"
+require "json"
 require "monitor"
 
 module Db
@@ -20,6 +22,42 @@ module Db
   # label of that configuration step.
   TYPE_MAP_QUERY = "SELECT t.oid, t.typname, t.typelem, t.typdelim, ti.proname AS typinput " \
     "FROM pg_type as t JOIN pg_proc as ti ON ti.oid = t.typinput"
+
+  # The session's result map: PG::BasicTypeMapForResults' decoders, but
+  # an OID it has no decoder for (uuid, time, interval, ranges, regclass,
+  # tsvector, ...) answers its text without a warning, as Rails' add_pg_decoders
+  # map (a PG::TypeMapByOid) does; the pg gem's WarningTypeMap warns
+  # instead, which Core's strict warnings raise. money decodes as Rails'
+  # result map's MoneyDecoder (OID::Money) does.
+  def self.result_type_map(conn)
+    map = PG::BasicTypeMapForResults.new(conn)
+    map.default_type_map = PG::TypeMapAllStrings.new
+    map.add_coder(MoneyDecoder.new(oid: 790, name: "money"))
+    map
+  end
+
+  # postgresql_adapter.rb MoneyDecoder: OID::Money#cast_value (a locale
+  # formatted amount, "($2.55)" negative) as a Decimal of scale 2.
+  class MoneyDecoder < PG::SimpleDecoder
+    def decode(value, tuple = nil, field = nil)
+      return value unless ::String === value
+      value = value.sub(/^\((.+)\)$/, '-\1')
+      case value
+      when /^-?\D*+[\d,]+\.\d{2}$/
+        value.delete!("^-0-9.")
+      when /^-?\D*+[\d.]+,\d{2}$/
+        value.delete!("^-0-9,")
+        value.tr!(",", ".")
+      end
+      return nil if value.strip.empty?
+      decimal = begin
+        value.to_d
+      rescue ArgumentError
+        BigDecimal(0)
+      end
+      decimal.round(2)
+    end
+  end
 
   # The connection lifecycle of the PostgreSQLAdapter of the Rails native
   # Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha: abstract_adapter.rb,
@@ -416,8 +454,8 @@ module Db
     # 8.2 skips the SETs the session already has, see above), from the
     # adapter's configuration (a resolved database.yml entry), in Rails'
     # order and each setting a statement of its own as its internal_execute.
-    # A reset session has lost its prepared statements. Rails' own type
-    # decoders are not ported: the driver keeps PG::BasicTypeMapForResults.
+    # A reset session has lost its prepared statements. Results decode
+    # with PG::BasicTypeMapForResults (Db.result_type_map).
     def configure_connection
       @raw_connection.instance_variable_set(:@rh_pg_cache, {})
       check_version
@@ -443,7 +481,7 @@ module Db
         end
       end
       raw_execute(TYPE_MAP_QUERY, "SCHEMA", [], materialize_transactions: false) do |conn|
-        conn.type_map_for_results = PG::BasicTypeMapForResults.new(conn)
+        conn.type_map_for_results = Db.result_type_map(conn)
         nil
       end
       reconfigure_connection_timezone(variables)
@@ -1048,7 +1086,7 @@ module Db
     # caller decision; the default never replays arbitrary SQL. Lowered SQL
     # can opt in once its read semantics have been proven.
     if handle[:cacheable] && binds.empty? && (cached = context[:cache]&.[](key))
-      handle[:rows], handle[:names] = cached
+      handle[:rows], handle[:names], handle[:json] = cached
       handle[:result] = :cached
       return
     end
@@ -1077,13 +1115,14 @@ module Db
     end
     handle[:result] = result
     handle[:names] = result.fields
+    handle[:json] = json_columns(result)
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     # Only SELECT results can be replayed. Writes (including RETURNING)
     # invalidate cache; this is decided by PG's command tag, not SQL text.
     if result.cmd_status.start_with?("SELECT")
       if handle[:cacheable] && binds.empty? && context[:cache] && result.ntuples <= 16
         handle[:rows] = result.values
-        context[:cache][key] = [handle[:rows], handle[:names]]
+        context[:cache][key] = [handle[:rows], handle[:names], handle[:json]]
       end
     else
       context[:cache]&.clear
@@ -1117,7 +1156,27 @@ module Db
 
   def self.column_text(handle, index)
     value = column_value(handle, index)
-    value.nil? ? "" : text_value(value)
+    value.nil? ? "" : column_text_value(handle, index, value)
+  end
+
+  JSON_OIDS = [114, 3802].freeze # json, jsonb
+
+  # The indexes of a result's json/jsonb columns, nil when it has none.
+  def self.json_columns(result)
+    indexes = (0...result.nfields).select { |i| JSON_OIDS.include?(result.ftype(i)) }
+    indexes.empty? ? nil : indexes
+  end
+
+  # A json/jsonb column read as text is JSON text, which a model's json
+  # attribute hydrates from (RoundhouseJsonColumn.load); the result map
+  # decodes it (pluck answers that value), so it is encoded back, never
+  # `to_s` (a Hash's inspect, a string scalar's bare text).
+  def self.column_text_value(handle, index, value)
+    if handle[:json]&.include?(index)
+      JSON.generate(value)
+    else
+      text_value(value)
+    end
   end
 
   # A column read as text. PG::BasicTypeMapForResults decodes a
@@ -1159,7 +1218,7 @@ module Db
 
   def self.column_text_opt(handle, index)
     value = column_value(handle, index)
-    value.nil? ? nil : text_value(value)
+    value.nil? ? nil : column_text_value(handle, index, value)
   end
 
   def self.column_bool_opt(handle, index)
