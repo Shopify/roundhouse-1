@@ -30,3 +30,24 @@ fn a_class_nested_in_a_nested_class_is_defined_before_its_enclosing_body_reads_i
         run.stderr
     );
 }
+
+/// Core's price_list_prices/service.rb and rate_repository/pricing.rb:
+/// a case/in arm whose constant the tree does not carry
+/// (`in ::GraphApi::MoneyInput`, `in Partner[Partner::RateType::Flow]`).
+/// The refusal was written bare, `in (raise "…")`, which does not parse.
+/// Pinned it parses: the arms before it match, and testing it raises the
+/// named refusal where Ruby would raise NameError.
+#[test]
+fn an_uncarried_constant_in_a_pattern_is_a_parseable_named_refusal() {
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write(
+            "lib/conv.rb",
+            "module Conv\n  def self.of(input)\n    case input\n    in Integer then input\n    in ::Missing::MoneyInput then :money\n    in Missing::Partner[Missing::Partner::Flow] then :flow\n    in { amount: } then amount\n    end\n  end\nend\n",
+        )
+        .run_ruby("p Conv.of(1)\nbegin\n  Conv.of({ amount: 2 })\nrescue RuntimeError => e\n  puts e.message\nend\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "1\nroundhouse: constant not supported (all targets)\n", "{}", run.stderr);
+    let conv = std::fs::read_to_string(run.emitted.join("app/models/conv.rb")).expect("conv.rb");
+    assert!(!conv.contains("in (raise"), "{conv}");
+}
