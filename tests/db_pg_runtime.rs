@@ -83,11 +83,11 @@ fn shared_lowering_executes_postgresql_sql_in_emitted_ruby() {
         name: Symbol::from("entries"),
         columns: vec![
             Column { name: Symbol::from("entry_key"), col_type: ColumnType::Integer,
-                nullable: false, default: None, primary_key: true, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: true, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
             Column { name: Symbol::from("Title"), col_type: ColumnType::Text,
-                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
             Column { name: Symbol::from("enabled"), col_type: ColumnType::Boolean,
-                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
         ],
         indexes: vec![], foreign_keys: vec![], virtual_module: None, primary_key_columns: Vec::new(),
     });
@@ -201,11 +201,11 @@ fn postgres_model_app_with(application_rb: Option<&str>) -> roundhouse::app::App
         name: Symbol::from("entries"),
         columns: vec![
             Column { name: Symbol::from("id"), col_type: ColumnType::Integer,
-                nullable: false, default: None, primary_key: true, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: true, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
             Column { name: Symbol::from("Title"), col_type: ColumnType::Text,
-                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
             Column { name: Symbol::from("enabled"), col_type: ColumnType::Boolean,
-                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None },
+                nullable: false, default: None, primary_key: false, generated: None, generated_text_compatible: None, generated_int4_compatible: None },
         ], indexes: vec![], foreign_keys: vec![], virtual_module: None, primary_key_columns: Vec::new(),
     });
     let model = roundhouse::ingest::model::ingest_model(
