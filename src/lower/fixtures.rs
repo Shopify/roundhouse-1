@@ -496,6 +496,10 @@ pub struct RawFixtureSet {
     pub preamble: Vec<Expr>,
     /// Refusals the set raises, by name, when it loads (the first one).
     pub errors: Vec<String>,
+    /// The loader whose rules resolved the rows. Under FasterFixtures a
+    /// key the compiled schema has no column for may still name a live
+    /// column, or its `<key>_id`, which the runtime resolves.
+    pub rules: FixtureRules,
 }
 
 /// Rails' `ActiveRecord::FixtureSet::MAX_ID`.
@@ -802,6 +806,7 @@ fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, r
         rows,
         preamble: fixture.preamble.clone(),
         errors,
+        rules,
     }
 }
 

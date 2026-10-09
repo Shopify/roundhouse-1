@@ -11,6 +11,11 @@
 //! - The YAML's nil, empty string, integer and mapping values stay
 //!   distinct; a mapping is YAML text in a text column (Rails'
 //!   `with_yaml_fallback`) and JSON in a jsonb one.
+//! - A column the model ignores (`ignored_columns`, which the compiled
+//!   schema leaves out) still loads: Rails and FasterFixtures take the
+//!   table's columns from the database, and so does the runtime for a key
+//!   the compiled columns lack. Under FasterFixtures a `keeper:` key whose
+//!   `keeper_id` column is ignored is that reference.
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +51,8 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
   end
   create_table "garages", force: :cascade do |t|
     t.jsonb "layout"
+    t.string "legacy_code"
+    t.bigint "keeper_id"
   end
 end
 "#;
@@ -86,10 +93,22 @@ const OWNERS: &str = r#"alice:
 /// A jsonb column. The probe test never reads a garage back: the emitted
 /// row hydration stringifies the driver's decoded jsonb Hash before
 /// `RoundhouseJsonColumn.load` parses it, a separate read-side gap.
+///
+/// `legacy_code` and `keeper_id` are Garage's ignored columns.
 const GARAGES: &str = r#"north:
   layout:
     bays: 3
     doors: [front, side]
+  legacy_code: G-1
+"#;
+
+/// Under FasterFixtures, `keeper: alice` names the ignored `keeper_id`.
+const GARAGES_FASTER_FIXTURES: &str = r#"north:
+  layout:
+    bays: 3
+    doors: [front, side]
+  legacy_code: G-1
+  keeper: alice
 "#;
 
 const PROBE_TEST: &str = r#"require "test_helper"
@@ -123,7 +142,7 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-fn fixture_app(tag: &str) -> PathBuf {
+fn fixture_app(tag: &str, faster_fixtures: bool) -> PathBuf {
     let app = scratch(&format!("{tag}-app"));
     copy_tree(&Path::new(MANIFEST_DIR).join("fixtures/tiny-blog"), &app);
     let write = |rel: &str, text: &str| {
@@ -135,7 +154,11 @@ fn fixture_app(tag: &str) -> PathBuf {
     write("app/models/vehicle.rb", "class Vehicle < ApplicationRecord\n  belongs_to :owner, optional: true\nend\n");
     write("app/models/car.rb", "class Car < Vehicle\nend\n");
     write("app/models/truck.rb", "class Truck < Vehicle\nend\n");
-    write("app/models/garage.rb", "class Garage < ApplicationRecord\nend\n");
+    write("app/models/garage.rb", "class Garage < ApplicationRecord\n  self.ignored_columns = %w[legacy_code keeper_id]\nend\n");
+    if faster_fixtures {
+        // Core's loader: its presence selects FasterFixtures' rules.
+        write("app/models/faster_fixtures/fixture_set.rb", "module FasterFixtures\n  class FixtureSet\n  end\nend\n");
+    }
     // A writer that raises: a loader that assigned attributes would
     // never get past the first row.
     write(
@@ -147,15 +170,21 @@ fn fixture_app(tag: &str) -> PathBuf {
     write("config/database.yml", DATABASE_YML);
     write("test/test_helper.rb", "ENV[\"RAILS_ENV\"] ||= \"test\"\n");
     write("test/fixtures/cars.yml", CARS);
-    write("test/fixtures/trucks.yml", TRUCKS);
+    // FasterFixtures' table is `_fixture: table_name`, else the set's name.
+    let trucks = if faster_fixtures { format!("_fixture:\n  table_name: vehicles\n\n{TRUCKS}") } else { TRUCKS.to_string() };
+    write("test/fixtures/trucks.yml", &trucks);
     write("test/fixtures/owners.yml", OWNERS);
-    write("test/fixtures/garages.yml", GARAGES);
+    write("test/fixtures/garages.yml", if faster_fixtures { GARAGES_FASTER_FIXTURES } else { GARAGES });
     write("test/models/fixture_raw_rows_test.rb", PROBE_TEST);
     app
 }
 
 fn emit(tag: &str) -> PathBuf {
-    let app_dir = fixture_app(tag);
+    emit_with(tag, false)
+}
+
+fn emit_with(tag: &str, faster_fixtures: bool) -> PathBuf {
+    let app_dir = fixture_app(tag, faster_fixtures);
     let app = roundhouse::ingest::ingest_app(&app_dir).expect("ingest probe app");
     let out = scratch(&format!("{tag}-out"));
     let files = roundhouse::project::target_files(
@@ -223,12 +252,14 @@ fn sti_subclass_sets_insert_rows_into_the_base_table() {
         assert!(!cars.contains(absent), "{absent} in:\n{cars}");
     }
 
-    // A jsonb column casts the mapping as JSON.
+    // A jsonb column casts the mapping as JSON. `legacy_code`, an
+    // ignored column, is not in the compiled columns: the runtime finds it
+    // in the live table. Under Rails' rules no `faster_fixtures:` flag.
     let garages = read(&out, "test/fixtures/garages.rb");
     let north_id = roundhouse::lower::fixtures::fixture_identify("north");
     assert!(
         garages.contains(&format!(
-            r#"insert_fixture_rows("garages", {{ "id" => "integer", "layout" => "jsonb" }}, [], [{{ "layout" => {{ "bays" => 3, "doors" => ["front", "side"] }}, "id" => {north_id} }}])"#
+            r#"insert_fixture_rows("garages", {{ "id" => "integer", "layout" => "jsonb" }}, [], [{{ "layout" => {{ "bays" => 3, "doors" => ["front", "side"] }}, "legacy_code" => "G-1", "id" => {north_id} }}])"#
         )),
         "{garages}"
     );
@@ -241,6 +272,25 @@ fn sti_subclass_sets_insert_rows_into_the_base_table() {
     let helper = read(&out, "test/test_helper.rb");
     assert!(helper.contains(r#"["cars", "CarsFixtures", "Car", "vehicles"]"#), "{helper}");
     assert!(helper.contains(r#"["trucks", "TrucksFixtures", "Truck", "vehicles"]"#), "{helper}");
+}
+
+/// Under FasterFixtures the compiled schema's ignored `keeper_id` leaves
+/// `keeper: alice` unresolved at compile time: the row carries the key
+/// and the `faster_fixtures:` flag, and the runtime resolves it against
+/// the live table (`raw_rows_load_on_postgresql_under_faster_fixtures`).
+#[test]
+fn faster_fixtures_rows_leave_ignored_column_keys_to_the_live_table() {
+    let out = emit_with("ff", true);
+    let garages = read(&out, "test/fixtures/garages.rb");
+    let north_id = roundhouse::lower::fixtures::fixture_identify("north");
+    assert!(
+        garages.contains(&format!(
+            r#"insert_fixture_rows("garages", {{ "id" => "integer", "layout" => "jsonb" }}, [], [{{ "layout" => {{ "bays" => 3, "doors" => ["front", "side"] }}, "legacy_code" => "G-1", "keeper" => "alice", "id" => {north_id} }}], faster_fixtures: true)"#
+        )),
+        "{garages}"
+    );
+    let cars = read(&out, "test/fixtures/cars.rb");
+    assert!(cars.contains("faster_fixtures: true)"), "{cars}");
 }
 
 #[test]
@@ -266,16 +316,37 @@ fn a_model_whose_writer_raises_still_loads() {
 #[test]
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn raw_rows_load_on_postgresql() {
+    let stdout = run_on_postgresql(&emit("pg"));
+    // Garage's ignored `legacy_code` loads from the live table's column.
+    let north = roundhouse::lower::fixtures::fixture_identify("north");
+    let row = format!(r#"garages: [["{north}", "{{\"bays\": 3, \"doors\": [\"front\", \"side\"]}}", "G-1", nil]]"#);
+    assert!(stdout.contains(&row), "no {row} in stdout={stdout}");
+}
+
+/// The same app under FasterFixtures' rules: `keeper: alice` loads as the
+/// ignored `keeper_id` column's reference, alice's identify.
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn raw_rows_load_on_postgresql_under_faster_fixtures() {
+    let stdout = run_on_postgresql(&emit_with("pg-ff", true));
+    let north = roundhouse::lower::fixtures::fixture_identify("north");
+    let alice = roundhouse::lower::fixtures::fixture_identify("alice");
+    let row = format!(r#"garages: [["{north}", "{{\"bays\": 3, \"doors\": [\"front\", \"side\"]}}", "G-1", "{alice}"]]"#);
+    assert!(stdout.contains(&row), "no {row} in stdout={stdout}");
+}
+
+/// Runs the emitted test through PG_DRIVER, checks the runner's result
+/// and the vehicles and owners rows, and answers the driver's stdout.
+fn run_on_postgresql(out: &Path) -> String {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
-    let out = emit("pg");
     let driver = out.join("raw_rows_driver.rb");
     std::fs::write(&driver, PG_DRIVER).unwrap();
     let result = std::process::Command::new("ruby")
         .arg(&driver)
-        .arg(&out)
+        .arg(out)
         .output()
         .expect("ruby");
-    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "stdout={stdout}\nstderr={stderr}");
     assert!(!stdout.contains("fixture_set_not_loaded") && !stderr.contains("fixture_set_not_loaded"), "stdout={stdout}\nstderr={stderr}");
@@ -291,16 +362,15 @@ fn raw_rows_load_on_postgresql() {
     let alice = roundhouse::lower::fixtures::fixture_identify("alice");
     let hauler = roundhouse::lower::fixtures::fixture_identify("hauler");
     let mini = roundhouse::lower::fixtures::fixture_identify("mini");
-    let north = roundhouse::lower::fixtures::fixture_identify("north");
     for row in [
         format!(r#"["{beetle}", "Car", "Beetle", nil, "4", "{alice}", "---\ndoors: 2\ncolors:\n- red\n- blue\n", "t"]"#),
         format!(r#"["{hauler}", "Truck", "Hauler", nil, "18", nil, nil, "t"]"#),
         format!(r#"["{mini}", "Car", "", "mini", "4", nil, nil, "t"]"#),
         format!(r#"owners: [["{alice}", "Alice"]]"#),
-        format!(r#"garages: [["{north}", "{{\"bays\": 3, \"doors\": [\"front\", \"side\"]}}"]]"#),
     ] {
         assert!(stdout.contains(&row), "no {row} in stdout={stdout}\nstderr={stderr}");
     }
+    stdout
 }
 
 /// Creates the database and tables, runs the emitted test, prints the
@@ -322,7 +392,7 @@ begin
     c.exec('CREATE TABLE "comments" ("id" bigserial PRIMARY KEY, "body" text NOT NULL, "post_id" bigint NOT NULL)')
     c.exec('CREATE TABLE "owners" ("id" bigserial PRIMARY KEY, "name" character varying, "created_at" timestamp(6))')
     c.exec('CREATE TABLE "vehicles" ("id" bigserial PRIMARY KEY, "type" character varying, "name" character varying, "nickname" character varying, "wheels" integer, "owner_id" bigint, "specs" text, "created_at" timestamp(6), "updated_at" timestamp(6))')
-    c.exec('CREATE TABLE "garages" ("id" bigserial PRIMARY KEY, "layout" jsonb)')
+    c.exec('CREATE TABLE "garages" ("id" bigserial PRIMARY KEY, "layout" jsonb, "legacy_code" character varying, "keeper_id" bigint)')
   end
   results = File.join(root, "results.jsonl")
   File.delete(results) if File.exist?(results)
@@ -334,7 +404,7 @@ begin
   with.(db) do |c|
     c.exec("SELECT id, type, name, nickname, wheels, owner_id, specs::text, (created_at IS NOT NULL AND updated_at IS NOT NULL) FROM vehicles ORDER BY id").values.each { |r| puts r.inspect }
     puts "owners: #{c.exec("SELECT id, name FROM owners ORDER BY id").values.inspect}"
-    puts "garages: #{c.exec("SELECT id, layout::text FROM garages ORDER BY id").values.inspect}"
+    puts "garages: #{c.exec("SELECT id, layout::text, legacy_code, keeper_id FROM garages ORDER BY id").values.inspect}"
     puts "next vehicle id: #{c.exec("SELECT nextval('vehicles_id_seq')").getvalue(0, 0)}"
   end
   status = st.success? ? 0 : 1

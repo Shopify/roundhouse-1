@@ -84,6 +84,19 @@ module ActiveRecord
     # ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid::ACCEPTABLE_UUID.
     FIXTURE_ACCEPTABLE_UUID = %r{\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z}
 
+    # FasterFixtures' POLYMORPHIC_VALUE.
+    FIXTURE_POLYMORPHIC_VALUE = /^(\S+)\s*\(([^\)]*)\)\s*$/
+
+    # PostgreSQL type name => the cast type `fixture_sql_value` takes.
+    FIXTURE_PG_CAST_TYPES = {
+      "int2" => "integer", "int4" => "integer", "int8" => "integer", "oid" => "integer",
+      "float4" => "float", "float8" => "float", "numeric" => "decimal", "money" => "decimal",
+      "bool" => "boolean", "uuid" => "uuid", "json" => "json", "jsonb" => "jsonb",
+      "timestamp" => "datetime", "timestamptz" => "datetime", "date" => "date",
+      "time" => "time", "timetz" => "time", "bytea" => "binary",
+      "varchar" => "string", "text" => "string", "bpchar" => "string", "citext" => "string", "name" => "string",
+    }.freeze
+
     # Rails' test/fixtures/, which rails/test_help.rb appends to
     # ActiveSupport::TestCase.fixture_paths: the tree's own (this file is
     # <tree>/runtime/active_record_test_fixtures.rb).
@@ -188,17 +201,34 @@ module ActiveRecord
       # row omits one (a single row names only its own), each value cast
       # by its column's type (`type.serialize`, YAML for a Hash or Array
       # the cast leaves). `columns` is column => cast type, in table order.
-      def insert_fixture_rows(table, columns, timestamps, rows)
+      #
+      # `columns` is the compiled schema's, which leaves out a model's
+      # `ignored_columns`; Rails and FasterFixtures read the table's
+      # columns from the database (`schema_cache.columns_hash`). So a key
+      # outside `columns` is looked up in the live table: a column there
+      # is cast by its database type, and under FasterFixtures
+      # (`faster_fixtures:`) a key whose `<key>_id` is a live column is
+      # the reference `FixtureSet#table_rows` resolves.
+      def insert_fixture_rows(table, columns, timestamps, rows, faster_fixtures: false)
         return nil if rows.empty?
         now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
+        live = nil
         rows = rows.map do |row|
           row = row.dup
           timestamps.each { |column| row[column] = now unless row.key?(column) }
           unknown = row.keys - columns.keys
           unless unknown.empty?
+            live ||= fixture_live_columns(table)
+            unknown = resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+          end
+          unless unknown.empty?
             raise FixtureError, %(table "#{table}" has no columns named #{unknown.map(&:inspect).join(", ")}.)
           end
           row
+        end
+        if live
+          extra = rows.flat_map(&:keys).uniq - columns.keys
+          columns = columns.merge(extra.to_h { |name| [name, live.fetch(name)] }) unless extra.empty?
         end
         names = columns.keys
         names = names.select { |name| rows.first.key?(name) } if rows.size == 1
@@ -216,6 +246,58 @@ module ActiveRecord
       end
 
       private
+        # The table's columns in the database, column => cast type, as
+        # `schema_cache.columns_hash` types them (a type this loader has no
+        # cast for keeps its PostgreSQL name and is quoted as text).
+        def fixture_live_columns(table)
+          regclass = quote_string(quote_table_name(table))
+          handle = Db.prepare_uncached(
+            "SELECT string_agg(a.attname || chr(9) || t.typname, chr(10) ORDER BY a.attnum) " \
+            "FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid " \
+            "WHERE a.attrelid = #{regclass}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''"
+          )
+          listing = begin
+            Db.step?(handle) ? Db.column_text_opt(handle, 0) : nil
+          ensure
+            Db.finalize(handle)
+          end
+          listing.to_s.split("\n").to_h do |line|
+            name, type = line.split("\t", 2)
+            [name, FIXTURE_PG_CAST_TYPES.fetch(type, type)]
+          end
+        end
+
+        # The row's keys outside the compiled columns that the live table
+        # answers (FasterFixtures::FixtureSet#table_rows): a live column
+        # stays; under FasterFixtures, `<key>_id` takes the reference (nil
+        # or false drops it, an Integer is the id, `label (Class)` also sets
+        # `<key>_type`, any other label is identified by the column's type).
+        # Answers the keys still unknown.
+        def resolve_live_fixture_keys(table, row, unknown, live, faster_fixtures)
+          unknown.reject do |key|
+            next true if live.key?(key)
+            next false unless faster_fixtures
+            fk_id = "#{key}_id"
+            next false unless live.key?(fk_id)
+            value = row.delete(key)
+            next true unless value
+            row[fk_id] =
+              if value.is_a?(Integer)
+                value
+              elsif !value.respond_to?(:match)
+                raise FixtureError, %(table "#{table}": #{key}: #{value.inspect} is not a fixture label)
+              elsif (md = value.match(FIXTURE_POLYMORPHIC_VALUE))
+                fk_type = "#{key}_type"
+                raise FixtureError, %(table "#{table}" has no column #{fk_type.inspect} for #{key}: #{value.inspect}) unless live.key?(fk_type)
+                row[fk_type] = md[2]
+                identify(md[1], live.fetch(fk_id))
+              else
+                identify(value, live.fetch(fk_id))
+              end
+            true
+          end
+        end
+
         # ActiveRecord::FixtureSet.insert.
         def insert(rows)
           by_pool = {}

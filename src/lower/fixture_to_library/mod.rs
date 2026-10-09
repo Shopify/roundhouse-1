@@ -951,12 +951,20 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
                 ),
                 Ty::Array { elem: Box::new(Ty::Untyped) },
             );
-            exprs.push(send(
-                Some(test_fixtures_const()),
-                "insert_fixture_rows",
-                vec![lit_str(set.table.as_str().to_string()), columns_hash, timestamps, rows],
-                Ty::Nil,
-            ));
+            let mut args = vec![lit_str(set.table.as_str().to_string()), columns_hash, timestamps, rows];
+            if set.rules == crate::lower::fixtures::FixtureRules::FasterFixtures {
+                args.push(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Hash {
+                        entries: vec![(
+                            crate::lower::typing::lit_sym(Symbol::from("faster_fixtures")),
+                            crate::lower::typing::lit_bool(true),
+                        )],
+                        kwargs: true,
+                    },
+                ));
+            }
+            exprs.push(send(Some(test_fixtures_const()), "insert_fixture_rows", args, Ty::Nil));
         }
         (_, error) => {
             let message = error.cloned().unwrap_or_else(|| {
