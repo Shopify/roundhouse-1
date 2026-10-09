@@ -98,6 +98,124 @@ pub(crate) fn file_autoloads(source: &str, file: &str, listing: &[String]) -> Ve
     out
 }
 
+/// The absolute directory `__FILE__` stands under while a file's glob
+/// requires are evaluated: what a pattern read off `__FILE__` or
+/// `__dir__` starts with, and a literal pattern (relative to the
+/// process's working directory in Ruby, not to the file) does not.
+const TREE_ROOT: &str = "/\u{0}tree";
+
+/// A file's top-level glob requires, each `(statement start, features)`:
+///
+/// ```ruby
+/// Dir[File.join(__dir__, "buyer-risk-ml/**/*.rb")].each { |file| require_relative file }
+/// ```
+///
+/// (buyer-risk-ml 2.51.11's entry file). Ruby requires every file the
+/// pattern matches, in `Dir`'s order, as the statement runs; so the
+/// statement is those requires, one per matched file of the compiled
+/// tree (`listing`), each feature relative to `file`'s directory and
+/// without `.rb`, as `require_relative` names it. Read: `Dir[pattern]`
+/// or `Dir.glob(pattern)`, optionally `.sort`, then `.each` with a block
+/// whose one statement is `require_relative param` or `require param`;
+/// the pattern evaluated as the autoload loops' are (`eval`), and only
+/// one read off `__FILE__`/`__dir__`: a file's own tree. A loop matching
+/// no file of the tree is not one (left to run as written).
+pub(crate) fn file_glob_requires(source: &str, file: &str, listing: &[String]) -> Vec<(usize, Vec<String>)> {
+    let result = ruby_prism::parse(source.as_bytes());
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    // An ingest path is absolute (the tree's directory joined); a
+    // listing path is as the ingest registered it, so is the match.
+    let absolute = file.starts_with('/');
+    let rooted = format!("{TREE_ROOT}/{}", file.trim_start_matches('/'));
+    let dir = dirname(file);
+    let mut locals: HashMap<String, Value> = HashMap::default();
+    let mut out = Vec::new();
+    for statement in program.statements().body().iter() {
+        if let Some(write) = statement.as_local_variable_write_node() {
+            let name = constant_id_str(&write.name()).to_string();
+            match eval(&write.value(), &rooted, &locals) {
+                Some(value) => {
+                    locals.insert(name, value);
+                }
+                None => {
+                    locals.remove(&name);
+                }
+            }
+            continue;
+        }
+        let Some(paths) = require_loop(&statement, &rooted, absolute, &locals, listing) else { continue };
+        let features: Option<Vec<String>> = paths
+            .iter()
+            .map(|path| relative_path_from(path, &dir).map(|rel| rel.strip_suffix(".rb").unwrap_or(&rel).to_string()))
+            .collect();
+        if let Some(features) = features {
+            out.push((statement.location().start_offset(), features));
+        }
+    }
+    out
+}
+
+/// The tree files one glob-require statement loads, in load order.
+fn require_loop(
+    statement: &Node<'_>,
+    file: &str,
+    absolute: bool,
+    locals: &HashMap<String, Value>,
+    listing: &[String],
+) -> Option<Vec<String>> {
+    let call = statement.as_call_node()?;
+    if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
+        return None;
+    }
+    let mut glob = call.receiver()?.as_call_node()?;
+    let resorted = constant_id_str(&glob.name()) == "sort" && glob.arguments().is_none() && glob.block().is_none();
+    if resorted {
+        glob = glob.receiver()?.as_call_node()?;
+    }
+    let on_dir = glob.receiver().is_some_and(|r| r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "Dir"));
+    if !on_dir || !matches!(&*constant_id_str(&glob.name()), "[]" | "glob") || glob.block().is_some() {
+        return None;
+    }
+    let args: Vec<Node<'_>> = glob.arguments()?.arguments().iter().collect();
+    let [pattern] = args.as_slice() else { return None };
+    let Value::Str(pattern) = eval(pattern, file, locals)? else { return None };
+    let pattern = cleanpath(&pattern);
+    let pattern = pattern.strip_prefix(TREE_ROOT)?;
+    let pattern = if absolute { pattern } else { pattern.strip_prefix('/')? };
+    let block = call.block()?.as_block_node()?;
+    let param = block_param(&block)?;
+    let body: Vec<Node<'_>> = block.body().map(flatten_statements).unwrap_or_default();
+    let [only] = body.as_slice() else { return None };
+    let require = only.as_call_node()?;
+    let args: Vec<Node<'_>> = require.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let required = matches!(args.as_slice(), [arg]
+        if arg.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == param));
+    if require.receiver().is_some()
+        || require.block().is_some()
+        || !matches!(&*constant_id_str(&require.name()), "require" | "require_relative")
+        || !required
+    {
+        return None;
+    }
+    let mut matched: Vec<String> = listing.iter().filter(|f| f.ends_with(".rb") && glob_matches(pattern, f)).cloned().collect();
+    if resorted {
+        // `Array#sort` on the paths: by bytes.
+        matched.sort();
+    } else {
+        dir_order(&mut matched);
+    }
+    (!matched.is_empty()).then_some(matched)
+}
+
+/// `Dir.glob`'s order (sorted, Ruby 3.0 on): each directory's entries
+/// by bytes, a directory's matches where its name sorts. So `a/y.rb`
+/// precedes `a.rb` (`a` < `a.rb`), which a byte sort of whole paths
+/// reverses (`/` sorts after `.`).
+fn dir_order(paths: &mut [String]) {
+    paths.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+}
+
 fn declarations(statements: &[Node<'_>], nesting: &[String], file: &str, listing: &[String], out: &mut Vec<String>) {
     for statement in statements {
         let (path, body) = if let Some(module) = statement.as_module_node() {
@@ -255,6 +373,11 @@ fn eval(node: &Node<'_>, file: &str, scope: &HashMap<String, Value>) -> Option<V
     for arg in &args {
         values.push(eval(arg, file, scope)?);
     }
+    // `__dir__`: the directory of `__FILE__` (Ruby resolves symlinks
+    // first, which a tree path has none of).
+    if call.receiver().is_none() && method == "__dir__" && values.is_empty() {
+        return Some(Value::Str(dirname(file)));
+    }
     let receiver = call.receiver()?;
     let constant = receiver.as_constant_read_node().map(|c| constant_id_str(&c.name()).to_string());
     match (constant.as_deref(), method.as_str(), values.as_slice()) {
@@ -263,6 +386,14 @@ fn eval(node: &Node<'_>, file: &str, scope: &HashMap<String, Value>) -> Option<V
         (Some("File"), "basename", [Value::Str(p) | Value::Path(p), Value::Str(ext)]) => Some(Value::Str(basename(p, Some(ext)))),
         (Some("File"), "join", parts) if !parts.is_empty() && parts.iter().all(|v| !matches!(v, Value::Sym(_))) => {
             Some(Value::Str(join(parts.iter().map(Value::text))))
+        }
+        // `File.expand_path(path, dir)` from an absolute `dir` (one read
+        // off `__FILE__`, which is absolute where `file_glob_requires`
+        // evaluates): lexical, as Ruby's is with no `~` and no symlink.
+        (Some("File"), "expand_path", [Value::Str(p) | Value::Path(p), Value::Str(base) | Value::Path(base)])
+            if base.starts_with('/') && !p.starts_with('~') =>
+        {
+            Some(Value::Str(if p.starts_with('/') { cleanpath(p) } else { cleanpath(&join([base.as_str(), p.as_str()].into_iter())) }))
         }
         (Some("Pathname"), "new", [Value::Str(p) | Value::Path(p)]) => Some(Value::Path(p.clone())),
         (Some(_), _, _) => None,
@@ -476,5 +607,35 @@ mod tests {
         assert!(!glob_matches("d/gateways/**/*.rb", "d/gateways/.hidden.rb"));
         assert!(!glob_matches("d/gateways/*.rb", "d/gateways/sub/y.rb"));
         assert!(!glob_matches("d/gateways/**/*.rb", "d/gateways.rb"));
+    }
+
+    #[test]
+    fn glob_requires_follow_ruby() {
+        let listing: Vec<String> = ["g/lib/x.rb", "g/lib/x/b.rb", "g/lib/x/a.rb", "g/lib/x/a/y.rb", "g/lib/x/ab.rb", "g/lib/x/c.txt", "g/lib/other.rb"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let features = |source: &str| -> Vec<(usize, Vec<String>)> { file_glob_requires(source, "g/lib/x.rb", &listing) };
+        let expected = vec!["x/a/y", "x/a", "x/ab", "x/b"];
+        let found = features("require \"set\"\nDir[File.join(__dir__, \"x/**/*.rb\")].each { |file| require_relative file }\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 14);
+        assert_eq!(found[0].1, expected);
+        let found = features("Dir.glob(File.expand_path(\"x/**/*.rb\", File.dirname(__FILE__))).each do |f|\n  require f\nend\n");
+        assert_eq!(found[0].1, expected);
+        let found = features("dir = File.dirname(__FILE__)\nDir[\"#{dir}/x/*.rb\"].sort.each { |f| require f }\n");
+        assert_eq!(found[0].1, vec!["x/a", "x/ab", "x/b"]);
+        // `../` out of the file's own directory.
+        let up = file_glob_requires("Dir[__dir__ + \"/../lib/x/*.rb\"].each { |f| require f }\n", "g/test/t.rb", &listing);
+        assert_eq!(up[0].1, vec!["../lib/x/a", "../lib/x/ab", "../lib/x/b"]);
+        // An absolute tree, as the ingest registers it.
+        let absolute: Vec<String> = listing.iter().map(|p| format!("/t/{p}")).collect();
+        let found = file_glob_requires("Dir[File.join(__dir__, \"x/**/*.rb\")].each { |file| require_relative file }\n", "/t/g/lib/x.rb", &absolute);
+        assert_eq!(found[0].1, expected);
+        // Not this shape: a cwd-relative literal, another block, no match.
+        assert!(features("Dir[\"g/lib/x/*.rb\"].each { |f| require f }\n").is_empty());
+        assert!(features("Dir[File.join(__dir__, \"x/*.rb\")].each { |f| load f }\n").is_empty());
+        assert!(features("Dir[File.join(__dir__, \"x/*.rb\")].each { |f| puts f; require f }\n").is_empty());
+        assert!(features("Dir[File.join(__dir__, \"y/*.rb\")].each { |f| require f }\n").is_empty());
     }
 }

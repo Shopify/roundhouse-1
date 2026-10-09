@@ -12302,7 +12302,7 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("web_pixels_manager", "requiring it loads 168 Rails framework files"),
     ("carriers_db", "requiring it loads 182 Rails framework files"),
     ("shopify-cdp", "requiring it loads 168 Rails framework files"),
-    ("buyer-risk-ml", "requiring it loads a Rails framework file"),
+    ("buyer-risk-ml", "keys.rb requires active_support/core_ext/object/blank"),
     ("token_protocol", "requiring it loads 170 Rails framework files"),
     ("monorepo_slices", "requiring it loads 90 Rails framework files"),
     ("session_awareness", "requiring it loads 170 Rails framework files"),
