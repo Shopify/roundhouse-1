@@ -2387,6 +2387,19 @@ end
         }
         test_mixins.scan(&source, &entry.display().to_string());
     }
+    // A shared module's spliced bodies read constants in its own lexical
+    // scope; these are the app's, as far as ingest has them by now.
+    let app_constants: Vec<String> = app
+        .library_classes
+        .iter()
+        .flat_map(|lc| {
+            let name = lc.name.0.as_str();
+            std::iter::once(name.to_string()).chain(lc.constants.iter().map(move |(c, _)| format!("{name}::{}", c.as_str())))
+        })
+        .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
+        .chain(app.concern_model_items.keys().map(|id| id.0.as_str().to_string()))
+        .collect();
+    test_mixins.set_library_context(classless.iter().map(|p| p.display().to_string()), app_constants);
     test_mixins.finish();
     let test_class_nestings = test_mixins.class_nestings();
     let test_class_extends = test_mixins.class_extends();
@@ -3556,7 +3569,9 @@ fn carry_support_file(
     }
 }
 
-/// Test-path files that declare no test class and no shared test module:
+/// Test-path files that declare no test class (a shared test module's file
+/// is carried as its library source, the members the splice leaves to the
+/// module, or skipped when it keeps none):
 /// Core's `components/*/test/support/helpers/**` (`module Apps::TestHelper`,
 /// `module GeoIpHelper` with its `class MockGeoIPLocation`), which a test
 /// file `require`s from the test load path and then includes or calls.
@@ -3586,20 +3601,27 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
     let mut carried_classes: Vec<(PathBuf, Vec<crate::ident::ClassId>)> = Vec::new();
     for entry in classless {
         let path_str = entry.display().to_string();
-        if test_mixins.declares_shared_tests(&path_str)
-            || carried.iter().any(|set| set.contains(entry))
-            || already.contains(&path_str)
-        {
+        let shared = test_mixins.declares_shared_tests(&path_str);
+        if carried.iter().any(|set| set.contains(entry)) || already.contains(&path_str) {
             continue;
         }
         let Some(source) = read_or_ledger(vfs, entry)? else { continue };
+        // A file of shared test modules is carried for what the splice
+        // leaves in it: a module's own classes, modules and state, and
+        // the file's other declarations (`TestMixins::library_source`).
+        let source = if shared {
+            match test_mixins.library_source(&path_str, &source) {
+                Some(library) => library,
+                None => continue,
+            }
+        } else {
+            source
+        };
         if super::library_class::has_active_record_base(&source, model_bases) {
-            unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                file: path_str.clone(),
-                message: "test-support file not carried: it declares an ActiveRecord model, \
-                          and a model under a test path is not ingested as one"
-                    .to_string(),
-            }))?;
+            let message = "test-support file not carried: it declares an ActiveRecord model, \
+                           and a model under a test path is not ingested as one";
+            test_mixins.note_uncarried(&path_str, message.to_string());
+            unwrap_or_record::<()>(Err(IngestError::Unsupported { file: path_str.clone(), message: message.to_string() }))?;
             continue;
         }
         let (ingested, deferred) = super::inherited_alias::capturing(|| {
@@ -3624,11 +3646,15 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
                     let err = super::inherited_alias::refusal(&path_str);
                     let site = deferred[0];
                     super::error_site::note(&err, site.start as usize, site.end as usize);
+                    test_mixins.note_uncarried(&path_str, err.to_string());
                     drop_library_file(app, &path_str, &err);
                 }
             }
             Ok(classes) => carry_support_file(app, entry, &source, classes, &mut not_at_boot, &mut carried_classes, None),
-            Err(err) => drop_library_file(app, &path_str, &err),
+            Err(err) => {
+                test_mixins.note_uncarried(&path_str, err.to_string());
+                drop_library_file(app, &path_str, &err);
+            }
         }
         if let Some(program) = app.file_programs.last_mut().filter(|p| p.source == path_str) {
             resolve_test_load_path_requires(vfs, entry, load_roots, &mut program.items);
