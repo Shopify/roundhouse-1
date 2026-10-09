@@ -3803,7 +3803,12 @@ impl<'a> BodyTyper<'a> {
                             // A Ruby-family runtime port's class
                             // (`ActiveSupport::MessageEncryptor`); its
                             // reads are gated per target (runtime_reads).
-                            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(id.0.as_str()) {
+                            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(id.0.as_str())
+                            // A test base the emitted test harness
+                            // defines (`ActiveJob::TestCase`), named by a
+                            // test hook's or helper's `#: self as
+                            // singleton(…)`.
+                            && !crate::analyze::test_constants::is_harness_declared_type(id.0.as_str()) {
                             missing.borrow_mut().push(id.0.as_str().to_owned());
                         }
                         id.clone()

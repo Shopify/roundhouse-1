@@ -522,6 +522,15 @@ pub struct App {
     /// (`emit::ruby::library::declared_in_gem_source`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_source_dirs: Vec<String>,
+    /// The test environment's `$LOAD_PATH` below the app root, each
+    /// ending in `/`: Rails' `test`, and each `paths.add(…, load_path:
+    /// true)` of the application and its engines, unconditional or in the
+    /// test environment (Core's engines' `paths.add("test", load_path:
+    /// true)`; `ingest::app::rails_test_load_path`). A test hook's or a
+    /// test-support file's `require "support/helpers/…"` resolves there
+    /// (`project::test_load_path_features`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_load_roots: Vec<String>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
@@ -1440,6 +1449,7 @@ impl App {
             boot_native_requires: Vec::new(),
             bundler_gems: Vec::new(),
             gem_source_dirs: Vec::new(),
+            test_load_roots: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),

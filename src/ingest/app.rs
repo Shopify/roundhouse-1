@@ -461,6 +461,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     super::sources::reset();
     super::initializers::reset();
     let _source_root = super::sources::set_root(dir);
+    // A PostgreSQL tree's emitted test helper fires the test-case load
+    // hooks; a lib file's hook for one registers as written
+    // (`on_load_reopen::registered_as_written`).
+    let _test_hooks = super::on_load_reopen::defer_test_hooks(
+        declared_database_adapter(vfs, dir).ok().flatten().is_some_and(|(adapter, _)| adapter == "postgresql"),
+    );
     let gem_sources = gem_source_dirs(vfs, dir)?;
     let mut path_gems = path_gem_dirs(vfs, dir);
     path_gems.extend(gem_sources.iter().map(|(_, gem)| gem.clone()));
@@ -2322,6 +2328,13 @@ end
         roots.dedup();
         roots
     };
+    // The test environment's `$LOAD_PATH` itself, which a carried
+    // file's `require` reads at run time (`project::test_load_path_features`).
+    app.test_load_roots = rails_test_load_path(vfs, dir, &engine_dirs)
+        .iter()
+        .filter_map(|root| root.strip_prefix(dir).ok())
+        .map(|rel| format!("{}/", rel.display()))
+        .collect();
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();
@@ -2878,11 +2891,13 @@ end
             .chain(path_gems.iter().map(|gem| gem.join("lib")))
             .collect();
         let lifted: Vec<&str> = super::on_load_hooks::FIRED_HOOKS.iter().map(|(h, _)| *h).collect();
+        let test_load_path: Vec<PathBuf> = app.test_load_roots.iter().map(|root| dir.join(root)).collect();
         let inputs = super::initializer_programs::Inputs {
             vfs,
             dir,
             files: &boot_initializers,
             load_path: &load_path,
+            test_load_path: &test_load_path,
             loaded_support: &loaded_support,
             lifted: &lifted,
         };
@@ -8729,6 +8744,140 @@ pub(super) fn is_rails_engine_class(class: &ruby_prism::ClassNode<'_>) -> bool {
                     }
                 })
         })
+}
+
+/// The directories the test environment's `$LOAD_PATH` holds below the
+/// tree, as Rails 8.2 builds it: `rails test` appends `Rails.root/test`
+/// (railties commands/test/test_command.rb:29), and each engine and the
+/// application put each of their `paths.add(LIT, load_path: true)` on it
+/// (engine.rb:596 `set_load_path`). Read from the application's class
+/// body in config/application.rb and from each engine's `Rails::Engine`
+/// subclass (its root the engine's directory, `engine_dirs`): a statement
+/// of the body, or of an `if Rails.env.test?` or a `case Rails.env` `when "test"`
+/// there (Core's config/application.rb:208-211, `components/*/lib/*/engine.rb`). An engine without one adds nothing
+/// (Core's access_and_auth/login_with_shop), and a directory the tree
+/// does not have is skipped, as `set_load_path` skips it. Not read: a
+/// path under another condition, or one written other than as a literal.
+fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    use ruby_prism::Node;
+    // `Rails.env` (`::Rails.env`).
+    fn rails_env(node: &Node<'_>) -> bool {
+        node.as_call_node().is_some_and(|env| {
+            super::util::constant_id_str(&env.name()) == "env"
+                && env.arguments().is_none()
+                && env.receiver().and_then(|r| super::util::constant_path_of(&r)).is_some_and(|p| {
+                    p.iter().map(String::as_str).skip_while(|s| s.is_empty()).eq(["Rails"])
+                })
+        })
+    }
+    // `Rails.env.test?`.
+    fn rails_env_test(node: &Node<'_>) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        super::util::constant_id_str(&call.name()) == "test?"
+            && call.arguments().is_none()
+            && call.receiver().is_some_and(|r| rails_env(&r))
+    }
+    // `paths.add("test", load_path: true)` / `config.paths.add(…)`.
+    fn load_path_entry(node: &Node<'_>) -> Option<String> {
+        let call = node.as_call_node()?;
+        if super::util::constant_id_str(&call.name()) != "add" {
+            return None;
+        }
+        let paths = call.receiver()?.as_call_node()?;
+        if super::util::constant_id_str(&paths.name()) != "paths" || paths.arguments().is_some() {
+            return None;
+        }
+        match paths.receiver() {
+            None => {}
+            Some(config) => {
+                let config = config.as_call_node()?;
+                if super::util::constant_id_str(&config.name()) != "config" || config.receiver().is_some() {
+                    return None;
+                }
+            }
+        }
+        let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+        let [path, options] = args.as_slice() else { return None };
+        let path = path.as_string_node()?;
+        let options = options.as_keyword_hash_node()?;
+        let load_path = options.elements().iter().any(|element| {
+            element.as_assoc_node().is_some_and(|assoc| {
+                assoc.key().as_symbol_node().is_some_and(|key| key.unescaped() == b"load_path")
+                    && assoc.value().as_true_node().is_some()
+            })
+        });
+        load_path.then(|| String::from_utf8_lossy(path.unescaped()).into_owned())
+    }
+    fn body_entries(body: Node<'_>, out: &mut Vec<String>) {
+        for stmt in super::util::flatten_statements(body) {
+            if let Some(entry) = load_path_entry(&stmt) {
+                out.push(entry);
+            } else if let Some(branch) = stmt.as_if_node() {
+                if rails_env_test(&branch.predicate()) {
+                    if let Some(then) = branch.statements() {
+                        body_entries(then.as_node(), out);
+                    }
+                }
+            } else if let Some(case) = stmt.as_case_node() {
+                // `case Rails.env when "test"` (Core's
+                // markets/platform/lib/markets/platform/engine.rb:9):
+                // Rails.env is a String, which a "test" condition matches.
+                if case.predicate().is_some_and(|p| rails_env(&p)) {
+                    for when in case.conditions().iter().filter_map(|c| c.as_when_node()) {
+                        let test = when.conditions().iter().any(|c| c.as_string_node().is_some_and(|s| s.unescaped() == b"test"));
+                        if let (true, Some(then)) = (test, when.statements()) {
+                            body_entries(then.as_node(), out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    struct Classes<'a> {
+        engine: bool,
+        out: &'a mut Vec<String>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Classes<'_> {
+        fn visit_class_node(&mut self, class: &ruby_prism::ClassNode<'pr>) {
+            let wanted = if self.engine {
+                is_rails_engine_class(class)
+            } else {
+                class.superclass().and_then(|parent| super::util::constant_path_of(&parent)).is_some_and(|p| {
+                    let p: Vec<&str> = p.iter().map(String::as_str).skip_while(|s| s.is_empty()).collect();
+                    p == ["Rails", "Application"]
+                })
+            };
+            if wanted {
+                if let Some(body) = class.body() {
+                    body_entries(body, self.out);
+                }
+            } else {
+                ruby_prism::visit_class_node(self, class);
+            }
+        }
+    }
+    let entries = |file: &Path, engine: bool| -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(source) = vfs.read(file) else { return out };
+        let needle: &[u8] = if engine { b"Engine" } else { b"Application" };
+        if !source.windows(b"load_path".len()).any(|w| w == b"load_path") || !source.windows(needle.len()).any(|w| w == needle) {
+            return out;
+        }
+        let parsed = ruby_prism::parse(&source);
+        ruby_prism::Visit::visit(&mut Classes { engine, out: &mut out }, &parsed.node());
+        out
+    };
+    let mut roots = vec![dir.join("test")];
+    roots.extend(entries(&dir.join("config/application.rb"), false).into_iter().map(|path| dir.join(path)));
+    for engine in engine_dirs {
+        for file in read_rb_files(vfs, &engine.join("lib")).unwrap_or_default() {
+            roots.extend(entries(&file, true).into_iter().map(|path| engine.join(path)));
+        }
+    }
+    roots.retain(|root| vfs.is_dir(root));
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// Whether any Ruby file under `lib_dir` subclasses `Rails::Engine`

@@ -666,7 +666,10 @@ fn postgres_test_helper_names_fixture_sets_for_load_once_instead_of_truncating()
     let bases = helper.find("module ActiveSupport\n  TestCase = ::TestBase\nend\n").expect("ActiveSupport::TestCase");
     assert!(helper.contains("module ActionController\n  class TestCase < TestBase\n  end\nend\n"), "{helper}");
     assert!(bases < helper.find("require_relative \"../boot\"").expect("boot"), "{helper}");
-    assert!(helper.trim_end().ends_with("TestBase.include(ActiveRecord::TestFixtures)"), "{helper}");
+    // rails/test_help.rb: the boot-registered :active_support_test_case hooks
+    // fire, then its own include (`project::test_case_load_hooks_block`).
+    let fired = helper.find("ActiveSupport.run_load_hooks(:active_support_test_case, TestBase)").expect("hooks fired");
+    assert!(fired < helper.find("TestBase.include(ActiveRecord::TestFixtures)").expect("TestFixtures"), "{helper}");
 
     // The driver runs the tests and nothing else: the runner owns setup.
     let test = source("test/models/entry_test.rb");

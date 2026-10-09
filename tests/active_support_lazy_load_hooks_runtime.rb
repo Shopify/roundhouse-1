@@ -276,5 +276,94 @@ if MODE == "emitted"
     top = outcome { ActiveSupport.run_load_hooks(:probe_top_level, Module.new) }
     check(top == "raises NameError: uninitialized constant TopLevelMissing", "the tree's uncovered hook: #{top}")
     puts "! the tree's hook registered outside a railtie statement still #{top}"
+    # Where the emitted test helper fires the test-case hooks
+    # (`project::test_case_load_hooks_block`): the same hook is named and
+    # the next one runs.
+    $probe = []
+    ActiveSupport.on_load(:probe_top_level) { $probe << :after_failing }
+    $probe = []
+    err = captured_stderr do
+      top = outcome do
+        ActiveSupport::LazyLoadHooks.naming_failures("activesupport/lib/active_support/test_case.rb:408") do
+          ActiveSupport.run_load_hooks(:probe_top_level, Module.new)
+        end
+      end
+    end
+    check(top == "ran" && $probe == [:after_failing] && err.lines.map(&:chomp) == [
+      "roundhouse: error[load_hook_not_run]: app/models/probe_engine.rb:9 on_load(:probe_top_level) did not run: NameError: uninitialized constant TopLevelMissing (fired at activesupport/lib/active_support/test_case.rb:408)",
+    ], "test helper firing: #{top}; #{$probe.inspect}; #{err.inspect}")
+    puts "! #{err.lines.first.chomp}; the next hook ran"
+    top = outcome { ActiveSupport.run_load_hooks(:probe_top_level, Module.new) }
+    check(top == "raises NameError: uninitialized constant TopLevelMissing", "outside the firing: #{top}")
+  end
+
+  # A test base whose hooks the emitted test helper defers to its first
+  # subclass (`project::test_case_load_hooks_block`, `run_when_loaded`), as Rails loads the
+  # base where a test first names it: none run before; the first subclass
+  # (or a subclass of a base whose file requires it) fires them once,
+  # before its body; a failing one of the tree's own is named and the next
+  # runs; a hook registered after runs at once.
+  isolated do
+    cases_file = File.join(tree, "app/models/probe_cases.rb")
+    File.write(cases_file, <<~RUBY)
+      ActiveSupport.on_load(:probe_controller_case) { $probe << [:controller, self] }
+      ActiveSupport.on_load(:probe_view_case) { CaseMissing }
+      ActiveSupport.on_load(:probe_view_case) { $probe << [:view, self] }
+    RUBY
+    load cases_file
+    controller_base, view_base = Class.new, Class.new
+    ActiveSupport::LazyLoadHooks.run_when_loaded(:probe_controller_case, controller_base, "actionpack/lib/action_controller/test_case.rb:611")
+    ActiveSupport::LazyLoadHooks.run_when_loaded(:probe_view_case, view_base, "actionview/lib/action_view/test_case.rb:256", after: [:probe_controller_case])
+    check($probe.empty?, "before a subclass: #{$probe.inspect}")
+    seen = nil
+    err = captured_stderr { Class.new(view_base) { seen = $probe.dup } }
+    check(seen == [[:controller, controller_base], [:view, view_base]], "first subclass: #{seen.inspect}")
+    check(err.lines.map(&:chomp) == [
+      "roundhouse: error[load_hook_not_run]: app/models/probe_cases.rb:2 on_load(:probe_view_case) did not run: NameError: uninitialized constant CaseMissing (fired at actionview/lib/action_view/test_case.rb:256)",
+    ], "failing deferred hook: #{err.inspect}")
+    Class.new(Class.new(controller_base))
+    Class.new(view_base)
+    check($probe.length == 2, "fired once: #{$probe.inspect}")
+    ActiveSupport.on_load(:probe_controller_case) { $probe << :registered_after }
+    check($probe.last == :registered_after, "registered after: #{$probe.inspect}")
+    puts "! a test base's hooks: none before its first subclass, then once, after the bases its file requires; #{err.lines.first.chomp}; a hook registered after runs at once"
+  end
+
+  # A base whose hooks Rails fires in its Behavior's `included do`
+  # (`behavior: true`; ActionView::TestCase::Behavior): the base includes
+  # Behavior, and a class that includes it itself (Core's
+  # developer_dashboard check_box_test.rb) loads the base, firing the
+  # base's hooks and those of the bases its file requires once, then gets
+  # the hooks run on itself; a subclass of the base already has Behavior
+  # and runs none (ActiveSupport::Concern#append_features), and a failing
+  # hook of the tree's own is named for each includer.
+  isolated do
+    behavior_file = File.join(tree, "app/models/probe_behavior.rb")
+    File.write(behavior_file, <<~RUBY)
+      ActiveSupport.on_load(:probe_behavior_case) { $probe << [:behavior, self] }
+      ActiveSupport.on_load(:probe_behavior_case) { BehaviorMissing }
+    RUBY
+    load behavior_file
+    $probe = []
+    required_base, base = Class.new, Class.new
+    ActiveSupport.on_load(:probe_required_case) { $probe << [:required, self] }
+    ActiveSupport::LazyLoadHooks.run_when_loaded(:probe_required_case, required_base, "actionpack/lib/action_controller/test_case.rb:611")
+    ActiveSupport::LazyLoadHooks.run_when_loaded(:probe_behavior_case, base, "actionview/lib/action_view/test_case.rb:256", after: [:probe_required_case], behavior: true)
+    check(base.include?(base::Behavior) && $probe.empty?, "before an includer: #{base.ancestors.inspect}; #{$probe.inspect}")
+    includer = nil
+    err = captured_stderr { includer = Class.new { include base::Behavior } }
+    check($probe == [[:required, required_base], [:behavior, base], [:behavior, includer]], "first includer: #{$probe.inspect}")
+    check(err.lines.map(&:chomp) == [
+      "roundhouse: error[load_hook_not_run]: app/models/probe_behavior.rb:2 on_load(:probe_behavior_case) did not run: NameError: uninitialized constant BehaviorMissing (fired at actionview/lib/action_view/test_case.rb:256)",
+    ] * 2, "failing Behavior hook: #{err.inspect}")
+    captured_stderr do
+      Class.new(base)
+      Class.new(base) { include base::Behavior }
+    end
+    check($probe.length == 3, "a subclass of the base: #{$probe.inspect}")
+    other = nil
+    captured_stderr { other = Class.new { include base::Behavior } }
+    check($probe.last == [:behavior, other] && $probe.length == 4, "a second includer: #{$probe.inspect}")
+    puts "! a Behavior base's hooks: the first includer fires the base's and the bases its file requires, then its own; each includer gets them; a subclass of the base runs none; #{err.lines.first.chomp}"
   end
 end

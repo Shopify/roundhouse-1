@@ -27,6 +27,12 @@
 # registered it already runs under that convention: a railtie or engine
 # initializer (`Railtie.not_run_unless_it_runs`) or body statement
 # (`Railtie.run_body_statement`), whose deferred hook is the same work.
+# Or where the emitted test helper fires the test-case hooks
+# (`LazyLoadHooks.naming_failures`, `LazyLoadHooks.run_when_loaded`,
+# `project::test_case_load_hooks_block`): in Rails a hook raising there
+# ends the test boot, or the load of the test file naming the base,
+# before its tests run; here it is named and the next hook runs, and
+# each test that needed it fails on its own.
 #
 # This file is also where the tree loads what active_support.rb sets up
 # first: below, its `autoload` entries for the constants this tree ports.
@@ -93,8 +99,72 @@ module ActiveSupport
 
     @covered = {}.compare_by_identity
     @native = {}
+    @naming_site = nil
+    @when_loaded = {}
 
     class << self
+      # Runs the block, a firing of hooks at `site` (the Rails file and
+      # line that fires them), under which a failing hook of this tree's
+      # own code is named, error[load_hook_not_run], and the next runs.
+      def naming_failures(site) # :nodoc:
+        previous, @naming_site = @naming_site, site
+        yield
+      ensure
+        @naming_site = previous
+      end
+
+      # Fires `name`'s hooks on `base` (under naming_failures(site)) where
+      # the tree first loads the base as Rails does, after the hooks of the
+      # bases `after` names. Rails loads a test base where code first names
+      # it, and its file fires the hooks as it loads (`site`), having
+      # required the bases it builds on (action_view/test_case.rb requires
+      # action_controller/test_case); the emitted tree defines the bases up
+      # front, so they fire when the first class descends from the base,
+      # before that class's body runs.
+      #
+      # `behavior: true`: the base fires them where Rails' does, in its
+      # `Behavior`'s `included do` (ActionController::TestCase::Behavior,
+      # ActionDispatch::IntegrationTest::Behavior,
+      # ActionView::TestCase::Behavior), with the includer: the base
+      # includes `base::Behavior` (defined here if the tree has none), and
+      # each other class that includes it gets the hooks run on itself
+      # once naming it has loaded the base (and so fired the base's); a
+      # subclass of the base already has it, and runs none. Only
+      # the hooks' part of Behavior is ported; the base's request and view
+      # machinery is the runtime test helper's.
+      def run_when_loaded(name, base, site, after: [], behavior: false) # :nodoc:
+        @when_loaded[name] = lambda do
+          @when_loaded.delete(name)
+          after.each { |prior| fire_when_loaded(prior) }
+          naming_failures(site) { ActiveSupport.run_load_hooks(name, base) }
+        end
+        hooks = self
+        base.singleton_class.prepend(Module.new do
+          define_method(:inherited) do |subclass|
+            hooks.fire_when_loaded(name)
+            super(subclass)
+          end
+        end)
+        return unless behavior
+        mixin = base.const_defined?(:Behavior, false) ? base.const_get(:Behavior, false) : base.const_set(:Behavior, Module.new)
+        base.include(mixin)
+        # ActiveSupport::Concern#append_features: a class that has
+        # Behavior already (a subclass of the base) runs no `included` block.
+        mixin.singleton_class.prepend(Module.new do
+          define_method(:append_features) do |includer|
+            return false if includer < mixin
+            super(includer)
+            hooks.fire_when_loaded(name)
+            hooks.naming_failures(site) { ActiveSupport.run_load_hooks(name, includer) }
+          end
+        end)
+      end
+
+      # Fires a base's deferred hooks (`run_when_loaded`) unless they ran.
+      def fire_when_loaded(name) # :nodoc:
+        @when_loaded[name]&.call
+      end
+
       # A hook this tree's code registers while a railtie's or engine's
       # initializer or body statement runs is covered by that statement's
       # convention.
@@ -117,6 +187,8 @@ module ActiveSupport
           site, registered = "#{gem_site(path)}:#{line}", ""
         elsif (convention = @covered[block])
           site, registered = "#{tree_site(path)}:#{line}", " (registered by #{convention})"
+        elsif @naming_site
+          site, registered = "#{tree_site(path)}:#{line}", " (fired at #{@naming_site})"
         else
           raise
         end

@@ -2334,7 +2334,7 @@ fn fixture_set_rows(app: &App, fixture_lcs: &[LibraryClass]) -> Vec<FixtureSetRo
 /// had no `assertions`, and the second raised NameError.
 /// `ActiveSupport::TestCase` is `TestBase` itself, the class emitted
 /// test classes descend from for it (`emitted_test_parent`).
-const MINITEST_TEST_CASES: &str = "\
+pub(crate) const MINITEST_TEST_CASES: &str = "\
 # Rails' test base classes, before the app's files reopen them: TestBase
 # (defined below) is ActiveSupport::TestCase, and ActionController::
 # TestCase descends from it.

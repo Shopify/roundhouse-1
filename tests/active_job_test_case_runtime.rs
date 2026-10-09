@@ -4,8 +4,9 @@
 //! a tree without it failed every such file at load with
 //! `NameError: uninitialized constant ActiveJob::TestCase` (38 rows of
 //! unit-1000). It is Rails' class: TestBase with ActiveJob::TestHelper,
-//! running the `:active_job_test_case` load hooks where the tree carries
-//! lazy_load_hooks.
+//! whose `:active_job_test_case` load hooks fire as the first class
+//! descends from it where the tree carries lazy_load_hooks
+//! (`project::test_case_load_hooks_block`).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 

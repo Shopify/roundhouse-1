@@ -2668,6 +2668,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // class or module built at runtime, mid-method, has no static
         // home in the IR's class-table model — ledgered specifically
         // rather than falling through to the generic message.
+        // A module an initializer's load hook defines, carried as a
+        // library class (`initializer_programs::hoist_hook_modules`): a
+        // read of its constant where the block defines it.
+        n if n.as_module_node().is_some()
+            && super::initializers::defined_at(file, n.location().start_offset()).is_some() =>
+        {
+            let name = super::initializers::defined_at(file, n.location().start_offset()).unwrap_or_default();
+            let mut read = Expr::new(span, ExprNode::Const { path: name.split("::").map(Symbol::from).collect() });
+            read.decisions |= crate::expr::GENERATED_CONST_REF;
+            return Ok(read);
+        }
         n if n.as_class_node().is_some() || n.as_module_node().is_some() => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
