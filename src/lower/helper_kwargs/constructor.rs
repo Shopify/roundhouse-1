@@ -20,11 +20,11 @@ pub(super) struct InstanceCallParams {
     unqualified_class_ids: HashMap<String, String>,
     ambiguous_names: HashSet<String>,
     model_names: HashSet<String>,
-    /// Every flattened `initialize`/`new` in the app has its keywords
-    /// written back as keywords by the Ruby family
-    /// (`Param::keywords_written_as_keywords`), so a constructor call the
-    /// CRuby tree leaves as written binds as Ruby's does.
-    ruby_family_writes_constructor_keywords: bool,
+    /// The first `initialize`/`new` (`Owner#name`) whose flattened
+    /// keywords the Ruby family does not write back as keywords
+    /// (`Param::keywords_written_as_keywords`). With none, a constructor
+    /// call the CRuby tree leaves as written binds as Ruby's does.
+    ruby_family_positional_constructor: Option<String>,
 }
 
 impl InstanceCallParams {
@@ -81,52 +81,55 @@ impl InstanceCallParams {
             unqualified_class_ids,
             ambiguous_names: names.ambiguous_names.clone(),
             model_names: names.model_names.clone(),
-            ruby_family_writes_constructor_keywords: ruby_family_writes_constructor_keywords(app),
+            ruby_family_positional_constructor: ruby_family_positional_constructor(app),
         }
     }
 }
 
-/// Whether the Ruby family writes every flattened constructor keyword
-/// back. Ingest flattens an optional keyword into a positional-with-default
-/// (`Param::from_keyword`), which is what makes an unverified `new` lookup
-/// unsafe on targets without keyword arguments. A native-keyword tree
-/// writes a method's trailing flattened keywords back (`emit_method`), and
-/// keeps every unrewritten call's keywords, so the binding is Ruby's own.
-/// One `initialize` or `new` anywhere whose flattened keywords are not
-/// written back could be the effective constructor of an unverified
-/// lookup, so it keeps every such refusal on that tree too.
-fn ruby_family_writes_constructor_keywords(app: &App) -> bool {
-    let constructor = |method: &&crate::dialect::MethodDef| {
-        matches!(method.name.as_str(), "initialize" | "new")
+/// The first constructor whose flattened keywords the Ruby family does
+/// not write back. Ingest flattens an optional keyword into a
+/// positional-with-default (`Param::from_keyword`), which is what makes an
+/// unverified `new` lookup unsafe on targets without keyword arguments. A
+/// native-keyword tree writes a method's trailing flattened keywords back
+/// (`emit_method`), and keeps every unrewritten call's keywords, so the
+/// binding is Ruby's own. One `initialize` or `new` anywhere whose
+/// flattened keywords stay positional could be the effective constructor
+/// of an unverified lookup, so it keeps every such refusal on that tree.
+fn ruby_family_positional_constructor(app: &App) -> Option<String> {
+    let offending = |owner: &str, method: &crate::dialect::MethodDef| {
+        (matches!(method.name.as_str(), "initialize" | "new")
+            && !crate::dialect::Param::keywords_written_as_keywords(&method.params))
+        .then(|| format!("{owner}#{}", method.name.as_str()))
     };
-    let written_back = |method: &crate::dialect::MethodDef| {
-        crate::dialect::Param::keywords_written_as_keywords(&method.params)
-    };
-    let classes = app
-        .library_classes
+    app.library_classes
         .iter()
         .chain(app.rails_application.iter())
         .chain(
             app.test_modules
                 .iter()
                 .flat_map(|module| module.inner_classes.iter()),
-        );
-    classes
-        .flat_map(|class| class.methods.iter())
-        .filter(constructor)
-        .all(written_back)
-        && app
-            .models
-            .iter()
-            .flat_map(|model| model.methods())
-            .filter(constructor)
-            .all(written_back)
-        && app
-            .test_modules
-            .iter()
-            .flat_map(|module| module.helpers.iter())
-            .filter(constructor)
-            .all(written_back)
+        )
+        .find_map(|class| {
+            class
+                .methods
+                .iter()
+                .find_map(|method| offending(class.name.0.as_str(), method))
+        })
+        .or_else(|| {
+            app.models.iter().find_map(|model| {
+                model
+                    .methods()
+                    .find_map(|method| offending(model.name.0.as_str(), method))
+            })
+        })
+        .or_else(|| {
+            app.test_modules.iter().find_map(|module| {
+                module
+                    .helpers
+                    .iter()
+                    .find_map(|method| offending(module.name.0.as_str(), method))
+            })
+        })
 }
 
 pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> {
@@ -549,12 +552,16 @@ fn refuse_constructor(
     detail: &str,
     diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
-    let as_written = params.ruby_family_writes_constructor_keywords
-        && !params.lexical_refinement_calls.contains(&expr.span);
-    let detail = if as_written {
-        format!("{detail}; the CRuby tree, which writes flattened keywords back, runs the call as written")
-    } else {
-        detail.to_string()
+    let refinement = params.lexical_refinement_calls.contains(&expr.span);
+    let as_written = params.ruby_family_positional_constructor.is_none() && !refinement;
+    let detail = match &params.ruby_family_positional_constructor {
+        _ if as_written => format!(
+            "{detail}; the CRuby tree, which writes flattened keywords back, runs the call as written"
+        ),
+        Some(positional) if !refinement => format!(
+            "{detail}; refused on the CRuby tree too: `{positional}` keeps flattened keywords positional there"
+        ),
+        _ => detail.to_string(),
     };
     let diagnostic = crate::diagnostic::Diagnostic::unsupported(
         expr.span,

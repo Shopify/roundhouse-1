@@ -1189,10 +1189,21 @@ impl Param {
     /// ones, `params.len()` when there is none. Only a trailing run can be
     /// keywords, and a flattened keyword-rest only as its last; `None`
     /// when the run breaks that, and the whole method stays positional.
+    ///
+    /// A native `**rest` may close the run: ingest keeps a keyword-rest the
+    /// body forwards (`super(**args)`) while still flattening the optional
+    /// keywords before it. `def initialize(api: nil, **args)` is written
+    /// `(api: nil, **args)`, not `(api = nil, **args)`, where Ruby would
+    /// bind a caller's `api:` into `args`.
     pub fn respelled_keywords_from(params: &[Param]) -> Option<usize> {
-        let tail = params.iter().rev().take_while(|p| p.from_keyword || p.from_kwrest).count();
-        let first = params.len() - tail;
-        params[first..].iter().position(|p| p.from_kwrest).is_none_or(|i| i + 1 == tail).then_some(first)
+        let end = params.len() - usize::from(params.last().is_some_and(|p| p.keyword && p.rest));
+        let run = &params[..end];
+        let tail = run.iter().rev().take_while(|p| p.from_keyword || p.from_kwrest).count();
+        if tail == 0 {
+            return Some(params.len());
+        }
+        let first = end - tail;
+        run[first..].iter().position(|p| p.from_kwrest).is_none_or(|i| i + 1 == tail).then_some(first)
     }
 
     /// Every keyword the source declared is a keyword in the Ruby family's
