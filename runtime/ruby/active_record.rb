@@ -18,3 +18,36 @@ require_relative "active_record/signed_id"
 require_relative "active_record/token_for"
 require_relative "active_record/arel"
 require_relative "active_record/relation"
+
+# activerecord gem_version.rb and version.rb, from Shopify/rails
+# 5813559f4aed (8.2.0.alpha), which is the Rails Core runs
+# (docs/RAILS_VERSION.md). Gems branch on `ActiveRecord.version` in
+# their module bodies. softer_delete 0.9.0's common.rb does
+# `if ActiveRecord.version >= "7.2.0.alpha"`, and kafka-shopify's
+# transaction tracker does `return if ::ActiveRecord.version < "7.2"`.
+# So boot calls it as each carried gem loads, and a missing reader stops
+# the boot. The value Core's Rails reports is the one to answer, so each
+# branch goes the way it does natively. A `Gem::Version` compares with a
+# version String. A natively loaded gem can call these readers too, so
+# the text shake (emit::ruby::shake) must keep them: the names
+# `version` and `gem_version` in this comment count as uses.
+module ActiveRecord
+  # Returns the currently loaded version of Active Record as a +Gem::Version+.
+  def self.gem_version
+    Gem::Version.new VERSION::STRING
+  end
+
+  module VERSION
+    MAJOR = 8
+    MINOR = 2
+    TINY  = 0
+    PRE   = "alpha"
+
+    STRING = [MAJOR, MINOR, TINY, PRE].compact.join(".")
+  end
+
+  # Returns the currently loaded version of Active Record as a +Gem::Version+.
+  def self.version
+    gem_version
+  end
+end

@@ -151,6 +151,30 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ]);
     register_stdlib_class(classes, "Rails", &[("deprecator", deprecation.clone())], &[]);
     register_stdlib_class(classes, "ActiveSupport", &[("deprecator", deprecation.clone())], &[]);
+    // `ActiveRecord.version` / `ActiveSupport.version` and their
+    // `gem_version` (activerecord and activesupport gem_version.rb and
+    // version.rb, Rails 8.2.0.alpha): a Gem::Version, which compares
+    // with a version string through its Comparable `<=>`. Answered by
+    // runtime/ruby/active_record.rb and runtime/ruby/active_support_ext.rb.
+    // softer_delete's module body branches on
+    // `ActiveRecord.version >= "7.2.0.alpha"`.
+    let gem_version = class("Gem::Version");
+    for framework in ["ActiveRecord", "ActiveSupport"] {
+        register_stdlib_class(classes, framework, &[
+            ("version", gem_version.clone()), ("gem_version", gem_version.clone()),
+        ], &[]);
+    }
+    // The orderings Gem::Version's `include Comparable` gives it, which
+    // the vendored RBS declares but dispatch does not follow, and the
+    // readers spinel's builtin Gem::Version shares with RubyGems'.
+    // RubyGems' `<=>` (and spinel's) takes a version string as well as a
+    // Version, and answers nil for an operand it cannot compare.
+    register_stdlib_class(classes, "Gem::Version", &[], &[
+        ("<=>", Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
+        ("<", Ty::Bool), ("<=", Ty::Bool), (">", Ty::Bool), (">=", Ty::Bool),
+        ("between?", Ty::Bool), ("prerelease?", Ty::Bool), ("version", Ty::Str),
+        ("segments", Ty::Array { elem: Box::new(Ty::Union { variants: vec![Ty::Int, Ty::Str] }) }),
+    ]);
     // ActiveSupport::Inflector and its Inflections, answered by
     // runtime/spinel/active_support_inflector.rb (Rails 8.2.0.alpha),
     // which only the PostgreSQL CRuby tree carries (`runtime_reads`

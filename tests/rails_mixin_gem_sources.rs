@@ -8,8 +8,8 @@
 //! harness now carries the five gems (bin/check-target GEM_SOURCES).
 //!
 //! The Concern here is softer_delete's `UsingIsNotDeleted` cut to its
-//! scopes and `deleted?`: the full gem's `Common` reaches gaps named in
-//! the ignored test below. Native Rails 8.1.4 (sqlite) on the same model,
+//! scopes and `deleted?`; the full gem's `Common` branches on
+//! `ActiveRecord.version`, which the last test covers. Native Rails 8.1.4 (sqlite) on the same model,
 //! schema and test gave the asserted values.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -84,13 +84,13 @@ fn without_the_key_the_include_is_refused_by_name() {
 
 /// softer_delete/common.rb and ar_transaction_changes.rb branch on
 /// `ActiveRecord.version` in their module bodies (softer_delete 0.9.0:
-/// `if ActiveRecord.version >= "7.2.0.alpha"`). The
-/// runtime's ActiveRecord has no `version`, so the boot's load of the
-/// carried entry raises NoMethodError, and Bundler.require'd gem-source
-/// entries load unguarded: one such gem stops the boot. Native Rails
-/// 8.1.4 takes the `>= 7.2` branch.
+/// `if ActiveRecord.version >= "7.2.0.alpha"`). Bundler.require'd
+/// gem-source entries load unguarded, so before the runtime answered
+/// `ActiveRecord.version` (runtime/ruby/active_record.rb, Rails
+/// 8.2.0.alpha's Gem::Version) the load raised NoMethodError and one such
+/// gem stopped the boot. Native Rails 8.1.4 takes the `>= 7.2` branch, as
+/// the pinned 8.2.0.alpha does.
 #[test]
-#[ignore = "gap: ActiveRecord.version is undefined in the runtime (softer_delete/common.rb, ar_transaction_changes.rb module-body branches)"]
 fn a_carried_gem_s_active_record_version_branch_loads() {
     const VERSIONED: &str = "require \"softer_delete/version\"\nrequire \"active_support\"\nrequire \"active_support/concern\"\nrequire \"active_record\"\n\nmodule SofterDelete\n  module UsingIsNotDeleted\n    extend ActiveSupport::Concern\n\n    if ActiveRecord.version >= \"7.2.0.alpha\"\n      def deleted?\n        !is_not_deleted\n      end\n    else\n      def deleted?\n        :old_rails\n      end\n    end\n\n    included do\n      scope :deleted, -> { where(is_not_deleted: nil) }\n      scope :not_deleted, -> { where(is_not_deleted: true) }\n    end\n  end\nend\n";
     app(CARRIED)
