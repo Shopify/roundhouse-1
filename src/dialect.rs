@@ -1581,6 +1581,14 @@ pub struct ConditionalArm {
     /// inside the branch, so it exists only when Ruby runs the branch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<ConditionalDeclaration>,
+    /// The load-time conditionals nested in this branch, each a
+    /// statement of its own that Ruby evaluates only when this branch
+    /// runs (ar_transaction_changes 1.1.11 nests
+    /// `if ActiveRecord.version >= Gem::Version.new('8.1.0.alpha')` in
+    /// its `>= '7.1'` branch). The Ruby family writes each inside this
+    /// branch, ordered by its span's start among the branch's methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested: Vec<ConditionalDefinitions>,
 }
 
 /// A `class` / `module` statement in a [`ConditionalArm`]: the name it
@@ -1614,8 +1622,23 @@ impl ConditionalMember {
 }
 
 impl ConditionalDefinitions {
+    /// Whether a branch of this statement, or of a conditional nested
+    /// in one, defines `method`.
     pub fn contains(&self, method: &MethodDef) -> bool {
-        self.arms.iter().any(|arm| arm.methods.iter().any(|m| m.is(method)))
+        self.arms.iter().any(|arm| arm.methods.iter().any(|m| m.is(method)) || arm.nested.iter().any(|n| n.contains(method)))
+    }
+
+    /// Every branch of this statement and of the conditionals nested in
+    /// its branches, outermost first.
+    pub fn all_arms(&self) -> Vec<&ConditionalArm> {
+        let mut out = Vec::new();
+        for arm in &self.arms {
+            out.push(arm);
+            for nested in &arm.nested {
+                out.extend(nested.all_arms());
+            }
+        }
+        out
     }
 }
 

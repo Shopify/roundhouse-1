@@ -1330,7 +1330,7 @@ impl NestedPlacement {
         let in_branch: Vec<&str> = parent
             .conditional_definitions
             .iter()
-            .flat_map(|c| c.arms.iter())
+            .flat_map(|c| c.all_arms())
             .flat_map(|arm| arm.declarations.iter())
             .map(|d| d.name.0.as_str())
             .collect();
@@ -10268,7 +10268,7 @@ fn emit_library_class_decl_inner(
         .conditional_definitions
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.arms.iter().all(|arm| arm.methods.is_empty()))
+        .filter(|(_, c)| c.all_arms().iter().all(|arm| arm.methods.is_empty()))
         .map(|(at, c)| {
             let before = lc
                 .methods
@@ -10971,26 +10971,34 @@ fn write_conditional_definitions(
             let pad = if n == 0 { body_pad } else { inner_pad.as_str() };
             writeln!(s, "{pad}{line}").unwrap();
         }
-        // The branch's methods and declarations, in source order.
-        let mut items: Vec<(u32, Option<usize>, Option<&crate::dialect::ConditionalDeclaration>)> = arm
+        // The branch's methods, declarations and nested conditionals,
+        // in source order.
+        enum Item<'a> {
+            Method(usize),
+            Declaration(&'a crate::dialect::ConditionalDeclaration),
+            Nested(&'a crate::dialect::ConditionalDefinitions),
+        }
+        let mut items: Vec<(u32, Item<'_>)> = arm
             .methods
             .iter()
             .filter_map(|member| lc.methods.iter().position(|m| member.is(m)))
-            .map(|index| (lc.methods[index].name_span.start, Some(index), None))
-            .chain(arm.declarations.iter().map(|d| (d.start, None, Some(d))))
+            .map(|index| (lc.methods[index].name_span.start, Item::Method(index)))
+            .chain(arm.declarations.iter().map(|d| (d.start, Item::Declaration(d))))
+            .chain(arm.nested.iter().map(|n| (n.span.start, Item::Nested(n))))
             .collect();
-        items.sort_by_key(|(start, _, _)| *start);
+        items.sort_by_key(|(start, _)| *start);
         let mut first = true;
-        for (_, index, declaration) in items {
+        for (_, item) in items {
             if !first {
                 writeln!(s).unwrap();
             }
             first = false;
-            if let Some(index) = index {
-                write_library_method(s, lc, index, &inner_pad, instance_form);
-            }
-            if let Some(declaration) = declaration {
-                NestedPlacement::place_declared(&lc.name, s, declaration.name.0.as_str());
+            match item {
+                Item::Method(index) => write_library_method(s, lc, index, &inner_pad, instance_form),
+                Item::Declaration(declaration) => {
+                    NestedPlacement::place_declared(&lc.name, s, declaration.name.0.as_str())
+                }
+                Item::Nested(nested) => write_conditional_definitions(s, lc, nested, &inner_pad, instance_form),
             }
         }
     }
@@ -11328,7 +11336,7 @@ impl NameIndex {
 fn conditional_declarations(app: &App) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::default();
     for lc in &app.library_classes {
-        for declaration in lc.conditional_definitions.iter().flat_map(|c| c.arms.iter()).flat_map(|arm| arm.declarations.iter()) {
+        for declaration in lc.conditional_definitions.iter().flat_map(|c| c.all_arms()).flat_map(|arm| arm.declarations.iter()) {
             out.entry(declaration.name.0.as_str().to_string()).or_insert_with(|| lc.name.0.as_str().to_string());
         }
     }

@@ -8910,7 +8910,7 @@ fn without_conditional_declarations_of(
         .iter()
         .filter(|c| c.name == *outer)
         .flat_map(|c| c.conditional_definitions.iter())
-        .flat_map(|d| d.arms.iter())
+        .flat_map(|d| d.all_arms())
         .flat_map(|arm| arm.declarations.iter())
         .map(|d| d.name.0.as_str().to_string())
         .collect();

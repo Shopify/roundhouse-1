@@ -59,9 +59,13 @@ pub(super) struct Visibility {
     /// or module body, whose emit writes the conditional).
     conditionals: bool,
     /// Def offsets inside a load-time conditional: (the statement's
-    /// offset, the branch index). Two definitions of a name in different
+    /// offset, the branch index), outermost first, one per conditional
+    /// the def is nested in. Two definitions of a name in different
     /// branches of one statement are alternatives.
-    alternatives: HashMap<usize, (usize, usize)>,
+    alternatives: HashMap<usize, Vec<(usize, usize)>>,
+    /// The (statement, branch) of each load-time conditional enclosing
+    /// the one being walked, outermost first.
+    enclosing: Vec<(usize, usize)>,
     /// A load-time conditional's statement offset, to its branch count
     /// when it ends in `else` (some branch always runs); absent otherwise.
     exhaustive: HashMap<usize, usize>,
@@ -118,7 +122,12 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<Conditiona
     }
     arms.iter()
         .any(|(_, stmts)| {
-            stmts.iter().any(|stmt| definition(stmt).is_some() || is_declaration(stmt) || conditional_accessor(stmt).is_some())
+            stmts.iter().any(|stmt| {
+                definition(stmt).is_some()
+                    || is_declaration(stmt)
+                    || conditional_accessor(stmt).is_some()
+                    || conditional_definition(stmt).is_some()
+            })
         })
         .then_some(ConditionalDefinition { negated, arms })
 }
@@ -146,7 +155,11 @@ pub(super) fn is_declaration(stmt: &Node<'_>) -> bool {
 impl ConditionalDefinition<'_> {
     /// Whether a branch defines a method (not only declares classes).
     pub(super) fn defines(&self) -> bool {
-        self.arms.iter().any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some()))
+        self.arms.iter().any(|(_, stmts)| {
+            stmts
+                .iter()
+                .any(|stmt| definition(stmt).is_some() || conditional_definition(stmt).is_some_and(|c| c.defines()))
+        })
     }
 }
 
@@ -433,9 +446,9 @@ impl Visibility {
         // A definition in another branch of the same load-time
         // conditional is an alternative to this one, not a definition
         // this one replaces.
-        let exclusive = |p: &usize| {
-            matches!((self.alternatives.get(p), self.alternatives.get(&offset)),
-                (Some((a, x)), Some((b, y))) if a == b && x != y)
+        let exclusive = |p: &usize| match (self.alternatives.get(p), self.alternatives.get(&offset)) {
+            (Some(a), Some(b)) => a.iter().any(|(s, x)| b.iter().any(|(t, y)| s == t && x != y)),
+            _ => false,
         };
         let previous: Option<Vec<usize>> = self
             .known
@@ -499,10 +512,18 @@ impl Visibility {
         // conditional that always runs a branch: whichever branch ran
         // defined the method. A change of a method only some branches
         // define raises NameError in Ruby when another branch ran.
-        let statement = positions.first().and_then(|p| self.alternatives.get(p)).map(|(s, _)| *s);
+        if positions.iter().any(|p| self.alternatives.get(p).is_some_and(|path| path.len() > 1)) {
+            return Err(Self::unsupported(
+                file,
+                format!("visibility change for `{name}`, which a nested load-time conditional defines, is not modeled"),
+            ));
+        }
+        let statement = positions.first().and_then(|p| self.alternatives.get(p)).map(|path| path[0].0);
         let mut branches: Vec<usize> = positions
             .iter()
-            .filter_map(|p| self.alternatives.get(p).filter(|(s, _)| Some(*s) == statement).map(|(_, b)| *b))
+            .filter_map(|p| {
+                self.alternatives.get(p).map(|path| path[0]).filter(|(s, _)| Some(*s) == statement).map(|(_, b)| b)
+            })
             .collect();
         branches.sort_unstable();
         branches.dedup();
@@ -786,6 +807,16 @@ impl Visibility {
             for stmt in statements {
                 let offset = stmt.location().start_offset();
                 STATEMENT.set(Some((offset, stmt.location().end_offset())));
+                // A conditional nested in the branch runs only when
+                // this branch does; its definitions are alternatives
+                // within it and to the other branches here.
+                if let Some(inner) = conditional_definition(stmt) {
+                    self.enclosing.push((statement, arm));
+                    let walked = self.walk_conditional(stmt, &inner, class_side, default, module_function, file);
+                    self.enclosing.pop();
+                    walked?;
+                    continue;
+                }
                 // A class or module is a body of its own, walked by its
                 // own pass; the visibility around it is unchanged.
                 if is_declaration(stmt) {
@@ -800,7 +831,7 @@ impl Visibility {
                 // Its methods are this branch's alternatives, with the
                 // visibility in effect around the statement.
                 if let Some(call) = conditional_accessor(stmt) {
-                    self.alternatives.insert(offset, (statement, arm));
+                    self.alternatives.insert(offset, self.branch_path(statement, arm));
                     self.declare(&call, offset, class_side, default, file)?;
                     continue;
                 }
@@ -859,11 +890,16 @@ impl Visibility {
                         default
                     }
                 });
-                self.alternatives.insert(offset, (statement, arm));
+                self.alternatives.insert(offset, self.branch_path(statement, arm));
                 self.define(offset, name, side, visibility, file)?;
             }
         }
         Ok(())
+    }
+
+    /// The enclosing conditionals' (statement, branch) pairs, then this one.
+    fn branch_path(&self, statement: usize, arm: usize) -> Vec<(usize, usize)> {
+        self.enclosing.iter().copied().chain(std::iter::once((statement, arm))).collect()
     }
 
     /// Why a branch statement other than a `def` keeps a load-time

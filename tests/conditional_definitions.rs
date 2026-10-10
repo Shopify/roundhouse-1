@@ -269,3 +269,98 @@ end
         "[true, \"extended Widget\", \"tracked Widget\"]\n[true, \"extended Shop\", \"tracked Shop\"]\n[:extended]\n"
     );
 }
+
+/// ar_transaction_changes 1.1.11 nests `if ActiveRecord.version >=
+/// Gem::Version.new('8.1.0.alpha')` in its `>= '7.1'` branch. Ingest
+/// refused the nested conditional ("a conditional nested in a load-time
+/// conditional definition is not modeled") and dropped the module body,
+/// so Core's includers lost `transaction_changed_attributes`. Each
+/// nested conditional is a statement of its own inside its branch,
+/// evaluated only when that branch runs, at any depth and with the
+/// `elsif` / `else` / `unless` arms of every level.
+#[test]
+fn a_conditional_nested_in_a_load_time_branch_runs_as_ruby_runs_it() {
+    const GEM: &str = r#"module Vc
+  LEVEL = Gem::Version.new("8.2.0")
+
+  if LEVEL >= Gem::Version.new("7.1")
+    def outer = "7.1+"
+
+    if LEVEL >= Gem::Version.new("9.0")
+      def inner = "9+"
+    elsif LEVEL >= Gem::Version.new("8.1.0.alpha")
+      def inner = "8.1+"
+
+      unless LEVEL >= Gem::Version.new("8.2")
+        def deepest = "pre-8.2"
+      else
+        def deepest = "8.2+"
+      end
+    else
+      def inner = "pre-8.1"
+    end
+
+    def after = "after nested"
+  elsif LEVEL >= Gem::Version.new("6.0")
+    def outer = "6.x"
+
+    if LEVEL >= Gem::Version.new("6.1")
+      def inner = "6.1"
+    end
+  else
+    def outer = "old"
+  end
+
+  unless LEVEL >= Gem::Version.new("7.0")
+    if LEVEL >= Gem::Version.new("6.0")
+      def legacy = "legacy"
+    end
+  end
+
+  def report
+    [outer, inner, deepest, after, respond_to?(:legacy), Vc.private_method_defined?(:secret), secret]
+  end
+
+  private
+
+  if LEVEL >= Gem::Version.new("7.0")
+    if LEVEL.segments.first == 8
+      def secret = "s"
+    else
+      def secret = "other"
+    end
+  end
+end
+"#;
+    const WIDGET: &str = "class Widget\n  include Vc\nend\n";
+    const SCRIPT: &str = "p Widget.new.report\n";
+    const EXPECTED: &str = "[\"7.1+\", \"8.1+\", \"8.2+\", \"after nested\", false, true, \"s\"]\n";
+
+    let root = std::env::temp_dir().join(format!("roundhouse-nested-conditional-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/vc.rb"), GEM).unwrap();
+    std::fs::write(root.join("widget.rb"), WIDGET).unwrap();
+    let native = emit_and_run::ruby()
+        .arg("-I")
+        .arg(root.join("lib"))
+        .args(["-r", "vc", "-r"])
+        .arg(root.join("widget.rb"))
+        .args(["-e", SCRIPT])
+        .output()
+        .expect("CRuby control");
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(native.status.success(), "native control failed:\n{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), EXPECTED, "native control");
+
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("roundhouse.yml", "gem_sources:\n  vc: vendor/gems/vc-1.0.0\n")
+        .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    vc (1.0.0)\n\nDEPENDENCIES\n  vc\n")
+        .write("config/application.rb", "require \"vc\"\n")
+        .write("vendor/gems/vc-1.0.0/lib/vc.rb", GEM)
+        .write("lib/widget.rb", WIDGET)
+        .run_ruby(SCRIPT);
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
+}

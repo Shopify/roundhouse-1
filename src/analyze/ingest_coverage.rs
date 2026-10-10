@@ -68,7 +68,7 @@ fn conditional_declarations_reopened(app: &App) -> Vec<Diagnostic> {
     for lc in &app.library_classes {
         for conditional in &lc.conditional_definitions {
             let Some(own) = source_of(conditional.span.file) else { continue };
-            for declaration in conditional.arms.iter().flat_map(|arm| arm.declarations.iter()) {
+            for declaration in conditional.all_arms().into_iter().flat_map(|arm| arm.declarations.iter()) {
                 let others: Vec<String> = app
                     .library_class_files
                     .iter()
