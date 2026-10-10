@@ -121,3 +121,60 @@ fn a_slice_carries_the_data_files_its_manifest_names_whatever_the_extension() {
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, "\"return redis.call('GET', KEYS[1])\\n\"\n\"type Query { position: Int }\\n\"\n");
 }
+
+/// A Lua script Core reads on Rails.root in a class body: essentials'
+/// RedisLocking::SharedLock builds `Sabertooth::Script.from_file(
+/// Rails.root.join("lib/redis_scripts/acquire_shared_locks.lua"))` at
+/// load. The slicer (v3.36) lists it as data; the emit carries it at its
+/// Rails.root-relative path, and the emitted `Rails.root.join` finds it
+/// there. Before v3.36 the file was not carried and the body raised
+/// Errno::ENOENT inside every StatsD assertion that reached the lock.
+#[test]
+fn a_rails_root_lua_script_read_at_load_resolves_in_the_tree() {
+    use roundhouse::diagnostic::Severity;
+    let base = std::env::temp_dir().join(format!("roundhouse-slice-lua-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("slice/root");
+    let write = |rel: &str, content: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("lib/redis_scripts/acquire_shared_locks.lua", "return redis.call('SET', KEYS[1], ARGV[1])\n");
+    write("lib/redis_scripts/unread.lua", "return 0\n");
+    write(
+        "app/models/shared_lock.rb",
+        "class SharedLock\n  ACQUIRE = File.read(Rails.root.join(\"lib/redis_scripts/acquire_shared_locks.lua\"))\nend\n",
+    );
+    let entry = |path: &str, role: &str| format!("{{\"role\": {role:?}, \"core_path\": {path:?}, \"slice_path\": {path:?}}}");
+    let manifest = format!(
+        "{{\"files\": [{}, {}]}}",
+        entry("app/models/shared_lock.rb", "autoload"),
+        entry("lib/redis_scripts/acquire_shared_locks.lua", "data"),
+    );
+    std::fs::write(base.join("slice/slice-manifest.json"), manifest).unwrap();
+
+    let mut app = roundhouse::ingest::ingest_app(&root).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, &root, roundhouse::project::BuildTarget::Ruby)
+    });
+    let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).map(|d| d.message.clone()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let files = files.expect("target files");
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).filter(|p| p.starts_with("lib/redis_scripts/")).collect();
+    assert_eq!(paths, vec!["lib/redis_scripts/acquire_shared_locks.lua"]);
+
+    let emitted = base.join("emitted");
+    roundhouse::project::write_to_dir(&files, &emitted).expect("write tree");
+    let out = emit_and_run::ruby()
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .args(["-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\np SharedLock::ACQUIRE\n"])
+        .output()
+        .expect("ruby");
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "\"return redis.call('SET', KEYS[1], ARGV[1])\\n\"\n");
+}

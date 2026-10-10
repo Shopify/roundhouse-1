@@ -197,34 +197,104 @@ module ActiveRecord
     end
   end
 
-  # Row set from `Connection#execute` / `#exec_query`. Mirrors the
-  # slice of `ActiveRecord::Result` the corpus uses: `to_a`, `first`,
-  # `each`, `rows`.
+  # Row set from `Connection#execute` / `#exec_query`: Rails 8.2's
+  # `ActiveRecord::Result` (activerecord/lib/active_record/result.rb),
+  # built the way Rails builds it, `new(columns, rows, column_types =
+  # nil, affected_rows: nil)` with each row an Array of its values in
+  # column order. Core prepends ActiveRecordShopScopedResult, whose
+  # `initialize(columns, rows, column_types = {}, affected_rows: nil)`
+  # reads `columns.index("shop_id")` and filters `rows` before `super`;
+  # the one-argument shape this class had raised ArgumentError there.
+  # `each`/`to_a`/`first`/`[]` answer the rows as name→value Hashes.
   class Result
-    def initialize(rows)
-      @rows = rows
+    include Enumerable
+
+    attr_reader :columns, :rows, :affected_rows
+
+    # The adapter's row loop answers name→value Hashes; Rails' adapters
+    # hand `new` the column names and the value Arrays.
+    def self.from_hashes(hashes, affected_rows: nil)
+      columns = hashes.empty? ? [] : hashes.first.keys
+      new(columns, hashes.map { |row| columns.map { |name| row[name] } }, nil, affected_rows: affected_rows)
     end
 
-    # Rails' shape: each row an Array of its values, in column order
-    # (`to_a` is the hashes). campfire reads ids an `insert_all!`
-    # returned with `.rows.flatten`.
-    def rows
-      @rows.map { |row| row.values }
+    def initialize(columns, rows, column_types = nil, affected_rows: nil)
+      @columns = columns.each(&:-@).freeze
+      @rows = rows
+      @hash_rows = nil
+      @column_types = column_types.freeze
+      @affected_rows = affected_rows
+    end
+
+    def includes_column?(name)
+      @columns.include?(name)
+    end
+
+    def length
+      @rows.length
+    end
+
+    def each(&block)
+      if block_given?
+        hash_rows.each(&block)
+      else
+        hash_rows.to_enum { @rows.size }
+      end
+    end
+
+    def empty?
+      @rows.empty?
+    end
+
+    def to_ary
+      hash_rows
     end
 
     def to_a
-      @rows
+      hash_rows
     end
 
-    def first
-      @rows.first
+    def [](idx)
+      hash_rows[idx]
     end
 
-    def each
-      @rows.each do |row|
-        yield row
+    def first(n = nil)
+      n ? hash_rows.first(n) : hash_rows.first
+    end
+
+    def last(n = nil)
+      n ? hash_rows.last(n) : hash_rows.last
+    end
+
+    # Rails: each column's type by index and by name, from the
+    # adapter's index-keyed `column_types`; a column it gives none for is
+    # `Type.default_value` (ActiveModel's Value, where the tree carries
+    # ActiveModel::Type). Empty when the adapter gave no types at all.
+    def column_types
+      return {} unless @column_types
+      @types_hash ||= begin
+        fallback = defined?(ActiveModel::Type) && ActiveModel::Type.respond_to?(:default_value) ? ActiveModel::Type.default_value : nil
+        types = {}
+        @columns.each_with_index do |name, index|
+          type = @column_types[index] || fallback
+          types[name] = types[index] = type
+        end
+        types.freeze
       end
-      @rows
+    end
+
+    def result
+      self
+    end
+
+    private
+
+    def hash_rows
+      @hash_rows ||= @rows.map do |row|
+        hash = {}
+        @columns.each_with_index { |name, index| hash[name] = row[index] }
+        hash
+      end
     end
   end
 
@@ -284,7 +354,7 @@ module ActiveRecord
     # simply produce zero rows. Delegates to the adapter's row loop
     # (which resolves column names once, not rows×cols times).
     def execute(sql)
-      Result.new(ActiveRecord.adapter.select_rows(sql))
+      Result.from_hashes(ActiveRecord.adapter.select_rows(sql))
     end
 
     # `select_rows(sql)` — Rails' rows as Arrays of values, in column
@@ -357,7 +427,7 @@ module ActiveRecord
     # selects nothing, so it is an empty one.
     def exec_insert(sql, name = nil, binds = [])
       exec_update(sql, name, binds)
-      Result.new([])
+      Result.new([], [])
     end
   end
 
