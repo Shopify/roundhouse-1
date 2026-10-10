@@ -192,6 +192,16 @@ const CLASS_SIDE_BUILTINS: &[&str] = &[
     "yield_self",
 ];
 
+/// The runtime base's class-side settings (inheritance.rb's
+/// `class_attribute`s, runtime/ruby/active_record/connection.rb), which
+/// the runtime reads at call time, so a write from a replayed class-body
+/// call takes effect as in Rails: Core's `StiLookupTable.extended` sets
+/// `store_full_sti_class = false`.
+const RUNTIME_CLASS_SETTINGS: &[&str] = &[
+    "store_full_sti_class", "store_full_sti_class=", "store_full_sti_class?", "store_full_class_name",
+    "store_full_class_name=", "store_full_class_name?",
+];
+
 /// Blocks that run later, or with another `self`: their bodies are not
 /// class-body effects of the macro.
 const DEFERRED_BLOCK_METHODS: &[&str] = &["define_method", "define_singleton_method", "lambda", "proc"];
@@ -866,7 +876,7 @@ impl<'s, 'a> Walk<'s, 'a> {
             self.path.pop();
             return walked;
         }
-        if CLASS_SIDE_BUILTINS.contains(&name) || self.side.synthesized(name) {
+        if CLASS_SIDE_BUILTINS.contains(&name) || RUNTIME_CLASS_SETTINGS.contains(&name) || self.side.synthesized(name) {
             return Ok(());
         }
         Err(format!("{} calls `{name}`, which the lowered `{}` does not define", self.via(), self.side.owner.0.as_str()))
