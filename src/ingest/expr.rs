@@ -1205,20 +1205,34 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // (the IR has no safe-send flag). nil receiver → the And
             // yields nil without dispatching, matching `&.`; a plain
             // Send would have silently DROPPED the guard and crashed on
-            // nil at runtime. Two documented divergences: the receiver
-            // expression evaluates twice (harmless for the ivar/local
-            // receivers real templates use), and a `false` receiver
-            // skips the call where Ruby's `&.` would dispatch (nil is
-            // the only value `&.` guards) — acceptable until a real
-            // call site cares, at which point Send grows a `safe` flag.
+            // nil at runtime. A receiver that is not a plain read is
+            // bound once first — `(__safe_nav17 = a.pop) && __safe_nav17.b`
+            // — because evaluating it twice is not harmless: campfire's
+            // `@idle[address].pop&.first` popped two connections and
+            // handed back the wrong one. One divergence stays: a `false`
+            // receiver skips the call where Ruby's `&.` would dispatch
+            // (nil is the only value `&.` guards) — acceptable until a
+            // real call site cares, at which point Send grows a `safe`
+            // flag.
             //
             // A receiver that is itself an `&&` (`a&.b&.c`, so `(a && a.b)`)
             // is truthy only as its right operand, so the guarded call
             // goes to that operand: `(a && a.b) && a.b.c`, not
-            // `(a && a.b) && (a && a.b).c`. Same value, `a` read once less,
-            // and the call's receiver is the `a.b` read itself.
+            // `(a && a.b) && (a && a.b).c`. Same value, and the chain
+            // rewrite sees `a.b.c` (`owner&.themes&.where`). Only for a
+            // right operand that is a chain of argument-less readers
+            // over a plain read (`is_reader_chain`), which reads the
+            // same twice; any other is bound once, as above.
             match (c.is_safe_navigation(), recv) {
-                (true, Some(r)) => {
+                (true, Some(r)) if is_plain_read(&r) => ExprNode::BoolOp {
+                    op: crate::expr::BoolOpKind::And,
+                    surface: crate::expr::BoolOpSurface::Symbol,
+                    left: r,
+                    right: Expr::new(span, send),
+                },
+                (true, Some(r))
+                    if matches!(&*r.node, ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right, .. } if is_reader_chain(right)) =>
+                {
                     let mut send = send;
                     if let (
                         ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right: guarded, .. },
@@ -1232,6 +1246,35 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                         surface: crate::expr::BoolOpSurface::Symbol,
                         left: r,
                         right: Expr::new(span, send),
+                    }
+                }
+                (true, Some(r)) => {
+                    // One local per site: a shared name would hold a
+                    // different type at each `&.` in a method, and a
+                    // local that does is polymorphic on spinel.
+                    let temp = Symbol::from(format!("__safe_nav{}", r.span.start));
+                    let read = Expr::new(
+                        r.span,
+                        ExprNode::Var { id: crate::ident::VarId(0), name: temp.clone() },
+                    );
+                    let bound = Expr::new(
+                        r.span,
+                        ExprNode::Assign {
+                            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: temp },
+                            value: r,
+                        },
+                    );
+                    let ExprNode::Send { method, args, block, parenthesized, .. } = send else {
+                        unreachable!("built as a Send above")
+                    };
+                    ExprNode::BoolOp {
+                        op: crate::expr::BoolOpKind::And,
+                        surface: crate::expr::BoolOpSurface::Symbol,
+                        left: bound,
+                        right: Expr::new(
+                            span,
+                            ExprNode::Send { recv: Some(read), method, args, block, parenthesized },
+                        ),
                     }
                 }
                 _ => send,
@@ -4477,4 +4520,28 @@ fn binary_string(s: &ruby_prism::StringNode<'_>, span: Span, file: &str) -> Inge
         value = send(value, "freeze", Vec::new());
     }
     Ok(*value.node)
+}
+
+/// A receiver `&.` may read twice without changing what the program
+/// does: a local, an ivar, a constant, `self`, or a literal.
+fn is_plain_read(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Var { .. }
+            | ExprNode::Ivar { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::SelfRef
+            | ExprNode::Lit { .. }
+    )
+}
+
+/// `a.b.c`: argument-less, block-less calls over a plain read
+/// ([`is_plain_read`]), the `a&.b` reader chain `&.` lowering repeats.
+fn is_reader_chain(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Send { recv: Some(recv), args, block: None, .. } if args.is_empty() => {
+            is_plain_read(recv) || is_reader_chain(recv)
+        }
+        _ => false,
+    }
 }

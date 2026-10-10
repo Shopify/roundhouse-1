@@ -1395,6 +1395,19 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 methods.append(&mut synth);
             }
         }
+        // A helper that overrides ActionView's `token_tag` to answer ""
+        // (campfire's ApplicationHelper: "Header-only forgery protection
+        // needs no secret in forms or cached HTML"). Rails' form helpers
+        // build their token field through it, so every form then has
+        // none; synthesized as the runtime's switch for that. Another
+        // body is not read.
+        if app_helpers_blank_token_tag(vfs, dir) {
+            if let Ok(mut synth) =
+                crate::runtime_src::parse_methods("def token_fields_omitted\n  true\nend\n")
+            {
+                methods.append(&mut synth);
+            }
+        }
         // `GlobalID.app` — the first segment of every `gid://<app>/
         // <Model>/<id>` this runtime mints, and half of every turbo
         // stream name that names a record. Rails takes it from the
@@ -2281,6 +2294,11 @@ end
     // the mixin means, and it needs nothing from a target's mixin
     // semantics.
     let shared_test_helpers = ingest_test_helper_modules(vfs, dir)?;
+    // The rest of `test/test_helpers/`: modules one test class includes
+    // itself (campfire's `include PushServiceTestHelper` in two web push
+    // tests). Kept whole — nested classes and module methods too — and
+    // carried into each including test's file as inner classes.
+    let included_test_helpers = ingest_included_test_helper_files(vfs, dir, &shared_test_helpers)?;
     // The app-wide `setup` the same file declares — see
     // `ingest_test_case_setup`. Prepended to every test module's own.
     let test_case_setup: Option<crate::expr::Expr> = {
@@ -2459,6 +2477,7 @@ end
             continue;
         }
         splice_test_helpers(&mut tm, &shared_test_helpers);
+        carry_included_test_helpers(&mut tm, &included_test_helpers);
         if let Some(case_setup) = &test_case_setup {
             splice_test_case_setup(&mut tm, case_setup);
         }
@@ -12530,6 +12549,49 @@ fn extract_transaction_callback_config(source: &[u8]) -> TransactionCallbackConf
 /// controllers and are not read.
 ///
 /// `None` = Rails' class default (`header_or_legacy_token`).
+/// Does a module under `app/helpers` define `token_tag` as exactly `""`?
+fn app_helpers_blank_token_tag<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    fn blank_token_tag(node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(def) = node.as_def_node() {
+            if def.name().as_slice() == b"token_tag" {
+                let Some(body) = def.body() else { return false };
+                let stmts: Vec<_> = match body.as_statements_node() {
+                    Some(s) => s.body().iter().collect(),
+                    None => vec![body],
+                };
+                return stmts.len() == 1
+                    && stmts[0].as_string_node().is_some_and(|s| s.unescaped().is_empty());
+            }
+            return false;
+        }
+        let mut found = false;
+        if let Some(m) = node.as_module_node() {
+            if let Some(b) = m.body() {
+                found = blank_token_tag(&b);
+            }
+        } else if let Some(c) = node.as_class_node() {
+            if let Some(b) = c.body() {
+                found = blank_token_tag(&b);
+            }
+        } else if let Some(s) = node.as_statements_node() {
+            found = s.body().iter().any(|n| blank_token_tag(&n));
+        } else if let Some(p) = node.as_program_node() {
+            found = blank_token_tag(&p.statements().as_node());
+        }
+        found
+    }
+    let helpers = dir.join("app/helpers");
+    if !vfs.is_dir(&helpers) {
+        return false;
+    }
+    let Ok(files) = read_rb_files(vfs, &helpers) else { return false };
+    files.iter().any(|file| {
+        let Ok(source) = vfs.read(file) else { return false };
+        let result = super::prism::parse(&source, &file.display().to_string());
+        blank_token_tag(&result.node())
+    })
+}
+
 fn read_forgery_verification_strategy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<String> {
     fn strategy_value(text: &str) -> Option<String> {
         let v = text.trim().trim_start_matches(':');
@@ -12801,6 +12863,80 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
             .unwrap_or(usize::MAX)
     });
     Ok(out)
+}
+
+/// Each `test/test_helpers/` file that is not spliced into every test
+/// case, as (its top-level module, every class the file defines). The
+/// file is read whole because a helper module can carry what a method
+/// splice cannot: campfire's `PushServiceTestHelper` defines a nested
+/// `Server` class and module methods with their own state.
+fn ingest_included_test_helper_files<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    shared: &[LibraryClass],
+) -> IngestResult<Vec<(crate::ident::ClassId, Vec<LibraryClass>)>> {
+    let helpers_dir = dir.join("test/test_helpers");
+    if !vfs.is_dir(&helpers_dir) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in read_rb_files(vfs, &helpers_dir)? {
+        let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
+        let Some(classes) =
+            unwrap_or_record(ingest_library_classes(&source, &entry.display().to_string()))?
+        else {
+            continue;
+        };
+        let Some(top) = classes.iter().find(|c| c.is_module && !c.name.0.as_str().contains("::")) else {
+            continue;
+        };
+        if shared.iter().any(|lc| lc.name == top.name) {
+            continue;
+        }
+        let top = top.name.clone();
+        let mut classes = classes;
+        for lc in &mut classes {
+            for m in &mut lc.methods {
+                restore_source_keywords(&mut m.params);
+            }
+        }
+        out.push((top, classes));
+    }
+    Ok(out)
+}
+
+/// Undo the library-class flattening of keyword parameters: this code
+/// runs only as the test-side Ruby it was written as, called with the
+/// keywords its own source passes (`Server.new(**options)`,
+/// `server.hung_up?(within: 1)`), so the parameters stay keywords.
+fn restore_source_keywords(params: &mut [crate::dialect::Param]) {
+    for p in params {
+        if p.from_keyword {
+            p.from_keyword = false;
+            p.keyword = true;
+        } else if p.from_kwrest {
+            p.from_kwrest = false;
+            p.keyword = true;
+            p.rest = true;
+            p.default = None;
+        }
+    }
+}
+
+/// A test class that `include`s one of those modules gets the module's
+/// file as inner classes, so the include resolves in the test's own
+/// emitted file.
+fn carry_included_test_helpers(tm: &mut TestModule, helpers: &[(crate::ident::ClassId, Vec<LibraryClass>)]) {
+    for (module, classes) in helpers {
+        if !tm.includes.contains(module) {
+            continue;
+        }
+        for lc in classes {
+            if !tm.inner_classes.iter().any(|c| c.name == lc.name) {
+                tm.inner_classes.push(lc.clone());
+            }
+        }
+    }
 }
 
 /// Modules a file mixes into the test cases through a top-level

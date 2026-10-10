@@ -228,6 +228,28 @@ module ActiveRecord
     end
   end
 
+  # `connection.raw_connection` — see `Connection#raw_connection`.
+  class RawConnection
+    # SQLite3::Database#transaction: BEGIN in the given mode, the block,
+    # COMMIT; ROLLBACK and re-raise on an exception. Like the gem's, it
+    # sits below ActiveRecord, so `transaction_open?` does not see it.
+    def transaction(mode = :deferred)
+      Db.exec("BEGIN #{mode.to_s.upcase} TRANSACTION")
+      begin
+        result = yield
+      rescue Exception => e
+        begin
+          Db.exec("ROLLBACK")
+        rescue StandardError
+          # SQLite may have ended the transaction itself already.
+        end
+        raise e
+      end
+      Db.exec("COMMIT")
+      result
+    end
+  end
+
   class Connection
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
@@ -282,6 +304,24 @@ module ActiveRecord
     def select_value(sql, name = nil)
       row = select_rows(sql).first
       row && row.first
+    end
+
+    # Schema questions the app asks before touching a table (campfire's
+    # `Room::MessagesCount.ensure!` checks both before installing its
+    # triggers), answered from SQLite's own catalog.
+    def data_source_exists?(name)
+      !select_value("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = #{quote(name.to_s)}").nil?
+    end
+
+    def column_exists?(table, column)
+      select_rows("PRAGMA table_info(#{quote(table.to_s)})").any? { |row| row[1].to_s == column.to_s }
+    end
+
+    # The sqlite3 gem's connection under the adapter. Only its
+    # `transaction(mode)` is reached: campfire repairs its counters in one
+    # `BEGIN IMMEDIATE` write transaction.
+    def raw_connection
+      RawConnection.new
     end
 
     def exec_query(sql)
@@ -540,6 +580,17 @@ module ActiveRecord
       string.gsub(/(?=[%_])/, escape_character)
     end
 
+    # Rails' `clear_query_caches_for_current_thread`: the replay cache
+    # forgets what it holds and stays on (campfire's caching tests clear
+    # it between two renders so the second one's queries are counted).
+    def self.clear_query_caches_for_current_thread
+      if Db.query_cache_enabled?
+        Db.query_cache_end
+        Db.query_cache_begin
+      end
+      nil
+    end
+
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with
     # ROLLBACK + re-raise on any exception. A nested call JOINS the
     # outer transaction, as Rails' default (`requires_new: false`) does:
@@ -549,11 +600,11 @@ module ActiveRecord
     #
     # `isolation:`, `requires_new:`, and `joinable:` are Rails'
     # `DatabaseStatements#transaction` keyword options (the same three
-    # `with_lock` forwards — see base.rb). All three are accepted and
-    # ignored: no isolation levels, and no SAVEPOINT-backed `requires_new:`
-    # under this joined-by-default implementation. They exist on the
-    # signature so a call that passes them (directly, or via `with_lock`)
-    # doesn't raise `ArgumentError`.
+    # `with_lock` forwards — see base.rb). `isolation:` and `joinable:`
+    # are accepted and ignored (no isolation levels). A nested
+    # `requires_new: true` runs inside a SAVEPOINT, as Rails' does: an
+    # exception or `ActiveRecord::Rollback` from it undoes only its own
+    # writes, and the outer transaction carries on.
     #
     # The depth reset on an exception is explicit, in the `rescue`
     # itself, rather than left to the `ensure` below: Spinel
@@ -576,14 +627,44 @@ module ActiveRecord
     # so it type-checked as the unresolved `Var` here, not the honest
     # gradual `Untyped` — `Db`'s own contract keeps this method
     # concretely typed the same way its `Db.exec` calls already are.
+    # `raise ActiveRecord::Rollback` inside the block rolls the
+    # transaction back without the exception escaping, and the call
+    # answers nil.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       depth = Db._txn_depth
       if depth > 0
+        savepoint = requires_new ? "rh_savepoint_#{depth}" : nil
+        Db.exec("SAVEPOINT #{savepoint}") unless savepoint.nil?
         Db._txn_depth = depth + 1
         begin
           result = yield
+          Db.exec("RELEASE SAVEPOINT #{savepoint}") unless savepoint.nil?
+          result
+        rescue ActiveRecord::Rollback
+          # Swallowed by the joined block that saw it, as in Rails: the
+          # outer transaction carries on and commits.
+          Db._txn_depth = depth
+          unless savepoint.nil?
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction; the
+              # Rollback still answers nil, as the outer ROLLBACK's does.
+            end
+          end
+          result = nil
         rescue Exception => e
           Db._txn_depth = depth
+          unless savepoint.nil?
+            begin
+              Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
+              Db.exec("RELEASE SAVEPOINT #{savepoint}")
+            rescue StandardError
+              # SQLite may already have ended the whole transaction (see
+              # the outer ROLLBACK below); that must not hide `e`.
+            end
+          end
           raise e
         ensure
           Db._txn_depth = depth
@@ -594,6 +675,12 @@ module ActiveRecord
         rolled_back = false
         begin
           result = yield
+        rescue ActiveRecord::Rollback
+          # Rails' quiet way out: roll back, raise nothing, answer nil.
+          rolled_back = true
+          Db._txn_depth = 0
+          Db.exec("ROLLBACK")
+          result = nil
         rescue Exception => e
           rolled_back = true
           Db._txn_depth = 0
@@ -1382,6 +1469,15 @@ module ActiveRecord
       writes.each { |key, value| self[key] = value }
       _adapter_update
       true
+    end
+
+    # `record.delete` — the row goes, with no callbacks (Rails'
+    # `Persistence#delete`, beside `destroy`, which runs them).
+    def delete
+      _adapter_delete if persisted?
+      @persisted = false
+      @destroyed = true
+      self
     end
 
     # Rails' `Base#as_json(only:)` attribute serializer, monomorphized:

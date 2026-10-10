@@ -70,6 +70,14 @@ module ActiveRecord
       def with_connection
         yield ActiveRecord::Base.connection
       end
+
+      # Rails hands the thread's connection back to the pool so another
+      # can take it — campfire's counter test does, before writing
+      # through a second, foreign `SQLite3::Database`. Ours holds no
+      # lock between statements, so there is nothing to hand back.
+      def release_connection
+        nil
+      end
     end
     # <<< db-shim-config
 

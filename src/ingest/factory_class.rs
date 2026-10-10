@@ -310,7 +310,7 @@ fn unsupported(file: &str, message: &str) -> IngestError {
     IngestError::Unsupported { file: file.into(), message: message.into() }
 }
 
-fn factory_class(
+pub(super) fn factory_class(
     path: &[String],
     call: &CallNode<'_>,
     block: Option<&BlockNode<'_>>,

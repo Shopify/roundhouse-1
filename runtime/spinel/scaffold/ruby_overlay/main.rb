@@ -141,6 +141,7 @@ module Main
     request_format = :json if path_format == "json"
     request_format = :turbo_stream if path_format == "turbo_stream"
     request_format = :rss if path_format == "rss"
+    request_format = :xml if path_format == "xml"
     # `/service-worker.js`: campfire's raw service-worker template.
     request_format = :js if path_format == "js"
     # A route-forced format (`get "/rss" => "home#index", :format =>
@@ -285,7 +286,7 @@ module Main
       out_cookies[session_cookie] =
         session_out.empty? ? nil : ActionDispatch::Session.signed_cookie(session_out, session_cookie)
     end
-    is_redirect = controller.status >= 300 && controller.status < 400
+    is_redirect = controller.status >= 300 && controller.status < 400 && !controller.head_response?
     # Headers the action set beyond Content-Type/Location — a
     # `Content-Disposition` on a download, the Cache-Control a blob
     # route asks for — ride as the tuple's sixth element.
@@ -357,7 +358,8 @@ module Main
   def self.run_rack(env)
     status, body, content_type, location, set_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies =
       dispatch_core(env, env["rack.input"] || StringIO.new(""))
-    headers = { "content-type" => content_type }
+    headers = {}
+    headers["content-type"] = content_type unless content_type.empty?
     headers["location"] = location unless location.nil?
     # A nil value is a header the app unset (`X-Rev` outside a deploy
     # with GIT_REVISION) — Rack 3 refuses a nil, so it is not written.

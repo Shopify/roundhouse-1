@@ -1751,6 +1751,7 @@ mod tests {
             strict_locals: Default::default(),
             view_name: "messages/_message".to_string(),
             ivar_models: Default::default(),
+            str_ivars: Default::default(),
         }
     }
 

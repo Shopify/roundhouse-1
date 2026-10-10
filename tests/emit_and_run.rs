@@ -54,6 +54,8 @@ mod controller_url_helpers;
 mod controller_super_ivars;
 #[path = "emit_and_run/assoc_pluck_typed.rs"]
 mod assoc_pluck_typed;
+#[path = "emit_and_run/action_controller_head.rs"]
+mod action_controller_head;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
 #[path = "support/campfire_caches.rs"]
@@ -62,6 +64,8 @@ mod campfire_caches_contract;
 mod campfire_caches;
 #[path = "emit_and_run/action_text_markdown.rs"]
 mod action_text_markdown;
+#[path = "emit_and_run/ordinalize.rs"]
+mod ordinalize;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -142,6 +146,37 @@ fn model_concern_delegate_through_belongs_to_runs() {
     let run = delegate_association::overlay().run_ruby(delegate_association::ASSERTIONS);
     run.assert_passes();
     assert!(run.stdout.contains("model concern delegate passed"));
+}
+
+#[test]
+fn active_support_many_block_and_squish_bang_run_in_emitted_ruby() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/active_support_probe.rb",
+            r#"class ActiveSupportProbe
+  def self.many_matches
+    seen = []
+    zero = [1, 2, 3].many? { |n| n > 9 }
+    one = [1, 2, 3].many? { |n| n == 2 }
+    multiple = [1, 2, 3, 4].many? { |n| seen << n; n > 1 }
+    [zero, one, multiple, seen.length]
+  end
+
+  def self.squish_bang
+    text = "\u00a0foo\u2003bar\u2028".dup
+    text.squish!
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"raise "many? block zero/one/multiple or short circuit failed" unless ActiveSupportProbe.many_matches == [false, false, true, 3]
+raise "squish! did not match Unicode whitespace semantics" unless ActiveSupportProbe.squish_bang == "foo bar"
+puts "ActiveSupport core extensions emitted Ruby passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("ActiveSupport core extensions emitted Ruby passed"));
 }
 
 #[test]
@@ -230,6 +265,85 @@ puts "has_many to_sql passed"
     assert!(run.stdout.contains("has_many to_sql passed"));
 }
 
+/// `maximum` / `minimum` on a model class and on a has_many reader (of a
+/// possibly-nil owner too) run as SQL extrema of the column's type, nil
+/// over no rows: the reader alone answers an Array, which has neither.
+fn extrema_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().edit(
+        "app/models/article.rb",
+        "  validates :title, presence: true\n",
+        "  validates :title, presence: true
+
+  def self.newest_id
+    Article.maximum(:id)
+  end
+
+  def last_commenter
+    comments.maximum(:commenter)
+  end
+
+  def first_comment_id
+    self.comments.minimum(:id)
+  end
+
+  def self.first_articles_last_comment_id
+    Article.first.comments.maximum(:id)
+  end
+",
+    )
+}
+
+const EXTREMA_ASSERTIONS: &str = r#"Article.delete_all
+raise "empty newest_id: #{Article.newest_id.inspect}" unless Article.newest_id.nil?
+a = Article.create!(title: "One", body: "A sufficiently long body.")
+b = Article.create!(title: "Two", body: "A sufficiently long body.")
+raise "newest_id: #{Article.newest_id.inspect}" unless Article.newest_id == b.id
+raise "empty last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter.nil?
+c1 = Comment.create!(article_id: a.id, commenter: "Ann", body: "first comment")
+Comment.create!(article_id: a.id, commenter: "Zed", body: "second comment")
+Comment.create!(article_id: b.id, commenter: "Zoe", body: "other article")
+raise "last_commenter: #{a.last_commenter.inspect}" unless a.last_commenter == "Zed"
+raise "first_comment_id: #{a.first_comment_id.inspect}" unless a.first_comment_id == c1.id
+raise "first_articles_last_comment_id: #{Article.first_articles_last_comment_id.inspect}" unless Article.first_articles_last_comment_id == Comment.where(article_id: a.id).last.id
+puts "extrema passed"
+"#;
+
+#[test]
+fn extrema_run_on_a_model_and_its_has_many_reader() {
+    let run = extrema_app().run_ruby(EXTREMA_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("extrema passed"));
+}
+
+/// The has_many readers `lower::scope_chain` does not seed — one off a
+/// call with arguments, or off a local holding the reader — stay
+/// unresolved: their Array has no `maximum`.
+#[test]
+fn extrema_on_an_unseeded_reader_stay_errors() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.by_title_last_comment_id(title)
+    Article.find_by!(title: title).comments.maximum(:id)
+  end
+
+  def held_last_comment_id
+    held = comments
+    held.maximum(:id)
+  end
+",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert_eq!(
+        errors.iter().filter(|e| e.contains("`maximum`")).count(),
+        2,
+        "both unseeded readers keep their error: {errors:?}"
+    );
+}
+
 /// `in_batches` with a block hands each batch as a relation; without
 /// one, `update_all` and `touch_all` reach every row.
 #[test]
@@ -276,6 +390,144 @@ puts "in_batches passed"
         );
     run.assert_passes();
     assert!(run.stdout.contains("in_batches passed"));
+}
+
+/// `Rails.public_path` runs as `Rails.root` does: the runtime's AppPath
+/// answers `join` and `to_s`.
+#[test]
+fn rails_public_path_joins() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.logo_path
+    Rails.public_path.join(\"images\", \"logo.png\").to_s
+  end
+",
+        )
+        .run_ruby(
+            r#"raise "logo_path: #{Article.logo_path}" unless Article.logo_path == "public/images/logo.png"
+puts "public_path passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("public_path passed"));
+}
+
+/// A nested `transaction(requires_new: true)` is a savepoint: a Rollback
+/// or a rescued exception from it undoes only its own writes, and the
+/// outer transaction commits the rest; without an error it answers the
+/// block's value.
+#[test]
+fn requires_new_transactions_roll_back_to_their_savepoint() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.add(title)
+    Article.create!(title: title, body: \"A sufficiently long body.\")
+  end
+
+  def self.savepoints
+    Article.transaction do
+      add(\"outer\")
+      Article.transaction(requires_new: true) do
+        add(\"rolled-back\")
+        raise ActiveRecord::Rollback
+      end
+      begin
+        Article.transaction(requires_new: true) do
+          add(\"raised\")
+          raise ArgumentError, \"inner\"
+        end
+      rescue ArgumentError
+        nil
+      end
+      Article.transaction(requires_new: true) do
+        add(\"kept\")
+        \"kept\"
+      end
+    end
+  end
+",
+        )
+        .run_ruby(
+            r#"Article.delete_all
+raise "savepoints: #{Article.savepoints.inspect}" unless Article.savepoints == "kept"
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["kept", "outer"]
+puts "savepoints passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("savepoints passed"));
+}
+
+/// A Sidekiq worker's class-side entries run its `perform` inline, as an
+/// ActiveJob's `perform_later` does: `include Sidekiq::Job` (or `Worker`)
+/// and `sidekiq_options` leave the emitted class, `perform_in` /
+/// `perform_at` drop their delay, and a subclass of a worker is one too.
+#[test]
+fn sidekiq_workers_perform_inline() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/workers/title_worker.rb",
+            "class TitleWorker
+  include Sidekiq::Job
+  sidekiq_options queue: :low_priority, retry: 3
+
+  def perform(title)
+    Article.create!(title: title, body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .write(
+            "app/workers/loud_title_worker.rb",
+            "class LoudTitleWorker < TitleWorker
+  def perform(title)
+    Article.create!(title: title.upcase, body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .write(
+            "app/workers/legacy_title_worker.rb",
+            "class LegacyTitleWorker
+  include Sidekiq::Worker
+
+  def perform(title)
+    Article.create!(title: title + \"?\", body: \"A sufficiently long body.\")
+  end
+end
+",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.enqueue_all
+    TitleWorker.perform_async(\"now\")
+    TitleWorker.perform_in(5.minutes, \"later\")
+    LoudTitleWorker.perform_async(\"loud\")
+    LegacyTitleWorker.perform_at(1.hour.from_now, \"legacy\")
+  end
+",
+        )
+        .run_ruby(
+            r#"Article.enqueue_all
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["LOUD", "later", "legacy?", "now"]
+puts "sidekiq passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("sidekiq passed"));
 }
 
 /// A class object and its instances that define the same names: each
@@ -1353,6 +1605,229 @@ end
         )
         .run_test("test/controllers/weeks_controller_test.rb")
         .assert_passes();
+}
+
+/// `Result = Struct.new(…, keyword_init: true)` in a class body is the
+/// class it defines: its members, their nil default, and the methods
+/// its block adds. Expected values are Ruby's own.
+#[test]
+fn a_struct_constant_runs_as_its_class() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/render\", to: \"renders#show\"\n",
+        )
+        .write(
+            "app/services/renderer.rb",
+            r#"class Renderer
+  Result = Struct.new(:title, :html, keyword_init: true)
+  Pair = Struct.new(:left, :right, keyword_init: true) do
+    def total
+      left + right
+    end
+  end
+
+  def call(text)
+    Result.new(title: text, html: "<p>#{text}</p>")
+  end
+
+  def pair
+    Pair.new(left: 1, right: 2)
+  end
+
+  def half
+    Pair.new(left: 3)
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/renders_controller.rb",
+            r#"class RendersController < ApplicationController
+  def show
+    result = Renderer.new.call(params[:text].to_s)
+    result.title = result.title.upcase
+    pair = Renderer.new.pair
+    render plain: [result.title, result.html, pair.total, pair.left, Renderer.new.half.right.nil?].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/renders_controller_test.rb",
+            r#"require "test_helper"
+
+class RendersControllerTest < ActionDispatch::IntegrationTest
+  test "struct constants build their classes" do
+    get "/render", params: { text: "hi" }
+    assert_equal "HI <p>hi</p> 3 1 true", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/renders_controller_test.rb")
+        .assert_passes();
+}
+
+/// `Float#to_d` / `Integer#to_d` build a BigDecimal without
+/// `bigdecimal/util`, and the decimal arithmetic after them runs:
+/// Float and Integer operands, comparison, `round`, and `floor`/`ceil`
+/// with and without digits. `0.1 + 0.2` keeps `Float#to_d`'s 16 digits,
+/// and exponent-form floats (`Float#to_s`'s `1.0e-05`) convert as well.
+/// Expected values are CRuby 3.4's with bigdecimal 4.1, printed as
+/// activesupport's `BigDecimalWithDefaultFormat` prints them (plain
+/// `F` notation, which a Rails app always loads).
+#[test]
+fn float_to_d_and_decimal_arithmetic_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/decimal\", to: \"decimals#show\"\n",
+        )
+        .write(
+            "app/controllers/decimals_controller.rb",
+            r#"class DecimalsController < ApplicationController
+  def show
+    f = params[:f].to_s.to_f
+    i = params[:i].to_s.to_i
+    g = params[:a].to_s.to_f + params[:b].to_s.to_f
+    a = BigDecimal("1.555")
+    price = f.to_d * i.to_d
+    render plain: [
+      price.to_s, (price - a).to_s, (a / 7).floor(2).to_s, a.round(2).to_s, a.round, a.floor,
+      a.ceil(1).to_s, (f - a).to_s, (i * a).to_s, a.to_f, price > a, g.to_d.to_s, (-a).abs.to_s, a.round(0),
+      a.to_d.to_s,
+      params[:exps].to_s.split(",").map { |e| e.to_f.to_d.to_s }.join(",")
+    ].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/decimals_controller_test.rb",
+            r#"require "test_helper"
+
+class DecimalsControllerTest < ActionDispatch::IntegrationTest
+  test "decimal arithmetic matches CRuby" do
+    get "/decimal", params: { f: "2.5", i: "3", a: "0.1", b: "0.2", exps: "1.0e-5,1e20,-1.0e-10,1.2345678901234567e20,-1.2345678901234567e-20" }
+    assert_equal "7.5 5.945 0.22 1.56 2 1 1.6 0.945 4.665 1.555 true 0.3 1.555 2 1.555 " \
+      "0.00001,100000000000000000000.0,-0.0000000001,123456789012345600000.0,-0.00000000000000000001234567890123456", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/decimals_controller_test.rb")
+        .assert_passes();
+}
+
+/// An Integer range's Enumerable calls (`map`, `filter_map`, `select`,
+/// `reduce`, `flat_map`, `each_with_object`) run through `to_a`, on an
+/// inclusive and an exclusive range and a constant bound.
+#[test]
+fn integer_range_enumerable_calls_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/months\", to: \"months#show\"\n",
+        )
+        .write(
+            "app/controllers/months_controller.rb",
+            r#"class MonthsController < ApplicationController
+  MAX = 3
+
+  def show
+    a = (1..12).map { |m| "month#{m}" }
+    b = (1..MAX).filter_map { |i| i.even? ? i * 2 : nil }
+    c = (1..5).select { |i| i > 2 }
+    d = (1..4).reduce(0) { |s, i| s + i }
+    e = (1..3).flat_map { |i| [i, i] }
+    f = (1..3).each_with_object({}) { |i, h| h[i] = i * i }
+    g = (2...5).map { |i| i * 10 }
+    render plain: [a.first, a.size, b.sum, c.size, d, e.size, f[3], g.join("-")].join(" ")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/months_controller_test.rb",
+            r#"require "test_helper"
+
+class MonthsControllerTest < ActionDispatch::IntegrationTest
+  test "range enumerable calls" do
+    get "/months"
+    assert_equal "month1 12 4 3 10 6 9 20-30-40", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/months_controller_test.rb")
+        .assert_passes();
+}
+
+/// The range reaches those calls as an Array, the shape every target
+/// answers: the emitted Ruby reads `(1..n).to_a.filter_map`, and a call
+/// that answers its receiver (`each_with_index`) is left on the range.
+#[test]
+fn integer_range_enumerable_calls_go_through_to_a() {
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .write(
+            "app/models/calendar.rb",
+            "class Calendar\n  def self.even_doubles(n)\n    (1..n).filter_map { |i| i.even? ? i * 2 : nil }\n  end\n\n  def self.walk\n    (1..3).each_with_index { |i, at| i + at }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let source = walk_files(&emitted)
+        .into_iter()
+        .find(|text| text.contains("def self.even_doubles"))
+        .expect("Calendar emitted");
+    assert!(source.contains("(1..n).to_a.filter_map"), "{source}");
+    assert!(source.contains("(1..3).each_with_index"), "{source}");
+}
+
+/// A test body takes the same rewrites as app code: the analyzer types
+/// `(1..3).filter_map` and `2.5.to_d` there too, so without them the
+/// emitted test would call a range method or a `bigdecimal/util`
+/// reopen no target provides.
+#[test]
+fn range_and_to_d_rewrites_reach_test_bodies() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            r#"require "test_helper"
+
+class RewritesInTestsTest < ActiveSupport::TestCase
+  test "range and decimal calls in a test body" do
+    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }
+    assert_equal "2.5", 2.5.to_d.to_s
+  end
+end
+"#,
+        )
+        .run_test("test/models/rewrites_in_tests_test.rb")
+        .assert_passes();
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .write(
+            "test/models/rewrites_in_tests_test.rb",
+            "require \"test_helper\"\n\nclass RewritesInTestsTest < ActiveSupport::TestCase\n  test \"range\" do\n    assert_equal [4], (1..3).filter_map { |i| i.even? ? i * 2 : nil }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let test = std::fs::read_to_string(emitted.join("test/models/rewrites_in_tests_test.rb")).expect("emitted test");
+    assert!(test.contains("(1..3).to_a.filter_map"), "{test}");
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else if path.extension().is_some_and(|e| e == "rb") {
+            out.extend(std::fs::read_to_string(&path).ok());
+        }
+    }
+    out
 }
 
 /// A job `perform_later` enqueues under the test adapter is held, not
@@ -11407,5 +11882,454 @@ raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.cre
 Comment.bulk_skipping(article, ["c"])
 raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3
 "#)
+        .assert_passes();
+}
+
+/// campfire's `MessagesController#create` from 2c53c46 on: the
+/// controller renders the message once, hands the markup to a concern
+/// method by keyword (`broadcast_create(html:)`), which broadcasts it
+/// with `**(html ? { html: html } : {})`, and the turbo-stream view
+/// appends the same String (`turbo_stream.append target, @html`). Its
+/// cache layer folds `I18n.locale` into keys and copies response headers
+/// by downcased name (`response.headers.slice(*CACHE_HEADERS)`).
+///
+/// Before: the keyword reached the flattened `broadcast_create(html =
+/// nil)` as a Hash, `broadcast_append_to` with that option was left
+/// unlowered (undefined on the record), the view looked for a
+/// `message_htmls/_message_html` partial, `I18n` was undefined, and
+/// `headers["ETag"]` / `headers["etag"]` were two headers.
+#[test]
+fn rendered_markup_reaches_the_broadcast_and_the_stream_as_given() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  post \"/articles/:article_id/comments/:id/announce\", to: \"comments#announce\", as: :announce_article_comment\n  resources :articles do\n")
+        .edit("app/models/comment.rb", "  belongs_to :article\n", "  include Announces\n  belongs_to :article\n")
+        .write("app/models/comment/announces.rb", r##"module Comment::Announces
+  def announce(html: nil)
+    broadcast_append_to article, :announcements, target: [ article, :announcements ], **(html ? { html: html } : {})
+  end
+end
+"##)
+        .edit("app/controllers/comments_controller.rb", "  def destroy\n", r##"  def announce
+    @comment = @article.comments.find(params[:id])
+    @comment_html = render_to_string partial: "comments/comment", formats: :html, locals: { comment: @comment }
+    @comment.announce(html: @comment_html)
+    response.headers["X-Probe"] = "first"
+    response.headers["x-probe"] = "second"
+    response.headers["X-Gone"] = "soon"
+    response.headers.delete("x-gone")
+    response.headers["X-Copied"] = response.headers.slice("X-PROBE", "x-absent").map { |name, value| "#{name}=#{value}" }.join(",")
+    response.headers["X-Locale"] = I18n.locale.to_s
+  end
+
+  def destroy
+"##)
+        .write("app/views/comments/announce.turbo_stream.erb", "<%= turbo_stream.append dom_id(@comment.article, :announcements), @comment_html %>\n")
+        .write("test/controllers/announcements_controller_test.rb", r##"require "test_helper"
+
+class AnnouncementsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @article = Article.create!(title: "Announced", body: "A sufficiently long article body.")
+    @comment = @article.comments.create!(commenter: "Ann", body: "Said <b>once</b>")
+    @stream = "#{@article.to_gid_param}:announcements"
+  end
+
+  test "the rendered comment is broadcast and streamed as given" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_response :success
+    assert_includes response.body, %(<turbo-stream action="append" target="announcements_article_#{@article.id}">)
+    assert_includes response.body, %(<div id="comment_#{@comment.id}")
+    assert_includes response.body, "Said &lt;b&gt;once&lt;/b&gt;"
+    assert_not_includes response.body, "&lt;div"
+
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 1, sent.size
+    assert_includes sent.first, %(<div id="comment_#{@comment.id}")
+    assert_not_includes sent.first, "&lt;div"
+  end
+
+  test "header names match without regard to case" do
+    post announce_article_comment_url(@article, @comment, format: :turbo_stream)
+    assert_equal "second", response.headers["X-Probe"]
+    assert_nil response.headers["X-Gone"]
+    assert_equal "x-probe=second", response.headers["X-Copied"]
+    assert_equal "en", response.headers["X-Locale"]
+  end
+
+  test "markup handed in replaces the partial, and without it the partial renders" do
+    @comment.announce(html: "<p>handed in</p>")
+    @comment.announce
+    sent = ActionCable.server.pubsub.broadcasts(@stream).map { |broadcast| JSON.parse(broadcast) }
+    assert_equal 2, sent.size
+    assert_includes sent.first, "<p>handed in</p>"
+    assert_includes sent.last, %(<div id="comment_#{@comment.id}")
+  end
+end
+"##)
+        .run_test("test/controllers/announcements_controller_test.rb")
+        .assert_passes();
+}
+
+/// Framework surface campfire main's tests and cache keys reach, each
+/// with Rails' behaviour:
+/// - `request.format.to_s` is the negotiated Mime string;
+/// - `Rails.application.env_config` keeps what a test sets in it;
+/// - a helper test's `controller` is a test controller, whose
+///   `perform_caching` is false in the test environment;
+/// - `update_columns` and `delete` skip callbacks;
+/// - `raise ActiveRecord::Rollback` undoes the transaction quietly;
+/// - `clear_enqueued_jobs`, `assert_nothing_raised`, `assert_dom_equal`.
+fn rails_surface_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/format\", to: \"articles#format_probe\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r##"class ArticlesController < ApplicationController
+  def format_probe
+    render plain: request.format.to_s
+  end
+
+"##)
+        .write("app/helpers/articles_helper.rb", r##"module ArticlesHelper
+  def caching_label
+    controller.perform_caching ? "cached" : "fresh"
+  end
+end
+"##)
+        .write("app/jobs/touch_job.rb", "class TouchJob < ApplicationJob\n  def perform(article)\n  end\nend\n")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  SAVED = []\n  after_save { SAVED << title }\n\n")
+        .write("test/helpers/articles_helper_test.rb", r##"require "test_helper"
+
+class ArticlesHelperTest < ActionView::TestCase
+  test "a helper reads the test controller" do
+    assert_equal "fresh", caching_label
+  end
+
+  test "markup compares up to attribute order and the whitespace between tags" do
+    assert_dom_equal %(<p class="a" id="b">x</p>), %(<p id="b"  class="a">x</p>\n)
+    assert_nothing_raised { Article.count }
+  end
+end
+"##)
+        .write("test/controllers/format_probes_controller_test.rb", r##"require "test_helper"
+
+class FormatProbesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveJob::TestHelper
+
+  test "the request format is its Mime string" do
+    get "/format"
+    assert_equal "text/html", response.body
+  end
+
+  test "env_config keeps what a test sets" do
+    previous = Rails.application.env_config["action_dispatch.show_exceptions"]
+    Rails.application.env_config["action_dispatch.show_exceptions"] = :rescuable
+    assert_equal :rescuable, Rails.application.env_config["action_dispatch.show_exceptions"]
+  ensure
+    Rails.application.env_config["action_dispatch.show_exceptions"] = previous
+  end
+
+  test "update_columns and delete skip callbacks" do
+    article = Article.create!(title: "Columns", body: "A sufficiently long article body.")
+    saved = Article::SAVED.size
+    article.update_columns(title: "Renamed")
+    assert_equal saved, Article::SAVED.size
+    assert_equal "Renamed", Article.find(article.id).title
+    article.delete
+    assert_nil Article.find_by(id: article.id)
+  end
+
+  test "a rollback undoes the transaction without raising" do
+    count = Article.count
+    result = Article.transaction do
+      Article.create!(title: "Gone", body: "A sufficiently long article body.")
+      raise ActiveRecord::Rollback
+    end
+    assert_nil result
+    assert_equal count, Article.count
+  end
+
+  test "clear_enqueued_jobs forgets what was enqueued" do
+    article = Article.create!(title: "Queued", body: "A sufficiently long article body.")
+    TouchJob.perform_later(article)
+    assert_enqueued_jobs 1, only: TouchJob
+    clear_enqueued_jobs
+    assert_no_enqueued_jobs only: TouchJob
+  end
+end
+"##)
+}
+
+#[test]
+fn rails_surface_for_cache_keys_rollbacks_and_jobs() {
+    rails_surface_app()
+        .run_test("test/controllers/format_probes_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn a_helper_test_has_a_test_controller_and_dom_assertions() {
+    rails_surface_app()
+        .run_test("test/helpers/articles_helper_test.rb")
+        .assert_passes();
+}
+
+/// Three ingest/emit shapes campfire main's web push pool reaches:
+/// - `@idle[address].pop&.first` evaluates the receiver ONCE (the `&.`
+///   desugar read it twice, popping two entries);
+/// - classes nested in a class under a runtime namespace
+///   (`class WebPush::Connections` with `class HTTP < Net::HTTP; include
+///   Stages; end`) are emitted, a module a sibling includes first;
+/// - each nested class keeps its own name inside the parent.
+#[test]
+fn a_safe_navigated_call_runs_once_and_nested_classes_survive_a_compact_parent() {
+    emit_and_run::real_blog()
+        .write("lib/web_push/probe_pool.rb", r##"class WebPush::ProbePool
+  class Lost < StandardError; end
+
+  module Stages
+    def stage
+      :checking
+    end
+  end
+
+  class HTTP < Net::HTTP
+    include Stages
+  end
+
+  def initialize
+    @idle = { "a" => [ [ :first, 1 ], [ :second, 2 ] ] }
+  end
+
+  def checkout(address)
+    @idle[address].pop&.first
+  end
+
+  def left(address)
+    @idle[address].size
+  end
+
+  def connection
+    HTTP.new("example.com", 443)
+  end
+end
+"##)
+        .run_ruby(r##"
+pool = WebPush::ProbePool.new
+taken = pool.checkout("a")
+raise "took #{taken.inspect}" unless taken == :second
+raise "popped #{2 - pool.left("a")}" unless pool.left("a") == 1
+raise "no stage" unless pool.connection.stage == :checking
+raise "HTTP is #{WebPush::ProbePool::HTTP.superclass}" unless WebPush::ProbePool::HTTP.superclass == Net::HTTP
+raise "Lost" unless WebPush::ProbePool::Lost.ancestors.include?(StandardError)
+"##)
+        .assert_passes();
+}
+
+/// A `test/test_helpers/` module that one test class includes itself
+/// (campfire's `include PushServiceTestHelper`), carried whole into the
+/// test's file: its nested class, its module methods, a constructor
+/// whose keywords stay keywords (`Server.new(**options)`), a duration in
+/// a module method, and `assert_not_kind_of`.
+#[test]
+fn a_test_helper_module_one_test_includes_is_carried_whole() {
+    emit_and_run::real_blog()
+        .write("test/test_helpers/probe_server_helper.rb", r##"module ProbeServerHelper
+  NAME = "probe"
+
+  class Server
+    attr_reader :status, :label
+
+    def initialize(status: "201 Created", label: -> { NAME })
+      @status, @label = status, label.call
+    end
+  end
+
+  class << self
+    def started_at
+      1.minute.ago
+    end
+  end
+
+  private
+    def with_server(**options)
+      yield Server.new(**options)
+    end
+end
+"##)
+        .write("test/models/probe_server_test.rb", r##"require "test_helper"
+
+class ProbeServerTest < ActiveSupport::TestCase
+  include ProbeServerHelper
+
+  test "the helper's class takes its keywords" do
+    with_server(status: "500 Oops") do |server|
+      assert_equal "500 Oops", server.status
+      assert_equal "probe", server.label
+      assert_not_kind_of String, server
+    end
+    with_server do |server|
+      assert_equal "201 Created", server.status
+    end
+  end
+
+  test "a module method reads a duration" do
+    assert ProbeServerHelper.started_at < Time.now
+  end
+end
+"##)
+        .run_test("test/models/probe_server_test.rb")
+        .assert_passes();
+}
+
+/// campfire main keeps `rooms.messages_count` with SQLite triggers it
+/// installs itself, and repairs the count once fixtures are loaded:
+/// - a `load_fixtures` override on the app's `ActiveSupport::TestCase`
+///   (`fixtures = super; …; fixtures`) runs its statements after the
+///   fixtures, ahead of the tests' own setup;
+/// - `connection.data_source_exists?` / `column_exists?` read SQLite's
+///   catalog, `raw_connection.transaction(:immediate)` is a write
+///   transaction below ActiveRecord, `connection_pool.release_connection`
+///   answers;
+/// - `clear_query_caches_for_current_thread` leaves the cache on.
+#[test]
+fn a_fixture_hook_and_trigger_maintenance_run_as_rails_runs_them() {
+    emit_and_run::real_blog()
+        .edit("test/test_helper.rb", "    # Add more helper methods to be used by all tests here...\n", r##"    def load_fixtures(config)
+      fixtures = super
+      Article::Counting.ensure!
+      fixtures
+    end
+"##)
+        .edit("db/schema.rb", "    t.string \"title\"\n", "    t.string \"title\"\n    t.integer \"comments_total\", default: 0, null: false\n")
+        .write("app/models/article/counting.rb", r##"class Article::Counting
+  TRIGGER = "comments_ai_articles_total"
+
+  def self.ensure!(connection = ActiveRecord::Base.connection)
+    return unless connection.adapter_name.match?(/sqlite/i)
+    return unless connection.data_source_exists?(:articles)
+    return unless connection.column_exists?(:articles, :comments_total)
+    return if installed?(connection)
+
+    connection.raw_connection.transaction(:immediate) do
+      connection.execute("UPDATE articles SET comments_total = (SELECT COUNT(*) FROM comments WHERE comments.article_id = articles.id)")
+      connection.execute("CREATE TRIGGER #{TRIGGER} AFTER INSERT ON comments BEGIN UPDATE articles SET comments_total = comments_total + 1 WHERE id = NEW.article_id; END")
+    end
+  end
+
+  def self.installed?(connection = ActiveRecord::Base.connection)
+    connection.select_value("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = #{connection.quote(TRIGGER)}").present?
+  end
+end
+"##)
+        .write("test/models/article_counting_test.rb", r##"require "test_helper"
+
+class ArticleCountingTest < ActiveSupport::TestCase
+  test "the fixture hook installed the trigger and backfilled the counts" do
+    assert Article::Counting.installed?
+    article = articles(:one)
+    assert_equal article.comments.count, article.comments_total
+    article.comments.create!(commenter: "Ann", body: "Counted by the trigger")
+    assert_equal article.comments.count, article.reload.comments_total
+  end
+
+  test "schema questions read the catalog" do
+    connection = ActiveRecord::Base.connection
+    assert connection.data_source_exists?(:comments)
+    assert_not connection.data_source_exists?(:nothing_here)
+    assert connection.column_exists?(:articles, :comments_total)
+    assert_not connection.column_exists?(:articles, :missing)
+    assert_nil ActiveRecord::Base.connection_pool.release_connection
+    assert_nil ActiveRecord::Base.clear_query_caches_for_current_thread
+  end
+
+  test "a raw write transaction rolls back when its block raises" do
+    connection = ActiveRecord::Base.connection
+    count = Article.count
+    assert_raises(RuntimeError) do
+      connection.raw_connection.transaction(:immediate) do
+        connection.execute("DELETE FROM articles")
+        raise "abandon"
+      end
+    end
+    assert_equal count, Article.count
+  end
+end
+"##)
+        .run_test("test/models/article_counting_test.rb")
+        .assert_passes();
+}
+
+/// campfire main's header-only forgery protection, from the test side:
+/// - an app helper overriding `token_tag` to answer "" leaves every form
+///   without a token field (Rails' form helpers build it through that);
+/// - a POST carrying `_method: "delete"` is routed as the DELETE it says
+///   (Rack's MethodOverride, as both production dispatchers apply it);
+/// - the integration session's `reset!` starts a fresh one.
+#[test]
+fn a_blank_token_tag_override_method_override_and_session_reset() {
+    emit_and_run::real_blog()
+        .write("app/helpers/application_helper.rb", r##"module ApplicationHelper
+  private
+    def token_tag(*)
+      ""
+    end
+end
+"##)
+        .write("test/controllers/token_free_forms_controller_test.rb", r##"require "test_helper"
+
+class TokenFreeFormsControllerTest < ActionDispatch::IntegrationTest
+  setup do
+    @previous = ActionController::Base.allow_forgery_protection
+    ActionController::Base.allow_forgery_protection = true
+  end
+
+  teardown do
+    ActionController::Base.allow_forgery_protection = @previous
+  end
+
+  test "forms carry no token field" do
+    get new_article_url
+    assert_response :success
+    assert_select "form"
+    assert_select "input[name='authenticity_token']", count: 0
+  end
+
+  test "a POST with _method is the verb it names" do
+    ActionController::Base.allow_forgery_protection = false
+    article = Article.create!(title: "Overridden", body: "A sufficiently long article body.")
+    assert_difference "Article.count", -1 do
+      post article_url(article), params: { _method: "delete" }
+    end
+  end
+
+  test "reset! starts a fresh session" do
+    https!
+    host! "blog.example.test"
+    get articles_url
+    reset!
+    assert_not https?
+    assert_equal "www.example.com", host
+    assert_nil response
+  end
+end
+"##)
+        .run_test("test/controllers/token_free_forms_controller_test.rb")
+        .assert_passes();
+}
+
+/// A bounded `ActiveSupport::Cache::MemoryStore` keeps an html-safe
+/// String (a SafeBuffer) as such, as Rails' store does. campfire main
+/// caches each text message's rendered body this way (`auto_link`
+/// answers a SafeBuffer); the store refused anything but an exact
+/// String, so with caching on every message body rendered empty.
+#[test]
+fn a_memory_store_keeps_an_html_safe_string() {
+    emit_and_run::real_blog()
+        .run_ruby(r##"
+store = ActiveSupport::Cache::MemoryStore.new(size: 4096)
+body = store.fetch("presentation") { "<b>hi</b>".html_safe }
+raise "fetch answered #{body.inspect}" unless body == "<b>hi</b>" && body.html_safe?
+again = store.read("presentation")
+raise "read answered #{again.inspect}" unless again == "<b>hi</b>" && again.html_safe?
+raise "the cached copy is the caller's object" if again.equal?(body)
+"##)
         .assert_passes();
 }

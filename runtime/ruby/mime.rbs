@@ -37,5 +37,5 @@ module Mime
 
   ALL: Mime::AllType
 
-  def self.[]: (String extension) -> Mime::Type?
+  def self.[]: (String | Symbol extension) -> Mime::Type?
 end

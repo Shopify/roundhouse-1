@@ -1,3 +1,17 @@
 # Top-level require shim — active_record.rb just `require_relative`s
 # its child files (errors, validations, base). No method definitions
 # of its own, so no signatures to declare.
+
+# ActiveRecord.version / gem_version and VERSION (Rails 8.2.0.alpha).
+module ActiveRecord
+  def self.gem_version: () -> Gem::Version
+  def self.version: () -> Gem::Version
+
+  module VERSION
+    MAJOR: Integer
+    MINOR: Integer
+    TINY: Integer
+    PRE: String
+    STRING: String
+  end
+end
