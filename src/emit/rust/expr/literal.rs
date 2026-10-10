@@ -19,7 +19,7 @@ use super::{
 /// surrounding map is String-typed.
 pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
     if entries.is_empty() {
-        return "crate::det::HashMap::default()".to_string();
+        return "std::collections::HashMap::default()".to_string();
     }
     // Tuple-type unification: HashMap::from_iter([(k, v), ...]) infers from
     // the first tuple; later tuples must share that type. Coerce
@@ -78,7 +78,7 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
                 format!("(({k_s}).to_string(), serde_json::Value::from({v_s}))")
             })
             .collect();
-        return format!("crate::det::HashMap::from_iter([{}])", pairs.join(", "));
+        return format!("std::collections::HashMap::from_iter([{}])", pairs.join(", "));
     }
     let pairs: Vec<String> = entries
         .iter()
@@ -144,7 +144,7 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
             format!("({k_s}, {v_s})")
         })
         .collect();
-    format!("crate::det::HashMap::from_iter([{}])", pairs.join(", "))
+    format!("std::collections::HashMap::from_iter([{}])", pairs.join(", "))
 }
 
 /// Emit an Array literal as a `vec![...]` macro invocation. Tail-position

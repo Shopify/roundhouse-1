@@ -269,7 +269,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
         writeln!(out).unwrap();
         writeln!(
             out,
-            "    pub fn render_with(&mut self, content: &str, opts: crate::det::HashMap<String, serde_json::Value>) {{"
+            "    pub fn render_with(&mut self, content: &str, opts: std::collections::HashMap<String, serde_json::Value>) {{"
         )
         .unwrap();
         writeln!(
@@ -875,8 +875,8 @@ fn format_hash_constant(name: &str, entries: &[(Expr, Expr)]) -> String {
     }
     let pairs_s = pairs.join(", ");
     format!(
-        "static {name}: std::sync::LazyLock<crate::det::HashMap<{key_ty}, {val_ty}>> = \
-         std::sync::LazyLock::new(|| crate::det::HashMap::from_iter([{pairs_s}]));"
+        "static {name}: std::sync::LazyLock<std::collections::HashMap<{key_ty}, {val_ty}>> = \
+         std::sync::LazyLock::new(|| std::collections::HashMap::from_iter([{pairs_s}]));"
     )
 }
 

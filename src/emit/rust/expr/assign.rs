@@ -294,7 +294,7 @@ fn none_init_option_return_ty(value: &Expr) -> Option<crate::ty::Ty> {
 fn empty_hash_return_annotation(value: &Expr) -> String {
     match empty_hash_return_ty(value) {
         Some(crate::ty::Ty::Hash { key, value }) => format!(
-            ": crate::det::HashMap<{}, {}>",
+            ": std::collections::HashMap<{}, {}>",
             super::super::ty::rust_ty(&key),
             super::super::ty::rust_ty(&value),
         ),

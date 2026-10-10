@@ -14,6 +14,10 @@ types and their local `type` aliases into the `default` /
 `with_capacity_and_hasher` / `from_iter` forms a non-std hasher needs.
 `[..].into()` conversions and nested `use std::{collections::..}` trees
 still need a hand edit; `cargo check --all-targets` finds them.
+Emitted-code templates are not the compiler's maps: string literals in
+src/emit/rust/** write the emitted crate's `std::collections::HashMap`
+(no `crate::det` there). Revert any it rewrites; the Rust emit tests
+(`emit::rust::ty::tests`, `emit::shared::utf8_chr`) fail otherwise.
 """
 import re, sys
 prefix = sys.argv[1]

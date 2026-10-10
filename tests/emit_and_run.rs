@@ -10452,10 +10452,11 @@ fn a_test_naming_the_sqlite3_constraint_exception_is_refused_off_cruby() {
 
 const HARNESS_NAMES_TEST: &str = "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  test \"harness names\" do\n    store = ActiveSupport::Cache::MemoryStore.new\n    assert store\n    seen = []\n    callback = ->(*args) { seen << args }\n    ActiveSupport::Notifications.subscribed(callback, \"other.event\") { 1 }\n    assert_equal [], seen\n  end\nend\n";
 
-/// `ActiveSupport::Cache::MemoryStore` and `ActiveSupport::Notifications`
-/// are declared by the Ruby-family test harness. A test naming them runs
-/// on Ruby and emits on the trees carrying that harness; every other
-/// target is refused at the name before a test naming it is written.
+/// `ActiveSupport::Notifications` is declared by the Ruby-family test
+/// harness, and `ActiveSupport::Cache::MemoryStore` by the Ruby-family
+/// runtime port (runtime/active_support_cache.rb). A test naming them
+/// runs on Ruby and emits on the trees carrying them; every other target
+/// is refused at each name before a test naming it is written.
 #[test]
 fn a_harness_name_runs_on_the_ruby_family_and_is_refused_elsewhere() {
     use roundhouse::project::BuildTarget;
@@ -10468,12 +10469,12 @@ fn a_harness_name_runs_on_the_ruby_family_and_is_refused_elsewhere() {
     app().run_test("test/models/widget_test.rb").assert_passes();
     for target in [BuildTarget::Spinel, BuildTarget::Jruby] {
         let (_, errors) = app().emit(target);
-        assert!(!errors.iter().any(|e| e.contains("harness_constant")), "{target:?}: {errors:?}");
+        assert!(!errors.iter().any(|e| e.contains("harness_constant") || e.contains("runtime_constant")), "{target:?}: {errors:?}");
     }
     for target in [BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python, BuildTarget::Go] {
         let (_, errors) = app().emit(target);
-        for name in ["ActiveSupport::Cache::MemoryStore", "ActiveSupport::Notifications"] {
-            assert!(errors.iter().any(|e| e.contains("harness_constant") && e.contains(name)), "{target:?} {name}: {errors:?}");
+        for (construct, name) in [("runtime_constant", "ActiveSupport::Cache::MemoryStore"), ("harness_constant", "ActiveSupport::Notifications")] {
+            assert!(errors.iter().any(|e| e.contains(construct) && e.contains(name)), "{target:?} {name}: {errors:?}");
         }
     }
 }
@@ -10481,7 +10482,8 @@ fn a_harness_name_runs_on_the_ruby_family_and_is_refused_elsewhere() {
 /// Ruby binds a qualified read's first segment lexically: inside
 /// `module Shop` with an app `Shop::ActiveSupport`, `ActiveSupport::
 /// Cache::MemoryStore` reaches the app module and raises NameError, so
-/// the harness name is refused there. Rooted, it reaches the harness.
+/// the runtime name is refused there, in a test body and in app code.
+/// Rooted, it reaches the runtime's class.
 #[test]
 fn a_harness_name_shadowed_by_an_app_namespace_is_refused() {
     use roundhouse::project::BuildTarget;
@@ -10493,6 +10495,10 @@ fn a_harness_name_shadowed_by_an_app_namespace_is_refused() {
             .write("test/models/shop/order_test.rb", &format!("require \"test_helper\"\n\nmodule Shop\n  class OrderTest < ::ActiveSupport::TestCase\n    test \"x\" do\n      {body}\n    end\n  end\nend\n"))
     };
     let (_, errors) = app("assert ActiveSupport::Cache::MemoryStore.new").emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("constant not supported (all targets): ActiveSupport::Cache::MemoryStore")), "{errors:?}");
+    let (_, errors) = app("assert ::ActiveSupport::Cache::MemoryStore.new")
+        .write("app/models/shop/order.rb", "module Shop\n  class Order\n    def self.store\n      ActiveSupport::Cache::MemoryStore.new\n    end\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("constant not supported (all targets): ActiveSupport::Cache::MemoryStore")), "{errors:?}");
     app("assert ::ActiveSupport::Cache::MemoryStore.new").run_test("test/models/shop_order_test.rb").assert_passes();
 }

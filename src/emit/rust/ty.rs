@@ -38,7 +38,7 @@ pub fn rust_ty(ty: &Ty) -> String {
         }
         Ty::Array { elem } => format!("Vec<{}>", rust_ty(elem)),
         Ty::Hash { key, value } => format!(
-            "crate::det::HashMap<{}, {}>",
+            "std::collections::HashMap<{}, {}>",
             rust_ty(key),
             rust_ty(value)
         ),
@@ -156,5 +156,13 @@ mod tests {
         };
         assert!(!rust_value_shaped(&ty));
         assert!(rust_ty(&ty).starts_with("Option<"));
+    }
+
+    /// The emitted crate has no `crate::det` (the compiler's own
+    /// deterministic aliases); its maps are std's.
+    #[test]
+    fn hash_is_the_emitted_crates_std_map() {
+        let ty = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Int) };
+        assert_eq!(rust_ty(&ty), "std::collections::HashMap<String, i64>");
     }
 }

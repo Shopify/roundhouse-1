@@ -748,7 +748,7 @@ fn default_value_for_ty(ty: &Ty) -> String {
         Ty::Str | Ty::Sym => "String::new()".to_string(),
         Ty::Nil => "()".to_string(),
         Ty::Array { .. } => "Vec::new()".to_string(),
-        Ty::Hash { .. } => "crate::det::HashMap::default()".to_string(),
+        Ty::Hash { .. } => "std::collections::HashMap::default()".to_string(),
         Ty::Untyped => "serde_json::Value::Null".to_string(),
         Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)) => {
             "None".to_string()

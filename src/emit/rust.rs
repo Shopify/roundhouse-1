@@ -1643,7 +1643,7 @@ fn render_axum_handler_wrappers(
             // after the `Path` extractors keeps the consumption
             // ordering deterministic).
             args.push(
-                "axum::extract::Form(form): axum::extract::Form<crate::det::HashMap<String, String>>"
+                "axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>"
                     .to_string(),
             );
         }
@@ -1656,7 +1656,7 @@ fn render_axum_handler_wrappers(
             body.push_str("    let mut params = crate::http::params_from_form(form);\n");
         } else if !path_params.is_empty() {
             body.push_str(
-                "    let mut params: crate::det::HashMap<String, serde_json::Value> = crate::det::HashMap::default();\n",
+                "    let mut params: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::default();\n",
             );
         }
         // Path params land as serde_json::Value::from(i64) under

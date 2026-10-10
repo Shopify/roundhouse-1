@@ -654,6 +654,19 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// Whether an unresolved unrooted `Head::Rest` binds `Head` to an app
+    /// namespace of a lexical scope around it (`Shop::ActiveSupport`),
+    /// which Rubydex found lacks `Rest`: no top-level `Head::Rest` answers.
+    fn lexically_shadowed_head(&self, span: crate::span::Span, path: &[Symbol]) -> bool {
+        let Some((head, rest)) = path.split_first() else { return false };
+        if rest.is_empty() || head.as_str().is_empty() {
+            return false;
+        }
+        let Some(resolver) = self.const_resolver.as_ref() else { return false };
+        resolver.unresolved_nesting(span, path).iter()
+            .any(|scope| resolver.has_source_namespace(&format!("{scope}::{head}")))
+    }
+
     /// `Head::Rest` read through a constant of an enclosing scope that
     /// names a class or module (`Head = Gem::Module`, an entry of the
     /// scope's `ClassInfo::type_aliases` from `class_constant_aliases`):
@@ -1738,6 +1751,13 @@ impl<'a> BodyTyper<'a> {
                                     let ty = exact_modeled_class(&target);
                                     if matches!(ty, Ty::Var { .. }) { exact_modeled_class(path) } else { ty }
                                 }
+                                // Ruby binds a qualified read's head
+                                // lexically: inside `module Shop` with an
+                                // app `Shop::ActiveSupport`,
+                                // `ActiveSupport::Cache::MemoryStore`
+                                // reaches the app module and raises
+                                // NameError, not the top-level class.
+                                None if self.lexically_shadowed_head(expr_span, path) => unknown(),
                                 None => exact_modeled_class(path),
                             },
                         }
