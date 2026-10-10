@@ -2706,9 +2706,11 @@ module MochaBridge
   # ahead of the gem in some trees, and the matchers are only needed
   # once a test reaches one.
   def self.matcher(name, arg = nil)
-    # `Mocha::ParameterMatchers::Methods` is where mocha 3 keeps the
-    # matcher methods; `Mocha::API` includes it into a test class.
-    extend Mocha::ParameterMatchers::Methods unless singleton_class.include?(Mocha::ParameterMatchers::Methods)
+    # mocha 3 keeps the matcher methods in `Mocha::ParameterMatchers::Methods`;
+    # mocha 2 (Core pins 2.5) defines them on `Mocha::ParameterMatchers`
+    # itself. `Mocha::API` includes whichever into a test class.
+    matchers = Mocha::ParameterMatchers.const_defined?(:Methods, false) ? Mocha::ParameterMatchers::Methods : Mocha::ParameterMatchers
+    extend matchers unless singleton_class.include?(matchers)
     arg.nil? ? public_send(name) : public_send(name, arg)
   end
 end
@@ -3858,7 +3860,10 @@ fn ruby_family_files(
     // it (`lower::job_class_side`), with the ActiveSupport::Callbacks and
     // ActiveSupport::Rescuable ports it builds on. Rescuable rides alone
     // where the app names it.
-    let carries_job_callbacks = carries_named(&files, &["ActiveJob::Callbacks"]);
+    // Its Arguments and Serializers ride with it, and carry it where the
+    // app names them (Core's lock_queue.rb, its argument serializers).
+    let carries_job_callbacks =
+        carries_named(&files, &["ActiveJob::Callbacks", "ActiveJob::Arguments", "ActiveJob::Serializers"]);
     let carries_rescuable = carries_job_callbacks || carries_named(&files, &["ActiveSupport::Rescuable"]);
     let carries_callbacks = carries_job_callbacks || carries_named(&files, &["ActiveSupport::Callbacks"]);
     let carries_descendants_tracker = carries_callbacks || carries_named(&files, &["ActiveSupport::DescendantsTracker"]);
@@ -18833,6 +18838,24 @@ mod tests {
             "stderr={}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// `MochaBridge.matcher` must reach the matchers under both mocha
+    /// layouts: mocha 3 keeps them in `Mocha::ParameterMatchers::Methods`,
+    /// mocha 2 (Core pins 2.5.0) on `Mocha::ParameterMatchers` itself.
+    /// Naming only `::Methods` made every bridged `anything`/`has_entries`
+    /// on Core an `uninitialized constant`. Stand-in modules play the two
+    /// gem shapes; `--disable-gems` keeps an installed mocha out.
+    #[test]
+    fn mocha_bridge_matcher_serves_mocha_2_and_3_layouts() {
+        for (layout, want) in [
+            ("module Mocha; module ParameterMatchers; def anything = :m2; end; end", "m2"),
+            ("module Mocha; module ParameterMatchers; module Methods; def anything = :m3; end; end; end", "m3"),
+        ] {
+            let script = format!("{layout}\n{MOCHA_BRIDGE_REPLAY}\nprint MochaBridge.matcher(:anything)\n");
+            let out = std::process::Command::new("ruby").arg("--disable-gems").arg("-e").arg(&script).output().expect("ruby");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "stderr={}", String::from_utf8_lossy(&out.stderr));
+        }
     }
 
     /// The spinel tree names the app source each emitted line came from

@@ -39,9 +39,9 @@
 # - Not ported, with no observable callback behaviour: Instrumentation and
 #   Logging (their `around_enqueue` callbacks and `perform_now` wrappers
 #   emit notifications and tag a logger), ExecutionState's locale and time
-#   zone, the singleton `:execute` chain around `Base.execute`, argument
-#   serialization (the arguments are passed as they are),
-#   `ActiveSupport::ExecutionContext[:job]`, and the priority. The
+#   zone, the singleton `:execute` chain around `Base.execute`,
+#   `ActiveSupport::ExecutionContext[:job]`, and QueuePriority's class
+#   side. The
 #   queue name is QueueName's, and routes nothing: the in-process adapter
 #   has one queue (active_job.rb), so it is only what a job and its
 #   callbacks read back.
@@ -59,8 +59,22 @@
 #   does with the `set(wait:)` options it drops.
 # - `_raw_enqueue` rescues no ActiveJob::EnqueueError: the shared adapter
 #   raises none.
+# - Core's `serialize`/`deserialize` (core.rb) are here, with
+#   ActiveJob::Arguments (arguments.rb) and ActiveJob::Serializers and its
+#   built-in serializers (serializers.rb, serializers/*): Core's jobs
+#   extend the payload with `super.merge(...)`, BackgroundQueue::Logging
+#   logs it, and Core calls `ActiveJob::Arguments.serialize` itself. The
+#   in-process adapter still hands the job its arguments as they are, so
+#   `serialize` is what a job and its callers read, not a round trip.
+#   `delegate` and `safe_constantize` are written out; a serializer whose
+#   `klass` the tree does not define serializes nothing.
 
 require "securerandom"
+require "set"
+require "singleton"
+require "time"
+require "date"
+require "bigdecimal"
 require_relative "active_support_callbacks"
 require_relative "active_support_rescuable"
 
@@ -83,6 +97,21 @@ module ActiveJob
     # Queue in which the job will reside.
     attr_writer :queue_name
 
+    # The job's arguments as `serialize` wrote them, until `perform_now`
+    # deserializes them.
+    attr_writer :serialized_arguments
+    attr_writer :priority
+    attr_accessor :provider_job_id
+    attr_accessor :locale
+    attr_accessor :timezone
+    attr_accessor :enqueued_at
+
+    # QueuePriority#priority: a Proc priority is evaluated on the job.
+    def priority
+      @priority = instance_exec(&@priority) if @priority.is_a?(Proc)
+      @priority
+    end
+
     # Creates a new job instance. Takes the arguments that will be
     # passed to the perform method.
     def initialize(*arguments, **kwargs)
@@ -93,6 +122,7 @@ module ActiveJob
       @executions = 0
       @exception_executions = {}
       @queue_name = self.class.queue_name
+      @timezone = Time.zone&.name if Time.respond_to?(:zone)
     end
 
     # Configures the job with the given options.
@@ -102,6 +132,522 @@ module ActiveJob
       self.queue_name   = self.class.queue_name_from_part(options[:queue]) if options[:queue]
       self
     end
+
+    # The job as a Hash of primitives, the payload a queue adapter
+    # stores; an app job extends it with `super.merge(...)`.
+    def serialize
+      {
+        "job_class"  => self.class.name,
+        "job_id"     => job_id,
+        "provider_job_id" => provider_job_id,
+        "queue_name" => queue_name,
+        "priority"   => priority,
+        "arguments"  => serialize_arguments_if_needed(arguments),
+        "executions" => executions,
+        "exception_executions" => exception_executions,
+        "locale"     => locale || (I18n.locale.to_s if defined?(I18n)),
+        "timezone"   => timezone,
+        "enqueued_at" => Time.now.utc.iso8601(9),
+        "scheduled_at" => scheduled_at ? scheduled_at.utc.iso8601(9) : nil,
+      }
+    end
+
+    # Attaches the stored job data to the current instance; the arguments
+    # stay serialized until `perform_now` needs them.
+    def deserialize(job_data)
+      self.job_id               = job_data["job_id"]
+      self.provider_job_id      = job_data["provider_job_id"]
+      self.queue_name           = job_data["queue_name"]
+      self.priority             = job_data["priority"]
+      self.serialized_arguments = job_data["arguments"]
+      self.executions           = job_data["executions"]
+      self.exception_executions = job_data["exception_executions"]
+      self.locale               = job_data["locale"] || (I18n.locale.to_s if defined?(I18n))
+      self.timezone             = job_data["timezone"] || (Time.zone&.name if Time.respond_to?(:zone))
+      self.enqueued_at          = deserialize_time(job_data["enqueued_at"]) if job_data["enqueued_at"]
+      self.scheduled_at         = deserialize_time(job_data["scheduled_at"]) if job_data["scheduled_at"]
+    end
+
+    module ClassMethods
+      # Creates a new job instance from a hash created with +serialize+.
+      def deserialize(job_data)
+        job_class = begin
+          Object.const_get(job_data["job_class"])
+        rescue NameError
+          nil
+        end
+        raise UnknownJobClassError, job_data["job_class"] unless job_class
+
+        job = job_class.new
+        job.deserialize(job_data)
+        job
+      end
+    end
+
+    private
+      def serialize_arguments_if_needed(arguments)
+        if arguments_serialized?
+          @serialized_arguments
+        else
+          serialize_arguments(arguments)
+        end
+      end
+
+      def deserialize_arguments_if_needed
+        if arguments_serialized?
+          @arguments = deserialize_arguments(@serialized_arguments)
+          @serialized_arguments = nil
+        end
+      end
+
+      def serialize_arguments(arguments)
+        Arguments.serialize(arguments)
+      end
+
+      def deserialize_arguments(serialized_args)
+        Arguments.deserialize(serialized_args)
+      end
+
+      def arguments_serialized?
+        @serialized_arguments
+      end
+
+      def deserialize_time(time)
+        time.is_a?(Time) ? time : Time.iso8601(time)
+      end
+  end
+
+  # ActiveJob::Arguments: a job's arguments to and from primitives.
+  module Arguments
+    extend self
+
+    GLOBALID_KEY = "_aj_globalid"
+    SYMBOL_KEYS_KEY = "_aj_symbol_keys"
+    RUBY2_KEYWORDS_KEY = "_aj_ruby2_keywords"
+    WITH_INDIFFERENT_ACCESS_KEY = "_aj_hash_with_indifferent_access"
+    OBJECT_SERIALIZER_KEY = "_aj_serialized"
+
+    RESERVED_KEYS = [
+      GLOBALID_KEY, GLOBALID_KEY.to_sym,
+      SYMBOL_KEYS_KEY, SYMBOL_KEYS_KEY.to_sym,
+      RUBY2_KEYWORDS_KEY, RUBY2_KEYWORDS_KEY.to_sym,
+      OBJECT_SERIALIZER_KEY, OBJECT_SERIALIZER_KEY.to_sym,
+      WITH_INDIFFERENT_ACCESS_KEY, WITH_INDIFFERENT_ACCESS_KEY.to_sym,
+    ].to_set
+    private_constant :RESERVED_KEYS, :GLOBALID_KEY,
+      :SYMBOL_KEYS_KEY, :RUBY2_KEYWORDS_KEY, :WITH_INDIFFERENT_ACCESS_KEY
+
+    # Serializes a set of arguments. Intrinsic types that can safely be
+    # serialized without mutation are returned as-is. Arrays/Hashes are
+    # serialized element by element. All other types are serialized using
+    # GlobalID or a registered serializer.
+    def serialize(arguments)
+      arguments.map { |argument| serialize_argument(argument) }
+    end
+
+    def serialize_argument(argument) # :nodoc:
+      case argument
+      when nil, true, false, Integer, Float # Types that can hardly be subclassed
+        argument
+      when String
+        if argument.class == String
+          argument
+        else
+          begin
+            Serializers.serialize(argument)
+          rescue SerializationError
+            argument
+          end
+        end
+      when Symbol
+        { OBJECT_SERIALIZER_KEY => "ActiveJob::Serializers::SymbolSerializer", "value" => argument.name }
+      when Array
+        argument.map { |arg| serialize_argument(arg) }
+      when Hash
+        if indifferent_hash?(argument)
+          serialize_indifferent_hash(argument)
+        else
+          symbol_keys = argument.keys
+          symbol_keys.select! { |k| k.is_a?(Symbol) }
+          symbol_keys.map!(&:name)
+
+          aj_hash_key = if Hash.ruby2_keywords_hash?(argument)
+            RUBY2_KEYWORDS_KEY
+          else
+            SYMBOL_KEYS_KEY
+          end
+          result = serialize_hash(argument)
+          result[aj_hash_key] = symbol_keys
+          result
+        end
+      else
+        if defined?(GlobalID::Identification) && argument.is_a?(GlobalID::Identification)
+          convert_to_global_id_hash(argument)
+        else
+          Serializers.serialize(argument)
+        end
+      end
+    end
+
+    # Deserializes a set of arguments. Intrinsic types that can safely be
+    # deserialized without mutation are returned as-is. Arrays/Hashes are
+    # deserialized element by element. All other types are deserialized
+    # using GlobalID or a registered serializer.
+    def deserialize(arguments)
+      arguments.map { |argument| deserialize_argument(argument) }
+    rescue
+      raise DeserializationError
+    end
+
+    private
+      def indifferent_hash?(argument)
+        defined?(ActiveSupport::HashWithIndifferentAccess) && argument.is_a?(ActiveSupport::HashWithIndifferentAccess)
+      end
+
+      def deserialize_argument(argument)
+        case argument
+        when nil, true, false, String, Integer, Float
+          argument
+        when Array
+          argument.map { |arg| deserialize_argument(arg) }
+        when Hash
+          if serialized_global_id?(argument)
+            deserialize_global_id argument
+          elsif custom_serialized?(argument)
+            Serializers.deserialize(argument)
+          else
+            deserialize_hash(argument)
+          end
+        else
+          raise ArgumentError, "Can only deserialize primitive arguments: #{argument.inspect}"
+        end
+      end
+
+      def serialized_global_id?(hash)
+        hash.size == 1 && hash.include?(GLOBALID_KEY)
+      end
+
+      def deserialize_global_id(hash)
+        GlobalID::Locator.locate hash[GLOBALID_KEY]
+      end
+
+      def custom_serialized?(hash)
+        hash.key?(OBJECT_SERIALIZER_KEY)
+      end
+
+      def serialize_hash(argument)
+        argument.each_with_object({}) do |(key, value), hash|
+          hash[serialize_hash_key(key)] = serialize_argument(value)
+        end
+      end
+
+      def deserialize_hash(serialized_hash)
+        result = serialized_hash.transform_values { |v| deserialize_argument(v) }
+        if result.delete(WITH_INDIFFERENT_ACCESS_KEY)
+          result = result.with_indifferent_access
+        elsif symbol_keys = result.delete(SYMBOL_KEYS_KEY)
+          result = transform_symbol_keys(result, symbol_keys)
+        elsif symbol_keys = result.delete(RUBY2_KEYWORDS_KEY)
+          result = transform_symbol_keys(result, symbol_keys)
+          result = Hash.ruby2_keywords_hash(result)
+        end
+        result
+      end
+
+      def serialize_hash_key(key)
+        case key
+        when RESERVED_KEYS
+          raise SerializationError.new("Can't serialize a Hash with reserved key #{key.inspect}")
+        when String
+          key
+        when Symbol
+          key.name
+        else
+          raise SerializationError.new("Only string and symbol hash keys may be serialized as job arguments, but #{key.inspect} is a #{key.class}")
+        end
+      end
+
+      def serialize_indifferent_hash(indifferent_hash)
+        result = serialize_hash(indifferent_hash)
+        result[WITH_INDIFFERENT_ACCESS_KEY] = true
+        result
+      end
+
+      def transform_symbol_keys(hash, symbol_keys)
+        hash.to_h.transform_keys do |key|
+          if symbol_keys.include?(key)
+            key.to_sym
+          else
+            key
+          end
+        end
+      end
+
+      def convert_to_global_id_hash(argument)
+        { GLOBALID_KEY => argument.to_global_id.to_s }
+      rescue URI::GID::MissingModelIdError
+        raise SerializationError, "Unable to serialize #{argument.class} " \
+          "without an id. (Maybe you forgot to call save?)"
+      end
+  end
+
+  # ActiveJob::Serializers: the registry of argument serializers, with
+  # the built-in ones. `ActiveJob::Serializers.add_serializers` is where
+  # an app (Core's MoneyBagJobArgumentSerializer) and a gem's railtie
+  # (shopify-money's JobArgumentSerializer) register theirs.
+  module Serializers
+    OBJECT_SERIALIZER_KEY = Arguments::OBJECT_SERIALIZER_KEY
+
+    @serializers = Set.new
+    @serializers_index = {}
+
+    class << self
+      # Returns serialized representative of the passed object.
+      # Will look up through all known serializers.
+      # Raises ActiveJob::SerializationError if it can't find a proper serializer.
+      def serialize(argument)
+        serializer = @serializers_index[argument.class] || serializers.find { |s| s.serialize?(argument) }
+        raise SerializationError.new("Unsupported argument type: #{argument.class.name}") unless serializer
+        serializer.serialize(argument)
+      end
+
+      # Returns deserialized object.
+      # Will look up through all known serializers.
+      # If no serializer found will raise <tt>ArgumentError</tt>.
+      def deserialize(argument)
+        serializer_name = argument[OBJECT_SERIALIZER_KEY]
+        raise ArgumentError, "Serializer name is not present in the argument: #{argument.inspect}" unless serializer_name
+
+        serializer = begin
+          Object.const_get(serializer_name)
+        rescue NameError
+          nil
+        end
+        raise ArgumentError, "Serializer #{serializer_name} is not known" unless serializer
+
+        serializer.deserialize(argument)
+      end
+
+      # Returns list of known serializers.
+      attr_reader :serializers
+
+      def serializers=(serializers)
+        @serializers_index.clear
+        @serializers = Set.new
+        add_new_serializers(serializers)
+      end
+
+      # Adds new serializers to a list of known serializers.
+      def add_serializers(*new_serializers)
+        new_serializers = new_serializers.flatten
+        add_new_serializers(new_serializers)
+      end
+
+      private
+        def add_new_serializers(new_serializers)
+          new_serializers.map! do |s|
+            if s.is_a?(Class) && s < ObjectSerializer
+              s.instance
+            else
+              s
+            end
+          end
+
+          @serializers += new_serializers
+          new_serializers.each do |s|
+            @serializers_index[s.klass] = s if s.respond_to?(:klass) && s.klass
+          end
+          @serializers
+        end
+    end
+
+    # Base class for serializing and deserializing custom objects.
+    # ActiveSupport's `delegate` is written out as the three methods.
+    class ObjectSerializer
+      include Singleton
+
+      class << self
+        def serialize?(argument) = instance.serialize?(argument)
+        def serialize(argument) = instance.serialize(argument)
+        def deserialize(argument) = instance.deserialize(argument)
+      end
+
+      def initialize
+        super
+        @template = { Serializers::OBJECT_SERIALIZER_KEY => self.class.name }.freeze
+      end
+
+      # Determines if an argument should be serialized by a serializer.
+      # A `klass` the tree does not define (no ActiveSupport::Duration)
+      # serializes nothing.
+      def serialize?(argument)
+        k = klass
+        k ? argument.is_a?(k) : false
+      end
+
+      # Serializes an argument to a JSON primitive type.
+      def serialize(hash)
+        @template.merge(hash)
+      end
+
+      # Deserializes an argument from a JSON primitive type.
+      def deserialize(hash)
+        raise NotImplementedError, "#{self.class.name} should implement a public #deserialize(hash) method"
+      end
+
+      # The class of the object that will be serialized.
+      def klass
+        raise NotImplementedError, "#{self.class.name} should implement a public #klass method"
+      end
+    end
+
+    class SymbolSerializer < ObjectSerializer # :nodoc:
+      def serialize(argument)
+        super("value" => argument.name)
+      end
+
+      def deserialize(argument)
+        argument["value"].to_sym
+      end
+
+      def klass
+        Symbol
+      end
+    end
+
+    class DurationSerializer < ObjectSerializer # :nodoc:
+      def serialize(duration)
+        super("value" => duration.value, "parts" => Arguments.serialize(duration.parts.to_a))
+      end
+
+      def deserialize(hash)
+        value = hash["value"]
+        parts = Arguments.deserialize(hash["parts"].to_h)
+        klass.new(value, parts.to_h)
+      end
+
+      def klass
+        ActiveSupport::Duration if defined?(ActiveSupport::Duration)
+      end
+    end
+
+    class TimeObjectSerializer < ObjectSerializer # :nodoc:
+      NANO_PRECISION = 9
+
+      def serialize(time)
+        super("value" => time.iso8601(NANO_PRECISION))
+      end
+    end
+
+    class DateTimeSerializer < TimeObjectSerializer # :nodoc:
+      def deserialize(hash)
+        DateTime.iso8601(hash["value"])
+      end
+
+      def klass
+        DateTime
+      end
+    end
+
+    class DateSerializer < ObjectSerializer # :nodoc:
+      def serialize(date)
+        super("value" => date.iso8601)
+      end
+
+      def deserialize(hash)
+        Date.iso8601(hash["value"])
+      end
+
+      def klass
+        Date
+      end
+    end
+
+    class TimeWithZoneSerializer < ObjectSerializer # :nodoc:
+      NANO_PRECISION = 9
+
+      def serialize(time_with_zone)
+        super(
+          "value" => time_with_zone.iso8601(NANO_PRECISION),
+          "time_zone" => time_with_zone.time_zone.tzinfo.name
+        )
+      end
+
+      def deserialize(hash)
+        Time.iso8601(hash["value"]).in_time_zone(hash["time_zone"] || Time.zone)
+      end
+
+      def klass
+        ActiveSupport::TimeWithZone if defined?(ActiveSupport::TimeWithZone)
+      end
+    end
+
+    class TimeSerializer < TimeObjectSerializer # :nodoc:
+      def deserialize(hash)
+        Time.iso8601(hash["value"])
+      end
+
+      def klass
+        Time
+      end
+    end
+
+    class ModuleSerializer < ObjectSerializer # :nodoc:
+      def serialize(constant)
+        raise SerializationError, "Serializing an anonymous class is not supported" unless constant.name
+        super("value" => constant.name)
+      end
+
+      def deserialize(hash)
+        Object.const_get(hash["value"])
+      end
+
+      def klass
+        Module
+      end
+    end
+
+    class RangeSerializer < ObjectSerializer
+      def serialize(range)
+        super(
+          "begin" => Arguments.serialize_argument(range.begin),
+          "end" => Arguments.serialize_argument(range.end),
+          "exclude_end" => range.exclude_end?, # Always boolean, no need to serialize
+        )
+      end
+
+      def deserialize(hash)
+        Range.new(*Arguments.deserialize([hash["begin"], hash["end"]]), hash["exclude_end"])
+      end
+
+      def klass
+        ::Range
+      end
+    end
+
+    class BigDecimalSerializer < ObjectSerializer # :nodoc:
+      def serialize(big_decimal)
+        super("value" => big_decimal.to_s)
+      end
+
+      def deserialize(hash)
+        BigDecimal(hash["value"])
+      end
+
+      def klass
+        BigDecimal
+      end
+    end
+
+    add_serializers SymbolSerializer.instance,
+      DurationSerializer.instance,
+      DateTimeSerializer.instance,
+      DateSerializer.instance,
+      TimeWithZoneSerializer.instance,
+      TimeSerializer.instance,
+      ModuleSerializer.instance,
+      RangeSerializer.instance,
+      BigDecimalSerializer.instance
   end
 
   # ActiveJob::Enqueuing.
@@ -519,6 +1065,7 @@ module ActiveJob
       end
       return false if base < self
       base.include Core
+      base.extend Core::ClassMethods
       base.include QueueName
       base.include Enqueuing
       base.extend Enqueuing::ClassMethods

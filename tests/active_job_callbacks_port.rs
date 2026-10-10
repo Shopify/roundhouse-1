@@ -818,3 +818,117 @@ fn the_registration_hook_is_consumed_for_jobs_only() {
         "{error}"
     );
 }
+
+/// A job whose payload extends `serialize` with `super.merge`, as Core's
+/// BackgroundQueue concerns do (LockQueue, ReadReplica, Logging), with
+/// the `deserialize` that reads it back.
+const STAMP_JOB: &str = r#"class StampJob < ApplicationJob
+  before_perform { |job| job.trail << "before" }
+
+  def serialize
+    super.merge("stamp" => 7)
+  end
+
+  def deserialize(job_data)
+    super
+    @stamp = job_data["stamp"]
+  end
+
+  def stamp
+    @stamp
+  end
+
+  def perform(*args)
+    trail << args
+  end
+end
+"#;
+const POINT: &str = r##"class Point
+  attr_reader :x, :y
+
+  def initialize(x, y)
+    @x = x
+    @y = y
+  end
+
+  def inspect
+    "#<Point #{x},#{y}>"
+  end
+end
+"##;
+/// An app serializer, as Core's MoneyBagJobArgumentSerializer is.
+const POINT_SERIALIZER: &str = r#"class PointSerializer < ActiveJob::Serializers::ObjectSerializer
+  def serialize(point)
+    super("x" => point.x, "y" => point.y)
+  end
+
+  def deserialize(hash)
+    Point.new(hash["x"], hash["y"])
+  end
+
+  def klass
+    Point
+  end
+end
+"#;
+const SERIALIZE_OBSERVE: &str = r##"require "json"
+ActiveJob::Serializers.add_serializers(PointSerializer)
+job = StampJob.new(1, :two, { a: 3, "b" => [4.5, nil] }, 1...5, Time.utc(2026, 1, 2, 3, 4, 5), BigDecimal("1.5"), String, Point.new(1, 2), kw: true)
+data = job.serialize
+p data.reject { |k, _| %w[job_id enqueued_at locale timezone].include?(k) }
+back = StampJob.deserialize(JSON.parse(JSON.generate(data)))
+p [back.class, back.job_id == job.job_id, back.stamp, back.queue_name, back.executions]
+p ActiveJob::Arguments.deserialize(data["arguments"])
+[[Object.new], [{ 1 => 2 }], [{ "_aj_globalid" => 1 }]].each do |args|
+  ActiveJob::Arguments.serialize(args)
+rescue ActiveJob::SerializationError => e
+  p e.message.sub(/#<Object:0x\h+>/, "#<Object>")
+end
+"##;
+const SERIALIZE_FILES: &[(&str, &str, &str)] = &[
+    ("app/jobs/application_job.rb", "app/models/application_job.rb", APPLICATION_JOB),
+    ("app/models/point.rb", "app/models/point.rb", POINT),
+    ("app/jobs/point_serializer.rb", "app/models/point_serializer.rb", POINT_SERIALIZER),
+    ("app/jobs/stamp_job.rb", "app/models/stamp_job.rb", STAMP_JOB),
+];
+
+/// Core's jobs extend `serialize` with `super.merge(...)` and Core calls
+/// `ActiveJob::Arguments` and `ActiveJob::Serializers` itself; with no
+/// ActiveJob::Core#serialize on the port, every perform that logged its
+/// payload was `super: no superclass method 'serialize'`. On the
+/// PostgreSQL (CRuby-only) tree an app's `ObjectSerializer` subclass is
+/// kept and registers on the port, as Core's MoneyBagJobArgumentSerializer
+/// does.
+#[test]
+fn job_serialization_runs_like_activejob() {
+    let mut app = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_active_job_serialize\n");
+    for (path, _, text) in SERIALIZE_FILES {
+        app = app.write(path, text);
+    }
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
+    // `check` names the PostgreSQL adapter as having no runtime of its
+    // own in target-independent analysis; the CRuby tree carries one.
+    let errors: Vec<_> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let requires: String = SERIALIZE_FILES
+        .iter()
+        .map(|(_, emitted, _)| format!("require_relative {:?}\n", emitted.trim_end_matches(".rb")))
+        .collect();
+    for (_, file, _) in SERIALIZE_FILES {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(!text.contains("roundhouse:"), "{file}: {text}");
+    }
+    let script = format!(
+        "require_relative 'runtime/active_job'\nrequire_relative 'runtime/active_job_errors'\n\
+         require_relative 'runtime/active_job_callbacks'\n{requires}{SERIALIZE_OBSERVE}"
+    );
+    let out = emit_and_run::ruby().current_dir(&*dir).args(["-W0", "-e", &script]).output().expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<(&str, &str)> = SERIALIZE_FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    let native = native_of(&files, &format!("{requires}{SERIALIZE_OBSERVE}"));
+    assert!(native.contains("\"stamp\" => 7") && native.contains("PointSerializer"), "{native}");
+    assert_eq!(stdout, native, "emitted on the port vs native activejob");
+}

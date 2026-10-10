@@ -29,5 +29,11 @@ module ActiveRecord
     def hash
       id.nil? ? super : [self.class, id].hash
     end
+
+    # globalid's Railtie: `ActiveSupport.on_load(:active_record) { include
+    # GlobalID::Identification }`, so every record answers `to_global_id`
+    # (runtime/global_id.rb). Core's ActiveJob arguments and cache keys
+    # reach it on a Shop.
+    include GlobalID::Identification if defined?(GlobalID::Identification)
   end
 end

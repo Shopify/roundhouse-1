@@ -17,9 +17,10 @@
 #
 # NOT PORTED, and named where reached: the gem's Locator
 # (`GlobalID#find`, `GlobalID.find`, the locator-dispatched
-# `model_class`), `SignedGlobalID` and `GlobalID::Verifier`, and the
+# `model_class`), `SignedGlobalID` and `GlobalID::Verifier`. The
 # Railtie's `ActiveSupport.on_load(:active_record) { include
-# GlobalID::Identification }`. `GlobalID.app` defaults to
+# GlobalID::Identification }` is runtime/active_record_bang.rb's, which
+# loads after ActiveRecord::Base. `GlobalID.app` defaults to
 # `Rails.application.global_id_app`, where the Railtie would use the
 # application's railtie name.
 #
