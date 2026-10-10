@@ -789,7 +789,7 @@ fn rewrite_fixture_call(e: &Expr, fixture_names: &[Symbol]) -> Option<Expr> {
 /// column → value rows to `ActiveRecord::TestFixtures.insert_fixture_rows`,
 /// one multi-row INSERT cast per column, so no model is instantiated and
 /// no writer, callback or validation runs (`lower::fixtures::lower_fixture_rows`
-/// resolves the rows). Each label accessor answers `<Model>.find(<id>)`,
+/// resolves the rows). Each label accessor finds its inserted row (`TestFixtures.fixture_find`),
 /// memoized until the next load, as Rails' fixture cache does. The other
 /// targets keep `lower_fixtures_to_library_classes`.
 pub fn lower_fixtures_to_raw_row_library_classes(app: &App) -> Vec<LibraryClass> {
@@ -825,23 +825,22 @@ fn build_raw_row_fixture_class(set: &crate::lower::fixtures::RawFixtureSet, want
     let owner_id = ClassId(Symbol::from(owner_name));
     let class_ty = Ty::Class { id: set.class.clone(), args: vec![] };
 
-    let finds: Vec<Expr> = set
-        .rows
-        .iter()
-        .map(|row| {
-            let key: Vec<Expr> = row.find_key.iter().map(raw_value_expr).collect();
-            let arg = if set.composite_find {
-                with_ty(
-                    Expr::new(
-                        Span::synthetic(),
-                        ExprNode::Array { elements: key, style: crate::expr::ArrayStyle::Brackets },
-                    ),
-                    Ty::Array { elem: Box::new(Ty::Untyped) },
-                )
-            } else {
-                key.into_iter().next().unwrap_or_else(crate::lower::typing::nil_lit)
-            };
-            send(Some(class_const(&set.class)), "find", vec![arg], class_ty.clone())
+    // Rails' `Fixture#find` finds by the model's key columns of the row
+    // the set inserted (`fixture.slice(*primary_key)`), so each accessor
+    // reads back its row as `_fixtures_load!` inserted it: an ERB key, a
+    // generated id and a normalized uuid are the values the INSERT used.
+    let finds: Vec<Expr> = (0..set.rows.len())
+        .map(|index| {
+            let rows = with_ty(
+                Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from(FIXTURE_ROWS_IVAR) }),
+                Ty::Array { elem: Box::new(Ty::Untyped) },
+            );
+            send(
+                Some(test_fixtures_const()),
+                "fixture_find",
+                vec![class_const(&set.class), rows, lit_int(index as i64)],
+                class_ty.clone(),
+            )
         })
         .collect();
 
@@ -921,8 +920,13 @@ fn build_raw_row_fixture_class(set: &crate::lower::fixtures::RawFixtureSet, want
     }
 }
 
+/// The module's inserted rows, which its accessors find by. Not an
+/// accessor cache slot (`__fx_` / `__fxe_`): it lives until the next load.
+const FIXTURE_ROWS_IVAR: &str = "__fixture_rows";
+
 /// `_fixtures_load!`: clear the accessors' cache, run the file's ERB
-/// statements, then insert the rows (or raise the set's refusal).
+/// statements, then insert the rows, keeping them as inserted (or raise
+/// the set's refusal).
 fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr {
     let mut exprs: Vec<Expr> = set
         .rows
@@ -999,7 +1003,18 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
                     },
                 ));
             }
-            exprs.push(send(Some(test_fixtures_const()), "insert_fixture_rows", args, Ty::Nil));
+            exprs.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: Symbol::from(FIXTURE_ROWS_IVAR) },
+                    value: send(
+                        Some(test_fixtures_const()),
+                        "insert_fixture_rows",
+                        args,
+                        Ty::Array { elem: Box::new(Ty::Untyped) },
+                    ),
+                },
+            ));
         }
         (_, error) => {
             let message = error.cloned().unwrap_or_else(|| {

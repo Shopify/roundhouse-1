@@ -515,9 +515,6 @@ pub struct RawFixtureRow {
     pub label: Symbol,
     /// Column → value, in YAML order with generated keys after.
     pub values: IndexMap<Symbol, RawFixtureValue>,
-    /// What the label's accessor passes to `<Model>.find`: one value, or
-    /// (for a composite-key model) the key's values in order.
-    pub find_key: Vec<RawFixtureValue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -535,8 +532,6 @@ pub struct RawFixtureSet {
     /// The timestamp columns the loader fills with `now` when a row
     /// omits them.
     pub timestamps: Vec<Symbol>,
-    /// `<Model>.find` takes the key as an Array.
-    pub composite_find: bool,
     pub rows: Vec<RawFixtureRow>,
     pub preamble: Vec<Expr>,
     /// Refusals the set raises, by name, when it loads (the first one).
@@ -812,14 +807,13 @@ fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, r
             }
         })
         .unwrap_or_default();
-    // The model's key, which `find` takes.
+    // The model's key, which generates a missing one under Rails' rules.
     let model_pk: Vec<Symbol> = match model {
         Some(m) if !m.composite_primary_key.is_empty() => m.composite_primary_key.clone(),
         Some(m) => vec![m.primary_key.clone().unwrap_or_else(|| Symbol::from("id"))],
         None if table_pk.len() > 1 => table_pk.clone(),
         None => vec![table_pk.first().cloned().unwrap_or_else(|| Symbol::from("id"))],
     };
-    let composite_find = model_pk.len() > 1;
 
     let mut rows = Vec::new();
     for (label, fields) in &fixture.records {
@@ -837,16 +831,7 @@ fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, r
             ),
             FixtureRules::Rails => rails_row(label, &mut row, model, &model_pk, &col_type),
         }
-        let find_key = model_pk
-            .iter()
-            .map(|k| match row.get(k) {
-                Some(RawFixtureValue::Ruby(_) | RawFixtureValue::RubyReference { .. }) | None => {
-                    RawFixtureValue::Nil
-                }
-                Some(v) => v.clone(),
-            })
-            .collect();
-        rows.push(RawFixtureRow { label: label.clone(), values: row, find_key });
+        rows.push(RawFixtureRow { label: label.clone(), values: row });
     }
 
     RawFixtureSet {
@@ -856,7 +841,6 @@ fn lower_raw_fixture_set(fixture: &Fixture, app: &App, index: &ModelIndex<'_>, r
         table: table_name,
         columns,
         timestamps,
-        composite_find,
         rows,
         preamble: fixture.preamble.clone(),
         errors,

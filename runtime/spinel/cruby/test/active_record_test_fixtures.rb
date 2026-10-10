@@ -248,9 +248,9 @@ module ActiveRecord
       #
       # Under FasterFixtures `model` is the set's model class name: an
       # Integer in a uuid column then goes through the set's
-      # `normalize_fixture_value` (table_rows).
+      # `normalize_fixture_value` (table_rows). Answers the rows as inserted.
       def insert_fixture_rows(table, columns, timestamps, rows, faster_fixtures: false, model: nil)
-        return nil if rows.empty?
+        return [] if rows.empty?
         now = Time.now.utc.strftime("%Y-%m-%d %H:%M:%S")
         live = nil
         rows = rows.map do |row|
@@ -289,7 +289,27 @@ module ActiveRecord
           sql << "(#{names.map { |name| quote_identifier(name) }.join(", ")}) VALUES #{values.join(", ")}"
         end
         Db.exec(sql)
-        nil
+        rows
+      end
+
+      # ActiveRecord::Fixture#find for the set's `index`th row as
+      # `insert_fixture_rows` inserted it (`rows`, kept by the module's
+      # `_fixtures_load!`): `find_by!` on the model's key columns of the
+      # row (`fixture.slice(*primary_key)`), in `all_queries_scope.scoping`.
+      # With no global scope that relation is the default scope's
+      # `all_queries:` part, which this runtime refuses at compile time: a
+      # relation with no default scope, as `Relation.new(model, false)`
+      # builds it. Not the model's `unscoped`, which an app may override
+      # (Core's Shop adds its island) and Rails does not call here. A key
+      # value an ERB tag produced is the text Rails read.
+      def fixture_find(model, rows, index)
+        raise FixtureSetNotLoaded, "fixture set for #{model.name} has not been loaded" if rows.nil?
+        row = rows.fetch(index)
+        keys = Array(model.primary_key).map(&:to_s)
+        conditions = row.slice(*keys).transform_values { |value| fixture_erb_text(value) }
+        scope = model.global_current_scope(true) if model.respond_to?(:global_current_scope)
+        scope ||= ActiveRecord::Relation.new(model, false)
+        scope.scoping { model.find_by!(conditions) }
       end
 
       private
