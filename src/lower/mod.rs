@@ -162,6 +162,7 @@ pub mod relation_residue;
 pub mod params_residue;
 pub mod params_permit;
 pub mod normalizes;
+pub mod state_machines;
 pub mod relation_select_block;
 pub mod send_dispatch;
 pub mod relation_counted_terminal;

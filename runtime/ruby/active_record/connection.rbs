@@ -136,7 +136,7 @@ module ActiveRecord
     def self.exists?: (?(Integer | Float | String | nil) id) -> bool
     def self._exists_primary_key_input: (Integer | Float | String | nil id) -> bool
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
-    def self.where: (Hash[Symbol, untyped] conditions) -> Relation
+    def self.where: (Hash[Symbol, untyped] | String | Array[untyped] conditions, *untyped args) -> Relation
     def self.find_by: (Hash[String | Symbol, untyped] conditions) -> Base?
     def self.find_sole_by: (Hash[String | Symbol, untyped] conditions) -> Base
     def self.find_or_initialize_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
