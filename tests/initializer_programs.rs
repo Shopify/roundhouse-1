@@ -358,3 +358,77 @@ fn boot_loads_a_gem_file_an_initializer_requires_where_it_requires_it() {
     assert!(!stderr.contains("initializer_statement_not_run"), "{stderr}");
     assert_eq!(stdout, "[\"nil\", 3, :c]\n", "stderr={stderr}");
 }
+
+/// A lambda's `return` returns from the lambda, so the statement that
+/// stores it runs (Core's essentials initializers/verdict.rb:
+/// `config.on_flag_error = ->(error, handle) { return false if ... }` in
+/// `Verdict.configure`; r9 refused the whole statement, so the test
+/// env's `config.flag_store = Verdict::Flags::BinaryStore.new` never ran
+/// and 35 tests raised "Handle ... not found in flags.yml"). A `return`
+/// in a plain block still ends the file and is refused.
+const LAMBDA_RETURNS: &str = "module FlagConfig\n  def self.handlers\n    @handlers ||= {}\n  end\nend\n\
+FlagConfig.handlers[:arrow] = ->(error) {\n  return false if error.nil?\n  [1, 2].each { |x| return x if x == error }\n  :other\n}\n\
+FlagConfig.handlers[:kernel] = lambda do |error|\n  return :none unless error\n  error * 2\nend\n\
+BootLog.record(FlagConfig.handlers[:arrow].call(nil))\nBootLog.record(FlagConfig.handlers[:arrow].call(2))\n\
+BootLog.record(FlagConfig.handlers[:arrow].call(5))\nBootLog.record(FlagConfig.handlers[:kernel].call(nil))\n\
+BootLog.record(FlagConfig.handlers[:kernel].call(4))\n";
+const BLOCK_RETURN: &str = "[1].each { |x| return if x }\n";
+
+fn lambda_return_fixture_app() -> TempDir {
+    let app = temp_dir("lambda-return");
+    copy_tree(&Path::new(MANIFEST_DIR).join("fixtures/tiny-blog"), &app.0);
+    let write = |rel: &str, text: &str| {
+        let path = app.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n");
+    write("app/models/boot_log.rb", SIMPLE_BOOT_LOG);
+    let (module, statements) = LAMBDA_RETURNS.split_at(LAMBDA_RETURNS.find("FlagConfig.handlers[:arrow]").unwrap());
+    write("app/models/flag_config.rb", module);
+    write("config/initializers/lambdas.rb", statements);
+    write("config/initializers/zz_block.rb", BLOCK_RETURN);
+    write("roundhouse.yml", "database_adapter: postgresql\n");
+    write("config/database.yml", DATABASE_YML);
+    app
+}
+
+#[test]
+fn a_lambda_return_in_an_initializer_is_carried() {
+    let dir = lambda_return_fixture_app();
+    let app = roundhouse::ingest::ingest_app(&dir.0).expect("ingest fixture");
+    let gaps = gaps_in(&app, "config/initializers/lambdas.rb");
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let block = gaps_in(&app, "config/initializers/zz_block.rb");
+    assert_eq!(block.len(), 1, "{block:?}");
+    assert_eq!(block[0].detail, "`return` in an initializer");
+}
+
+/// The boot runs the lambdas as native Ruby does. Boot loads the `pg`
+/// gem: run with `--ignored` and a `GEM_PATH` that has it.
+#[test]
+#[ignore = "requires ruby with the pg gem"]
+fn boot_runs_an_initializer_lambda_that_returns() {
+    let native = Command::new("ruby")
+        .args(["-e", &format!("{SIMPLE_BOOT_LOG}{LAMBDA_RETURNS}p BootLog.entries\n")])
+        .output()
+        .expect("ruby");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "[false, 2, :other, :none, 8]\n", "native control");
+
+    let dir = lambda_return_fixture_app();
+    let app = roundhouse::ingest::ingest_app(&dir.0).expect("ingest fixture");
+    let (out, _files) = emit(&app);
+    let output = Command::new("ruby")
+        .args(["-e", "require \"./boot\"\np BootLog.entries\n"])
+        .current_dir(&out.0)
+        .env_remove("DATABASE_URL")
+        .env_remove("ROUNDHOUSE_DATABASE_URL")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(!stderr.contains("initializer_statement_not_run"), "{stderr}");
+    assert_eq!(stdout, "[false, 2, :other, :none, 8]\n", "stderr={stderr}");
+}
