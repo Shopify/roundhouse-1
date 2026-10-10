@@ -9648,10 +9648,17 @@ fn emit_library_class_decl_inner(
         }
         let parent = outer_class_parent(&qualified, app);
         match (is_app_class(&qualified, app), parent) {
-            (true, Some(p)) => format!(
-                "class {seg} < {}",
-                super::expr::singleton_scoped_path(&lexically_qualified(p.0.as_str(), &segments[..i], app))
-            ),
+            (true, Some(p)) => {
+                // As the class's own header writes it: `class Rails <
+                // ::Rails::Railtie` inside `module Measured` stays rooted,
+                // since a bare `Rails` there is the `Measured::Rails` being
+                // reopened.
+                let written = library_classes_named(&qualified, app)
+                    .into_iter()
+                    .find(|c| !c.is_module)
+                    .map_or_else(|| p.0.as_str().to_string(), |c| written_parent(c, &p, app));
+                format!("class {seg} < {}", super::expr::singleton_scoped_path(&lexically_qualified(&written, &segments[..i], app)))
+            }
             (true, None)
                 if library_classes_named(&qualified, app)
                     .into_iter()
@@ -13577,10 +13584,18 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
                 _ => false,
             })
     };
+    // A module boot includes into ActiveRecord::Base
+    // (`App::framework_base_includes`) is included at run time, after the
+    // app's own concerns were spliced into their includers at ingest, so
+    // its `extend ActiveSupport::Concern` is what gives the base its
+    // `ClassMethods` (measured 3.2.1's `Measured::Rails::ActiveRecord::
+    // Weight`). The tree's Concern port (runtime/active_support_concern.rb)
+    // runs it.
+    let base_included_concern = lc.is_module && app.framework_base_includes.contains(&lc.name);
     lc.unknown_calls
         .iter()
         .filter(|call| {
-            if port_extend(call) {
+            if port_extend(call) || (base_included_concern && is_concern_extend(call)) {
                 return true;
             }
             let ExprNode::Send { recv, method, .. } = &*call.node else { return false };

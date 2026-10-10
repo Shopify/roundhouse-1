@@ -213,7 +213,8 @@ fn is_model_dsl(name: &str) -> bool {
 
 /// Class-side methods every lowered model answers at class-body time:
 /// Ruby's Module/Class/Kernel surface, and what the Ruby-family runtime's
-/// core extensions add (`Module#delegate`, `Object#present?`).
+/// core extensions add (`Module#delegate`, `Object#present?`,
+/// `Module#redefine_method` of active_support/core_ext/module/redefine_method).
 const CLASS_SIDE_BUILTINS: &[&str] = &[
     "!", "!=", "<", "<=", "<=>", "==", "===", ">", ">=", "Array", "Float", "Hash", "Integer", "String",
     "__method__", "alias_method", "ancestors", "attr", "attr_accessor", "attr_reader", "attr_writer",
@@ -228,8 +229,8 @@ const CLASS_SIDE_BUILTINS: &[&str] = &[
     "present?", "private", "private_class_method", "private_constant", "private_instance_methods",
     "private_method_defined?", "proc", "protected", "protected_method_defined?", "public",
     "public_class_method", "public_constant", "public_instance_method", "public_instance_methods",
-    "public_method", "public_method_defined?", "puts", "raise", "remove_instance_variable",
-    "remove_method", "require", "require_relative", "respond_to?", "singleton_class", "singleton_class?",
+    "public_method", "public_method_defined?", "puts", "raise", "redefine_method",
+    "redefine_singleton_method", "remove_instance_variable", "remove_method", "require", "require_relative", "respond_to?", "singleton_class", "singleton_class?",
     "singleton_methods", "sprintf", "superclass", "tap", "then", "throw", "to_s", "undef_method", "warn",
     "yield_self",
 ];
@@ -254,7 +255,8 @@ const RUNTIME_CLASS_MACROS: &[&str] = &["typed_store", "typed_stores", "store_ac
 
 /// Blocks that run later, or with another `self`: their bodies are not
 /// class-body effects of the macro.
-const DEFERRED_BLOCK_METHODS: &[&str] = &["define_method", "define_singleton_method", "lambda", "proc"];
+const DEFERRED_BLOCK_METHODS: &[&str] =
+    &["define_method", "define_singleton_method", "redefine_method", "redefine_singleton_method", "lambda", "proc"];
 
 
 /// The class side a model-body call is answered from: the class's own
