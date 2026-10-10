@@ -151,6 +151,50 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     diags
 }
 
+/// Ruby family: a SUBCLASSED model's own class methods get their bare
+/// `new` back. [`apply_class_body_new_lowering`] bound it to the owner
+/// for every target, and for a model it only reports the subclass case
+/// ([`monomorphize_subclassed`]); CRuby has the late binding the strict
+/// targets lack, so `self.new` there builds the receiving class as Ruby
+/// does. `Markets::Region.find_or_initialize_all` reached as
+/// `Markets::Subdivision.find_or_initialize_all` builds Subdivisions, not
+/// Regions that fail `validates :type`. The receiver this pass wrote
+/// carries the whole call's span; an author-written `Owner.new` constant
+/// is a strict sub-range of its call and keeps its class.
+pub(crate) fn unbind_subclassed_model_new(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
+    let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
+    let private = private_constructors(app);
+    let mut subclassed = subclassed_names(app);
+    subclassed.retain(|name| models.contains(name.as_str()) && !private.contains(name));
+    fn unbind(expr: &mut Expr, owner: &[Symbol]) {
+        if matches!(&*expr.node, ExprNode::MethodDefExpr { .. }) {
+            return;
+        }
+        expr.node.for_each_child_mut(&mut |c| unbind(c, owner));
+        let span = expr.span;
+        let ExprNode::Send { recv, method, .. } = &mut *expr.node else { return };
+        if method.as_str() != "new" {
+            return;
+        }
+        if recv.as_ref().is_some_and(|r| {
+            r.span == span && matches!(&*r.node, ExprNode::Const { path } if path[..] == owner[..])
+        }) {
+            *recv = None;
+        }
+    }
+    for lc in lcs.iter_mut() {
+        if !subclassed.contains(lc.name.0.as_str()) {
+            continue;
+        }
+        let owner: Vec<Symbol> = lc.name.0.as_str().split("::").map(Symbol::from).collect();
+        for m in &mut lc.methods {
+            if m.receiver == MethodReceiver::Class && !m.name_span.is_synthetic() {
+                unbind(&mut m.body, &owner);
+            }
+        }
+    }
+}
+
 /// Classes whose class-side `new` is private or protected: the nearest
 /// `private_class_method :new` / `public_class_method :new` along the
 /// superclass chain in this tree decides. A superclass is looked up from
@@ -233,8 +277,9 @@ fn monomorphize_subclassed(
                 "inherited class-side constructor",
                 format!(
                     "`{}.{}` builds with a bare `new` and `{owner}` is subclassed in this \
-                     tree, so a subclass calling it gets a `{owner}` where Ruby would give \
-                     it a subclass instance. Only library classes are monomorphized here.",
+                     tree, so on the strict targets a subclass calling it gets a `{owner}` where \
+                     Ruby would give it a subclass instance (the ruby family keeps the bare \
+                     `new`). Only library classes are monomorphized here.",
                     owner,
                     method.name.as_str(),
                 ),

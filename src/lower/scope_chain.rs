@@ -3688,9 +3688,13 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
         // root on — it is read back as the implicit self it stands for.
         // Outside a scope body the constant keeps its class-level
         // reading, which is what the strict targets and every direct
-        // `Message.paged?` call want.
+        // `Message.paged?` call want. A relation-taking user class
+        // method's body (`Markets::Region.find_or_initialize_all`'s
+        // `scope.or(where(attributes))`) reads it the same way when the
+        // receiver is that pass's own — synthetic, or given the whole
+        // call's span — rather than an author-written constant.
         Some(r)
-            if ctx.self_const_is_implicit
+            if (ctx.self_const_is_implicit || r.span.is_synthetic() || r.span == span)
                 && ctx.scope_body.as_ref().is_some_and(|(m, _)| {
                     INGEST_QUALIFIED_AR_CALLS.contains(&method.as_str())
                         && const_model(&r, ctx.models).as_ref() == Some(m)
@@ -4821,6 +4825,58 @@ fn rewrite_relation_taking_body(
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
+    spawn_shared_roots(body, rel_param);
+}
+
+/// The runtime relation's chain methods mutate in place — the scope
+/// method spawns once on entry — so a body that roots on `__rel` more
+/// than once, or inside a block that may run many times, had every root
+/// write the same object: `Markets::Region.find_or_initialize_all`'s
+/// `reduce(none) { |scope, a| scope.or(where(a)) }` read `__rel.none`
+/// and then `__rel.where(a)` on that very empty relation. Rails answers
+/// a new relation from each, so each root takes its own `__rel.spawn`.
+/// A body with one root outside any block keeps the bare form.
+fn spawn_shared_roots(body: &mut Expr, rel: &Symbol) {
+    fn is_root(e: &Expr, rel: &Symbol) -> bool {
+        matches!(&*e.node, ExprNode::Send { recv: Some(r), method, .. }
+            if is_relation_chain_method(method.as_str())
+                && matches!(&*r.node, ExprNode::Var { name, .. } if name == rel))
+    }
+    fn count(e: &Expr, rel: &Symbol, in_block: bool, roots: &mut usize, repeated: &mut bool) {
+        if is_root(e, rel) {
+            *roots += 1;
+            *repeated |= in_block;
+        }
+        let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+        e.node.for_each_child(&mut |c| count(c, rel, in_block, roots, repeated));
+    }
+    fn spawn(e: &mut Expr, rel: &Symbol) {
+        e.node.for_each_child_mut(&mut |c| spawn(c, rel));
+        if !is_root(e, rel) {
+            return;
+        }
+        let ExprNode::Send { recv: Some(r), .. } = &mut *e.node else { return };
+        let span = r.span;
+        let ty = r.ty.clone();
+        let shared = std::mem::replace(r, syn(span, ExprNode::Lit { value: Literal::Nil }));
+        let mut spawned = syn(
+            span,
+            ExprNode::Send {
+                recv: Some(shared),
+                method: Symbol::from("spawn"),
+                args: Vec::new(),
+                block: None,
+                parenthesized: false,
+            },
+        );
+        spawned.ty = ty;
+        *r = spawned;
+    }
+    let (mut roots, mut repeated) = (0, false);
+    count(body, rel, false, &mut roots, &mut repeated);
+    if roots > 1 || repeated {
+        spawn(body, rel);
+    }
 }
 
 /// Rewrite a non-scope-body expression (controller action, library-class
