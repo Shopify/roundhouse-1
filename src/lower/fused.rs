@@ -321,6 +321,8 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
     let readers = super::assoc_loaded::association_readers_by_model(app);
     let flat_loaded = super::assoc_loaded::flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
+    let modules = super::assoc_loaded::module_has_many(app, &by_model);
+    super::assoc_loaded::rename_shadowed_module_predicates(app);
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         walk_postorder(body, &mut |e| {
@@ -334,6 +336,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
+                &modules,
                 &readers,
                 &flat_loaded,
             );
@@ -351,6 +354,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
+                &modules,
                 &readers,
                 &flat_loaded,
             );
@@ -368,6 +372,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &json_map,
                 &sole_includer,
                 &by_model,
+                &modules,
                 &readers,
                 &flat_loaded,
             );
@@ -385,6 +390,7 @@ fn rewrite_mid_node(
     json_map: &super::has_json::HasJsonColumns,
     sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    modules: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
     readers: &super::assoc_loaded::AssociationReaders,
     flat_loaded: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
 ) {
@@ -407,7 +413,7 @@ fn rewrite_mid_node(
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);
     }
-    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, readers, flat_loaded);
+    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, modules, readers, flat_loaded);
     super::arel_sql_order::rewrite_node(e);
 }
 

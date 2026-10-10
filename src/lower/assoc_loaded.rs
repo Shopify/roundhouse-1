@@ -106,6 +106,117 @@ pub(crate) fn flat_loaded_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol
     out
 }
 
+/// Concern modules whose includers are all models, each with the
+/// has_many names every includer declares. Core's
+/// `HasSyncedActiveRecordMetafields` declares `has_many :metafields` on
+/// each includer from its `included` hook, and its own methods ask
+/// `owner.metafields.loaded?` with `owner = self`: every includer
+/// answers the flat `metafields_loaded?`, so the hop flattens in the
+/// module body too, whichever includer runs it.
+pub(crate) fn module_has_many(
+    app: &App,
+    by_model: &HashMap<ClassId, HashSet<Symbol>>,
+) -> HashMap<ClassId, HashSet<Symbol>> {
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
+    for (module, includers) in app.includers_of_modules() {
+        let mut common: Option<HashSet<Symbol>> = None;
+        for id in &includers {
+            let Some(names) = by_model.get(id) else {
+                common = None;
+                break;
+            };
+            common = Some(match common {
+                None => names.clone(),
+                Some(c) => c.intersection(names).cloned().collect(),
+            });
+        }
+        if let Some(names) = common.filter(|c| !c.is_empty()) {
+            out.insert(module, names);
+        }
+    }
+    out
+}
+
+/// A concern's private method named like an includer's synthesized
+/// flat predicate (`metafields_loaded?(owner)` in
+/// `HasSyncedActiveRecordMetafields`) is shadowed by it: the model's own
+/// `def metafields_loaded?` wins over the included module's, and the
+/// concern's calls fail with "given 1, expected 0". Rails has no such
+/// method on the model (its predicate is `association(:x).loaded?`), so
+/// the concern's method keeps its meaning under a name only it uses:
+/// the def and its implicit-self calls in the module and its model
+/// includers move to `<module>__<name>`. Private, so no explicit
+/// receiver elsewhere can name it. The flat predicate keeps its one
+/// name for every other pass.
+pub(crate) fn rename_shadowed_module_predicates(app: &mut App) {
+    let flat_loaded = flat_loaded_by_model(app);
+    let includers = app.includers_of_modules();
+    let mut renames: Vec<(ClassId, Vec<ClassId>, Symbol, Symbol)> = Vec::new();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        let Some(users) = includers.get(&lc.name) else { continue };
+        for m in &lc.methods {
+            if m.receiver != crate::dialect::MethodReceiver::Instance
+                || m.visibility != crate::dialect::MethodVisibility::Private
+                || m.name_span.is_synthetic()
+            {
+                continue;
+            }
+            let Some(assoc) = m.name.as_str().strip_suffix("_loaded?") else { continue };
+            let assoc = Symbol::from(assoc);
+            if !users
+                .iter()
+                .any(|id| flat_loaded.get(id).is_some_and(|names| names.contains(&assoc)))
+            {
+                continue;
+            }
+            // An includer's own def overrides the concern's in Rails too.
+            if app.models.iter().filter(|model| users.contains(&model.name)).any(|model| {
+                model.body.iter().any(|item| {
+                    matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+                        if method.name == m.name
+                            && method.receiver == crate::dialect::MethodReceiver::Instance)
+                })
+            }) {
+                continue;
+            }
+            let prefix = crate::naming::snake_case(&lc.name.0.as_str().replace("::", ""));
+            let renamed = Symbol::from(format!("{prefix}__{}", m.name.as_str()));
+            renames.push((lc.name.clone(), users.iter().cloned().collect(), m.name.clone(), renamed));
+        }
+    }
+    for (module, users, from, to) in renames {
+        fn rename_calls(e: &mut Expr, from: &Symbol, to: &Symbol) {
+            e.node.for_each_child_mut(&mut |c| rename_calls(c, from, to));
+            if let ExprNode::Send { recv, method, .. } = &mut *e.node {
+                let implicit = match recv {
+                    None => true,
+                    Some(r) => matches!(&*r.node, ExprNode::SelfRef),
+                };
+                if implicit && method == from {
+                    *method = to.clone();
+                }
+            }
+        }
+        if let Some(lc) = app.library_classes.iter_mut().find(|lc| lc.name == module) {
+            for m in &mut lc.methods {
+                if m.name == from && m.receiver == crate::dialect::MethodReceiver::Instance {
+                    m.name = to.clone();
+                }
+                rename_calls(&mut m.body, &from, &to);
+            }
+        }
+        for model in app.models.iter_mut().filter(|m| users.contains(&m.name)) {
+            for item in &mut model.body {
+                if let crate::dialect::ModelBodyItem::Method { method, .. } = item {
+                    if method.receiver == crate::dialect::MethodReceiver::Instance {
+                        rename_calls(&mut method.body, &from, &to);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve which model owns the association hop.
 ///
 /// Typed explicit receiver wins — including a union, but only when every
@@ -199,14 +310,16 @@ pub fn apply_assoc_loaded_lowering(app: &mut App) -> Vec<Diagnostic> {
     let readers = association_readers_by_model(app);
     let flat_loaded = flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
+    let modules = module_has_many(app, &by_model);
+    rename_shadowed_module_predicates(app);
     super::for_each_owned_hook_body(app, &mut |owner, e| {
-        rewrite(e, owner, &sole_includer, &by_model, &readers, &flat_loaded);
+        rewrite(e, owner, &sole_includer, &by_model, &modules, &readers, &flat_loaded);
     });
     for view in &mut app.views {
-        rewrite(&mut view.body, None, &sole_includer, &by_model, &readers, &flat_loaded);
+        rewrite(&mut view.body, None, &sole_includer, &by_model, &modules, &readers, &flat_loaded);
     }
     super::for_each_test_body(app, &mut |e| {
-        rewrite(e, None, &sole_includer, &by_model, &readers, &flat_loaded);
+        rewrite(e, None, &sole_includer, &by_model, &modules, &readers, &flat_loaded);
     });
     Vec::new()
 }
@@ -216,13 +329,14 @@ fn rewrite(
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
+    modules: &HashMap<ClassId, HashSet<Symbol>>,
     readers: &AssociationReaders,
     flat_loaded: &HashMap<ClassId, HashSet<Symbol>>,
 ) {
     expr.node.for_each_child_mut(&mut |c| {
-        rewrite(c, enclosing, sole_includer, by_model, readers, flat_loaded)
+        rewrite(c, enclosing, sole_includer, by_model, modules, readers, flat_loaded)
     });
-    rewrite_node(expr, enclosing, sole_includer, by_model, readers, flat_loaded);
+    rewrite_node(expr, enclosing, sole_includer, by_model, modules, readers, flat_loaded);
 }
 
 pub(crate) fn rewrite_node(
@@ -230,6 +344,7 @@ pub(crate) fn rewrite_node(
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
+    modules: &HashMap<ClassId, HashSet<Symbol>>,
     readers: &AssociationReaders,
     flat_loaded: &HashMap<ClassId, HashSet<Symbol>>,
 ) {
@@ -249,7 +364,10 @@ pub(crate) fn rewrite_node(
         return;
     };
     let proxy_call = matches!(method.as_str(), "reload" | "reset");
-    if (method.as_str() != "loaded?" && !proxy_call) || !args.is_empty() {
+    // `record.comments.target`: CollectionProxy#target, the loaded (or
+    // built) records without a load — the synthesized `comments_target`.
+    let target_read = method.as_str() == "target";
+    if (method.as_str() != "loaded?" && !proxy_call && !target_read) || !args.is_empty() {
         return;
     }
     let ExprNode::Send {
@@ -268,17 +386,14 @@ pub(crate) fn rewrite_node(
     // Scope by the association receiver's model (`message` in
     // `message.boosts.loaded?`), not a global name set — a has_one or
     // plain method of the same name on another class must stay.
-    let Some(owner_model) =
-        resolve_owner_model(owner.as_ref(), enclosing, sole_includer, by_model, assoc)
-    else {
-        return;
+    let declares = |id: &ClassId| by_model.get(id).is_some_and(|names| names.contains(assoc));
+    let owner_model = match resolve_owner_model(owner.as_ref(), enclosing, sole_includer, by_model, assoc) {
+        Some(id) if declares(&id) => id,
+        _ => match module_owner(owner.as_ref(), enclosing, modules, assoc) {
+            Some(id) => id,
+            None => return,
+        },
     };
-    let Some(names) = by_model.get(&owner_model) else {
-        return;
-    };
-    if !names.contains(assoc) {
-        return;
-    }
     if proxy_call {
         // `record.comments.reload` / `.reset`: Rails' CollectionProxy
         // runs it on the association. Marked for the trees that carry
@@ -298,7 +413,11 @@ pub(crate) fn rewrite_node(
         expr.hint = Some(crate::expr::IrHint::AssociationProxy);
         return;
     }
-    let flat = Symbol::from(format!("{}_loaded?", assoc.as_str()));
+    let flat = if target_read {
+        Symbol::from(format!("{}_target", assoc.as_str()))
+    } else {
+        Symbol::from(format!("{}_loaded?", assoc.as_str()))
+    };
     // Explicit `message.boosts.loaded?` keeps `message` as receiver.
     // Implicit-self `boosts.loaded?` collapses to `self.boosts_loaded?`
     // — the same SelfRef hop `has_json` uses for `settings.foo?`.
@@ -323,8 +442,34 @@ pub(crate) fn rewrite_node(
             parenthesized: false,
         },
     );
-    rewritten.ty = Some(Ty::Bool);
+    rewritten.ty = if target_read { expr.ty.clone() } else { Some(Ty::Bool) };
     *expr = rewritten;
+}
+
+/// In a module `module_has_many` admits, the module owns `assoc` when
+/// the hop's receiver is its self: implicit, `self`, or a local the
+/// analyzer typed as the module or left untyped (`owner = self` under
+/// `#: self as untyped`).
+fn module_owner(
+    recv: Option<&Expr>,
+    enclosing: Option<&ClassId>,
+    modules: &HashMap<ClassId, HashSet<Symbol>>,
+    assoc: &Symbol,
+) -> Option<ClassId> {
+    let module = enclosing?;
+    if !modules.get(module).is_some_and(|names| names.contains(assoc)) {
+        return None;
+    }
+    let admits = match recv {
+        None => true,
+        Some(r) if matches!(&*r.node, ExprNode::SelfRef) => true,
+        Some(r) => match r.ty.as_ref() {
+            None | Some(Ty::Untyped) => true,
+            Some(Ty::Class { id, .. }) => id == module,
+            _ => false,
+        },
+    };
+    admits.then(|| module.clone())
 }
 
 /// `association(:creator).loaded?` → `creator_loaded?` (or

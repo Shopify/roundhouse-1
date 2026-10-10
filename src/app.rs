@@ -1343,6 +1343,18 @@ impl App {
     pub fn sole_includer_of_modules(
         &self,
     ) -> crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
+        self.includers_of_modules()
+            .into_iter()
+            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
+            .collect()
+    }
+
+    /// Module → every non-module class that includes it, directly or
+    /// through another module (`sole_includer_of_modules` keeps the
+    /// modules with exactly one).
+    pub fn includers_of_modules(
+        &self,
+    ) -> crate::det::HashMap<crate::ident::ClassId, std::collections::BTreeSet<crate::ident::ClassId>> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::det::HashMap;
         let modules: BTreeSet<&crate::ident::ClassId> = self
@@ -1409,9 +1421,6 @@ impl App {
             }
         }
         includers
-            .into_iter()
-            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
-            .collect()
     }
     pub const SCHEMA_VERSION: u32 = 1;
 
