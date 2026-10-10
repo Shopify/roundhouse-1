@@ -15,7 +15,10 @@
 //! `ArgumentError: Unspecified pod_id` (13 unit-1000 ids). The library
 //! body now stays the Concern, its block carried onto the includer, and
 //! the `setup` it calls while app/models eager-loads is held until the
-//! test runner's callbacks load.
+//! test runner's callbacks load. A block calling the Concern's own
+//! ClassMethods (Core's MemcachedHelper: `included do
+//! install_memory_memcached_callbacks end`) runs after the includer is
+//! extended with them, as Concern#append_features orders it.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -44,11 +47,32 @@ const HELPER: &str = r#"module PodHelper
 end
 "#;
 
+const CACHE_HELPER: &str = r#"module CacheHelper
+  extend ActiveSupport::Concern
+
+  included do
+    install_cache_callbacks
+  end
+
+  module ClassMethods
+    def install_cache_callbacks
+      setup(:setup_cache, prepend: true)
+    end
+  end
+
+  def setup_cache
+    $cache = :fresh
+  end
+end
+"#;
+
 const INITIALIZER: &str = r#"require_relative "../helpers/pod_helper"
+require_relative "../helpers/cache_helper"
 
 module ActiveSupport
   class TestCase
     include PodHelper
+    include CacheHelper
   end
 end
 "#;
@@ -59,6 +83,10 @@ class PodTest < ActiveSupport::TestCase
   test "the concern's included block registered its setup" do
     assert_equal 0, $pod
     assert patched?
+  end
+
+  test "a class method the included block calls registered its setup" do
+    assert_equal :fresh, $cache
   end
 end
 "#;
@@ -73,10 +101,11 @@ fn a_support_concern_included_into_test_case_runs_its_included_block() {
             "test_paths:\n  - test/support/helpers\n  - test/support/initializers\n  - test/models\n",
         )
         .write("test/support/helpers/pod_helper.rb", HELPER)
+        .write("test/support/helpers/cache_helper.rb", CACHE_HELPER)
         .write("test/support/initializers/active_support_test_case.rb", INITIALIZER)
         .write("test/test_helper.rb", "require_relative \"support/initializers/active_support_test_case\"\n")
         .write("test/models/pod_test.rb", TEST)
         .run_test("test/models/pod_test.rb");
     run.assert_passes();
-    assert!(run.stdout.contains("1 tests passed") || run.stdout.contains("1 runs"), "{}", run.stdout);
+    assert!(run.stdout.contains("2 tests passed") || run.stdout.contains("2 runs"), "{}", run.stdout);
 }

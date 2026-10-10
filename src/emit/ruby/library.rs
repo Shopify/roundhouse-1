@@ -9611,7 +9611,15 @@ fn emit_library_class_decl_inner(
         }
         let root = inc.0.as_str().trim_start_matches("::");
         let groups = || carried_attributes.iter().filter(|g| root_of(&g.after) == root);
-        if groups().next().is_some() {
+        // Concern#append_features extends the includer with ClassMethods
+        // before it runs the `included do` block: a carried statement may
+        // call one (Core's MemcachedHelper: `included do
+        // install_memory_memcached_callbacks end`).
+        let carries_statements = app
+            .included_block_statements
+            .get(&lc.name)
+            .is_some_and(|statements| statements.iter().any(|(after, _)| after.0.as_str().trim_start_matches("::") == root));
+        if groups().next().is_some() || carries_statements {
             let reached = reached_by(root);
             for carrier in &spliced_extends {
                 let owned = crate::app::class_methods_carrier_owner(carrier).is_some_and(|o| reached.contains(&root_of(&o)));
