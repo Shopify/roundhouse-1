@@ -64,9 +64,8 @@ fn trusted_id_attribute_defines_its_reader_and_records_the_class() {
     let app = app();
     let diagnostics: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter().map(|d| d.to_string()).collect();
     let dropped: Vec<&String> = diagnostics.iter().filter(|d| d.contains("trusted_id_attribute")).collect();
-    // The `attribute: :id` form branches on composite_primary_key?: left alone.
-    assert_eq!(dropped.len(), 1, "{dropped:?}");
-    assert!(dropped[0].contains("model macro call on `Merch::Product` not lowered"), "{dropped:?}");
+    // The `attribute: :id` form too: its reader tests composite_primary_key? when called.
+    assert!(dropped.is_empty(), "{dropped:?}");
     assert!(!diagnostics.iter().any(|d| d.contains("trusted_variant") || d.contains("`db_id`")), "{diagnostics:?}");
 
     let files = roundhouse::emit::ruby::emit_lowered_models(&app);
@@ -87,6 +86,10 @@ fn trusted_id_attribute_defines_its_reader_and_records_the_class() {
         "@_trusted_variant = ::Merch::VariantId.new(db_id)",
         "self.trusted_id_attributes = trusted_id_attributes.merge(shop_id: ::Component::TrustedId)",
         "self.trusted_id_attributes = trusted_id_attributes.merge(variant: ::Merch::VariantId)",
+        "def trusted_id",
+        "if self.class.composite_primary_key?",
+        "@_trusted_id = ::Merch::VariantId.new(db_id)",
+        "self.trusted_id_attributes = trusted_id_attributes.merge(id: ::Merch::VariantId)",
     ] {
         assert!(product.contains(want), "missing `{want}`:\n{product}");
     }

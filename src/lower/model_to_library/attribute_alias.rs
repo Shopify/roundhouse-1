@@ -71,9 +71,23 @@ pub(super) fn demanded_as_alias(
 /// `initialize`/`update`/`update!`, and `self.attribute_aliases`. Runs
 /// after the schema methods are pushed; a model without aliases is left
 /// as it was.
+///
+/// Rails' `define_attribute_methods` also runs `alias_attribute :id_value,
+/// :id` on every model with an `id` column and no `id_value` one; that
+/// alias gets its twins here too. A composite key's `id_value` is the
+/// renamed column reader (`composite_key::rekey`), so it is skipped.
 pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
-    if model.attribute_aliases.is_empty() {
+    let has_column = |name: &str| table.columns.iter().any(|c| c.name.as_str() == name);
+    let implicit_id_value = has_column("id")
+        && !has_column("id_value")
+        && model.composite_primary_key.is_empty()
+        && !model.attribute_aliases.iter().any(|(n, _)| n.as_str() == "id_value");
+    if model.attribute_aliases.is_empty() && !implicit_id_value {
         return;
+    }
+    let mut aliases = model.attribute_aliases.clone();
+    if implicit_id_value {
+        aliases.push((Symbol::from("id_value"), Symbol::from("id")));
     }
     let owner = &model.name;
     let column_spellings: Vec<Symbol> = table
@@ -82,7 +96,7 @@ pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, ta
         .flat_map(|c| [spelling("", c.name.as_str(), ""), spelling("", c.name.as_str(), "="), spelling("", c.name.as_str(), "?")])
         .collect();
     let mut twins: Vec<MethodDef> = Vec::new();
-    for (new, old) in &model.attribute_aliases {
+    for (new, old) in &aliases {
         for (p, s) in PATTERNS {
             let orig = spelling(p, old.as_str(), s);
             let twin = spelling(p, new.as_str(), s);
@@ -104,6 +118,11 @@ pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, ta
         }
     }
     methods.extend(twins);
+    // Without a written alias the runtime's `attribute_aliases` (the
+    // `id_value` one) answers and the hash-taking methods resolve as is.
+    if model.attribute_aliases.is_empty() {
+        return;
+    }
     for m in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
         match m.name.as_str() {
             "[]" | "[]=" => add_alias_arms(&mut m.body, &model.attribute_aliases),

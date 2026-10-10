@@ -1240,12 +1240,46 @@ module ActiveRecord
       end
     end
     
-    # `record.update_column(name, value)` — write one attribute straight
-    # to the row, skipping validations and callbacks. Sets the in-memory
-    # value via the `[]=` indexer, then persists via the same adapter
-    # path `save` uses.
-    def update_column(name, value)
-      self[name] = value
+    # `record.update_column(name, value, touch:)` — Rails'
+    # `update_columns(name => value, touch: touch)`, through whatever
+    # `update_columns` the model answers (Core's MutationGuard overrides
+    # both and calls `super`).
+    def update_column(name, value, touch: nil)
+      update_columns(name => value, touch: touch)
+    end
+    
+    # `record.update_columns(attributes)` — write the attributes straight
+    # to the row, skipping validations and callbacks. Sets each in-memory
+    # value via the `[]=` indexer (an alias names its column), then
+    # persists via the same adapter path `save` uses. Rails refuses a new
+    # or destroyed record. A `touch: true` key also sets the update
+    # timestamps the record has, unless given; Rails' named-column touch
+    # is refused by name.
+    def update_columns(attributes)
+      raise ActiveRecordError, "cannot update a new record" if new_record?
+      raise ActiveRecordError, "cannot update a destroyed record" if destroyed?
+      writes = {}
+      touch = nil
+      attributes.each do |name, value|
+        key = name.to_s
+        key = self.class.attribute_aliases[key] || key
+        if key == "touch"
+          touch = value
+        else
+          writes[key] = value
+        end
+      end
+      if touch
+        unless touch == true
+          raise NotImplementedError, "#{self.class.name}#update_columns(touch: #{touch.inspect}): only touch: true is ported"
+        end
+        now = ActiveSupport.db_now
+        cols = self.class.schema_columns
+        ["updated_at", "updated_on"].each do |col|
+          writes[col] = now if cols.include?(col.to_sym) && !writes.key?(col)
+        end
+      end
+      writes.each { |key, value| self[key] = value }
       _adapter_update
       true
     end

@@ -1969,6 +1969,9 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                         "find"
                             | "find_by"
                             | "find_by!"
+                            | "first!"
+                            | "last!"
+                            | "take!"
                             | "find_sole_by"
                             | "destroy_by"
                             | "delete_by"
@@ -2367,9 +2370,29 @@ pub struct Ctx<'a> {
     pub track_targets: bool,
     /// See [`Registries::plain_subclasses`].
     pub plain_subclasses: &'a HashMap<ClassId, ClassId>,
+    /// See [`Registries::shadowed`].
+    pub shadowed: &'a HashSet<ClassId>,
 }
 
 impl Ctx<'_> {
+    /// The model's constant at a rewritten site: `::`-rooted when a
+    /// nested constant of its first segment exists, which a bare
+    /// reference inside that namespace would resolve to instead
+    /// (`Theme.create!` in `module OnlineStore` reaching the
+    /// `OnlineStore::Theme` module).
+    fn model_const(&self, span: crate::span::Span, model: &ClassId) -> Expr {
+        let mut e = const_expr(span, model);
+        if self.shadowed.contains(model) {
+            if let ExprNode::Const { path } = &mut *e.node {
+                path.insert(0, Symbol::from(""));
+            }
+        }
+        e
+    }
+    fn relation_new(&self, span: crate::span::Span, model: &ClassId) -> Expr {
+        relation_new_of(span, self.model_const(span, model))
+    }
+
     /// Does a call to scope `method` on `model` keep the relation? False
     /// for a scope proved to answer some other value
     /// ([`UserMethodReturns::non_relation_scopes`]).
@@ -2447,6 +2470,7 @@ impl Ctx<'_> {
             user_returns: self.user_returns,
             track_targets: self.track_targets,
             plain_subclasses: self.plain_subclasses,
+            shadowed: self.shadowed,
         }
     }
 }
@@ -2591,7 +2615,7 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
         "find_each" | "find_in_batches" => true,
         _ => matches!(
             name,
-            "ids" | "pluck" | "count" | "first" | "last" | "exists?" | "any?" | "empty?" | "size"
+            "ids" | "pluck" | "count" | "first" | "last" | "first!" | "last!" | "take!" | "exists?" | "any?" | "empty?" | "size"
                 | "length"
                 | "destroy_all"
                 | "delete_all"
@@ -3780,7 +3804,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     if on_self {
                         relation_new_of(span, syn(span, ExprNode::SelfRef))
                     } else {
-                        relation_new(span, &self_class)
+                        ctx.relation_new(span, &self_class)
                     }
                 };
                 if method.as_str() == "all" && args.is_empty() && block.is_none() {
@@ -3792,7 +3816,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     let recv = if on_self {
                         syn(span, ExprNode::SelfRef)
                     } else {
-                        const_expr(span, &self_class)
+                        ctx.model_const(span, &self_class)
                     };
                     *expr = put(span, Some(recv), method, args, block, true);
                     return keeps.then_some(self_model);
@@ -3827,12 +3851,12 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         || CLASS_ROOT_TERMINALS.contains(&method.as_str()))
                 {
                     let _ = lower_relation_args(&m, &method, &mut args, ctx);
-                    let seed = relation_new(span, &sub);
+                    let seed = ctx.relation_new(span, &sub);
                     *expr = put(span, Some(seed), method, args, block, parenthesized);
                     return Some(m);
                 }
                 if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
-                    *expr = put(span, Some(relation_new(span, &sub)), counted, args, block, parenthesized);
+                    *expr = put(span, Some(ctx.relation_new(span, &sub)), counted, args, block, parenthesized);
                     return None;
                 }
             }
@@ -3885,7 +3909,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     let build = syn(
                         span,
                         ExprNode::Send {
-                            recv: Some(const_expr(span, &m)),
+                            recv: Some(ctx.model_const(span, &m)),
                             method: Symbol::from("new"),
                             args: vec![var_expr(span, &attrs)],
                             block: None,
@@ -3970,7 +3994,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         let build = syn(
                             span,
                             ExprNode::Send {
-                                recv: Some(const_expr(span, &m)),
+                                recv: Some(ctx.model_const(span, &m)),
                                 method: Symbol::from("new"),
                                 args: vec![var_expr(span, &attrs)],
                                 block: None,
@@ -4065,7 +4089,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     || method.as_str() == "all"
                     || CLASS_ROOT_TERMINALS.contains(&method.as_str())
                 {
-                    let seed = relation_new(span, &m);
+                    let seed = ctx.relation_new(span, &m);
                     if method.as_str() == "all" {
                         *expr = seed;
                     } else {
@@ -4081,7 +4105,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // relation, as the chain methods above do. Answers an
                 // Array, not a relation: no model to thread.
                 if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
-                    *expr = put(span, Some(relation_new(span, &m)), counted, args, block, parenthesized);
+                    *expr = put(span, Some(ctx.relation_new(span, &m)), counted, args, block, parenthesized);
                     return None;
                 }
                 let returns = ctx.user_returns.class.get(&(m.clone(), method.clone())).cloned();
@@ -4337,7 +4361,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             if let Some(merged) = merged {
                                 *expr = put(
                                     span,
-                                    Some(const_expr(span, &target)),
+                                    Some(ctx.model_const(span, &target)),
                                     Symbol::from(ctor_name),
                                     merged,
                                     block,
@@ -4399,7 +4423,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             let mut seed = syn(
                                 span,
                                 ExprNode::Send {
-                                    recv: Some(relation_new(span, &target)),
+                                    recv: Some(ctx.relation_new(span, &target)),
                                     method: Symbol::from(seed_method),
                                     args: vec![fk_hash],
                                     block: None,
@@ -4452,7 +4476,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 let new_args = thread_rel(args, seed, Some(leading), span);
                                 *expr = put(
                                     span,
-                                    Some(const_expr(span, &target)),
+                                    Some(ctx.model_const(span, &target)),
                                     method,
                                     new_args,
                                     block,
@@ -4468,7 +4492,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                 let new_args = thread_rel(args, seed, leading, span);
                                 *expr = put(
                                     span,
-                                    Some(const_expr(span, &target)),
+                                    Some(ctx.model_const(span, &target)),
                                     method,
                                     new_args,
                                     block,
@@ -4623,7 +4647,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         };
                         *expr = put(
                             span,
-                            Some(const_expr(span, &mr)),
+                            Some(ctx.model_const(span, &mr)),
                             method,
                             vec![seed],
                             None,
@@ -4640,7 +4664,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     let leading = ctx.scope_params(&mr, &method);
                     let keeps = ctx.scope_keeps_relation(&mr, &method);
                     let new_args = thread_rel(args, r, leading, span);
-                    *expr = put(span, Some(const_expr(span, &mr)), method, new_args, block, true);
+                    *expr = put(span, Some(ctx.model_const(span, &mr)), method, new_args, block, true);
                     return keeps.then_some(mr);
                 }
                 // A registered association-scoped class method takes the
@@ -4652,7 +4676,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // — so the model does not survive the call.
                 if let Some(leading) = ctx.assoc_class_method_params(&mr, &method) {
                     let new_args = thread_rel(args, r, Some(leading), span);
-                    *expr = put(span, Some(const_expr(span, &mr)), method, new_args, block, true);
+                    *expr = put(span, Some(ctx.model_const(span, &mr)), method, new_args, block, true);
                     return None;
                 }
                 if is_relation_chain_method(method.as_str()) {
@@ -4793,6 +4817,7 @@ fn rewrite_relation_taking_body(
         track_targets: false,
         user_returns: &empty_returns,
         plain_subclasses: no_plain_subclasses(),
+        shadowed: no_shadowed(),
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -4834,6 +4859,7 @@ pub fn rewrite_call_site_in(
         user_returns: regs.user_returns,
         track_targets: regs.track_targets,
         plain_subclasses: regs.plain_subclasses,
+        shadowed: regs.shadowed,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -4861,12 +4887,37 @@ pub struct Registries<'a> {
     /// seeds a relation on the subclass, as `Asset.order(:id)` does on
     /// the model.
     pub plain_subclasses: &'a HashMap<ClassId, ClassId>,
+    /// Models whose bare constant a nested namespace shadows
+    /// ([`shadowed_models`]): a rewrite writes them `::`-rooted.
+    pub shadowed: &'a HashSet<ClassId>,
 }
 
 /// No plain model subclasses: the registries of a caller with no app.
 pub fn no_plain_subclasses() -> &'static HashMap<ClassId, ClassId> {
     static EMPTY: std::sync::OnceLock<HashMap<ClassId, ClassId>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(HashMap::default)
+}
+
+/// No shadowed models: the registries of a caller with no app.
+pub fn no_shadowed() -> &'static HashSet<ClassId> {
+    static EMPTY: std::sync::OnceLock<HashSet<ClassId>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashSet::default)
+}
+
+/// The models whose first constant segment `A` is also the last segment
+/// of some nested constant `P::A` (a model, class or module): Ruby
+/// resolves a bare `A` written inside `P` to `P::A`, so a rewrite that
+/// names the model there has to root it.
+pub fn shadowed_models<'a>(models: &'a [Model], constants: impl Iterator<Item = &'a str>) -> HashSet<ClassId> {
+    let nested: HashSet<&str> = constants
+        .chain(models.iter().map(|m| m.name.0.as_str()))
+        .filter_map(|c| c.rsplit_once("::").map(|(_, last)| last))
+        .collect();
+    models
+        .iter()
+        .filter(|m| nested.contains(m.name.0.as_str().split("::").next().unwrap_or("")))
+        .map(|m| m.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -5098,6 +5149,7 @@ mod tests {
             unique_keys: empty_unique_keys(),
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
+            shadowed: no_shadowed(),
         }
     }
 
@@ -5119,6 +5171,7 @@ mod tests {
             instance_self: None,
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
+            shadowed: no_shadowed(),
             user_returns: empty_returns(),
         }
     }
@@ -5390,6 +5443,7 @@ mod tests {
             instance_self: None,
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
+            shadowed: no_shadowed(),
         }
     }
 

@@ -214,6 +214,8 @@ module ActiveRecord
     def order_by_key: (String direction) -> bool
     def key_order_terms: (String direction) -> Array[String]
     def first!: () -> Base
+    def last!: () -> Base
+    def take!: () -> Base
     def last: () -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
