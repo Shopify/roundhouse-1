@@ -1086,7 +1086,36 @@ module ActiveRecord
       unless _retypable_attribute_names.include?(name)
         raise NotImplementedError, "#{self.name}.serialize(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
       end
-      @__serialized_attributes = (@__serialized_attributes || {}).merge(name => decoration)
+      _decorate_attribute(name, decoration)
+    end
+
+    # attribute_registration.rb's `decorate_attributes(names = nil,
+    # &decorator)`, for a call the class body makes at load: each named
+    # attribute's type becomes what the block returns for (name, type),
+    # applied when the types are first read, in declaration order with
+    # the `serialize` decorations (Rails keeps both as pending
+    # modifications). Core's Checkout wraps `line_items`' type in
+    # Shopify::BigDecimalDecorator before serializing it. As for
+    # `attribute`, a column whose compiled accessors do not consult a
+    # declared type raises NotImplementedError, and so does the nil
+    # `names` (every attribute) form.
+    def self.decorate_attributes(names = nil, &decorator)
+      if names.nil?
+        raise NotImplementedError, "#{self.name}.decorate_attributes without names: decorating every attribute is not ported"
+      end
+      list = []
+      Array(names).each { |n| list << n.to_s }
+      list.each do |name|
+        unless _retypable_attribute_names.include?(name)
+          raise NotImplementedError, "#{self.name}.decorate_attributes([#{name.inspect}]): the compiled accessors for `#{name}` do not consult a declared type"
+        end
+      end
+      list.each { |name| _decorate_attribute(name, ->(cast_type) { decorator.call(name, cast_type) }) }
+      nil
+    end
+
+    def self._decorate_attribute(name, decoration)
+      @__attribute_decorations = (@__attribute_decorations || []) + [[name, decoration]]
       _reset_attribute_types
       nil
     end
@@ -1186,9 +1215,10 @@ module ActiveRecord
     private_constant :IGNORED_COLUMNS_NONE
     
     # Read on every retypable accessor and bind, so memoized; a later
-    # `attribute` or `serialize` here or in a superclass clears it. A
-    # serialized column's decoration (Type::Serialized::Decoration) wraps
-    # the type it would otherwise have.
+    # `attribute`, `serialize` or `decorate_attributes` here or in a
+    # superclass clears it. A decoration (a serialized column's
+    # Type::Serialized::Decoration, a `decorate_attributes` block) wraps
+    # the type it would otherwise have, in declaration order.
     def self._declared_attribute_types
       @__declared_types_memo ||= begin
         parent = superclass
@@ -1198,8 +1228,8 @@ module ActiveRecord
           own[n] = type.is_a?(Symbol) ? ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) : type
         end
         types = inherited.merge(own)
-        serialized = @__serialized_attributes || {} #: Hash[String, untyped]
-        serialized.each { |n, decoration| types[n] = decoration.call(types[n] || _cast_type_for_spec(n, schema_column_types[n])) }
+        decorations = @__attribute_decorations || [] #: Array[[String, untyped]]
+        decorations.each { |n, decoration| types[n] = decoration.call(types[n] || _cast_type_for_spec(n, schema_column_types[n])) }
         types
       end
     end
@@ -1762,6 +1792,17 @@ module ActiveRecord
       attr_name = attr_name.to_s
       attr_name = self.class.attribute_aliases[attr_name] || attr_name
       _has_attribute?(attr_name)
+    end
+
+    # attribute_methods/before_type_cast.rb's
+    # read_attribute_before_type_cast (a String or Symbol name, an alias
+    # read as its column): the column's stored value, from the compiled
+    # `attributes_before_type_cast`. A name that is no column answers
+    # nil, as Rails' attribute set does for an unknown key.
+    def read_attribute_before_type_cast(attr_name)
+      name = attr_name.to_s
+      name = self.class.attribute_aliases[name] || name
+      attributes_before_type_cast[name]
     end
 
     def _has_attribute?(attr_name)

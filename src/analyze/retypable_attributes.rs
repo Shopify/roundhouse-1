@@ -72,6 +72,7 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
             names.extend(call_names);
         }
         names.extend(body_statements(m).filter_map(|e| serialized_column(e, table)).map(|c| c.as_str().to_string()));
+        names.extend(body_statements(m).filter_map(|e| decorated_columns(e, table)).flatten().map(|c| c.as_str().to_string()));
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
@@ -449,6 +450,38 @@ pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Op
         .then(|| column.name.clone())
 }
 
+/// A direct `decorate_attributes([:col, ...]) { |name, type| ... }` body
+/// statement naming columns of `table`, every name a literal: Rails
+/// (attribute_registration.rb) replaces each named attribute's type with
+/// what the block returns for it, in declaration order with the
+/// `serialize` decorations (Core's Checkout wraps `line_items`' type in
+/// Shopify::BigDecimalDecorator before serializing it). So the columns
+/// take the retypable path and the call runs at class load as written,
+/// for the runtime's `decorate_attributes`. A call naming no column, or
+/// a name that is not a literal, stays unclaimed.
+pub(crate) fn decorated_columns(expr: &Expr, table: &crate::schema::Table) -> Option<Vec<Symbol>> {
+    let ExprNode::Send { recv, method, args, block: Some(block), .. } = &*expr.node else { return None };
+    if method.as_str() != "decorate_attributes" || !on_self(recv) {
+        return None;
+    }
+    if !matches!(&*block.node, ExprNode::Lambda { .. }) {
+        return None;
+    }
+    let [names_arg] = args.as_slice() else { return None };
+    if !literal_only(names_arg) {
+        return None;
+    }
+    let mut names = Vec::new();
+    literal_names(names_arg, &mut names);
+    if names.is_empty() {
+        return None;
+    }
+    names
+        .iter()
+        .map(|n| table.columns.iter().find(|c| c.name.as_str() == n).map(|c| c.name.clone()))
+        .collect()
+}
+
 /// The spans of the body calls the stamped columns answer, every
 /// argument a literal: the model's own app class macro calls that reach
 /// `attribute` naming only `retypable_attributes`, or `query_constraints`
@@ -464,13 +497,15 @@ pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Op
 /// `model_to_library::unclaimed_unknowns` and the STI subclass check skip
 /// these by span. Needs the model's `retypable_attributes` and
 /// `query_constraints` stamped. The model's own `serialize` calls with an
-/// app coder (`serialized_column`) are claimed too, and the direct
+/// app coder (`serialized_column`) and its `decorate_attributes` calls
+/// (`decorated_columns`) are claimed too, and the direct
 /// `attribute ..., default:` calls (`defaulted_attribute`) of the model
 /// and its STI subclasses.
 pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::Span> {
     let mut out = Vec::new();
     if let Some(table) = app.schema.tables.get(&model.table.0) {
         out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
+        out.extend(body_statements(model).filter(|e| decorated_columns(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| alias_attribute_decl(e, table).is_some()).map(|e| e.span));
         let side = ClassSide::of(model, app);

@@ -89,6 +89,8 @@ module ActiveRecord
     def self._cast_type_for_spec: (String name, Array[(Symbol | Integer | String)?] spec) -> ActiveModel::Type::Value
     def self.attribute: (String | Symbol name, ?untyped type, ?default: untyped, **untyped options) -> nil
     def self.serialize: (String | Symbol attr_name, ?coder: untyped, ?type: untyped, ?comparable: bool, ?yaml: Hash[Symbol, untyped], **untyped options) -> nil
+    def self.decorate_attributes: (?untyped names) { (String, untyped) -> untyped } -> nil
+    def self._decorate_attribute: (String name, untyped decoration) -> nil
     def self._retypable_attribute_names: () -> Array[String]
     def self._defaulted_attribute_names: () -> Array[String]
     def self._declared_attribute_defaults: () -> Hash[String, untyped]
@@ -158,6 +160,7 @@ module ActiveRecord
     def _note_unloaded: (Hash[String, untyped] row) -> nil
     def has_attribute?: (String | Symbol attr_name) -> bool
     def _has_attribute?: (untyped attr_name) -> bool
+    def read_attribute_before_type_cast: (String | Symbol attr_name) -> untyped
     def self.has_attribute?: (String | Symbol attr_name) -> bool
     def self._has_attribute?: (untyped attr_name) -> bool
     def self.reflect_on_all_associations: (?Symbol? macro) -> Array[untyped]
