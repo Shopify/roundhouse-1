@@ -39,10 +39,15 @@ fn rails_logger_writes_the_log_device_like_rails() {
         "default: level: 0",
         "default: outputs to log/test.log: true",
         "default: warnings: []",
+        // Rails 8.2's shape: a BroadcastLogger over a TaggedLogging logger.
+        "default: class: \"ActiveSupport::BroadcastLogger\"",
+        "default: broadcasts: [[\"ActiveSupport::Logger\", true]]",
+        "default: second log: \"to both\\nblock to both\\n\"",
         "default: log: \"debug line\\ninfo line\\nx\\n",
         "info: level: 1",
         "info: debug block called: false",
         "info: log: \"info line\\nx\\n",
+        "[req-1] [shop] tagged line\\n[outer] tagged without a block\\ndebug block, no args\\n",
         "unwritable: outputs to STDERR: true",
         "unwritable: stderr: \"Rails Error: Unable to access log file. Please ensure that ROOT/log/test.log exists",
     ] {
@@ -50,8 +55,8 @@ fn rails_logger_writes_the_log_device_like_rails() {
     }
 }
 
-/// A configured logger the tree cannot carry (no ::Logger: Rails 8.2's
-/// TaggedLogging/BroadcastLogger shapes) is refused by name, and the log
+/// A configured logger the tree cannot carry (neither a ::Logger nor an
+/// ActiveSupport::BroadcastLogger) is refused by name, and the log
 /// still goes to the framework default device rather than stderr.
 #[test]
 fn rails_logger_refuses_a_logger_it_cannot_carry_by_name() {
