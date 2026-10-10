@@ -15641,12 +15641,46 @@ fn body_files(name: &str, app: &App) -> crate::det::HashSet<u32> {
         }
     };
     for c in library_classes_named(name, app) {
-        c.methods.iter().for_each(|m| add(&m.body.span));
+        c.methods.iter().filter(|m| !inherited_copy(c, m, app)).for_each(|m| add(&m.body.span));
         c.constants.iter().for_each(|(_, e)| add(&e.span));
         c.class_ivar_initializers.iter().for_each(|e| add(&e.span));
         c.unknown_calls.iter().for_each(|e| add(&e.span));
     }
     out
+}
+
+/// Whether `m`, a class-side method of `c`, is a copy of one an
+/// ancestor writes (`lower::class_body_new::monomorphize_subclassed`
+/// copies an inherited constructing method into each descendant, body
+/// span and all): its body was written in the ancestor's file, not in
+/// one of `c`'s. Counted as `c`'s, Core's `GraphApi::ObjectType.
+/// authorized_new` put object_type.rb among the files of `Home::Feed`
+/// and of each card nested under it, so no card was written apart from
+/// Feed and all 27 were merged into feed.rb, where `Payment`'s `include
+/// IsIconType` read a constant nothing had loaded.
+fn inherited_copy(c: &LibraryClass, m: &crate::dialect::MethodDef, app: &App) -> bool {
+    if m.receiver != MethodReceiver::Class || m.body.span.file.0 == 0 {
+        return false;
+    }
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut current = c.name.0.as_str().to_string();
+    let mut parent = c.parent.clone();
+    while let Some(p) = parent {
+        let ancestor = lexical_parent(&current, &p, app).0.as_str().trim_start_matches("::").to_string();
+        if !seen.insert(ancestor.clone()) {
+            return false;
+        }
+        let classes = library_classes_named(&ancestor, app);
+        if classes.is_empty() {
+            return false;
+        }
+        if classes.iter().any(|a| a.methods.iter().any(|am| am.name == m.name && am.receiver == m.receiver && am.body.span == m.body.span)) {
+            return true;
+        }
+        parent = classes.iter().find_map(|a| a.parent.clone());
+        current = ancestor;
+    }
+    false
 }
 
 /// A class that can absorb its nested classes: a LIBRARY class, not a

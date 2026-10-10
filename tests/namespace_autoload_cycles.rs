@@ -213,3 +213,44 @@ fn an_implementer_loads_its_interface_first() {
     let run = interface_app().run_ruby_env("p Cards::Simple.interfaces\np Card.interface?\n", &[RUBYOPT]);
     assert_quiet(&run, "[Card]\ntrue\n");
 }
+
+/// Core's GraphApi::Admin::Home::Feed shape: `Feed < ObjectType`, and
+/// each card nested under it in a file of its own, a subclass of the
+/// same base, that includes a sibling module from another file. The
+/// base's class-side constructor (`ObjectType.authorized_new`, a bare
+/// `new`) is copied into every descendant with its body span, which put
+/// object_type.rb among the files of Feed and of each card: no card was
+/// written apart from Feed, all were merged into feed.rb, and Feed's
+/// file read `IconMixin` (Zeitwerk's autoload, natively) before anything
+/// loaded it.
+fn feed_app() -> emit_and_run::Overlay {
+    base()
+        .write(
+            "app/graphql/base_type.rb",
+            "class BaseType\n  def self.build(object)\n    new(object)\n  end\n\n  def initialize(object)\n    @object = object\n  end\nend\n",
+        )
+        .write("app/graphql/feed.rb", "class Feed < BaseType\n  def self.label\n    \"feed\"\n  end\nend\n")
+        .write(
+            "app/graphql/feed/cards/icon_mixin.rb",
+            "class Feed\n  module Cards\n    module IconMixin\n      def icon\n        \"icon:#{self.class.name}\"\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/feed/cards/payment.rb",
+            "class Feed\n  module Cards\n    class Payment < BaseType\n      include IconMixin\n    end\n  end\nend\n",
+        )
+}
+
+#[test]
+fn a_nested_class_of_its_own_file_loads_from_it_not_the_parents() {
+    let run = feed_app().run_ruby_env("p Feed.label\np Feed::Cards::Payment.build(1).icon\n", &[RUBYOPT]);
+    assert_quiet(&run, "\"feed\"\n\"icon:Feed::Cards::Payment\"\n");
+    let feed = std::fs::read_to_string(run.emitted.join("app/models/feed.rb")).expect("feed.rb");
+    assert!(!feed.contains("class Payment"), "{feed}");
+    assert!(run.emitted.join("app/models/feed/cards/payment.rb").exists());
+}
+
+#[test]
+fn the_nested_class_loads_first() {
+    let run = feed_app().run_ruby_env("p Feed::Cards::Payment.build(1).icon\np Feed.label\n", &[RUBYOPT]);
+    assert_quiet(&run, "\"icon:Feed::Cards::Payment\"\n\"feed\"\n");
+}
