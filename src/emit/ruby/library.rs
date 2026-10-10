@@ -12549,6 +12549,10 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Opt
                 .filter(|c| {
                     !is_body_statement(c)
                         && !dropped.iter().any(|d| std::ptr::eq(*d, *c))
+                        // Run on each includer, not where it stands: Core's
+                        // MemcachedHelper registers on and includes its
+                        // blocker above its `included do`.
+                        && !carried_included_block(lc, c, app)
                         && !(defines_only && defines_apart(lc, call, c))
                         && !own.runs(c)
                         && !names_own_method_above(lc, c)
@@ -14900,13 +14904,7 @@ pub(crate) fn dropped_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> V
         return Vec::new();
     }
     let own = modelled_class_body_calls(lc, app);
-    // A Concern's `included do` that ingest gave every class it runs
-    // on (or reported there) is not missing from any of them.
-    let carried_block = |call: &Expr| {
-        app.carried_included_blocks.contains(&lc.name)
-            && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
-                if method.as_str() == "included")
-    };
+    let carried_block = |call: &Expr| carried_included_block(lc, call, app);
     // A `delegate_missing_to` is written as the `method_missing` pair
     // placed at it (`ingest::delegate::missing_delegators`), added
     // to the methods above.
@@ -14928,6 +14926,15 @@ pub(crate) fn dropped_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> V
                 && !trailing_freeze(lc, app).is_some_and(|f| std::ptr::eq(f, *call))
         })
         .collect()
+}
+
+/// Whether `call` is a Concern's `included do` that ingest gave every
+/// class it runs on (or reported there): not missing from any of them,
+/// and not written in the module's own body.
+fn carried_included_block(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    app.carried_included_blocks.contains(&lc.name)
+        && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
+            if method.as_str() == "included")
 }
 
 /// The body's closing `freeze` (`self.freeze`), which Ruby runs after

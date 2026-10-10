@@ -277,3 +277,129 @@ fn an_untyped_stored_local_is_reported_by_its_source_name() {
     assert!(text.contains("class-body local `reason` holds a value with no inferred type"), "{text}");
     assert!(!text.contains("RH_BODY_LOCAL"), "{text}");
 }
+
+/// Core's `TestMacros::MemcachedHelper` builds a `TestAccessBlocker <
+/// Module` into a body local, registers two stores on it (a method
+/// object, a lambda, a squished heredoc) and includes it through `self
+/// #: untyped` / `.include(blocker)`, below a `class << self` def and
+/// above its `included do`. Ruby runs those statements in source order;
+/// dropping them left every includer without `unblock_memcached`. Native
+/// Ruby on the same source is the oracle.
+const BLOCKER: &str = r#"# frozen_string_literal: true
+
+class AccessBlocker < Module
+  attr_reader :registrations
+
+  def initialize(name)
+    super()
+    @registrations = []
+    blocker = self
+    define_method("unblock_#{name}") do
+      blocker.registrations.map { |r| r[:key] }
+    end
+  end
+
+  def register(getter:, setter:, key:, message:)
+    @registrations << { getter: getter, setter: setter, key: key, message: message }
+  end
+end
+"#;
+
+const CACHE_HELPER: &str = r#"# frozen_string_literal: true
+
+require "active_support/concern"
+require "access_blocker"
+
+module CacheHelper
+  extend(ActiveSupport::Concern)
+
+  class << self
+    def label
+      "cache"
+    end
+  end
+
+  blocker = AccessBlocker.new("cache")
+  blocker.register(
+    getter: Kernel.method(:rand),
+    setter: Kernel.method(:srand),
+    key: "rails_cache",
+    message: "Rails.cache is in memory."
+  )
+  blocker.register(
+    getter: Kernel.method(:rand),
+    setter: lambda { |store|
+      stores = {} #: Hash[Symbol, untyped]
+      stores[:local] = store
+    },
+    key: "local_store",
+    message: <<~MSG.squish
+      The local store is in memory.
+      Use the real one rarely.
+    MSG
+  )
+  self #: untyped
+    .include(blocker)
+
+  included do
+    attr_accessor :installed
+  end
+
+  def helper_keys
+    unblock_cache
+  end
+end
+"#;
+
+const CACHE_USER: &str = r#"# frozen_string_literal: true
+
+require "cache_helper"
+
+class CacheUser
+  include CacheHelper
+end
+"#;
+
+const BLOCKER_REPORT: &str = "u = CacheUser.new\nu.installed = 1\n\
+    p u.unblock_cache, u.helper_keys, u.installed, CacheHelper.label, CacheHelper.ancestors.first(2).map(&:class)\n";
+
+#[test]
+fn a_body_local_module_is_registered_on_and_included_as_in_native_ruby() {
+    let dir = std::env::temp_dir().join(format!("roundhouse-body-locals-blocker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in [("access_blocker.rb", BLOCKER), ("cache_helper.rb", CACHE_HELPER), ("cache_user.rb", CACHE_USER)] {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    let native = std::process::Command::new("ruby")
+        .arg("-I")
+        .arg(&dir)
+        .arg("-ractive_support")
+        .arg("-ractive_support/core_ext/string/filters")
+        .arg("-e")
+        .arg(format!("require \"cache_user\"\n{BLOCKER_REPORT}"))
+        .output()
+        .expect("native Ruby control");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(expected.starts_with("[\"rails_cache\", \"local_store\"]\n"), "native control: {expected}");
+
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\nend\n")
+        .write("lib/access_blocker.rb", BLOCKER)
+        .write("lib/cache_helper.rb", CACHE_HELPER)
+        .write("lib/cache_user.rb", CACHE_USER)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let helper = std::fs::read_to_string(emitted.join("app/models/cache_helper.rb")).unwrap();
+    assert!(helper.contains("self.include(RH_BODY_LOCAL_blocker_"), "{helper}");
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("require \"./main\"\n{BLOCKER_REPORT}"))
+        .current_dir(&emitted)
+        .output()
+        .expect("spawn ruby");
+    assert!(output.status.success(), "emitted program failed in {}:\n{}", emitted.display(), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
