@@ -22,7 +22,7 @@
 //! "active_merchant/billing/gateways/x"` it registers is one the emitted
 //! autoloader registers (`project`'s gem autoloads). Only that closed
 //! vocabulary is read: `__FILE__`, string literals and interpolation,
-//! `String#+`, `String#camelize`, `File.dirname`/`basename`/`join`,
+//! `String#+`, `String#camelize`, `String#to_sym`, `File.dirname`/`basename`/`join`,
 //! `Pathname.new`, `Pathname#relative_path_from`/`sub_ext`/`to_s`, body
 //! locals assigned from those, and `Dir[pattern]`/`Dir.glob(pattern)`
 //! with `*`, `?` and `**/`. Anything else is not this shape, and the
@@ -50,11 +50,12 @@ impl Value {
 }
 
 /// One glob loop of a body: the byte span of its statement and the
-/// `(constant, feature)` autoloads it registers.
+/// `(constant, file)` autoloads it registers.
 pub(crate) struct Loop {
     pub(crate) start: usize,
-    /// The `(constant, feature)` pairs; the emitted autoloader registers
-    /// the constant at the file defining it, so the feature is not read.
+    /// The `(constant, file)` pairs, `file` the matched path the block
+    /// registered it for; the emitted autoloader registers the constant
+    /// at the file defining it, so the feature itself is not read.
     pub(crate) autoloads: Vec<(String, String)>,
 }
 
@@ -86,8 +87,9 @@ pub(crate) fn body_loops(statements: &[Node<'_>], file: &str, listing: Option<&[
 }
 
 /// The full constant names a file's glob loops autoload, each under the
-/// class or module whose body registers it.
-pub(crate) fn file_autoloads(source: &str, file: &str, listing: &[String]) -> Vec<String> {
+/// class or module whose body registers it, with the matched file whose
+/// block iteration registered it.
+pub(crate) fn file_autoloads(source: &str, file: &str, listing: &[String]) -> Vec<(String, String)> {
     let result = ruby_prism::parse(source.as_bytes());
     let root = result.node();
     let mut out = Vec::new();
@@ -216,7 +218,7 @@ fn dir_order(paths: &mut [String]) {
     paths.sort_by(|a, b| a.split('/').cmp(b.split('/')));
 }
 
-fn declarations(statements: &[Node<'_>], nesting: &[String], file: &str, listing: &[String], out: &mut Vec<String>) {
+fn declarations(statements: &[Node<'_>], nesting: &[String], file: &str, listing: &[String], out: &mut Vec<(String, String)>) {
     for statement in statements {
         let (path, body) = if let Some(module) = statement.as_module_node() {
             (module_name_path(&module), module.body())
@@ -230,8 +232,8 @@ fn declarations(statements: &[Node<'_>], nesting: &[String], file: &str, listing
         let nesting: Vec<String> = nesting.iter().cloned().chain(path).collect();
         let statements = flatten_statements(body);
         for found in body_loops(&statements, file, Some(listing)) {
-            for (name, _) in found.autoloads {
-                out.push(format!("{}::{name}", nesting.join("::")));
+            for (name, path) in found.autoloads {
+                out.push((format!("{}::{name}", nesting.join("::")), path));
             }
         }
         declarations(&statements, &nesting, file, listing, out);
@@ -271,7 +273,7 @@ fn glob_loop(
     let mut autoloads = Vec::new();
     for path in matches {
         let mut scope = locals.clone();
-        scope.insert(param.clone(), Value::Str(path));
+        scope.insert(param.clone(), Value::Str(path.clone()));
         let mut registered = false;
         for statement in &body {
             if let Some(write) = statement.as_local_variable_write_node() {
@@ -279,7 +281,8 @@ fn glob_loop(
                 scope.insert(constant_id_str(&write.name()).to_string(), value);
                 continue;
             }
-            autoloads.push(autoload(statement, file, &scope)?);
+            let (name, _feature) = autoload(statement, file, &scope)?;
+            autoloads.push((name, path.clone()));
             registered = true;
         }
         if !registered {
@@ -402,6 +405,9 @@ fn eval(node: &Node<'_>, file: &str, scope: &HashMap<String, Value>) -> Option<V
             match (recv, method.as_str(), values.as_slice()) {
                 (Value::Str(a), "+", [Value::Str(b)]) => Some(Value::Str(a + b)),
                 (Value::Str(s), "camelize", []) => camelize(&s).map(Value::Str),
+                // `String#to_sym` (offsite_payments 3.0.1's integrations.rb
+                // names each autoload `filename.camelize.to_sym`).
+                (Value::Str(s), "to_sym", []) => Some(Value::Sym(s)),
                 (Value::Path(p), "relative_path_from", [Value::Path(base) | Value::Str(base)]) => {
                     relative_path_from(p.as_str(), base).map(Value::Path)
                 }

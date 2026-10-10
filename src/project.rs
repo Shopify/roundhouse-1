@@ -8434,7 +8434,10 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // (activemerchant 1.137.0's `Dir[File.dirname(__FILE__) +
     // '/gateways/**/*.rb'].each { … autoload(…) }`), evaluated over the
     // tree's sources (`ingest::autoload_glob`).
-    let glob_autoloads: std::collections::BTreeSet<String> = {
+    // Each with the file it names (offsite_payments 3.0.1's `autoload
+    // integration_class, f`): that file is the constant's autoload, as a
+    // literal `autoload :Name, "path"` names one (`autoload_target`).
+    let glob_autoload_files: Vec<(String, String)> = {
         let listing: Vec<String> = app.sources.iter().map(|source| source.path.clone()).collect();
         app.sources
             .iter()
@@ -8442,6 +8445,8 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             .flat_map(|source| crate::ingest::autoload_glob::file_autoloads(&source.text, &source.path, &listing))
             .collect()
     };
+    let glob_autoloads: std::collections::BTreeSet<String> =
+        glob_autoload_files.iter().map(|(full, _)| full.clone()).collect();
     let required_files: Vec<&crate::span::SourceFile> = app.sources.iter().filter(|source| required_gem_file(&source.path)).collect();
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     // Each name a required gem file writes `autoload :Name` or
@@ -8563,6 +8568,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let autoload_target = |source: &str| -> Option<String> {
         if !required_gem_file(source) {
             return None;
+        }
+        let globbed: Vec<&String> =
+            glob_autoload_files.iter().filter(|(_, file)| file == source).map(|(full, _)| full).collect();
+        if let [one] = globbed.as_slice() {
+            return Some((*one).clone());
         }
         let lib = gem_lib(source)?;
         let rel = rel_of(source);
