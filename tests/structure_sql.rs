@@ -772,6 +772,66 @@ fn fixture_entries_the_loader_cannot_place_are_named() {
     assert!(named.iter().any(|d| d.contains("`ghosts`") && d.contains("not a model")), "{named:?}");
 }
 
+/// Under Core's FasterFixtures a set loads as table rows: `shop:
+/// snowdevil` is the `shop_id` column's reference with no `belongs_to
+/// :shop` and no `shops` set (AccessAndAuth::AppAccess::Change), a
+/// belongs_to with a custom foreign key places through that column, and
+/// a set with `_fixture: table_name` needs a table, not a model, and a
+/// column the model ignores (ShopLegalEntity's `temp_zip`) is still the
+/// table's, as a value or a `<key>_id` reference. Only a
+/// key the table cannot take is named, as the loader raises on it.
+#[test]
+fn faster_fixtures_entries_resolve_through_the_table() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `owners` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\nCREATE TABLE `app_access_changes` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `shop_id` bigint NOT NULL,\n  `api_client_id` bigint NOT NULL,\n  `keeper_ref` bigint DEFAULT NULL,\n  `flow` varchar(255) NOT NULL,\n  `temp_zip` varchar(255) DEFAULT NULL,\n  `primary_location_id` bigint DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\nCREATE TABLE `audit_rows` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `shop_id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/faster_fixtures/fixture_set.rb", "module FasterFixtures\n  class FixtureSet\n  end\nend\n"),
+        ("app/models/owner.rb", "class Owner < ApplicationRecord\nend\n"),
+        ("app/models/change.rb", "class Change < ApplicationRecord\n  self.table_name = \"app_access_changes\"\n  belongs_to :keeper, class_name: \"Owner\", foreign_key: :keeper_ref, optional: true\n  self.ignored_columns += [\"temp_zip\", \"primary_location_id\"]\nend\n"),
+        ("test/fixtures/owners.yml", "ann: {}\n"),
+        ("test/fixtures/changes.yml", "_fixture:\n  table_name: app_access_changes\n  model_class: Change\n\nsnow:\n  shop: snowdevil\n  api_client: marketplace\n  keeper: ann\n  flow: oauth\n  temp_zip: K2P\n  primary_location: hq\n  colour: red\n"),
+        ("test/fixtures/audit_rows.yml", "_fixture:\n  table_name: audit_rows\n\none:\n  shop: snowdevil\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    Analyzer::new(&app).analyze(&mut app);
+    let named: Vec<String> = diagnose(&app).into_iter().map(|d| d.to_string()).filter(|d| d.contains("fixture_entry")).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert!(named[0].contains("`changes`.snow.colour"), "{named:?}");
+}
+
+/// FasterFixtures' `table_rows` resolves a reference with no `<key>_id`
+/// column through the association's one writable foreign key, and writes
+/// the class into `association.foreign_type` (MarketingIntegratedCampaign
+/// Connection's `connectable` on `object_id` / `object_type`), not into a
+/// `<key>_type` column the table does not have.
+#[test]
+fn faster_fixtures_polymorphic_reference_writes_the_declared_foreign_type() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `connections` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `object_id` bigint NOT NULL,\n  `object_type` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/faster_fixtures/fixture_set.rb", "module FasterFixtures\n  class FixtureSet\n  end\nend\n"),
+        ("app/models/connection.rb", "class Connection < ApplicationRecord\n  delegated_type :connectable, types: %w[Campaign], foreign_key: :object_id, foreign_type: :object_type\nend\n"),
+        ("test/fixtures/connections.yml", "one:\n  connectable: summer (Campaign)\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    let sets = roundhouse::lower::fixtures::lower_fixture_rows(&app);
+    let row = &sets[0].rows[0].values;
+    let keys: Vec<&str> = row.keys().map(|k| k.as_str()).collect();
+    assert_eq!(keys, ["id", "object_type", "object_id"], "{row:?}");
+    assert_eq!(row[&roundhouse::Symbol::from("object_type")], roundhouse::lower::fixtures::RawFixtureValue::Str("Campaign".into()));
+    Analyzer::new(&app).analyze(&mut app);
+    let named: Vec<String> = diagnose(&app).into_iter().map(|d| d.to_string()).filter(|d| d.contains("fixture_entry")).collect();
+    assert!(named.is_empty(), "{named:?}");
+}
+
 /// Review r1 cases: a NOT NULL boolean holds `false` (blank to Rails, not
 /// to the generic presence check) and a NOT NULL column with a default
 /// holds the default. The string with no default holds the blank `""` and

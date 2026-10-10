@@ -412,6 +412,9 @@ fn enum_stored_value(
 /// belongs_to whose target label exists. Rails loads each (or raises on an
 /// unknown column), so a dropped entry is different data, not a no-op.
 pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
+    if fixture_rules(app) == FixtureRules::FasterFixtures {
+        return unplaced_faster_fixtures_entries(app);
+    }
     let mut out = Vec::new();
     for fixture in &app.fixtures {
         let class = fixture.class_id();
@@ -432,6 +435,50 @@ pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
                     && model.associations().any(|a| matches!(a, Association::BelongsTo { name, .. } if name == key));
                 if !nil_reference && resolve_field(key, value, Some(model), app).is_empty() {
                     out.push(format!("fixture `{}`.{label}.{key} names neither a {} column nor a belongs_to with that fixture label", fixture.path, class.0));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `unloaded_fixture_entries` for an app that loads through
+/// FasterFixtures (Core). Its sets load as table rows, not through a
+/// model: `shop: snowdevil` is the `shop_id` column's reference whether
+/// or not the model declares `belongs_to :shop` or a `shops` set has
+/// that label, and a set needs a table, not a model. So an entry is
+/// unplaced only when the raw row still names no column of the table
+/// after FasterFixtures' `table_rows` resolution; the loader raises on
+/// it by name (`table "t" has no columns named …`), as Rails would.
+fn unplaced_faster_fixtures_entries(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    for (fixture, set) in app.fixtures.iter().zip(lower_fixture_rows(app)) {
+        // `ActiveStorage::FixtureSet.blob` rows, as above.
+        if !fixture.records.is_empty() && fixture.records.keys().all(|l| fixture.file_blobs.contains_key(l)) {
+            continue;
+        }
+        let Some(columns) = &set.columns else {
+            out.push(format!("fixture set `{}` loads table `{}`, which is not in this tree's schema", set.path, set.table));
+            continue;
+        };
+        // A column every model on the table ignores leaves the compiled
+        // table (`ingest::app`), but it is still the database's: the
+        // loader inserts it, or references through it, by the live
+        // columns, as Rails' `connection.columns` does.
+        let ignored: Vec<&String> = app
+            .models
+            .iter()
+            .filter(|m| m.table.0 == set.table)
+            .flat_map(|m| &m.ignored_columns)
+            .collect();
+        let is_column = |name: &str| columns.iter().any(|(c, _)| c.as_str() == name) || ignored.iter().any(|c| c.as_str() == name);
+        for row in &set.rows {
+            for key in row.values.keys() {
+                if !is_column(key.as_str()) && !is_column(&format!("{key}_id")) {
+                    out.push(format!(
+                        "fixture `{}`.{}.{key} names neither a `{}` column nor a reference through `{key}_id` or a belongs_to foreign key",
+                        set.path, row.label, set.table
+                    ));
                 }
             }
         }
@@ -951,16 +998,20 @@ fn faster_fixtures_row(
         let mut fk_id = format!("{key}_id");
         let mut fk_type = format!("{key}_type");
         if !has_col(&fk_id) {
+            // `association.foreign_type`: the declared `foreign_type:`,
+            // else `<key>_type`.
             let assoc = model.and_then(|m| {
                 m.associations().find_map(|a| match a {
-                    Association::BelongsTo { name, foreign_key, .. } if name == &key => Some(foreign_key.clone()),
+                    Association::BelongsTo { name, foreign_key, foreign_type, .. } if name == &key => {
+                        Some((foreign_key.clone(), foreign_type.clone()))
+                    }
                     _ => None,
                 })
             });
             match assoc {
-                Some(fk) if has_col(fk.as_str()) => {
+                Some((fk, foreign_type)) if has_col(fk.as_str()) => {
                     fk_id = fk.as_str().to_string();
-                    fk_type = format!("{key}_type");
+                    fk_type = foreign_type.map_or_else(|| format!("{key}_type"), |t| t.as_str().to_string());
                 }
                 _ => continue,
             }
