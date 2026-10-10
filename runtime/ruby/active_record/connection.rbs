@@ -141,6 +141,7 @@ module ActiveRecord
     def self._attribute_deserialize: (String name, untyped value) -> untyped
     def self._bind_type_cast: (String name, untyped value) -> untyped
     def self._bind_bool_text: (bool flag) -> String
+    def self._quoted_time: (Time time) -> String
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
     def self._primary_key_from_database: (untyped value) -> untyped
@@ -186,6 +187,7 @@ module ActiveRecord
     def has_attribute?: (String | Symbol attr_name) -> bool
     def _has_attribute?: (untyped attr_name) -> bool
     def read_attribute_before_type_cast: (String | Symbol attr_name) -> untyped
+    def attributes_for_database: () -> Hash[String, untyped]
     def slice: (*untyped methods) -> untyped
     def values_at: (*untyped methods) -> Array[untyped]
     def self.has_attribute?: (String | Symbol attr_name) -> bool

@@ -1458,14 +1458,25 @@ module ActiveRecord
     # compare at all. A number is its digits; a boolean is PostgreSQL's
     # text encoding 't'/'f' of its TRUE/FALSE literal, or SQLite's 1/0
     # literal itself. Only string and text columns take the text; any
-    # other keeps the value its compiled escape expects.
+    # other keeps the value its compiled escape expects. A time of day
+    # (Type::Time::Value) binds as quoting.rb's `quoted_time`, its clock
+    # text, on any column.
     def self._bind_type_cast(name, value)
+      return _quoted_time(value.__getobj__) if defined?(ActiveRecord::Type::Time::Value) && ActiveRecord::Type::Time::Value === value
       text = case value
              when true then _bind_bool_text(true)
              when false then _bind_bool_text(false)
              when Integer, Float then value.to_s
              end
       text && %i[string text].include?(schema_column_types.dig(name, 0)) ? text : value
+    end
+
+    # quoting.rb's `quoted_time` over `quoted_date`: the value Type::Time
+    # serialized (already in the adapter's zone) as its clock time, with
+    # microseconds where it has any.
+    def self._quoted_time(time)
+      text = format("%02d:%02d:%02d", time.hour, time.min, time.sec)
+      time.usec > 0 ? "#{text}.#{format("%06d", time.usec)}" : text
     end
 
     def self._bind_bool_text(flag)
@@ -1488,7 +1499,7 @@ module ActiveRecord
     end
 
     # The spec's type: PostgreSQL's type map answers its OID classes for
-    # a decimal, date, timestamp and uuid column.
+    # a decimal, date, timestamp, jsonb and uuid column.
     def self._cast_type_for_spec(name, spec)
       kind = spec[0]
       case kind
@@ -1497,6 +1508,9 @@ module ActiveRecord
       when :decimal then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Decimal.new(precision: spec[1], scale: spec[2])
       when :date then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Date.new
       when :timestamp then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Timestamp.new(precision: spec[1])
+      when :time then ActiveRecord::Type::Time.new(precision: spec[1])
+      when :json then ActiveRecord::Type::Json.new
+      when :jsonb then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb.new
       when :uuid then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid.new
       when :big_integer then ActiveRecord::Type::BigInteger.new
       when :string then ActiveRecord::Type::String.new(limit: spec[1])
@@ -1993,6 +2007,24 @@ module ActiveRecord
       name = attr_name.to_s
       name = self.class.attribute_aliases[name] || name
       attributes_before_type_cast[name]
+    end
+
+    # attribute_methods.rb's attributes_for_database: each attribute's
+    # value_for_database (its type's `serialize` of the value), by name.
+    # Paquito's ActiveRecordCoder dumps a record with it. An enum column's
+    # compiled slot already holds the stored value, which is what
+    # EnumType#serialize answers, so it is taken as is (the EnumType is
+    # not ported as a cast type).
+    def attributes_for_database
+      specs = self.class.schema_column_types
+      attributes.each_with_object({}) do |(name, value), result|
+        spec = specs[name]
+        result[name] = if spec && spec[0] == :unported && spec[1] == "ActiveRecord::Enum::EnumType"
+          value
+        else
+          self.class.type_for_attribute(name).serialize(value)
+        end
+      end
     end
 
     # core.rb's `slice(*methods)`: each named method's value, by name, in

@@ -1,7 +1,7 @@
 // ActiveModel's attribute types and ActiveRecord::Type's names over them
 // (runtime/spinel/active_model_type.rb: Type::{Value,ImmutableString,
-// String,Integer,BigInteger,Binary,Boolean,DateTime,Decimal} with their helpers,
-// ActiveRecord::Type::{Text,DateTime}) against activemodel / activerecord 8.2.0.alpha
+// String,Integer,BigInteger,Binary,Boolean,DateTime,Decimal,Time} with their helpers,
+// ActiveRecord::Type::{Text,DateTime,Time,Json}, OID::Jsonb) against activemodel / activerecord 8.2.0.alpha
 // (Core's pinned Shopify/rails 5813559f, from CORE_GEM_HOME):
 // tests/active_model_type_runtime.rb runs the same observations natively
 // and on the port and requires every observation equal.
@@ -30,6 +30,10 @@ fn attribute_types_answer_like_activemodel() {
     for seen in [
         "AR::Integer(limit: 8) type: :integer",
         "AR::Text type: :text",
+        "AR::Time(precision: 6) type: :time",
+        "OID::Jsonb type: :jsonb",
+        "Json changed_in_place?: [false, true]",
+        r#"lookup time json: "[\"ActiveRecord::Type::Time\" US-ASCII frozen=true, \"ActiveRecord::Type::Json\""#,
         "AR::DateTime(precision: 6) type: :datetime",
         "ActiveModel::RangeError: 9223372036854775808 is out of range",
         "utc=false zone=\"ABC\"",

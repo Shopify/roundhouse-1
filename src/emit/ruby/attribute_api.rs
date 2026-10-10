@@ -216,6 +216,8 @@ fn declared_spec(ty: &Symbol) -> Expr {
         "binary" => spec("binary", None),
         "immutable_string" => spec("immutable_string", None),
         "value" => spec("value", None),
+        "time" => spec("time", None),
+        "json" => spec("json", None),
         other => unported(&format!("the `:{other}` attribute type")),
     }
 }
@@ -249,10 +251,13 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
         ColumnType::Date => unported("ActiveModel::Type::Date"),
         ColumnType::DateTime if pg => spec("timestamp", None),
         ColumnType::DateTime => unported("ActiveModel::Type::DateTime with the time zone converter"),
-        ColumnType::Time => unported("ActiveModel::Type::Time"),
-        ColumnType::Json if pg => unported("ActiveRecord::Type::Json"),
-        ColumnType::Jsonb if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb"),
-        ColumnType::Json | ColumnType::Jsonb => unported("ActiveRecord::Type::Json"),
+        // `register_class_with_precision m, "time", Type::Time`: an unsized
+        // column (fmod -1) is precision 6 on PostgreSQL; SQLite reads it
+        // from the declared type, which the schema does not keep.
+        ColumnType::Time if pg => spec("time", Some(6)),
+        ColumnType::Time => spec("time", None),
+        ColumnType::Jsonb if pg => spec("jsonb", None),
+        ColumnType::Json | ColumnType::Jsonb => spec("json", None),
         ColumnType::Uuid if pg => spec("uuid", None),
         ColumnType::Uuid => unported("a uuid column type"),
     }

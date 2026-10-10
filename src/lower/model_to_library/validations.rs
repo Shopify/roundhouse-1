@@ -1669,11 +1669,11 @@ fn inline_uniqueness_check(
     // as its type column too, as `where(assoc => record)` writes it.
     let columns = |name: &Symbol| -> Vec<Symbol> {
         for a in model.associations() {
-            if let Association::BelongsTo { name: n, foreign_key, polymorphic, .. } = a {
+            if let Association::BelongsTo { name: n, foreign_key, polymorphic, foreign_type, .. } = a {
                 if n == name {
                     let mut cols = vec![foreign_key.clone()];
                     if *polymorphic {
-                        cols.push(Symbol::from(format!("{}_type", name.as_str())));
+                        cols.push(foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str()))));
                     }
                     return cols;
                 }

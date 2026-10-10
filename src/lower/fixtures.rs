@@ -229,6 +229,7 @@ fn resolve_field_inner(
             target,
             foreign_key,
             polymorphic,
+            foreign_type,
             ..
         } = assoc
         {
@@ -264,7 +265,7 @@ fn resolve_field_inner(
                         },
                     },
                     LoweredFixtureField {
-                        column: Symbol::from(format!("{}_type", name.as_str())),
+                        column: foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str()))),
                         value: LoweredFixtureValue::Literal {
                             ty: Ty::Str,
                             raw: class,
@@ -1106,7 +1107,7 @@ fn rails_row(
     }
     // resolve_sti_reflections: a belongs_to name is its foreign key.
     for assoc in model.associations() {
-        let Association::BelongsTo { name, foreign_key, polymorphic, .. } = assoc else { continue };
+        let Association::BelongsTo { name, foreign_key, polymorphic, foreign_type, .. } = assoc else { continue };
         if name == foreign_key || !row.contains_key(name) {
             continue;
         }
@@ -1120,7 +1121,10 @@ fn rails_row(
                         let tail = s[open + 1..].trim_end();
                         if let Some(class) = tail.strip_suffix(')') {
                             if !class.contains(')') {
-                                row.insert(Symbol::from(format!("{name}_type")), RawFixtureValue::Str(class.to_string()));
+                                row.insert(
+                                    foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{name}_type"))),
+                                    RawFixtureValue::Str(class.to_string()),
+                                );
                                 s = s[..open].trim_end().to_string();
                             }
                         }
