@@ -10130,6 +10130,10 @@ fn emit_library_class_decl_inner(
         NestedPlacement::place(&lc.name, &mut s, |_| true);
     }
 
+    if !railtie && !replays_foreign_class_body(lc, app) && let Some(call) = trailing_freeze(lc, app) {
+        writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();
+    }
+
     for i in (0..depth).rev() {
         writeln!(s, "{}end", "  ".repeat(i)).unwrap();
     }
@@ -14346,8 +14350,32 @@ pub(crate) fn dropped_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> V
                 && !modelled_elsewhere(lc, call)
                 && !written_pair(call)
                 && !is_body_statement(call)
+                && !trailing_freeze(lc, app).is_some_and(|f| std::ptr::eq(f, *call))
         })
         .collect()
+}
+
+/// The body's closing `freeze` (`self.freeze`), which Ruby runs after
+/// everything above it: Core's component/schema.rb `module BooleanType;
+/// freeze; end`. Written as the body's last statement, after every def,
+/// constant and nested class the emit places in it. Only where nothing
+/// the tree writes later adds to the class: a nested class written in a
+/// file of its own, or a reopen, would raise FrozenError where the
+/// source's single body did not.
+pub(crate) fn trailing_freeze<'a>(lc: &'a LibraryClass, app: &App) -> Option<&'a Expr> {
+    let call = lc.unknown_calls.last()?;
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+    let name = lc.name.0.as_str().trim_start_matches("::");
+    let nested = format!("{name}::");
+    let nests = |id: &ClassId| id.0.as_str().trim_start_matches("::").starts_with(&nested);
+    (method.as_str() == "freeze"
+        && args.is_empty()
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && !app.library_class_reopens.contains_key(&lc.name)
+        && !app.models.iter().any(|m| m.name == lc.name || nests(&m.name))
+        && !app.controllers.iter().any(|c| c.name == lc.name || nests(&c.name))
+        && !app.library_classes.iter().any(|other| nests(&other.name)))
+    .then_some(call)
 }
 
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {

@@ -9949,7 +9949,8 @@ const IMPLICIT_NAMESPACE_REQUIRE: &str = r##"
 # Answers the autoload of an implicit namespace
 # (`RoundhouseAutoload.implicit_autoload`), as Zeitwerk's Kernel#require
 # answers a directory's; every other require goes on to Kernel's own
-# `require` as it stood. Kernel's own method, not a module prepended to
+# `require` as it stood, and one that raises restores the autoloads of
+# the programs that failed (`restore_autoloads`). Kernel's own method, not a module prepended to
 # it: Zeitwerk's `alias_method :zeitwerk_original_require, :require`
 # would take the prepended method, whose `super` then has no method of
 # the alias's name (COMPILED_GEM_REQUIRE).
@@ -9961,6 +9962,9 @@ module Kernel
   private def require(feature)
     return RoundhouseAutoload.autovivify(feature) if feature.is_a?(String) && RoundhouseAutoload.implicit?(feature)
     RoundhouseAutoload::REQUIRE_BEFORE_IMPLICIT_NAMESPACES.bind_call(self, feature)
+  rescue Exception
+    RoundhouseAutoload.restore_autoloads
+    raise
   end
 end
 "##;
@@ -10006,6 +10010,32 @@ const AUTOLOAD_RUNTIME: &str = r##"
       next unless mod.is_a?(Module)
       next unless mod.constants(false).include?(name) && !mod.const_defined?(name, false)
       mod.send(:remove_const, name)
+      ((@removed ||= {})[file] ||= []) << [mod, name]
+    end
+  end
+
+  # A require that raised (IMPLICIT_NAMESPACE_REQUIRE): a program that
+  # loaded is forgotten; each whose load failed, no longer loading, gets back
+  # the autoloads `entering_program` removed, as Ruby keeps a constant's
+  # autoload when its file raises: what the failed body defined is
+  # discarded, and the next reference loads the file again and raises
+  # its own error, not "uninitialized constant".
+  def self.restore_autoloads
+    @removed&.delete_if do |file, removed|
+      full = path(file)
+      next true if $LOADED_FEATURES.include?(full) || (File.exist?(full) && $LOADED_FEATURES.include?(File.realpath(full)))
+      next false if loading?(file)
+      @entered&.delete(file)
+      removed.each do |mod, name|
+        mod.send(:remove_const, name) if mod.const_defined?(name, false) && !mod.autoload?(name, false)
+        @registering_autoload = true
+        begin
+          mod.autoload(name, path(file))
+        ensure
+          @registering_autoload = false
+        end
+      end
+      true
     end
   end
 
