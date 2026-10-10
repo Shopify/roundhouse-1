@@ -2660,6 +2660,101 @@ module ActiveSupport
 end
 module ActionController
   class TestCase < TestBase
+    # ActionController::TestCase::Behavior (actionpack 8.2
+    # test_case.rb): the controller, request and response a test's setup
+    # and helpers read, built by the first setup callback. DIVERGENCE,
+    # stated: there is no ActionDispatch::TestResponse, so `response` is
+    # nil, and `process` (get/post/...) is refused by name.
+    module Behavior
+      CONTROLLERS_ROOT = File.expand_path('../app/controllers', __dir__)
+
+      attr_reader :response, :request
+
+      def self.included(base)
+        base.extend(ClassMethods)
+        base.setup :setup_controller_request_and_response
+      end
+
+      module ClassMethods
+        def tests(controller_class)
+          case controller_class
+          when String, Symbol
+            self.controller_class = (controller_class.to_s.camelize + 'Controller').constantize
+          when Class
+            self.controller_class = controller_class
+          else
+            raise ArgumentError, 'controller class must be a String, Symbol, or Class'
+          end
+        end
+
+        # `class_attribute :_controller_class`.
+        def _controller_class
+          return @_controller_class if instance_variable_defined?(:@_controller_class)
+          superclass.respond_to?(:_controller_class) ? superclass._controller_class : nil
+        end
+
+        def controller_class=(new_class)
+          @_controller_class = new_class
+        end
+
+        def controller_class
+          if current_controller_class = _controller_class
+            current_controller_class
+          else
+            self.controller_class = determine_default_controller_class(name)
+          end
+        end
+
+        # ActiveSupport::Testing::ConstantLookup. A candidate's
+        # app/controllers file loads first, as Zeitwerk autoloads it on
+        # the constant's reference: this tree registers no autoload for
+        # controllers.
+        def determine_default_controller_class(name)
+          names = name.to_s.split('::')
+          while names.size > 0
+            names[-1] = names[-1].sub(/Test$/, '')
+            begin
+              file = File.join(CONTROLLERS_ROOT, names.join('::').underscore + '.rb')
+              require file if File.file?(file)
+              constant = names.join('::').safe_constantize
+              break(constant) if Class === constant && constant < ActionController::Metal
+            ensure
+              names.pop
+            end
+          end
+        end
+      end
+
+      def process(action, **)
+        raise NotImplementedError, \"roundhouse: ActionController::TestCase#process (#{action}): controller tests' requests are not ported\"
+      end
+
+      %i[get post patch put delete head].each do |verb|
+        define_method(verb) { |action, **options| process(action, **options) }
+      end
+
+      def setup_controller_request_and_response
+        @controller = nil unless defined? @controller
+
+        if klass = self.class.controller_class
+          if @controller.nil?
+            begin
+              @controller = klass.new
+            rescue
+              warn \"could not construct controller #{klass}\" if $VERBOSE
+            end
+          end
+        end
+
+        @request = ActionController::TestRequest.create(@controller.class)
+
+        if @controller
+          @controller.request = @request
+          @controller.params = {}
+        end
+      end
+    end
+    include Behavior
   end
 end
 ";

@@ -129,7 +129,7 @@ end
 failures = []
 # The report and statement lines, without what each runner prints around
 # them (minitest's progress characters run onto the line that follows).
-reports = ->(lines) { lines.filter_map { |l| l[/\A[.EFS]*((?:sql|start|depths|isolation|raised|posts|after|extra|non-transactional[\w -]*): .*)\z/, 1] } }
+reports = ->(lines) { lines.filter_map { |l| l[/\A[.EFS]*((?:sql|start|depths|isolation|raised|posts|after(?: super)?|before_setup|extra|non-transactional[\w -]*): .*)\z/, 1] } }
 results.each do |side, (files, _storage)|
   files.each_with_index do |(lines, stderr, status), i|
     failures << "#{side} #{TEST_FILES[i]} exited #{status.exitstatus}:\n#{lines.join("\n")}\n#{stderr}" unless status.success?

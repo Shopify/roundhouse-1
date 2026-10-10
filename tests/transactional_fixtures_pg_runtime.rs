@@ -60,6 +60,14 @@ end
 const TRANSACTIONAL_TEST: &str = r##"require "test_helper"
 
 class TransactionalProbeTest < ActiveSupport::TestCase
+  # TestFixtures#before_setup sets up the fixtures (and the test's
+  # transaction) in this `super`: Core resets its Shop.current here first.
+  def before_setup
+    report("before_setup", ActiveRecord::Base.connection.open_transactions)
+    super
+    report("after super", ActiveRecord::Base.connection.open_transactions)
+  end
+
   test "fixture transactions hold every writing pool" do
     report("start", [ActiveRecord::Base.connection.open_transactions, AnimalsRecord.connection.open_transactions, ActiveRecord::Base.connection.transaction_open?])
     ActiveRecord::Base.connection.execute("INSERT INTO posts (title) VALUES ('outer')")

@@ -37,10 +37,13 @@
 # rows run in their own savepoint, so the other sets in the pool still
 # load. Rails would raise the load error from every test's setup.
 #
-# The runner (minitest_runner.rb) calls the hooks below where Rails'
-# before_setup and after_teardown run setup_fixtures and
-# teardown_fixtures: before the test's setup, and after its teardown and
-# after_teardown. Each test starts with fresh fixture accessors, as with
+# setup_fixtures runs in Rails' own `before_setup` (setup_fixtures, then
+# super), so a `before_setup` above it in the test's ancestry runs first:
+# Core's ActiveSupport::TestCase#before_setup resets its GlobalState
+# (Shop.current among it) and only then reaches this. The runner
+# (minitest_runner.rb) calls teardown_fixtures where Rails'
+# after_teardown does: after the test's teardown and after_teardown.
+# Each test starts with fresh fixture accessors, as with
 # Rails' per-test `@fixture_cache`. Rails' `fixture_sets` accessors
 # (`shops(:snowdevil)`, `fixture(:shops, :snowdevil)`) answer through the
 # set's compiled module, where the compiler did not lower the call to it.
@@ -71,6 +74,12 @@ module ActiveRecord
     # ActiveRecord::Fixture::FixtureError: a row naming a column the
     # table does not have.
     class FixtureError < StandardError; end
+
+    # The `sql.active_record` name of the fixtures' DELETEs and INSERTs:
+    # Rails' insert_fixtures_set and Core's FasterFixtures run them as
+    # `execute_batch(statements, "Fixtures Load")`, which a subscriber
+    # (Core's NoSetupMutations) tells from a test's own writes.
+    FIXTURES_LOAD = "Fixtures Load"
 
     # ActiveRecord::FixtureSet::MAX_ID.
     FIXTURE_MAX_ID = 2**30 - 1
@@ -288,7 +297,7 @@ module ActiveRecord
           end
           sql << "(#{names.map { |name| quote_identifier(name) }.join(", ")}) VALUES #{values.join(", ")}"
         end
-        Db.exec(sql)
+        Db.exec(sql, FIXTURES_LOAD)
         rows
       end
 
@@ -412,7 +421,7 @@ module ActiveRecord
                   failed = {}
                   tables.each do |table|
                     begin
-                      conn.transaction(requires_new: true) { Db.exec("DELETE FROM #{quote_table_name(table)}") }
+                      conn.transaction(requires_new: true) { Db.exec("DELETE FROM #{quote_table_name(table)}", FIXTURES_LOAD) }
                     rescue NoMemoryError, SignalException, SystemExit
                       raise
                     rescue Exception => error # rubocop:disable Lint/RescueException
@@ -752,6 +761,12 @@ module ActiveRecord
     # other methods: `fixture(:web_sites, :rubyonrails)`.
     def fixture(fixture_set_name, *fixture_names)
       active_record_fixture(fixture_set_name, *fixture_names)
+    end
+
+    # ActiveRecord::TestFixtures#before_setup.
+    def before_setup # :nodoc:
+      __roundhouse_setup_active_record_fixtures(name)
+      super if defined?(super)
     end
 
     # setup_fixtures, for the test method `name`.

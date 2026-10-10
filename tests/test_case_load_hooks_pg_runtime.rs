@@ -213,12 +213,29 @@ class BehaviorHookTest < ActiveSupport::TestCase
 end
 "#;
 
-const TEST_FILES: [&str; 5] = [
+/// ActionController::TestCase::Behavior's first setup callback: the
+/// controller its name names, and the request a `setup do` block reads
+/// (Core's login helpers reach `request.buyer_session`).
+const CONTROLLER_REQUEST_TEST: &str = r#"require "test_helper"
+
+class NotesControllerTest < ActionController::TestCase
+  setup do
+    @seen = [request.class.name, request.controller_class.name, @controller.class.name, @controller.request.equal?(request), @controller.params.empty?]
+  end
+
+  test "the controller and its request exist before setup blocks run" do
+    assert_equal ["ActionController::TestRequest", "NotesController", "NotesController", true, true], @seen
+  end
+end
+"#;
+
+const TEST_FILES: [&str; 6] = [
     "test/models/hook_order_test.rb",
     "test/models/job_hook_test.rb",
     "test/controllers/controller_hook_test.rb",
     "test/helpers/view_hook_test.rb",
     "test/helpers/behavior_hook_test.rb",
+    "test/controllers/notes_controller_test.rb",
 ];
 
 const PATH_GEMS: &str = "PATH\n  remote: components/widgets\n  specs:\n    widgets (0.1.0)\n\nDEPENDENCIES\n  widgets!\n";
@@ -239,6 +256,7 @@ fn files() -> Vec<(&'static str, String)> {
         ("db/structure.sql", STRUCTURE.into()),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".into()),
         ("app/models/note.rb", "class Note < ApplicationRecord\nend\n".into()),
+        ("app/controllers/notes_controller.rb", "class NotesController < ActionController::Base\nend\n".into()),
         ("app/models/hook_log.rb", HOOK_LOG.into()),
         ("config/initializers/test_hooks.rb", INITIALIZER.into()),
         ("config/initializers/session_store.rb", SESSION_INITIALIZER.into()),
@@ -260,6 +278,7 @@ fn files() -> Vec<(&'static str, String)> {
         (TEST_FILES[2], lines(CONTROLLER_TEST)),
         (TEST_FILES[3], lines(VIEW_TEST)),
         (TEST_FILES[4], lines(BEHAVIOR_TEST)),
+        (TEST_FILES[5], CONTROLLER_REQUEST_TEST.into()),
     ]
 }
 
@@ -355,13 +374,14 @@ exit(ok ? 0 : 1)
 
 /// What native Rails answers (Shopify/rails 5813559f, checked on the task
 /// PostgreSQL), so two identical wrong answers still fail.
-const EXPECTED: [(&str, &str, u64); 7] = [
+const EXPECTED: [(&str, &str, u64); 8] = [
     ("BehaviorHookTest#test_including_the_view_case_behavior_runs_its_hooks_on_the_includer", "pass", 1),
     ("ControllerHookTest#test_controller_hook_helpers_reach_the_test_in_registration_order", "pass", 4),
     ("HookOrderTest#test_a_module_the_hook_block_defines_is_a_top_level_module", "pass", 3),
     ("HookOrderTest#test_hook_helper_reaches_the_test", "pass", 1),
     ("HookOrderTest#test_only_the_active_support_hooks_ran", "pass", 3),
     ("JobHookTest#test_the_job_case_hooks_ran_as_it_loaded", "pass", 2),
+    ("NotesControllerTest#test_the_controller_and_its_request_exist_before_setup_blocks_run", "pass", 1),
     ("ViewHookTest#test_the_view_case_loads_the_controller_case_first", "pass", 2),
 ];
 
