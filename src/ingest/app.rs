@@ -2923,6 +2923,13 @@ end
             .map(|source| super::initializer_programs::relative(dir, Path::new(source)))
             .filter(in_gem_source)
             .collect();
+        let lib_programs: crate::det::HashSet<String> = app
+            .file_programs
+            .iter()
+            .filter(|program| load_path.iter().any(|lib| dir.join(&program.source).starts_with(lib)))
+            .map(|program| super::initializer_programs::relative(dir, Path::new(&program.source)))
+            .filter(|rel| !in_gem_source(rel))
+            .collect();
         let inputs = super::initializer_programs::Inputs {
             vfs,
             dir,
@@ -2931,6 +2938,7 @@ end
             test_load_path: &test_load_path,
             loaded_support: &loaded_support,
             gem_files: &gem_files,
+            lib_programs: &lib_programs,
             lifted: &lifted,
         };
         super::initializer_programs::collect(&mut app, &inputs, &fired);

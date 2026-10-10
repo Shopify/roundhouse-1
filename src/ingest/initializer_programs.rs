@@ -160,6 +160,10 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
     /// emitted tree's compiled-gem `require` to load
     /// (`project::compiled_gem_features`).
     pub gem_files: &'a crate::det::HashSet<String>,
+    /// The file programs (`App::file_programs`) of the other `lib/`
+    /// directories on the load path (the app's, a path gem's), relative
+    /// to the app root: a `require` of one loads its emitted program.
+    pub lib_programs: &'a crate::det::HashSet<String>,
     /// Hooks a runtime port lifts by itself (`on_load_hooks::FIRED_HOOKS`
     /// on PostgreSQL): left to that reader.
     pub lifted: &'a [&'a str],
@@ -892,6 +896,22 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
         // file. Refused, `Hedwig::Process.prepend(…)` below it raised
         // NameError at boot.
         if target.as_ref().is_some_and(|t| inputs.gem_files.contains(&relative(inputs.dir, t))) {
+            return;
+        }
+        // A file of a path gem's (or the app's) `lib/` the tree carries
+        // as a file program, which runs more than declarations (Core's
+        // checkouts/one protobuf.rb initializer: `require
+        // "checkout_protobuf_definitions"`, whose file requires every
+        // `*_pb.rb` beside it): the emitted program, as Ruby loads the
+        // file. Refused, nothing loaded the `_pb.rb` files and
+        // `CheckoutProtobufDefinitions::PurchaseOrders::CustomFields` was
+        // undefined where a codec named it.
+        if let Some(rel) = target.as_ref().map(|t| relative(inputs.dir, t)).filter(|rel| inputs.lib_programs.contains(rel)) {
+            // The holder is emitted at app/models/<holder>.rb.
+            *method = Symbol::from("require_relative");
+            if let ExprNode::Lit { value: Literal::Str { value } } = &mut *args[0].node {
+                *value = format!("roundhouse_files/{}", rel.strip_suffix(".rb").unwrap_or(&rel));
+            }
             return;
         }
         // On the test load path only (a test hook's `require
