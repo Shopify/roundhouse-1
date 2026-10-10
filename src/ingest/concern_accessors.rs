@@ -718,6 +718,32 @@ pub(super) fn splice_into_library_includers(
         }
         false
     };
+    // A test case's class side: ActiveSupport::Testing::SetupAndTeardown's
+    // `setup`/`teardown` (the runner's RoundhouseTestCallbacks port) on
+    // ActiveSupport::TestCase and what inherits it, and Module#prepend
+    // there. Core's ActiveRecordTestHelper, which test/support's
+    // active_support_test_case.rb includes into ActiveSupport::TestCase,
+    // registers `setup(:default_pod_selection)` in its `included do`:
+    // left out, every job a test enqueued had no pod (`Unspecified
+    // pod_id`).
+    let test_case_side = |lc: &crate::dialect::LibraryClass, method: &str| -> bool {
+        if !matches!(method, "setup" | "teardown" | "prepend") {
+            return false;
+        }
+        let mut at = Some(lc);
+        for _ in 0..32 {
+            let Some(class) = at else { return false };
+            if top(&class.name).0.as_str() == "ActiveSupport::TestCase" {
+                return true;
+            }
+            let Some(parent) = class.parent.as_ref() else { return false };
+            if top(parent).0.as_str() == "ActiveSupport::TestCase" {
+                return true;
+            }
+            at = app.library_classes.iter().find(|c| c.name == top(parent));
+        }
+        false
+    };
     let block_includes = |concern: &ClassId| -> Vec<ClassId> {
         app.concern_model_items
             .get(concern)
@@ -927,7 +953,9 @@ pub(super) fn splice_into_library_includers(
                     && let ModelBodyItem::Unknown { expr, .. } = item
                     && let ExprNode::Send { recv, method, .. } = &*expr.node
                     && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
-                    && (class_side.contains(method.as_str()) || gem_class_side(lc, method.as_str()))
+                    && (class_side.contains(method.as_str())
+                        || gem_class_side(lc, method.as_str())
+                        || test_case_side(lc, method.as_str()))
                 {
                     let root_id = top(&lc.includes[*root]);
                     let class_attributes: &[Symbol] = &declared;

@@ -220,6 +220,11 @@ struct Mixin {
     /// methods rather than an includer's copies: reflection on its
     /// methods, or a use the splice does not see (`TestMixins::reached`).
     keeps_helpers: bool,
+    /// For a library module: a library class includes it
+    /// (`TestMixins::library_included`), so its library body stays the
+    /// Concern it is, `extend ActiveSupport::Concern` and `included do`
+    /// with it, and that class's include runs the block natively.
+    library_concern: bool,
     /// The modules in its own ancestry the test files declare, nearest
     /// first (`TestMixins::module_ancestry`): after its lexical scopes,
     /// Ruby looks a constant its bodies read up in these.
@@ -420,6 +425,11 @@ pub(super) struct TestMixins {
     /// with, which errs toward keeping its helpers where that resolves
     /// lexically elsewhere.
     reached: Set<String>,
+    /// The modules a receiverless `include` in the body of a class
+    /// without a superclass names, as written (`reached_modules`): Core's
+    /// `class ActiveSupport::TestCase; include ActiveRecordTestHelper` in
+    /// a test-support initializer. Matched as `reached` is.
+    library_included: Set<String>,
 }
 
 /// What a concern's `included do` block does on the class, as far as a
@@ -551,7 +561,7 @@ impl TestMixins {
         let root = result.node();
         let before = self.decls.len();
         let stmts = root.as_program_node().map(|p| p.statements().body().iter().collect::<Vec<_>>()).unwrap_or_default();
-        reached_modules(&root, &mut self.reached);
+        reached_modules(&root, &mut self.reached, &mut self.library_included);
         let declared = self.declared.entry(file.to_string()).or_default();
         for stmt in stmts {
             scan_node(&stmt, &[], file, &mut self.decls, &mut self.classes, &mut self.known, declared);
@@ -651,10 +661,14 @@ impl TestMixins {
             self.mixins[k].ancestry = ancestry;
             if self.mixins[k].real {
                 let name = &self.mixins[k].name;
-                self.mixins[k].keeps_helpers = self.reached.iter().any(|w| match w.strip_prefix("::") {
+                let names = |w: &String| match w.strip_prefix("::") {
                     Some(full) => name == full,
                     None => name == w || name.ends_with(&format!("::{w}")),
-                });
+                };
+                let keeps_helpers = self.reached.iter().any(names);
+                let library_concern = self.library_included.iter().any(names);
+                self.mixins[k].keeps_helpers = keeps_helpers;
+                self.mixins[k].library_concern = library_concern;
                 if self.mixins[k].fatal.is_none() {
                     match self.library_includes(k) {
                         Ok(kept) => self.mixins[k].kept_includes = kept,
@@ -828,7 +842,7 @@ impl TestMixins {
         for d in self.decls.iter().filter(|d| d.file == file) {
             if let Some(&k) = self.by_name.get(&d.name) {
                 let m = &self.mixins[k];
-                spliced.insert(d.offset, m.real.then_some(LibraryForm { helpers: m.keeps_helpers }));
+                spliced.insert(d.offset, m.real.then_some(LibraryForm { helpers: m.keeps_helpers, concern: m.library_concern }));
                 kept.extend(m.kept_includes.iter().cloned());
             }
         }
@@ -2883,13 +2897,18 @@ fn module_hook(stmt: &Node<'_>) -> Option<String> {
 /// (also through `send`) names with a receiver, at the top level, in a
 /// block, method or `class << …`, or in the body of a class without a
 /// superclass, where the splice does not take the module's helpers.
-fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
+fn reached_modules(root: &Node<'_>, out: &mut Set<String>, included: &mut Set<String>) {
     use ruby_prism::Visit;
     struct Reach<'s> {
         out: &'s mut Set<String>,
+        /// `TestMixins::library_included`.
+        included: &'s mut Set<String>,
         /// Each enclosing scope: whether a receiverless `include` in it is
         /// one the splice handles (a module's or a subclass's body).
         own: Vec<bool>,
+        /// Each enclosing scope: whether it is a class body without a
+        /// superclass.
+        library_class: Vec<bool>,
     }
     impl Reach<'_> {
         fn note(&mut self, node: &Node<'_>) {
@@ -2902,33 +2921,45 @@ fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
     impl<'pr> Visit<'pr> for Reach<'_> {
         fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
             self.own.push(true);
+            self.library_class.push(false);
             ruby_prism::visit_module_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
             self.own.push(node.superclass().is_some());
+            self.library_class.push(node.superclass().is_none());
             ruby_prism::visit_class_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
             self.own.push(false);
+            self.library_class.push(false);
             ruby_prism::visit_singleton_class_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
             self.own.push(false);
+            self.library_class.push(false);
             ruby_prism::visit_def_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
             self.own.push(false);
+            self.library_class.push(false);
             ruby_prism::visit_block_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
             self.own.push(false);
+            self.library_class.push(false);
             ruby_prism::visit_lambda_node(self, node);
             self.own.pop();
+            self.library_class.pop();
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             let name = constant_id_str(&node.name());
@@ -2940,6 +2971,14 @@ fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
             if mixes(name) && !(node.receiver().is_none() && self.own.last() == Some(&true)) {
                 args.iter().for_each(|a| self.note(a));
             }
+            if name == "include" && node.receiver().is_none() && self.library_class.last() == Some(&true) {
+                for a in &args {
+                    if let Some(path) = constant_path_of(a).filter(|p| !p.is_empty()) {
+                        let rooted = a.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                        self.included.insert(format!("{}{}", if rooted { "::" } else { "" }, path.join("::")));
+                    }
+                }
+            }
             let sent = args.first().and_then(|a| a.as_symbol_node()).is_some_and(|s| mixes(&String::from_utf8_lossy(s.unescaped())));
             if matches!(name, "send" | "public_send" | "__send__") && sent {
                 args[1..].iter().for_each(|a| self.note(a));
@@ -2947,7 +2986,7 @@ fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
             ruby_prism::visit_call_node(self, node);
         }
     }
-    Reach { out, own: Vec::new() }.visit(root);
+    Reach { out, included, own: Vec::new(), library_class: Vec::new() }.visit(root);
 }
 
 /// How a library module (`Mixin::real`) is carried (`library_source`).
@@ -2955,6 +2994,8 @@ fn reached_modules(root: &Node<'_>, out: &mut Set<String>) {
 struct LibraryForm {
     /// Its instance helpers stay in its body (`Mixin::keeps_helpers`).
     helpers: bool,
+    /// It stays a Concern with its `included do` (`Mixin::library_concern`).
+    concern: bool,
 }
 
 /// `library_source`'s walk: the ranges to blank (`blank`), the bytes that
@@ -3155,9 +3196,12 @@ fn library_member(member: &Node<'_>, form: LibraryForm, kept: &[(usize, Vec<bool
             let at = call.location().start_offset();
             kept.iter().find(|(o, _)| *o == at).map_or(Member::Drop, |(_, keep)| all(keep.clone()))
         }
-        "extend" => yes(args.iter().all(|n| {
-            matches!(constant_path_of(n).map(|p| p.join("::")).as_deref(), Some("T::Helpers" | "T::Sig" | "T::Generic"))
+        "extend" => yes(args.iter().all(|n| match constant_path_of(n).map(|p| p.join("::")).as_deref() {
+            Some("T::Helpers" | "T::Sig" | "T::Generic") => true,
+            Some("ActiveSupport::Concern") => form.concern,
+            _ => false,
         })),
+        "included" => yes(form.concern && call.block().is_some() && args.is_empty()),
         "attr_reader" | "attr_writer" | "attr_accessor" => yes(call.block().is_none() && args.iter().all(|a| a.as_symbol_node().is_some())),
         "private" | "protected" | "public" if call.block().is_none() && args.iter().all(|a| a.as_symbol_node().is_some()) => {
             all(args.iter().map(|a| a.as_symbol_node().is_some_and(|s| !dropped(&String::from_utf8_lossy(s.unescaped())))).collect())
@@ -3380,6 +3424,7 @@ fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
         body_includes: Vec::new(),
         kept_includes: Vec::new(),
         keeps_helpers: false,
+        library_concern: false,
         ancestry: Vec::new(),
     };
     let result = super::prism::parse_silent(source);
@@ -4360,7 +4405,7 @@ end
         let reached = |source: &str| {
             let result = super::super::prism::parse_silent(source.as_bytes());
             let mut out = Set::default();
-            reached_modules(&result.node(), &mut out);
+            reached_modules(&result.node(), &mut out, &mut Set::default());
             let mut out: Vec<String> = out.into_iter().collect();
             out.sort();
             out

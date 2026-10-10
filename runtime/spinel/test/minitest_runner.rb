@@ -1084,6 +1084,12 @@ module RoundhouseTestCallbacks
   end
 end
 TestBase.extend(RoundhouseTestCallbacks::ClassMethods)
+if defined?(RoundhouseEarlyTestCallbacks)
+  RoundhouseEarlyTestCallbacks::PENDING.each do |klass, chain, filters, block|
+    RoundhouseTestCallbacks.register(klass, chain, filters, block)
+  end
+  RoundhouseEarlyTestCallbacks::PENDING.clear
+end
 
 # Rack's multipart round trip for the rack-test gem's own
 # `Rack::Test::UploadedFile`: rack-test encodes the file as a multipart

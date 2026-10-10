@@ -8281,6 +8281,29 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // ignores as shadowed when the constant is already defined at setup
     // (`RoundhouseAutoload.register`).
     let mut declared_path_named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The constants an app source under `app/<x>` (or its `concerns`)
+    // names by its path. Compiled as the app's own, it is absent from
+    // `declaring`, but it is still the constant's autoload: a support
+    // program's reopen around its own module (query_engine_fixtures.rb's
+    // `class Taxonomy; module QueryEngineReader`) does not make the
+    // constant one declared only inside file programs. Core's
+    // Merchandising::Taxonomy::QueryEngineReader got no autoload and was
+    // an empty implicit module: `undefined method 'configure'`.
+    let app_dir_named: std::collections::BTreeSet<String> = app
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let rel = source.path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&source.path);
+            rel.strip_suffix(".rb").map(constant_path)
+        })
+        .flat_map(|path| {
+            let segments: Vec<&str> = path.split('/').collect();
+            (2..segments.len())
+                .filter(|&i| segments[i - 2] == "app" || (i >= 3 && segments[i - 1] == "concerns" && segments[i - 3] == "app"))
+                .map(|i| segments[i..].join("/").chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for (anchor, sources) in &declaring {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
@@ -8308,7 +8331,10 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         };
         if let Some(program) = owner.and_then(|o| program_by_source.get(o)) {
             program_of_file.insert(anchor.clone(), program.clone());
-        } else if named.is_empty() && sources.iter().all(|source| program_by_source.contains_key(source)) {
+        } else if named.is_empty()
+            && !app_dir_named.contains(&wanted)
+            && sources.iter().all(|source| program_by_source.contains_key(source))
+        {
             // Declared only inside file programs, away from any path an
             // autoload root maps the constant to (kafka-shopify's
             // patches/avro_stdlib_json.rb reopens the gem's

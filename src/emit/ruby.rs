@@ -2635,7 +2635,25 @@ pub(crate) const MINITEST_TEST_CASES: &str = "\
 # Rails' test base classes, before the app's files reopen them: TestBase
 # (defined below) is ActiveSupport::TestCase, and ActionController::
 # TestCase descends from it.
+# A `setup`/`teardown` on them while the app boots (an `included do` a
+# test-support initializer's include into ActiveSupport::TestCase runs as
+# app/models eager-loads) is held, in order, until
+# test/minitest_runner.rb's RoundhouseTestCallbacks registers it.
+module RoundhouseEarlyTestCallbacks
+  PENDING = []
+
+  def setup(*filters, &block)
+    PENDING << [self, :setup, filters, block]
+    nil
+  end
+
+  def teardown(*filters, &block)
+    PENDING << [self, :teardown, filters, block]
+    nil
+  end
+end
 class TestBase
+  extend RoundhouseEarlyTestCallbacks
 end
 module ActiveSupport
   TestCase = ::TestBase
