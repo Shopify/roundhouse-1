@@ -268,6 +268,7 @@ fn validate_activation(
     }
     let resolver = app.const_resolver.for_app(app);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
+    let mut block_includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
     let mut modules = HashSet::default();
     let retained: HashSet<_> = app.library_classes.iter().map(|c| &c.name)
         .chain(app.models.iter().map(|m| &m.name))
@@ -293,8 +294,24 @@ fn validate_activation(
             if is_module {
                 modules.insert(owner.clone());
             }
-            let edges = includes.entry(owner.clone()).or_default();
-            for statement in flatten_statements(body) {
+            includes.entry(owner.clone()).or_default();
+            // A Concern's `included do include M end` runs on the base, as
+            // a dependency does (SofterDelete::UsingIsDeleted). Kept apart:
+            // dependency verification reads only module-level edges.
+            let mut statements: Vec<_> = flatten_statements(body).into_iter().map(|s| (s, false)).collect();
+            let blocks: Vec<_> = statements.iter().filter_map(|(statement, _)| statement.as_call_node()).collect();
+            for call in blocks {
+                if is_module
+                    && call.receiver().is_none()
+                    && constant_id_str(&call.name()) == "included"
+                    && call.arguments().is_none()
+                    && let Some(block) = call.block().and_then(|b| b.as_block_node())
+                    && let Some(block_body) = block.body()
+                {
+                    statements.extend(flatten_statements(block_body).into_iter().map(|s| (s, true)));
+                }
+            }
+            for (statement, in_block) in statements {
                 let Some(call) = statement.as_call_node() else { continue };
                 if call.receiver().is_some() || call.block().is_some() {
                     continue;
@@ -304,6 +321,8 @@ fn validate_activation(
                 if name != "include" {
                     continue;
                 }
+                let edges = if in_block { &mut block_includes } else { &mut includes }
+                    .entry(owner.clone()).or_default();
                 let Some(args) = call.arguments() else { continue };
                 for arg in args.arguments().iter() {
                     let Some(path) = constant_path_of(&arg) else { continue };
@@ -332,6 +351,50 @@ fn validate_activation(
         &includes.iter().map(|(id, edges)| (id.clone(), edges.clone())).collect(),
         framework_shadows,
     );
+    // An include lifted into a model body from elsewhere (an initializer's
+    // `on_load(:user) { class User; include Extension; end }`,
+    // `load_hook_includes`) is the model's own include: resolve it where it
+    // is written, falling back to the model's lexical scope, which is the
+    // reopen's.
+    for model in &app.models {
+        let mut lifted = Vec::new();
+        for item in &model.body {
+            let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { continue };
+            if method.as_str() != "include" {
+                continue;
+            }
+            for arg in args {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                if let Some(id) = resolver.namespace(arg.span, path) {
+                    lifted.push(id.clone());
+                    continue;
+                }
+                let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+                let mut scope = Some(model.name.0.as_str());
+                while let Some(prefix) = scope {
+                    let id = crate::ClassId(Symbol::from(format!("{prefix}::{written}")));
+                    if modules.contains(&id) {
+                        lifted.push(id);
+                        break;
+                    }
+                    scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+                }
+                if scope.is_none() {
+                    let id = crate::ClassId(Symbol::from(written.trim_start_matches("::")));
+                    if modules.contains(&id) {
+                        lifted.push(id);
+                    }
+                }
+            }
+        }
+        let edges = includes.entry(model.name.clone()).or_default();
+        for id in lifted {
+            if !edges.contains(&id) {
+                edges.push(id);
+            }
+        }
+    }
     // What a class's superclass chain already includes, transitively. A
     // library class including such a Concern again is a no-op in Ruby (the
     // module is in its ancestors): the accessor is the parent's, and
@@ -360,17 +423,36 @@ fn validate_activation(
         }
         out
     };
+    // What a Concern hands its includer: each verified Concern it includes
+    // at module level becomes a dependency, included into the base first
+    // (`append_features` walks `@_dependencies`), and an `include` its
+    // block performs runs on the base too. Only verified Concerns are
+    // followed: a plain module's own includes ran on that module.
+    let concern_edges = |id: &crate::ClassId| {
+        includes.get(id).into_iter().chain(block_includes.get(id)).flatten()
+    };
+    let deferred_reach = |direct: &[crate::ClassId]| -> HashSet<crate::ClassId> {
+        let mut out = HashSet::default();
+        let mut stack: Vec<_> = direct.iter().filter(|id| deferred.contains(*id)).cloned().collect();
+        while let Some(id) = stack.pop() {
+            if out.insert(id.clone()) {
+                stack.extend(concern_edges(&id).filter(|nested| deferred.contains(*nested)).cloned());
+            }
+        }
+        out
+    };
     for (owner, direct) in &includes {
         // A survey source refusal already diagnosed an omitted class.
         if deferred.contains(owner) || (!retained.contains(owner) && !modules.contains(owner)) {
             continue;
         }
         let mut model = app.models.iter_mut().find(|m| &m.name == owner);
+        let reach = if model.is_some() { deferred_reach(direct) } else { HashSet::default() };
         if let Some(model) = model.as_mut() {
             for item in &mut model.body {
                 let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-                if spans.contains(&expr.span) && !direct.iter().any(|id| {
-                    deferred.contains(id) && app.concern_model_items.get(id).is_some_and(|items| items.iter().any(|item| {
+                if spans.contains(&expr.span) && !reach.iter().any(|id| {
+                    app.concern_model_items.get(id).is_some_and(|items| items.iter().any(|item| {
                         matches!(item, ModelBodyItem::Unknown { expr: original, .. } if original.span == expr.span)
                     }))
                 }) {
@@ -395,7 +477,7 @@ fn validate_activation(
                     if model.is_none() && settled.contains(&(owner.clone(), expr.span)) {
                         continue;
                     }
-                    let supplied = direct.contains(&id) && model.as_ref().is_some_and(|m| m.body.iter().any(|item| {
+                    let supplied = (direct.contains(&id) || reach.contains(&id)) && model.as_ref().is_some_and(|m| m.body.iter().any(|item| {
                         matches!(item, ModelBodyItem::Unknown { expr: carried, .. } if carried.span == expr.span)
                     }));
                     if supplied {
@@ -427,6 +509,9 @@ fn validate_activation(
                 && (model.is_some() || deferred.contains(&id))
             {
                 pending.extend(nested.iter().cloned());
+            }
+            if deferred.contains(&id) {
+                pending.extend(block_includes.get(&id).into_iter().flatten().cloned());
             }
         }
     }
