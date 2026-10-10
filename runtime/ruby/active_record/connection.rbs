@@ -109,6 +109,7 @@ module ActiveRecord
     def self.schema_column_types: () -> Hash[String, Array[(Symbol | Integer | String)?]]
     def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> ActiveModel::Type::Value } -> ActiveModel::Type::Value
     def self.attribute_types: () -> Hash[String, ActiveModel::Type::Value]
+    def self.column_defaults: () -> Hash[String, untyped]
     def self._cast_column: (String name, untyped value) -> untyped
     def self._cast_type_for_spec: (String name, Array[(Symbol | Integer | String)?] spec) -> ActiveModel::Type::Value
     def self.attribute: (String | Symbol name, ?untyped type, ?default: untyped, **untyped options) -> nil

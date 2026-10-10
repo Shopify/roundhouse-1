@@ -20,6 +20,7 @@ const STRUCTURE: &str = r#"CREATE TABLE vehicles (
     name character varying,
     state character varying,
     alarm_state character varying,
+    wheels integer DEFAULT 4,
     CONSTRAINT vehicles_pkey PRIMARY KEY (id)
 );
 "#;
@@ -121,6 +122,11 @@ const VEHICLE: &str = r#"class Vehicle < ApplicationRecord
     end
   end
 
+  # A class-level override over Active Record's, as Core's concerns do.
+  def self.table_exists?
+    super && name == "Vehicle"
+  end
+
   def log
     @log ||= []
   end
@@ -146,6 +152,7 @@ const PROBE: &str = r##"class StateMachinesProbe
     out << "scopes: #{Vehicle.with_state(:idling).map(&:name).join(",")} #{Vehicle.without_state(:idling).map(&:name).join(",")} #{Vehicle.with_states(:parked, :idling).count}"
     out << "park: #{v.park} #{Vehicle.find(v.id).state}"
     out << "names: #{Vehicle.state_machines.keys.join(",")} #{Vehicle.state_machine(:state).states.map(&:value).join(",")}"
+    out << "schema: #{Vehicle.table_exists?} #{Vehicle.column_defaults.map { |k, d| "#{k}=#{d.inspect}" }.join(",")}"
     out
   end
 end
@@ -153,7 +160,7 @@ end
 
 /// Native Rails 8.2 with the same gems on the same PostgreSQL, so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 9] = [
+const EXPECTED: [&str; 10] = [
     "new: parked true false active true",
     "can: true false",
     "ignite: true running true ignited running",
@@ -163,6 +170,7 @@ const EXPECTED: [&str; 9] = [
     "scopes: a b 2",
     "park: true parked",
     "names: state,alarm_state parked,running",
+    "schema: true id=nil,name=nil,state=nil,alarm_state=nil,wheels=4",
 ];
 
 /// What native Rails requires, in order.

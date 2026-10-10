@@ -593,6 +593,22 @@ module ActiveRecord
         end
       end
 
+      # postgresql/schema_statements.rb's data_source_exists? over
+      # data_source_sql: a table, view, materialized view, partitioned or
+      # foreign table of that name in the search path (or the named
+      # schema).
+      def data_source_exists?(name)
+        schema, table = name.to_s.scan(/[^".]+|"[^"]*"/).map { |part| part.delete('"') }
+        if table.nil?
+          table = schema
+          schema = nil
+        end
+        scope = schema ? "n.nspname = #{quote(schema)}" : "n.nspname = ANY (current_schemas(false))"
+        sql = "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace " \
+              "WHERE #{scope} AND c.relkind IN ('r','v','m','p','f') AND c.relname = #{quote(table)}"
+        !query_value(sql, "SCHEMA").nil?
+      end
+
       def supports_identity_columns? # :nodoc:
         true
       end

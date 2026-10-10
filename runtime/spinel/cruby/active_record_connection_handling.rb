@@ -425,8 +425,9 @@ module ActiveRecord
     # (the adapter's `columns`, a "SCHEMA" query) per table name: the
     # columns, by name, of each table a model or the app asks about.
     # Loading or dumping a cache file (`_load_from`, `dump_to`,
-    # `init_with` / `encode_with`), primary keys, data sources and
-    # indexes are not ported and refuse by name.
+    # `init_with` / `encode_with`), primary keys, the data source list and
+    # indexes are not ported and refuse by name; `data_source_exists?` is
+    # asked of the catalog per name.
     class SchemaCache
       def initialize # :nodoc:
         @columns = {}
@@ -473,7 +474,16 @@ module ActiveRecord
         @indexes.delete name
       end
 
-      %i[primary_keys data_source_exists? add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
+      # schema_cache.rb: whether the table or view exists, asked of the
+      # catalog once per name (the cache is not prefilled from
+      # `data_sources`, which is not ported).
+      def data_source_exists?(pool, name)
+        return @data_sources[name] if @data_sources.key?(name)
+
+        @data_sources[name.dup.freeze] = pool.with_connection { |connection| connection.data_source_exists?(name) }
+      end
+
+      %i[primary_keys add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
         define_method(name) do |*|
           raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: ActiveRecord::ConnectionAdapters::SchemaCache##{name}: " \
             "this runtime's schema cache holds only the columns it reads from the catalog"
@@ -1163,6 +1173,12 @@ module ActiveRecord
 
       def schema_cache # :nodoc:
         connection_pool.schema_cache
+      end
+
+      # model_schema.rb: whether the class's table exists, through the
+      # pool's schema cache.
+      def table_exists?
+        schema_cache.data_source_exists?(table_name)
       end
 
       # model_schema.rb over SchemaContext#load_schema!: the table's

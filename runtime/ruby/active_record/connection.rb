@@ -1190,6 +1190,17 @@ module ActiveRecord
       value = _declared_attribute_defaults[name]
       value.is_a?(Proc) ? value.call : value
     end
+
+    # model_schema.rb's column_defaults: each attribute's default as a
+    # new record starts with it, the column default deserialized by the
+    # attribute's type and a declared `default:` over it (a Proc default
+    # is called, as `_default_attributes.deep_dup.to_hash` evaluates it).
+    def self.column_defaults
+      defaults = {} #: Hash[String, untyped]
+      columns_hash.each { |name, column| defaults[name] = type_for_attribute(name).deserialize(column.default) }
+      _declared_attribute_defaults.each_key { |name| defaults[name] = _attribute_default(name) }
+      defaults.freeze
+    end
     
     # attribute_methods.rb's `alias_attribute(new_name, old_name)` over a
     # column. The compiler defines the new name's attribute methods and
