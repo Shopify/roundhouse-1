@@ -238,3 +238,28 @@ puts "ALL OK"
         "overlay multi-key API failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
     );
 }
+
+/// Rails' `MemoryStore#clear(options = nil)` takes and ignores options;
+/// Core's Verdict flag cache calls `Verdict.cache.clear(namespace: ...)`
+/// from every test's `before_setup`, which raised ArgumentError.
+#[test]
+fn overlay_clear_accepts_and_ignores_options() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/rails_cache"
+
+store = Rails::MemoryStore.new
+store.write("a", 1)
+store.write("b", 2)
+store.clear(namespace: "verdict")
+raise "namespace clear kept entries" unless store.read("a").nil? && store.read("b").nil?
+store.write("c", 3)
+store.clear
+raise "clear kept entries" unless store.read("c").nil?
+puts "ALL OK"
+"#;
+    let out = Command::new("ruby").arg("-e").arg(script).current_dir(root).output().expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("ALL OK"), "overlay clear failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}");
+}

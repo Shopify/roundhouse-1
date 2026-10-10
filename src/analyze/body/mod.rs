@@ -378,6 +378,19 @@ pub(crate) fn cref_class(written: &ClassId, scope: &str, classes: Classes<'_>) -
         }
         parts.pop();
     }
+    cref_ancestors(scope, classes)
+        .iter()
+        .map(|ancestor| ClassId(Symbol::from(format!("{}::{name}", ancestor.0.as_str()).as_str())))
+        .find(|candidate| classes.contains_key(candidate))
+        .or_else(|| classes.contains_key(written).then(|| written.clone()))
+}
+
+/// The ancestors of `scope` that Ruby's constant lookup searches after
+/// the lexical scopes, nearest first, `scope` itself excluded: its
+/// includes (the last one first, each with its own), then its superclass
+/// chain. A mixin no registry entry answers for stands in by each of its
+/// lexical spellings.
+pub(crate) fn cref_ancestors(scope: &str, classes: Classes<'_>) -> Vec<ClassId> {
     fn ancestors(id: &ClassId, classes: Classes<'_>, out: &mut Vec<ClassId>) {
         if out.contains(id) || out.len() > 64 {
             return;
@@ -410,19 +423,16 @@ pub(crate) fn cref_class(written: &ClassId, scope: &str, classes: Classes<'_>) -
     }
     let mut chain = Vec::new();
     ancestors(&ClassId(Symbol::from(scope)), classes, &mut chain);
+    chain.remove(0);
     chain
-        .iter()
-        .skip(1)
-        .map(|ancestor| ClassId(Symbol::from(format!("{}::{name}", ancestor.0.as_str()).as_str())))
-        .find(|candidate| classes.contains_key(candidate))
-        .or_else(|| classes.contains_key(written).then(|| written.clone()))
 }
 
 /// `ty` with every sorbet type alias it names (`Name = T.type_alias { X }`,
 /// in `ClassInfo::type_aliases`) replaced by the type the alias names.
-/// An alias is found the way `lexical_class` finds a class, innermost
-/// enclosing scope of `scope` first, and its own type is read in the
-/// scope that declares it. Bounded, so an alias cycle stays a class.
+/// An alias is found the way Ruby finds a constant (`cref_class`):
+/// innermost enclosing scope of `scope` first, then `scope`'s ancestors,
+/// and its own type is read in the scope that declares it. Bounded, so an
+/// alias cycle stays a class.
 pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) -> Ty {
     let has_class = std::cell::Cell::new(false);
     ty.map_class_ids(&|id| {
@@ -432,11 +442,12 @@ pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) ->
     if !has_class.get() {
         return ty.clone();
     }
-    expand_type_aliases_by(
+    expand_type_aliases_in(
         ty,
         scope,
         &|owner, name| classes.get(owner).and_then(|info| info.type_aliases.get(name).cloned()),
         &|id, _| id.clone(),
+        &|scope| cref_ancestors(scope, classes),
         true,
     )
 }
@@ -455,9 +466,26 @@ pub(crate) fn expand_type_aliases_by(
     class: &dyn Fn(&ClassId, &str) -> ClassId,
     normalize: bool,
 ) -> Ty {
+    expand_type_aliases_in(ty, scope, alias, class, &|_| Vec::new(), normalize)
+}
+
+/// [`expand_type_aliases_by`] where an alias the lexical scopes miss is
+/// looked up in `ancestors(scope)` (`cref_ancestors`), as Ruby's constant
+/// lookup does: Hedwig's `Memory::Bulking` includes `CommandTable::Bulking`
+/// and casts to `T::Hash[String, [Float, StaleInProgressBulkInfo]]`, the
+/// mixin's alias.
+pub(crate) fn expand_type_aliases_in(
+    ty: &Ty,
+    scope: &str,
+    alias: &dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
+    class: &dyn Fn(&ClassId, &str) -> ClassId,
+    ancestors: &dyn Fn(&str) -> Vec<ClassId>,
+    normalize: bool,
+) -> Ty {
     struct Expand<'a> {
         alias: &'a dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
         class: &'a dyn Fn(&ClassId, &str) -> ClassId,
+        ancestors: &'a dyn Fn(&str) -> Vec<ClassId>,
         normalize: bool,
     }
     impl Expand<'_> {
@@ -529,12 +557,22 @@ pub(crate) fn expand_type_aliases_by(
                     return Some((owner, aliased));
                 }
                 if parts.pop().is_none() {
-                    return None;
+                    break;
                 }
             }
+            // Then the ancestors of the innermost scope; a qualified name
+            // (`Bulking::Info`) through each ancestor's own nesting.
+            (self.ancestors)(scope).into_iter().find_map(|ancestor| {
+                let owner = if prefix.is_empty() {
+                    ancestor.0.as_str().to_owned()
+                } else {
+                    format!("{}::{prefix}", ancestor.0.as_str())
+                };
+                (self.alias)(&ClassId(Symbol::from(owner.as_str())), &Symbol::from(name)).map(|aliased| (owner, aliased))
+            })
         }
     }
-    Expand { alias, class, normalize }.ty(ty, scope, 0)
+    Expand { alias, class, ancestors, normalize }.ty(ty, scope, 0)
 }
 
 /// A parameterized stdlib generic written unqualified: `Set[String]`,
