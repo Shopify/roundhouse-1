@@ -2388,6 +2388,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     // runtime (`sti_scope::push_type_condition_methods`); scopes and
     // columns stay its base model's.
     crate::lower::sti_scope::unseat_implicit_roots(lcs, app);
+    crate::lower::class_body_new::unbind_subclassed_model_new(lcs, app);
     let sti_subclasses = crate::lower::sti_scope::sti_bases(app);
     let mut self_seeded = plain_subclasses.clone();
     self_seeded.extend(sti_subclasses.iter().map(|(sub, base)| (sub.clone(), base.clone())));
