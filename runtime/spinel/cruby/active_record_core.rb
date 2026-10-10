@@ -39,8 +39,114 @@
 # model answers from `reflect_on_association` for each association it
 # compiled (emit::ruby::library::apply_association_reflections) and for
 # those a class macro declares (lower::model_to_library::macro_associations).
+#
+# And Core#init_with / #init_with_attributes, the class-side
+# `attributes_builder` (model_schema.rb) with the attribute set it builds
+# from database values (activemodel attribute_set/builder.rb's Builder
+# and LazyAttributeSet), Dirty's `clear_changes_information` and
+# Core#strict_loading!. Shopify Core's DisconnectedFixtureSet.new_record
+# calls `klass.allocate.init_with("attributes" => values)`, and Core's
+# ActiveRecordAttributesCoercion turns the Hash into that set first.
+# Differences:
+# - `init_with_attributes` builds the record from the set's database
+#   values through the model's compiled `instantiate(row)` (from_row,
+#   mark_persisted!, the find and initialize hooks) and takes that
+#   record's state, since the runtime's records keep their columns in
+#   compiled slots, not in an attribute set. A hook that captures the
+#   record's identity sees the record it ran on.
+# - `init_with` takes an attribute set; a coder whose "attributes" is a
+#   Hash (Rails stores it as @attributes and fails on the first read)
+#   raises ArgumentError, and so does a YAML coder's "concise_attributes".
+# - `strict_loading!` records the flag and mode as Rails does, but the
+#   compiled association readers do not raise StrictLoadingViolationError.
 
 module ActiveModel
+  class AttributeSet # :nodoc:
+    class Builder # :nodoc:
+      attr_reader :types, :default_attributes
+
+      def initialize(types, default_attributes = {})
+        @types = types
+        @default_attributes = default_attributes
+      end
+
+      def build_from_database(values = {}, additional_types = {})
+        LazyAttributeSet.new(values, types, additional_types, default_attributes)
+      end
+    end
+  end
+
+  class LazyAttributeSet < AttributeSet # :nodoc:
+    def initialize(values, types, additional_types, default_attributes, attributes = {})
+      @attributes = attributes
+      @values = values
+      @types = types
+      @additional_types = additional_types
+      @default_attributes = default_attributes
+      @casted_values = {}
+    end
+
+    def [](name)
+      @attributes[name] || default_attribute(name)
+    end
+
+    def key?(name)
+      (values.key?(name) || types.key?(name) || @attributes.key?(name)) && self[name].initialized?
+    end
+
+    def keys
+      keys = values.keys | types.keys | @attributes.keys
+      keys.keep_if { |name| self[name].initialized? }
+    end
+
+    def fetch_value(name, &block)
+      if attr = @attributes[name]
+        return attr.value(&block)
+      end
+
+      @casted_values.fetch(name) do
+        value_present = true
+        value = values.fetch(name) { value_present = false }
+
+        if value_present
+          type = additional_types.fetch(name, types[name])
+          @casted_values[name] = type.deserialize(value)
+        else
+          attr = default_attribute(name, value_present, value)
+          attr.value(&block)
+        end
+      end
+    end
+
+    # AttributeSet#values_before_type_cast, over the keys the set has.
+    def values_before_type_cast
+      keys.to_h { |name| [name, self[name].value_before_type_cast] }
+    end
+
+    private
+      attr_reader :values, :types, :additional_types, :default_attributes
+
+      def default_attribute(
+        name,
+        value_present = true,
+        value = values.fetch(name) { value_present = false }
+      )
+        type = additional_types.fetch(name, types[name])
+
+        if value_present
+          @attributes[name] = Attribute.from_database(name, value, type, @casted_values[name])
+        elsif types.key?(name)
+          if attr = default_attributes[name]
+            @attributes[name] = attr.dup
+          else
+            @attributes[name] = Attribute.uninitialized(name, type)
+          end
+        else
+          Attribute.null(name)
+        end
+      end
+  end
+
   # Raised when forbidden attributes are used for mass assignment.
   class ForbiddenAttributesError < StandardError
   end
@@ -113,6 +219,18 @@ end
 module ActiveRecord
   UnknownAttributeError = ActiveModel::UnknownAttributeError
 
+  module LegacyYamlAdapter # :nodoc:
+    def self.convert(coder)
+      return coder unless defined?(Psych::Coder) && coder.is_a?(Psych::Coder)
+
+      case coder["active_record_yaml_version"]
+      when 1, 2 then coder
+      else
+        raise("Active Record doesn't know how to load YAML with this format.")
+      end
+    end
+  end
+
   module Core
     def initialize(_attributes = nil)
       init_internals
@@ -127,6 +245,66 @@ module ActiveRecord
     # Prevents records from being written to the database.
     def readonly!
       @readonly = true
+    end
+
+    # Initialize an empty model object from +coder+.
+    def init_with(coder, &block)
+      coder = LegacyYamlAdapter.convert(coder)
+      unless coder["attributes"]
+        raise ArgumentError, "roundhouse: #{self.class}#init_with: a YAML coder's concise_attributes are not ported"
+      end
+      init_with_attributes(coder["attributes"], coder["new_record"], &block)
+    end
+
+    # Initialize an empty model object from +attributes+, an attribute set
+    # of database values (`attributes_builder.build_from_database`).
+    def init_with_attributes(attributes, new_record = false) # :nodoc:
+      unless attributes.is_a?(ActiveModel::LazyAttributeSet)
+        raise ArgumentError, "roundhouse: #{self.class}#init_with_attributes takes the attribute set " \
+          "`attributes_builder.build_from_database` builds, not #{attributes.class}"
+      end
+      record = self.class.instantiate(attributes.values_before_type_cast)
+      record.instance_variables.each { |ivar| instance_variable_set(ivar, record.instance_variable_get(ivar)) }
+      @persisted = false if new_record
+
+      yield self if block_given?
+
+      self
+    end
+
+    # Clears all dirty data: current changes and previous changes.
+    def clear_changes_information
+      @__last_saved_attributes = _attribute_snapshot
+      @saved_changes = nil
+      @id_previously_changed = false
+      nil
+    end
+
+    # Sets the record to strict_loading mode.
+    def strict_loading!(value = true, mode: :all)
+      unless [:all, :n_plus_one_only].include?(mode)
+        raise ArgumentError, "The :mode option must be one of [:all, :n_plus_one_only] but #{mode.inspect} was provided."
+      end
+
+      @strict_loading_mode = mode
+      @strict_loading = value
+    end
+
+    attr_reader :strict_loading_mode
+
+    # Returns +true+ if the record is in strict_loading mode.
+    def strict_loading?
+      @strict_loading
+    end
+
+    # Returns +true+ if the record uses strict_loading with +:n_plus_one_only+ mode enabled.
+    def strict_loading_n_plus_one_only?
+      @strict_loading_mode == :n_plus_one_only
+    end
+
+    # Returns +true+ if the record uses strict_loading with +:all+ mode enabled.
+    def strict_loading_all?
+      @strict_loading_mode == :all
     end
 
     private
@@ -493,6 +671,15 @@ module ActiveRecord
       define_method(:"_runtime_#{name}", own)
       private :"_runtime_#{name}"
       remove_method name
+    end
+
+    # model_schema.rb's `attributes_builder`: the attribute set builder
+    # for the class's attribute types. Rails passes the defaults of the
+    # attributes that are not columns, and the primary key's; the runtime
+    # keeps no default attribute set, so a name the values leave out reads
+    # as uninitialized.
+    def self.attributes_builder # :nodoc:
+      @attributes_builder ||= ActiveModel::AttributeSet::Builder.new(attribute_types, {})
     end
 
     include ActiveModel::AttributeAssignment
