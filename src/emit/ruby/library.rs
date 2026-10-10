@@ -14490,6 +14490,48 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
     e.node.for_each_child_mut(&mut |child| rewrite_program_requires(child, app, rel, sources));
 }
 
+/// A file program's `include M` of a Concern, followed by the extends
+/// ActiveSupport::Concern's `append_features` performs on the includer
+/// (`concern_carrier_extends`). The tree carries no Concern, so a class
+/// body's include has them written after it (`write_include`); one in a
+/// program statement had none. paquito 1.0.2's
+/// `ActiveSupport.on_load(:active_record) do include
+/// Paquito::ColumnsDigestCache end` left ActiveRecord::Base without
+/// `paquito_columns_digest`, which its ActiveRecordCoder calls on every
+/// record it dumps. Only constants that name an app module as written
+/// (the statement is at the file's top level) are taken.
+fn program_concern_extends(e: &mut Expr, app: &App) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && method.as_str() == "include"
+        && !args.is_empty()
+    {
+        let names: Option<Vec<ClassId>> = args
+            .iter()
+            .map(|a| match &*a.node {
+                ExprNode::Const { path } => {
+                    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    let name = name.trim_start_matches("::");
+                    (!library_classes_named(name, app).is_empty()).then(|| ClassId(Symbol::from(name)))
+                }
+                _ => None,
+            })
+            .collect();
+        let carriers = names.map(|n| concern_carrier_extends(&n, app)).unwrap_or_default();
+        if !carriers.is_empty() {
+            let span = e.span;
+            let mut exprs = vec![e.clone()];
+            for carrier in carriers {
+                let path = std::iter::once(Symbol::from("")).chain(carrier.0.as_str().split("::").map(Symbol::from)).collect();
+                let arg = Expr::new(span, ExprNode::Const { path });
+                exprs.push(Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }));
+            }
+            *e = Expr::new(span, ExprNode::Seq { exprs });
+        }
+        return;
+    }
+    e.node.for_each_child_mut(&mut |child| program_concern_extends(child, app));
+}
+
 /// A carried engine body statement's loads of the app's own Ruby files,
 /// resolved against the tree, where the source's files are not on
 /// `$LOAD_PATH` (railties 8.2.0.alpha loads them from the engine root):
@@ -14784,6 +14826,7 @@ pub(super) fn emit_file_program(
                 ProgramItem::Statement(expr) => {
                     let mut expr = carried_loads(expr, app, None, sources);
                     rewrite_program_requires(&mut expr, app, rel, sources);
+                    program_concern_extends(&mut expr, app);
                     let text = super::emit_expr(&expr);
                     writeln!(s, "{pad}RoundhouseAutoload.file_statement({:?}) do", statement_site(app, expr.span)).unwrap();
                     lines(s, &format!("{pad}  "), &text);
