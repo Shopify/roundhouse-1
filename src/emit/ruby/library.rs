@@ -13845,7 +13845,9 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
                         "roundhouse: error[file_require_not_carried]: {}: `{method} {feature:?}` names an app file the tree does not carry; it was not loaded",
                         statement_site(app, span)
                     );
-                    *e = call(None, "warn", vec![lit(message)], true);
+                    // STDERR, not `warn`: a diagnostic is not a Ruby warning, and
+                    // Core's strict_warnings raises on every warning.
+                    *e = call(Some(mk(ExprNode::Const { path: vec![Symbol::from("STDERR")] })), "puts", vec![lit(message)], true);
                 }
                 None => {}
             }

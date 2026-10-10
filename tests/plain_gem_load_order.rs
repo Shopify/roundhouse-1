@@ -22,7 +22,10 @@
 mod emit_and_run;
 
 /// Core's StrictWarning: a circular-require warning raises.
-const STRICT: &str = "$VERBOSE = true\n\nmodule Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.include?(\"circular require\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n";
+/// It also raises on a boot diagnostic written through `warn`: Core's
+/// strict_warnings raises on every warning, so a diagnostic must go to
+/// $stderr (r8c's job-iteration adapter-loop report failed the boot).
+const STRICT: &str = "$VERBOSE = true\n\nmodule Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.include?(\"circular require\") || msg.start_with?(\"roundhouse:\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n";
 
 /// Each gem: (name, its lib files).
 type Gem<'a> = (&'a str, &'a [(&'a str, &'a str)]);

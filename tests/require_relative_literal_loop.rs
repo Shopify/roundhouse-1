@@ -144,3 +144,46 @@ fn a_require_relative_loop_over_a_literal_list_loads_each_file_it_names() {
     let unreached = models.split("UNREACHED_PROGRAMS").nth(1).and_then(|rest| rest.split(']').next()).unwrap_or("");
     assert!(!unreached.contains("adaptkit"), "{models}");
 }
+
+/// An element whose file the tree does not carry is named on $stderr, and
+/// the boot goes on. r8c: the slice left out job-iteration's adapters, and
+/// the report went through `warn`, which Core's strict_warnings (every
+/// warning raises) turned into a boot failure. The hook here raises on a
+/// roundhouse diagnostic sent as a warning. Natively the file exists; it is
+/// absent here to stand for one the slice did not carry, so there is no
+/// CRuby control.
+#[test]
+fn a_loop_element_the_tree_does_not_carry_is_reported_on_stderr_not_warned() {
+    const LISTED: &str = r##"module Adaptkit
+  module Adapters
+    LIST = %w[alpha gone].freeze
+    LIST.each { |n| require_relative "adapters/#{n}_adapter" }
+  end
+end
+"##;
+    const STRICT: &str = "module Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.start_with?(\"roundhouse:\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n";
+    let mut app = emit_and_run::empty_app()
+        .write("roundhouse.yml", "gem_sources:\n  adaptkit: vendor/gems/adaptkit-1.0.0\n")
+        .write("Gemfile.lock", LOCK)
+        .write("Gemfile", "source \"https://rubygems.org\"\n\ngem \"adaptkit\"\n")
+        .write("lib/strict.rb", STRICT)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "Bundler.require(*Rails.groups)\n");
+    for (path, text) in [
+        ("adaptkit.rb", "module Adaptkit\n  LOADED = []\nend\n\nrequire_relative \"adaptkit/adapters\"\n"),
+        ("adaptkit/adapters.rb", LISTED),
+        ("adaptkit/adapters/alpha_adapter.rb", ALPHA),
+    ] {
+        app = app.write(&format!("vendor/gems/adaptkit-1.0.0/lib/{path}"), text);
+    }
+    let run = app.run_ruby("require \"adaptkit\" unless defined?(Adaptkit)\nputs Adaptkit::LOADED.inspect\n");
+    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert_eq!(lines(run.stdout.as_bytes()), ["[:alpha]"], "{}", run.stderr);
+    assert!(
+        run.stderr.contains("error[file_require_not_carried]") && run.stderr.contains("adapters/gone_adapter"),
+        "{}",
+        run.stderr
+    );
+    let adapters = std::fs::read_to_string(run.emitted.join("app/models/adaptkit/adapters.rb")).unwrap();
+    assert!(!adapters.contains("warn("), "{adapters}");
+}

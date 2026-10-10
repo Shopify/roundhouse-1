@@ -9475,7 +9475,8 @@ fn unroll_literal_require_loops(files: &mut [(String, String)], app: &App) {
                 let message = format!(
                     "roundhouse: error[file_require_not_carried]: {site}: `require_relative {feature:?}` names an app file the tree does not carry; it was not loaded"
                 );
-                out.push_str(&format!("{indent}warn({message:?})\n"));
+                // $stderr, not `warn`: Core's strict_warnings raises on warnings.
+                out.push_str(&format!("{indent}$stderr.puts({message:?})\n"));
             }
             at += used;
             changed = true;
