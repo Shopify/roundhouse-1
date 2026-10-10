@@ -270,9 +270,10 @@ module Rails
     # Rails::Application::Bootstrap's and Finisher's initializer names,
     # in their order (railties 8.2.0.alpha application/bootstrap.rb and
     # finisher.rb). The tree's boot has done the work of each by the
-    # time the railties run, so they run nothing here; they are in the
-    # collection so a railtie's `before:`/`after:` naming one orders as
-    # in Rails.
+    # time the railties run, so they run nothing here but the store
+    # `:initialize_cache` takes from the config (`initialize_cache_step`);
+    # they are in the collection so a railtie's `before:`/`after:` naming
+    # one orders as in Rails.
     BOOTSTRAP_INITIALIZERS = %i[
       load_environment_hook load_active_support set_eager_load initialize_logger
       initialize_error_reporter initialize_event_reporter initialize_cache
@@ -387,6 +388,7 @@ module Rails
 
       def sorted_initializers_of_railties(app) # :nodoc:
         work = {
+          initialize_cache: -> { initialize_cache_step(app) },
           bootstrap_hook: -> { ActiveSupport.run_load_hooks(:before_initialize, app) },
           build_middleware_stack: -> { Configuration.refuse_app_middleware! },
           run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
@@ -413,6 +415,26 @@ module Rails
         end
         add.(FINISHER_INITIALIZERS)
         collection.tsort
+      end
+
+      # Bootstrap's `:initialize_cache` (railties 8.2.0.alpha
+      # application/bootstrap.rb): `Rails.cache = ActiveSupport::Cache.
+      # lookup_store(*config.cache_store)`. A store object the config names
+      # by the time this step runs becomes Rails.cache: Core's essentials
+      # engine sets `Rails.configuration.cache_store` to its
+      # TestProxyCacheStore in an initializer `before: :initialize_cache`,
+      # and app code calls that store's own API
+      # (`Rails.cache.with_high_throughput_local_cache`), which raised
+      # NoMethodError on the tree's Rails::MemoryStore. A store named by a
+      # symbol (`:null_store`, `:memory_store`) or none keeps the tree's
+      # own store (runtime/rails_cache.rb), which answers the calls the
+      # compiler emits and is cleared before each test.
+      def initialize_cache_step(app) # :nodoc:
+        config = app.config
+        return unless defined?(::ActiveSupport::Cache::Store) && config.respond_to?(:cache_store)
+        store = config.cache_store
+        return if store.nil? || store.is_a?(Symbol) || store.is_a?(Array)
+        ::Rails.instance_variable_set(:@cache_store, ::ActiveSupport::Cache.lookup_store(store))
       end
 
       # Finisher's `:eager_load!` (railties application/finisher.rb):
