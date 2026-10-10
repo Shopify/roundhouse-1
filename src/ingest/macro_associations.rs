@@ -79,7 +79,30 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
             body.insert(at, item);
         }
     }
+    for model in &mut app.models {
+        drop_redeclared(&mut model.body);
+    }
     any
+}
+
+/// A second declaration of an association name replaces the first, as
+/// Rails' `add_reflection` replaces the reflection of that name (Core's
+/// Shipping::Label runs `accelerated_belongs_to :shop` and then
+/// `belongs_to_shop_through :order`, which runs it again): the earlier
+/// Association items of a redeclared name are dropped, so the compiled
+/// readers and the `association`/`_preload_dispatch` case arms are
+/// declared once (a duplicate `when` warns, and Core's strict warnings
+/// make that fatal at load).
+fn drop_redeclared(body: &mut Vec<ModelBodyItem>) {
+    let mut seen: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
+    let mut keep = vec![true; body.len()];
+    for (at, item) in body.iter().enumerate().rev() {
+        if let ModelBodyItem::Association { assoc, .. } = item {
+            keep[at] = seen.insert(assoc.name().clone());
+        }
+    }
+    let mut keep = keep.into_iter();
+    body.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// The macro call parsed as the `belongs_to`/`has_one`/`has_many` call
