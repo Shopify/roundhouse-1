@@ -78,7 +78,12 @@ fn the_cruby_tree_runs_the_authored_value() {
         named[0]
     );
     let tracer = std::fs::read_to_string(dir.join("app/models/tracer.rb")).expect("tracer.rb");
-    assert_eq!(tracer.trim(), "TRACER = OpenTelemetry.tracer_provider.tracer(\"Shopify\")", "{tracer}");
+    // The body naming `OpenTelemetry` carries the gem-facade anchor's
+    // `require_relative` ahead of the authored value, which is untouched.
+    assert!(
+        tracer.trim().ends_with("\nTRACER = OpenTelemetry.tracer_provider.tracer(\"Shopify\")"),
+        "{tracer}"
+    );
 }
 
 /// The RBI enumerates the class: the declaration is indexed, nothing to

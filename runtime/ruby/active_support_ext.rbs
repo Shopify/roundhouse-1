@@ -23,10 +23,11 @@ module ActiveSupport
     end
   end
   def self.index_by: (untyped list) { (untyped) -> untyped } -> Hash[untyped, untyped]
-  # The lowerer routes only Array receivers to this helper. Relation
-  # receivers keep their typed method, and Array/Relation unions use
-  # the existing size lowering, so an Array contract here cannot coerce
-  # an association into Spinel's poly-array representation.
+  # The lowerer routes Array receivers here, Relation receivers to
+  # `size > 1` (campfire `@room.users.many?`), and Array/Relation unions
+  # the same way. An Array contract cannot coerce an association into
+  # Spinel's poly-array representation because those sites never reach
+  # this helper.
   def self.many?: (Array[Object] list) ?{ (Object item) -> Object } -> bool
   def self.to_sentence: (Array[untyped] list, String words_connector, String two_words_connector, String last_word_connector) -> String
   def self.symbolize_keys: (Hash[String, untyped] hash) -> Hash[Symbol, untyped]

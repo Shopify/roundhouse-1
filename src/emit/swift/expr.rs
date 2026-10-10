@@ -566,7 +566,8 @@ fn block_body_throws(e: &Expr) -> bool {
 }
 
 fn is_known_instance_method(recv: &Expr, method: &str) -> bool {
-    let Some(crate::ty::Ty::Class { id, .. }) = recv.ty.as_ref() else {
+    // An ivar reads as `T | nil` until `initialize` assigns it.
+    let Some(crate::ty::Ty::Class { id, .. }) = recv.ty.as_ref().map(|t| t.peel_nilable()) else {
         return false;
     };
     let cls = super::naming::type_name(id.0.as_str());
@@ -1332,7 +1333,10 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         // the enclosing branch's nil-guard proved it non-nil.
         ExprNode::Ivar { name } => {
             let n = camel(name.as_str());
-            if NONNULL_PROPS.with(|s| s.borrow().contains(&n)) {
+            // A parameter of the same name (`head(status)` reading
+            // `@status`) shadows the bare property.
+            let n = if is_param(name.as_str()) { format!("self.{n}") } else { n };
+            if NONNULL_PROPS.with(|s| s.borrow().contains(&camel(name.as_str()))) {
                 format!("{n}!")
             } else {
                 n
@@ -1379,6 +1383,15 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
                         emit_expr(f)
                     );
                 }
+            }
+            // `("rtl" if false)` in value position: no else branch, a
+            // literal then-branch — Swift's `if` can't be an argument,
+            // and the missing branch is Ruby's nil.
+            if is_empty_branch(else_branch)
+                && matches!(&*then_branch.node, ExprNode::Lit { value } if !matches!(value, Literal::Nil))
+                && matches!(e.ty.as_ref(), Some(t) if !matches!(t, crate::ty::Ty::Nil))
+            {
+                return format!("({} ? {} : nil)", emit_expr(cond), emit_expr(then_branch));
             }
             emit_if(cond, then_branch, else_branch)
         }
@@ -1537,6 +1550,13 @@ fn emit_hash(entries: &[(Expr, Expr)], e: &Expr) -> String {
         .iter()
         .map(|(k, v)| format!("{}: {}", emit_expr(k), emit_expr(v)))
         .collect();
+    // Every value nil (`{"X-Empty" => nil}`): there is no element type to
+    // pin, and `Any?` would refuse the `[String: String?]` the literal is
+    // passed as. Swift infers it from that context instead.
+    if matches!(e.ty.as_ref(), Some(crate::ty::Ty::Hash { value, .. }) if matches!(**value, crate::ty::Ty::Nil))
+    {
+        return format!("[{}]", pairs.join(", "));
+    }
     format!("([{}] as {dict_ty})", pairs.join(", "))
 }
 
@@ -1607,6 +1627,14 @@ fn emit_bool_op(op: BoolOpKind, left: &Expr, right: &Expr, e: &Expr) -> String {
     let l = emit_expr(left);
     let r = group_try_rhs(&emit_expr(right));
     match op {
+        // `true && "hot"` is a value, not a Bool: the right operand when
+        // the left holds, else the left's `false`.
+        BoolOpKind::And
+            if matches!(left.ty.as_ref(), Some(crate::ty::Ty::Bool))
+                && right.ty.as_ref().is_some_and(|t| !matches!(t, crate::ty::Ty::Bool)) =>
+        {
+            format!("({l} ? ({r} as Any?) : (false as Any?))")
+        }
         BoolOpKind::And => format!("{l} && {r}"),
         // `||` is logical-or for Bool results, but Ruby's `x || default`
         // nil-coalescing idiom maps to Swift's `??` when the result
@@ -2882,6 +2910,13 @@ fn emit_send(
         // below, which still sees the real `method`.
         let coercible = if is_known_instance_method(r, method) { "\0" } else { method };
         match coercible {
+            // `arr.pop` (HeaderStore#delete) drops the last element.
+            "pop" if array_elem_ty(r).is_some() => return format!("{rs}.removeLast()"),
+            // A receiver that is statically nil (a Void call: `assert_nil
+            // controller.head(:no_content)`) is evaluated, and is nil.
+            "nil?" if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Nil)) => {
+                return format!("({{ _ = {rs}; return true }}())")
+            }
             "nil?" => return format!("({rs} == nil)"),
             // `to_s`: identity on a String; plain interpolation for
             // provably-scalar receivers; the RhString.s unwrapper for

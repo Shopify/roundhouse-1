@@ -185,7 +185,74 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
     if let Some(program) = root.as_program_node() {
         collect(Some(program.statements().as_node()), &[], file, &mut out)?;
     }
+    refuse_shadowed_generators(root, &out, file)?;
     Ok(out)
+}
+
+/// A factory whose generator the file itself declares (`class Data`,
+/// `Struct = …`, in any scope) builds whatever that declaration says, not
+/// the core class the factory model assumes; and a `class`/`module` body
+/// reopening a factory class would be emitted ahead of the constant that
+/// defines it. Both refused by name rather than guessed at.
+fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &str) -> IngestResult<()> {
+    #[derive(Default)]
+    struct Declares {
+        scope: Vec<String>,
+        names: Vec<String>,
+        qualified: Vec<String>,
+    }
+    impl Declares {
+        fn declare(&mut self, path: Option<Vec<String>>) -> usize {
+            let path = path.unwrap_or_default();
+            self.names.extend(path.last().cloned());
+            let depth = self.scope.len();
+            self.scope.extend(path);
+            self.qualified.push(self.scope.join("::"));
+            depth
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declares {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let depth = self.declare(class_name_path(node));
+            ruby_prism::visit_class_node(self, node);
+            self.scope.truncate(depth);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let depth = self.declare(module_name_path(node));
+            ruby_prism::visit_module_node(self, node);
+            self.scope.truncate(depth);
+        }
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.names.push(constant_id_str(&node.name()).to_string());
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+    }
+    let factories: Vec<&LibraryClass> = classes
+        .iter()
+        .filter(|class| matches!(class.origin, Some(LibraryClassOrigin::FactoryClass { .. })))
+        .collect();
+    if factories.is_empty() {
+        return Ok(());
+    }
+    let mut declares = Declares::default();
+    ruby_prism::Visit::visit(&mut declares, root);
+    for class in factories {
+        if let Some(generator) = class.parent.as_ref().map(|p| p.0.as_str()) {
+            if matches!(generator, "Data" | "Struct") && declares.names.iter().any(|n| n == generator) {
+                return Err(unsupported(
+                    file,
+                    &format!("{generator} factory in a file that declares its own `{generator}`"),
+                ));
+            }
+        }
+        if declares.qualified.iter().any(|q| q == class.name.0.as_str()) {
+            return Err(unsupported(
+                file,
+                &format!("`{}` is a factory class and also reopened by a class body", class.name.0),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`factory_classes`] for one top-level declaration (`class`/`module`
@@ -194,6 +261,7 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
 pub(super) fn factory_classes_under(declaration: &Node<'_>, file: &str) -> IngestResult<Vec<LibraryClass>> {
     let mut out = Vec::new();
     collect_stmt(declaration, &[], file, &mut out, false)?;
+    refuse_shadowed_generators(declaration, &out, file)?;
     Ok(out)
 }
 
@@ -323,10 +391,22 @@ pub(super) fn factory_class(
     let struct_factory = generator == "Struct";
     let receiver = call.receiver().expect("factory_block checked the receiver");
     let mut args = Vec::new();
+    let mut members: Vec<String> = Vec::new();
     if let Some(arguments) = call.arguments() {
         let arguments: Vec<_> = arguments.arguments().iter().collect();
         for (index, arg) in arguments.iter().enumerate() {
-            if symbol_value(arg).is_some() {
+            if let Some(member) = symbol_value(arg) {
+                // CRuby raises on both at the `define`/`new` call.
+                if members.contains(&member) {
+                    return Err(unsupported(file, &format!("{generator} factory repeats member `{member}`")));
+                }
+                if !struct_factory && member.ends_with('=') {
+                    return Err(unsupported(
+                        file,
+                        &format!("Data factory member `{member}` is not a valid data member"),
+                    ));
+                }
+                members.push(member);
                 args.push(ingest_expr(arg, file)?);
                 continue;
             }

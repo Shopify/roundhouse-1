@@ -99,7 +99,12 @@ fn the_installed_source_declares_the_class() {
         named[0]
     );
     let tracer = std::fs::read_to_string(dir.join("app/models/tracer.rb")).expect("tracer.rb");
-    assert_eq!(tracer.trim(), "TRACER = OpenTelemetry.tracer_provider.tracer(\"Shopify\")", "{tracer}");
+    // The body naming `OpenTelemetry` carries the gem-facade anchor's
+    // `require_relative` ahead of the authored value, which is untouched.
+    assert!(
+        tracer.trim().ends_with("\nTRACER = OpenTelemetry.tracer_provider.tracer(\"Shopify\")"),
+        "{tracer}"
+    );
 }
 
 /// The namespace is opentelemetry-api's, read whole, and it declares no

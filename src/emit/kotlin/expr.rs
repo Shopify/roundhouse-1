@@ -420,7 +420,7 @@ fn class_relation_ref(path: &[crate::ident::Symbol]) -> String {
 /// to keep a transpiled class's real method from being rewritten into a
 /// Kotlin stdlib idiom of the same Ruby name.
 fn recv_declares_method(r: &Expr, method: &str) -> bool {
-    let Some(crate::ty::Ty::Class { id, .. }) = r.ty.as_ref() else {
+    let Some(crate::ty::Ty::Class { id, .. }) = r.ty.as_ref().map(|t| t.peel_nilable()) else {
         return false;
     };
     is_instance_method_of(&type_name(id.0.as_str()), method)
@@ -451,7 +451,8 @@ fn is_instance_method_of(class_name: &str, method: &str) -> bool {
 /// `Ty::Class` (its last `::` segment). Used to consult the instance-method
 /// registry for the call-vs-property decision.
 fn receiver_class_name(r: &Expr) -> Option<String> {
-    match r.ty.as_ref()? {
+    // An ivar reads as `T | nil` until `initialize` assigns it.
+    match r.ty.as_ref()?.peel_nilable() {
         crate::ty::Ty::Class { id, .. } => Some(type_name(id.0.as_str())),
         _ => None,
     }
@@ -936,6 +937,10 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
             let n = camel(name.as_str());
             if is_object_tl_field(&n) {
                 format!("{n}.get()")
+            } else if is_param(name.as_str()) {
+                // A parameter of the same name (`head(status)` reading
+                // `@status`) shadows the bare property.
+                format!("this.{}", nonnull_read(n))
             } else {
                 nonnull_read(n)
             }
@@ -956,6 +961,15 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         ExprNode::Send { recv, method, args, block, .. } => {
             let rendered = emit_send(recv.as_ref(), method.as_str(), args, block.as_ref());
             coerce_nullable_finder(rendered, recv.as_ref(), method.as_str(), e.ty.as_ref())
+        }
+        // `("rtl" if false)` as an argument: Kotlin's `if` expression needs
+        // its `else`, which is Ruby's nil.
+        ExprNode::If { cond, then_branch, else_branch }
+            if is_empty_branch(else_branch)
+                && matches!(&*then_branch.node, ExprNode::Lit { value } if !matches!(value, Literal::Nil))
+                && matches!(e.ty.as_ref(), Some(t) if !matches!(t, crate::ty::Ty::Nil)) =>
+        {
+            format!("(if ({}) {} else null)", emit_expr(cond), emit_expr(then_branch))
         }
         ExprNode::If { cond, then_branch, else_branch } => {
             emit_if(cond, then_branch, else_branch)
@@ -1116,6 +1130,13 @@ fn emit_hash(entries: &[(Expr, Expr)], e: &Expr) -> String {
         .iter()
         .map(|(k, v)| format!("{} to {}", emit_expr(k), emit_expr(v)))
         .collect();
+    // Every value nil (`{"X-Empty" => nil}`): nothing to pin, and `Any?`
+    // would refuse the `MutableMap<String, String?>` the literal is passed
+    // as; Kotlin infers it from that expected type.
+    if matches!(e.ty.as_ref(), Some(crate::ty::Ty::Hash { value, .. }) if matches!(**value, crate::ty::Ty::Nil))
+    {
+        return emit_hash_inferred(entries);
+    }
     // Heterogeneous `<String, Any?>` so a mixed map (Broadcasts payloads,
     // render options) type-checks against `Any?` params. A homogeneous map in
     // return position is re-typed by `wrap_return` (where map invariance is a
@@ -1214,6 +1235,14 @@ fn emit_bool_op(op: BoolOpKind, left: &Expr, right: &Expr, e: &Expr) -> String {
     let l = emit_expr(left);
     let r = emit_expr(right);
     match op {
+        // `true && "hot"` is a value, not a Boolean: the right operand when
+        // the left holds, else the left's `false`.
+        BoolOpKind::And
+            if matches!(left.ty.as_ref(), Some(crate::ty::Ty::Bool))
+                && right.ty.as_ref().is_some_and(|t| !matches!(t, crate::ty::Ty::Bool)) =>
+        {
+            format!("(if ({l}) ({r} as Any?) else false)")
+        }
         BoolOpKind::And => format!("{l} && {r}"),
         // `||` is logical-or for Bool results, but Ruby's `x || default`
         // nil-coalescing idiom maps to Kotlin's `?:` when the result
@@ -1892,6 +1921,13 @@ fn emit_send(
         // below, which still sees the real `method`.
         let coercible = if recv_declares_method(r, method) { "\0" } else { method };
         match coercible {
+            // `arr.pop` (HeaderStore#delete) drops the last element.
+            "pop" if recv_is_array(r) => return format!("{rs}.removeLast()"),
+            // A receiver that is statically nil (a Unit call: `assert_nil
+            // controller.head(:no_content)`) is evaluated, and is nil.
+            "nil?" if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Nil)) => {
+                return format!("run {{ {rs}; true }}")
+            }
             "nil?" => return format!("({rs} == null)"),
             "!" => return format!("!({rs})"),
             // Ruby's `nil.to_s` is "" where Kotlin's `null.toString()` is

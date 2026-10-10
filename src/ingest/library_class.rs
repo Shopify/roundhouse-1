@@ -25,6 +25,9 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+/// Ingest the first class declaration, or return `None` if there is none.
+/// Custom Data blocks require plural ingestion because their lifted methods
+/// belong to additional library classes; reject them rather than lose that IR.
 pub fn ingest_library_class(
     source: &[u8],
     file: &str,
@@ -35,6 +38,15 @@ pub fn ingest_library_class(
     let Some(class) = find_first_class(&root) else {
         return Ok(None);
     };
+    if class.body().is_some_and(|body| flatten_statements(body).iter().any(|statement| {
+        super::data_factory::declaration(statement).is_some()
+            || super::factory_class::is_factory_class_write(statement)
+    })) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "Data.define blocks require plural library-class ingestion".into(),
+        });
+    }
     Ok(Some(library_class_from_node(&class, file)?))
 }
 
@@ -242,6 +254,7 @@ fn declared_classes_in(
         let conditional = conditionally_declared(class.body(), &lc.name, file)?;
         let structs = struct_constant_classes(&lc.name, class.body(), file)?;
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
+        out.extend(super::data_factory::collect(class.body(), &lc.name, file)?);
         out.push(lc);
         out.extend(concerns);
         out.extend(conditional);
@@ -272,6 +285,7 @@ fn declared_classes_in(
         let conditional = conditionally_declared(module.body(), &lc.name, file)?;
         let structs = struct_constant_classes(&lc.name, module.body(), file)?;
         lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
+        out.extend(super::data_factory::collect(module.body(), &lc.name, file)?);
         out.push(lc);
         out.extend(concerns);
         out.extend(conditional);
@@ -3800,6 +3814,9 @@ fn walk_declaration_body<'pr>(
     Ok(out)
 }
 
+/// Collect a declaration's methods, constants, and supported DSL expansions
+/// using its resolved visibility. Custom Data constants retain only their call
+/// heads here; the factory collector owns lifting and validating their blocks.
 fn walk_decl_body_with_visibility<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
@@ -4126,7 +4143,11 @@ fn walk_decl_body_in<'pr>(
                 out.constants.push((name, value));
                 continue;
             }
-            let mut value = ingest_expr(&cw.value(), file)?;
+            let mut value = if let Some(call) = super::data_factory::declaration(&stmt) {
+                super::data_factory::head(&call, file)?
+            } else {
+                ingest_expr(&cw.value(), file)?
+            };
             if guarded {
                 value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
             }
@@ -5601,10 +5622,24 @@ fn class_body_define_method(
     }))
 }
 
+/// Ingest a method with the ordinary library keyword-flattening policy.
+/// Callers that need to retain the keyword contract use the explicit variant.
 pub(super) fn ingest_library_method(
     def: &ruby_prism::DefNode<'_>,
     owner: &ClassId,
     file: &str,
+) -> IngestResult<crate::dialect::MethodDef> {
+    ingest_library_method_with_keywords(def, owner, file, false)
+}
+
+/// Ingest a library method, optionally retaining keyword parameters even where
+/// ordinary library ingestion would flatten them. Data initializers require this
+/// to preserve Ruby's keyword binding and forwarding through `super`.
+pub(super) fn ingest_library_method_with_keywords(
+    def: &ruby_prism::DefNode<'_>,
+    owner: &ClassId,
+    file: &str,
+    preserve_keywords: bool,
 ) -> IngestResult<crate::dialect::MethodDef> {
     use crate::dialect::{MethodDef, MethodReceiver};
 
@@ -5680,7 +5715,7 @@ pub(super) fn ingest_library_method(
         // both flattenings are MARKED below: `lower::kwrest_forward`
         // repairs the call, and the marks are the only record that
         // these slots were not positional in the source.
-        let keeps_keywords = params.iter().any(|p| p.rest)
+        let keeps_keywords = preserve_keywords || params.iter().any(|p| p.rest)
             // Nameless `**` must keep the adjacent keyword group too:
             // a flattened optional would otherwise bind its default
             // while the keyword disappears into this rest slot.

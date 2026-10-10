@@ -14,12 +14,16 @@ use std::path::{Path, PathBuf};
 
 use super::super::EmittedFile;
 use crate::App;
-use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility};
+use crate::dialect::{AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver, MethodVisibility};
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+/// Lower library classes for Ruby and emit their source/RBS file pairs, grouping
+/// nested declarations with their owners where possible. Lifted Data factories
+/// participate in lowering but emit inside their owner's constant declaration,
+/// never as standalone class files.
 pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     let mut lcs: Vec<LibraryClass> = app.library_classes.clone();
     crate::timings::lap_start();
@@ -102,6 +106,13 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
 
     apply_constant_rooting(&mut lcs, app, RootingScope::RuntimeOnly);
     crate::timings::lap("emit library: constant_rooting");
+    let context;
+    let app = if lcs.iter().any(|lc| matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. }))) {
+        context = App { library_classes: lcs.clone(), ..app.clone() };
+        &context
+    } else {
+        app
+    };
     // A nested class goes in its parent's file, as the source wrote
     // it. Given its own, each part-file re-opened the outer class and
     // CLOSED it again, and `TracePoint(:end)` — how a gem implements
@@ -127,6 +138,9 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     let mut children: crate::det::HashMap<String, Vec<&LibraryClass>> =
         crate::det::HashMap::default();
     for lc in &lcs {
+        if matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
+            continue;
+        }
         if let Some(owner) = owner_in_this_tree(lc) {
             children.entry(owner).or_default().push(lc);
         }
@@ -193,7 +207,12 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     let mut after_declarations: Vec<(PathBuf, String, String, LibraryClass, EmittedFile, String)> = Vec::new();
     // (the declaration's path, the constants, their render there, whether they go before it)
     let mut beside_declarations: Vec<(PathBuf, LibraryClass, EmittedFile, bool)> = Vec::new();
-    for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
+    for (i, lc) in order
+        .iter()
+        .map(|&i| (i, &lcs[i]))
+        .filter(|(_, lc)| !matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })))
+        .filter(|(_, lc)| owner_in_this_tree(lc).is_none())
+    {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
         // `ShortId::CandidateId`) nests as `active_record/base.rb` —
@@ -8359,6 +8378,9 @@ pub(crate) enum RootingScope {
     RuntimeOnly,
 }
 
+/// Root method-body constant references that emission would otherwise shadow,
+/// restricting candidate namespaces according to `scope`. A Data factory block
+/// retains its enclosing owner's lexical scope, not the generated class's scope.
 pub(crate) fn apply_constant_rooting(
     lcs: &mut [LibraryClass],
     app: &App,
@@ -8426,7 +8448,11 @@ pub(crate) fn apply_constant_rooting(
         .collect();
     let known = |n: &str| class_names.contains(n);
     for lc in lcs.iter_mut() {
-        let name = lc.name.0.as_str();
+        let name = if matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
+            lc.name.0.as_str().rsplit_once("::").unwrap().0
+        } else {
+            lc.name.0.as_str()
+        };
         let mut shadowing: Vec<String> = name
             .split("::")
             .filter(|seg| shadows(seg))
@@ -8769,7 +8795,7 @@ pub(super) fn emit_library_class_pair(
     out_path: PathBuf,
 ) -> Vec<EmittedFile> {
     let rb = emit_library_class_decl(lc, app, out_path.clone());
-    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path, app);
+    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, app, &app.library_classes);
     vec![rb, rbs]
 }
 
@@ -8786,7 +8812,7 @@ pub(super) fn emit_library_class_pair_with_synthesized(
         out_path.clone(),
         synthesized_siblings,
     );
-    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path, app);
+    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, app, &app.library_classes);
     vec![rb, rbs]
 }
 
@@ -9022,6 +9048,41 @@ pub(super) fn emit_library_class_decl_with_synthesized(
     })
 }
 
+/// Render an indented method with named visibility directives that cannot leak
+/// to neighboring definitions. Explicitly public constructor/copy hooks need a
+/// directive too, because Ruby makes those instance methods private by default.
+fn render_library_method(s: &mut String, m: &MethodDef, body_pad: &str) {
+    for line in super::emit_method(m).lines() {
+        if line.is_empty() {
+            writeln!(s).unwrap();
+        } else {
+            writeln!(s, "{body_pad}{line}").unwrap();
+        }
+    }
+    let implicit_private = m.receiver == MethodReceiver::Instance
+        && matches!(m.name.as_str(), "initialize" | "initialize_copy" | "initialize_dup" | "initialize_clone");
+    let directive = match (m.receiver, m.visibility) {
+        (_, MethodVisibility::Public) if !implicit_private => None,
+        (MethodReceiver::Instance, MethodVisibility::Public) => Some("public"),
+        (MethodReceiver::Instance, MethodVisibility::Protected) => Some("protected"),
+        (MethodReceiver::Instance, MethodVisibility::Private) => Some("private"),
+        (MethodReceiver::Class, MethodVisibility::Private) => Some("private_class_method"),
+        (MethodReceiver::Class, MethodVisibility::Public) => None,
+        (MethodReceiver::Class, MethodVisibility::Protected) => {
+            writeln!(s, "{body_pad}class << self").unwrap();
+            writeln!(s, "{body_pad}  protected :{}", m.name).unwrap();
+            writeln!(s, "{body_pad}end").unwrap();
+            None
+        }
+    };
+    if let Some(directive) = directive {
+        writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
+    }
+}
+
+/// Assemble a library class's Ruby file with its requires and declarations.
+/// Reattach lifted Data methods by declaration span, preserving the factory's
+/// position and including dependencies from its methods and parameter defaults.
 fn emit_library_class_decl_inner(
     lc: &LibraryClass,
     app: &App,
@@ -9434,6 +9495,16 @@ fn emit_library_class_decl_inner(
             body_requires.extend(resolve_load(&m.body));
         } else {
             body_requires.extend(resolve_all(&m.body, false));
+        }
+    }
+    let factory_methods = app.library_classes.iter().filter(|class| {
+        matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
+            if lc.constants.iter().any(|(_, value)| value.span == declaration_span))
+    }).flat_map(|class| &class.methods);
+    for m in factory_methods {
+        body_requires.extend(resolve_all(&m.body, false));
+        for default in m.params.iter().filter_map(|param| param.default.as_ref()) {
+            body_requires.extend(resolve_all(default, false));
         }
     }
     // …and each eager constant's own, in order, because WHERE those go
@@ -10165,6 +10236,17 @@ fn emit_library_class_decl_inner(
             let mut rendered = super::emit_expr(value);
             if rendered.trim().is_empty() {
                 rendered = "nil".to_string();
+            }
+            if let Some(factory) = app.library_classes.iter().find(|class| {
+                matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
+                    if declaration_span == value.span)
+            }) {
+                writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                for method in &factory.methods {
+                    render_library_method(s, method, &format!("{body_pad}  "));
+                }
+                writeln!(s, "{body_pad}end").unwrap();
+                continue;
             }
             // `NAME = value unless const_defined?(:NAME)`, as written
             // (`expr::GUARDED_CONSTANT_WRITE`): a value defined first
@@ -15283,6 +15365,11 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
     if let Some(owner) = singleton_scope_owner(name, app) {
         return file_owner(&owner, app);
     }
+    if app.library_classes.iter().any(|class| class.name.0.as_str() == name
+        && matches!(class.origin, Some(LibraryClassOrigin::DataFactory { .. })))
+    {
+        return file_owner(name.rsplit_once("::").unwrap().0, app);
+    }
     let segments: Vec<&str> = name.split("::").collect();
     // Written apart from an enclosing class, it may still share a file
     // with one nested deeper: apps_runtime's database/placeholders.rb
@@ -16142,6 +16229,13 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
 /// stands in for every stubbed gem, so all their roots anchor there.
 /// On a ruby-family tree `project.rs` rewrites that file into the
 /// guarded-require block, and the same anchor loads the real gems.
+///
+/// `OpenTelemetry` is the one name here that is not a stubbed GEM — its
+/// façade never stands aside for a real `opentelemetry-api`/`-sdk` (see
+/// `runtime/ruby/open_telemetry_facade.rb`) — but it is still hosted off
+/// this same anchor file (`gem_facades.rb`'s own `require_relative`, and
+/// the per-flavor rewrite's matching one), so a body naming it resolves
+/// the same way.
 fn is_gem_facade_root(root: &str) -> bool {
     matches!(
         root,
@@ -16152,6 +16246,7 @@ fn is_gem_facade_root(root: &str) -> bool {
             | "BCrypt"
             | "RQRCode"
             | "SVG"
+            | "OpenTelemetry"
     )
 }
 

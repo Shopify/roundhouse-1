@@ -34,6 +34,7 @@ pub mod controller;
 pub mod environments;
 mod engine_config;
 mod error_site;
+mod data_factory;
 pub mod expr;
 mod factory_class;
 pub mod fixture;

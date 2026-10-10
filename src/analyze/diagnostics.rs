@@ -73,6 +73,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // Validation macros in a library class's body, which its emitted
     // class drops.
     out.extend(crate::lower::active_model_model::diagnose_dropped_validations(app));
+    out.extend(super::data::diagnose(app));
     // Rubydex's unresolved constants emit refusal stubs. Collect those
     // annotations from support methods/defaults/constants as well, so
     // an emitted raise cannot be hidden by the library diagnostic policy.

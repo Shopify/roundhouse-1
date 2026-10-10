@@ -85,6 +85,8 @@ SPINEL_TESTS = [
     "not_found_parity_spinel",
     "spinel_transaction_connection",
     "routes_segment_pattern_spinel",
+    "open_telemetry_stub_spinel",
+    "around_block_filter_spinel",
 ]
 # Inputs of the PostgreSQL Db gate (tests/spinel_pg_db.rs): the shim, its
 # RBS, the contract and time parsing it compiles with, and the cases.
