@@ -1805,6 +1805,18 @@ module ActiveRecord
       attributes_before_type_cast[name]
     end
 
+    # core.rb's `slice(*methods)`: each named method's value, by name, in
+    # a HashWithIndifferentAccess. Core's Markets::Region keys records
+    # by `record.slice(keys)`.
+    def slice(*methods)
+      methods.flatten.index_with { |method| public_send(method) }.with_indifferent_access
+    end
+
+    # core.rb's `values_at(*methods)`: the named methods' values.
+    def values_at(*methods)
+      methods.flatten.map! { |method| public_send(method) }
+    end
+
     def _has_attribute?(attr_name)
       return false unless attr_name.is_a?(String)
       column = attr_name.to_sym
