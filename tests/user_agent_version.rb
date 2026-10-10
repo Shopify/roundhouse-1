@@ -9,7 +9,9 @@
 #   Comparable operators answer over a battery of version strings, the
 #   errors included, plus the comparisons secure_headers makes.
 # - `compare` runs both and requires every observation equal.
-CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
+require_relative "support/rails_oracle"
+
+CORE_GEM_HOME = RailsOracle::CORE_GEM_HOME
 GEM_LIB = File.join(CORE_GEM_HOME, "gems/useragent-0.16.11/lib")
 
 if ARGV.first == "compare"

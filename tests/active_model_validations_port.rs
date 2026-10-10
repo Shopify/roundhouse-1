@@ -2,7 +2,7 @@
 //! (runtime/spinel/active_model_validations.rb, with
 //! active_support_option_merger.rb) against the Rails native Core runs
 //! (Shopify/rails 5813559f4aed, 8.2.0.alpha; tests/support/rails_oracle.rb),
-//! and api_versioning 4.6.0, whose FrozenRecord classes (ApiVersionRecord,
+//! and api_versioning 4.6.1, whose FrozenRecord classes (ApiVersionRecord,
 //! ApiChangeRecord) include it, compiled as a gem source over it.
 //!
 //! tests/active_model_validations_port.rb runs the same models through
@@ -25,7 +25,7 @@ fn root() -> &'static Path {
 
 fn core_gem_home() -> String {
     std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
 }
 
 fn gem_path() -> String {
@@ -67,7 +67,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activemodel (8.2.0.alpha)\n      activesupport (= 8.2.0.alpha)\n    activesupport (8.2.0.alpha)\n      concurrent-ruby (~> 1.0, >= 1.3.1)\n      i18n (>= 1.6, < 2)\n    api_versioning (4.6.0)\n      activemodel (>= 5.2)\n      activesupport (>= 5.2)\n      frozen_record (>= 0.26.1)\n      sorbet-runtime\n    concurrent-ruby (1.3.8)\n    frozen_record (0.27.4)\n      activemodel\n    i18n (1.15.2)\n      concurrent-ruby (~> 1.0)\n    sorbet-runtime (0.6.13502)\n\nDEPENDENCIES\n  api_versioning\n  frozen_record\n";
+const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activemodel (8.2.0.alpha)\n      activesupport (= 8.2.0.alpha)\n    activesupport (8.2.0.alpha)\n      concurrent-ruby (~> 1.0, >= 1.3.1)\n      i18n (>= 1.6, < 2)\n    api_versioning (4.6.1)\n      activemodel (>= 5.2)\n      activesupport (>= 5.2)\n      frozen_record (>= 0.26.1)\n      sorbet-runtime\n    concurrent-ruby (1.3.8)\n    frozen_record (0.27.4)\n      activemodel\n    i18n (1.15.2)\n      concurrent-ruby (~> 1.0)\n    sorbet-runtime (0.6.13502)\n\nDEPENDENCIES\n  api_versioning\n  frozen_record\n";
 
 const API_VERSION: &str = "module Probe\n  class ApiVersion < ApiVersioning::ApiVersionRecord\n  end\nend\n";
 
@@ -109,7 +109,7 @@ fn api_versioning_app(tag: &str, probe: &str) -> PathBuf {
         ("Gemfile.lock", LOCK),
         (
             "roundhouse.yml",
-            "test_paths:\n  - test\ngem_sources:\n  frozen_record: vendor/gems/frozen_record-0.27.4\n  api_versioning: vendor/gems/api_versioning-4.6.0\ndatabase_adapter: postgresql\n",
+            "test_paths:\n  - test\ngem_sources:\n  frozen_record: vendor/gems/frozen_record-0.27.4\n  api_versioning: vendor/gems/api_versioning-4.6.1\ndatabase_adapter: postgresql\n",
         ),
         ("config/boot.rb", "require \"bundler/setup\"\n"),
         (
@@ -127,7 +127,7 @@ fn api_versioning_app(tag: &str, probe: &str) -> PathBuf {
         std::fs::write(file, text).unwrap();
     }
     let gems = Path::new(&core_gem_home()).join("gems");
-    for gem in ["frozen_record-0.27.4", "api_versioning-4.6.0"] {
+    for gem in ["frozen_record-0.27.4", "api_versioning-4.6.1"] {
         copy_tree(&gems.join(gem), &dir.join("vendor/gems").join(gem));
     }
     dir
@@ -141,7 +141,7 @@ fn api_versioning_records_validate_like_native() {
          $LOAD_PATH.unshift {fr:?}\n$LOAD_PATH.unshift {av:?}\n$LOAD_PATH.unshift {models:?}\nrequire \"pathname\"\nrequire \"frozen_record\"\nrequire \"api_versioning\"\nrequire \"probe/api_version\"\nrequire \"av_probe\"\nputs AvProbe.lines\n",
         oracle = root().join("tests/support/rails_oracle").display().to_string(),
         fr = app.join("vendor/gems/frozen_record-0.27.4/lib").display().to_string(),
-        av = app.join("vendor/gems/api_versioning-4.6.0/lib").display().to_string(),
+        av = app.join("vendor/gems/api_versioning-4.6.1/lib").display().to_string(),
         models = app.join("app/models").display().to_string(),
     );
     std::fs::write(app.join("native.rb"), script).unwrap();

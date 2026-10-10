@@ -24,7 +24,7 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesu
 
 fn core_gem_home() -> PathBuf {
     PathBuf::from(std::env::var("CORE_GEM_HOME").unwrap_or_else(|_| {
-        "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into()
+        "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into()
     }))
 }
 

@@ -14,7 +14,7 @@ mod emit_and_run;
 
 use std::path::{Path, PathBuf};
 
-const GEM_HOME: &str = "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0";
+const GEM_HOME: &str = "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0";
 
 const LOCK: &str = "GIT\n  remote: https://github.com/rails/activeresource.git\n  revision: b2ad3bd7a95f2510fbf221ba37318ec2e449101a\n  specs:\n    activeresource (6.2.0)\n      activemodel (>= 7.0)\n      activemodel-serializers-xml (~> 1.0)\n      activesupport (>= 7.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    activemodel (8.0.2)\n      activesupport\n    activemodel-serializers-xml (1.0.3)\n      activemodel (>= 5.0.0.a)\n      activesupport (>= 5.0.0.a)\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activeresource!\n  activesupport\n";
 

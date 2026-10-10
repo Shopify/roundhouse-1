@@ -144,7 +144,7 @@ fn an_app_module_does_not_take_the_gem_source_replay() {
 
 fn core_gem_home() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("CORE_GEM_HOME").unwrap_or_else(|_| {
-        "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into()
+        "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into()
     }))
 }
 

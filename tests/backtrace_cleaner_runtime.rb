@@ -141,7 +141,7 @@ FRAMES = [
   "components/shop/lib/relative.rb:1:in 'Relative.go'",
   "app/models/relative.rb:1:in 'Relative.go'",
   "#{GEM_HOME}/gems/activerecord-8.1.4/lib/active_record/base.rb:1:in 'ActiveRecord::Base.x'",
-  "#{GEM_HOME}/bundler/gems/rails-5813559f4aed/activesupport/lib/active_support/notifications.rb:2:in 'instrument'",
+  "#{GEM_HOME}/bundler/gems/rails-5eb8c4c45bee/activesupport/lib/active_support/notifications.rb:2:in 'instrument'",
   "#{GEM_HOME}/gems/pg-1.6.2-x86_64-linux/lib/pg.rb:3:in 'PG.connect'",
   "#{DEFAULT_GEMS}/gems/minitest-5.25.0/lib/minitest.rb:4:in 'Minitest.run'",
   "#{RUBYLIBDIR}/set.rb:5:in 'Set#each'",
