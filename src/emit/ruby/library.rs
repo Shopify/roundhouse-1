@@ -2811,6 +2811,9 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
     let stale_state = native && app_calls_association(app);
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        if native {
+            synth_open_polymorphic_accessors(lc, model);
+        }
         let mut own = belongs_to(model);
         if !native {
             own.retain(|(_, _, type_column)| type_column.is_none());
@@ -3053,18 +3056,28 @@ pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App) 
     }
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        // (name, :through or HABTM, singular)
-        let names: Vec<(Symbol, bool, bool)> = model
+        // (name, :through or HABTM, singular, the unscoped has_many's
+        // relation source)
+        let names: Vec<(Symbol, bool, bool, Option<String>)> = model
             .associations()
             .filter_map(|a| match a {
-                Association::HasMany { name, through: None, .. } => Some((name.clone(), false, false)),
-                Association::HasOne { name, .. } => Some((name.clone(), false, true)),
+                Association::HasMany { name, target, foreign_key, as_interface, scope, through: None, .. } => {
+                    let plain = scope.is_none().then(|| {
+                        let mut conditions = format!("{}: @id", foreign_key.as_str());
+                        if let Some(intf) = as_interface {
+                            conditions.push_str(&format!(", {}_type: {:?}", intf.as_str(), model.name.0.as_str()));
+                        }
+                        format!("ActiveRecord::Relation.new(::{}).where({conditions})", target.0.as_str())
+                    });
+                    Some((name.clone(), false, false, plain))
+                }
+                Association::HasOne { name, .. } => Some((name.clone(), false, true, None)),
                 Association::HasMany { name, through: Some(_), .. }
-                | Association::HasAndBelongsToMany { name, .. } => Some((name.clone(), true, false)),
+                | Association::HasAndBelongsToMany { name, .. } => Some((name.clone(), true, false, None)),
                 Association::BelongsTo { .. } => None,
             })
             .collect();
-        for (name, through, singular) in names {
+        for (name, through, singular, plain) in names {
             // A reader that answers a Relation (a `:through` one, or one
             // whose scope keeps it chainable) is tracked; one that
             // answers its records memoizes them.
@@ -3078,7 +3091,7 @@ pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App) 
             if through || relation {
                 track_through_reader(lc, &name);
             } else {
-                memoize_query_reader(lc, &name, singular);
+                memoize_query_reader(lc, &name, singular, plain.as_deref());
             }
         }
     }
@@ -3154,7 +3167,7 @@ fn track_through_reader(lc: &mut LibraryClass, name: &Symbol) {
 /// @loaded = true, @cache]`, for the synthesized has_many/has_one reader
 /// shape: the loaded guard first, no `return` after it, and an Array or
 /// record value. Anything else is left alone.
-fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool) {
+fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, plain: Option<&str>) {
     fn returns(e: &Expr) -> bool {
         let mut found = matches!(&*e.node, ExprNode::Return { .. });
         if !found {
@@ -3203,13 +3216,96 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool) {
         block: None,
         parenthesized: false,
     });
+    // The reader's relation, before it loads: the collection proxy's
+    // scope (`_<name>_association_scope`), for the creates and queries
+    // it answers. A query that is a relation loaded with `to_a` and
+    // reads no local of the reader is it; an unscoped has_many's
+    // compiled query is its key (and `as:` type) on the target.
+    let scope = (!singular)
+        .then(|| match &*query.node {
+            ExprNode::Send { recv: Some(rel), method, args, block: None, .. }
+                if method.as_str() == "to_a" && args.is_empty() && !reads_local(rel) =>
+            {
+                Some(rel.clone())
+            }
+            _ => plain.map(|src| {
+                let src = format!("def __scope\n  {src}\nend\n");
+                crate::runtime_src::parse_methods(&src)
+                    .unwrap_or_else(|e| panic!("memoize_query_reader: generated source failed to parse: {e}\n{src}"))
+                    .pop()
+                    .expect("one method")
+                    .body
+            }),
+        })
+        .flatten();
     let value = syn(ExprNode::If { cond: new_record, then_branch: none, else_branch: query });
     exprs.push(syn(ExprNode::Assign { target: LValue::Ivar { name: cache.clone() }, value }));
     exprs.push(syn(ExprNode::Assign {
         target: LValue::Ivar { name: loaded },
         value: syn(ExprNode::Lit { value: Literal::Bool { value: true } }),
     }));
-    exprs.push(syn(ExprNode::Ivar { name: cache }));
+    if singular {
+        exprs.push(syn(ExprNode::Ivar { name: cache }));
+        return;
+    }
+    // A collection reader answers Rails' CollectionProxy over its
+    // records (runtime/spinel/active_record_associations.rb), loaded
+    // here or preloaded: what a call the scope-chain lowering cannot
+    // see (`record.send(:items).create(…)`, `items.first!`) reaches.
+    let wrap = |records: Expr| {
+        let sp = records.span;
+        syn(ExprNode::Send {
+            recv: Some(Expr::new(
+                sp,
+                ExprNode::Const {
+                    path: vec![
+                        Symbol::from("ActiveRecord"),
+                        Symbol::from("Associations"),
+                        Symbol::from("CollectionProxy"),
+                    ],
+                },
+            )),
+            method: Symbol::from("wrap"),
+            args: vec![
+                syn(ExprNode::SelfRef),
+                syn(ExprNode::Lit { value: Literal::Sym { value: name.clone() } }),
+                records,
+            ],
+            block: None,
+            parenthesized: true,
+        })
+    };
+    if let ExprNode::If { then_branch, .. } = &mut *exprs[0].node {
+        if let ExprNode::Return { value } = &mut *then_branch.node {
+            let records = std::mem::replace(value, syn(ExprNode::Lit { value: Literal::Nil }));
+            *value = wrap(records);
+        }
+    }
+    exprs.push(wrap(syn(ExprNode::Ivar { name: cache })));
+    if let Some(rel) = scope {
+        let scope_name = Symbol::from(format!("_{}_association_scope", name.as_str()));
+        if !lc.methods.iter().any(|m| m.name == scope_name && m.receiver == MethodReceiver::Instance) {
+            let mut scope_method = lc
+                .methods
+                .iter()
+                .find(|m| &m.name == name && m.receiver == MethodReceiver::Instance)
+                .expect("the reader")
+                .clone();
+            scope_method.name = scope_name;
+            scope_method.signature = None;
+            scope_method.body = rel;
+            lc.methods.push(scope_method);
+        }
+    }
+}
+
+/// Does `e` read a local variable (or a block parameter)?
+fn reads_local(e: &Expr) -> bool {
+    let mut found = matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Lambda { .. });
+    if !found {
+        e.node.for_each_child(&mut |c| found = found || reads_local(c));
+    }
+    found
 }
 
 /// Ruby-family pre-emit pass: each model answers `association(name)`.
@@ -3342,11 +3438,19 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
         } else {
             "raise ActiveRecord::AssociationNotFoundError.new(self, name)"
         };
-        let src = if arms.is_empty() {
+        let mut src = if arms.is_empty() {
             format!("def association(name)\n  {otherwise}\nend\n")
         } else {
             format!("def association(name)\n  case name.to_s\n{arms}  else {otherwise}\n  end\nend\n")
         };
+        // Rails' `association_cached?(name)` (`@association_cache.key?`):
+        // whether the record holds the association's state. Here that
+        // state is the association's two ivars, held once a read, a
+        // preload or a writer loaded it; a name the model does not
+        // have answers false, as Rails' does.
+        if !lc.methods.iter().any(|m| m.name.as_str() == "association_cached?" && m.receiver == MethodReceiver::Instance) {
+            src.push_str("def association_cached?(name)\n  instance_variable_get(:\"@#{name}_loaded\") == true\nend\n");
+        }
         let methods = crate::runtime_src::parse_methods(&src)
             .unwrap_or_else(|e| panic!("apply_association_reader: generated source failed to parse: {e}\n{src}"));
         for mut m in methods {
@@ -3690,7 +3794,7 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
             return;
         }
         if let ExprNode::Send { method, args, .. } = &*e.node {
-            if method.as_str() == "association" && args.len() == 1 {
+            if matches!(method.as_str(), "association" | "association_cached?") && args.len() == 1 {
                 *found = true;
                 return;
             }
@@ -3709,6 +3813,80 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
     }
     crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &belongs_to_loaded, &mut found));
     found
+}
+
+/// A polymorphic `belongs_to` whose implementors ingest could not name
+/// (no `as:` inverse, no `types:`), on the CRuby and JRuby trees: the
+/// shared lowering leaves it without accessors, since a strict target
+/// cannot name the class, and `record.approver` was a NoMethodError.
+/// Rails reads the class from the type column when asked
+/// (`BelongsToPolymorphicAssociation#klass`, `polymorphic_class_for`),
+/// so these do:
+///
+/// ```ruby
+/// def approver
+///   type = approver_type
+///   if approver_id.nil? || type.nil? || type.empty?
+///     nil
+///   else
+///     Object.const_get(type).find_by(id: approver_id)   # the primary_key:
+///   end
+/// end
+///
+/// def approver=(value)
+///   self.approver_id = value.nil? ? nil : value.id
+///   self.approver_type = value.nil? ? nil : value.class.polymorphic_name
+/// end
+/// ```
+///
+/// The memoization below then puts the reader behind the loaded guard
+/// and the writer loads what it assigns, as for every belongs_to. A
+/// reader or writer the model writes itself wins.
+fn synth_open_polymorphic_accessors(lc: &mut LibraryClass, model: &crate::dialect::Model) {
+    use crate::dialect::Association;
+    for assoc in model.associations() {
+        let Association::BelongsTo {
+            name, foreign_key, polymorphic: true, polymorphic_targets, foreign_type, primary_key, ..
+        } = assoc
+        else {
+            continue;
+        };
+        if !polymorphic_targets.is_empty() {
+            continue;
+        }
+        let n = name.as_str();
+        let fk = foreign_key.as_str();
+        let type_column = foreign_type.as_ref().map_or_else(|| format!("{n}_type"), |t| t.as_str().to_string());
+        let pk = primary_key.as_ref().map_or("id", |k| k.as_str());
+        let has = |lc: &LibraryClass, method: &str| {
+            lc.methods.iter().any(|m| m.name.as_str() == method && m.receiver == MethodReceiver::Instance)
+                || crate::lower::model_to_library::model_defines_instance_method(model, &Symbol::from(method))
+        };
+        let mut src = String::new();
+        if !has(lc, n) {
+            src.push_str(&format!(
+                "def {n}\n  if {fk}.nil? || {type_column}.nil? || {type_column}.empty?\n    nil\n  else\n    \
+                 Object.const_get({type_column}).find_by({pk}: {fk})\n  end\nend\n"
+            ));
+        }
+        if !has(lc, &format!("{n}=")) {
+            src.push_str(&format!(
+                "def {n}=(value)\n  self.{fk} = value.nil? ? nil : value.{pk}\n  \
+                 self.{type_column} = value.nil? ? nil : value.class.polymorphic_name\nend\n"
+            ));
+        }
+        if src.is_empty() {
+            continue;
+        }
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("synth_open_polymorphic_accessors: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            // Synthesized, so the loaded guard goes on (`ensure_cache_guard`).
+            m.name_span = Span::synthetic();
+            lc.methods.push(m);
+        }
+    }
 }
 
 /// `Seq[guard, query]` -> `Seq[guard, @cache = query, @loaded = true, @cache]`.
@@ -4025,7 +4203,7 @@ fn sti_class_dispatch(base_new: Expr, type_read: &Expr, args: &[Expr], span: Spa
 /// def _autosave_creator
 ///   if @creator_loaded && !@creator_cache.nil? && !@creator_cache.destroyed?
 ///     @creator_cache.save if @creator_cache.new_record?
-///     @creator_id = @creator_cache.id
+///     @creator_id = @creator_cache.id   # the `primary_key:`, `id` by default
 ///   end
 /// end
 /// ```
@@ -4086,19 +4264,22 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        let names: Vec<(Symbol, Symbol)> = model
+        let names: Vec<(Symbol, Symbol, Symbol)> = model
             .associations()
             .filter_map(|a| match a {
                 // `autosave: false` never saves the target.
-                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, .. }
+                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, .. }
                     if *autosave != Some(false) =>
                 {
-                    Some((name.clone(), foreign_key.clone()))
+                    // `primary_key: :uuid`: the key takes the target's
+                    // `uuid`, as Rails' `record._read_attribute(primary_key)`.
+                    let pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
+                    Some((name.clone(), foreign_key.clone(), pk))
                 }
                 _ => None,
             })
             .collect();
-        for (name, fk) in names {
+        for (name, fk, pk) in names {
             let writer = Symbol::from(format!("{}=", name.as_str()));
             let Some(w) = lc
                 .methods
@@ -4124,7 +4305,7 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
                 span,
                 ExprNode::Seq { exprs: vec![assign, stash_unsaved(&name, span)] },
             );
-            lc.methods.push(autosave_method(&lc.name, &name, &fk));
+            lc.methods.push(autosave_method(&lc.name, &name, &fk, &pk));
             fold_before_validation(&mut lc.methods, &lc.name, &name);
             for m in lc.methods.iter_mut().filter(|m| {
                 m.receiver == MethodReceiver::Instance
@@ -4231,6 +4412,7 @@ fn autosave_method(
     owner: &ClassId,
     name: &Symbol,
     fk: &Symbol,
+    pk: &Symbol,
 ) -> crate::dialect::MethodDef {
     let span = Span::synthetic();
     let syn = |n| Expr::new(span, n);
@@ -4270,7 +4452,7 @@ fn autosave_method(
                 }),
                 syn(ExprNode::Assign {
                     target: LValue::Ivar { name: fk.clone() },
-                    value: send(cache(), "id"),
+                    value: send(cache(), pk.as_str()),
                 }),
             ],
         }),

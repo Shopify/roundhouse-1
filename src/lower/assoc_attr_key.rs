@@ -99,7 +99,14 @@ pub fn apply_assoc_attr_key_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut conflicted: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
     for m in &app.models {
         for a in m.associations() {
-            if let Association::BelongsTo { name, foreign_key, .. } = a {
+            if let Association::BelongsTo { name, foreign_key, polymorphic, .. } = a {
+                // A polymorphic key is half of the pair: `update!(approver:
+                // user)` writes the type column too, which only the
+                // association's writer does.
+                if *polymorphic {
+                    conflicted.insert(name.clone());
+                    continue;
+                }
                 match table.get(name) {
                     Some(existing) if existing != foreign_key => {
                         conflicted.insert(name.clone());

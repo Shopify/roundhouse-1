@@ -509,6 +509,173 @@ module ActiveRecord
       end
     end
 
+    # What a has_many reader answers on the CRuby and JRuby trees
+    # (`emit::ruby::library::apply_collection_memoization`): Rails'
+    # CollectionProxy, over the records the reader loaded. Rails' reader
+    # answers the proxy, a Relation for the association that loads when
+    # enumerated; the emitted reader loads at once and keeps the
+    # records, so the proxy is an Array of them that also answers the
+    # association's own methods. The scope-chain lowering already runs a
+    # chain it can see (`owner.items.where(…)`, `.create!`) on a
+    # Relation; the proxy answers the calls it cannot: a gem's
+    # `object.send(:transitions).create(fields)`, `first!` on the
+    # reader's records, a relation method on a reader passed around.
+    #
+    # The proxy is the owner's target: `wrap` stores it in the
+    # association's cache, so a record the proxy creates or builds joins
+    # what the next read answers (`Association.created`, Rails'
+    # `add_to_target`), and the association object reads the same
+    # records. Its scope is the reader's own query
+    # (`_<name>_association_scope`, emitted beside the reader: the key,
+    # an `as:` type, the association's scope and its extension); a
+    # reader that carries none falls back to `association(name).scope`.
+    #
+    # Ported (activerecord 8.2.0.alpha associations/collection_proxy.rb,
+    # collection_association.rb): `build` / `new`, `create` / `create!`
+    # (RecordNotSaved for an unsaved owner, "You cannot call create
+    # unless the parent is saved"), `first!` / `last!` / `take!` over
+    # the loaded records (RecordNotFound when there are none), `find`
+    # with an id, a column `sum`, `destroy_all` / `delete_all` (which
+    # empty the target), `reload`, `scope`, `proxy_association`,
+    # `loaded?` (always: the reader loads), and any other Relation
+    # method, which runs on the scope. Array's own methods keep Array's meaning, which for a
+    # loaded proxy is Rails' (`first`, `size`, `each`, `include?`);
+    # `<<` / `push` stay Array's (the lowering writes a statically seen
+    # `owner.items << record` as `Association.concat`).
+    class CollectionProxy < Array
+      # The reader's records as the proxy, stored as the owner's target.
+      def self.wrap(owner, name, records)
+        return records if records.is_a?(CollectionProxy) && records.proxy_owner.equal?(owner) && records.proxy_name == name
+        proxy = new(owner, name, records || [])
+        owner.instance_variable_set(:"@#{name}_cache", proxy)
+        proxy
+      end
+
+      attr_reader :proxy_owner, :proxy_name
+
+      def initialize(owner, name, records)
+        super(records)
+        @proxy_owner = owner
+        @proxy_name = name
+      end
+
+      def proxy_association
+        @proxy_owner.association(@proxy_name)
+      end
+
+      def loaded?
+        true
+      end
+
+      def scope
+        reader_scope = :"_#{@proxy_name}_association_scope"
+        if @proxy_owner.respond_to?(reader_scope)
+          @proxy_owner.public_send(reader_scope)
+        elsif @proxy_owner.respond_to?(:association)
+          proxy_association.scope
+        else
+          raise NotImplementedError, "roundhouse: #{@proxy_owner.class.name}##{@proxy_name}: the association's scope is not emitted"
+        end
+      end
+
+      def build(attributes = {}, &block)
+        return attributes.map { |attrs| build(attrs, &block) } if attributes.is_a?(Array)
+        record = scope.build(attributes)
+        yield record if block
+        Association.created(@proxy_owner, @proxy_name, record)
+      end
+      alias_method :new, :build
+
+      def create(attributes = {}, &block)
+        _create_record(attributes, false, &block)
+      end
+
+      def create!(attributes = {}, &block)
+        _create_record(attributes, true, &block)
+      end
+
+      def first!
+        first || raise_record_not_found
+      end
+
+      def last!
+        last || raise_record_not_found
+      end
+
+      def take!
+        first || raise_record_not_found
+      end
+
+      # `find(id)` is a query on the association (`Enumerable#find`'s
+      # block form keeps its meaning).
+      def find(*args, &block)
+        return super(*args, &block) if block
+        scope.find(*args)
+      end
+
+      # A column sum is a query (`Enumerable#sum` keeps the block and
+      # numeric forms).
+      def sum(*args, &block)
+        return super(*args, &block) if block || args.empty? || !(args[0].is_a?(Symbol) || args[0].is_a?(String))
+        scope.sum(*args)
+      end
+
+      # The rows go, and so do the records the owner holds.
+      def destroy_all
+        destroyed = scope.destroy_all
+        clear
+        destroyed
+      end
+
+      def delete_all
+        deleted = scope.delete_all
+        clear
+        deleted
+      end
+
+      # The association read again, as Rails' `proxy.reload`.
+      def reload
+        @proxy_owner.instance_variable_set(:"@#{@proxy_name}_loaded", false)
+        @proxy_owner.public_send(@proxy_name)
+      end
+
+      def method_missing(method, *args, **kwargs, &block)
+        relation = scope
+        return super unless relation.respond_to?(method)
+        relation.public_send(method, *args, **kwargs, &block)
+      end
+
+      def respond_to_missing?(method, include_private = false)
+        return false if method.to_s.start_with?("to_")
+        scope.respond_to?(method) || super
+      rescue NotImplementedError
+        super
+      end
+
+      private
+        def _create_record(attributes, raise_error, &block)
+          if attributes.is_a?(Array)
+            return attributes.map { |attrs| _create_record(attrs, raise_error, &block) }
+          end
+          unless @proxy_owner.persisted?
+            raise ActiveRecord::RecordNotSaved.new("You cannot call create unless the parent is saved", @proxy_owner)
+          end
+          record = scope.build(attributes)
+          yield record if block
+          if raise_error
+            raise ActiveRecord::RecordInvalid, record unless record.save
+          else
+            record.save
+          end
+          Association.created(@proxy_owner, @proxy_name, record)
+        end
+
+        def raise_record_not_found
+          model = scope.klass
+          raise ActiveRecord::RecordNotFound.new("Couldn't find #{model.name}", model.name, model.primary_key)
+        end
+    end
+
     # `Preloader.new(records:, associations:, scope:).call`
     # (associations/preloader.rb, preloader/branch.rb, preloader/
     # association.rb): loads the named associations of records a program
