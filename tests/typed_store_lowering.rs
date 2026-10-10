@@ -237,3 +237,44 @@ end
     );
     assert!(!src.contains("default_money_format"), "no bare local call left: {src}");
 }
+
+/// A store with no boolean attribute has nothing to cast: the cast
+/// helper must still be Ruby (`case key else value end` does not parse;
+/// Core's Dns::Record and GiftCardConfiguration).
+#[test]
+fn a_store_without_boolean_attributes_reads_as_a_hash() {
+    emit_and_run::empty_app()
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :records do |t|\n    t.text :data\n  end\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        )
+        .write(
+            "app/models/record.rb",
+            r#"class Record < ApplicationRecord
+  typed_store :data do |s|
+    s.string :value
+  end
+
+  def shown
+    data[:value] || "none"
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+r = Record.new
+raise "default #{r.shown.inspect}" unless r.shown == "none"
+r.data[:value] = "1.2.3.4"
+raise "write through #{r.shown.inspect}" unless r.shown == "1.2.3.4"
+r.save!
+raise "persisted" unless Record.find(r.id).shown == "1.2.3.4"
+puts "PASS"
+"#,
+        )
+        .assert_passes();
+}

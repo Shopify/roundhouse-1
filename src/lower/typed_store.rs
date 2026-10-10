@@ -337,7 +337,14 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
     let key = Symbol::from("key");
     let value = Symbol::from("value");
     let key_ref = || sp_expr(ExprNode::Var { id: VarId(0), name: key.clone() });
-    let case = |arms: Vec<crate::expr::Arm>| sp_expr(ExprNode::Case { scrutinee: key_ref(), arms });
+    // A `case` whose only arm is the `else` is not Ruby (`case key else`
+    // does not parse): with no attribute to match, the body is the else.
+    let case = |mut arms: Vec<crate::expr::Arm>| {
+        if arms.len() == 1 {
+            return arms.pop().expect("one arm").body;
+        }
+        sp_expr(ExprNode::Case { scrutinee: key_ref(), arms })
+    };
     let arm = |name: &str, body: Expr| crate::expr::Arm {
         pattern: crate::expr::Pattern::Lit { value: Literal::Str { value: name.to_string() } },
         guard: None,
