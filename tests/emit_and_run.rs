@@ -12026,8 +12026,8 @@ raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url
 /// no validations, no callbacks, timestamps filled. `insert_all!`
 /// raises on a duplicate and answers an `ActiveRecord::Result` of the
 /// RETURNING columns, whose `rows` are Arrays of values (campfire's
-/// search test reads new ids with `.rows.flatten`); `insert_all` skips
-/// a duplicate. Both used to run the save callbacks, and `insert_all!`
+/// search test reads new ids with `.rows.flatten`), built with Rails'
+/// `new(columns, rows)`; `insert_all` skips a duplicate. Both used to run the save callbacks, and `insert_all!`
 /// was undefined.
 #[test]
 fn bulk_inserts_skip_callbacks_and_insert_all_bang_returns_its_rows() {
@@ -12046,9 +12046,19 @@ fn bulk_inserts_skip_callbacks_and_insert_all_bang_returns_its_rows() {
   end
 "#)
         .run_ruby(r#"
+# Rails' constructor, as a prepended initialize (Core's
+# ActiveRecordShopScopedResult) receives it: the columns, then Arrays.
+module SeenResult
+  def initialize(columns, rows, column_types = {}, affected_rows: nil)
+    $seen = [columns, rows.map(&:class).uniq]
+    super
+  end
+end
+ActiveRecord::Result.prepend(SeenResult)
 article = Article.create!(title: "Bulk", body: "A sufficiently long article body.")
 rows = Comment.bulk_ids(article, ["a", "b"])
 raise "rows #{rows.inspect}" unless rows.map(&:last) == ["a", "b"] && rows.all? { |r| r.first.is_a?(Integer) }
+raise "constructed with #{$seen.inspect}" unless $seen == [["id", "commenter"], [Array]]
 raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.created_at && c.updated_at }
 Comment.bulk_skipping(article, ["c"])
 raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3

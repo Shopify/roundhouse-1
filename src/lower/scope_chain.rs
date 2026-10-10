@@ -3986,12 +3986,15 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // `ActiveRecord::Result` of the RETURNING columns, one
                 // row per insert (the primary key when `returning:` is
                 // left out, SQLite's default). campfire's search test
-                // reads the new ids with `.rows.flatten`.
+                // reads the new ids with `.rows.flatten`. Built with
+                // Rails' constructor, `new(columns, rows)`, each row the
+                // Array of its values, so a prepended `initialize` (Core's
+                // ActiveRecordShopScopedResult) sees what Rails passes.
                 //
-                //   ActiveRecord::Result.new(rows.map { |__attrs|
+                //   ActiveRecord::Result.new(["id"], rows.map { |__attrs|
                 //     __rec = Message.new(__attrs)
                 //     __rec._insert_row
-                //     { "id" => __rec.id } })
+                //     [__rec.id] })
                 //
                 // Only a literal column list (Strings or Symbols) lowers;
                 // anything else declines.
@@ -4048,26 +4051,33 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         );
                         let row = syn(
                             span,
-                            ExprNode::Hash {
-                                entries: columns
+                            ExprNode::Array {
+                                elements: columns
                                     .iter()
                                     .map(|c| {
-                                        (
-                                            syn(span, ExprNode::Lit { value: Literal::Str { value: c.clone() } }),
-                                            syn(
-                                                span,
-                                                ExprNode::Send {
-                                                    recv: Some(var_expr(span, &rec)),
-                                                    method: Symbol::from(c.as_str()),
-                                                    args: vec![],
-                                                    block: None,
-                                                    parenthesized: false,
-                                                },
-                                            ),
+                                        syn(
+                                            span,
+                                            ExprNode::Send {
+                                                recv: Some(var_expr(span, &rec)),
+                                                method: Symbol::from(c.as_str()),
+                                                args: vec![],
+                                                block: None,
+                                                parenthesized: false,
+                                            },
                                         )
                                     })
                                     .collect(),
-                                kwargs: false,
+                                style: Default::default(),
+                            },
+                        );
+                        let column_names = syn(
+                            span,
+                            ExprNode::Array {
+                                elements: columns
+                                    .iter()
+                                    .map(|c| syn(span, ExprNode::Lit { value: Literal::Str { value: c.clone() } }))
+                                    .collect(),
+                                style: Default::default(),
                             },
                         );
                         let mut args = args;
@@ -4100,7 +4110,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     },
                                 )),
                                 method: Symbol::from("new"),
-                                args: vec![rows],
+                                args: vec![column_names, rows],
                                 block: None,
                                 parenthesized: true,
                             },

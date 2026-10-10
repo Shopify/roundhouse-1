@@ -16,13 +16,29 @@ module ActiveRecord
   end
 
   class Result
-    @rows: Array[Hash[String, untyped]]
+    @columns: Array[String]
+    @rows: Array[Array[untyped]]
+    @hash_rows: Array[Hash[String, untyped]]?
+    @column_types: untyped
+    @types_hash: Hash[String | Integer, untyped]?
+    @affected_rows: Integer?
 
-    def initialize: (Array[Hash[String, untyped]] rows) -> void
+    def self.from_hashes: (Array[Hash[String, untyped]] hashes, ?affected_rows: Integer?) -> Result
+    def initialize: (Array[String] columns, Array[Array[untyped]] rows, ?untyped column_types, ?affected_rows: Integer?) -> void
+    def columns: () -> Array[String]
     def rows: () -> Array[Array[untyped]]
-    def to_a: () -> Array[Hash[String, untyped]]
-    def first: () -> Hash[String, untyped]?
+    def affected_rows: () -> Integer?
+    def includes_column?: (String name) -> bool
+    def length: () -> Integer
     def each: () { (Hash[String, untyped]) -> void } -> Array[Hash[String, untyped]]
+    def empty?: () -> bool
+    def to_ary: () -> Array[Hash[String, untyped]]
+    def to_a: () -> Array[Hash[String, untyped]]
+    def []: (Integer idx) -> Hash[String, untyped]?
+    def first: () -> Hash[String, untyped]?
+    def last: () -> Hash[String, untyped]?
+    def column_types: () -> Hash[String | Integer, untyped]
+    def result: () -> Result
   end
 
   class RawConnection
