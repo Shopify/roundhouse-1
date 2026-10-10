@@ -4191,6 +4191,9 @@ fn ruby_family_files(
     for cycle in crate::require_graph::cycles(&files) {
         eprintln!("roundhouse: warning[require_cycle]: {}", cycle.describe());
     }
+    for direct in crate::require_graph::declaration_requires(&files) {
+        eprintln!("roundhouse: warning[declaration_require]: {}", direct.describe());
+    }
     Ok(files)
 }
 
@@ -9639,7 +9642,13 @@ fn load_declarations_through_their_program(
         let mut changed = false;
         let mut out = String::with_capacity(content.len());
         for line in content.split_inclusive('\n') {
-            let text = line.trim_end_matches('\n');
+            // A require a cycle break moved into a body (`module Hedwig`
+            // around `require_relative "hedwig/logging"`) is indented, and
+            // may be guarded (`... unless defined?(::Hedwig::Current)`): it
+            // loads through the program all the same, keeping both.
+            let full = line.trim_end_matches('\n');
+            let indent = &full[..full.len() - full.trim_start().len()];
+            let (text, guard) = split_require_guard(&full[indent.len()..]);
             let replaced = if let Some(rel) =
                 text.strip_prefix("require_relative \"").and_then(|r| r.strip_suffix('"'))
             {
@@ -9670,7 +9679,9 @@ fn load_declarations_through_their_program(
             match replaced {
                 Some(new) => {
                     changed = true;
+                    out.push_str(indent);
                     out.push_str(&new);
+                    out.push_str(guard);
                     if line.ends_with('\n') {
                         out.push('\n');
                     }
@@ -9682,6 +9693,21 @@ fn load_declarations_through_their_program(
             *content = out;
         }
     }
+}
+
+/// A require line split before its modifier guard (`require_relative
+/// "x" unless defined?(::X)`): the require, and the guard with its
+/// leading space (empty when unguarded).
+fn split_require_guard(text: &str) -> (&str, &str) {
+    for modifier in [" unless ", " if "] {
+        if let Some(at) = text.find(modifier) {
+            let head = &text[..at];
+            if head.ends_with('"') || head.ends_with("\")") {
+                return (head, &text[at..]);
+            }
+        }
+    }
+    (text, "")
 }
 
 /// Each feature of a gem this tree compiles from source (`gem_sources:`,

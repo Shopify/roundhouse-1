@@ -106,7 +106,8 @@ fn the_capabilities_namespace_loads_first() {
     assert_quiet(&run, "[\"caps::admin\", \"shelf::smart\"]\n");
 }
 
-/// The compile-time cycle check (`roundhouse::require_graph`) over an
+/// The compile-time cycle and declaration-require checks
+/// (`roundhouse::require_graph`) over an
 /// emitted tree already on disk: `ROUNDHOUSE_TREE=<out> cargo test
 /// --test namespace_autoload_cycles -- --ignored --nocapture`.
 #[test]
@@ -130,5 +131,45 @@ fn require_cycles_of_an_emitted_tree() {
     for cycle in &cycles {
         println!("require_cycle: {}", cycle.describe());
     }
-    println!("{} files, {} cycles", files.len(), cycles.len());
+    let direct = roundhouse::require_graph::declaration_requires(&files);
+    for found in &direct {
+        println!("declaration_require: {}", found.describe());
+    }
+    println!("{} files, {} cycles, {} declaration requires", files.len(), cycles.len(), direct.len());
+}
+
+/// Core's hedwig gem: hedwig.rb requires hedwig/logging and includes
+/// `Hedwig::Logging`; logging.rb runs a statement (a require), so its
+/// program loads the declarations and `Hedwig::Logging`'s autoload names
+/// that program. logging.rb's `module Hedwig` reopens the namespace,
+/// which closes a load cycle, so the require moves into hedwig.rb's body.
+/// It still loads the program: required directly, the declarations
+/// file's `module Logging` fired the autoload into the program, whose
+/// require of that file was in progress, and the r7 boot died with
+/// "constant Hedwig::Logging not defined" (and ActiveResource::Callbacks
+/// the same way, from `class Base`).
+fn hedwig_app() -> emit_and_run::Overlay {
+    base()
+        .write(
+            "lib/hedwig.rb",
+            "require \"logger\"\n\nmodule Hedwig\n  include Hedwig::Logging\n\n  extend self\nend\n",
+        )
+        .write(
+            "lib/hedwig/logging.rb",
+            "require \"logger\"\n\nmodule Hedwig\n  module Logging\n    FORMATTER = proc { |severity, msg| \"#{severity}: #{msg}\" }\n\n    def format_line(msg)\n      FORMATTER.call(\"INFO\", msg)\n    end\n  end\nend\n",
+        )
+}
+
+#[test]
+fn a_namespace_requiring_its_nested_programs_module_in_its_body_loads_the_program() {
+    let run = hedwig_app().run_ruby_env("p Hedwig.format_line(\"up\")\np Hedwig::Logging::FORMATTER.call(\"WARN\", \"x\")\n", &[RUBYOPT]);
+    assert_quiet(&run, "\"INFO: up\"\n\"WARN: x\"\n");
+    let hedwig = std::fs::read_to_string(run.emitted.join("app/models/hedwig.rb")).expect("hedwig.rb");
+    assert!(!hedwig.contains("require_relative \"hedwig/logging\""), "{hedwig}");
+}
+
+#[test]
+fn the_nested_programs_module_loads_first() {
+    let run = hedwig_app().run_ruby_env("p Hedwig::Logging.instance_methods\np Hedwig.format_line(\"up\")\n", &[RUBYOPT]);
+    assert_quiet(&run, "[:format_line]\n\"INFO: up\"\n");
 }
