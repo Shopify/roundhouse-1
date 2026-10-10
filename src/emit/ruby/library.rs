@@ -13849,6 +13849,42 @@ fn rewrite_carried_loads(
             return;
         }
     }
+    // `Dir[config.root.join("lib/patches/**/*.rb")].each { |file| require
+    // file }` (essentials' engine): each carried file is required in turn
+    // under its own refusal (`RoundhouseAutoload.require_carried_files`),
+    // so one this tree cannot load is named and the others still load,
+    // instead of its error ending the loop and the initializer with it.
+    if let ExprNode::Send { recv: Some(glob), method, args, block: Some(block), .. } = &*e.node {
+        let requires_each = method.as_str() == "each"
+            && args.is_empty()
+            && matches!(&*block.node, ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+                if params.len() == 1 && extra_params.is_empty() && {
+                    let body = match &*body.node {
+                        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+                        _ => body,
+                    };
+                    matches!(&*body.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                        if method.as_str() == "require"
+                            && matches!(args.as_slice(), [arg] if matches!(&*arg.node, ExprNode::Var { name, .. } if *name == params[0])))
+                });
+        if requires_each {
+            let glob = carried_loads(glob, app, root, sources);
+            if let ExprNode::Send { recv: Some(owner), method, args, .. } = &*glob.node {
+                if method.as_str() == "carried_files"
+                    && matches!(&*owner.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "RoundhouseAutoload")
+                {
+                    *e = Expr::new(e.span, ExprNode::Send {
+                        recv: Some(owner.clone()),
+                        method: Symbol::from("require_carried_files"),
+                        args: args.clone(),
+                        block: None,
+                        parenthesized: true,
+                    });
+                    return;
+                }
+            }
+        }
+    }
     let mut replacement: Option<Expr> = None;
     if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node {
         let span = e.span;
@@ -14147,7 +14183,16 @@ pub(super) fn emit_file_program(
                         lines(s, pad, &rendered);
                     }
                 }
+                // Under `file_statement`, as a plain statement: a receiver
+                // this tree does not define (essentials' patches/
+                // action_view_ext.rb reopens `ActionView::Helpers::
+                // AssetUrlHelper`) is named and the file's other
+                // statements still run, as does the engine's
+                // `lib/patches/**` glob that requires the file.
                 ProgramItem::ClassEval { receiver, method, parts } => {
+                    writeln!(s, "{pad}RoundhouseAutoload.file_statement({:?}) do", statement_site(app, receiver.span)).unwrap();
+                    let outer = pad;
+                    let pad = &format!("{outer}  ");
                     writeln!(s, "{pad}{}.{method} do", super::emit_expr(receiver)).unwrap();
                     // A model's class-body macros are the lowering's (see
                     // `replays_foreign_class_body`); any other receiver
@@ -14161,6 +14206,7 @@ pub(super) fn emit_file_program(
                     };
                     class_eval_parts(parts, &format!("{pad}  "), app, out_path, method, replays, s);
                     writeln!(s, "{pad}end").unwrap();
+                    writeln!(s, "{outer}end").unwrap();
                 }
                 // A condition that raises runs neither branch, named.
                 ProgramItem::Branch { cond, negate, then_items, else_items } => {

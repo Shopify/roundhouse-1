@@ -70,13 +70,18 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
         // with nothing to carry is named where the glob matches it.
         .write("lib/foo/patches/statement_only.rb", "Comparable.instance_method(:clamp)\n")
         .write("lib/foo/patches/notes.rb", "# frozen_string_literal: true\n")
+        // A patch whose load raises is named, and the glob's later files
+        // (string_shout.rb) still load. Not eager loaded, which would
+        // require it again and raise, as Rails' eager load would.
+        .write("lib/foo/patches/a_broken.rb", "module Broken\n  VALUE = Integer(\"x\")\nend\n")
+        .write("config/environments/test.rb", "Rails.application.configure do\n  config.eager_load = false\nend\n")
         .emit(BuildTarget::Ruby);
     let engine = std::fs::read_to_string(dir.join("app/models/foo/engine.rb")).expect("the engine is carried");
     assert!(engine.contains("class Engine < Rails::Engine"), "{engine}");
     assert!(engine.contains("run_body_statement(\"lib/foo/engine.rb:8\") do"), "{engine}");
     assert!(engine.contains("require RoundhouseAutoload.path(\"models/foo/settings\")"), "{engine}");
     assert!(
-        engine.contains("RoundhouseAutoload.carried_files(\"lib/foo/patches/**/*.rb\", [\"models/roundhouse_files/lib/foo/patches/statement_only\", \"models/string\"], [\"lib/foo/patches/notes.rb\"])"),
+        engine.contains("RoundhouseAutoload.require_carried_files(\"lib/foo/patches/**/*.rb\", [\"models/broken\", \"models/roundhouse_files/lib/foo/patches/statement_only\", \"models/string\"], [\"lib/foo/patches/notes.rb\"])"),
         "{engine}"
     );
     let models = std::fs::read_to_string(dir.join("app/models.rb")).expect("app/models.rb");
@@ -143,6 +148,10 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
     );
     assert!(
         stderr.contains("roundhouse: error[engine_glob_file_not_carried]: lib/foo/patches/notes.rb matches lib/foo/patches/**/*.rb in the source, but the tree carries no file for it; it was not loaded"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("roundhouse: error[engine_glob_file_not_loaded]: app/models/broken.rb (matched by lib/foo/patches/**/*.rb) did not load: ArgumentError"),
         "{stderr}"
     );
     assert!(stderr.contains("roundhouse: 1 railtie and engine initializer(s), hook(s) and body statement(s) did not run"), "{stderr}");
