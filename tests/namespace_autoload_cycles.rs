@@ -173,3 +173,43 @@ fn the_nested_programs_module_loads_first() {
     let run = hedwig_app().run_ruby_env("p Hedwig::Logging.instance_methods\np Hedwig.format_line(\"up\")\n", &[RUBYOPT]);
     assert_quiet(&run, "[:format_line]\n\"INFO: up\"\n");
 }
+
+/// Core's GraphApi::Admin::Home::Card shape: a module becomes an
+/// interface by its include (the included module's `self.included`
+/// extends it, as graphql-ruby's `GraphQL::Schema::Interface` does),
+/// and then names the classes that implement it, each of which checks
+/// the interface as it loads (one whose file requires, so it is a program
+/// the module requires through). Natively the classes autoload where the
+/// body names them, below the include; a require above the include
+/// loaded them while the module was no interface yet.
+fn interface_app() -> emit_and_run::Overlay {
+    base()
+        .write(
+            "app/graphql/interface.rb",
+            "module Interface\n  module DefinitionMethods\n    def interface?\n      true\n    end\n  end\n\n  def self.included(child)\n    child.extend(DefinitionMethods)\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/object_type.rb",
+            "class ObjectType\n  def self.implements(int)\n    raise \"#{int} cannot be implemented since it's not an interface\" unless int.respond_to?(:interface?)\n\n    (@interfaces ||= []) << int\n  end\n\n  def self.interfaces\n    @interfaces\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/card.rb",
+            "module Card\n  include Interface\n\n  LAYOUTS = { simple: Cards::Simple }.freeze\n\n  def self.layouts\n    LAYOUTS\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/cards/simple.rb",
+            "require \"set\"\n\nmodule Cards\n  class Simple < ObjectType\n    implements Card\n  end\nend\n",
+        )
+}
+
+#[test]
+fn an_interface_module_loads_its_implementers_below_its_include() {
+    let run = interface_app().run_ruby_env("p Card.layouts.keys\np Cards::Simple.interfaces\n", &[RUBYOPT]);
+    assert_quiet(&run, "[:simple]\n[Card]\n");
+}
+
+#[test]
+fn an_implementer_loads_its_interface_first() {
+    let run = interface_app().run_ruby_env("p Cards::Simple.interfaces\np Card.interface?\n", &[RUBYOPT]);
+    assert_quiet(&run, "[Card]\ntrue\n");
+}

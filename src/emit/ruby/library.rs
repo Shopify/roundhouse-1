@@ -9132,6 +9132,7 @@ fn emit_library_class_decl_inner(
             }
         }
     }
+    let mixin_requires: BTreeSet<String> = requires.iter().filter(|r| !header_requires.contains(*r)).cloned().collect();
     // Require-edge classification: LOAD-time refs vs body-only refs.
     //
     // Class-body constant initializers execute while the file is being
@@ -9377,6 +9378,14 @@ fn emit_library_class_decl_inner(
         Vec::new()
     };
     requires.retain(|r| !in_body.contains(r));
+    // Only an include's own module loads above the includes; the rest
+    // load below them, where the body first reads them natively. Core's
+    // GraphApi::Admin::Home::Card names its card classes in
+    // `orphan_types` after `include GraphApi::InterfaceType`, and each
+    // card class `implements` Card as it loads: required above the
+    // include, Card was no GraphQL interface yet.
+    let (in_body, in_body_after_includes): (Vec<String>, Vec<String>) =
+        in_body.into_iter().partition(|r| mixin_requires.contains(r));
     // The source's own top-level requires first, as Ruby runs them
     // before the body (`authored_requires`). A load-time need that one
     // of them already loads is not repeated.
@@ -9787,6 +9796,9 @@ fn emit_library_class_decl_inner(
     }
     for (_, inc) in &positioned {
         extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
+    }
+    for r in &in_body_after_includes {
+        writeln!(s, "{body_pad}{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
     }
     if (lc.includes.len() > positioned.len() || !carrier_extends.is_empty()) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
