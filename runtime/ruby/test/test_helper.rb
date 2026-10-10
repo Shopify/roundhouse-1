@@ -23,6 +23,7 @@
 # TS: better-sqlite3 / libsql; Rust: rusqlite; Go: modernc.org/sqlite).
 
 require "minitest/autorun"
+require "i18n"
 
 # Base64 / JSON are CRuby stdlib here (the framework tests run under
 # stock CRuby with no transpile step). Required up-front so
@@ -60,6 +61,7 @@ $LOAD_PATH.unshift(File.expand_path("..", FRAMEWORK_RUBY))
 end
 
 require "active_record"
+require "active_support_number_helper"
 require "action_view/slots"
 require "action_view/view_helpers"
 # The ruby-family ViewHelpers reopen (date_helper_test.rb). Same

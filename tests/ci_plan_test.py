@@ -48,6 +48,9 @@ def git_repository():
         git("init")
         git("config", "user.name", "CI test")
         git("config", "user.email", "test@example.invalid")
+        # Not left on: `git commit` detaches `git maintenance run --auto`, which can still be writing .git/objects when the temporary directory is removed.
+        git("config", "maintenance.auto", "false")
+        git("config", "gc.auto", "0")
         previous = os.getcwd()
         try:
             os.chdir(root)

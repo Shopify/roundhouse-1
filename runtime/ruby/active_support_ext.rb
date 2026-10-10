@@ -10,6 +10,8 @@
 # so the scaffold ActiveSupport module is one constant with both
 # surfaces.
 require_relative "active_support_inflections"
+require_relative "hash_deep_merge"
+require_relative "active_support_number_helper"
 #
 # `src/lower/blank.rs` grounds `blank?`/`present?`/`presence` by the
 # receiver's static type and every target compiles the result. What it
@@ -239,19 +241,20 @@ module ActiveSupport
     h
   end
 
-  # AS `Enumerable#many?`, no-block form: MORE THAN ONE element. Rails
-  # writes it as a short-circuiting `any?` with a counter so it stops at
-  # the second hit; the receivers that reach here are already
-  # materialized, so `length` answers the same question without the
-  # block. Another core_ext reopen the transpiled runtimes cannot host —
-  # same home and same rule as `index_by` above, the receiver evaluated
+  # AS `Enumerable#many?`: the materialized no-block form is a length
+  # check; the block form counts matches and stops at the second hit.
+  # Another core_ext reopen the transpiled runtimes cannot host — same
+  # home and same rule as `index_by` above, the receiver is evaluated
   # exactly once.
-  #
-  # The block form (`many? { … }`) is NOT here: it counts matches
-  # instead, and no corpus app writes it. `lower::enumerable_ext`
-  # rewrites only the bare call, so the block form stays visible.
   def self.many?(list)
-    list.length > 1
+    return list.length > 1 unless block_given?
+
+    count = 0
+    list.each do |item|
+      count = count + 1 if yield item
+      return true if count > 1
+    end
+    false
   end
 
   # AS `String#squish`: runs of whitespace collapsed to one space, and
@@ -259,8 +262,8 @@ module ActiveSupport
   # `gsub(/[[:space:]]+/, " ").strip` on a `String` reopen — a core_ext
   # the transpiled runtimes cannot host, and a REGEX the targets do not
   # all lower, so the scan is spelled out the way `to_sentence` below
-  # is. `[[:space:]]` is the six ASCII whitespace characters; a corpus
-  # that needs Unicode spaces would widen this test, not the shape.
+  # is. Match each character against Rails' POSIX whitespace class,
+  # including Unicode whitespace.
   #
   # campfire's `content_filters_test` writes `<<~HTML.squish` to put a
   # multi-line fixture body on one line before handing it to a filter.
@@ -270,7 +273,7 @@ module ActiveSupport
     i = 0
     while i < text.length
       c = text[i]
-      if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\f" || c == "\v"
+      if c.match?(/[[:space:]]/)
         pending_space = !out.empty?
       else
         out = out + " " if pending_space
@@ -280,6 +283,14 @@ module ActiveSupport
       i = i + 1
     end
     out
+  end
+
+  # Rails' destructive form always returns the same receiver, including
+  # when its contents were already squished.
+  def self.squish!(text)
+    text.gsub!(/[[:space:]]+/, " ")
+    text.strip!
+    text
   end
 
   # AS `Enumerable#sole`: THE one element, and a raise for any other
@@ -854,6 +865,28 @@ module ActiveSupport
       i = i + 1
     end
     sign + out + rest
+  end
+
+  # Not `f.to_s` as it is: `Float#to_d` keeps the shortest digits but cuts them at 16 without rounding (bigdecimal's BIGDECIMAL_DOUBLE_FIGURES).
+  def self.float_decimal_text(f)
+    text = f.to_s
+    exp_at = text.index("e")
+    mantissa = exp_at.nil? ? text : text[0, exp_at].to_s
+    exp = exp_at.nil? ? 0 : text[exp_at + 1, text.length].to_s.to_i
+    negative = mantissa.start_with?("-")
+    mantissa = mantissa[1, mantissa.length].to_s if negative
+    dot = mantissa.index(".")
+    int_part = dot.nil? ? mantissa : mantissa[0, dot].to_s
+    frac_part = dot.nil? ? "" : mantissa[dot + 1, mantissa.length].to_s
+    digits = int_part + frac_part
+    lead = 0
+    while lead < digits.length && digits[lead] == "0"
+      lead = lead + 1
+    end
+    significant = digits[lead, digits.length].to_s
+    return text if significant.length <= 16
+    point = int_part.length - lead + exp
+    (negative ? "-" : "") + "0." + significant[0, 16].to_s + "e" + point.to_s
   end
 end
 

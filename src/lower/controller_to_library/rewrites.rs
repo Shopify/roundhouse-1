@@ -1756,7 +1756,8 @@ pub(super) fn rewrite_destroy_bang(expr: &Expr) -> Expr {
     })
 }
 
-/// `request.format.html?` → `self.request_format == :html`, and
+/// `request.format.html?` → `self.request_format == :html`,
+/// `request.format.to_s` → its Mime string, and
 /// `request.format = :html` → `self.request_format = :html`.
 ///
 /// Rails' `request.format` is a `Mime::Type` whose predicates answer
@@ -1791,6 +1792,35 @@ pub(super) fn rewrite_request_format(expr: &Expr) -> Expr {
         )
     }
     map_expr(expr, &|e| match &*e.node {
+        // `request.format.to_s` — the negotiated Mime::Type's string
+        // (`"text/html"`), which campfire folds into its cache keys.
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.is_empty() && method.as_str() == "to_s" && is_request_format(r) =>
+        {
+            let lookup = Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        e.span,
+                        ExprNode::Const { path: vec![Symbol::from("Mime"), Symbol::from("Type")] },
+                    )),
+                    method: Symbol::from("lookup_by_extension"),
+                    args: vec![request_format(e.span)],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            Some(Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(lookup),
+                    method: Symbol::from("to_s"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            ))
+        }
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }
             if args.is_empty() && method.as_str().ends_with('?') && is_request_format(r) =>
         {
@@ -2123,16 +2153,17 @@ pub(super) fn rewrite_redirect_to(
     })
 }
 
-/// `render(:show, …, location: @article)` — Rails' POST-201 idiom.
+/// `render(:show, …, location: @article)` or
+/// `head :created, location: @article` — Rails' POST-201 idioms.
 /// The kwarg value is a polymorphic record reference; rewrite to
 /// `RouteHelpers.<singular>_path(@x.id)` so the runtime's
-/// `render(body, location: <string>)` sees a path string. Mirrors
-/// the `redirect_to @x` polymorphic rewrite below; runs over render
+/// response location handling sees a path string. Mirrors the
+/// `redirect_to @x` polymorphic rewrite below; runs over render/head
 /// Sends specifically (not redirect_to, which has its own pass).
-pub(super) fn rewrite_render_location_kwarg(expr: &Expr) -> Expr {
+pub(super) fn rewrite_response_location_kwarg(expr: &Expr) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, parenthesized }
-            if method.as_str() == "render" && !args.is_empty() =>
+            if (method.as_str() == "render" || method.as_str() == "head") && !args.is_empty() =>
         {
             let new_args: Vec<Expr> = args
                 .iter()

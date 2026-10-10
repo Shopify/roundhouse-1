@@ -4499,6 +4499,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
         .map_err(|e| format!("read inflector runtime: {e}"))?;
     files.push(("runtime/active_support_inflector.rb".into(), inflector));
+    drop_inflector_slice(files);
     // ActiveSupport::Multibyte::Unicode (8.2.0.alpha multibyte/unicode.rb),
     // which the Inflector's `transliterate` calls.
     let unicode = crate::runtime_files::read_to_string("runtime/spinel/active_support_multibyte_unicode.rb")
@@ -4547,6 +4548,20 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
              require_relative \"../../active_support_i18n_railtie\"\n"
                 .into(),
         ));
+        // A constant `I18n` anchors on runtime/i18n_locale.rb
+        // (`emit::ruby::library`'s `require_path_for_body_const`), the
+        // fixed-`:en` stand-in for trees with no i18n gem. This tree has
+        // the gem, and the stand-in's `def self.locale` would shadow the
+        // gem's `I18n.locale` for good, so the anchor loads the gem.
+        for (path, content) in files.iter_mut() {
+            if path == "runtime/i18n_locale.rb" {
+                *content = "# The i18n gem, as active_support/i18n.rb loads it — see\n\
+                            # `project::apply_postgres_bootstrap`. The stand-in at\n\
+                            # runtime/ruby/i18n_locale.rb is for trees without the gem.\n\
+                            require_relative \"active_support_i18n\"\n"
+                    .to_string();
+            }
+        }
     }
     // String's inflection methods over the Inflector (8.2.0.alpha
     // core_ext/string/inflections.rb), which `require "active_support"`
@@ -7164,16 +7179,31 @@ fn apply_cable_channels(files: &mut [(String, String)], app: &App) {
 /// (an "already initialized constant" warning over the shim's module) and
 /// active_record_connection_handling.rb defines both class methods.
 fn strip_db_shim_config(files: &mut [(String, String)]) {
+    strip_runtime_span(files, "runtime/active_record_db_config.rb", "db-shim-config");
+}
+
+/// Drop the scaffold's ActiveSupport::Inflector slice (the
+/// `inflector-slice` span of runtime/ruby/active_support_inflections.rb)
+/// from a tree that carries the full port: the slice loads first, with
+/// active_support_ext, and its `def self.camelize` & co. would shadow the
+/// port's `extend self` methods, losing the app's acronyms and rules.
+fn drop_inflector_slice(files: &mut [(String, String)]) {
+    strip_runtime_span(files, "runtime/active_support_inflections.rb", "inflector-slice");
+}
+
+/// `file`'s content without each `# >>> span` … `# <<< span` region.
+fn strip_runtime_span(files: &mut [(String, String)], file: &str, span: &str) {
+    let (open, close) = (format!("# >>> {span}"), format!("# <<< {span}"));
     for (path, content) in files.iter_mut() {
-        if path != "runtime/active_record_db_config.rb" {
+        if path != file {
             continue;
         }
         let mut out = String::with_capacity(content.len());
         let (mut inside, mut closed) = (false, false);
         for line in content.split_inclusive('\n') {
             match line.trim() {
-                "# >>> db-shim-config" => inside = true,
-                "# <<< db-shim-config" => (inside, closed) = (false, true),
+                t if t == open => inside = true,
+                t if t == close => (inside, closed) = (false, true),
                 // The blank line that separated the span from what follows.
                 "" if closed => closed = false,
                 _ if !inside => {
@@ -7196,6 +7226,14 @@ fn apply_instantiate_named(files: &mut [(String, String)], app: &App) {
     const TAIL: &str = "      # <<< generated: instantiate-named\n";
     let mut arms: Vec<(String, String)> = Vec::new();
     for model in &app.models {
+        // Only a class with a table has rows to snapshot, and only it has
+        // `instantiate`: an ActiveModel class (campfire's
+        // `Opengraph::Location`) or the abstract `ApplicationRecord` in
+        // the list was a call to a method nothing defines — spinel
+        // refused the whole build over it.
+        if !app.schema.tables.contains_key(&model.table.0) {
+            continue;
+        }
         let name = model.name.0.as_str().to_string();
         arms.push((name.clone(), name.clone()));
         for sub in &model.sti_subclass_names {
@@ -11685,11 +11723,12 @@ fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
 /// `translate` maps it), but the name stays refused rather than
 /// supported on one setup only.
 ///
-/// `transaction` with options is refused on every target but the
-/// PostgreSQL Ruby tree: the shared runtime's `Base.transaction` takes
-/// none, and Rails' `isolation:` is checked only when the transaction
-/// first runs a statement, which its eager BEGIN does not reproduce. The
-/// PostgreSQL tree carries Rails' TransactionManager
+/// `transaction` with options other than `requires_new:` is refused on
+/// every target but the PostgreSQL Ruby tree: the shared runtime's
+/// `Base.transaction` runs a nested `requires_new:` in a SAVEPOINT, but
+/// ignores `joinable:`, and Rails' `isolation:` is checked only when the
+/// transaction first runs a statement, which its eager BEGIN does not
+/// reproduce. The PostgreSQL tree carries Rails' TransactionManager
 /// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
 /// `requires_new:`, `joinable:`, `isolation:`).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
@@ -11723,7 +11762,19 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     || app.models.iter().any(|model| model.name == *id));
             let postgres_ruby = target == "ruby"
                 && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
-            if method.as_str() == "transaction" && !args.is_empty() && ar_class && !postgres_ruby {
+            // `requires_new:` alone, as a keyword: the shared runtime's.
+            let requires_new_only = |arg: &crate::expr::Expr| {
+                matches!(&*arg.node, crate::expr::ExprNode::Hash { entries, kwargs: true }
+                    if entries.iter().all(|(key, _)| matches!(&*key.node,
+                        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+                            if value.as_str() == "requires_new")))
+            };
+            if method.as_str() == "transaction"
+                && !args.is_empty()
+                && !(args.len() == 1 && requires_new_only(&args[0]))
+                && ar_class
+                && !postgres_ruby
+            {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target,
@@ -12325,6 +12376,14 @@ fn spinel_files_with_assertions(
         files.push(("sig/runtime/request_forgery_protection.rbs".to_string(), rbs));
     }
 
+    // Rails 8.1.4 ActionController::Head's options-hash implementation
+    // is only emitted for the Ruby family and Spinel, not strict targets.
+    {
+        let rbs = crate::runtime_files::read_to_string("runtime/spinel/action_controller_head.rbs")
+            .map_err(|e| format!("read runtime/spinel/action_controller_head.rbs: {e}"))?;
+        files.push(("sig/runtime/action_controller_head.rbs".to_string(), rbs));
+    }
+
     // HTTP Token/Basic auth sidecar — the ActionController::Base reopen in
     // runtime/http_authentication.rb (ruby family only). It types the
     // block parameters the helpers yield, which the app's blocks compare.
@@ -12585,7 +12644,12 @@ fn spinel_files_with_assertions(
         // scaffold (strict targets literalize controller_name/path).
         // Listed before active_support_ext so require_relative resolves.
         "active_support_inflections",
+        "active_support_number_helper",
+        "active_support_number_helper_mixin",
+        "action_view_number_helper",
+        "action_view_number_helper_mixin",
         "active_support_ext",
+        "hash_deep_merge",
         "security_utils",
         "params",
         "action_text",
@@ -12647,6 +12711,10 @@ fn spinel_files_with_assertions(
         // previewer capture. Port for Spinel; CRuby/JRuby swap to the
         // default gem below. BUNDLED also lists Timeout → "timeout".
         "timeout",
+        // `I18n.locale` / `default_locale` — the locale campfire folds
+        // into its cache keys. Rails' default, `:en`; setting one is
+        // not modeled (see the file's header).
+        "i18n_locale",
     ] {
         let rb = format!("runtime/ruby/{stem}.rb");
         let content = crate::runtime_files::read_to_string(&rb)?;
@@ -13161,10 +13229,22 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>, minitest: bool) {
     // One require, in the helper every test file loads — the place the
     // app put it.
     if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
-        for (_, entry) in &needed {
+        for (gem, entry) in &needed {
             let line = format!("require {entry:?}");
-            if !helper.contains(&line) {
-                insert_require_line(helper, &line);
+            if helper.contains(&line) {
+                continue;
+            }
+            // WebMock AFTER the app has loaded, as Rails' test_helper
+            // orders it (`config/environment`, then `webmock/minitest`):
+            // the gem swaps `Net::HTTP` for its own subclass while it is
+            // enabled, so an app class that subclasses `Net::HTTP` at
+            // load (campfire's `WebPush::Connections::HTTP`) would
+            // otherwise inherit WebMock's, and once a test disables
+            // WebMock to reach a real server its `start` breaks.
+            const BOOT: &str = "require_relative \"../boot\"\n";
+            match helper.find(BOOT) {
+                Some(at) if *gem == "webmock" => helper.insert_str(at + BOOT.len(), &format!("{line}\n")),
+                _ => insert_require_line(helper, &line),
             }
         }
         let with_mocha = needed.iter().any(|(gem, _)| *gem == "mocha");

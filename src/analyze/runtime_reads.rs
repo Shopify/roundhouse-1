@@ -605,9 +605,29 @@ fn class_name(ty: &Option<Ty>) -> Option<&str> {
 /// the PostgreSQL CRuby tree).
 const RECORD_SERIALIZATION_PORT: &str = "ActiveModel::Serializers::JSON";
 
+/// The `ActiveSupport::Inflector` methods the scaffold's slice
+/// (runtime/ruby/active_support_inflections.rb) answers on every
+/// Ruby-family tree: those that read no inflection rules. Rails' other
+/// Inflector methods read them (`inflections(locale)`), so they need the
+/// full port's `ActiveSupport::Inflector::Inflections`.
+const INFLECTOR_SLICE: &[&str] = &["camelize", "deconstantize", "foreign_key", "upcase_first", "downcase_first", "ordinalize"];
+
+/// `ActiveSupport::Inflector.underscore(...)`: a read of the inflection
+/// rules, which only the full Inflector port declares, though the slice
+/// declares the module itself.
+fn inflector_rules_read(expr: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node else { return None };
+    (class_name(&recv.ty) == Some("ActiveSupport::Inflector") && !INFLECTOR_SLICE.contains(&method.as_str()))
+        .then(|| format!("ActiveSupport::Inflector.{}", method.as_str()))
+}
+
 fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut Vec<RuntimeRead>) {
     if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs) && !accumulator_answers(expr)) {
         out.push(RuntimeRead { span: expr.span, name: needs.to_string(), shown, in_test, declaration: false });
+    }
+    const INFLECTIONS: &str = "ActiveSupport::Inflector::Inflections";
+    if let Some(shown) = inflector_rules_read(expr).filter(|_| gated(INFLECTIONS)) {
+        out.push(RuntimeRead { span: expr.span, name: INFLECTIONS.to_string(), shown, in_test, declaration: false });
     }
     if expr.decisions & crate::expr::RECORD_SERIALIZATION != 0 && gated(RECORD_SERIALIZATION_PORT) {
         // `lower::as_json_residue` may have made the record an argument

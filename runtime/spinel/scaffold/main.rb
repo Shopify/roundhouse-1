@@ -371,6 +371,7 @@ module Main
     request_format = :json if path_format == "json"
     request_format = :turbo_stream if path_format == "turbo_stream"
     request_format = :rss if path_format == "rss"
+    request_format = :xml if path_format == "xml"
     # `/service-worker.js`: campfire's raw service-worker template.
     request_format = :js if path_format == "js"
     # A route-forced format (`get "/rss" => "home#index", :format => "rss"`)
@@ -392,6 +393,8 @@ module Main
       request_format = :rss
     elsif matched.req_format == :json
       request_format = :json
+    elsif matched.req_format == :xml
+      request_format = :xml
     end
 
     controller = Main.instantiate_controller(matched.controller)
@@ -423,6 +426,7 @@ module Main
     fmt_name = "rss" if request_format == :rss
     fmt_name = "turbo_stream" if request_format == :turbo_stream
     fmt_name = "js" if request_format == :js
+    fmt_name = "xml" if request_format == :xml
     request_obj.format = fmt_name
     request_obj.body = req.raw_body
     # Write straight into the RBS-pinned `@env` (Hash[String, untyped] ->
@@ -544,7 +548,10 @@ module Main
     # controller's type unconditionally (ruby_overlay/main.rb); this is
     # the same contract. RSS keeps its fixed feed type, matching what
     # that overlay dispatch returns for the same routes.
-    if request_format == :rss
+    if controller.content_type.empty?
+      # Head responses in Rails omit Content-Type for statuses that do
+      # not permit a body (1xx, 204, 205, and 304).
+    elsif request_format == :rss
       res.headers["Content-Type"] = "application/rss+xml; charset=utf-8"
     elsif controller.content_type != "text/html; charset=utf-8"
       res.headers["Content-Type"] = controller.content_type

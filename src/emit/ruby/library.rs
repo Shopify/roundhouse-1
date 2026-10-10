@@ -563,6 +563,68 @@ fn unwrapped(body: &[&str], depth: usize) -> Option<String> {
     (open < close).then(|| body[open..close].join("\n"))
 }
 
+/// A nested class's block out of its standalone render, at the
+/// indentation the parent's nested body wants (`depth` levels). The
+/// render opens either with the parent's `depth` wrapper lines (`module
+/// WebPush` / `class Connections`) around the child's own header
+/// (`unwrapped`), or, when an outer segment is the runtime's, with ONE
+/// compact header naming the whole path (`module
+/// WebPush::Connections::Stages`), which is renamed to its last segment.
+fn child_block(body: &[&str], depth: usize, full_name: &str) -> Option<String> {
+    let first = body.iter().position(|l| !l.trim().is_empty())?;
+    let header = body[first];
+    for keyword in ["class ", "module "] {
+        let compact = format!("{keyword}{full_name}");
+        if header == compact || header.starts_with(&format!("{compact} ")) {
+            let last = body.iter().rposition(|l| l.trim() == "end")?;
+            let simple = full_name.rsplit("::").next().unwrap_or(full_name);
+            let mut out = vec![format!("{keyword}{simple}{}", &header[compact.len()..])];
+            out.extend(body[first + 1..=last].iter().map(|l| l.to_string()));
+            return Some(shifted(&out.join("\n"), depth as isize));
+        }
+    }
+    unwrapped(body, depth)
+}
+
+/// `block` moved `levels` two-space indents right (left when negative).
+/// A line without that much indentation (heredoc text) stays as it is.
+fn shifted(block: &str, levels: isize) -> String {
+    let pad = "  ".repeat(levels.unsigned_abs());
+    block
+        .lines()
+        .map(|l| match levels {
+            _ if l.is_empty() => String::new(),
+            n if n >= 0 => format!("{pad}{l}"),
+            _ => l.strip_prefix(pad.as_str()).unwrap_or(l).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `content` with `blocks` spliced after the parent's header: the nested
+/// one at `header_indent` (`spliced_after_header`), else the compact one
+/// at the margin (`class WebPush::Connections`, as a class under a
+/// runtime namespace renders), whose body is `depth - 1` levels
+/// shallower than the blocks are cut for. Without the second arm the
+/// children, already left out of the tree as files of their own, were
+/// silently gone.
+fn spliced_after_either_header(
+    content: &str,
+    depth: usize,
+    keyword: &str,
+    full_name: &str,
+    blocks: &[String],
+) -> Option<String> {
+    spliced_after_header(content, &"  ".repeat(depth - 1), keyword, blocks).or_else(|| {
+        let compact = format!("{keyword}{full_name}");
+        if depth < 2 || !content.lines().any(|l| l == compact || l.starts_with(&format!("{compact} "))) {
+            return None;
+        }
+        let shallower: Vec<String> = blocks.iter().map(|b| shifted(b, 1 - depth as isize)).collect();
+        spliced_after_header(content, "", &compact, &shallower)
+    })
+}
+
 /// `content` with `blocks` placed right after the parent's own header
 /// — the `class` line (`module` line for a module: `keyword`) at
 /// `header_indent` — or `None` when there is no such line, since
@@ -728,7 +790,12 @@ fn nested_blocks(
                 let built = builds.iter().flatten().any(|d| d == k.name.0.as_str());
                 let waits_for = superclass_wait(k, built)
                     .filter(|p| names.contains(p.as_str()) && !placed.contains(p.as_str()));
-                if waits_for.is_some() {
+                // A module the class body `include`s is read the moment
+                // the body runs, as its superclass is. (campfire's
+                // `class HTTP < Net::HTTP; include Stages; end` beside
+                // its `module Stages`.)
+                let waits_for_include = k.includes.iter().map(|p| p.0.as_str()).any(|p| names.contains(p) && !placed.contains(p));
+                if waits_for.is_some() || waits_for_include {
                     return true;
                 }
                 if builds_of(k).iter().any(|d| !placed.contains(d.as_str())) {
@@ -808,22 +875,24 @@ fn nested_blocks(
             if own_dir.is_some_and(|d| rebased == d.trim_end_matches('/')) {
                 continue;
             }
-            hoisted.push(format!("require_relative {rebased:?}{guard}"));
+            let line = format!("require_relative {rebased:?}{guard}");
+            if !hoisted.contains(&line) {
+                hoisted.push(line);
+            }
         }
         // A plain `require "x"` names a library, not a path, and is
         // carried as written.
-        hoisted.extend(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("require \""))
-                .map(|l| l.to_string()),
-        );
+        for l in lines.iter().filter(|l| l.starts_with("require \"")) {
+            if !hoisted.iter().any(|h| h == l) {
+                hoisted.push(l.to_string());
+            }
+        }
         let body: Vec<&str> = lines
             .iter()
             .copied()
             .filter(|l| !l.starts_with("require"))
             .collect();
-        let Some(block) = unwrapped(&body, depth) else { continue };
+        let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
         let after_defs = builds_after_parent_defs(parent, kid, app);
         let at = nested_position(parent, kid, app).or_else(|| after_defs.then(|| declared_at(kid, app)).flatten());
@@ -847,7 +916,7 @@ fn nested_blocks(
             );
             let sidecar = super::rbs::emit_library_class_rbs(each, &path, app);
             let lines: Vec<&str> = sidecar.content.lines().collect();
-            if let Some(block) = unwrapped(&lines, depth) {
+            if let Some(block) = child_block(&lines, depth, each.name.0.as_str()) {
                 sidecar_blocks.push(block);
             }
         }
@@ -1178,7 +1247,6 @@ fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &Nest
     }
     let depth = parent.name.0.as_str().split("::").count();
     let blocks: Vec<String> = unplaced.iter().map(|&j| nested.blocks[j].1.clone()).collect();
-    let own_header_indent = "  ".repeat(depth - 1);
     let Some(rb) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rb")) else {
         return;
     };
@@ -1187,17 +1255,21 @@ fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &Nest
     let spliced = if blocks.is_empty() {
         rb.content.trim_end_matches('\n').to_string()
     } else {
-        let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, header_keyword(parent), &blocks) else {
+        let Some(spliced) =
+            spliced_after_either_header(&rb.content, depth, header_keyword(parent), parent.name.0.as_str(), &blocks)
+        else {
             return;
         };
         spliced
     };
+    // A require the parent's own file already carries is not repeated.
+    let hoisted: Vec<&String> = nested.hoisted.iter().filter(|r| !rb.content.lines().any(|l| l == r.as_str())).collect();
     let mut content = String::new();
-    for r in &nested.hoisted {
+    for r in &hoisted {
         content.push_str(r);
         content.push('\n');
     }
-    if !nested.hoisted.is_empty() {
+    if !hoisted.is_empty() {
         content.push('\n');
     }
     content.push_str(&spliced);
@@ -1207,7 +1279,7 @@ fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &Nest
     // Only once the `.rb` took the body: a sidecar must describe the
     // file beside it, and a child left out of the one stays out of the
     // other.
-    splice_sidecar(files, depth, header_keyword(parent), &nested.sidecar_blocks);
+    splice_sidecar(files, depth, header_keyword(parent), parent.name.0.as_str(), &nested.sidecar_blocks);
 }
 
 /// The keyword of `parent`'s own header line. Only a module that holds
@@ -1217,13 +1289,12 @@ fn header_keyword(parent: &LibraryClass) -> &'static str {
     if parent.is_module { "module " } else { "class " }
 }
 
-fn splice_sidecar(files: &mut [EmittedFile], depth: usize, keyword: &str, sidecar_blocks: &[String]) {
-    let own_header_indent = "  ".repeat(depth - 1);
+fn splice_sidecar(files: &mut [EmittedFile], depth: usize, keyword: &str, full_name: &str, sidecar_blocks: &[String]) {
     let Some(rbs) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rbs"))
     else {
         return;
     };
-    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, keyword, sidecar_blocks) {
+    if let Some(spliced) = spliced_after_either_header(&rbs.content, depth, keyword, full_name, sidecar_blocks) {
         rbs.content = format!("{spliced}\n");
     }
 }
@@ -15975,6 +16046,12 @@ fn require_path_for_body_const(
         // `project::BUNDLED`, so nothing writes a bare `require "zlib"`
         // and the constant would resolve to nothing at all.
         "Zlib" => Some("runtime/zlib".to_string()),
+        // `Timeout` — ported into `runtime/ruby/timeout.rb` for spinel,
+        // swapped for Ruby's own on the ruby family (`require
+        // "timeout"`). Anchored for the same reason Zlib is: on spinel
+        // nothing else loads the port, and campfire's unfurl controller
+        // names the constant without a require.
+        "Timeout" => Some("runtime/timeout".to_string()),
         // `TypeID` — ported into `runtime/ruby/typeid.rb`, swapped for the
         // gem on the ruby family. Anchored so the model that names it
         // (lobsters' Token concern, spliced into 18 models) loads it.
@@ -15989,6 +16066,11 @@ fn require_path_for_body_const(
         // constant is actionpack's, not the stdlib's, so no bare
         // `require` reaches it on the ruby family either.
         "Mime" => Some("runtime/mime".to_string()),
+        // `I18n` — the i18n gem's locale accessors, in
+        // `runtime/ruby/i18n_locale.rb` (not `i18n.rb`, which would shadow the
+        // gem wherever `runtime/ruby` is on the load path). No Rails is
+        // loaded on these trees, so nothing else defines the constant.
+        "I18n" => Some("runtime/i18n_locale".to_string()),
         // `useragent` + `platform_agent`, PORTED into
         // `runtime/ruby/user_agent.rb` — they were façades that raised
         // until campfire's room page turned out to render all three PWA

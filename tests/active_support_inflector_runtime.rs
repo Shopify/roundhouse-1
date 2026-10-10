@@ -186,7 +186,11 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
     ];
     let run = dir.join("feature-run");
     let feature_paths: Vec<String> = features.iter().map(|f| format!("runtime/features/{f}.rb")).collect();
-    for path in ["runtime/module_delegate.rb", "runtime/active_support_inflector.rb"].into_iter().chain(feature_paths.iter().map(String::as_str)) {
+    // The scaffold's Inflector slice loads first, with active_support_ext;
+    // this tree drops it, or its singleton `camelize` would shadow the
+    // port's and lose the acronym.
+    assert!(!source("runtime/active_support_inflections.rb").contains("module Inflector"), "the PostgreSQL tree keeps the Inflector slice");
+    for path in ["runtime/active_support_inflections.rb", "runtime/module_delegate.rb", "runtime/active_support_inflector.rb"].into_iter().chain(feature_paths.iter().map(String::as_str)) {
         let file = run.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, source(path)).unwrap();
@@ -197,6 +201,7 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
             "-e",
             &format!(
                 "$LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+                 require_relative 'runtime/active_support_inflections'\n\
                  require_relative 'runtime/module_delegate'\n\
                  require_relative 'runtime/active_support_inflector'\n\
                  ActiveSupport::Inflector.inflections(:en) {{ |i| i.acronym 'API' }}\n\
@@ -211,4 +216,44 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
     let model = source("app/models/probe.rb");
     assert!(model.contains("ActiveSupport::Inflector.underscore(\"APIKey\")") && !model.contains("not supported"), "{model}");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// The scaffold's Inflector slice (runtime/ruby/active_support_inflections.rb),
+// which every Ruby-family tree carries: its caller-visible contract.
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
+const ASSERTIONS: &str = r#"
+inflector = ActiveSupport::Inflector
+raise "camelize" unless inflector.camelize("foo_bar") == "FooBar"
+raise "camelize word normalization" unless inflector.camelize("foo_BAR") == "FooBar"
+raise "camelize punctuation boundary" unless inflector.camelize("foo_BAR-Baz") == "FooBar-Baz"
+raise "lower camelize" unless inflector.camelize("foo/bar_baz", false) == "foo::BarBaz"
+raise "namespace camelize" unless inflector.camelize("/foo/bar") == "::Foo::Bar"
+raise "deconstantize" unless inflector.deconstantize("Admin::UsersController") == "Admin"
+raise "top-level deconstantize" unless inflector.deconstantize("UsersController").empty?
+raise "foreign_key" unless inflector.foreign_key("Admin::APIKey") == "api_key_id"
+raise "foreign_key option" unless inflector.foreign_key("Admin::APIKey", false) == "api_keyid"
+raise "upcase_first" unless inflector.upcase_first("hello") == "Hello"
+raise "downcase_first" unless inflector.downcase_first("WORLD") == "wORLD"
+puts "ActiveSupport::Inflector caller contract passed"
+"#;
+
+#[test]
+fn inflector_slice_runs_in_emitted_cruby_app() {
+    let run = emit_and_run::real_blog().run_ruby(ASSERTIONS);
+    run.assert_passes();
+    assert!(run
+        .stdout
+        .contains("ActiveSupport::Inflector caller contract passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn inflector_slice_runs_in_native_spinel_app() {
+    let run = emit_and_run::real_blog().run_spinel(ASSERTIONS);
+    run.assert_passes();
+    assert!(run
+        .stdout
+        .contains("ActiveSupport::Inflector caller contract passed"));
 }

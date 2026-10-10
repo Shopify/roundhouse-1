@@ -1,0 +1,13 @@
+module ActiveSupport
+  module NumberHelper
+    # The aliases are active_support_number_helper.rbs's (one module, one
+    # declaration each: RBS refuses a duplicate).
+    def number_to_currency: (number_value number, ?number_options options) -> String?
+    def number_to_delimited: (number_value number, ?number_options options) -> String?
+    def number_to_human: (number_value number, ?number_options options) -> String?
+    def number_to_human_size: (number_value number, ?number_options options) -> String?
+    def number_to_percentage: (number_value number, ?number_options options) -> String?
+    def number_to_phone: (number_value number, ?number_options options) -> String?
+    def number_to_rounded: (number_value number, ?number_options options) -> String?
+  end
+end

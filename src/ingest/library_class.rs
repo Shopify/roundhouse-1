@@ -143,7 +143,20 @@ fn library_classes(
     // class), whose parent resolves as the block-less form's does.
     let factories = super::factory_class::factory_classes(&root, file)?;
     synthesized.extend(factories.iter().filter(|class| class.origin.is_none()).map(|class| class.name.clone()));
-    out.extend(factories);
+    // One nested in a class this file declares (`Renderer::Result`)
+    // follows that owner and what it already nests, as the source orders
+    // them; any other comes last.
+    for class in factories {
+        let owner = class.name.0.as_str().rsplit_once("::").map(|(owner, _)| owner.to_string());
+        let nested = |c: &LibraryClass, owner: &str| {
+            let name = c.name.0.as_str();
+            name == owner || name.strip_prefix(owner).is_some_and(|rest| rest.starts_with("::"))
+        };
+        match owner.and_then(|owner| out.iter().rposition(|c| nested(c, &owner))) {
+            Some(at) => out.insert(at + 1, class),
+            None => out.push(class),
+        }
+    }
     // A file holding nothing but such constants still declares them.
     // Without a class to host the rest, other file-level constants
     // were dropped before this too.
@@ -218,7 +231,7 @@ fn declared_classes_in(
         if class.location().start_offset() >= before {
             continue;
         }
-        let (lc, struct_base) = library_class_and_struct_base(&class, &within(scope), file)
+        let (mut lc, struct_base) = library_class_and_struct_base(&class, &within(scope), file)
             .map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
@@ -227,9 +240,13 @@ fn declared_classes_in(
         }
         let concerns = concerning_modules(class.body(), &lc.name, file)?;
         let conditional = conditionally_declared(class.body(), &lc.name, file)?;
+        let structs = struct_constant_classes(&lc.name, class.body(), file)?;
+        lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         out.push(lc);
         out.extend(concerns);
         out.extend(conditional);
+        // Not before the owner: the struct is named under it, so the owner has to exist first.
+        out.extend(structs.into_iter().map(|(_, s)| s));
     }
     for (scope, module) in find_all_module_declarations_with_scope(node) {
         if module.location().start_offset() >= before {
@@ -249,13 +266,16 @@ fn declared_classes_in(
         // INSTANCE methods; they reach an includer only through an
         // `extend` (the authored `included` hook, or Concern's
         // `append_features`), never the owner's own singleton.
-        let lc = library_class_from_module_node_with_scope(&module, &within(scope), file)
+        let mut lc = library_class_from_module_node_with_scope(&module, &within(scope), file)
             .map_err(|err| super::error_site::at(err, &module.as_node()))?;
         let concerns = concerning_modules(module.body(), &lc.name, file)?;
         let conditional = conditionally_declared(module.body(), &lc.name, file)?;
+        let structs = struct_constant_classes(&lc.name, module.body(), file)?;
+        lc.constants.retain(|(name, _)| !structs.iter().any(|(s, _)| s == name));
         out.push(lc);
         out.extend(concerns);
         out.extend(conditional);
+        out.extend(structs.into_iter().map(|(_, s)| s));
     }
     Ok(out)
 }
@@ -2060,7 +2080,23 @@ fn struct_base_id(owner: &ClassId) -> ClassId {
 /// Every parameter defaults to nil, matching Struct: `Point.new(1)`
 /// leaves `y` nil rather than raising.
 fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
-    let base = struct_base_id(owner);
+    struct_class(
+        struct_base_id(owner),
+        members,
+        false,
+        crate::dialect::LibraryClassOrigin::StructSuperclass {
+            owner: owner.0.clone(),
+            members: members.to_vec(),
+        },
+    )
+}
+
+fn struct_class(
+    base: ClassId,
+    members: &[Symbol],
+    keyword_init: bool,
+    origin: crate::dialect::LibraryClassOrigin,
+) -> LibraryClass {
     let mut methods = Vec::new();
     for m in members {
         methods.push(synth_attr_reader(&base, m, MethodReceiver::Instance));
@@ -2069,9 +2105,12 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
     let params: Vec<Param> = members
         .iter()
         .map(|m| {
-            let mut p = Param::positional(m.clone());
-            p.default = Some(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }));
-            p
+            let nil = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+            if keyword_init {
+                Param::keyword(m.clone(), Some(nil))
+            } else {
+                Param::with_default(m.clone(), nil)
+            }
         })
         .collect();
     let assigns: Vec<Expr> = members
@@ -2117,10 +2156,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
-        origin: Some(crate::dialect::LibraryClassOrigin::StructSuperclass {
-            owner: owner.0.clone(),
-            members: members.to_vec(),
-        }),
+        origin: Some(origin),
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
@@ -2180,6 +2216,68 @@ fn source_passes_rest_on(def: &ruby_prism::DefNode<'_>) -> bool {
     uses.0
 }
 
+/// `Result = Struct.new(:a, :b, keyword_init: true)` with no block,
+/// written directly in a class or module body: the call, read as the
+/// class it defines. A block with defs is `factory_class`'s already.
+/// Only `keyword_init: true`: since Ruby 3.2 a positional struct takes
+/// keywords too, so the reader types would not be the constructor's.
+/// A member Ruby could not also spell as a keyword parameter
+/// (`success?`, `end`) or a splatted member list stays the constant.
+fn struct_constant_spec<'pr>(value: &ruby_prism::Node<'pr>) -> Option<ruby_prism::CallNode<'pr>> {
+    let call = value.as_call_node()?;
+    if call.name().as_slice() != b"new" || call.block().is_some() || constant_path_of(&call.receiver()?)? != vec!["Struct".to_string()] {
+        return None;
+    }
+    let mut members = 0;
+    let mut keyword_init = false;
+    for arg in call.arguments()?.arguments().iter() {
+        if let Some(options) = arg.as_keyword_hash_node() {
+            let elements: Vec<_> = options.elements().iter().collect();
+            let [pair] = elements.as_slice() else { return None };
+            let pair = pair.as_assoc_node()?;
+            if symbol_value(&pair.key()).as_deref() != Some("keyword_init") || pair.value().as_true_node().is_none() {
+                return None;
+            }
+            keyword_init = true;
+            continue;
+        }
+        let member = symbol_value(&arg)?;
+        if !member.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            || !member.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || crate::emit::ruby::expr::is_ruby_keyword(&member)
+        {
+            return None;
+        }
+        members += 1;
+    }
+    (members > 0 && keyword_init).then_some(call)
+}
+
+/// The classes `owner`'s body defines through a block-less
+/// `X = Struct.new(…, keyword_init: true)` ([`struct_constant_spec`]),
+/// with the constant names they replace. Each is a `FactoryClass`, so
+/// the runtime's Struct still supplies the constructor, `to_h`, `==`
+/// and the rest; ingest only adds the readers and writers.
+fn struct_constant_classes(
+    owner: &ClassId,
+    body: Option<ruby_prism::Node<'_>>,
+    file: &str,
+) -> IngestResult<Vec<(Symbol, LibraryClass)>> {
+    let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else {
+        return Ok(Vec::new());
+    };
+    let scope: Vec<String> = owner.0.as_str().split("::").map(str::to_string).collect();
+    let mut out = Vec::new();
+    for stmt in statements.body().iter() {
+        let Some(write) = stmt.as_constant_write_node() else { continue };
+        let Some(call) = struct_constant_spec(&write.value()) else { continue };
+        let name = constant_id_str(&write.name()).to_string();
+        let mut path = scope.clone();
+        path.push(name.clone());
+        out.push((Symbol::from(name), super::factory_class::factory_class(&path, &call, None, file)?));
+    }
+    Ok(out)
+}
 /// Same as `library_class_from_node` but for module-as-namespace
 /// declarations — modules whose body has at least one direct `def`,
 /// surfaced via `find_all_modules`. Lowered to a `LibraryClass` with

@@ -1300,6 +1300,9 @@ pub fn emit_with_assertions(
             // into a seeded Relation. See the module.
             crate::lower::records_to_relation_arg::rewrite_test_classes(&mut test_lcs, app);
             library::apply_scope_lowering(&mut test_lcs, app);
+            // `1.minute.ago` in a class a test file carries (campfire's
+            // `PushServiceTestHelper.sign`), as library classes get it.
+            library::apply_duration_lowering(&mut test_lcs, app);
             // A test class nests under the class it tests
             // (`class User … class BotTest`), which shadows exactly as
             // the model-side concern does: campfire's

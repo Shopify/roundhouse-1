@@ -224,6 +224,59 @@ end
 # returns opaque tree/node handles — the contract is the surface, not
 # the handle shape.
 module Dom
+  # Markup as a list of tokens two equivalent documents share: each tag
+  # with its name downcased and its attributes sorted, each text run
+  # trimmed, whitespace-only runs dropped. `assert_dom_equal` compares
+  # these.
+  def self.equivalence_tokens(html)
+    out = []
+    html.scan(/<[^>]*>|[^<]+/).each do |tok|
+      if tok.start_with?("<")
+        out << tag_token(tok)
+      else
+        text = tok.strip
+        out << text unless text.empty?
+      end
+    end
+    out
+  end
+
+  # `<td  class="a" id=b>` -> `<td class="a" id="b">`; `</TD >` -> `</td>`.
+  def self.tag_token(tok)
+    inner = tok[1, tok.length - 2].to_s.strip
+    return "</#{inner[1, inner.length].to_s.strip.downcase}>" if inner.start_with?("/")
+    inner = inner[0, inner.length - 1].to_s.strip if inner.end_with?("/")
+    i = 0
+    i += 1 while i < inner.length && !" \t\n\r".include?(inner[i])
+    name = inner[0, i].to_s.downcase
+    attrs = []
+    while i < inner.length
+      i += 1 while i < inner.length && " \t\n\r".include?(inner[i])
+      break if i >= inner.length
+      start = i
+      i += 1 while i < inner.length && !" \t\n\r=".include?(inner[i])
+      key = inner[start, i - start].to_s.downcase
+      i += 1 while i < inner.length && " \t\n\r".include?(inner[i])
+      value = nil
+      if i < inner.length && inner[i] == "="
+        i += 1
+        i += 1 while i < inner.length && " \t\n\r".include?(inner[i])
+        quote = inner[i]
+        if quote == "\"" || quote == "'"
+          close = inner.index(quote, i + 1) || inner.length
+          value = inner[i + 1, close - i - 1].to_s
+          i = close + 1
+        else
+          start = i
+          i += 1 while i < inner.length && !" \t\n\r".include?(inner[i])
+          value = inner[start, i - start].to_s
+        end
+      end
+      attrs << (value.nil? ? key : "#{key}=\"#{value}\"")
+    end
+    attrs.empty? ? "<#{name}>" : "<#{name} #{attrs.sort.join(" ")}>"
+  end
+
   # Parse an HTML document. Stub: the document *is* its html string.
   def self.parse(html)
     html
@@ -586,6 +639,14 @@ module ActiveJob
 
     def assert_no_enqueued_jobs(only: [], &block)
       assert_enqueued_jobs(0, only: only, &block)
+    end
+
+    # Rails' `clear_enqueued_jobs`: the `:test` adapter forgets what it
+    # holds, and a blockless assertion afterwards counts from here.
+    def clear_enqueued_jobs
+      ActiveJob.clear_held
+      @__jobs_from = ActiveJob.performed.length
+      nil
     end
 
     # The suite runs under the `:test` adapter (see the block comment
@@ -1112,6 +1173,26 @@ class TestBase
     end
   end
 
+  # Minitest's `assert_nothing_raised`: the block runs, and an exception
+  # from it fails the test by propagating, as any error does here.
+  def assert_nothing_raised(*_exceptions)
+    yield
+  end
+
+  # rails-dom-testing's `assert_dom_equal`: the same markup up to
+  # attribute order and the whitespace between tags. Compared as tokens
+  # (`Dom.equivalence_tokens`), since this harness has no DOM to walk;
+  # entities are compared as written, not decoded.
+  def assert_dom_equal(expected, actual, msg = nil)
+    return if Dom.equivalence_tokens(expected.to_s) == Dom.equivalence_tokens(actual.to_s)
+    raise(msg || "assert_dom_equal failed: expected #{expected.inspect}, got #{actual.inspect}")
+  end
+
+  def assert_dom_not_equal(expected, actual, msg = nil)
+    return unless Dom.equivalence_tokens(expected.to_s) == Dom.equivalence_tokens(actual.to_s)
+    raise(msg || "assert_dom_not_equal failed: #{actual.inspect} is the same markup")
+  end
+
   # `assert_match` left as a method — nilable value handling differs
   # per target. spinel-target will need adjusting when toolchain-spinel
   # re-enables; for now this works under CRuby.
@@ -1346,13 +1427,19 @@ module ActionDispatch
 end
 
 # The other three test-case parents a Rails app writes against.
-# `ActionView::TestCase` LOADS and nothing more so far: every test under
-# it fails on its first `view` — a per-test NoMethodError in the tally,
-# which is the honest reading of "the harness has no such thing yet",
-# and a better one than a NameError taking the file whole. The two
-# cable parents carry their harness below.
+# `ActionView::TestCase`: `view.<helper>` is bound at compile time
+# (`lower::view_test_case`); what the harness supplies is the controller
+# a helper reads (`controller.perform_caching`, campfire's
+# `MessagesHelper`). Rails builds an `ActionView::TestCase::TestController`
+# per test, an ActionController::Base, so a fresh Base is installed as
+# the current controller before each one. The two cable parents carry
+# their harness below.
 module ActionView
   class TestCase < TestBase
+    def setup
+      super
+      ActionController::Current.controller = ActionController::Base.new
+    end
   end
 end
 
@@ -1709,6 +1796,21 @@ module RequestDispatch
     @__https == true
   end
 
+  # Rails' integration `reset!`: a fresh session — no cookies, session or
+  # flash carried over, the default host, plain http — as a new browser
+  # would bring (campfire's fetch-metadata test signs in once per
+  # `Sec-Fetch-Site` value).
+  def reset!
+    @__session = nil
+    @__flash = nil
+    @__cookies = nil
+    @__response = nil
+    @__host = nil
+    @__https = false
+    sync_url_origin
+    nil
+  end
+
   def dispatch_request(method, path, params, headers = {}, as = nil)
     path = integration_request_path(path)
     require_relative "../config/routes"
@@ -1739,6 +1841,15 @@ module RequestDispatch
     # a query string reaches a test path at all: a route helper renders
     # its non-segment options into one.
     match_path, _, query = path.partition("?")
+    # A form's hidden `_method` carries the real verb (Rack's
+    # MethodOverride), exactly as both production dispatchers apply it
+    # after the body parse. campfire's fetch-metadata test posts
+    # `_method: "delete"` cross-site and expects the DELETE route's
+    # forgery refusal, not "No route matches POST".
+    if method == "POST" && params.is_a?(Hash)
+      override = (params[:_method] || params["_method"]).to_s.upcase
+      method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
+    end
     matched = ActionDispatch::Router.match(
       method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
     )
