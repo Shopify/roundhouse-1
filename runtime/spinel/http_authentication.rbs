@@ -18,5 +18,17 @@ module ActionController
     def self.unquote: (String value) -> String
     def self.basic?: (String header) -> bool
     def self.basic_credentials: (String header) -> Array[String]
+
+    # Rails' module functions (see the .rb); `request` is either Request
+    # twin, both of which answer `authorization`.
+    module Basic
+      def self.authenticate: (untyped request) { (String user_name, String password) -> untyped } -> untyped
+      def self.has_basic_credentials?: (untyped request) -> bool
+      def self.user_name_and_password: (untyped request) -> Array[String]
+      def self.decode_credentials: (untyped request) -> String
+      def self.auth_scheme: (untyped request) -> String?
+      def self.auth_param: (untyped request) -> String?
+      def self.encode_credentials: (untyped user_name, untyped password) -> String
+    end
   end
 end

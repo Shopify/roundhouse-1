@@ -345,7 +345,20 @@ pub(in crate::analyze) fn register(
         let mut test_request = ClassInfo::default();
         test_request.parent = Some(request_id.clone());
         test_request.instance_methods = request.instance_methods.clone();
-        classes.entry(ClassId(Symbol::from("ActionDispatch::TestRequest"))).or_insert(test_request);
+        classes.entry(ClassId(Symbol::from("ActionDispatch::TestRequest"))).or_insert(test_request.clone());
+        // `ActionController::TestRequest.create(controller_class)`, the
+        // controller-test request (runtime/action_dispatch_request.rb on
+        // the CRuby tree); Core's PolicyContextBuilder builds one for its
+        // GraphQL controller.
+        let mut controller_test_request = test_request;
+        controller_test_request.parent = Some(ClassId(Symbol::from("ActionDispatch::TestRequest")));
+        let controller_test_request_id = ClassId(Symbol::from("ActionController::TestRequest"));
+        controller_test_request.instance_methods.insert(Symbol::from("controller_class"), Ty::Untyped);
+        controller_test_request.class_methods.insert(
+            Symbol::from("create"),
+            Ty::Class { id: controller_test_request_id.clone(), args: vec![] },
+        );
+        classes.entry(controller_test_request_id).or_insert(controller_test_request);
         // `ActionDispatch::Http::Headers`, what `request.headers` builds
         // over the env (runtime/ruby/action_dispatch/headers.rb, shared
         // by both Request twins), with that port's surface.
@@ -414,6 +427,29 @@ pub(in crate::analyze) fn register(
     }
     for m in ["request_http_basic_authentication", "request_http_token_authentication"] {
         app_ctrl.class_methods.insert(Symbol::from(m), Ty::Nil);
+    }
+    // Rails' `ActionController::HttpAuthentication::Basic` module
+    // functions (the same runtime file). Core's graph clients compute a
+    // constant from `encode_credentials` at load, so its reads type
+    // through this table.
+    {
+        let mut basic = ClassInfo::default();
+        basic.is_module = true;
+        let str_or_nil = || Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+        for (m, ty) in [
+            ("encode_credentials", Ty::Str),
+            ("decode_credentials", Ty::Str),
+            ("user_name_and_password", Ty::Array { elem: Box::new(Ty::Str) }),
+            ("has_basic_credentials?", Ty::Bool),
+            ("auth_scheme", str_or_nil()),
+            ("auth_param", str_or_nil()),
+            ("authenticate", Ty::Untyped),
+        ] {
+            basic.class_methods.insert(Symbol::from(m), ty);
+        }
+        classes
+            .entry(ClassId(Symbol::from("ActionController::HttpAuthentication::Basic")))
+            .or_insert(basic);
     }
     app_ctrl.class_methods.insert(Symbol::from("response"), Ty::Untyped);
     // The response surface the shared runtime's Base defines on the

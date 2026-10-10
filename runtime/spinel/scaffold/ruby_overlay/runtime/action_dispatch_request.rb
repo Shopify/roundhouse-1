@@ -14,6 +14,8 @@
 # write scratch keys into it (`exception_notifier.exception_data`),
 # which the real ENV object would reject for non-String values.
 require "stringio"
+require "securerandom"
+require "digest"
 require_relative "action_dispatch/headers"
 
 module ActionDispatch
@@ -38,6 +40,85 @@ module ActionDispatch
 
     def session_skip?
       @session_options[:skip] == true
+    end
+
+    # Rails' `session_options=` stores them in the env as well, where
+    # Rack's session middleware reads them.
+    def session_options=(options)
+      @session_options = options
+      set_header("rack.session.options", options)
+    end
+
+    # Rack's session: the env's `rack.session`, an empty Hash until one
+    # is set (`Rack::Request::Helpers#session`).
+    def session
+      fetch_header("rack.session") { |k| set_header(k, {}) }
+    end
+
+    def session=(session)
+      set_header("rack.session", session)
+    end
+
+    # Rack::Request::Env, which Rails' Request includes: the env read
+    # and written by key.
+    def get_header(name) = @env[name]
+
+    def set_header(name, value)
+      @env[name] = value
+    end
+
+    def has_header?(name) = @env.key?(name)
+
+    def fetch_header(name, &block) = @env.fetch(name, &block)
+
+    def delete_header(name) = @env.delete(name)
+
+    def add_header(key, value)
+      if value.nil?
+        get_header(key)
+      elsif has_header?(key)
+        set_header(key, "#{get_header(key)},#{value}")
+      else
+        set_header(key, value)
+      end
+    end
+
+    # Rails' `request.authorization`: the header, or one of the names a
+    # proxy or rewrite moves it to.
+    def authorization
+      get_header("HTTP_AUTHORIZATION") ||
+        get_header("X-HTTP_AUTHORIZATION") ||
+        get_header("X_HTTP_AUTHORIZATION") ||
+        get_header("REDIRECT_X_HTTP_AUTHORIZATION")
+    end
+
+    # Rails' path parameters (the route's captures), kept in the env
+    # under its key; writing them drops the merged-parameters cache.
+    PARAMETERS_KEY = "action_dispatch.request.path_parameters"
+
+    def path_parameters
+      get_header(PARAMETERS_KEY) || set_header(PARAMETERS_KEY, {})
+    end
+
+    def path_parameters=(parameters)
+      delete_header("action_dispatch.request.parameters")
+      set_header(PARAMETERS_KEY, parameters)
+    end
+
+    # Rails' verb table (ActionDispatch::Request::HTTP_METHODS), which
+    # `request_method=` checks a name against.
+    HTTP_METHODS = %w[
+      OPTIONS GET HEAD POST PUT DELETE TRACE CONNECT
+      PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK
+      VERSION-CONTROL REPORT CHECKOUT CHECKIN UNCHECKOUT MKWORKSPACE UPDATE LABEL MERGE BASELINE-CONTROL MKACTIVITY
+      ORDERPATCH ACL SEARCH MKCALENDAR PATCH QUERY
+    ].freeze
+
+    def request_method=(request_method)
+      if request_method && !HTTP_METHODS.include?(request_method)
+        raise ActionController::UnknownHttpMethod, "#{request_method}, accepted HTTP methods are #{HTTP_METHODS.to_sentence}"
+      end
+      set_header("REQUEST_METHOD", request_method) if request_method
     end
 
     # `request.headers["Accept-Encoding"]` — the shared
@@ -206,12 +287,18 @@ module ActionDispatch
   # under the given keys: `Rack::MockRequest.env_for("/")` with its
   # test host, address and agent (TestRequest::DEFAULT_ENV), then the
   # application's `env_config`.
+  #
+  # The writers are Rails' (actionpack testing/test_request.rb), each a
+  # header write: Core's synthetic storefront request sets `host`,
+  # `request_method` and `path` on one.
   class TestRequest < Request
     def self.create(env = {})
       base = default_env
       app = defined?(Rails) && Rails.respond_to?(:application) && Rails.application
       base.merge!(app.env_config) if app.respond_to?(:env_config)
-      new(base.merge!(env.each_with_object({}) { |(k, v), h| h[k.to_s] = v }))
+      base.merge!(env.each_with_object({}) { |(k, v), h| h[k.to_s] = v })
+      base["rack.request.cookie_hash"] ||= {}.with_indifferent_access
+      new(base)
     end
 
     def self.default_env
@@ -237,6 +324,219 @@ module ActionDispatch
       }
     end
     private_class_method :default_env
+
+    def request_method=(method)
+      super(method.to_s.upcase)
+    end
+
+    def host=(host)
+      set_header("HTTP_HOST", host)
+    end
+
+    def port=(number)
+      set_header("SERVER_PORT", number)
+    end
+
+    def request_uri=(uri)
+      set_header("REQUEST_URI", uri)
+    end
+
+    def path=(path)
+      set_header("PATH_INFO", path)
+    end
+
+    def action=(action_name)
+      path_parameters[:action] = action_name.to_s
+    end
+
+    def if_modified_since=(last_modified)
+      set_header("HTTP_IF_MODIFIED_SINCE", last_modified)
+    end
+
+    def if_none_match=(etag)
+      set_header("HTTP_IF_NONE_MATCH", etag)
+    end
+
+    def remote_addr=(addr)
+      set_header("REMOTE_ADDR", addr)
+    end
+
+    def user_agent=(user_agent)
+      set_header("HTTP_USER_AGENT", user_agent)
+    end
+
+    def accept=(mime_types)
+      delete_header("action_dispatch.request.accepts")
+      set_header("HTTP_ACCEPT", Array(mime_types).collect(&:to_s).join(","))
+    end
+  end
+end
+
+# Rails' controller-test request and session (actionpack
+# action_controller/test_case.rb). Core's checkout PolicyContextBuilder
+# builds `ActionController::TestRequest.create(GraphQLController)` and
+# gives it a session store. `assign_parameters`, which only
+# `ActionController::TestCase#process` calls, is not ported: the test
+# harness drives controller actions itself.
+module ActionController
+  # Rails' TestSession is a Rack `SecureSessionHash` whose data is loaded
+  # up front and never written to a store; this is that hash. Keys are
+  # Strings, as Rack's session stores them.
+  class TestSession
+    # Rack::Session::Abstract::Persisted::DEFAULT_OPTIONS.
+    DEFAULT_OPTIONS = {
+      key: "rack.session",
+      path: "/",
+      domain: nil,
+      expire_after: nil,
+      secure: false,
+      httponly: true,
+      defer: false,
+      renew: false,
+      sidbits: 128,
+      cookie_only: true,
+      secure_random: ::SecureRandom,
+    }.freeze
+
+    # Rack::Session::SessionId: the cookie's public id, and the hashed
+    # private id a store keys on.
+    class SessionId
+      ID_VERSION = 2
+
+      attr_reader :public_id
+
+      def initialize(public_id)
+        @public_id = public_id
+      end
+
+      def private_id
+        "#{ID_VERSION}::#{Digest::SHA256.hexdigest(public_id)}"
+      end
+
+      alias cookie_value public_id
+      alias to_s public_id
+
+      def empty? = false
+
+      def inspect = public_id.inspect
+    end
+
+    def initialize(session = {}, id = SessionId.new(SecureRandom.hex(16)))
+      @id = id
+      @data = stringify_keys(session)
+      @loaded = true
+    end
+
+    def id = @id
+
+    def id_was = @id
+
+    def exists? = true
+
+    def enabled? = true
+
+    def loaded? = @loaded
+
+    def options = {}
+
+    def keys = @data.keys
+
+    def values = @data.values
+
+    def [](key) = @data[key.to_s]
+
+    def []=(key, value)
+      @data[key.to_s] = value
+    end
+    alias store []=
+
+    def key?(key) = @data.key?(key.to_s)
+    alias has_key? key?
+    alias include? key?
+
+    def fetch(key, *args, &block)
+      @data.fetch(key.to_s, *args, &block)
+    end
+
+    def dig(*keys)
+      keys = keys.map.with_index { |key, i| i.zero? ? key.to_s : key }
+      @data.dig(*keys)
+    end
+
+    def delete(key) = @data.delete(key.to_s)
+
+    def update(hash)
+      @data.update(stringify_keys(hash))
+    end
+    alias merge! update
+
+    def to_hash = @data.dup
+    alias to_h to_hash
+
+    def each(&block) = @data.each(&block)
+
+    def empty? = @data.empty?
+
+    def clear
+      @data.clear
+    end
+
+    def destroy
+      clear
+    end
+
+    def load!
+      @id
+    end
+
+    def inspect = @data.inspect
+
+    private
+
+    def stringify_keys(other)
+      other.to_hash.each_with_object({}) { |(key, value), hash| hash[key.to_s] = value }
+    end
+  end
+
+  class TestRequest < ActionDispatch::TestRequest
+    def self.new_session
+      TestSession.new
+    end
+
+    attr_reader :controller_class
+
+    # Rails' controller-test env is the dispatch one without PATH_INFO
+    # (its DEFAULT_ENV); the application's `env_config` still applies.
+    def self.create(controller_class)
+      env = {}
+      app = defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+      env = app.env_config.merge(env) if app.respond_to?(:env_config)
+      env["rack.request.cookie_hash"] = {}.with_indifferent_access
+      new(default_env.merge(env), new_session, controller_class)
+    end
+
+    def self.default_env
+      env = super
+      env.delete("PATH_INFO")
+      env
+    end
+    private_class_method :default_env
+
+    def initialize(env, session, controller_class)
+      super(env)
+
+      self.session = session
+      self.session_options = TestSession::DEFAULT_OPTIONS.dup
+      @controller_class = controller_class
+    end
+
+    def query_string=(string)
+      set_header("QUERY_STRING", string)
+    end
+
+    def content_type=(type)
+      set_header("CONTENT_TYPE", type)
+    end
   end
 end
 

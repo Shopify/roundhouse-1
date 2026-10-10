@@ -150,5 +150,47 @@ module ActionController
       return [decoded, ""] if at.nil?
       [decoded[0, at].to_s, decoded[at + 1, decoded.length].to_s]
     end
+
+    # Rails' `ActionController::HttpAuthentication::Basic`, the module
+    # functions beside its ControllerMethods (actionpack
+    # metal/http_authentication.rb, ported verbatim but for `.second`,
+    # spelled `[1]`). Core's graph clients build their `Authorization`
+    # header with `encode_credentials` at load (TaxesApi::API), and its
+    # controller tests set `HTTP_AUTHORIZATION` from it. The controller
+    # helpers above stay on their own parser; these read
+    # `request.authorization` as Rails does. `authentication_request`
+    # (the 401 writer) is not ported: `request_http_basic_authentication`
+    # above is the challenge this runtime renders.
+    module Basic
+      def self.authenticate(request)
+        if has_basic_credentials?(request)
+          yield(*user_name_and_password(request))
+        end
+      end
+
+      def self.has_basic_credentials?(request)
+        request.authorization.present? && (auth_scheme(request).downcase == "basic")
+      end
+
+      def self.user_name_and_password(request)
+        decode_credentials(request).split(":", 2)
+      end
+
+      def self.decode_credentials(request)
+        ::Base64.decode64(auth_param(request) || "")
+      end
+
+      def self.auth_scheme(request)
+        request.authorization.to_s.split(" ", 2).first
+      end
+
+      def self.auth_param(request)
+        request.authorization.to_s.split(" ", 2)[1]
+      end
+
+      def self.encode_credentials(user_name, password)
+        "Basic #{::Base64.strict_encode64("#{user_name}:#{password}")}"
+      end
+    end
   end
 end

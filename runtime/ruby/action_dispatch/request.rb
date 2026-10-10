@@ -314,6 +314,16 @@ module ActionDispatch
       @referer
     end
 
+    # Rails' `request.authorization`: the header, or one of the names a
+    # proxy or rewrite moves it to. HttpAuthentication::Basic reads it.
+    def authorization
+      ["HTTP_AUTHORIZATION", "X-HTTP_AUTHORIZATION", "X_HTTP_AUTHORIZATION", "REDIRECT_X_HTTP_AUTHORIZATION"].each do |k|
+        value = @env[k]
+        return value.to_s unless value.nil?
+      end
+      nil
+    end
+
     # The User-Agent header. campfire's auth spine records it on every
     # Session row (`start_new_session_for`) and `deny_bots` filters on
     # it, so every sign-in reads it. Was a hole we opened ourselves:
