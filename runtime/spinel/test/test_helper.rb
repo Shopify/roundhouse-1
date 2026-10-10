@@ -909,13 +909,8 @@ end
 # The runtime fragment-caches message partials in its own store; these
 # give the test the settings it reads and restores. A fresh
 # `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
-# a `Rails::Cache`, so it can stand in for `Rails.cache` here.
-module Rails
-  def self.cache=(store)
-    @cache_store = store
-  end
-end
-
+# a `Rails::Cache`, so it can stand in for `Rails.cache` (whose writer
+# is in runtime/ruby/rails.rb).
 module ActionView
   class PartialRenderer
     def self.collection_cache

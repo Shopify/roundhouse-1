@@ -127,6 +127,12 @@ module Rails
     @cache_store ||= Cache.new
   end
 
+  # Rails' `Rails.cache=`. Core's test support hands `Rails.method(:cache=)`
+  # to a blocker while its module body loads, before the test helper.
+  def self.cache=(store)
+    @cache_store = store
+  end
+
   # One logger per process, as Rails.logger is: a gem that keeps it
   # (hashie's railtie `Hashie.logger = Rails.logger`) holds the same one.
   # This is the strict targets' logger. The CRuby and JRuby trees replace
