@@ -117,6 +117,29 @@ module TypedStore
       to_h.inspect
     end
 
+    # The rest of the TypedHash's Hash surface (`values_at`, `slice`,
+    # `symbolize_keys`, `except`, ... : Core's
+    # `ShopBillingSetting::Extension` reads `self[:status].values_at(*keys)`)
+    # answers over a copy, as `to_h` does. Hash's own `select`, `reject`
+    # and `compact` answer a Hash, where the Enumerable ones above would
+    # answer pairs.
+    def select(&block) = to_h.select(&block)
+    alias filter select
+
+    def reject(&block) = to_h.reject(&block)
+
+    def compact = to_h.compact
+
+    def method_missing(name, *args, &block)
+      h = to_h
+      return super unless h.respond_to?(name)
+      h.public_send(name, *args, &block)
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      to_h.respond_to?(name) || super
+    end
+
     private
 
     def serialized
@@ -127,6 +150,28 @@ module TypedStore
       @record.__send__(:"__rh_#{@column}_keys")
     end
   end
+
+  # `<column>_was` on a store: the Hash the column held before the
+  # pending change (`serialized`, `attribute_was`), with the declared
+  # defaults filled in as the reader's view has them. A copy, as Rails'
+  # dirty tracking hands out.
+  def self.snapshot(record, column, serialized)
+    Snapshot.new(record, column, serialized).to_h
+  end
+
+  class Snapshot < Accessor
+    def initialize(record, column, serialized)
+      super(record, column)
+      @serialized = serialized
+    end
+
+    private
+
+    def serialized
+      @serialized
+    end
+  end
+  private_constant :Snapshot
 end
 
 # The gem's class-side `typed_store(store_attribute, options = {}, &block)`

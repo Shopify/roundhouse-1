@@ -3492,6 +3492,7 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
             // them the ivar-read `.clone()` rust adds, moving out of
             // `&self`.
             body: crate::lower::has_json::column_hash_read(model, &c.name)
+                .or_else(|| crate::lower::typed_store::column_hash_read(model, &c.name))
                 .or_else(|| enum_label_read(model, c))
                 .or_else(|| (c.col_type == crate::schema::ColumnType::Date).then(|| temporal_reader_body(c)))
                 .or_else(|| is_generic_json_col(c, model).then(|| json_reader_body(c)))
