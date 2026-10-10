@@ -909,8 +909,39 @@ pub(crate) fn settle_type_aliases(app: &mut crate::App) {
         }
         expr.node.for_each_child(&mut |child| check_types(child, out));
     }
+    // A constant path the tree evaluates outside an alias's own block
+    // (`attribute :pending, T::Hash[GenericArtifactHandle::HandleNameT,
+    // PendingTerms]` in a class body): Ruby resolves it at load, so the
+    // alias must be defined there, as sorbet-runtime's `T.type_alias`
+    // defines it.
+    fn value_paths(expr: &Expr, out: &mut Vec<Vec<Symbol>>) {
+        if is_alias(expr) {
+            return;
+        }
+        if let ExprNode::Const { path } = &*expr.node {
+            out.push(path.clone());
+        }
+        expr.node.for_each_child(&mut |child| value_paths(child, out));
+    }
     let mut read = crate::det::HashSet::default();
-    crate::lower::for_each_emit_body_ref(app, &mut |body| check_types(body, &mut read));
+    let mut paths = Vec::new();
+    crate::lower::for_each_emit_body_ref(app, &mut |body| {
+        check_types(body, &mut read);
+        value_paths(body, &mut paths);
+    });
+    // `Owner::Name` names the alias when `Owner` is its owner's last
+    // segment; a bare `Name` by its name, as a check's type does.
+    for (owner, name, _) in &found {
+        let owner_last = owner.0.as_str().rsplit("::").next().unwrap_or_default();
+        if paths.iter().any(|path| match path.as_slice() {
+            [.., last] if last != name => false,
+            [_] => true,
+            [.., parent, _] => parent.as_str() == owner_last,
+            [] => false,
+        }) {
+            read.insert(name.clone());
+        }
+    }
     loop {
         let before = read.len();
         for (_, name, value) in &found {

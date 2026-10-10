@@ -227,3 +227,38 @@ end
     assert!(emitted.contains("Passed `nil` into T.must"), "got:\n{emitted}");
     assert!(!emitted.contains("non-nil assertion"), "got:\n{emitted}");
 }
+
+#[test]
+fn a_type_alias_a_class_body_names_at_load_is_defined() {
+    // Core's cart_next.rb: `attribute :pending_artifacts,
+    // T::Hash[CheckoutPlatform::GenericArtifactHandle::HandleNameT, ...]`
+    // evaluates the alias constant when the class loads, so the tree must
+    // define it, as sorbet-runtime's `T.type_alias` does. Dropped, 803 of
+    // the unit-1000 ids failed in setup with NameError.
+    let source = r#"module Handle
+  HandleNameT = T.type_alias { String }
+  Label = T.type_alias { T.nilable(String) }
+
+  sig { returns(Label) }
+  def self.label; end
+end
+
+class Gauge
+  Count = T.type_alias { Integer }
+  KEY_TYPE = Handle::HandleNameT
+
+  configure do
+    requires(:count, Count)
+  end
+end
+"#;
+    let handle = emitted(source, "handle.rb");
+    assert!(handle.contains("HandleNameT = SorbetRuntimeCheck.type_alias { String }"), "got:\n{handle}");
+    // Only a `sig` names `Label`; the tree drops that, so it goes too.
+    assert!(!handle.contains("Label ="), "got:\n{handle}");
+    let gauge = emitted(source, "gauge.rb");
+    assert!(gauge.contains("KEY_TYPE = Handle::HandleNameT"), "got:\n{gauge}");
+    // A bare alias a class-body block names (Core's pipeline steps:
+    // `interface do requires :x, T::Hash[LocationId, AllocationSet] end`).
+    assert!(gauge.contains("Count = SorbetRuntimeCheck.type_alias { Integer }"), "got:\n{gauge}");
+}
