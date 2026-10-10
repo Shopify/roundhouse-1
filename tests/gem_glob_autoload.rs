@@ -134,3 +134,61 @@ fn a_strict_target_refuses_the_module_body_global_write_by_name() {
         "{errors:#?}"
     );
 }
+
+// offsite_payments 3.0.1's integrations.rb: each file of a directory
+// beside `__FILE__`, its basename camelized and made a symbol, is the
+// constant autoloaded from that absolute path.
+const SYM_FILES: &[(&str, &str)] = &[
+    ("lib/payoff.rb", "require \"payoff/integrations\"\n\nmodule Payoff\n  def self.integration(name)\n    Integrations.const_get(name)\n  end\nend\n"),
+    (
+        "lib/payoff/integrations.rb",
+        "module Payoff\n  module Integrations\n    Dir[File.dirname(__FILE__) + '/integrations/*.rb'].each do |f|\n      # Get camelized class name\n      filename = File.basename(f, '.rb')\n\n      integration_class = filename.camelize.to_sym\n\n      autoload integration_class, f\n    end\n  end\nend\n",
+    ),
+    ("lib/payoff/integrations/paypal.rb", "module Payoff\n  module Integrations\n    module Paypal\n      def self.service_url = \"https://paypal.test\"\n    end\n  end\nend\n"),
+    // A module holding only a class (offsite_payments' mollie.rb): its
+    // file is still `Mollie`'s autoload, which defines the class.
+    ("lib/payoff/integrations/mollie.rb", "module Payoff\n  module Integrations\n    module Mollie\n      class API\n        def self.host = \"api.mollie.test\"\n      end\n    end\n  end\nend\n"),
+    ("lib/payoff/integrations/bit_pay.rb", "module Payoff\n  module Integrations\n    module BitPay\n      KIND = :crypto\n    end\n  end\nend\n"),
+];
+
+const SYM_SCRIPT: &str = r#"p Payoff::Integrations.constants.sort
+p Payoff::Integrations::Paypal.service_url
+p Payoff.integration("BitPay")::KIND
+p Payoff::Integrations.autoload?(:Paypal)
+p Payoff::Integrations::Mollie::API.host
+"#;
+
+const SYM_EXPECTED: &str = "[:BitPay, :Mollie, :Paypal]\n\"https://paypal.test\"\n:crypto\nnil\n\"api.mollie.test\"\n";
+
+#[test]
+fn a_gem_glob_autoload_loop_naming_symbols_registers_each_constant_as_native() {
+    let dir = std::env::temp_dir().join(format!("rh_gem_glob_autoload_sym_native_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, text) in SYM_FILES {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let main = format!(
+        "require {ORACLE:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\n\
+         require \"active_support/core_ext/string/inflections\"\n$LOAD_PATH.unshift({:?})\nrequire \"payoff\"\n{SYM_SCRIPT}",
+        dir.join("lib").display().to_string()
+    );
+    std::fs::write(dir.join("main.rb"), main).unwrap();
+    let out = Command::new("ruby").arg("main.rb").current_dir(&dir).output().expect("ruby is on PATH");
+    assert!(out.status.success(), "native failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), SYM_EXPECTED, "native control");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let mut overlay = emit_and_run::empty_app()
+        .write("roundhouse.yml", "gem_sources:\n  payoff: vendor/gems/payoff-1.0.0\n")
+        .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    payoff (1.0.0)\n\nDEPENDENCIES\n  payoff\n")
+        .write("config/application.rb", "require \"payoff\"\n");
+    for (path, text) in SYM_FILES {
+        overlay = overlay.write(&format!("vendor/gems/payoff-1.0.0/{path}"), text);
+    }
+    let run = overlay.run_ruby(SYM_SCRIPT);
+    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert_eq!(run.stdout, SYM_EXPECTED, "{}", run.stderr);
+    assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
+}
