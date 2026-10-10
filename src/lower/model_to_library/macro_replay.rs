@@ -1330,12 +1330,22 @@ pub fn replay_model_macros(app: &mut crate::App) {
     let mut replays: Vec<(usize, Vec<crate::span::Span>)> = Vec::new();
     // Per model, the settings by statement span.
     let mut settings: Vec<Vec<(crate::span::Span, bool)>> = vec![Vec::new(); app.models.len()];
+    // The PostgreSQL CRuby tree's Base carries the class attribute
+    // (runtime/spinel/cruby/active_record_core.rb), so the setting is also
+    // written at run time, where a later reader (a macro that calls
+    // `belongs_to` at run time, app code) sees it as in Rails.
+    let replay_settings = app.carries_postgresql_runtime();
     for (i, model) in app.models.iter().enumerate() {
         let mut spans = Vec::new();
         for (expr, verdict) in model_macro_verdicts_guarded(model, app, false) {
             match verdict {
                 MacroVerdict::Replay => spans.push(expr.span),
-                MacroVerdict::BelongsToRequiredByDefault(value) => settings[i].push((expr.span, value)),
+                MacroVerdict::BelongsToRequiredByDefault(value) => {
+                    settings[i].push((expr.span, value));
+                    if replay_settings {
+                        spans.push(expr.span);
+                    }
+                }
                 MacroVerdict::Refuse(_) => {}
             }
         }
@@ -1390,7 +1400,7 @@ pub fn replay_model_macros(app: &mut crate::App) {
         let mut required = starts[i];
         for item in &mut model.body {
             match item {
-                ModelBodyItem::Unknown { expr, .. } => {
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => {
                     if let Some((_, v)) = settings[i].iter().find(|(s, _)| *s == expr.span) {
                         required = *v;
                     }
