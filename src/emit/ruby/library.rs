@@ -9482,6 +9482,15 @@ fn emit_library_class_decl_inner(
         body_requires.extend(now.iter().filter_map(|p| resolve(p, true)));
         body_requires.extend(later.iter().filter(|p| !now.contains(*p)).filter_map(|p| resolve(p, false)));
     }
+    // A body statement the file keeps where the source has it
+    // (`carries_body_statement`) runs as the body loads, after the
+    // `require`s above it: `Format.register_lazy(...)` after a body
+    // `require "x/format"` reads the class that file defines. The body
+    // `require` itself is dropped (the tree builds its own require graph),
+    // so what the statement names loads at the top of the file.
+    for call in lc.unknown_calls.iter().filter(|call| carries_body_statement(lc, call, app)) {
+        body_requires.extend(resolve_load(call));
+    }
     for &i in &deferred {
         body_requires.extend(resolve_load(&lc.constants[i].1));
     }

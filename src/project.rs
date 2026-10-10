@@ -9131,7 +9131,10 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     for (namespace, children) in &namespaces {
         for (name, child) in children {
             let Some(file) = child.file.as_ref() else { continue };
-            if let Some(program) = program_of_file.get(file) {
+            // A program whose declarations load in place keeps the autoload a
+            // gem registers for them (`in_place_program`): a plain `require`
+            // of it meets the same circular autoload.
+            if let Some(program) = program_of_file.get(file).or_else(|| in_place_program.get(file)) {
                 program_constants.entry(program.clone()).or_default().push((namespace, name));
             } else if program_anchors.contains(file) || requires_first(file) {
                 program_constants.entry(file.clone()).or_default().push((namespace, name));
