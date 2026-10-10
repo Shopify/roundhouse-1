@@ -981,7 +981,7 @@ impl TestMixins {
         let root = result.node();
         let Some((class, nesting)) = find_class(&root, &[], name) else { return Ok(None) };
         let scope: Vec<String> = nesting.get(1).map(|o| o.split("::").map(str::to_string).collect()).unwrap_or_default();
-        let tm = super::test::ingest_test_class(&(scope, class), &[], file).map_err(|err| match err {
+        let tm = super::test::ingest_test_class(&(scope, class), &[], &[], file).map_err(|err| match err {
             IngestError::Unsupported { file, message } => {
                 IngestError::Unsupported { message: format!("test class `{name}` refused: {message}"), file }
             }
