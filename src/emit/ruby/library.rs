@@ -11897,6 +11897,61 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
         }
     }
 
+    /// The parent of the model or library class `name`, if any.
+    fn parent_of<'a>(name: &str, app: &'a App) -> Option<&'a str> {
+        if let Some(m) = app.models.iter().find(|m| m.name.0.as_str() == name) {
+            return m.parent.as_ref().map(|p| p.0.as_str());
+        }
+        library_classes_named(name, app).into_iter().find_map(|c| c.parent.as_ref()).map(|p| p.0.as_str())
+    }
+
+    /// Whether `name` is a class below `ancestor`, by the app's models
+    /// and library classes.
+    fn descends_from(name: &str, ancestor: &str, app: &App) -> bool {
+        let mut at = parent_of(name, app);
+        let mut steps = 0;
+        while let Some(parent) = at {
+            let parent = parent.trim_start_matches("::");
+            if parent == ancestor {
+                return true;
+            }
+            steps += 1;
+            if steps > 32 {
+                return false;
+            }
+            at = parent_of(parent, app);
+        }
+        false
+    }
+
+    /// Whether a value, as it runs, names a subclass of `class_name`
+    /// (`PRIORITIES = { Country.name => 1 }` in Core's Markets::Region):
+    /// naming it loads it, and its class body runs against this class —
+    /// Country's `model_uuid_attributes` asks Region's compiled
+    /// `_retypable_attribute_names`. Above the defs, that is the Base's
+    /// answer. A stored closure runs later.
+    fn names_subclass(expr: &Expr, class_name: &str, app: &App) -> bool {
+        match &*expr.node {
+            ExprNode::Lambda { .. } => false,
+            ExprNode::Const { path } => {
+                let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                let joined = joined.trim_start_matches("::");
+                descends_from(joined, class_name, app)
+                    || (path.len() == 1 && descends_from(&format!("{class_name}::{joined}"), class_name, app))
+            }
+            ExprNode::Send { method, .. } if matches!(method.as_str(), "proc" | "lambda") => false,
+            _ => {
+                let mut found = false;
+                expr.node.for_each_child(&mut |child| {
+                    if !found && names_subclass(child, class_name, app) {
+                        found = true;
+                    }
+                });
+                found
+            }
+        }
+    }
+
     let own: crate::det::HashSet<&str> =
         lc.methods.iter().map(|m| m.name.as_str()).collect();
     // A gem source's class body runs as the gem's Ruby does, top to
@@ -11921,6 +11976,7 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
     for (i, (name, value)) in lc.constants.iter().enumerate() {
         if calls_self(value, &own, &deferred_names, lc.name.0.as_str())
             || (gem_source && below_own_def(value) && runs_app_code(value, app))
+            || names_subclass(value, lc.name.0.as_str().trim_start_matches("::"), app)
         {
             deferred_names.insert(name.as_str().to_string());
             written_constants(value, &mut deferred_names);

@@ -29,6 +29,15 @@ const STORE: &str = r#"class Store
     Marshal.load(Marshal.dump(value))
   end
 
+  # paquito's SafeYAML#load: Psych's own exception classes.
+  def safe(text)
+    Psych.safe_load(text, permitted_classes: [], aliases: false)
+  rescue Psych::DisallowedClass => e
+    "disallowed: #{e.class}"
+  rescue Psych::Exception => e
+    "psych: #{e.class}"
+  end
+
   def quick
     Timeout.timeout(5) { 42 }
   rescue Timeout::Error, Interrupt, IO::TimeoutError
@@ -52,6 +61,9 @@ class StoreTest < ActiveSupport::TestCase
     assert_nil store.read("missing.yml")
     assert_equal [1, "x"], store.copy([1, "x"])
     assert_equal 42, store.quick
+    assert_equal({ "a" => 1 }, store.safe("a: 1"))
+    assert_equal "disallowed: Psych::DisallowedClass", store.safe("--- !ruby/object:Object {}\n")
+    assert_equal "psych: Psych::AliasesNotEnabled", store.safe("a: &x 1\nb: *x\n")
   end
 end
 "#)
@@ -87,7 +99,7 @@ fn cruby_stdlib_constants_run_in_emitted_ruby() {
 #[test]
 fn a_runtime_without_them_refuses_them() {
     let (_, errors) = app().emit(BuildTarget::Rust);
-    for name in ["FileUtils", "YAML", "Errno::ENOENT", "Marshal", "Timeout::Error", "Interrupt"] {
+    for name in ["FileUtils", "YAML", "Errno::ENOENT", "Marshal", "Timeout::Error", "Interrupt", "Psych::DisallowedClass"] {
         let needle = format!("{name} is CRuby's own");
         assert!(errors.iter().any(|e| e.contains(&needle)), "{name}: {errors:#?}");
     }

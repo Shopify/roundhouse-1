@@ -10,7 +10,9 @@
 # `strict_encode64` for turbo-stream signed names, `strict_decode64` for
 # the Action Cable glue, and the `urlsafe_*` pair for campfire's QR-code
 # helper (`Base64.urlsafe_encode64(url)` / the controller's decode).
-# `encode64`'s line-wrapping form still has no caller and stays out.
+# Since then the whole stdlib surface, ported with its semantics
+# (Core passes `padding: false` and relies on strict decode raising):
+# `encode64`, lax `decode64`, strict `strict_decode64`.
 module Base64
   ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
@@ -49,22 +51,60 @@ module Base64
     out
   end
 
-  # RFC 4648 §4 decode — inverse of strict_encode64. Skips "=" padding
-  # and any non-alphabet byte. Accumulates 6 bits per input char into a
-  # bit buffer, emitting one byte per 8 accumulated bits. Added for the
-  # Action Cable glue's signed_stream_name decode (the encode side is
-  # turbo_stream_from). Returns the decoded String.
+  # RFC 4648 §4 decode — inverse of strict_encode64, with Ruby's
+  # `unpack1("m0")` strictness: the length must be a multiple of four,
+  # every character must be in the alphabet, "=" may only close the
+  # last quantum, and the bits padding discards must be zero. Anything
+  # else raises `ArgumentError, "invalid base64"`, as the stdlib does —
+  # JWT and cookie verifiers rely on that to reject tampered input.
   def self.strict_decode64(s)
+    n = s.length
+    if n % 4 != 0
+      raise ArgumentError, "invalid base64"
+    end
+    pad = 0
+    if n > 0 && s[n - 1] == "="
+      pad = 1
+      if s[n - 2] == "="
+        pad = 2
+      end
+    end
+    i = 0
+    while i < n - pad
+      if char_value(s[i]) < 0
+        raise ArgumentError, "invalid base64"
+      end
+      i = i + 1
+    end
+    if pad == 2 && (char_value(s[n - 3]) & 0x0F) != 0
+      raise ArgumentError, "invalid base64"
+    end
+    if pad == 1 && (char_value(s[n - 2]) & 0x03) != 0
+      raise ArgumentError, "invalid base64"
+    end
+    decode64(s)
+  end
+
+  # Ruby's lax `decode64` (`unpack1("m")`): skips any byte outside the
+  # alphabet (newlines included) and stops at the first "=". Accumulates
+  # 6 bits per input char into a bit buffer, emitting one byte per 8
+  # accumulated bits. lobsters' FetchEmailBlocklistJob decodes a GitHub
+  # contents-API payload, which wraps at 60 columns.
+  def self.decode64(s)
     out = +""
     acc = 0
     nbits = 0
     i = 0
     n = s.length
     while i < n
-      val = char_value(s[i])
+      c = s[i]
       i = i + 1
+      if c == "="
+        break
+      end
+      val = char_value(c)
       if val < 0
-        next   # padding "=" or stray byte
+        next   # stray byte
       end
       # Masked: only the low `nbits + 6` bits (at most 13) are ever
       # read, and an unmasked accumulator grows without bound — a
@@ -77,6 +117,21 @@ module Base64
         byte = (acc >> nbits) & 0xFF
         out << byte.chr
       end
+    end
+    out
+  end
+
+  # Ruby's `encode64` (`pack("m")`): the strict encoding wrapped at 60
+  # characters (45 input bytes) per line, every line — the last one
+  # included — ending in "\n". The empty string encodes to "".
+  def self.encode64(s)
+    out = +""
+    i = 0
+    n = s.bytesize
+    while i < n
+      out << strict_encode64(s.byteslice(i, 45).to_s)
+      out << "\n"
+      i = i + 45
     end
     out
   end
@@ -102,13 +157,21 @@ module Base64
   # explicit loop uses only the shapes the rest of this file already
   # does, which is what keeps it compiling on every ruby-family target.
   #
-  # Padding is KEPT, matching Rails' `urlsafe_encode64(bin,
-  # padding: true)` default — campfire calls it with no keyword.
-  def self.urlsafe_encode64(s)
+  # The stdlib signature, `urlsafe_encode64(bin, padding: true)`:
+  # campfire calls it with no keyword, GlobalID#to_param and Core's JWT
+  # code with `padding: false`. Trailing "=" are what padding means in
+  # base64, and nothing else in the alphabet produces one, so dropping
+  # them is the whole difference.
+  def self.urlsafe_encode64(s, padding: true)
     std = strict_encode64(s)
+    n = std.length
+    unless padding
+      while n > 0 && std[n - 1] == "="
+        n = n - 1
+      end
+    end
     out = +""
     i = 0
-    n = std.length
     while i < n
       c = std[i]
       if c == "+"
@@ -123,35 +186,15 @@ module Base64
     out
   end
 
-  # The `padding: false` form, which GlobalID#to_param uses:
-  #
-  #   Base64.urlsafe_encode64(to_s, padding: false)   # globalid 1.3.0
-  #
-  # A separate method rather than a keyword on the one above, for the
-  # reason that comment gives about parameterizing the encoder — and
-  # because an omitted optional parameter is its own hazard on the
-  # strict targets. Trailing "=" are what padding means in base64, and
-  # nothing else in the alphabet produces one, so stripping them is the
-  # whole difference.
+  # Kept for the runtime callers written before `urlsafe_encode64`
+  # took the keyword (web_push_crypto, rails.rb's GlobalID).
   def self.urlsafe_encode64_nopad(s)
-    out = urlsafe_encode64(s)
-    n = out.length
-    while n > 0 && out[n - 1] == "="
-      n = n - 1
-    end
-    out[0, n].to_s
+    urlsafe_encode64(s, padding: false)
   end
 
-  # Ruby's lax `decode64` ignores padding and out-of-alphabet bytes
-  # (newlines included) — exactly what `strict_decode64` above already
-  # does, so it is the same body. lobsters' FetchEmailBlocklistJob
-  # decodes a GitHub contents-API payload, which wraps at 60 columns.
-  def self.decode64(s)
-    strict_decode64(s)
-  end
-
-  # The inverse: map the URL-safe pair back and hand off to the standard
-  # decoder, which already skips padding and any stray byte.
+  # The inverse, as the stdlib does it: map the URL-safe pair back,
+  # restore the padding an unpadded input left off (RFC 4648 lets an
+  # encoder omit it, and `padding: false` does), then decode strictly.
   def self.urlsafe_decode64(s)
     std = +""
     i = 0
@@ -166,6 +209,11 @@ module Base64
         std << c.to_s
       end
       i = i + 1
+    end
+    if !(n > 0 && s[n - 1] == "=")
+      while std.length % 4 != 0
+        std << "="
+      end
     end
     strict_decode64(std)
   end

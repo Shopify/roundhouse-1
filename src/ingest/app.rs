@@ -3170,6 +3170,7 @@ end
                     continue;
                 };
                 if crate::analyze::retypable_attributes::serialized_column(expr, table).is_some()
+                    || crate::analyze::retypable_attributes::decorated_columns(expr, table).is_some()
                     || crate::analyze::retypable_attributes::defaulted_attribute(expr, table).is_some()
                     || crate::analyze::retypable_attributes::alias_attribute_decl(expr, table).is_some()
                 {
