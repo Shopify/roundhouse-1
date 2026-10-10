@@ -195,6 +195,16 @@ module ActiveRecord
         end
       end
 
+      # A field whose whole scalar is one `<%= … %>` tag. Rails renders
+      # the file through ERB and then Psych reads the text, so the value
+      # is the tag's `to_s` as YAML reads it: `"…".inspect` is the quoted
+      # string's contents, JSON text a Hash, `5` an Integer, nothing nil.
+      def erb_scalar(value)
+        text = value.to_s
+        return nil if text.strip.empty?
+        YAML.unsafe_load(text)
+      end
+
       # A reference an ERB tag names: the referenced row's id. Under
       # FasterFixtures an Integer is the id itself, and a label in a uuid
       # column is the set's `fixture_identifier` (`class_name`, `column`).
