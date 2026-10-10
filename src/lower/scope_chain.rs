@@ -2292,6 +2292,11 @@ fn is_relation_chain_method(name: &str) -> bool {
             // without it here that body never rooted on `__rel` and the
             // search paged every message in the table.
             | "reorder"
+            // `unscope(where: :col)` drops a condition the relation
+            // gathered (activerecord query_methods.rb `unscope!`): a
+            // scope body that is only that call acts on the relation the
+            // scope runs against, as `reorder` above.
+            | "unscope"
     )
 }
 

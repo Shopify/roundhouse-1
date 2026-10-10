@@ -1638,6 +1638,17 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).where(conditions.to_h)
     end
 
+    # `Model.lock` / `Model.unscope(…)`: Rails delegates both to `all`
+    # (querying.rb), so the default scope applies before `unscope`
+    # removes from it.
+    def self.lock(locks = true)
+      ActiveRecord::Relation.new(self).lock(locks)
+    end
+
+    def self.unscope(*args)
+      ActiveRecord::Relation.new(self).unscope(*args)
+    end
+
     # Model Hash finders use the relation's NULL / IN predicates too.
     # `.to_h` matches `where` above: Hash is a no-op (nil / Array values
     # survive); non-Hash inputs raise rather than reach Relation's SQL path.

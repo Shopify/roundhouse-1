@@ -732,6 +732,26 @@ module ActiveJob
       end
   end
 
+  # Push many jobs onto the queue at once without running enqueue callbacks.
+  # Queue adapters may communicate the enqueue status of each job by setting
+  # successfully_enqueued and/or enqueue_error on the passed-in job instances.
+  # (activejob/lib/active_job.rb. The shared adapter takes each job
+  # through `_raw_enqueue`, in place of the per-adapter `enqueue_all`, and
+  # there is no `instrument_enqueue_all`.)
+  def self.perform_all_later(*jobs)
+    jobs.flatten!
+    jobs.each do |job|
+      job.successfully_enqueued = false
+      job.enqueue_error = nil
+      begin
+        job.__send__(:_raw_enqueue)
+      rescue EnqueueError => e
+        job.enqueue_error = e
+      end
+    end
+    nil
+  end
+
   # ActiveJob::Execution.
   module Execution
     module ClassMethods
