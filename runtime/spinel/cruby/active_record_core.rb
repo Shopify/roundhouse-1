@@ -407,6 +407,13 @@ module ActiveRecord
         @delegate_reflection.autosave = autosave
       end
 
+      # A class macro's `has_many :name, through:` declares the wrapped
+      # has_many's options (AssociationReflection#_roundhouse_declared).
+      def _roundhouse_declared(options)
+        @delegate_reflection._roundhouse_declared(options)
+        self
+      end
+
       def through_reflection
         active_record.reflect_on_association(options[:through])
       end

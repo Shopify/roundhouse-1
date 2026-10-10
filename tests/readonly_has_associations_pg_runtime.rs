@@ -32,6 +32,13 @@ CREATE TABLE events (
     verb character varying,
     CONSTRAINT events_pkey PRIMARY KEY (id)
 );
+
+CREATE TABLE stamps (
+    id bigserial NOT NULL,
+    event_id bigint,
+    label character varying,
+    CONSTRAINT stamps_pkey PRIMARY KEY (id)
+);
 "#;
 
 const DATABASE_YML: &str = r#"default: &default
@@ -221,11 +228,22 @@ const BATCH: &str = r#"class Batch < ApplicationRecord
     class_name: "Event",
     as: "subject",
     inverse_of: "subject", primary_key: :id, foreign_key: :subject_id
+
+  readonly_has_many :stamps,
+    class_name: "Stamp",
+    through: :events,
+    source: :stamps
 end
 "#;
 
 const EVENT: &str = r#"class Event < ApplicationRecord
   belongs_to :subject, polymorphic: true
+  has_many :stamps
+end
+"#;
+
+const STAMP: &str = r#"class Stamp < ApplicationRecord
+  belongs_to :event
 end
 "#;
 
@@ -241,6 +259,8 @@ const PROBE: &str = r##"class ReadonlyHasAssociationsProbe
     Event.create!(subject: b2, verb: "created")
     r = Batch.reflect_on_association(:timeline_comment)
     out << "reflection: #{r.macro} #{r.class_name} #{r.options[:autosave].inspect} #{r.options[:as].inspect}"
+    r = Batch.reflect_on_association(:stamps)
+    out << "through reflection: #{r.macro} #{r.class_name} #{r.options[:through].inspect} #{r.options[:source].inspect} #{r.options[:autosave].inspect}"
     r = Batch.reflect_on_association(:events)
     out << "events reflection: #{r.macro} #{r.collection?} #{r.options[:autosave].inspect} #{r.options[:extend].inspect}"
     b = Batch.find(b1.id)
@@ -276,8 +296,9 @@ end
 
 /// Native Rails 8.2 on the same PostgreSQL, so two identical wrong
 /// answers still fail.
-const EXPECTED: [&str; 13] = [
+const EXPECTED: [&str; 14] = [
     "reflection: has_one Event false \"subject\"",
+    "through reflection: has_many Stamp :events :stamps false",
     "events reflection: has_many true false [Component::ReadOnlyAssociations::ReadOnlyAssociationExtension]",
     "events: closed,comment,created [true] [\"created\"]",
     "has_one: comment Batch true false",
@@ -293,15 +314,16 @@ const EXPECTED: [&str; 13] = [
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 5] = [
+const LOADS: [&str; 6] = [
     "app/models/concerns/component/read_only_associations",
     "app/models/application_record",
     "app/models/batch",
     "app/models/event",
+    "app/models/stamp",
     "app/models/readonly_has_associations_probe",
 ];
 
-const FILES: [(&str, &str); 9] = [
+const FILES: [(&str, &str); 10] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -310,6 +332,7 @@ const FILES: [(&str, &str); 9] = [
     ("app/models/application_record.rb", APPLICATION_RECORD),
     ("app/models/batch.rb", BATCH),
     ("app/models/event.rb", EVENT),
+    ("app/models/stamp.rb", STAMP),
     ("app/models/readonly_has_associations_probe.rb", PROBE),
 ];
 
