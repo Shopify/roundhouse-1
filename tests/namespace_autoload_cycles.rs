@@ -254,3 +254,43 @@ fn the_nested_class_loads_first() {
     let run = feed_app().run_ruby_env("p Feed::Cards::Payment.build(1).icon\np Feed.label\n", &[RUBYOPT]);
     assert_quiet(&run, "\"icon:Feed::Cards::Payment\"\n\"feed\"\n");
 }
+
+/// Core's GraphApi::Admin::Catalog shape: a module whose own
+/// `class << self; def included(concretion)` hook extends each includer
+/// with a DSL (a `field` that accepts `preload:`), and whose body names
+/// the classes that include it (a constant over them). Each of those
+/// classes' files runs `implements Mod`, which includes it: Module#included
+/// runs the hook right then. The hook is defined above the body, so it
+/// must exist before the requires that load the classes (the load cycle
+/// between the module and its includers), not after the body statements.
+fn hooked_module_app() -> emit_and_run::Overlay {
+    base()
+        .write(
+            "app/graphql/object_type.rb",
+            "class ObjectType\n  def self.implements(mod)\n    include mod\n  end\n\n  def self.field(name, null: true)\n    (@fields ||= []) << name\n  end\n\n  def self.fields\n    @fields\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/model_dsl.rb",
+            "module ModelDsl\n  def field(name, preload: nil, **opts)\n    (@preloads ||= {})[name] = preload\n    super(name, **opts)\n  end\n\n  def preloads\n    @preloads\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/shelf.rb",
+            "module Shelf\n  class << self\n    def included(concretion)\n      concretion.extend(ModelDsl)\n      super\n    end\n  end\n\n  KINDS = { plain: Shelves::Plain }.freeze\n\n  def self.kinds\n    KINDS\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/shelves/plain.rb",
+            "require \"set\"\n\nmodule Shelves\n  class Plain < ObjectType\n    implements Shelf\n    field :owner, preload: :owner\n  end\nend\n",
+        )
+}
+
+#[test]
+fn a_modules_included_hook_defined_above_its_body_exists_before_its_includers_load() {
+    let run = hooked_module_app().run_ruby_env("p Shelf.kinds.keys\np Shelves::Plain.preloads\n", &[RUBYOPT]);
+    assert_quiet(&run, "[:plain]\n{owner: :owner}\n");
+}
+
+#[test]
+fn an_includer_of_a_hooked_module_loads_first() {
+    let run = hooked_module_app().run_ruby_env("p Shelves::Plain.preloads\np Shelf.kinds.keys\n", &[RUBYOPT]);
+    assert_quiet(&run, "{owner: :owner}\n[:plain]\n");
+}
