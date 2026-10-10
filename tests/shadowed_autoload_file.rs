@@ -89,3 +89,40 @@ fn shadowed(eager: bool) {
     let emitted = run("emitted", &tree, &gem, eager);
     assert_eq!(emitted, native, "emitted");
 }
+
+/// The app's copy with a stdlib require ahead of its declarations, and
+/// a file reading the constant as it loads: the emitted tree requires the
+/// constant's file ahead of that file (a `require_relative` header, or
+/// `RoundhouseAutoload.require_through` for a file program), its stand-in
+/// for Zeitwerk's autoload. The gem defined the constant first, so the
+/// reference finds it and the shadowed file never runs (Core's
+/// payments/vault instrument_transformer loaded the engine's
+/// owner_type.rb over the native proto gem's).
+const APP_COUNTRY_PROGRAM: &str = "require \"json\"\n\nmodule Codes\n  module Country\n    UNSPECIFIED = 0\n    US = 1\n\n    def self.origin\n      \"app\"\n    end\n  end\nend\n";
+
+const WIDGET_READING_COUNTRY: &str = "class Widget\n  ORIGIN = Codes::Country.origin\n\n  def self.kind\n    \"app\"\n  end\n\n  def self.list\n    Listing::LIST\n  end\nend\n";
+
+#[test]
+fn a_load_time_reference_to_a_shadowed_constant_does_not_load_its_file() {
+    let (tree, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("config/environments/test.rb", "Rails.application.configure do\n  config.eager_load = false\nend\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("app/models/codes/country.rb", APP_COUNTRY_PROGRAM)
+        .write("app/models/widget.rb", WIDGET_READING_COUNTRY)
+        .write("config/initializers/listing.rb", INITIALIZER)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let widget = std::fs::read_to_string(tree.join("app/models/widget.rb")).unwrap();
+    assert!(widget.contains("require_relative \"codes/country\""), "the shape under test:\n{widget}");
+    let country = std::fs::read_to_string(tree.join("app/models/codes/country.rb")).unwrap();
+    assert!(country.starts_with("return if defined?(RoundhouseAutoload) && RoundhouseAutoload.shadowed_file?(\"models/codes/country\")\n"), "{country}");
+    let scratch = tree.parent().expect("scratch").to_path_buf();
+    let gem = scratch.join("codes-1.0.0/lib/codes/country.rb");
+    std::fs::create_dir_all(gem.parent().unwrap()).unwrap();
+    std::fs::write(&gem, GEM_COUNTRY).unwrap();
+    let native = run("native", &scratch.join("app"), &gem, false);
+    assert_eq!(native, EXPECTED, "native");
+    let emitted = run("emitted", &tree, &gem, false);
+    assert_eq!(emitted, native, "emitted");
+}
