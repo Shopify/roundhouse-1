@@ -2884,7 +2884,9 @@ end
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
     super::on_load_reopen::apply_pending(&mut app);
+    let pending_delegates = super::delegate::pending_model_delegates(&app);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
+    super::delegate::lower_spliced_model_delegates(&mut app, &pending_delegates);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     drop_class_methods_block_mixes_in(&mut app, &concern_class_method_spans);
     splice_deferred_mixes_in_extends(&mut app, &concern_class_method_spans);

@@ -129,15 +129,7 @@ struct Delegation {
 /// declarations on its own classes — so what reaches here is the
 /// general shape only.
 pub fn lower_delegates(app: &mut crate::App) {
-    // A zero-arg forwarder for an admitted `def m(a, *)` is the arity
-    // error the module header declines; leave those declarations visible.
-    let nameless_rest: crate::det::HashSet<String> = app
-        .library_classes
-        .iter()
-        .flat_map(|c| c.methods.iter())
-        .filter(|m| m.unsupported_formals.is_none() && m.params.iter().any(crate::dialect::Param::is_nameless_rest))
-        .map(|m| m.name.as_str().to_string())
-        .collect();
+    let nameless_rest = nameless_rest_names(app);
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
         let had_definer = lc.unknown_calls.iter().any(forwardable_definer);
@@ -159,8 +151,49 @@ pub fn lower_delegates(app: &mut crate::App) {
     for (i, methods) in generated {
         app.library_classes[i].methods.extend(methods);
     }
+    let none = crate::det::HashSet::default();
     for model in &mut app.models {
-        lower_model_delegates(model, &nameless_rest, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
+        lower_model_delegates(model, &nameless_rest, &none, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
+    }
+}
+
+/// A zero-arg forwarder for an admitted `def m(a, *)` is the arity
+/// error the module header declines; leave those declarations visible.
+fn nameless_rest_names(app: &crate::App) -> crate::det::HashSet<String> {
+    app.library_classes
+        .iter()
+        .flat_map(|c| c.methods.iter())
+        .filter(|m| m.unsupported_formals.is_none() && m.params.iter().any(crate::dialect::Param::is_nameless_rest))
+        .map(|m| m.name.as_str().to_string())
+        .collect()
+}
+
+/// The `delegate` declarations every model's body still holds: those
+/// `lower_delegates` left (declined or of a shape it does not
+/// reproduce), which `lower_spliced_model_delegates` must not expand
+/// a second time.
+pub(super) fn pending_model_delegates(app: &crate::App) -> crate::det::HashSet<crate::span::Span> {
+    use crate::dialect::ModelBodyItem;
+    app.models
+        .iter()
+        .flat_map(|m| m.body.iter())
+        .filter_map(|item| match item {
+            ModelBodyItem::Unknown { expr, .. } if is_delegate_declaration(expr) => Some(expr.span),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `delegate` declarations a Concern's `included do` brought into
+/// its includers, expanded as the model's own are. Rails runs the
+/// block in the includer's class body, so `delegate :owned?, to:
+/// :account, allow_nil: true` there defines `owned?` on the model; the
+/// splice runs after `lower_delegates`, which never saw these.
+/// `before` is `pending_model_delegates` from ahead of the splice.
+pub(super) fn lower_spliced_model_delegates(app: &mut crate::App, before: &crate::det::HashSet<crate::span::Span>) {
+    let nameless_rest = nameless_rest_names(app);
+    for model in &mut app.models {
+        lower_model_delegates(model, &nameless_rest, before, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
     }
 }
 
@@ -173,6 +206,7 @@ pub fn lower_delegates(app: &mut crate::App) {
 fn lower_model_delegates(
     model: &mut crate::dialect::Model,
     decline: &crate::det::HashSet<String>,
+    skip: &crate::det::HashSet<crate::span::Span>,
     full_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
     declined_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
 ) {
@@ -184,7 +218,7 @@ fn lower_model_delegates(
         .body
         .iter()
         .filter_map(|item| match item {
-            ModelBodyItem::Unknown { expr, .. } if is_delegate(expr) => Some(expr.clone()),
+            ModelBodyItem::Unknown { expr, .. } if is_delegate(expr) && !skip.contains(&expr.span) => Some(expr.clone()),
             _ => None,
         })
         .collect();
@@ -221,7 +255,8 @@ fn lower_model_delegates(
     };
     let (methods, full, declined) = expand_delegates_declining(&mut lc, decline);
     // The declarations the expansion consumed: those it left are declined.
-    let left: Vec<crate::span::Span> = lc.unknown_calls.iter().map(|e| e.span).collect();
+    // A skipped declaration stays as written.
+    let left: Vec<crate::span::Span> = lc.unknown_calls.iter().map(|e| e.span).chain(skip.iter().copied()).collect();
     // The earlier methods a consumed declaration's forwarder replaced.
     let replaced = |m: &MethodDef| {
         methods.iter().any(|f| f.receiver == MethodReceiver::Instance && f.name == m.name)
