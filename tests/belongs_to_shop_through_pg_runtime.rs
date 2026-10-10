@@ -600,3 +600,29 @@ fn belongs_to_shop_through_replays_its_runtime_validation_and_callback() {
     }
     assert!(emitted.join("runtime/active_model_validations.rb").exists(), "the validations port is not carried");
 }
+
+/// A model that declares `accelerated_belongs_to :shop` and then
+/// `belongs_to_shop_through`, which declares `shop` again (Core's
+/// Shipping::Label): the second declaration replaces the first, as in
+/// Rails, so the emitted model declares `shop` once and parses without a
+/// warning (a duplicate `when` arm in `association`/`_preload_dispatch`
+/// is fatal under Core's strict warnings); without PostgreSQL.
+#[test]
+fn belongs_to_shop_through_after_accelerated_shop_declares_shop_once() {
+    let structure = format!(
+        "{STRUCTURE}\nCREATE TABLE parcels (\n    id bigserial NOT NULL,\n    order_id bigint,\n    shop_id bigint,\n    CONSTRAINT parcels_pkey PRIMARY KEY (id)\n);\n"
+    );
+    let parcel = "class Parcel < ApplicationRecord\n  accelerated_belongs_to :shop, primary_key: :id, foreign_key: :shop_id, inverse_of: false\n  belongs_to :order\n  belongs_to_shop_through :order, primary_key: :id, foreign_key: :shop_id, inverse_of: false\nend\n";
+    let (emitted, _) = overlay()
+        .write("db/structure.sql", &structure)
+        .write("app/models/parcel.rb", parcel)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let path = emitted.join("app/models/parcel.rb");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.matches("when \"shop\"").count() <= 1, "`shop` arms\n{text}");
+    assert_eq!(text.matches("    def shop\n").count(), 1, "`shop` readers\n{text}");
+    assert!(text.matches("when :shop\n").count() <= 1, "`shop` preload arms\n{text}");
+    let out = std::process::Command::new("ruby").arg("-wc").arg(&path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && !stderr.contains("warning"), "{stderr}\n{text}");
+}
