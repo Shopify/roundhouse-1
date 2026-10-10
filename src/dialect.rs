@@ -1551,8 +1551,9 @@ pub struct LibraryClass {
 ///
 /// Ingest admits only branches of plain `def`s (an inline `private def`
 /// included), with the visibility in effect around the statement, and
-/// `class` / `module` declarations ([`ConditionalArm::declarations`]);
-/// a branch with a visibility marker, an accessor, a constant or any
+/// `class` / `module` declarations ([`ConditionalArm::declarations`]),
+/// and load-time conditionals of the same shape nested in a branch
+/// ([`ConditionalArm::nested`]); a branch with a visibility marker, an accessor, a constant or any
 /// other statement keeps the file refused, by name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalDefinitions {
