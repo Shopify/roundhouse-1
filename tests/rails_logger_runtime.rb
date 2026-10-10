@@ -26,6 +26,7 @@
 # ::Logger and logs: the refusal is named on stderr and the default device
 # is used.
 require "fileutils"
+require "stringio"
 require "tmpdir"
 require_relative "support/rails_oracle"
 
@@ -126,6 +127,9 @@ show "memoized", Rails.logger.equal?(logger)
 show "level", logger.level
 show "predicates", [logger.debug?, logger.info?, logger.warn?, logger.error?, logger.fatal?]
 show "formatter", logger.formatter.class.name
+show "class", logger.class.name
+show "broadcasts", logger.broadcasts.map { |b| [b.class.name, b.is_a?(ActiveSupport::TaggedLogging)] }
+show "progname", logger.progname
 show "outputs to log/test.log", ActiveSupport::Logger.logger_outputs_to?(logger, File.join(ROOT, "log/test.log"))
 show "outputs to STDERR", ActiveSupport::Logger.logger_outputs_to?(logger, STDERR)
 logger.debug("debug line")
@@ -151,6 +155,18 @@ logger.info("dropped after level=")
 logger.warn("kept after level=")
 logger.level = :debug
 logger.debug("debug after level=")
+logger.tagged("req-1", "shop") { logger.info("tagged line") }
+logger.tagged("outer").info("tagged without a block")
+logger.broadcasts.first.debug { "debug block, no args" }
+extra = StringIO.new
+second = ActiveSupport::Logger.new(extra)
+logger.broadcast_to(second)
+show "broadcast to", logger.broadcasts.size
+logger.info("to both")
+logger.warn { "block to both" }
+logger.stop_broadcasting_to(second)
+logger.info("first only")
+show "second log", extra.string
 show "warnings", WARNINGS
 replacement = ::Logger.new(nil)
 Rails.logger = replacement

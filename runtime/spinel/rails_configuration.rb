@@ -95,14 +95,17 @@ module Rails
 
   # `Rails.logger` on this tree is the logger railties' bootstrap
   # initializer makes (railties 8.2.0.alpha application/bootstrap.rb:34-64,
-  # `initialize_logger`): an ActiveSupport::Logger
+  # `initialize_logger`): `config.logger`, or else an ActiveSupport::Logger
   # (runtime/active_support_logger.rb, a ::Logger) on the environment's
   # log file, `log/<env>.log` under Rails.root, with
-  # ActiveSupport::Logger::SimpleFormatter and the level of
+  # ActiveSupport::Logger::SimpleFormatter, wrapped in
+  # ActiveSupport::TaggedLogging; then, unless it is one already, wrapped
+  # in an ActiveSupport::BroadcastLogger at the level of
   # `config.log_level` (:debug unless set). So `Rails.logger.warn "x"`
-  # appends "x\n" to log/test.log in a test run, as natively, and the
-  # stdlib Logger's call forms (`level`, `debug?`, the block form
-  # `Dalli.logger.debug { ... }`, `add`, `silence`) are Ruby's own.
+  # appends "x\n" to log/test.log in a test run, as natively, the stdlib
+  # Logger's call forms (`level`, `debug?`, the block form
+  # `Dalli.logger.debug { ... }`, `add`, `silence`) are Ruby's own, and
+  # `tagged`, `broadcasts` and `broadcast_to` are activesupport's.
   #
   # The shared runtime's Rails::Logger (rails.rb) is the strict targets'
   # logger: one positional message, written to stderr through Kernel#warn.
@@ -116,20 +119,14 @@ module Rails
   # where it answers the key (a lifted key, or one a railtie stored), with
   # Rails' default otherwise: `logger` (nil), `log_file_size` (nil),
   # `paths["log"]` (log/<env>.log), `autoflush_log` (true),
-  # `log_formatter` (SimpleFormatter) and `log_level` (:debug). Ingest
-  # does not lift `config.logger` or `config.log_level` today
-  # (error[environment_statement_not_carried]), so on Core's tree each is
-  # Rails' default, which for Core's test.rb (LOG_LEVEL and CI unset)
-  # writes the same lines to the same file.
+  # `log_formatter` (SimpleFormatter), `log_level` (:debug) and
+  # `broadcast_log_level` (nil). Ingest does not lift `config.logger` or
+  # `config.log_level` today (error[environment_statement_not_carried]),
+  # so on Core's tree each is Rails' default, which for Core's test.rb
+  # (LOG_LEVEL and CI unset) writes the same lines to the same file.
   #
-  # Not carried, by name: a configured logger that is no ::Logger
-  # (error[rails_logger_not_carried]): this tree has no
-  # ActiveSupport::BroadcastLogger, and its ActiveSupport::TaggedLogging
-  # is a wrapper (runtime/logger.rb), not a logger extended with tags.
-  # Rails 8.2 also wraps the logger it builds in TaggedLogging and a
-  # BroadcastLogger; here Rails.logger is the ActiveSupport::Logger
-  # itself, so `tagged`, `broadcast_to` and `broadcasts` are
-  # NoMethodErrors rather than answered.
+  # Not carried, by name: a configured logger that is neither a ::Logger
+  # nor a BroadcastLogger (error[rails_logger_not_carried]).
   # A stand-in the shared reader memoized before this file loaded is not
   # this tree's logger; the first read below builds Rails'.
   if instance_variable_defined?(:@logger) && const_defined?(:Logger, false) && @logger.instance_of?(Logger)
@@ -163,21 +160,20 @@ module Rails
       require_relative "active_support_logger"
       config = configuration
       logger = configured(config, :logger, nil)
-      unless logger.nil? || logger.is_a?(::Logger)
+      unless logger.nil? || logger.is_a?(::Logger) || logger.is_a?(ActiveSupport::BroadcastLogger)
         $stderr.puts "roundhouse: error[rails_logger_not_carried]: config.logger is #{logger.class.name || logger.class.inspect}, " \
-          "which this tree cannot carry as Rails.logger (it carries a ::Logger: there is no ActiveSupport::BroadcastLogger, " \
-          "and ActiveSupport::TaggedLogging here is a wrapper, not a logger); Rails.logger is the framework default, " \
-          "an ActiveSupport::Logger on #{log_path(config)}"
+          "which this tree cannot carry as Rails.logger (it carries a ::Logger or an ActiveSupport::BroadcastLogger); " \
+          "Rails.logger is the framework default, an ActiveSupport::Logger on #{log_path(config)}"
         logger = nil
       end
       logger ||= begin
         size = configured(config, :log_file_size, nil)
         built = size ? ActiveSupport::Logger.new(default_log_file(config), 1, size) : ActiveSupport::Logger.new(default_log_file(config))
         built.formatter = configured(config, :log_formatter, ActiveSupport::Logger::SimpleFormatter.new)
-        built
+        ActiveSupport::TaggedLogging.new(built)
       rescue StandardError
         path = log_path(config)
-        fallback = ActiveSupport::Logger.new(STDERR)
+        fallback = ActiveSupport::TaggedLogging.new(ActiveSupport::Logger.new(STDERR))
         fallback.level = ActiveSupport::Logger::WARN
         fallback.warn(
           "Rails Error: Unable to access log file. Please ensure that #{path} exists and is writable " \
@@ -186,8 +182,15 @@ module Rails
         )
         fallback
       end
-      logger.level = ActiveSupport::Logger.const_get(configured(config, :log_level, :debug).to_s.upcase)
-      logger
+      if logger.is_a?(ActiveSupport::BroadcastLogger)
+        if (broadcast_level = configured(config, :broadcast_log_level, nil))
+          logger.level = ActiveSupport::Logger.const_get(broadcast_level.to_s.upcase)
+        end
+        logger
+      else
+        logger.level = ActiveSupport::Logger.const_get(configured(config, :log_level, :debug).to_s.upcase)
+        ActiveSupport::BroadcastLogger.new(logger)
+      end
     end
 
     # Application::Configuration#default_log_file.

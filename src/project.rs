@@ -2819,32 +2819,23 @@ end
 "##;
 
 /// The ruby family's `runtime/logger.rb`: Ruby's own Logger (the logger
-/// gem both trees load), activesupport's `ActiveSupport::Logger <
-/// ::Logger` over it (runtime/spinel/active_support_logger.rb), and the
-/// shared port's `ActiveSupport::TaggedLogging` wrapper, cut from
-/// `shared` (runtime/ruby/logger.rb). The shared port's own `Logger`
-/// and `ActiveSupport::Logger` exist for the targets with no stdlib; on
-/// these trees a second `Logger::Formatter` would reopen Ruby's, and an
+/// gem both trees load) and activesupport's `ActiveSupport::Logger <
+/// ::Logger`, `ActiveSupport::TaggedLogging` and
+/// `ActiveSupport::BroadcastLogger` over it
+/// (runtime/spinel/active_support_logger.rb). The shared port
+/// (runtime/ruby/logger.rb) exists for the targets with no stdlib: on
+/// these trees a second `Logger::Formatter` would reopen Ruby's, an
 /// `ActiveSupport::Logger` that is no `::Logger` loses the severities,
-/// `add` and `level` a subclass reaches (Core's StructuredLogger).
-fn ruby_family_logger(shared: &str) -> Result<String, String> {
-    const TAGGED: &str = "  # `ActiveSupport::TaggedLogging.new(logger)`";
-    let at = shared.find(TAGGED).ok_or("runtime/ruby/logger.rb: no ActiveSupport::TaggedLogging section")?;
-    let tagged = &shared[at..];
-    if !tagged.trim_end().ends_with("end\nend") {
-        return Err("runtime/ruby/logger.rb: TaggedLogging is not the file's last definition".into());
-    }
-    Ok(format!(
-        "# Ruby's own logger with activesupport's ActiveSupport::Logger over it\n\
-         # (runtime/active_support_logger.rb) — see `project::ruby_family_logger`.\n\
-         # The port at runtime/ruby/logger.rb exists for the targets that have\n\
-         # no stdlib; its TaggedLogging wrapper follows.\n\
-         require \"logger\"\n\
-         require \"stringio\"\n\
-         require_relative \"active_support_logger\"\n\n\
-         module ActiveSupport\n{tagged}"
-    ))
-}
+/// `add` and `level` a subclass reaches (Core's StructuredLogger), and
+/// its TaggedLogging wrapper answers neither `debug { ... }` nor a
+/// BroadcastLogger's surface, where Rails' extends the logger it wraps.
+const RUBY_FAMILY_LOGGER: &str = "# Ruby's own logger with activesupport's ActiveSupport::Logger,\n\
+     # TaggedLogging and BroadcastLogger over it (runtime/active_support_logger.rb)\n\
+     # — see `project::RUBY_FAMILY_LOGGER`. The port at runtime/ruby/logger.rb\n\
+     # exists for the targets that have no stdlib.\n\
+     require \"logger\"\n\
+     require \"stringio\"\n\
+     require_relative \"active_support_logger\"\n";
 
 /// The ruby family's `runtime/ipaddr.rb`: Ruby's own, plus the ONE
 /// method the port has and the stdlib does not. `runtime/ruby/ipaddr.rb`
@@ -3476,10 +3467,10 @@ fn ruby_family_files(
                         require \"tempfile\"\n"
                 .to_string();
         }
-        // `Logger`: Ruby's own, with activesupport's ActiveSupport::Logger
-        // over it (`ruby_family_logger`).
+        // `Logger`: Ruby's own, with activesupport's loggers over it
+        // (`RUBY_FAMILY_LOGGER`).
         if path == "runtime/logger.rb" {
-            *content = ruby_family_logger(content)?;
+            *content = RUBY_FAMILY_LOGGER.to_string();
         }
         // `Timeout`: default gem on CRuby/JRuby; the port is for Spinel.
         if path == "runtime/timeout.rb" {
@@ -5470,6 +5461,8 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
     ("active_support/logger", &["active_support_logger"]),
+    ("active_support/tagged_logging", &["active_support_logger"]),
+    ("active_support/broadcast_logger", &["active_support_logger"]),
     ("active_support/multibyte", &["active_support_multibyte_unicode"]),
     ("active_support/multibyte/unicode", &["active_support_multibyte_unicode"]),
     ("active_model", &["active_model_errors", "active_model_type", "active_model_validator"]),

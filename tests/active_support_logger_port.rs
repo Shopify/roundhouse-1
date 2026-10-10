@@ -12,7 +12,7 @@
 //!
 //! The CRuby and JRuby trees load Ruby's own logger and carry the port of
 //! activesupport's (runtime/spinel/active_support_logger.rb,
-//! `project::ruby_family_logger`). The file below, Core's StructuredLogger
+//! `project::RUBY_FAMILY_LOGGER`). The file below, Core's StructuredLogger
 //! with `Rails.event.notify` written as an append to `$events`, runs
 //! natively on Core's pinned activesupport (tests/support/rails_oracle.rb)
 //! and emitted on the port, and must print the same. Spinel has no
@@ -144,6 +144,28 @@ const LOG_USERS: &str = r#"module LogUsers
     logger.warn("plain")
     logger
   end
+
+  # Core's shapes (config/environments/test.rb, essentials' logging.rb):
+  # a TaggedLogging BroadcastLogger, broadcast to a second logger.
+  def self.broadcast(io, other)
+    logger = ActiveSupport::TaggedLogging.new(ActiveSupport::BroadcastLogger.new(ActiveSupport::Logger.new(io)))
+    second = ActiveSupport::Logger.new(other)
+    logger.broadcast_to(second)
+    logger.info("both")
+    logger.debug { "a block, run once" }
+    logger.tagged("req-1", "shop") { logger.warn("tagged") }
+    logger.tagged("outer").info("no block")
+    logger.level = :warn
+    logger.info("dropped")
+    logger.silence do
+      logger.warn("silenced")
+      logger.error("loud")
+    end
+    logger.stop_broadcasting_to(second)
+    logger.error("first only")
+    [logger.is_a?(ActiveSupport::BroadcastLogger), logger.broadcasts.size, logger.level, logger.progname,
+     logger.formatter.class.name, logger.respond_to?(:datetime_format), logger.datetime_format]
+  end
 end
 "#;
 
@@ -178,6 +200,14 @@ logger.local_level = :error
 logger.info("thread-local level drops this")
 logger.local_level = nil
 logger.info("and keeps this")
+io = StringIO.new
+other = StringIO.new
+p LogUsers.broadcast(io, other), io.string, other.string
+tagged = ActiveSupport::TaggedLogging.new(ActiveSupport::BroadcastLogger.new(StructuredLogger.new("semian")))
+tagged.info("via broadcast")
+tagged.error { "block via broadcast" }
+tagged.tagged("t") { tagged.warn("tagged via broadcast") }
+p tagged.broadcasts.map(&:class), tagged.level
 $events.each { |event| p event }
 "#;
 
@@ -207,6 +237,7 @@ fn native() -> String {
     let program = format!(
         "require {oracle:?}\nRailsOracle.activate(\"activesupport\")\n\
          require \"active_support\"\nrequire \"active_support/logger\"\nrequire \"stringio\"\n\
+         require \"active_support/tagged_logging\"\nrequire \"active_support/broadcast_logger\"\n\
          # `logger_outputs_to?` calls `try`, which a booted app has loaded.\n\
          require \"active_support/core_ext/object/try\"\n\
          abort \"native: activesupport is not Core's\" unless Gem.loaded_specs[\"activesupport\"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)\n\
