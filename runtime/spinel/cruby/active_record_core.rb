@@ -718,6 +718,35 @@ module ActiveRecord
       @attributes_builder ||= ActiveModel::AttributeSet::Builder.new(attribute_types, {})
     end
 
+    class << self
+      # core.rb: `class_attribute :belongs_to_required_by_default,
+      # instance_accessor: false`, true under `load_defaults` >= 5.0
+      # (Core's 8.1). Reading walks to the nearest class that assigned
+      # one. The compiled `belongs_to` declarations already applied a
+      # class body's or an `extended` hook's write
+      # (lower::model_to_library::macro_replay); a class macro that calls
+      # `belongs_to` at run time (Core's belongs_to_with_query_constraints)
+      # reads it here.
+      def belongs_to_required_by_default
+        klass = self
+        while klass
+          if klass.instance_variable_defined?(:@belongs_to_required_by_default)
+            return klass.instance_variable_get(:@belongs_to_required_by_default)
+          end
+          klass = klass.superclass
+        end
+        true
+      end
+
+      def belongs_to_required_by_default=(value)
+        @belongs_to_required_by_default = value
+      end
+
+      def belongs_to_required_by_default?
+        !!belongs_to_required_by_default
+      end
+    end
+
     include ActiveModel::AttributeAssignment
     include Core
     include Persistence
