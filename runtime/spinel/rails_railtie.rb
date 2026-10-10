@@ -430,8 +430,9 @@ module Rails
       # own store (runtime/rails_cache.rb), which answers the calls the
       # compiler emits and is cleared before each test.
       def initialize_cache_step(app) # :nodoc:
+        return unless defined?(::ActiveSupport::Cache::Store) && app.respond_to?(:config)
         config = app.config
-        return unless defined?(::ActiveSupport::Cache::Store) && config.respond_to?(:cache_store)
+        return unless config.respond_to?(:cache_store)
         store = config.cache_store
         return if store.nil? || store.is_a?(Symbol) || store.is_a?(Array)
         ::Rails.instance_variable_set(:@cache_store, ::ActiveSupport::Cache.lookup_store(store))

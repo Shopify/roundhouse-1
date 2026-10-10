@@ -47,6 +47,7 @@ fn a_store_an_initializer_configures_before_initialize_cache_is_rails_cache() {
              require_relative 'runtime/module_delegate'\n\
              require_relative 'runtime/active_support_inflector'\n\
              require_relative 'runtime/rails'\n\
+             require_relative 'runtime/rails_configuration'\n\
              Rails.env_name = 'test'\n\
              require_relative 'runtime/rails_railtie'\n\
              require_relative 'runtime/rails_engine'\n\

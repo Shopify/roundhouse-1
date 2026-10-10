@@ -52,7 +52,7 @@ end
 def outcome
   yield.inspect
 rescue Exception => e
-  "#{e.class}: #{e.message.lines.first.chomp.sub(/\.tmp\.\h+/, ".tmp.HEX").inspect}"
+  "#{e.class}: #{e.message.lines.first.chomp.sub(/\.tmp\.\h+/, ".tmp.HEX").sub(%r{/\S*/rh-atomic-write[^/]*/}, "DIR/").inspect}"
 end
 
 Dir.mktmpdir("rh-atomic-write") do |dir|
