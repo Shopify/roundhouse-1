@@ -1233,3 +1233,80 @@ module ActiveRecord
     end
   end
 end
+
+# The ar_transaction_changes gem (1.1.11), which Core includes into its
+# models: `transaction_changed_attributes`, each attribute changed since
+# the record's last transaction finished, by name, with its value before
+# that first change; an attribute written back to that value drops out.
+# The commit and rollback callbacks read it, and it resets once they ran
+# (Rails 8.1+: the gem resets in `_run_commit_callbacks` and
+# `_run_rollback_callbacks`, which `committed!`/`rolledback!` call only
+# for the instance that runs the callbacks).
+#
+# The gem's own file is not carried: ingest refuses it (a conditional
+# nested in its load-time `ActiveRecord.version` conditional), and the
+# gem records changes by wrapping `_write_attribute`/`write_attribute`,
+# which a compiled model's attribute writers do not call. This is the
+# same contract over the runtime's Dirty snapshot instead. The value
+# before an attribute's first write since the reset is its value at the
+# reset, so the reset keeps the snapshot (before the first one, the
+# first save keeps the snapshot it starts from: the hydrated one, nothing
+# for a new record), and the reader answers each attribute whose current value differs from it. A
+# create also writes the id (Rails' `_create_record`), which the
+# snapshot leaves out. The values are the attribute's typecast form (the
+# gem's `_read_attribute`): a timestamp's stored text comes back as the
+# time the reader answers. The emitted app reopens this module for the
+# gem's VERSION.
+module ArTransactionChanges
+  def transaction_changed_attributes
+    baseline = @_transaction_changes_kept ? @_transaction_changes_baseline : @__last_saved_attributes
+    changed = HashWithIndifferentAccess.new
+    changed["id"] = nil if @_transaction_changes_created
+    _attribute_snapshot.each do |name, value|
+      before = baseline.nil? ? nil : baseline[name]
+      changed[name] = _transaction_change_value(name, before) unless before == value
+    end
+    changed
+  end
+
+  def __track_saved_changes(was_new)
+    unless @_transaction_changes_kept
+      @_transaction_changes_baseline = @__last_saved_attributes
+      @_transaction_changes_kept = true
+    end
+    @_transaction_changes_created = true if was_new
+    super
+  end
+
+  def committed!(should_run_callbacks: true) # :nodoc:
+    super
+  ensure
+    _reset_transaction_changes if should_run_callbacks
+  end
+
+  def rolledback!(force_restore_state: false, should_run_callbacks: true) # :nodoc:
+    super
+  ensure
+    _reset_transaction_changes if should_run_callbacks
+  end
+
+  private
+    def _reset_transaction_changes
+      @_transaction_changes_baseline = _attribute_snapshot
+      @_transaction_changes_kept = true
+      @_transaction_changes_created = false
+    end
+
+    # A timestamp column's snapshot is its stored text; the reader (and
+    # the gem's `_read_attribute`) answers the time.
+    def _transaction_change_value(name, value)
+      return value unless value.is_a?(String)
+      type = begin
+        self.class.type_for_attribute(name)
+      rescue NotImplementedError
+        nil
+      end
+      return value unless type.respond_to?(:type) && type.type == :datetime
+      ActiveSupport.present_db(ActiveSupport.parse_db_time(value))
+    end
+end
