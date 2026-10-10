@@ -26,7 +26,11 @@
 //! other target for PostgreSQL), and that tree ports `Rails::Railtie`
 //! and `Rails::Engine` (runtime/rails_railtie.rb, rails_engine.rb), so
 //! the class is carried, its body replayed, and boot runs its
-//! initializers (`App::railties`).
+//! initializers (`App::railties`). Likewise an Active Job argument
+//! serializer (`ActiveJob::Serializers::ObjectSerializer`): the CRuby
+//! tree ports the registry (runtime/active_job_callbacks.rb), and Core's
+//! MoneyBagJobArgumentSerializer and shopify-money's railtie register
+//! theirs there.
 
 use crate::det::HashMap;
 
@@ -45,7 +49,9 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
         app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
     let unported = |base: &str| {
         is_unported_rails_base(base)
-            && !(carries_railties && crate::ingest::library_class::is_railtie_base(base))
+            && !(carries_railties
+                && (crate::ingest::library_class::is_railtie_base(base)
+                    || base == "ActiveJob::Serializers::ObjectSerializer"))
     };
     loop {
         let mut grew = false;
