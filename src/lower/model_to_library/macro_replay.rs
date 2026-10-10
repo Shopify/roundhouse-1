@@ -1085,6 +1085,9 @@ pub fn replay_model_macros(app: &mut crate::App) {
             }
         }
     }
+    for model in &mut app.models {
+        carry_read_body_locals(&mut model.body);
+    }
     if settings.iter().all(Vec::is_empty) {
         return;
     }
@@ -1138,6 +1141,47 @@ pub fn replay_model_macros(app: &mut crate::App) {
                     *optional = !required;
                 }
             }
+        }
+    }
+}
+
+/// A model-body local write (`coder = Serializer.new(...)`) a carried
+/// statement reads (`serialize :line_items, coder: coder`) becomes a
+/// `ClassBody` statement too, at its source position: Ruby runs the
+/// write where it stands, and the read raises NameError at class load
+/// without it. Core's Checkout builds its `line_items` coder this way;
+/// dropped, the class body raised and Ruby discarded the autoloaded
+/// class, with `Checkout::ShippingLine` already loaded on the discarded
+/// one. A write only statically lowered declarations read stays
+/// `Unknown`, as before.
+pub(crate) fn carry_read_body_locals(body: &mut [ModelBodyItem]) {
+    fn reads(e: &Expr, out: &mut Vec<crate::ident::Symbol>) {
+        if let ExprNode::Var { name, .. } = &*e.node {
+            out.push(name.clone());
+        }
+        e.node.for_each_child(&mut |c| reads(c, out));
+    }
+    let mut read: Vec<crate::ident::Symbol> = Vec::new();
+    for item in body.iter_mut().rev() {
+        match item {
+            ModelBodyItem::ClassBody { expr, .. } => reads(expr, &mut read),
+            ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } => {
+                let written = match &*expr.node {
+                    ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => name,
+                    _ => continue,
+                };
+                if !read.contains(written) {
+                    continue;
+                }
+                reads(expr, &mut read);
+                *item = ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+            _ => {}
         }
     }
 }
