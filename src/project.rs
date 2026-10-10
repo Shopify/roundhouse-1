@@ -15289,8 +15289,13 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     // ActiveRecord::Validations (Core's Validatable extends a Struct with
     // its ClassMethods) builds on the ActiveModel::Validations port.
     let record_validations = carries_named(files, &["ActiveRecord::Validations"]);
+    // A model's class-side `validates` called while the app runs (a class
+    // macro `lower::model_to_library::macro_replay` replays: Core's
+    // Denormalize#define_denormalized_foreign_key) builds its validators
+    // on the port too.
     let validations = record_validations
-        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"]);
+        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"])
+        || calls_runtime_validates(files);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [
         (true, "active_model_naming"),
@@ -15302,6 +15307,38 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(carried, port)| carried.then_some(port))
     .collect()
+}
+
+/// True where app code (not the runtime, not a test body) calls a
+/// class-side validation helper (`self.validates(...)`,
+/// `validates_presence_of(...)`): a compiled model's own declarations
+/// are lowered into its `validate`, so a call left in emitted code is
+/// one that runs at run time (runtime/ruby/active_record/connection.rb's
+/// `Base.validates`, which needs the ActiveModel::Validations port).
+fn calls_runtime_validates(files: &[(String, String)]) -> bool {
+    fn helper(word: &str) -> bool {
+        matches!(word, "validates" | "validates!" | "validates_with" | "validates_each" | "validates_associated")
+            || (word.starts_with("validates_") && word.ends_with("_of"))
+    }
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && content.contains("validates")
+            && content.lines().any(|line| {
+                let code = line.trim_start();
+                !code.starts_with('#')
+                    && code.match_indices("validates").any(|(at, _)| {
+                        let before = code[..at].chars().next_back();
+                        let word: String = code[at..].chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '!').collect();
+                        let after = code[at + word.len()..].chars().next();
+                        before.is_none_or(|c| c == '.' || c == ' ' || c == '(')
+                            && helper(&word)
+                            && matches!(after, Some('(' | ' '))
+                            && !code[..at].trim_end().ends_with("def")
+                    })
+            })
+    })
 }
 
 /// True where app code (not the runtime, not a test body) names one of

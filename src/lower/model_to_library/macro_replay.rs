@@ -18,7 +18,11 @@
 //! to it ([`MacroVerdict::Refuse`]). So is one that calls a class-side
 //! method neither the app nor Ruby's Module/Class surface (plus the
 //! runtime's core extensions) answers, one that `send`s a computed name,
-//! and one that calls `super`.
+//! and one that calls `super`. On PostgreSQL, whose tree's base
+//! registers the validations and lifecycle callbacks a class declares
+//! while it runs, those let a macro through
+//! ([`runtime_registers_at_class_body`]); their blocks run later, on the
+//! record.
 //!
 //! The walk follows what runs at class-body time: the macro's body, the
 //! class macros it calls on `self` (or on a local bound to `self`), and
@@ -149,6 +153,44 @@ fn runtime_answers_at_class_body(name: &str, answered: bool) -> bool {
         "attribute" | "query_constraints" | "alias_attribute" => answered,
         _ => false,
     }
+}
+
+/// Model DSL the PostgreSQL CRuby tree's base registers when it runs, so
+/// a macro reaching it at class-body time can be replayed there: the
+/// validation class methods (runtime/ruby/active_record/connection.rb's
+/// `Base.validates` and its helpers, over RuntimeValidations, which
+/// `valid?` runs with the compiled `validate`; on the
+/// ActiveModel::Validations port, `project::active_model_ports_carried`),
+/// and the callbacks runtime/spinel/cruby/active_record_callbacks.rb
+/// registers into Rails' chains beside the compiled hooks. Not
+/// `after_initialize` or `before_commit`, which that runtime refuses by
+/// name. Core's Denormalize#define_denormalized_foreign_key declares
+/// `validates(:shop_id, presence: true)` and a `before_validation`.
+fn runtime_registers_at_class_body(name: &str) -> bool {
+    if let Some(event) = ["before_", "around_", "after_"].iter().find_map(|kind| name.strip_prefix(kind)) {
+        if matches!(event, "save" | "create" | "update" | "destroy") {
+            return true;
+        }
+    }
+    matches!(
+        name,
+        "validate"
+            | "validates"
+            | "validates!"
+            | "validates_with"
+            | "validates_each"
+            | "validates_associated"
+            | "before_validation"
+            | "after_validation"
+            | "after_find"
+            | "after_touch"
+            | "after_commit"
+            | "after_save_commit"
+            | "after_create_commit"
+            | "after_update_commit"
+            | "after_destroy_commit"
+            | "after_rollback"
+    ) || (name.starts_with("validates_") && name.ends_with("_of"))
 }
 
 /// What a lowered model with a compiled table answers about it on the
@@ -863,6 +905,11 @@ impl<'s, 'a> Walk<'s, 'a> {
         if self.declares_association && matches!(name, "belongs_to" | "has_one" | "has_many" | "reflect_on_association") {
             return Ok(());
         }
+        if runtime_registers_at_class_body(name)
+            && self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+        {
+            return Ok(());
+        }
         if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {
             return Err(format!(
                 "{} reaches `{name}`, which the lowered model declares statically from its body, not at class-body run time",
@@ -985,7 +1032,10 @@ impl<'s, 'a> Walk<'s, 'a> {
                         });
                     let changes_self = !on_self
                         && matches!(name.as_str(), "class_eval" | "module_eval" | "instance_eval" | "instance_exec" | "class_exec" | "module_exec");
-                    if !(DEFERRED_BLOCK_METHODS.contains(&name.as_str()) || new_scope || changes_self) {
+                    // A registered callback's or validation's block runs
+                    // later, on the record.
+                    let registered = on_self && runtime_registers_at_class_body(&name);
+                    if !(DEFERRED_BLOCK_METHODS.contains(&name.as_str()) || new_scope || changes_self || registered) {
                         if let ExprNode::Lambda { body, .. } = &*block.node {
                             self.expr(body, aliases)?;
                         }
