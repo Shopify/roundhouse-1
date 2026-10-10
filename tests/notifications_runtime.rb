@@ -41,6 +41,15 @@ end
 observed[:event] = [event.name, event.payload[:value], event.time.is_a?(Numeric),
                    event.end >= event.time, event.duration >= 0]
 
+# Core's Verdict::Instrumentation::Subscriber: `Event.new(*args)` from a
+# five-argument subscriber, as Rails 8.2's constructor takes them.
+built = nil
+listener = notifications.subscribe("contract") { |*args| built = ActiveSupport::Notifications::Event.new(*args) }
+notifications.instrument("contract", value: 3)
+notifications.unsubscribe(listener)
+observed[:event_from_args] = [built.name, built.payload[:value], built.time.is_a?(Float),
+                              built.duration.is_a?(Float), built.duration >= 0]
+
 clock = []
 notifications.subscribed(->(name, started, finished, id, payload) {
   clock << [started.is_a?(Float), finished.is_a?(Float), finished >= started]
@@ -98,6 +107,7 @@ observed[:order] = [order, prepend_regexp]
 expected = {
   synchronous: [:result, [["contract", true, true, true, 1]]],
   event: ["contract", 2, true, true, true],
+  event_from_args: ["contract", 3, true, true, true],
   monotonic: [[true, true, true]],
   exception: [true, true, ["RuntimeError", "expected failure"]],
   scoped_cleanup: true,

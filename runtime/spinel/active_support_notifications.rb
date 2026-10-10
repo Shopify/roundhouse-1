@@ -8,17 +8,23 @@ require "securerandom"
 
 module ActiveSupport
   module Notifications
+    # Rails 8.2's constructor (instrumenter.rb): a subscriber's
+    # `Event.new(*args)` passes the five callback values. `time` and
+    # `end` are milliseconds; `duration` is their difference.
     class Event
-      attr_reader :name, :time, :end, :transaction_id, :duration
+      attr_reader :name, :time, :end, :transaction_id
       attr_accessor :payload
 
-      def initialize(name, started, finished, transaction_id, payload, duration)
+      def initialize(name, start, ending, transaction_id, payload)
         @name = name
-        @time = started
-        @end = finished
-        @transaction_id = transaction_id
         @payload = payload
-        @duration = duration
+        @time = start ? start.to_f * 1_000.0 : start
+        @transaction_id = transaction_id
+        @end = ending ? ending.to_f * 1_000.0 : ending
+      end
+
+      def duration
+        @end - @time
       end
     end
 
@@ -136,8 +142,7 @@ module ActiveSupport
           return if @listeners.empty?
           finished = Time.now
           monotonic_finish = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          duration = (monotonic_finish - @monotonic_start) * 1000.0
-          event = Event.new(name, @monotonic_start, monotonic_finish, id, payload, duration)
+          event = Event.new(name, @monotonic_start, monotonic_finish, id, payload)
           @listeners.each do |entry|
             callback = entry.callback
             procish = callback.respond_to?(:parameters) ? callback : callback.method(:call)

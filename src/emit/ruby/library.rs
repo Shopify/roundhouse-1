@@ -14666,6 +14666,16 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
         if owns_a_file(&prefix, app) {
             let mut own = body_files(name, app);
             own.extend(declared_files(name, app));
+            // An empty class under app/models has no body span and no
+            // `library_class_files` entry: its superclass is where it
+            // was written. Core's session/codec.rb `class
+            // UnsupportedCheckoutSessionError < DecodingError; end`,
+            // written into session.rb's body, read the codec at
+            // Session's top, whose table read `Session::CartNext`
+            // before session.rb defined it.
+            if own.is_empty() {
+                own.extend(library_classes_named(name, app).iter().map(|c| c.parent_span.file.0).filter(|f| *f != 0));
+            }
             if written_apart(&own, &prefix, app) {
                 apart_from_outer = true;
                 continue;

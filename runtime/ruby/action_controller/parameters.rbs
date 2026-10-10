@@ -145,7 +145,7 @@ module ActionController
     def convert_value_to_parameters: (::Object value) -> ::Object
     def specify_numeric_keys?: (::Object filter) -> bool
     def array_filter?: (::Object filter) -> bool
-    def unpermitted_parameters!: (Parameters params, (Symbol | bool)? on_unpermitted) -> void
+    def unpermitted_parameters!: (Parameters params, ?on_unpermitted: (Symbol | bool)?) -> void
     def unpermitted_keys: (Parameters params) -> Array[String]
     def permitted_scalar_filter: (Parameters params, ::Object permitted_key) -> void
     def non_scalar?: (::Object value) -> bool

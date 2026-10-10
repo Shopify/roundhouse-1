@@ -144,6 +144,8 @@ const PROBE: &str = r##"class SerializeCoderProbe
     rescue ActiveRecord::SerializationTypeMismatch => e
       out << "mismatch: #{e.message}"
     end
+    b[:tags] += ["r"]
+    out << "index: #{b[:tags].inspect} #{b.tags.inspect} #{b[:meta].inspect}"
     out << "types: #{Note.type_for_attribute(:tags).class} #{Note.type_for_attribute(:tags).type.inspect} #{Note.type_for_attribute(:meta).type.inspect}"
     out
   end
@@ -152,7 +154,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 12] = [
     "new: [] {} nil",
     r#"read: ["x", "y"] {"k" => "v", "n" => "1"} "hello" [] {}"#,
     r#"raw: [["x|y", "k=v;n=1", "HELLO"], [nil, nil, nil]]"#,
@@ -163,6 +165,7 @@ const EXPECTED: [&str; 11] = [
     r#"update: ["q"] {} "q" nil"#,
     r#"in place: ["x", "y", "z"]"#,
     r#"mismatch: can't serialize `tags`: was supposed to be a Array, but was a String. -- "oops""#,
+    r#"index: ["q", "r"] ["q", "r"] {}"#,
     "types: ActiveRecord::Type::Serialized :text :string",
 ];
 
