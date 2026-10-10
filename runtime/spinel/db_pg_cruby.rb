@@ -913,11 +913,12 @@ module Db
     nil
   end
 
-  def self.exec(sql)
+  # `name` is the `sql.active_record` event's (Rails' `execute(sql, name)`).
+  def self.exec(sql, name = "SQL")
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
-    result = adapter.raw_execute(sql) { |conn| adapter.perform_query(conn, sql) }
+    result = adapter.raw_execute(sql, name) { |conn| adapter.perform_query(conn, sql) }
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     nil
   ensure

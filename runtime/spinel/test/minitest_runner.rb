@@ -1217,18 +1217,16 @@ module RoundhouseTestRunner
       test.name = name.to_s if test.respond_to?(:name=)
       capture(errors, "setup") do
         yield if block_given?
-        # ActiveRecord::TestFixtures#before_setup's setup_fixtures, first,
-        # where the tree carries it (the PostgreSQL tree's
-        # runtime/active_record_test_fixtures.rb): the fixtures, loaded
-        # once, and the test's transaction.
-        if test.respond_to?(:__roundhouse_setup_active_record_fixtures)
-          test.__roundhouse_setup_active_record_fixtures(name)
-        end
         test.__roundhouse_setup_fixtures
         # Minitest's before_setup hook (`RoundhouseMinitestLifecycleHooks`),
-        # where a test's own modules define it; the fixture and callback
-        # phases its native `super` chain reaches are the runner's own
-        # steps around it.
+        # where a test's own modules define it. Where the tree carries
+        # ActiveRecord::TestFixtures (the PostgreSQL tree's
+        # runtime/active_record_test_fixtures.rb), its before_setup in
+        # that chain runs setup_fixtures (the fixtures, loaded once, and
+        # the test's transaction) after what an app's before_setup does
+        # ahead of its `super`: Core's resets Shop.current. The callback
+        # phase its native `super` chain reaches is the runner's own step
+        # after it.
         test.before_setup if test.respond_to?(:before_setup)
         # ActiveSupport's before_setup: run_callbacks :setup.
         RoundhouseTestCallbacks.run_setup(test) if test.class.is_a?(RoundhouseTestCallbacks::ClassMethods)
