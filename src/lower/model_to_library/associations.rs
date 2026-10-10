@@ -348,10 +348,13 @@ pub(super) fn push_association_methods(
                 target,
                 foreign_key,
                 polymorphic: false,
+                primary_key,
                 ..
             } => {
                 let sentinel = fk_sentinel(model, foreign_key);
-                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, sentinel.clone()));
+                // `primary_key: "uuid"`: the target's key the fk holds.
+                let assoc_pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
+                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone()));
                 // Rails provides the writer alongside the reader
                 // (`comment.story = obj` stores the foreign key). A
                 // custom writer in the model body must win (Rails: the
@@ -366,7 +369,7 @@ pub(super) fn push_association_methods(
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
                 {
-                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, sentinel));
+                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel));
                 }
                 push_singular_loaded_reader(methods, model, owner, name);
             }
@@ -1299,6 +1302,7 @@ fn synth_belongs_to_reader(
     name: &Symbol,
     target: &ClassId,
     foreign_key: &Symbol,
+    assoc_pk: &Symbol,
     sentinel: Expr,
 ) -> MethodDef {
     // def article
@@ -1328,7 +1332,7 @@ fn synth_belongs_to_reader(
                 Span::synthetic(),
                 ExprNode::Hash {
                     entries: vec![(
-                        lit_sym(Symbol::from("id")),
+                        lit_sym(assoc_pk.clone()),
                         Expr::new(
                             Span::synthetic(),
                             ExprNode::Ivar { name: foreign_key.clone() },
@@ -1596,6 +1600,7 @@ fn synth_belongs_to_writer(
     name: &Symbol,
     target: &ClassId,
     foreign_key: &Symbol,
+    assoc_pk: &Symbol,
     sentinel: Expr,
 ) -> MethodDef {
     // def story=(value)
@@ -1635,7 +1640,7 @@ fn synth_belongs_to_writer(
         Span::synthetic(),
         ExprNode::Send {
             recv: Some(var_ref(value.clone())),
-            method: Symbol::from("id"),
+            method: assoc_pk.clone(),
             args: vec![],
             block: None,
             parenthesized: false,
