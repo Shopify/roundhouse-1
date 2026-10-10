@@ -197,6 +197,14 @@ fn engine_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path, depth: usize, out: &mut Ve
 /// The Rails gems the boot's gem-source dependency block refuses a
 /// feature for depending on (`project::gem_source_dependency_block`,
 /// `__rh_rails_gems`).
+/// Gems whose lock closure reaches a Rails gem only through features the
+/// runtime's ports answer, measured in the emitted Core tree (r19, CRuby on
+/// PostgreSQL): tracking_number 3.0.0's `require 'active_support/all'`
+/// loads runtime/features/active_support/all.rb and no Rails gem, and
+/// `TrackingNumber.search` answers as natively. carriers_db 2.29.0's
+/// analyzers/checksum.rb requires it in its compiled file program.
+const PORT_ANSWERED_RAILS_DEPENDENTS: &[&str] = &["tracking_number"];
+
 const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "actionpack", "actionview", "activejob", "railties"];
 
 /// Add to `app`'s source constants the gems the gem sources (`gem_sources:`,
@@ -226,7 +234,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
     let (certain, _, _) = crate::project::gem_source_dependencies(app);
     let (file_features, file_certain) = gem_source_file_requires(app, dir);
     let features: BTreeSet<String> = features.into_iter().chain(file_features).collect();
-    let certain: BTreeSet<String> = certain.into_iter().chain(file_certain).collect();
+    let certain: BTreeSet<String> = certain.into_iter().chain(file_certain.iter().cloned()).collect();
     if features.is_empty() {
         return;
     }
@@ -261,11 +269,15 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
     let mut found = BTreeSet::new();
     let mut loads = BTreeSet::new();
     for gem in candidates {
+        // A gem measured to load over the runtime's Rails ports is loaded
+        // where a compiled file program requires it itself, which no boot
+        // guard stands in front of.
+        let port_answered = PORT_ANSWERED_RAILS_DEPENDENTS.contains(&gem);
         if sources.scans.contains_key(gem)
             || lock.is_in_repo(gem)
             || crate::project::gem_requires_rails(gem).is_some()
             || crate::project::gem_port_files(gem).is_some()
-            || reaches_rails(gem)
+            || (reaches_rails(gem) && !port_answered)
         {
             continue;
         }
@@ -276,6 +288,12 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
             let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
             require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
         };
+        if port_answered && reaches_rails(gem) {
+            if file_certain.iter().any(|f| owns(f)) {
+                loads.insert(gem.to_string());
+            }
+            continue;
+        }
         if features.iter().any(|f| owns(f)) {
             found.insert(gem.to_string());
         }

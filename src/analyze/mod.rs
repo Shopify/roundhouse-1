@@ -2531,9 +2531,34 @@ impl Analyzer {
                 _ => None,
             })))
             .chain(app.library_classes.iter().flat_map(|lc| lc.unknown_calls.iter().map(move |call| (&lc.name, call))));
+        // A class-body `if` / `unless` whose branches write constants
+        // (Core's `AgenticStorefronts::TranslationPlatformApi`:
+        // `if Rails.env.test? … URL = "…shop.dev…" else URL = "…shopify.io…"
+        // end`) declares each in the class, as the emitted body does
+        // when the branch runs. Every branch's write is the same
+        // declaration; the fixpoint joins their types.
+        fn branch_const_writes<'e>(stmt: &'e Expr, out: &mut Vec<(&'e Symbol, &'e Expr)>) {
+            match &*stmt.node {
+                ExprNode::If { then_branch, else_branch, .. } => {
+                    for branch in [then_branch, else_branch] {
+                        branch_const_writes(branch, out);
+                    }
+                }
+                ExprNode::Seq { exprs } => exprs.iter().for_each(|e| branch_const_writes(e, out)),
+                ExprNode::Assign { target: LValue::Const { path }, value } => {
+                    if let [name] = path.as_slice() {
+                        out.push((name, value));
+                    }
+                }
+                _ => {}
+            }
+        }
         for (owner, call) in class_body_calls {
             let mut writes = Vec::new();
             block_const_writes(call, &mut writes);
+            if matches!(&*call.node, ExprNode::If { .. }) {
+                branch_const_writes(call, &mut writes);
+            }
             for (name, value) in writes {
                 let self_ty = Ty::Class { id: owner.clone(), args: vec![] };
                 entries.push((self_ty, name.clone(), declaration_id(name, value), value, false));
@@ -2788,7 +2813,13 @@ impl Analyzer {
                     continue;
                 }
                 if let Some(id) = id {
-                    next_resolved.insert(*id, ty.clone());
+                    // Writes of one declaration in different branches
+                    // join (see `branch_const_writes`).
+                    let joined = match next_resolved.get(id) {
+                        Some(prev) if *prev != ty => union_of(prev.clone(), ty.clone()),
+                        _ => ty.clone(),
+                    };
+                    next_resolved.insert(*id, joined);
                 }
                 if !*production || ambiguous.contains(name) {
                     continue;

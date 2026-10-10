@@ -188,3 +188,34 @@ fn a_git_gem_s_checkout_gemspec_names_its_require_paths() {
     let _ = std::fs::remove_dir_all(&home);
     assert!(constant_errors(&errors).is_empty(), "{errors:#?}");
 }
+
+/// carriers_db 2.29.0's shape: a gem source file whose program requires
+/// tracking_number, a gem whose lock closure reaches activesupport only
+/// through `require 'active_support/all'`, which the runtime's feature
+/// port answers (measured: `project`'s `PORT_ANSWERED_RAILS_DEPENDENTS`).
+/// The compiled program runs that require itself, so the gem is loaded
+/// and `TrackingNumber.search` reads as the gem's.
+const TRACKING_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    hedgy (1.0.0)\n      activesupport (>= 7.2)\n      monolog (~> 1.0)\n      tracking_number\n    monolog (1.1.2)\n    tracking_number (3.0.0)\n      activesupport (>= 4.2.5)\n\nDEPENDENCIES\n  activesupport\n  hedgy\n";
+
+const TRACKING_CONFIGURATION: &str = "require \"tracking_number\"\n\nmodule Hedgy\n  class Configuration\n    def detect(number)\n      TrackingNumber.search(number)\n    end\n  end\nend\n";
+
+#[test]
+fn a_gem_measured_to_load_over_the_ports_is_loaded_where_a_file_program_requires_it() {
+    let home = fake_gem_home();
+    let spec = "Gem::Specification.new do |s|\n  s.name = \"tracking_number\".freeze\n  s.version = \"3.0.0\".freeze\n  s.summary = \"fixture\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\".freeze]\nend\n";
+    std::fs::write(home.join("specifications/tracking_number-3.0.0.gemspec"), spec).unwrap();
+    std::fs::create_dir_all(home.join("gems/tracking_number-3.0.0/lib")).unwrap();
+    std::fs::write(
+        home.join("gems/tracking_number-3.0.0/lib/tracking_number.rb"),
+        "require \"active_support/all\"\n\nmodule TrackingNumber\n  def self.search(_number) = []\nend\n",
+    )
+    .unwrap();
+    let (tree, errors) = app(&home, TRACKING_CONFIGURATION)
+        .write("Gemfile.lock", TRACKING_LOCK)
+        .write("sorbet/rbi/gems/tracking_number@3.0.0.rbi", "# typed: true\n\nmodule TrackingNumber\n  class << self\n    def search(body); end\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(constant_errors(&errors).is_empty(), "{errors:#?}");
+    let emitted = std::fs::read_to_string(tree.join("app/models/hedgy/configuration.rb")).expect("configuration.rb");
+    assert!(emitted.contains("TrackingNumber.search(number)"), "{emitted}");
+}
