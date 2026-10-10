@@ -192,12 +192,12 @@ module ActiveRecord
               status = status_of(&block)
             else
               begin
+                # `transaction` swallows the Rollback, as Rails' does.
                 ActiveRecord::Base.transaction do
                   status = status_of(&block)
                   raise ActiveRecord::Rollback unless status
                 end
-              rescue ActiveRecord::Rollback
-                restore(frame)
+                restore(frame) unless status
               rescue StandardError
                 restore(frame)
                 raise
