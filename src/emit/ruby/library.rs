@@ -8745,6 +8745,30 @@ fn emit_library_class_decl_inner(
         }
         _ => lc,
     };
+    // A Concern's `class_methods do` defines `ClassMethods` with the
+    // block's defs as its instance methods (`App::class_methods_blocks`);
+    // the IR's class-side copies on the Concern are that module here.
+    let block_spans = app.class_methods_blocks.get(&lc.name).filter(|_| lc.is_module && lc.top_level_constants.is_empty());
+    let (class_methods_block, without_block_methods);
+    let lc = match block_spans {
+        Some(spans) if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && spans.contains(&m.name_span)) => {
+            let in_block = |m: &MethodDef| m.receiver == MethodReceiver::Class && spans.contains(&m.name_span);
+            let mut module = lc.clone();
+            module.methods.retain(&in_block);
+            module.method_aliases.clear();
+            for m in &mut module.methods {
+                m.receiver = MethodReceiver::Instance;
+            }
+            let mut rest = lc.clone();
+            rest.methods.retain(|m| !in_block(m));
+            (class_methods_block, without_block_methods) = (Some(module), rest);
+            &without_block_methods
+        }
+        _ => {
+            class_methods_block = None;
+            lc
+        }
+    };
     let spliced_extends: Vec<&crate::ident::ClassId> = carrier_splices
         .into_iter()
         .flatten()
@@ -9300,6 +9324,18 @@ fn emit_library_class_decl_inner(
         writeln!(s, "{body_pad}end").unwrap();
         writeln!(s, "{body_pad}private_constant :GeneratedAttributeMethods").unwrap();
         writeln!(s, "{body_pad}include GeneratedAttributeMethods").unwrap();
+        writeln!(s).unwrap();
+    }
+    if let Some(module) = &class_methods_block {
+        let inner_pad = format!("{body_pad}  ");
+        writeln!(s, "{body_pad}module ClassMethods").unwrap();
+        for index in 0..module.methods.len() {
+            if index > 0 {
+                writeln!(s).unwrap();
+            }
+            write_library_method(&mut s, module, index, &inner_pad, &[]);
+        }
+        writeln!(s, "{body_pad}end").unwrap();
         writeln!(s).unwrap();
     }
 
@@ -12564,7 +12600,8 @@ fn concern_carrier_extends(includes: &[ClassId], app: &App) -> Vec<ClassId> {
             queue.extend(c.includes.iter().map(|n| (n.0.as_str().trim_start_matches("::").to_string(), concern)));
         }
         let carrier = format!("{name}::ClassMethods");
-        if concern && library_classes_named(&carrier, app).iter().any(|c| c.is_module) {
+        let block = app.class_methods_blocks.contains_key(&ClassId(Symbol::from(name.as_str())));
+        if concern && (block || library_classes_named(&carrier, app).iter().any(|c| c.is_module)) {
             out.push(ClassId(Symbol::from(carrier.as_str())));
         }
     }
@@ -13090,6 +13127,8 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     };
     let app_module = |path: &[Symbol]| resolve_app_module(lc, path, app);
     let mut extended: Vec<&LibraryClass> = Vec::new();
+    // The Concerns whose `class_methods do` module is extended.
+    let mut extended_blocks: Vec<&LibraryClass> = Vec::new();
     let mut out = Vec::new();
     for call in &lc.unknown_calls {
         // `self.x = v` through the body's own class-side writer, or after
@@ -13124,13 +13163,29 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
             if let Some(modules) = modules.filter(|m| !m.is_empty()) {
                 extended.extend(modules);
                 out.push(call);
+                continue;
+            }
+            let blocks: Option<Vec<&LibraryClass>> = args
+                .iter()
+                .map(|a| match &*a.node {
+                    ExprNode::Const { path } => resolve_class_methods_block(lc, path, app),
+                    _ => None,
+                })
+                .collect();
+            if let Some(owners) = blocks.filter(|m| !m.is_empty()) {
+                extended_blocks.extend(owners);
+                out.push(call);
             }
             continue;
         }
         let defines = |c: &LibraryClass| {
             c.methods.iter().any(|m| m.name == *method && m.receiver == MethodReceiver::Instance)
         };
-        if extended.iter().any(|m| defines(m)) {
+        let block_defines = |c: &LibraryClass| {
+            let spans = &app.class_methods_blocks[&c.name];
+            c.methods.iter().any(|m| m.name == *method && m.receiver == MethodReceiver::Class && spans.contains(&m.name_span))
+        };
+        if extended.iter().any(|m| defines(m)) || extended_blocks.iter().any(|m| block_defines(m)) {
             out.push(call);
         }
     }
@@ -13191,6 +13246,17 @@ fn resolve_app_module<'a>(lc: &LibraryClass, path: &[Symbol], app: &'a App) -> O
         let name = if n == 0 { written.clone() } else { format!("{}::{written}", scope[..n].join("::")) };
         library_classes_named(&name, app).into_iter().find(|c| c.is_module && c.origin.is_none())
     })
+}
+
+/// The Concern whose `class_methods do` defines the `ClassMethods` that
+/// `path` names from `lc`'s namespace (`App::class_methods_blocks`):
+/// Core's `extend FixtureFactory::Registry::ClassMethods`.
+fn resolve_class_methods_block<'a>(lc: &LibraryClass, path: &[Symbol], app: &'a App) -> Option<&'a LibraryClass> {
+    let (last, owner) = path.split_last()?;
+    if last.as_str() != "ClassMethods" || owner.is_empty() {
+        return None;
+    }
+    resolve_app_module(lc, owner, app).filter(|m| app.class_methods_blocks.contains_key(&m.name))
 }
 
 /// The modules of a bare `extend M, …` whose every argument is an app
@@ -14705,6 +14771,7 @@ fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
         // What the emit adds to a class by name (`extend`s, forwarders)
         // would be written into the constant's file too.
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.class_methods_blocks.contains_key(&classes[0].name)
         || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
     {
         return None;
@@ -14807,6 +14874,7 @@ fn nested_file_constant(lc: &LibraryClass, constant: &str, app: &App) -> Option<
         || is_model_named(owner, app)
         || file_owner(owner, app) != owner
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.class_methods_blocks.contains_key(&classes[0].name)
         || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
         || lc.top_level_constants.iter().any(|t| t.name.as_str() == constant)
     {
@@ -15010,6 +15078,7 @@ fn program_constants(lc: &LibraryClass, app: &App) -> Vec<(usize, String)> {
         || is_model_named(owner, app)
         || file_owner(owner, app) != owner
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.class_methods_blocks.contains_key(&classes[0].name)
         || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
     {
         return Vec::new();
@@ -15504,9 +15573,6 @@ fn require_path_for_body_const(
         }
         return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
     }
-    if first == self_name {
-        return None;
-    }
     // A qualified constant (`SecureHeaders::ClearSiteData::CACHE`,
     // `SecureHeaders::PolicyManagement::ALL_DIRECTIVES`) is defined by
     // the file of its longest class prefix: this file when that is this
@@ -15528,6 +15594,14 @@ fn require_path_for_body_const(
             }
             return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
         }
+    }
+    // Any other constant under this class is in this file. Only after
+    // the prefixes: a model's nested module keeps a file of its own
+    // (`file_owner`), and Core's `Event` body reads
+    // `Verb::CONFIRMED` (`Event::Verb::CONFIRMED`) into a constant as
+    // it loads, which raised NameError with no require of event/verb.rb.
+    if first == self_name {
+        return None;
     }
     // A core Ruby class an app reopens (e.g. `class String` in
     // lib/monkey.rb) lands in `library_classes`, but it is NOT an

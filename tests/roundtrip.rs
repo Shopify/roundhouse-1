@@ -218,6 +218,7 @@ fn tiny_blog_round_trips() {
         concern_spliced_actions: roundhouse::det::HashMap::default(),
         concern_spliced_class_methods: roundhouse::det::HashMap::default(),
         class_methods_carrier_splices: roundhouse::det::HashMap::default(),
+        class_methods_blocks: roundhouse::det::HashMap::default(),
         concern_model_items: roundhouse::det::HashMap::default(),
         render_edges: roundhouse::det::HashMap::default(),
         view_feeders: roundhouse::det::HashMap::default(),
