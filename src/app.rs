@@ -642,6 +642,15 @@ pub struct App {
     /// only Concern would have run (its `append_features` is not emitted).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_methods_carrier_splices: HashMap<ClassId, Vec<ClassMethodsCarrierSplice>>,
+    /// An ActiveSupport::Concern's `class_methods do` defs, by name span,
+    /// keyed by the Concern. The IR keeps them as the Concern's class
+    /// methods (the splice copies them onto includers); in Ruby they are
+    /// the instance methods of the `Owner::ClassMethods` the block
+    /// defines, which the Ruby emit writes nested in the Concern, so an
+    /// includer's `extend` (`class_methods_carrier_splices`) and an
+    /// authored `extend Owner::ClassMethods` both find it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub class_methods_blocks: HashMap<ClassId, Vec<crate::span::Span>>,
     /// The Ruby target's forwarders for a library class's instance-side
     /// `delegate :m, to: :t`: `def m(...) = t.m(...)`, as Rails generates.
     /// `ingest::delegate` writes the IR forwarder zero-arg (argument
@@ -1484,6 +1493,7 @@ impl App {
             concern_spliced_actions: HashMap::default(),
             concern_spliced_class_methods: HashMap::default(),
             class_methods_carrier_splices: HashMap::default(),
+            class_methods_blocks: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
             ruby_declined_delegate_forwarders: HashMap::default(),
             class_eval_macro_expansions: HashMap::default(),

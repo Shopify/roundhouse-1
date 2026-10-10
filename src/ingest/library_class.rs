@@ -5885,6 +5885,9 @@ pub struct ConcernClassMethodSpans {
     pub methods: Vec<Span>,
     pub bridges: Vec<Span>,
     pub has_nested_carrier: bool,
+    /// The subset of `methods` a `class_methods do` block defines: the
+    /// instance methods of the `ClassMethods` module the block builds.
+    pub block_methods: Vec<Span>,
     /// Literal framework identity and calls that require it to be installed.
     /// Finite configuration uses these; factory bridge splicing is unchanged.
     pub concern_extensions: Vec<Span>,
@@ -5962,6 +5965,7 @@ pub fn ingest_concern_class_method_spans(
         let mut spans: Vec<Span> = Vec::new();
         let mut bridges: Vec<Span> = Vec::new();
         let mut has_nested_carrier = false;
+        let mut block_methods: Vec<Span> = Vec::new();
         let in_concerning = concerning.is_some();
         let mut concern_extensions: Vec<Span> = concerning.into_iter().collect();
         let mut concern_calls = Vec::new();
@@ -6036,7 +6040,9 @@ pub fn ingest_concern_class_method_spans(
                     && constant_id_str(&call.name()) == "class_methods"
                 {
                     if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                        let before = spans.len();
                         defs_in(block.body(), file, &mut spans);
+                        block_methods.extend_from_slice(&spans[before..]);
                     }
                 }
                 // `included do def self.x … end end` is class_eval'd on
@@ -6082,6 +6088,7 @@ pub fn ingest_concern_class_method_spans(
                 methods: spans,
                 bridges,
                 has_nested_carrier,
+                block_methods,
                 concern_extensions,
                 concern_calls,
                 concern_call_modules,

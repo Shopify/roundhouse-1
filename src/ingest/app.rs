@@ -4727,6 +4727,13 @@ fn splice_concern_class_methods_into_includers(
     use crate::ident::{ClassId, Symbol};
     use crate::det::{HashMap, HashSet};
 
+    // A Concern's `class_methods do` builds its `ClassMethods` module,
+    // which the Ruby emit writes (`App::class_methods_blocks`).
+    let mut blocks: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::default();
+    for c in carriers.iter().filter(|c| !c.concern_extensions.is_empty() && !c.block_methods.is_empty()) {
+        blocks.entry(c.owner.clone()).or_default().extend(c.block_methods.iter().copied());
+    }
+    app.class_methods_blocks = blocks;
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
@@ -4741,8 +4748,14 @@ fn splice_concern_class_methods_into_includers(
     // if the module's authored `included` hook extends it.
     let concerns: HashSet<&ClassId> = carriers.iter()
         .filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
-    // The defs of each owner's nested `module ClassMethods`, by identity.
+    // The defs of each owner's nested `module ClassMethods`, by identity,
+    // and those of the one a Concern's `class_methods do` builds.
     let mut carrier_defs: HashMap<ClassId, HashSet<crate::span::Span>> = HashMap::default();
+    for (owner, spans) in &app.class_methods_blocks {
+        if class_side.contains_key(owner) {
+            carrier_defs.entry(owner.clone()).or_default().extend(spans.iter().copied());
+        }
+    }
     for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
         let Some(owner) = crate::app::class_methods_carrier_owner(&lc.name) else { continue };
         if !class_side.contains_key(&owner) {
@@ -5090,6 +5103,11 @@ fn drop_class_methods_block_mixes_in(app: &mut App, carriers: &[ConcernClassMeth
         .map(|c| &c.owner)
         .collect();
     for lc in app.library_classes.iter_mut().filter(|lc| lc.is_module && block_carriers.contains(&lc.name)) {
+        // The Ruby emit writes the `ClassMethods` a `class_methods do`
+        // builds (`App::class_methods_blocks`), so the call stands.
+        if app.class_methods_blocks.contains_key(&lc.name) {
+            continue;
+        }
         let own = format!("{}::ClassMethods", lc.name.0.as_str());
         if defined.contains(&own) {
             continue;
