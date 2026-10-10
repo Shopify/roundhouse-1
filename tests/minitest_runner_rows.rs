@@ -210,6 +210,44 @@ end
     assert!(backtrace.last().unwrap().contains("block in RoundhouseTestRunner.run_one"), "{x:#}");
 }
 
+/// Minitest::Test#capture_exceptions, which Core's teardowns wrap a reset
+/// in (PaymentMethod::DirectTest's Magellan reset, ElasticSearchTestHelper's
+/// teardown callback): each failure, error or skip in the block is
+/// recorded on the result in the phase it ran in, and the caller goes on,
+/// as Minitest's `failures <<` does.
+#[test]
+fn capture_exceptions_records_and_continues_as_minitest_does() {
+    let source = r#"
+class RunnerContractTest < ActiveSupport::TestCase
+  def teardown
+    capture_exceptions { raise ArgumentError, "teardown boom" }
+    super
+  end
+
+  test "captures and goes on" do
+    capture_exceptions { assert_equal 1, 2 }
+    capture_exceptions { raise KeyError, "body boom" }
+    assert true
+  end
+end
+"#;
+    let (emitted, errors) = app(source).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (rows, log) = emitted_rows(&emitted);
+    let row = &rows[0];
+    assert_eq!(row["status"], "error", "{log}");
+    assert_eq!(row["assertions"], 2, "{log}");
+    let found: Vec<(String, String, String)> = row["exceptions"].as_array().unwrap().iter()
+        .map(|x| (x["phase"].as_str().unwrap().into(), x["status"].as_str().unwrap().into(), x["class"].as_str().unwrap().into()))
+        .collect();
+    let expected: Vec<(String, String, String)> = [
+        ("test", "fail", "Minitest::Assertion"),
+        ("test", "error", "KeyError"),
+        ("teardown", "error", "ArgumentError"),
+    ].iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string())).collect();
+    assert_eq!(found, expected, "{log}");
+}
+
 /// Core's Gemfile names rack-test in :test, and the app's Bundler.require
 /// loads it before test_helper.rb. The gem's class stands, and a
 /// controller reached through the in-process dispatch gets the

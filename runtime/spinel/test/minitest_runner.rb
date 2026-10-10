@@ -152,6 +152,14 @@ module RoundhouseMinitestAssertions
   def skipped?
     failure&.fetch("status") == "skip"
   end
+
+  # Minitest::Test#capture_exceptions: the block's assertion failure,
+  # skip or error is recorded on the test's result, as Minitest's
+  # `failures <<` does, and the caller continues (a teardown step after
+  # it still runs). The row names the phase the runner is in.
+  def capture_exceptions(&block)
+    RoundhouseTestRunner.capture(@__roundhouse_errors ||= [], RoundhouseTestRunner.phase || "test", &block)
+  end
 end
 
 # ---- ActiveSupport::Testing::Assertions (ActiveSupport 8.2) ---------
@@ -1168,8 +1176,20 @@ module RoundhouseTestRunner
   TREE = File.expand_path("..", __dir__)
   BACKTRACE_FRAMES = 12
 
+  # The phase whose `capture` is running, for Minitest's
+  # capture_exceptions inside it.
+  def self.phase
+    Thread.current[:roundhouse_test_phase]
+  end
+
   def self.capture(errors, phase)
-    yield
+    outer = Thread.current[:roundhouse_test_phase]
+    Thread.current[:roundhouse_test_phase] = phase
+    begin
+      yield
+    ensure
+      Thread.current[:roundhouse_test_phase] = outer
+    end
   rescue NoMemoryError, SignalException, SystemExit
     raise
   rescue Exception => error
