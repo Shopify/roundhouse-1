@@ -364,6 +364,7 @@ pub(in crate::analyze) fn register(
         // by both Request twins), with that port's surface.
         let mut headers = ClassInfo::default();
         headers.instance_methods.insert(Symbol::from("[]"), Ty::Untyped);
+        headers.instance_methods.insert(Symbol::from("[]="), Ty::Untyped);
         headers.instance_methods.insert(Symbol::from("fetch"), Ty::Untyped);
         headers.instance_methods.insert(Symbol::from("key?"), Ty::Bool);
         headers.instance_methods.insert(Symbol::from("include?"), Ty::Bool);

@@ -111,6 +111,10 @@ show("ad remote_addr= fresh", ActionDispatch::TestRequest.create.tap { |q| q.rem
 show("ad user_agent=", r.user_agent)
 show("ad headers", %w[HTTP_IF_NONE_MATCH HTTP_IF_MODIFIED_SINCE REQUEST_URI SERVER_PORT HTTP_ACCEPT].map { |k| r.get_header(k) })
 show("ad headers[]", r.headers["Accept"])
+r.headers["X-Ip-Metadata"] = "countryCode:CA"
+r.headers["HTTP_X_RAW"] = "raw"
+r.headers["Content-Type"] = "text/plain"
+show("ad headers[]=", %w[HTTP_X_IP_METADATA HTTP_X_RAW CONTENT_TYPE].map { |k| r.get_header(k) })
 show("ad bad method", outcome { r.request_method = "BREW" })
 show("ad method after bad", r.request_method)
 r.path_parameters = { shop_route_locale: "en" }

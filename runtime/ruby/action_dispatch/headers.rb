@@ -31,6 +31,12 @@ module ActionDispatch
         @env[Headers.env_name(key)]
       end
 
+      # Rails' writer: the env under the header's name. Core's synthetic
+      # storefront request sets `Accept` and `Sec-Fetch-Dest` this way.
+      def []=(key, value)
+        @env[Headers.env_name(key)] = value
+      end
+
       def key?(key)
         @env.key?(Headers.env_name(key))
       end

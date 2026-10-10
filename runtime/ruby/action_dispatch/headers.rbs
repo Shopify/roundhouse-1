@@ -8,6 +8,7 @@ module ActionDispatch
 
       def initialize: (Hash[String, untyped] env) -> void
       def []: (String | Symbol key) -> untyped
+      def []=: (String | Symbol key, untyped value) -> untyped
       def key?: (String | Symbol key) -> bool
       def include?: (String | Symbol key) -> bool
       def fetch: (String | Symbol key, *untyped defaults) -> untyped
