@@ -2465,7 +2465,28 @@ impl<'a> BodyTyper<'a> {
                 unknown()
             }
 
-            ExprNode::Defined { .. } => union_of(Ty::Str, Ty::Nil),
+            ExprNode::Defined { operand } => {
+                // `defined?(IdentityClient)` of a constant refused as
+                // gem_requires_rails: every read of it raises by name, so
+                // this tree runs without the gem, and the guard answers
+                // nil as it does where the gem is not loaded (Core's
+                // `return unless defined?(IdentityClient)`). A native
+                // `require` that raised part way through the gem can
+                // otherwise leave its module defined. The operand is
+                // typed on a copy; the node itself is never rewritten
+                // otherwise.
+                let refused = matches!(&*operand.node, ExprNode::Const { .. }) && {
+                    let mut probe = operand.clone();
+                    self.analyze_expr(&mut probe, ctx);
+                    matches!(&probe.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+                        if construct.as_str() == "gem_requires_rails")
+                };
+                if refused {
+                    *expr.node = ExprNode::Lit { value: Literal::Nil };
+                    return Ty::Nil;
+                }
+                union_of(Ty::Str, Ty::Nil)
+            }
 
             ExprNode::Send { recv, method, args, block, parenthesized } => {
                 if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
