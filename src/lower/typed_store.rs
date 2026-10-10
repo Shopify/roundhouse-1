@@ -205,7 +205,11 @@ fn local_value(value: &Expr, locals: &[(Symbol, Expr)]) -> Option<Expr> {
 /// dance), and so must a name an earlier synthesizer claimed (schema
 /// column accessors). Signatures come from the declared attribute type
 /// (`typed_store_ty`), matching the analyzer's dispatch registration.
-pub(crate) fn push_typed_store_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+pub(crate) fn push_typed_store_methods(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    demanded: &crate::det::HashSet<Symbol>,
+) {
     let stores = typed_store_decls(&model.body);
     for (col, attrs) in &stores {
         push_store_hash_methods(methods, model, col, attrs);
@@ -298,7 +302,56 @@ pub(crate) fn push_typed_store_methods(methods: &mut Vec<MethodDef>, model: &Mod
                 AccessorKind::Method,
                 true,
             );
+            push_dirty_methods(methods, model, col, a, demanded);
         }
+    }
+}
+
+/// The store accessor's dirty readers Rails' `store_accessor` defines
+/// (the typed_store gem declares its attributes through it), over the
+/// column's pending change: `<name>_changed?` when the key's value
+/// before the change differs from its value now (Core's
+/// `Shop#sanitize_analytics_account` asks `analytics_account_changed?`),
+/// and `<name>_was`, the value before it. DEMAND-GATED as the column's
+/// pending-change readers are (`model_to_library::schema`): only a name
+/// some model body sends.
+fn push_dirty_methods(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    col: &Symbol,
+    a: &TypedStoreAttr,
+    demanded: &crate::det::HashSet<Symbol>,
+) {
+    let was = || {
+        let previous = sp_expr(ExprNode::Send {
+            recv: None,
+            method: Symbol::from("attribute_was"),
+            args: vec![str_lit(col.as_str())],
+            block: None,
+            parenthesized: true,
+        });
+        let mut read = read_body(col, a);
+        if let ExprNode::Send { args, .. } = &mut *read.node {
+            args[0] = previous;
+        }
+        read
+    };
+    let changed = Symbol::from(format!("{}_changed?", a.name.as_str()));
+    if demanded.contains(&changed) {
+        let body = sp_expr(ExprNode::Send {
+            recv: Some(was()),
+            method: Symbol::from("!="),
+            args: vec![read_body(col, a)],
+            block: None,
+            parenthesized: false,
+        });
+        let sig = Some(super::model_to_library::fn_sig(vec![], Ty::Bool));
+        push_synth_instance_method(methods, model, changed, Vec::new(), body, sig, AccessorKind::Method, false);
+    }
+    let was_name = Symbol::from(format!("{}_was", a.name.as_str()));
+    if demanded.contains(&was_name) {
+        let sig = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
+        push_synth_instance_method(methods, model, was_name, Vec::new(), was(), sig, AccessorKind::Method, false);
     }
 }
 

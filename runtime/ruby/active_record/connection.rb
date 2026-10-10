@@ -1795,6 +1795,13 @@ module ActiveRecord
       @validation_context
     end
 
+    # ActiveModel::Validations#validates_with: run the validators on
+    # this record now (a validate method calling it, as Core's
+    # RuntimeValidations#instance_validator does).
+    def validates_with(*args, &block)
+      ActiveRecord::RuntimeValidations.instance_validates_with(self, args, block)
+    end
+
     def save(context: nil)
       before_validation
       ok = valid?(context)
@@ -2277,6 +2284,20 @@ module ActiveRecord
           validators[nil] << validator
         end
         klass.validate(validator, options)
+      end
+      nil
+    end
+
+    # ActiveModel::Validations#validates_with.
+    def self.instance_validates_with(record, args, block)
+      record = record #: untyped
+      classes = args.dup #: Array[untyped]
+      block = block #: untyped
+      options = extract_options!(classes)
+      options[:class] = record.class
+      classes.each do |validator_class|
+        validator = validator_class.new(options.dup, &block)
+        validator.validate(record)
       end
       nil
     end

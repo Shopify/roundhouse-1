@@ -119,3 +119,43 @@ raise "initializer not applied" unless Rating::High.serialize == "critical"
         }
     }
 }
+
+/// A class-method override of a sorbet method that calls `super`
+/// (Core's `Customers::ValueObjects::CustomerOrigin.try_deserialize`)
+/// reaches sorbet's own lookup, and the methods built on it
+/// (`from_serialized`) dispatch to the override.
+#[test]
+fn an_override_calling_super_reaches_the_sorbet_method() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/origin.rb",
+            r#"class Origin < T::Enum
+  enums do
+    Api = new("api")
+    Unknown = new("unknown")
+  end
+
+  class << self
+    def try_deserialize(value)
+      value = value&.downcase
+      value = "api" if ["merchant", "pos"].include?(value)
+      super(value)
+    end
+
+    def has_serialized?(value)
+      super || value == "legacy"
+    end
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"raise "override lost" unless Origin.try_deserialize("POS").equal?(Origin::Api)
+raise "lookup lost" unless Origin.try_deserialize("unknown").equal?(Origin::Unknown)
+raise "nil lost" unless Origin.try_deserialize("nope").nil?
+raise "from_serialized skips override" unless Origin.from_serialized("Merchant").equal?(Origin::Api)
+raise "bare super lost" unless Origin.has_serialized?("api") && Origin.has_serialized?("legacy") && !Origin.has_serialized?("x")
+"#,
+        )
+        .assert_passes();
+}

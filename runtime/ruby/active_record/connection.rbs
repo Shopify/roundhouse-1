@@ -182,6 +182,7 @@ module ActiveRecord
     def update_attribute: (Symbol name, untyped value) -> bool
     def valid?: (?Symbol? context) -> bool
     def validation_context: () -> Symbol?
+    def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool
     def save!: (?context: Symbol?) -> Base
     # Ruby-family overrides of base.rb's dirty-tracking stubs.
@@ -232,6 +233,7 @@ module ActiveRecord
     def self.validate: (untyped klass, Array[untyped] args, untyped block) -> nil
     def self.validates: (untyped klass, Array[untyped] attributes, bool strict) -> nil
     def self.validates_with: (untyped klass, Array[untyped] args, untyped block) -> nil
+    def self.instance_validates_with: (untyped record, Array[untyped] args, untyped block) -> nil
     def self.validates_each: (untyped klass, Array[untyped] attr_names, untyped block) -> nil
     def self.helper: (untyped klass, String name, Array[untyped] attr_names) -> nil
     def self.validator_class: (untyped klass, String name) -> untyped

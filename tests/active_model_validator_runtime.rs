@@ -227,3 +227,43 @@ fn app_locale_data_keeps_error_types_from_baking() {
     let body = format!("{:?}", validator.methods);
     assert!(!body.contains("is invalid") && !body.contains("can't be blank"), "a default was baked: {body}");
 }
+
+/// `validates_with` called on an INSTANCE, as Core's
+/// `RuntimeValidations#instance_validator` does from a `validate`
+/// method: ActiveModel::Validations#validates_with builds each
+/// validator with the options (and `class:` the record's class) and
+/// runs it on this record now.
+#[test]
+fn instance_validates_with_runs_the_validator_on_the_record() {
+    let run = emit_and_run::empty_app()
+        .write("db/schema.rb", SCHEMA)
+        .write("app/models/application_record.rb", APPLICATION_RECORD)
+        .write(
+            "app/models/shop.rb",
+            r#"class Shop < ApplicationRecord
+  validate :instance_validator
+
+  def instance_validator
+    validates_with(DomainSuffixValidator, suffix: ".example")
+  end
+end
+"#,
+        )
+        .write(
+            "app/validators/domain_suffix_validator.rb",
+            r#"class DomainSuffixValidator < ActiveModel::Validator
+  def validate(record)
+    return if record.domain.to_s.end_with?(options[:suffix])
+    record.errors.add(:domain, "must end with #{options[:suffix]} (#{options.key?(:class)})")
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"p [Shop.new(domain: "a.test").valid?, Shop.new(domain: "a.test").tap(&:valid?).errors.to_a]
+p Shop.new(domain: "a.example").valid?
+"#,
+        );
+    run.assert_passes();
+    assert_eq!(run.stdout, "[false, [\"Domain must end with .example (false)\"]]\ntrue\n");
+}
