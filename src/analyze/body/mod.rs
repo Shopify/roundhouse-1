@@ -1836,6 +1836,18 @@ impl<'a> BodyTyper<'a> {
                     }
                     _ => ty,
                 };
+                // Off the PostgreSQL tree the registry's HashConfig is only
+                // the Db shim `connection_db_config` mints
+                // (runtime/spinel/active_record_db_config.rb), not Rails'
+                // class: a written reference stays a named gap.
+                let ty = if indexed_source
+                    && !self.carries_postgresql_base()
+                    && written_class_id(path).0.as_str() == "ActiveRecord::DatabaseConfigurations::HashConfig"
+                {
+                    unknown()
+                } else {
+                    ty
+                };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     // A stored class-body local is reported by the name the
                     // source wrote, not the hidden constant's.

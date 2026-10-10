@@ -4471,8 +4471,8 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // must NOT flip class-side wholesale (actions are instance
         // methods; the class-side clone for the marked helpers comes
         // from the controller lowering itself).
-        let is_helper_module = helper_modules.contains(&lc.name)
-            && !app.controllers.iter().any(|c| c.name == lc.name);
+        let is_controller = app.controllers.iter().any(|c| c.name == lc.name);
+        let is_helper_module = helper_modules.contains(&lc.name) && !is_controller;
         // Helper and view module functions have no controller context —
         // a bare `request` read there resolves to the per-dispatch
         // `ActionController::Current.request` (controllers keep their
@@ -4602,6 +4602,9 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             // to params but not to real self-dispatched methods.
             let own_params: crate::det::HashSet<Symbol> =
                 m.params.iter().map(|p| p.name.clone()).collect();
+            if is_controller && !own_instance_side.contains(&Symbol::from("helpers")) {
+                rewrite_controller_helpers_proxy(&mut m.body, &app.helper_method_index);
+            }
             rewrite_helper_calls(
                 &mut m.body,
                 if singleton_side { &no_helpers } else { class_index },
@@ -5451,6 +5454,32 @@ fn is_rails_url_helpers(node: &ExprNode) -> bool {
         if path.last().map(|s| s.as_str() == "Rails").unwrap_or(false))
 }
 
+/// `helpers.<m>(args)` → `<AppHelper>.<m>(args)` when `index` names an
+/// app helper defining `m`, else `ActionView::ViewHelpers.<m>(args)`.
+/// Only the receiver-less `helpers` reader is matched.
+fn qualify_helpers_proxy(expr: &mut Expr, index: &HashMap<Symbol, ClassId>) {
+    let ExprNode::Send { recv: Some(r), method, .. } = &mut *expr.node else { return };
+    let bare_helpers = matches!(&*r.node,
+        ExprNode::Send { recv: None, method: h, args, block: None, .. }
+            if h.as_str() == "helpers" && args.is_empty());
+    if bare_helpers {
+        let path = match index.get(method) {
+            Some(module) => module.0.as_str().split("::").map(Symbol::from).collect(),
+            None => view_helpers_path(),
+        };
+        *r.node = ExprNode::Const { path };
+    }
+}
+
+/// `helpers.<m>(args)` throughout a controller body. Rails' controller
+/// view context includes every app helper (`helper :all`), not only the
+/// modules the controller itself includes, so the whole index answers.
+fn rewrite_controller_helpers_proxy(expr: &mut Expr, index: &HashMap<Symbol, ClassId>) {
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_controller_helpers_proxy(c, index));
+    qualify_helpers_proxy(expr, index);
+}
+
 fn view_helpers_path() -> Vec<Symbol> {
     vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")]
 }
@@ -5745,19 +5774,10 @@ fn rewrite_helper_calls(
     // Case 1b: a controller's own `helpers.<m>(…)` — Rails' view-context
     // proxy (campfire's `helpers.dom_id(@boost.message, :boosts)`). An
     // app helper resolves to its module, anything else to ViewHelpers.
+    // (A controller's calls were already qualified against every helper
+    // by `rewrite_controller_helpers_proxy`.)
     if !own_methods.contains(&Symbol::from("helpers")) {
-        if let ExprNode::Send { recv: Some(r), method, .. } = &mut *expr.node {
-            let bare_helpers = matches!(&*r.node,
-                ExprNode::Send { recv: None, method: h, args, block: None, .. }
-                    if h.as_str() == "helpers" && args.is_empty());
-            if bare_helpers {
-                let path = match index.get(method) {
-                    Some(module) => module.0.as_str().split("::").map(Symbol::from).collect(),
-                    None => view_helpers_path(),
-                };
-                *r.node = ExprNode::Const { path };
-            }
-        }
+        qualify_helpers_proxy(expr, index);
     }
 
     // Case 2: collapse `Rails.application.routes.url_helpers` to RouteHelpers.

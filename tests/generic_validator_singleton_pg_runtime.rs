@@ -18,7 +18,8 @@
 //!   `BusinessCustomers::CompanyMetafieldOwner` includes
 //!   `::Metafields::Owners::AbstractOwner` so). The rooted path named no
 //!   app module once joined with its root, and the emitter dropped the
-//!   `extend` it lowers to (src/emit/ruby/library.rs, resolve_app_module).
+//!   include (src/emit/ruby/library.rs, resolve_app_module). It is kept
+//!   as `class << self; include`, so `included` fires as in the source.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -336,9 +337,17 @@ fn generic_validator_and_singleton_include_emit_as_ruby_loads_them() {
     assert!(!line.contains("Shipping/"), "{line}");
 
     let owner = read("app/models/biz/company_owner.rb");
-    assert!(owner.contains("extend ::Metafields::Owners::AbstractOwner"), "{owner}");
+    // The source's `class << self; include` is kept as written, so the
+    // module's `included` (not `extended`) hook fires on the singleton.
+    assert!(
+        owner.contains("class << self\n      include ::Metafields::Owners::AbstractOwner"),
+        "{owner}"
+    );
     let module_owner = read("app/models/biz/module_owner.rb");
-    assert!(module_owner.contains("extend Metafields::Owners::AbstractOwner"), "{module_owner}");
+    assert!(
+        module_owner.contains("class << self\n      include Metafields::Owners::AbstractOwner"),
+        "{module_owner}"
+    );
 }
 
 /// The same app natively, on Rails 8.2 and sorbet-runtime, and emitted.
