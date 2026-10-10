@@ -159,6 +159,13 @@ module ActiveRecord
       out
     end
 
+    # Rails' `scope_for_create`: the equality-only `where_values_hash`
+    # (IN lists left out, as in Rails). `create_with` is not supported,
+    # so there are no extra values to merge.
+    def scope_for_create
+      where_values_hash
+    end
+
     # Rails' `Relation#unscoped`: the model's relation with nothing
     # applied, its default scope included.
     def unscoped

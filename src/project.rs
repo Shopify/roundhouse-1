@@ -3735,14 +3735,17 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_support_file_store.rb: {e}"))?,
         ));
     }
-    // ActiveSupport::FileUpdateChecker and ActiveSupport::Benchmark
-    // (8.2.0.alpha file_update_checker.rb, benchmark.rb), each where app
-    // code names it (Core's developer dashboard, its Trilogy connection
-    // timing); tests/active_support_utilities_runtime.rb holds them to
-    // native ActiveSupport.
+    // ActiveSupport::FileUpdateChecker, ActiveSupport::Benchmark and
+    // ActiveSupport::ConfigurationFile (8.2.0.alpha file_update_checker.rb,
+    // benchmark.rb, configuration_file.rb), each where app code names it
+    // (Core's developer dashboard, its Trilogy connection timing, its
+    // DisconnectedFixtureSet's fixture reads);
+    // tests/active_support_utilities_runtime.rb holds them to native
+    // ActiveSupport.
     let utility_ports: Vec<&str> = [
         ("ActiveSupport::FileUpdateChecker", "active_support_file_update_checker"),
         ("ActiveSupport::Benchmark", "active_support_benchmark"),
+        ("ActiveSupport::ConfigurationFile", "active_support_configuration_file"),
     ]
     .into_iter()
     .filter(|(name, _)| carries_named(&files, &[name]))
@@ -12480,6 +12483,7 @@ fn spinel_files_with_assertions(
                 | "runtime/active_support_file_store.rb"
                 | "runtime/active_support_file_update_checker.rb"
                 | "runtime/active_support_benchmark.rb"
+                | "runtime/active_support_configuration_file.rb"
         )
     });
     files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");

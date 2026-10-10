@@ -1,7 +1,9 @@
 # Native ActiveSupport oracle (the Rails native Core runs; tests/support/
-# rails_oracle.rb) for ActiveSupport::FileUpdateChecker and
-# ActiveSupport::Benchmark against runtime/spinel/active_support_file_update_checker.rb
-# and runtime/spinel/active_support_benchmark.rb. Each mode works in its own
+# rails_oracle.rb) for ActiveSupport::FileUpdateChecker,
+# ActiveSupport::Benchmark and ActiveSupport::ConfigurationFile against
+# runtime/spinel/active_support_file_update_checker.rb,
+# runtime/spinel/active_support_benchmark.rb and
+# runtime/spinel/active_support_configuration_file.rb. Each mode works in its own
 # temporary directory and prints one line per observation, with that
 # directory shown as DIR; `compare` requires them equal.
 #
@@ -10,6 +12,9 @@
 # and extension globs, additions, removals, mtime changes, mtimes in the
 # future, the block and the gem-path filter. Benchmark's is
 # `realtime(unit) { }`: the units Core passes and the default.
+# ConfigurationFile's is `parse(path)` over each fixture file of Core's
+# DisconnectedFixtureSet.load_yaml: plain YAML, ERB, an empty file, a
+# YAML syntax error, a non-breaking space and `context:`.
 require "tmpdir"
 require "fileutils"
 require_relative "support/rails_oracle"
@@ -27,7 +32,7 @@ if ARGV.first == "compare"
     abort "utilities differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and the emitted FileUpdateChecker and Benchmark agree (#{RailsOracle.label})"
+  puts "Native ActiveSupport and the emitted FileUpdateChecker, Benchmark and ConfigurationFile agree (#{RailsOracle.label})"
   exit
 end
 
@@ -36,9 +41,11 @@ if ARGV.first == "native"
   require "active_support"
   require "active_support/file_update_checker"
   require "active_support/benchmark"
+  require "active_support/configuration_file"
 else
   require_relative "../runtime/spinel/active_support_file_update_checker"
   require_relative "../runtime/spinel/active_support_benchmark"
+  require_relative "../runtime/spinel/active_support_configuration_file"
 end
 
 ROOT = Dir.mktmpdir("rh-as-utilities-")
@@ -134,3 +141,36 @@ show "nanosecond", ActiveSupport::Benchmark.realtime(:nanosecond) { }.class
 show "no block", outcome { ActiveSupport::Benchmark.realtime }
 show "bad unit", outcome { ActiveSupport::Benchmark.realtime(:fortnight) { } }
 show "block value discarded", ActiveSupport::Benchmark.realtime { :ignored }.is_a?(Float)
+
+fixtures = File.join(ROOT, "components/widgets/test/fixtures/shard_0")
+FileUtils.mkdir_p(fixtures)
+yml = File.join(fixtures, "shops.yml")
+File.write(yml, "_fixture:\n  ignore: DEFAULTS\nDEFAULTS: &DEFAULTS\n  plan: basic\nsnowdevil:\n  <<: *DEFAULTS\n  name: Snowdevil\n  created_at: 2005-05-05\n  settings: |+\n    #x\n    ---\n    currency: USD\n")
+erb = File.join(fixtures, "shops.yml.erb")
+File.write(erb, "<% 2.times do |i| %>\nshop_<%= i %>:\n  name: Shop <%= i * 3 %>\n  id: <%= 100 + i %>\n<% end %>\n")
+File.write(File.join(fixtures, "empty.yml"), "")
+File.write(File.join(fixtures, "bad.yml"), "a:\n\tb: 1\n")
+File.write(File.join(fixtures, "nbsp.yml"), "a:\u00A0 1\n")
+File.write(File.join(fixtures, "context.yml.erb"), "who: <%= who %>\n")
+show "configuration plain", outcome { ActiveSupport::ConfigurationFile.parse(yml) }
+show "configuration erb", outcome { ActiveSupport::ConfigurationFile.parse(erb) }
+show "configuration empty", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "empty.yml")) }
+show "configuration syntax error", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "bad.yml")) }
+show "configuration error class", begin
+  ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "bad.yml"))
+rescue => e
+  [e.class.name, e.class.superclass]
+end
+require "stringio"
+saved, $stderr = $stderr, StringIO.new
+begin
+  nbsp = ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "nbsp.yml"))
+  warning = $stderr.string
+ensure
+  $stderr = saved
+end
+show "configuration nbsp", [nbsp, stable(warning)]
+who = "binding"
+show "configuration context", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "context.yml.erb"), context: binding) }
+show "configuration missing", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "missing.yml")) }
+show "configuration symbolize_names", outcome { ActiveSupport::ConfigurationFile.parse(erb, symbolize_names: true) }

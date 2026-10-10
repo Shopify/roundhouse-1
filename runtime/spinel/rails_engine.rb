@@ -29,8 +29,8 @@
 # `config.i18n.railties_load_path`, as Rails' does, where the tree carries
 # I18n::Railtie. The rest are refused when the engine has what they would
 # apply (error[engine_initializer_not_applied]): `add_locales` without
-# I18n::Railtie, `add_view_paths`, `add_mailer_preview_paths`, `add_fixture_paths`,
-# `prepend_helpers_path`.
+# I18n::Railtie, `add_view_paths`, `add_mailer_preview_paths`,
+# `prepend_helpers_path`. `add_fixture_paths` is Rails'.
 #
 # `routes` is Rails': the engine's route set
 # (`config.route_set_class.new_with_config(config)`, ActionDispatch's
@@ -487,9 +487,17 @@ module Rails
       not_applied(:add_mailer_preview_paths, paths["test/mailers/previews"].existent)
     end
 
+    # As Rails': the engine's test/fixtures, carried in its directory in
+    # this tree, joins fixture_paths where ActiveRecord::TestFixtures is
+    # included (runtime/active_record_test_fixtures.rb runs the hook).
+    # Rails.root is "." here; the check is against the tree's root.
     initializer :add_fixture_paths do
+      next if is_a?(Rails::Application)
+
       fixtures = config.root.join("test", "fixtures")
-      not_applied(:add_fixture_paths, fixtures.exist? ? [fixtures.to_s] : [])
+      if fixtures_in_root_and_not_in_vendor_or_dot_dir?(fixtures)
+        ActiveSupport.on_load(:active_record_fixtures) { self.fixture_paths |= ["#{fixtures}/"] }
+      end
     end
 
     initializer :prepend_helpers_path do |app|
@@ -511,6 +519,13 @@ module Rails
     end
 
     private
+      def fixtures_in_root_and_not_in_vendor_or_dot_dir?(fixtures)
+        root = defined?(::RoundhouseAutoload::ROOT) ? File.expand_path("..", ::RoundhouseAutoload::ROOT) : File.expand_path(Rails.root.to_s)
+        fixtures.exist? && fixtures.to_s.start_with?(root) &&
+          !fixtures.to_s.start_with?(File.join(root, "vendor")) &&
+          !fixtures.to_s.start_with?("#{root}/.")
+      end
+
       # What an engine initializer would apply and this tree has no
       # place for: named, by engine and path, when there is any.
       def not_applied(initializer, found)

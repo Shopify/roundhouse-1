@@ -21,7 +21,7 @@ fn file_update_checker_and_benchmark_answer_like_activesupport() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success() && stdout.contains("Native ActiveSupport and the emitted FileUpdateChecker and Benchmark agree"),
+        out.status.success() && stdout.contains("Native ActiveSupport and the emitted FileUpdateChecker, Benchmark and ConfigurationFile agree"),
         "the ports diverged from activesupport\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
     );
     // Not a vacuous agreement: both sides observed the whole script.

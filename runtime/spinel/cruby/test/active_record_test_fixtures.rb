@@ -709,7 +709,7 @@ module ActiveRecord
 
     private_class_method def self.fixtures_included(base)
       base.class_eval do
-        class_attribute :fixture_paths, instance_writer: false, default: [FIXTURE_PATH]
+        class_attribute :fixture_paths, instance_writer: false, default: []
         class_attribute :fixture_table_names, default: TestFixtures.fixture_set_rows.keys.sort
         class_attribute :fixture_class_names, default: {}
         class_attribute :use_transactional_tests, default: true
@@ -722,7 +722,10 @@ module ActiveRecord
       base.extend(ClassMethods)
       # The accessors of `fixtures :all` (fixture_table_names above).
       base.setup_fixture_accessors
+      # Each engine's test/fixtures (its `add_fixture_paths` hook), then
+      # rails/test_help.rb's `[*fixture_paths, "#{Rails.root}/test/fixtures/"].uniq`.
       ActiveSupport.run_load_hooks(:active_record_fixtures, base) if ActiveSupport.respond_to?(:run_load_hooks)
+      base.fixture_paths = base.fixture_paths | [FIXTURE_PATH]
     end
 
     # Generic fixture accessor for fixture names that may conflict with

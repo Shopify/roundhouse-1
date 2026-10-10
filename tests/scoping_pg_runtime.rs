@@ -2,7 +2,9 @@
 //! database: `current_scope` per model class (an STI subclass inherits
 //! its base's), `Relation#scoping` (the block's `Model.all` and finders
 //! start from the scope, nested blocks restore the outer one),
-//! `unscoped` with and without a block, `where_values_hash`, and Core's
+//! `unscoped` with and without a block, `where_values_hash`,
+//! `scope_for_create`, `descends_from_active_record?` and `sti_name`
+//! (DisconnectedFixtureSet.fetch and new_record), and Core's
 //! GlobalDB::ShopRecord shape: an `unscoped` override that reads
 //! `current_scope.where_values_hash` and runs the block under
 //! `relation.scoping(&block)`.
@@ -89,6 +91,7 @@ const PROBE: &str = r##"class ScopingProbe
     Item.unscoped.create!(island: 2, name: "d", live: false)
     out << "outside: #{Item.current_scope.inspect} #{Item.count} #{names(Item.unscoped)} #{names(Item.all)}"
     out << "where_values_hash: #{Item.unscoped.where(name: "a", island: 3).where_values_hash.sort.inspect} #{Item.where(name: nil).where_values_hash.sort.inspect}"
+    out << "scope_for_create: #{Item.where(name: "a").scope_for_create.sort.inspect} #{Item.unscoped.where(island: 3, name: %w[a b]).scope_for_create.sort.inspect}"
     out << Item.where(island: 2).scoping {
       "scoping: #{Item.current_scope.where_values_hash.sort.inspect} #{names(Item.all)} #{Item.count} #{names(Item.unscoped)} #{Item.where(name: "c").count} #{Item.find_by(name: "d").inspect}"
     }
@@ -112,6 +115,7 @@ const PROBE: &str = r##"class ScopingProbe
     out << Note.where(status: "live").scoping {
       "sti: #{Pinned.current_scope.nil?} #{Pinned.current_scope(true).nil?} #{Note.count} #{Pinned.count} #{Pinned.all.map(&:title).sort.join(",")}"
     }
+    out << "descends: #{ActiveRecord::Base.descends_from_active_record?} #{ApplicationRecord.descends_from_active_record?} #{Item.descends_from_active_record?} #{Note.descends_from_active_record?} #{Pinned.descends_from_active_record?} #{Pinned.sti_name}"
     out
   end
 end
@@ -124,15 +128,17 @@ end
 /// (`Pinned.where(..).scoping`). The sti_scope pass re-roots it onto
 /// the base (`Relation.new(Note).where(type: "Pinned")`), so the scope
 /// lands on Note, where Rails sets it on Pinned alone.
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 10] = [
     "outside: nil 2 a,b a,c",
     r#"where_values_hash: [["island", 3], ["name", "a"]] [["live", true], ["name", nil]]"#,
+    r#"scope_for_create: [["live", true], ["name", "a"]] [["island", 3]]"#,
     r#"scoping: [["island", 2], ["live", true]] c 1 c,d 1 nil"#,
     r#"unscoped block: [["island", 1]] 2 a,b b"#,
     r#"nested: 2 c,d 1 [["island", 2], ["live", true]]"#,
     "after: nil 2",
     "raised: nil",
     "sti: false true 2 1 p",
+    "descends: false true true true false Pinned",
 ];
 
 /// What native Rails requires, in order.

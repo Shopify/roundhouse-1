@@ -1188,6 +1188,22 @@ module ActiveRecord
         __rh_load_schema[:content_columns]
       end
 
+      # inheritance.rb's descends_from_active_record? and sti_name
+      # (`store_full_sti_class` is Rails' default true, not modeled).
+      def descends_from_active_record?
+        if self == Base
+          false
+        elsif superclass.abstract_class?
+          superclass.descends_from_active_record?
+        else
+          superclass == Base || !columns_hash.include?(inheritance_column)
+        end
+      end
+
+      def sti_name
+        store_full_class_name ? name : name.demodulize
+      end
+
       def column_for_attribute(name)
         name = name.to_s
         columns_hash.fetch(name) do
@@ -1415,6 +1431,17 @@ module ActiveRecord
         !READ_QUERY.match?(sql)
       rescue ArgumentError # Invalid encoding
         !READ_QUERY.match?(sql.b)
+      end
+
+      # abstract/database_statements.rb: a fixture's Hash or Array value
+      # goes in as YAML (Core's DisconnectedFixtureSet.fetch calls it).
+      def with_yaml_fallback(value) # :nodoc:
+        if value.is_a?(Hash) || value.is_a?(Array)
+          require "yaml"
+          YAML.dump(value)
+        else
+          value
+        end
       end
     end
 
