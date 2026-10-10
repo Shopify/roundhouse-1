@@ -6,7 +6,8 @@
 # zones.rb, core_ext/date_and_time/zones.rb, core_ext/date/zones.rb,
 # core_ext/string/zones.rb, core_ext/object/acts_like.rb and the
 # acts_like files, core_ext/time/conversions.rb's Time#to_fs and
-# #formatted_offset, and the parts of core_ext/time/calculations.rb,
+# #formatted_offset, date_formats.rb with Date's and DateTime's #to_fs and #inspect,
+# String#to_date and #to_datetime, and the parts of core_ext/time/calculations.rb,
 # core_ext/date_time/calculations.rb, core_ext/date/calculations.rb,
 # core_ext/date/conversions.rb, core_ext/date_and_time/calculations.rb
 # and core_ext/string/conversions.rb that TimeWithZone calls), verbatim
@@ -700,8 +701,86 @@ class DateTime
   end
 end
 
-# core_ext/string/zones.rb, over String#to_time (core_ext/string/
-# conversions.rb).
+# date_formats.rb, and Date#to_fs and #inspect (core_ext/date/
+# conversions.rb) and DateTime's, with its #formatted_offset (core_ext/
+# date_time/conversions.rb).
+module ActiveSupport
+  module DateFormats
+    @list = {
+      short: "%d %b",
+      long: "%B %d, %Y",
+      db: "%Y-%m-%d",
+      inspect: "%Y-%m-%d",
+      number: "%Y%m%d",
+      long_ordinal: lambda { |date|
+        day_format = ActiveSupport::Inflector.ordinalize(date.day)
+        date.strftime("%B #{day_format}, %Y")
+      },
+      rfc822: "%d %b %Y",
+      rfc2822: "%d %b %Y",
+      iso8601: lambda { |date| date.iso8601 }
+    }.freeze
+
+    singleton_class.attr_reader :list # :nodoc:
+
+    DEPRECATED_LIST = @list.dup # :nodoc:
+
+    def self.lookup(format) # :nodoc:
+      @list[format] || DEPRECATED_LIST[format]
+    end
+
+    def self.register(name, format)
+      @list = @list.merge(name => format).freeze
+    end
+  end
+end
+
+class Date
+  def to_fs(format = :default)
+    if formatter = ActiveSupport::DateFormats.lookup(format)
+      if formatter.respond_to?(:call)
+        formatter.call(self).to_s
+      else
+        strftime(formatter)
+      end
+    else
+      to_s
+    end
+  end
+  alias_method :to_formatted_s, :to_fs
+
+  def readable_inspect
+    strftime("%a, %d %b %Y")
+  end
+  alias_method :default_inspect, :inspect
+  alias_method :inspect, :readable_inspect
+end
+
+class DateTime
+  def to_fs(format = :default)
+    if formatter = ::ActiveSupport::TimeFormats.lookup(format)
+      formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
+    else
+      to_s
+    end
+  end
+  alias_method :to_formatted_s, :to_fs
+
+  def formatted_offset(colon = true, alternate_utc_string = nil)
+    utc? && alternate_utc_string || ActiveSupport::TimeZone.seconds_to_utc_offset(utc_offset, colon)
+  end
+
+  def readable_inspect
+    to_fs(:rfc822)
+  end
+  alias_method :default_inspect, :inspect
+  alias_method :inspect, :readable_inspect
+end
+
+# core_ext/string/zones.rb, over String#to_time, #to_date and
+# #to_datetime (core_ext/string/conversions.rb). `blank?` is String's
+# (core_ext/object/blank.rb: whitespace only), spelled out because the
+# tree's Object#blank? reads `empty?`.
 class String
   def to_time(form = :local)
     parts = Date._parse(self, false)
@@ -719,8 +798,16 @@ class String
       parts.fetch(:offset, form == :utc ? 0 : nil)
     )
 
-    form == :utc ? time.utc : time.to_time
-  end
+  form == :utc ? time.utc : time.to_time
+end
+
+def to_date
+  ::Date.parse(self, false) unless match?(/\A[[:space:]]*\z/)
+end
+
+def to_datetime
+  ::DateTime.parse(self, false) unless match?(/\A[[:space:]]*\z/)
+end
 
   def in_time_zone(zone = ::Time.zone)
     if zone

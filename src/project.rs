@@ -5517,6 +5517,10 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         calls: &[
             "ActiveSupport::TimeZone", "ActiveSupport::TimeWithZone", "Time.zone", ".zone=", ".use_zone", ".zone_default",
             ".in_time_zone", "ActiveSupport.use_zone", "ActiveSupport.in_time_zone",
+            // Left as calls on this tree (lower::time_current, lower::time_calendar)
+            // and answered by the port, as are String#to_time/#to_date/#to_datetime.
+            "Time.current", "Date.current", "DateTime.current", ".to_fs", ".to_formatted_s", ".rfc2822", ".rfc822",
+            ".to_time", ".to_date", ".to_datetime",
         ],
         at_require_rails: false,
     },

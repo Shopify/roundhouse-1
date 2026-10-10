@@ -2,6 +2,14 @@
 // dispatch one): each extension grounds to a function in
 // runtime/ruby/active_support_ext.rb (Time) or the date-gated
 // runtime/spinel/active_support_date_parsing.rb (`date_*` family).
+//
+// The PostgreSQL CRuby tree (`zone_port`) ports Rails' own zones
+// (runtime/spinel/active_support_time_with_zone.rb), so there
+// `in_time_zone` on a Time or Date and `Time.zone.today` / `yesterday` /
+// `tomorrow` stay the calls they are: `Date#in_time_zone(zone)` is
+// midnight in `zone` (the grounding takes midnight in Time.zone and
+// converts it), and `Time.zone.today` is a Date (the grounding answers
+// a Time at midnight).
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
@@ -9,18 +17,19 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 pub fn apply_time_calendar_grounding(app: &mut App) {
-    super::for_each_hook_body(app, &mut rewrite);
+    let zone_port = super::time_current::carries_zone_port(app);
+    super::for_each_hook_body(app, &mut |e| rewrite(e, zone_port));
     for view in &mut app.views {
-        rewrite(&mut view.body);
+        rewrite(&mut view.body, zone_port);
     }
 }
 
-fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
-    rewrite_node(expr);
+fn rewrite(expr: &mut Expr, zone_port: bool) {
+    expr.node.for_each_child_mut(&mut |e| rewrite(e, zone_port));
+    rewrite_node(expr, zone_port);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr) {
+pub(crate) fn rewrite_node(expr: &mut Expr, zone_port: bool) {
     if let ExprNode::Send { recv: Some(r), method, .. } = &mut *expr.node {
         if is_time_const(r) && method.as_str() == "use_zone" {
             *r = Expr::new(r.span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
@@ -37,7 +46,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     else {
         return;
     };
-    if is_time_zone_send(r) && args.is_empty() {
+    if is_time_zone_send(r) && args.is_empty() && !(zone_port && method.as_str() != "now") {
         let today = || time_expr(active_support_call("beginning_of_day", vec![now()]));
         let grounded = match method.as_str() {
             "now" => active_support_call("now", vec![]),
@@ -78,6 +87,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         return;
     }
     if is_date_value(r) {
+        if zone_port && method.as_str() == "in_time_zone" {
+            return;
+        }
         let recv = r.clone();
         let method_name = method.as_str().to_string();
         let call_args = args.to_vec();
@@ -87,7 +99,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     if !is_time_value(r) {
         return;
     }
-    if method.as_str() == "in_time_zone" && args.len() <= 1 {
+    if method.as_str() == "in_time_zone" && args.len() <= 1 && !zone_port {
         let grounded = match args.first() {
             Some(zone) => active_support_call("in_time_zone", vec![r.clone(), zone.clone()]),
             None => active_support_call("present", vec![r.clone()]),

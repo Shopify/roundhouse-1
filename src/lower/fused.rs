@@ -33,13 +33,14 @@ pub fn apply_fused_independent_rewrites(app: &mut App) -> Vec<crate::diagnostic:
     let skip_including = super::including::app_defines_including(app);
     let skip_full_messages = super::errors_full_messages::app_defines_full_messages(app);
     let port = super::active_model_model::ValidationsPort::of(app);
+    let zone_port = super::time_current::carries_zone_port(app);
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let locals = port.locals(body);
         let site = (&port, owner, &locals);
         let full_messages = (!skip_full_messages).then_some(&site);
         walk_postorder(body, &mut |e| {
-            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, full_messages);
+            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, full_messages, zone_port);
         });
     });
     for view in &mut app.views {
@@ -47,7 +48,7 @@ pub fn apply_fused_independent_rewrites(app: &mut App) -> Vec<crate::diagnostic:
         let site = (&port, None, &locals);
         let full_messages = (!skip_full_messages).then_some(&site);
         walk_postorder(&mut view.body, &mut |e| {
-            rewrite_view_node(e, skip_exclude, skip_in, skip_including, full_messages);
+            rewrite_view_node(e, skip_exclude, skip_in, skip_including, full_messages, zone_port);
         });
     }
     super::for_each_test_body(app, &mut |body| {
@@ -83,6 +84,7 @@ pub fn apply_fused_late_rewrites(app: &mut App) {
 /// still runs after this walk for that reason.
 pub fn apply_fused_context_rewrites(app: &mut App) {
     let formats = std::mem::take(&mut app.time_formats);
+    let zone_port = super::time_current::carries_zone_port(app);
     let mut gid_models: BTreeSet<Symbol> = BTreeSet::new();
     let mut gid_signed: BTreeSet<Symbol> = BTreeSet::new();
     let materialized = super::assoc_pluck::materialized_assoc_names(app);
@@ -91,7 +93,7 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
 
     super::for_each_hook_body(app, &mut |body| {
         walk_postorder(body, &mut |e| {
-            super::time_current::rewrite_node(e, &formats);
+            super::time_current::rewrite_node(e, &formats, zone_port);
             super::global_id_locate::rewrite_node(e, &mut gid_models, &mut gid_signed);
             super::assoc_pluck::rewrite_node(e, &materialized);
             super::try_guard::rewrite_node(e, &try_definers, &try_parents);
@@ -99,7 +101,7 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
     });
     super::for_each_test_body(app, &mut |body| {
         walk_postorder(body, &mut |e| {
-            super::time_current::rewrite_node(e, &formats);
+            super::time_current::rewrite_node(e, &formats, zone_port);
             super::webmock::rewrite_node(e);
             super::try_guard::rewrite_node(e, &try_definers, &try_parents);
         });
@@ -454,6 +456,7 @@ fn rewrite_hook_node(
     skip_in: bool,
     skip_including: bool,
     full_messages: FullMessages<'_>,
+    zone_port: bool,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -492,7 +495,7 @@ fn rewrite_hook_node(
     // Last: produces `ActiveSupport.*` / Range nodes no earlier fused
     // rewrite keys on. `where_range_split` still runs sequentially
     // afterwards and walks those Ranges.
-    super::time_calendar::rewrite_node(e);
+    super::time_calendar::rewrite_node(e, zone_port);
 }
 
 fn rewrite_view_node(
@@ -501,6 +504,7 @@ fn rewrite_view_node(
     skip_in: bool,
     skip_including: bool,
     full_messages: FullMessages<'_>,
+    zone_port: bool,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -531,7 +535,7 @@ fn rewrite_view_node(
         super::errors_full_messages::rewrite_node(e, site);
     }
     super::each_with_index::rewrite_node(e);
-    super::time_calendar::rewrite_node(e);
+    super::time_calendar::rewrite_node(e, zone_port);
 }
 
 fn rewrite_test_node(e: &mut Expr, full_messages: FullMessages<'_>) {

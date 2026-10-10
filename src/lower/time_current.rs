@@ -61,6 +61,21 @@
 //! do not know this format" is not the same fact as "Rails does not
 //! know it", and the two disagree exactly when an app defines a format
 //! somewhere the initializer scan did not look.
+//!
+//! ## The PostgreSQL CRuby tree
+//!
+//! That tree carries Rails' own vocabulary instead
+//! (runtime/spinel/active_support_time_with_zone.rb: `Time.current`,
+//! `Time#to_fs`, `TimeWithZone#to_fs` and `#rfc2822`, `Date#to_fs`), and
+//! Core runs in "Eastern Time (US & Canada)", where the UTC premise above
+//! is false: `Time.now.utc` is not `Time.current` (a TimeWithZone in
+//! Time.zone), a local `strftime` is not `to_fs(:db)` (UTC for a
+//! TimeWithZone, the date alone for a Date), and `getutc.strftime` is
+//! not `rfc2822` (the zone's offset). So there `Time.current`,
+//! `rfc822`/`rfc2822` and the built-in `to_fs` formats stay the calls
+//! they are and answer as Rails does; only an app's own format still
+//! expands here, as the initializer that registers it is not emitted.
+//! [`carries_zone_port`] says which tree this is.
 
 use std::collections::BTreeMap;
 
@@ -75,7 +90,8 @@ pub(crate) type TimeFormats = BTreeMap<Symbol, crate::app::TimeFormat>;
 /// hook owns (models, library classes, controllers, seeds — not views).
 pub fn apply_time_current_lowering(app: &mut App) {
     let formats = std::mem::take(&mut app.time_formats);
-    super::for_each_hook_body(app, &mut |body| rewrite_time_current(body, &formats));
+    let zone_port = carries_zone_port(app);
+    super::for_each_hook_body(app, &mut |body| rewrite_time_current_on(body, &formats, zone_port));
     // TEST BODIES TOO, for the reason the `to_fs` note above gives: it
     // is a hole we opened ourselves, and a test body reaches it the
     // same way an app body does — campfire's
@@ -85,8 +101,15 @@ pub fn apply_time_current_lowering(app: &mut App) {
     // Both halves of this pass expand into vocabulary every target
     // already speaks (`Time.now.utc`, `strftime`), so nothing here
     // leans on a CRuby overlay the strict-target test lanes lack.
-    super::for_each_test_body(app, &mut |body| rewrite_time_current(body, &formats));
+    super::for_each_test_body(app, &mut |body| rewrite_time_current_on(body, &formats, zone_port));
     app.time_formats = formats;
+}
+
+/// Whether the app's tree is the PostgreSQL CRuby one, which ports
+/// Rails' time zones (`project::apply_postgres_bootstrap`) — see the
+/// header's last section.
+pub(crate) fn carries_zone_port(app: &App) -> bool {
+    app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
 }
 
 /// `Time.current` → `Time.now.utc`, in place, recursively. The original
@@ -95,13 +118,19 @@ pub fn apply_time_current_lowering(app: &mut App) {
 /// `Time.current` type identically), and the outer expr keeps its type.
 /// Also the implementation behind the ruby emitter's view-pipeline copy.
 pub(crate) fn rewrite_time_current(expr: &mut Expr, formats: &TimeFormats) {
-    expr.node
-        .for_each_child_mut(&mut |c| rewrite_time_current(c, formats));
-    rewrite_node(expr, formats);
+    rewrite_time_current_on(expr, formats, false);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
-    let is_target = matches!(
+/// [`rewrite_time_current`] on a tree that does (`zone_port`) or does
+/// not carry the time zone port.
+pub(crate) fn rewrite_time_current_on(expr: &mut Expr, formats: &TimeFormats, zone_port: bool) {
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_time_current_on(c, formats, zone_port));
+    rewrite_node(expr, formats, zone_port);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats, zone_port: bool) {
+    let is_target = !zone_port && matches!(
         &*expr.node,
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }
             if method.as_str() == "current"
@@ -149,7 +178,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
         ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.is_empty() => {
             match method.as_str() {
                 "httpdate" => Some("%a, %d %b %Y %H:%M:%S GMT"),
-                "rfc822" | "rfc2822" => Some("%a, %d %b %Y %H:%M:%S %z"),
+                "rfc822" | "rfc2822" if !zone_port => Some("%a, %d %b %Y %H:%M:%S %z"),
                 _ => None,
             }
         }
@@ -184,7 +213,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
         };
         return;
     }
-    rewrite_to_fs(expr, formats);
+    rewrite_to_fs(expr, formats, zone_port);
 }
 
 /// Rails' built-in formats, from `ActiveSupport::TimeFormats`' own
@@ -237,7 +266,7 @@ fn strftime_call(recv: Expr, fmt: &str, span: crate::span::Span) -> ExprNode {
 
 /// `<time>.to_fs(:format)` / `to_formatted_s(:format)` → what the format
 /// is defined as. See the header for why an unknown one declines.
-fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats) {
+fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats, zone_port: bool) {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
         return;
     };
@@ -248,6 +277,9 @@ fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats) {
     // target answers `to_s`, and the no-arg call is not what breaks.
     let [format] = args.as_slice() else { return };
     let Some(name) = format_name(format) else {
+        if zone_port {
+            return;
+        }
         return decline(expr, "the format is not a literal");
     };
     let recv = recv.clone();
@@ -288,6 +320,10 @@ fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats) {
         return;
     }
 
+    // The tree's `to_fs` answers the rest as Rails' does, by receiver.
+    if zone_port {
+        return;
+    }
     match builtin_time_format(&name) {
         Some(Builtin::Strftime(fmt)) => *expr.node = strftime_call(recv, fmt, span),
         Some(Builtin::Method(m)) => {

@@ -63,6 +63,13 @@
 //!   raises under Rails too (`Duration#<=>` answers nil), so that
 //!   shape stays untouched residue.
 //!
+//! The PostgreSQL CRuby tree keeps the Duration in `<t> ± <dur>`:
+//! there `Time#+`/`#-` (the overlay) and `TimeWithZone#+`/`#-`
+//! (runtime/spinel/active_support_time_with_zone.rb) take it as Rails'
+//! do, moving a calendar part by the wall clock in the time's zone —
+//! `Jan 31 + 1.month` is Feb 29, and `1.day` across a DST change keeps
+//! the local hour — where its seconds would add 30 or 1 fixed days.
+//!
 //! View bodies are deliberately not walked — the same carve-out as
 //! blank/time_current: the ruby view pipeline still applies the
 //! emit-time vestige (`emit::ruby::library::apply_duration_lowering`)
@@ -79,8 +86,9 @@ use crate::ty::Ty;
 /// hook owns (models, library classes, controllers, seeds — not views).
 pub fn apply_duration_lowering(app: &mut App) {
     let temporal_predicates = !app_defines_temporal_predicates(app);
+    let zone_port = super::time_current::carries_zone_port(app);
     super::for_each_hook_body(app, &mut |body| {
-        apply_duration_rewrites(body, temporal_predicates)
+        apply_duration_rewrites_on(body, temporal_predicates, zone_port)
     });
     // TEST BODIES TOO. `1.day.ago` is not a method on any target's
     // Integer — this pass IS what grounds it — so a test writing one
@@ -94,7 +102,7 @@ pub fn apply_duration_lowering(app: &mut App) {
     // runtime answers, rather than leaning on a CRuby overlay the
     // strict-target test lanes do not ship.
     super::for_each_test_body(app, &mut |body| {
-        apply_duration_rewrites(body, temporal_predicates)
+        apply_duration_rewrites_on(body, temporal_predicates, zone_port)
     });
 }
 
@@ -109,12 +117,21 @@ pub fn apply_duration_lowering(app: &mut App) {
 /// it runs, `<t> - <dur>` is no longer distinguishable from the numeric
 /// `Time - Time` shape.
 pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool) {
+    apply_duration_rewrites_on(body, temporal_predicates, false);
+}
+
+/// [`apply_duration_rewrites`] on a tree that does (`zone_port`) or
+/// does not carry the time zone port, which keeps `<t> ± <dur>` (see
+/// the module header).
+pub(crate) fn apply_duration_rewrites_on(body: &mut Expr, temporal_predicates: bool, zone_port: bool) {
     rewrite_durations(body);
     if temporal_predicates {
         rewrite_temporal_predicates(body);
     }
     rewrite_duration_comparisons(body);
-    rewrite_time_duration_arith(body);
+    if !zone_port {
+        rewrite_time_duration_arith(body);
+    }
     rewrite_expires_in(body);
 }
 
