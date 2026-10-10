@@ -8699,8 +8699,14 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let rel = rel_of(source);
         let stem = rel.strip_prefix(&format!("{lib}/"))?.strip_suffix(".rb")?;
         let (parent_stem, leaf) = stem.rsplit_once('/').unwrap_or(("", stem));
-        let parents: Vec<&str> =
-            if parent_stem.is_empty() { vec![""] } else { cpaths_by_fold.get(&fold_stem(parent_stem))?.clone() };
+        // A gem's directory named for its hyphenated gem name
+        // (kafka-shopify 5.2.3's `kafka-shopify/producers` for
+        // `KafkaShopify::Producers`) folds without the hyphen.
+        let parents: Vec<&str> = if parent_stem.is_empty() {
+            vec![""]
+        } else {
+            cpaths_by_fold.get(&fold_stem(&parent_stem.replace('-', "")))?.clone()
+        };
         let names = autoload_names_by_fold.get(&fold_stem(leaf))?;
         let mut found: Vec<String> = Vec::new();
         for parent in &parents {
@@ -8758,10 +8764,19 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         // (activemerchant's `gateways/authorize_net.rb`, whose program
         // requires nokogiri before the class): then the constant's
         // autoload loads that program, as Ruby's autoload loads the file.
+        // So does a literal `autoload :Name, "path"` naming the file
+        // (`autoload_targets`): kafka-shopify 5.2.3's writers.rb
+        // `autoload(:MockWriter, "kafka-shopify/writers/mock_writer")`,
+        // a file that requires abstract_mock_writer first. With no
+        // autoload, `KafkaShopify::Writers::MockWriter` raised NameError
+        // (`Environment.default_writer` in every Monorail test).
         if in_place.contains(anchor)
             && !(in_place_program.contains_key(anchor)
                 && autoload_primary(anchor, content).is_some_and(|chain| {
-                    glob_autoloads.contains(&chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::"))
+                    let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+                    glob_autoloads.contains(&full)
+                        || matches!(declaring.get(anchor).map(Vec::as_slice), Some([one])
+                            if autoload_targets.get(one).is_some_and(|target| *target == full))
                 }))
         {
             continue;
