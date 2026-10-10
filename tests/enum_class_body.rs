@@ -401,3 +401,35 @@ puts "included integer enum passed"
         )
         .assert_passes();
 }
+
+/// Retail::Role's spelling: `ASSOCIATE = POS_USER`, so the mapping's
+/// first two keys fold to the same string. Ruby builds one entry, in the
+/// first key's position with the last value; the generated `kinds`
+/// literal must too, or Ruby warns "key duplicated" when the model file
+/// is parsed (Core's StrictWarning raises it at load).
+#[test]
+fn constant_labels_folding_to_one_key_build_one_entry() {
+    let run = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            r#"class Article < ApplicationRecord
+  POS_USER = "pos_user"
+  ASSOCIATE = POS_USER
+  OWNER = "account_owner"
+  enum :kind, { ASSOCIATE => "associate", OWNER => OWNER, POS_USER => POS_USER }
+"#,
+        )
+        .edit("db/schema.rb", "    t.string \"title\"", "    t.string \"title\"\n    t.string \"kind\"")
+        .run_ruby_env(
+            r#"
+expected = { "pos_user" => "pos_user", "account_owner" => "account_owner" }
+raise "kinds: #{Article.kinds.inspect}" unless Article.kinds == expected && Article.kinds.keys == expected.keys
+a = Article.new(title: "Hello world", body: "abcdefghij", kind: "pos_user")
+raise "predicate" unless a.pos_user?
+"#,
+            &[("RUBYOPT", "-W")],
+        );
+    run.assert_passes();
+    assert!(!run.stderr.contains("duplicated"), "stderr:\n{}", run.stderr);
+}

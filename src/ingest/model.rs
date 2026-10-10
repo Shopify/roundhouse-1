@@ -1469,6 +1469,7 @@ pub(super) fn expand_enum_decl(
             column
         ),
     })?;
+    let labels = dedup_mapping_labels(labels);
     let all_labels = labels.clone();
     let default = default_label.and_then(|d| labels.iter().find(|(l, _)| *l == d).and_then(|(_, v)| {
         match v { EnumStored::Lit(value) => Some(value.clone()), EnumStored::Expr(_) => None }
@@ -1978,6 +1979,22 @@ fn serialized_enum_receiver<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
     let values = receiver.as_call_node()?;
     (constant_id_str(&values.name()) == "values"
         && values.arguments().is_none() && values.block().is_none()).then_some(receiver)
+}
+
+/// A mapping whose labels fold to the same string (`ASSOCIATE =>
+/// ASSOCIATE, POS_USER => POS_USER` with `ASSOCIATE = POS_USER`) is one
+/// entry in the Hash Ruby builds: the first position, the last value.
+/// Kept as written, the generated `self.<plural>` literal would repeat a
+/// key, which Ruby warns about at parse time.
+fn dedup_mapping_labels(labels: Vec<(String, EnumStored)>) -> Vec<(String, EnumStored)> {
+    let mut out: Vec<(String, EnumStored)> = Vec::with_capacity(labels.len());
+    for (label, stored) in labels {
+        match out.iter_mut().find(|(l, _)| *l == label) {
+            Some(slot) => slot.1 = stored,
+            None => out.push((label, stored)),
+        }
+    }
+    out
 }
 
 /// Shared `label => value` extraction for both a braced `HashNode` and a
