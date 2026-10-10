@@ -59,7 +59,8 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
     let result = super::prism::parse(source, file);
     let root = result.node();
     let mut top_classes: Vec<ScopedClass<'_>> = Vec::new();
-    collect_top_level_classes(&root, &[], &mut top_classes);
+    let mut helper_modules: Vec<ScopedModule<'_>> = Vec::new();
+    collect_top_level_declarations(&root, &[], &mut top_classes, Some(&mut helper_modules));
     if top_classes.is_empty() {
         refuse_unreached_test_classes(&root, &[], file)?;
         return Ok(Vec::new());
@@ -80,7 +81,7 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
         let mut test_nodes = Vec::new();
         push_with_nested_test_classes(first, &mut test_nodes);
         refuse_unreached_test_classes(&root, &test_nodes, file)?;
-        return Ok(with_file_requires(ingest_each_test_class(&test_nodes, &helper_nodes, file)?, &root, file));
+        return Ok(with_file_requires(ingest_each_test_class(&test_nodes, &helper_nodes, &helper_modules, file)?, &root, file));
     }
     // A test class declared in a test class's body (Core's
     // `class PermissionGeneratorTest … class ValidateInitialTest <
@@ -92,7 +93,7 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
         push_with_nested_test_classes(class, &mut all_test_nodes);
     }
     refuse_unreached_test_classes(&root, &all_test_nodes, file)?;
-    Ok(with_file_requires(ingest_each_test_class(&all_test_nodes, &helper_nodes, file)?, &root, file))
+    Ok(with_file_requires(ingest_each_test_class(&all_test_nodes, &helper_nodes, &helper_modules, file)?, &root, file))
 }
 
 /// Each of the file's classes with the file's top-level loads
@@ -158,6 +159,7 @@ fn file_requires(root: &Node<'_>, file: &str) -> Vec<TestFileRequire> {
 fn ingest_each_test_class(
     test_nodes: &[ScopedClass<'_>],
     helper_nodes: &[ScopedClass<'_>],
+    helper_modules: &[ScopedModule<'_>],
     file: &str,
 ) -> IngestResult<Vec<TestModule>> {
     let mut out = Vec::new();
@@ -187,7 +189,7 @@ fn ingest_each_test_class(
             }
             continue;
         }
-        let result = ingest_test_class(class, helper_nodes, file).map_err(|err| match err {
+        let result = ingest_test_class(class, helper_nodes, helper_modules, file).map_err(|err| match err {
             IngestError::Unsupported { file, message } => IngestError::Unsupported {
                 message: format!("test class `{}` refused: {message}", scoped_class_name(class)),
                 file,
@@ -542,6 +544,7 @@ fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
 pub(super) fn ingest_test_class(
     (scope, class): &ScopedClass<'_>,
     top_level_helper_nodes: &[ScopedClass<'_>],
+    top_level_helper_modules: &[ScopedModule<'_>],
     file: &str,
 ) -> IngestResult<TestModule> {
     let mut name_path = scope.clone();
@@ -952,6 +955,12 @@ pub(super) fn ingest_test_class(
     for (helper_scope, helper_node) in top_level_helper_nodes {
         inner_classes.extend(carried_classes(&helper_node.as_node(), helper_scope, file)?);
     }
+    // So do the file's helper modules (`helper_module`): Core's
+    // `module Admin; module OrderAssessmentLockTestHelper; def …` beside
+    // `class OrderRisksControllerTest`, which includes it.
+    for (helper_scope, helper_module) in top_level_helper_modules {
+        inner_classes.extend(carried_classes(&helper_module.as_node(), helper_scope, file)?);
+    }
 
     Ok(TestModule {
         name,
@@ -1353,12 +1362,24 @@ fn collect_top_level_classes<'pr>(
     scope: &[String],
     out: &mut Vec<ScopedClass<'pr>>,
 ) {
+    collect_top_level_declarations(node, scope, out, None);
+}
+
+/// `collect_top_level_classes`, and with `modules`, the file's helper
+/// modules (`helper_module`) there too, each with its scope: the walk
+/// stops at one, whose classes are its own.
+fn collect_top_level_declarations<'pr>(
+    node: &Node<'pr>,
+    scope: &[String],
+    out: &mut Vec<ScopedClass<'pr>>,
+    mut modules: Option<&mut Vec<ScopedModule<'pr>>>,
+) {
     if let Some(c) = node.as_class_node() {
         if is_test_namespace(&c) {
             let mut inner = scope.to_vec();
             inner.extend(class_name_path(&c).unwrap_or_default());
             if let Some(body) = c.body() {
-                collect_top_level_classes(&body, &inner, out);
+                collect_top_level_declarations(&body, &inner, out, modules);
             }
             return;
         }
@@ -1366,25 +1387,40 @@ fn collect_top_level_classes<'pr>(
         return;
     }
     if let Some(p) = node.as_program_node() {
-        collect_top_level_classes(&p.statements().as_node(), scope, out);
+        collect_top_level_declarations(&p.statements().as_node(), scope, out, modules);
         return;
     }
     if let Some(s) = node.as_statements_node() {
         for stmt in s.body().iter() {
-            collect_top_level_classes(&stmt, scope, out);
+            collect_top_level_declarations(&stmt, scope, out, modules.as_deref_mut());
         }
         return;
     }
     if let Some(m) = node.as_module_node() {
+        if let Some(found) = modules.as_deref_mut().filter(|_| helper_module(&m)) {
+            found.push((scope.to_vec(), m));
+            return;
+        }
         let mut inner = scope.to_vec();
         inner.extend(module_name_path(&m).unwrap_or_default());
         if let Some(body) = m.body() {
-            collect_top_level_classes(&body, &inner, out);
+            collect_top_level_declarations(&body, &inner, out, modules);
         }
     }
 }
 
 pub(super) type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
+pub(super) type ScopedModule<'pr> = (Vec<String>, ruby_prism::ModuleNode<'pr>);
+
+/// A module a test file declares beside its test classes with content
+/// of its own (a `def`, a constant), holding no test class: a helper
+/// the file's tests include, which Ruby defines as the file loads. A
+/// module that only nests declarations is a namespace the walk goes
+/// through.
+fn helper_module(m: &ruby_prism::ModuleNode<'_>) -> bool {
+    let stmts = m.body().map(flatten_statements).unwrap_or_default();
+    stmts.iter().any(|s| s.as_class_node().is_none() && s.as_module_node().is_none()) && !holds_test_class(m.body())
+}
 
 /// A class that only nests (`class Deliverable` whose body is nothing
 /// but class and module declarations), is not test-shaped itself, and

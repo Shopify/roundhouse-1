@@ -122,6 +122,36 @@ module RoundhouseMinitestAssertions
   def __roundhouse_passed?
     @__roundhouse_errors.nil? || @__roundhouse_errors.empty?
   end
+
+  # Minitest::Runnable#name / #name= (`@NAME`, the test method's name,
+  # which the runner sets) and Minitest::Test's result readers over the
+  # same live list: Core's ActiveSupport::TestCase#after_teardown reads
+  # `error? || skipped? || assertions.positive?` and `method(name)`.
+  # Minitest's `failure` is the first recorded failure; here, its
+  # roundhouse-test-result/v1 exception row.
+  def name
+    @NAME
+  end
+
+  def name=(o)
+    @NAME = o
+  end
+
+  def failure
+    @__roundhouse_errors&.first
+  end
+
+  def passed?
+    __roundhouse_passed?
+  end
+
+  def error?
+    (@__roundhouse_errors || []).any? { |error| error.fetch("status") == "error" }
+  end
+
+  def skipped?
+    failure&.fetch("status") == "skip"
+  end
 end
 
 # ---- ActiveSupport::Testing::Assertions (ActiveSupport 8.2) ---------
@@ -1178,6 +1208,7 @@ module RoundhouseTestRunner
       # A test class that does not descend from TestBase (a bare
       # Minitest::Test the emitter kept) has no such writer.
       test.__roundhouse_errors = errors if test.respond_to?(:__roundhouse_errors=)
+      test.name = name.to_s if test.respond_to?(:name=)
       capture(errors, "setup") do
         yield if block_given?
         # ActiveRecord::TestFixtures#before_setup's setup_fixtures, first,
