@@ -15288,7 +15288,9 @@ fn carries_active_support_cache(files: &[(String, String)]) -> bool {
 fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     // ActiveRecord::Validations (Core's Validatable extends a Struct with
     // its ClassMethods) builds on the ActiveModel::Validations port.
-    let record_validations = carries_named(files, &["ActiveRecord::Validations"]);
+    // A `validates` run at run time on a model resolves Active Record's
+    // validators first (`uniqueness:` is only there).
+    let record_validations = carries_named(files, &["ActiveRecord::Validations"]) || calls_runtime_validates(files);
     // A model's class-side `validates` called while the app runs (a class
     // macro `lower::model_to_library::macro_replay` replays: Core's
     // Denormalize#define_denormalized_foreign_key) builds its validators
