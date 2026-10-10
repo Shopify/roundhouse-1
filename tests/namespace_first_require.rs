@@ -192,7 +192,9 @@ fn a_namespace_file_that_requires_the_requirer_is_not_required_back() {
     assert_eq!(expected, "[\"api_client\", \"registry\"]\n[\"non-pii\", \"owned-pii\"]\n", "native control");
     assert_eq!(run.stdout, expected, "{}", run.stderr);
     let registry = std::fs::read_to_string(run.emitted.join("app/models/vd/registry.rb")).expect("registry.rb");
-    assert!(registry.contains("require_relative \"subject_type/pii_level\"\n"), "{registry}");
+    // Registry and the namespace read each other at load, so the child
+    // require may also be the guarded in-body break of that cycle.
+    assert!(registry.contains("require_relative \"subject_type/pii_level\""), "{registry}");
     assert!(!registry.contains("require_relative \"subject_type\"\n"), "{registry}");
 }
 

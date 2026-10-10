@@ -56,6 +56,9 @@ pub mod naming;
 pub mod profile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod project;
+/// The emitted tree's load-time require graph and its cycles.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod require_graph;
 /// Embedded Ruby sources for constant lookup on all targets, plus the
 /// full Ruby and Spinel emit trees on native targets.
 #[cfg(not(target_arch = "wasm32"))]
