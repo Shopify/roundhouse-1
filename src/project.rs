@@ -7816,7 +7816,7 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
 /// in progress, circular require considered harmful", which Core's
 /// StrictWarning raises). Only an ancestor is moved, outermost first,
 /// to just before its first descendant; every other file keeps its place.
-fn namespace_files_first(anchors: &[String]) -> Vec<String> {
+pub(crate) fn namespace_files_first(anchors: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(anchors.len());
     for anchor in anchors {
         let mut ancestors: Vec<&String> = anchors
