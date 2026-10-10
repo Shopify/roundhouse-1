@@ -278,3 +278,53 @@ puts "PASS"
         )
         .assert_passes();
 }
+
+/// The typed_store gem declares its attributes through Rails'
+/// `store_accessor`, which defines `<key>_changed?` and `<key>_was`
+/// over the store column's pending change. Core's
+/// `Shop#sanitize_analytics_account` (a before_validation) asks
+/// `analytics_account_changed?`: NoMethodError. A change to ANOTHER
+/// key of the same column is no change to this one.
+#[test]
+fn store_keys_answer_their_own_dirty_state() {
+    emit_and_run::empty_app()
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :shops do |t|\n    t.string :name\n    t.text :settings\n  end\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        )
+        .write(
+            "app/models/shop.rb",
+            r#"class Shop < ApplicationRecord
+  typed_store :settings do |s|
+    s.string :analytics_account
+    s.string :plan_name
+  end
+
+  def report
+    [analytics_account_changed?, analytics_account_was, plan_name_changed?]
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+shop = Shop.new(name: "snow")
+shop.analytics_account = "UA-1"
+shop.save!
+fresh = Shop.find(shop.id)
+raise "clean #{fresh.report.inspect}" unless fresh.report == [false, "UA-1", false]
+fresh.plan_name = "plus"
+raise "other key #{fresh.report.inspect}" unless fresh.report == [false, "UA-1", true]
+fresh.analytics_account = "UA-2"
+raise "changed #{fresh.report.inspect}" unless fresh.report == [true, "UA-1", true]
+fresh.save!
+raise "saved #{fresh.report.inspect}" unless fresh.report == [false, "UA-2", false]
+puts "PASS"
+"#,
+        )
+        .assert_passes();
+}

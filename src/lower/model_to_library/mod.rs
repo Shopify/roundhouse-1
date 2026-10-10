@@ -2142,7 +2142,7 @@ fn build_methods_for_dialect(
     // declared attr, routing through the `TypedStore` runtime (the
     // YAML seam). Before `push_user_methods` so a custom method in the
     // model body wins via the synthesizer's own model-body check.
-    crate::lower::typed_store::push_typed_store_methods(&mut methods, model);
+    crate::lower::typed_store::push_typed_store_methods(&mut methods, model, &self::schema::demanded_names(models));
     // `has_json` schema keys — the JSON twin of the above: one typed
     // accessor triple per declared key, over the serialized column.
     // Same ordering rationale.

@@ -88,3 +88,17 @@ fn a_model_definition_wins() {
     assert!(src.contains("\"mine\""), "{src}");
     assert!(!src.contains(r#"attribute_was("username")"#), "{src}");
 }
+
+/// A validation's `if:` / `unless:` guard is demand too: Core's
+/// CheckoutConfiguration writes `validates :content, liquid: true, if:
+/// :content_changed?`, and the validation called a reader nothing had
+/// synthesized (NoMethodError on every save).
+#[test]
+fn a_validation_guard_is_demand() {
+    let src = emit_user(
+        "class User < ApplicationRecord\n  validates :about, presence: true, if: :about_changed?\n  validate :checked, unless: :email_changed?\n\n  def checked\n  end\nend\n",
+    );
+    assert!(src.contains("def about_changed?"), "{src}");
+    assert!(src.contains(r#"attribute_changed?("about")"#), "{src}");
+    assert!(src.contains("def email_changed?"), "{src}");
+}

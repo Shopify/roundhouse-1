@@ -2337,7 +2337,7 @@ pub(crate) fn share_model_body_names<'a>(models: &'a [Model], cache: &ModelBodyN
 
 /// [`model_body_names`] of `models`: the shared names when `models` is
 /// the shared slice.
-fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSet<Symbol>> {
+pub(crate) fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSet<Symbol>> {
     let shared = MODEL_BODY_NAMES.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -2385,11 +2385,61 @@ fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
                         walk(c, &mut out);
                     }
                 }
-                ModelBodyItem::Association { .. } | ModelBodyItem::Validation { .. } => {}
+                // `validates :content, liquid: true, if: :content_changed?`
+                // (Core's CheckoutConfiguration) demands its guard.
+                ModelBodyItem::Validation { validation, .. } => {
+                    for rule in &validation.rules {
+                        rule_names(rule, &mut out, walk);
+                    }
+                }
+                ModelBodyItem::Association { .. } => {}
             }
         }
     }
     out
+}
+
+/// The names a validation rule sends or names: its method, its Symbol
+/// `if:`/`unless:` guards, and the expressions it runs.
+fn rule_names(
+    rule: &crate::dialect::ValidationRule,
+    out: &mut crate::det::HashSet<Symbol>,
+    walk: fn(&Expr, &mut crate::det::HashSet<Symbol>),
+) {
+    use crate::dialect::{RuleValue, ValidationRule};
+    fn value_names(v: &RuleValue, out: &mut crate::det::HashSet<Symbol>, walk: fn(&Expr, &mut crate::det::HashSet<Symbol>)) {
+        match v {
+            RuleValue::Method { name } => {
+                out.insert(name.clone());
+            }
+            RuleValue::Expr { expr } | RuleValue::Call { callable: expr, .. } => walk(expr, out),
+            RuleValue::ClassScoped { value } => value_names(value, out, walk),
+            RuleValue::Literal { .. } => {}
+        }
+    }
+    match rule {
+        ValidationRule::Custom { method, if_method, unless_method } => {
+            out.insert(method.clone());
+            out.extend(if_method.iter().chain(unless_method).cloned());
+        }
+        ValidationRule::With { validator, options, if_method, unless_method } => {
+            walk(validator, out);
+            if let Some(o) = options {
+                walk(o, out);
+            }
+            out.extend(if_method.iter().chain(unless_method).cloned());
+        }
+        ValidationRule::Block { callable, .. } | ValidationRule::Each { callable, .. } => walk(callable, out),
+        ValidationRule::Object { object } => walk(object, out),
+        ValidationRule::Uniqueness { conditions: Some(c), .. } => walk(c, out),
+        ValidationRule::Guarded { rule, options } => {
+            rule_names(rule, out, walk);
+            for v in options.if_conds.iter().chain(&options.unless_conds) {
+                value_names(v, out, walk);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `def <name>; self.<runtime>("<col>"); end` — a per-column Dirty
