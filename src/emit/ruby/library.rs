@@ -9561,7 +9561,8 @@ fn emit_library_class_decl_inner(
     // `self.zendesk_account_integrity_group_id = ...` before its writer
     // existed.
     let own_runs = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
-    let first_own = if railtie { None } else { replayed.iter().position(|c| own_runs.runs(c)) };
+    let first_own =
+        if railtie { None } else { replayed.iter().position(|c| own_runs.runs(c) || names_own_method_above(lc, c)) };
     let mut calls_before: crate::det::HashMap<usize, Vec<&Expr>> = crate::det::HashMap::default();
     let mut leading: crate::det::HashSet<crate::span::Span> = crate::det::HashSet::default();
     for call in replayed.iter().take(first_own.unwrap_or(replayed.len())) {
@@ -9861,7 +9862,7 @@ fn emit_library_class_decl_inner(
         let port_macro = |e: &Expr| e.span != crate::span::Span::synthetic() && port_macros.contains(&e.span);
         let at = body_effects
             .iter()
-            .position(|e| own.runs(e) || wraps_own(e) || aliases_own(e) || port_macro(e))
+            .position(|e| own.runs(e) || wraps_own(e) || names_own_method_above(lc, e) || aliases_own(e) || port_macro(e))
             .unwrap_or(body_effects.len());
         body_effects.split_off(at)
     };
@@ -12132,6 +12133,7 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Opt
                     !is_body_statement(c)
                         && !(defines_only && defines_apart(lc, call, c))
                         && !own.runs(c)
+                        && !names_own_method_above(lc, c)
                         && !commutes_with_singleton_statement(call, c, app)
                 })
                 .map(|c| c.span),
@@ -12953,6 +12955,26 @@ fn names_own_method(lc: &LibraryClass, call: &Expr) -> bool {
     args.iter().any(|arg| {
         matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
             if lc.methods.iter().any(|m| m.name == *value))
+    })
+}
+
+/// Whether `call` names by a symbol argument one of `lc`'s defs the
+/// source writes above it in the same file: a macro that reads or wraps
+/// the def as the body runs, so it runs after the defs. ActsAsTheme's
+/// `def generate_unique_cityhash` and then `statsd_measure
+/// :generate_unique_cityhash, ...` (statsd-instrument raises "could not
+/// find method" for a method not defined yet).
+fn names_own_method_above(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { args, .. } = &*call.node else { return false };
+    if call.span.is_synthetic() {
+        return false;
+    }
+    args.iter().any(|arg| {
+        matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+            if lc.methods.iter().any(|m| m.name == *value
+                && !m.name_span.is_synthetic()
+                && m.name_span.file == call.span.file
+                && m.name_span.start < call.span.start))
     })
 }
 
