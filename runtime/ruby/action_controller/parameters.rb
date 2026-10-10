@@ -679,7 +679,7 @@ module ActionController
           hash_filter(params, filter, on_unpermitted, explicit_arrays)
         end
       end
-      unpermitted_parameters!(params, on_unpermitted)
+      unpermitted_parameters!(params, on_unpermitted: on_unpermitted)
       params.permit!
     end
 
@@ -841,7 +841,9 @@ module ActionController
       filter.is_a?(Array) && filter.size == 1 && filter.first.is_a?(Array)
     end
 
-    def unpermitted_parameters!(params, on_unpermitted)
+    # Rails 8.2 takes the action as a keyword defaulting to the class's
+    # setting: typed_parameters' `permit_types` calls it with `params` alone.
+    def unpermitted_parameters!(params, on_unpermitted: Parameters.action_on_unpermitted_parameters)
       return if on_unpermitted.nil? || on_unpermitted == false
       unpermitted = unpermitted_keys(params)
       return if unpermitted.empty?

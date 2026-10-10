@@ -191,6 +191,9 @@ P.action_on_unpermitted_parameters = :raise
 attempt("raise on unpermitted") { person.permit(:name, :age, :admin, :bio) }
 attempt("raise on one unpermitted") { P.new(a: 1, b: 2, controller: "c").permit(:a) }
 attempt("raise nested") { P.new(a: { b: 1, c: 2 }).permit(a: [:b]) }
+# typed_parameters' `permit_types`: `unpermitted_parameters!(params)`, the
+# action read from the class.
+attempt("unpermitted_parameters! with the class action") { P.new(a: 1, b: 2).send(:unpermitted_parameters!, P.new(a: 1)) }
 show "always permitted", P.new(a: 1, controller: "c", action: "x").permit(:a).to_h
 show "UnpermittedParameters#params", (begin; P.new(a: 1, b: 2).permit; rescue ActionController::UnpermittedParameters => e; e.params; end)
 show "UnpermittedParameters ancestors", ActionController::UnpermittedParameters.ancestors.include?(StandardError)

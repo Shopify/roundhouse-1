@@ -83,7 +83,7 @@ pub fn rewrite_assoc_create(expr: &Expr) -> Expr {
 }
 
 pub fn rewrite_assoc_create_with_models(expr: &Expr, models: &[crate::dialect::Model]) -> Expr {
-    crate::lower::controller_to_library::util::map_expr(expr, &|e| assoc_create_rewrite(e, models))
+    crate::lower::controller_to_library::util::map_expr(expr, &|e| assoc_create_rewrite(e, models, false))
 }
 
 /// In-place twin. Returns whether any node changed so the test
@@ -101,13 +101,18 @@ pub fn rewrite_assoc_create_with_models(expr: &Expr, models: &[crate::dialect::M
 /// after this pass, which an untyped runtime call would decline.
 /// Without it a test that read the association, created through it and
 /// read it again saw the first read's rows.
+///
+/// The target class is written rooted (`::Theme`): the call stands in
+/// the test's lexical scope, where the bare name can be another
+/// constant. Core's `@shop.themes.create!` inside `module OnlineStore`
+/// read `OnlineStore::Theme`, a namespace module.
 pub fn rewrite_assoc_create_with_models_in_place(
     expr: &mut Expr,
     models: &[crate::dialect::Model],
     join_target: bool,
 ) -> bool {
     crate::lower::controller_to_library::util::map_expr_mut(expr, &|e| {
-        let created = assoc_create_rewrite(e, models)?;
+        let created = assoc_create_rewrite(e, models, true)?;
         Some(if join_target { join_owner_target(e, created).unwrap_or_else(|c| c) } else { created })
     })
 }
@@ -191,7 +196,7 @@ fn join_owner_target(orig: &Expr, ctor: Expr) -> Result<Expr, Expr> {
     ))
 }
 
-fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model]) -> Option<Expr> {
+fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model], rooted: bool) -> Option<Expr> {
     let declared_target = |parent: &str, assoc: &str| -> Option<String> {
         let model = models.iter().find(|m| m.name.0.as_str() == parent)?;
         model.associations().find_map(|a| match a {
@@ -305,7 +310,11 @@ fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model]) -> Option<Ex
             recv: Some(Expr::new(
                 e.span,
                 ExprNode::Const {
-                    path: assoc_class.split("::").map(Symbol::from).collect(),
+                    path: rooted
+                        .then(|| Symbol::from(""))
+                        .into_iter()
+                        .chain(assoc_class.trim_start_matches("::").split("::").map(Symbol::from))
+                        .collect(),
                 },
             )),
             method: target_method,

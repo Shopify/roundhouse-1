@@ -3450,6 +3450,12 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
                     Span::synthetic(),
                     ExprNode::Ivar { name: col_storage_name(c) },
                 );
+                // A retypable slot holds the declared type's value (a
+                // `serialize`d Array), which `self[:col]` returns as
+                // its reader does; a String pre-cast would stringify it.
+                if is_retypable(model, c) {
+                    return with_ty(read, Ty::Untyped);
+                }
                 match super::ty_of_column_slot(c) {
                     slot @ Ty::Union { .. } => Expr::new(
                         Span::synthetic(),
