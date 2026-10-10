@@ -980,6 +980,8 @@ pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
     framework: &'s mut BTreeMap<String, FrameworkLoadHook>,
     /// Inside an `on_load` block: `self` is the hook's base.
     in_hook: usize,
+    /// Inside a lambda (`->` or `lambda { }`): `return` leaves the lambda.
+    in_lambda: usize,
     reason: Option<String>,
     /// An environment file's statement, not an initializer's.
     env: Option<EnvironmentRules<'s>>,
@@ -987,7 +989,7 @@ pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
 
 impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
     fn new(inputs: &'s Inputs<'a, V>, fired: &'s FiredHooks, framework: &'s mut BTreeMap<String, FrameworkLoadHook>) -> Self {
-        Scan { inputs, fired, framework, in_hook: 0, reason: None, env: None }
+        Scan { inputs, fired, framework, in_hook: 0, in_lambda: 0, reason: None, env: None }
     }
 
     /// The admission rule for an environment file's statement.
@@ -997,7 +999,7 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         framework: &'s mut BTreeMap<String, FrameworkLoadHook>,
         rules: EnvironmentRules<'s>,
     ) -> Self {
-        Scan { inputs, fired, framework, in_hook: 0, reason: None, env: Some(rules) }
+        Scan { inputs, fired, framework, in_hook: 0, in_lambda: 0, reason: None, env: Some(rules) }
     }
 
     pub(super) fn statement(&mut self, stmt: &Node<'_>) -> Verdict {
@@ -1237,7 +1239,15 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
                 }
             }
         }
+        let lambda = name == "lambda" && node.receiver().is_none() && node.block().is_some_and(|b| b.as_block_node().is_some());
+        self.scan.in_lambda += usize::from(lambda);
         ruby_prism::visit_call_node(self, node);
+        self.scan.in_lambda -= usize::from(lambda);
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.scan.in_lambda += 1;
+        ruby_prism::visit_lambda_node(self, node);
+        self.scan.in_lambda -= 1;
     }
     fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
         if self.env_config_write(&node.as_node()) {
@@ -1292,8 +1302,15 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
     fn visit_source_file_node(&mut self, _: &ruby_prism::SourceFileNode<'pr>) {
         self.scan.refuse("`__FILE__` is the initializer's own path");
     }
-    fn visit_return_node(&mut self, _: &ruby_prism::ReturnNode<'pr>) {
-        self.scan.refuse("`return` in an initializer");
+    // A lambda's `return` (Core's `config.on_flag_error = ->(error, handle)
+    // { return false if ... }` in essentials' initializers/verdict.rb)
+    // returns from the lambda; elsewhere it ends the initializer's file.
+    fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        if self.scan.in_lambda == 0 {
+            self.scan.refuse("`return` in an initializer");
+            return;
+        }
+        ruby_prism::visit_return_node(self, node);
     }
     fn visit_yield_node(&mut self, _: &ruby_prism::YieldNode<'pr>) {
         self.scan.refuse("`yield` in an initializer");
