@@ -6,20 +6,21 @@
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
 # Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime,
-# Decimal,Float,Date}, and ActiveRecord::Type::{Value,ImmutableString,String,Integer,
+# Decimal,Float,Date,Time}, and ActiveRecord::Type::{Value,ImmutableString,String,Integer,
 # BigInteger,Binary,Boolean,Decimal,Float} (the same classes), ActiveRecord::Type::Text,
-# ActiveRecord::Type::{DateTime,Date} with Internal::Timezone, and
-# PostgreSQL's OID::{Bytea,Decimal,Date,DateTime,Timestamp,Uuid}. An app that builds column types itself needs
+# ActiveRecord::Type::{DateTime,Date,Time} with Internal::Timezone,
+# ActiveRecord::Type::Json, and
+# PostgreSQL's OID::{Bytea,Decimal,Date,DateTime,Timestamp,Jsonb,Uuid}. An app that builds column types itself needs
 # them, for example Core's DeveloperDashboard::FastDev::TablelessSchema,
 # which builds `ActiveRecord::Type::Integer.new(limit: 8)` and its
 # siblings at load.
 #
 # Each method follows the 8.2.0.alpha source (activemodel
 # lib/active_model/type/{value,serialize_cast_value,immutable_string,
-# string,integer,big_integer,binary,boolean,date_time,decimal,float,date}.rb and type/helpers/*.rb; activerecord
-# lib/active_record/type/{text,date_time,date}.rb, type/internal/
+# string,integer,big_integer,binary,boolean,date_time,decimal,float,date,time}.rb and type/helpers/*.rb; activerecord
+# lib/active_record/type/{text,date_time,date,time,json}.rb, type/internal/
 # timezone.rb and connection_adapters/postgresql/oid/{decimal,date,
-# date_time,timestamp,uuid}.rb). The compiled models' column writers
+# date_time,timestamp,jsonb,uuid}.rb). The compiled models' column writers
 # cast through these (runtime `Base._cast_column`). tests/active_model_type_runtime.rb runs the same
 # observations against that native ActiveModel and this file and
 # requires them equal.
@@ -45,10 +46,14 @@
 #   answer Rails' adapter gives with `decode_bytea` and marks
 #   `@ar_pg_bytea_decoded`. So a String it deserializes counts as
 #   decoded and is not unescaped again.
-# - The other types (Time, Json) are not
-#   ported. The registries are (see the end of this file); a built-in
-#   name whose class is missing raises NotImplementedError on lookup,
-#   and the runtime's `type_for_attribute` raises it for a column whose
+# - ActiveRecord::Type::Time::Value is Ruby's DelegateClass(::Time), where
+#   Rails builds it with ActiveSupport::Delegation's faster equivalent.
+# - Json#serialize uses `ActiveSupport::JSON::Encoding.encode_without_escape`
+#   where the tree carries it, else `JSON.generate` over
+#   active_support_ext.rb's jsonable value. Json#accessor needs
+#   ActiveRecord::Store, which is not ported.
+# - The registries are (see the end of this file); the runtime's
+#   `type_for_attribute` raises NotImplementedError for a column whose
 #   type is not here.
 # - Binary::Data#as_json answers String#as_json's value (the string
 #   itself) where the tree does not define String#as_json.
@@ -68,6 +73,7 @@
 
 require "bigdecimal/util"
 require "date"
+require "delegate"
 
 module ActiveModel
   class RangeError < ::RangeError
@@ -973,6 +979,66 @@ module Type
           time && new_date(time.year, time.mon, time.mday)
         end
     end
+
+    # activemodel lib/active_model/type/time.rb: a time of day, on
+    # 2000-01-01. `value.present?` and `Time#change(year:, month:, day:)`
+    # are the private helpers' answers (see the header).
+    class Time < Value
+      include Helpers::Timezone
+      include Helpers::AcceptsMultiparameterTime.new(
+        defaults: { 1 => 2000, 2 => 1, 3 => 1, 4 => 0, 5 => 0 }
+      )
+      include Helpers::TimeValue
+
+      def type
+        :time
+      end
+
+      def user_input_in_time_zone(value)
+        return if Blank.blank?(value)
+
+        case value
+        when ::String
+          value = "2000-01-01 #{value}"
+          time_hash = begin
+            ::Date._parse(value)
+          rescue ArgumentError
+          end
+
+          return if time_hash.nil? || time_hash[:hour].nil?
+        when ::Time
+          value = change_date(value)
+        end
+
+        super(value)
+      end
+
+      private
+        def cast_value(value)
+          return apply_seconds_precision(value) unless value.is_a?(::String)
+          return if Blank.blank?(value)
+
+          dummy_time_value = value.sub(/\A\d{4}-\d\d-\d\d(?:T|\s)|/, "2000-01-01 ")
+
+          fast_string_to_time(dummy_time_value) || begin
+            time_hash = begin
+              ::Date._parse(dummy_time_value)
+            rescue ArgumentError
+            end
+
+            return if time_hash.nil? || time_hash[:hour].nil?
+            new_time(*time_hash.values_at(:year, :mon, :mday, :hour, :min, :sec, :sec_fraction, :offset))
+          end
+        end
+
+        # `value.change(year: 2000, day: 1, month: 1)`
+        # (core_ext/time/calculations.rb): the same clock time and offset.
+        def change_date(value)
+          return value.change(year: 2000, day: 1, month: 1) if value.respond_to?(:change)
+          sec = value.sec + value.subsec
+          value.utc? ? ::Time.utc(2000, 1, 1, value.hour, value.min, sec) : ::Time.new(2000, 1, 1, value.hour, value.min, sec, value.utc_offset)
+        end
+    end
   end
 end
 
@@ -1034,6 +1100,82 @@ module ActiveRecord
     class Text < ActiveModel::Type::String # :nodoc:
       def type
         :text
+      end
+    end
+
+    # type/time.rb: a time of day in the adapter's zone. A serialized
+    # value is wrapped as `Time::Value` (ActiveSupport::Delegation's
+    # DelegateClass(::Time); Ruby's here), which the adapter quotes as a
+    # time of day.
+    class Time < ActiveModel::Type::Time
+      include Internal::Timezone
+
+      Value = DelegateClass(::Time) # :nodoc:
+
+      def serialize(value)
+        case value = super
+        when ::Time
+          Value.new(value)
+        else
+          value
+        end
+      end
+
+      def serialize_cast_value(value) # :nodoc:
+        Value.new(super) if value
+      end
+
+      private
+        def cast_value(value)
+          case value = super
+          when Value
+            value.__getobj__
+          else
+            value
+          end
+        end
+    end
+
+    # type/json.rb: a json column. Values encode through Active Support
+    # without HTML escaping and decode back; text that is not JSON is
+    # reported and reads as nil.
+    class Json < ActiveModel::Type::Value
+      include ActiveModel::Type::Helpers::Mutable
+
+      def type
+        :json
+      end
+
+      def deserialize(value)
+        return value unless value.is_a?(::String)
+        begin
+          ActiveSupport::JSON.decode(value)
+        rescue ::JSON::ParserError => e
+          ActiveSupport.error_reporter.report(e, source: "application.active_record")
+          nil
+        end
+      end
+
+      # `ActiveSupport::JSON::Encoding.encode_without_escape`. A tree
+      # without runtime/active_support_json.rb has only
+      # active_support_ext.rb's encoder, whose output is HTML-escaped;
+      # its unescaped form is `JSON.generate` over the same jsonable value.
+      def serialize(value)
+        return if value.nil?
+        encoding = (ActiveSupport::JSON::Encoding if defined?(ActiveSupport::JSON::Encoding))
+        return encoding.encode_without_escape(value) if encoding.respond_to?(:encode_without_escape)
+        ::JSON.generate(ActiveSupport::JSON.jsonable(value))
+      end
+
+      def changed_in_place?(raw_old_value, new_value)
+        deserialize(raw_old_value) != new_value
+      end
+
+      def accessor
+        unless defined?(ActiveRecord::Store::StringKeyedHashAccessor)
+          raise NotImplementedError, "ActiveRecord::Type::Json#accessor: ActiveRecord::Store::StringKeyedHashAccessor is not ported"
+        end
+        ActiveRecord::Store::StringKeyedHashAccessor
       end
     end
 
@@ -1415,6 +1557,13 @@ module ActiveRecord
           end
         end
 
+        # oid/jsonb.rb: a jsonb column, Type::Json under its own name.
+        class Jsonb < ActiveRecord::Type::Json # :nodoc:
+          def type
+            :jsonb
+          end
+        end
+
         # oid/uuid.rb.
         class Uuid < ActiveModel::Type::Value # :nodoc:
           ACCEPTABLE_UUID = %r{\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z}
@@ -1464,9 +1613,6 @@ end
 # `ActiveRecord::Type.register(:model_uuid_as_integer,
 # Shopify::ModelUuidAsInteger, adapter: :postgresql)`) and `attribute
 # name, :sym` finds it. The built-in names are registered as in type.rb.
-# A built-in whose class this file does not port (Date, Float, Time,
-# Json) is registered with a block that raises NotImplementedError
-# naming the class, so looking it up never answers a different type.
 module ActiveModel
   module Type
     class Registry # :nodoc:
@@ -1498,11 +1644,6 @@ module ActiveModel
         attr_reader :registrations
     end
 
-    # A registration for a built-in type this file does not port.
-    def self.unported_registration(class_name) # :nodoc:
-      proc { |symbol, *| raise NotImplementedError, "type #{symbol.inspect}: #{class_name} is not ported" }
-    end
-
     @registry = Registry.new
 
     class << self
@@ -1527,7 +1668,7 @@ module ActiveModel
     register(:immutable_string, Type::ImmutableString)
     register(:integer, Type::Integer)
     register(:string, Type::String)
-    register(:time, &unported_registration("ActiveModel::Type::Time"))
+    register(:time, Type::Time)
   end
 end
 
@@ -1699,10 +1840,10 @@ module ActiveRecord
     register(:float, Type::Float, override: false)
     register(:integer, Type::Integer, override: false)
     register(:immutable_string, Type::ImmutableString, override: false)
-    register(:json, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Json"))
+    register(:json, Type::Json, override: false)
     register(:string, Type::String, override: false)
     register(:text, Type::Text, override: false)
-    register(:time, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Time"))
+    register(:time, Type::Time, override: false)
   end
 
   class TypeConflictError < StandardError # :nodoc:

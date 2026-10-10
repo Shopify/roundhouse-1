@@ -67,6 +67,9 @@ if ARGV.first == "native"
   ActiveRecord::Type::Text
   ActiveRecord::Type::DateTime
   ActiveModel::Type::ImmutableString
+  ActiveRecord::Type::Time
+  ActiveRecord::Type::Json
+  require "active_record/connection_adapters/postgresql/oid"
 else
   # The tree's load order: rails.rb, the CRuby overlay's core
   # extensions, then the port (gem_facades.rb requires it where the app
@@ -75,6 +78,10 @@ else
   require File.join(root, "runtime/ruby/rails")
   require File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime/active_support_core_ext")
   require File.join(root, "runtime/spinel/active_model_type")
+  # The JSON coder and error reporter Core's tree carries, which Type::Json
+  # encodes through and reports a parse failure to.
+  require File.join(root, "runtime/spinel/active_support_json")
+  require File.join(root, "runtime/ruby/active_support_reporters")
 end
 require "bigdecimal"
 require "date"
@@ -84,6 +91,10 @@ require "json"
 # by their parts, which both sides compute the same way.
 def describe(value)
   case value
+  when ::Delegator
+    # Type::Time::Value: Rails' ActiveSupport::Delegation::DelegateClass
+    # and Ruby's differ in their own methods, not in what they wrap.
+    "Delegator(#{describe(value.__getobj__)})"
   when ::String
     "#{value.inspect.gsub(/0x\h+/, "0x")} #{value.encoding} frozen=#{value.frozen?}"
   when ::DateTime
@@ -144,6 +155,12 @@ TYPES = {
   "AR::Decimal(scale: 2)" => -> { AR::Decimal.new(scale: 2) },
   "AM::Decimal(precision: 10, scale: 0)" => -> { AM::Decimal.new(precision: 10, scale: 0) },
   "AR::Value(precision: 1, scale: 2, limit: 3)" => -> { AR::Value.new(precision: 1, scale: 2, limit: 3) },
+  "AM::Time" => -> { AM::Time.new },
+  "AR::Time" => -> { AR::Time.new },
+  "AR::Time(precision: 6)" => -> { AR::Time.new(precision: 6) },
+  "AR::Time(timezone: :local, precision: 0)" => -> { AR::Time.new(timezone: :local, precision: 0) },
+  "AR::Json" => -> { AR::Json.new },
+  "OID::Jsonb" => -> { ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb.new },
 }
 
 TIME = Time.utc(2020, 6, 20, 10, 20, 30, Rational(123_456_789, 1000))
@@ -300,3 +317,11 @@ class MoneyColumnProbe < ActiveRecord::Type::Decimal
 end
 show "MoneyColumn-like serialize", [MoneyColumnProbe.new.serialize(nil), MoneyColumnProbe.new.serialize(12), MoneyColumnProbe.new.serialize("3.5"), MoneyColumnProbe.new.cast("7.25"), MoneyColumnProbe.new.type, MoneyColumnProbe.serialize_cast_value_compatible?]
 show "Binary string binary cast keeps object", outcome { s = "ab".b; AR::Binary.new.cast(s).equal?(s) }
+# Time of day and JSON, the way a time / json / jsonb column reads them.
+show "Time cast clock", [AR::Time.new.cast("10:20:30.5"), AR::Time.new(precision: 0).cast("2020-06-20 23:59:59.9"), AR::Time.new.cast("25:00"), AR::Time.new.cast(" ")]
+show "Time serialize class", outcome { v = AR::Time.new(precision: 6).serialize("10:20:30.123456789"); [v.is_a?(::Delegator), v.__getobj__, v.hour, v.usec] }
+show "Time cast serialized", outcome { t = AR::Time.new; t.cast(t.serialize("10:20")) }
+show "Json round trip", outcome { j = AR::Json.new; [j.serialize({ "a" => [1, 2.5, nil, true], :b => { "c" => "</script>" } }), j.deserialize('{"a":[1,{"b":null}]}'), j.cast({ a: 1 }), j.deserialize("not json"), j.serialize(nil)] }
+show "Json changed_in_place?", [AR::Json.new.changed_in_place?('{"a":1}', { "a" => 1 }), AR::Json.new.changed_in_place?('{"a":1}', { "a" => 2 })]
+show "Jsonb superclass", [ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb.superclass.name, ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb.new == AR::Json.new]
+show "lookup time json", outcome { [ActiveRecord::Type.lookup(:time, adapter: :postgresql).class.name, ActiveRecord::Type.lookup(:json, adapter: :postgresql).class.name, ActiveModel::Type.lookup(:time).class.name] }

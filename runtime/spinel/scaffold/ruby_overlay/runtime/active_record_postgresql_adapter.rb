@@ -479,8 +479,8 @@ module ActiveRecord
           when "bytea" then PgCast.new(:binary, nil, nil, nil, "OID::Bytea", {}, nil)
           when "point" then pg_unported_cast(:point, "OID::Point")
           when "hstore" then pg_unported_cast(:hstore, "OID::Hstore")
-          when "json" then pg_unported_cast(:json, "Type::Json")
-          when "jsonb" then pg_unported_cast(:jsonb, "OID::Jsonb")
+          when "json" then PgCast.new(:json, nil, nil, nil, "Type::Json", {}, nil)
+          when "jsonb" then PgCast.new(:jsonb, nil, nil, nil, "OID::Jsonb", {}, nil)
           when "cidr" then pg_unported_cast(:cidr, "OID::Cidr")
           when "inet" then pg_unported_cast(:inet, "OID::Inet")
           when "uuid" then PgCast.new(:uuid, nil, nil, nil, "OID::Uuid", {}, nil)
@@ -498,7 +498,9 @@ module ActiveRecord
               PgCast.new(:decimal, nil, precision, scale, "OID::Decimal", { precision: precision, scale: scale }, nil)
             end
           when "interval" then pg_unported_cast(:interval, "OID::Interval", precision: extract_precision(sql_type))
-          when "time", "timetz" then pg_unported_cast(:time, "Type::Time", precision: fmod == -1 ? 6 : fmod)
+          when "time", "timetz"
+            precision = fmod == -1 ? 6 : fmod
+            PgCast.new(:time, nil, precision, nil, "Type::Time", { precision: precision }, nil)
           when "timestamp"
             precision = fmod == -1 ? 6 : fmod
             # OID::Timestamp#type: :datetime while `datetime_type` is
@@ -526,6 +528,9 @@ module ActiveRecord
           when "OID::Uuid" then oid::Uuid.new
           when "OID::Decimal" then oid::Decimal.new(**args)
           when "OID::Timestamp" then oid::Timestamp.new(**args)
+          when "Type::Time" then ::ActiveRecord::Type::Time.new(**args)
+          when "Type::Json" then ::ActiveRecord::Type::Json.new
+          when "OID::Jsonb" then oid::Jsonb.new
           end
         end
 

@@ -2884,6 +2884,9 @@ pub(super) fn parse_association(
     let mut class_name: Option<String> = None;
     let mut foreign_key: Option<String> = None;
     let mut primary_key: Option<String> = None;
+    // `belongs_to :x, polymorphic: true, foreign_type: "object_type"` — the
+    // type column, where Rails otherwise reads `x_type`.
+    let mut foreign_type: Option<String> = None;
     let mut through: Option<String> = None;
     let mut source: Option<String> = None;
     let mut source_type: Option<String> = None;
@@ -2936,6 +2939,9 @@ pub(super) fn parse_association(
                 }
                 "primary_key" => {
                     primary_key = string_value(&value).or_else(|| symbol_value(&value))
+                }
+                "foreign_type" => {
+                    foreign_type = string_value(&value).or_else(|| symbol_value(&value))
                 }
                 "through" => through = symbol_value(&value),
                 "source" => source = symbol_value(&value),
@@ -3091,7 +3097,7 @@ pub(super) fn parse_association(
             polymorphic_targets: Vec::new(),
             default: belongs_to_default,
             touch,
-            foreign_type: None,
+            foreign_type: foreign_type.as_deref().map(Symbol::from),
             primary_key: primary_key.as_deref().map(Symbol::from),
             autosave,
         }),
