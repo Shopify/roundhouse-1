@@ -1297,6 +1297,16 @@ pub(crate) const CRUBY_ONLY_STDLIB: &[(&str, bool, &[(&str, fn() -> Ty)])] = &[
     ("Timeout", false, &[("timeout", untyped)]),
     ("Timeout::Error", true, &[]),
     ("Timeout::ExitException", true, &[]),
+    // psych/exception.rb and psych/syntax_error.rb: what `Psych.safe_load`
+    // raises. paquito's SafeYAML#load rescues `Psych::DisallowedClass`
+    // into UnsupportedType and any other `Psych::Exception` into
+    // UnpackError.
+    ("Psych::Exception", true, &[]),
+    ("Psych::BadAlias", true, &[]),
+    ("Psych::AliasesNotEnabled", true, &[]),
+    ("Psych::AnchorNotDefined", true, &[]),
+    ("Psych::DisallowedClass", true, &[]),
+    ("Psych::SyntaxError", true, &[]),
     ("Marshal", false, &[("dump", string), ("load", untyped)]),
     ("FileUtils", false, &[
         ("mkdir_p", untyped), ("makedirs", untyped), ("mkdir", untyped), ("rm", untyped),
