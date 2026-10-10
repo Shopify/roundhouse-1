@@ -17,17 +17,6 @@ require "stringio"
 require_relative "action_dispatch/headers"
 
 module ActionDispatch
-  # `ActionDispatch::TestRequest.create(env)` — see the twin in
-  # `runtime/ruby/action_dispatch/request.rb` for what it is for. This
-  # lane's Request IS env-backed, so `create` is the constructor and
-  # every key the env carries is readable, not just the ones a mapping
-  # thought to name.
-  module TestRequest
-    def self.create(env)
-      Request.new(env.each_with_object({}) { |(k, v), h| h[k.to_s] = v })
-    end
-  end
-
   class Request
     attr_reader :env
     attr_accessor :params
@@ -205,6 +194,49 @@ module ActionDispatch
       CgiIo.parse_form_into(query_string, out) unless query_string.empty?
       out
     end
+  end
+
+  # `ActionDispatch::TestRequest.create(env)` — see the twin in
+  # `runtime/ruby/action_dispatch/request.rb` for what it is for. This
+  # lane's Request IS env-backed, so `create` is the constructor and
+  # every key the env carries is readable, not just the ones a mapping
+  # thought to name. A Request subclass, as Rails' is: Core's
+  # `class FakeRequest < ActionDispatch::TestRequest` raised "superclass
+  # must be an instance of Class (given Module)" at load. Rails' env
+  # under the given keys: `Rack::MockRequest.env_for("/")` with its
+  # test host, address and agent (TestRequest::DEFAULT_ENV), then the
+  # application's `env_config`.
+  class TestRequest < Request
+    def self.create(env = {})
+      base = default_env
+      app = defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+      base.merge!(app.env_config) if app.respond_to?(:env_config)
+      new(base.merge!(env.each_with_object({}) { |(k, v), h| h[k.to_s] = v }))
+    end
+
+    def self.default_env
+      {
+        "rack.input" => StringIO.new("".b),
+        "rack.errors" => StringIO.new,
+        "rack.multithread" => true,
+        "rack.multiprocess" => true,
+        "rack.run_once" => false,
+        "REQUEST_METHOD" => "GET",
+        "SERVER_NAME" => "example.org",
+        "SERVER_PORT" => "80",
+        "SERVER_PROTOCOL" => "HTTP/1.1",
+        "QUERY_STRING" => "",
+        "PATH_INFO" => "/",
+        "rack.url_scheme" => "http",
+        "HTTPS" => "off",
+        "SCRIPT_NAME" => "",
+        "CONTENT_LENGTH" => "0",
+        "HTTP_HOST" => "test.host",
+        "REMOTE_ADDR" => "0.0.0.0",
+        "HTTP_USER_AGENT" => "Rails Testing",
+      }
+    end
+    private_class_method :default_env
   end
 end
 
