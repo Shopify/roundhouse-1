@@ -13820,9 +13820,23 @@ fn bundler_gem_require_block(bundler: &[crate::app::BundlerGem], lock: Option<&c
     out
 }
 
+/// Gems Bundler.require cannot autorequire, which the app's own files
+/// require by their real entry path, as (require path, lockfile gem):
+/// ruby-tlsh 1.1.6's entry is `ruby_tlsh.rb`, so Bundler's `ruby-tlsh`
+/// and `ruby/tlsh` both miss and it skips the gem (docs/RUNTIME_GEMS.md
+/// "unclassified"), and Core's theme_template_body.rb and
+/// theme_identification/vp_tree.rb `require "ruby_tlsh"` themselves. The
+/// tree loads them with `LOCK_GATED_REQUIRES`, at boot rather than where
+/// the app file requires them; each is measured Rails-free the same way
+/// (ruby_tlsh loads sorbet-runtime and its C extension, no Rails gem, no
+/// `on_load`). Without it `Tlsh` was undefined and every
+/// `ThemeTemplateBody.calculate_fingerprint` a NameError.
+const APP_REQUIRED_GEMS: &[(&str, &str)] = &[("ruby_tlsh", "ruby-tlsh")];
+
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
     let gated = LOCK_GATED_REQUIRES
         .iter()
+        .chain(APP_REQUIRED_GEMS)
         .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)) && !exclude.contains(gem))
         .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
@@ -13866,7 +13880,8 @@ pub(crate) fn lock_loaded_gems(
     bundler: &[crate::app::BundlerGem],
 ) -> std::collections::BTreeSet<String> {
     let mut loaded = std::collections::BTreeSet::new();
-    let mut stack: Vec<&str> = LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
+    let mut stack: Vec<&str> =
+        LOCK_GATED_REQUIRES.iter().chain(APP_REQUIRED_GEMS).map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
     stack.extend(
         bundler_required_runtime_gems(bundler, Some(lock))
             .into_iter()
@@ -14414,7 +14429,7 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     // The lock-gated Bundler.require entries load whatever app/ names,
     // so a GIT-sourced one (Core's sprockets fork) is activated too.
     let gated: Vec<&str> = lock
-        .map(|l| LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
+        .map(|l| LOCK_GATED_REQUIRES.iter().chain(APP_REQUIRED_GEMS).map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
         .unwrap_or_default();
     if needed.is_empty() && gated.is_empty() && gem_sources.is_empty() {
         return;
@@ -17298,6 +17313,23 @@ mod tests {
         // The file's own constant as an assignment is still its leaf.
         let leaf = "RemoteDomain = DomainSubscription\n";
         assert_eq!(autoload_primary("models/remote_domain", leaf), Some(vec![("RemoteDomain".to_string(), false)]));
+    }
+
+    /// ruby-tlsh, which Bundler cannot autorequire and Core's models
+    /// require as `ruby_tlsh`, loads by that path where the lock has it,
+    /// and its constants are the loaded gem's.
+    #[test]
+    fn an_app_required_gem_loads_by_its_entry_path_where_the_lock_has_it() {
+        let lock = crate::gems::Lockfile::parse(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    ruby-tlsh (1.1.6)\n      sorbet-runtime\n    sorbet-runtime (0.6.1)\n\nDEPENDENCIES\n  ruby-tlsh (~> 1.1)\n",
+        );
+        assert!(gem_require_block(&[], Some(&lock)).contains("\"ruby_tlsh\""));
+        assert!(lock_loaded_gems(&lock, &[]).contains("ruby-tlsh"));
+        let empty = crate::gems::Lockfile::parse("GEM\n  specs:\n\nDEPENDENCIES\n");
+        assert!(!gem_require_block(&[], Some(&empty)).contains("ruby_tlsh"));
+        for (_, gem) in APP_REQUIRED_GEMS {
+            assert!(!RAILS_DEPENDENT_GEMS.iter().any(|(g, _)| g == gem), "{gem} is Rails-dependent");
+        }
     }
 
     /// A gem the tree loads or a runtime port stands in for is never
