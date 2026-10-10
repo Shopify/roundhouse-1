@@ -33,7 +33,14 @@
 //! replacement is an ordinary sequence. An assignment nested inside an
 //! expression the pass cannot expand leaves the `defined?` untouched:
 //! a guard that stays `defined?` fails the way it does today, which is
-//! honest, where a flag one writer never sets would answer wrong.
+//! honest, where a flag one writer never sets would answer wrong. So
+//! does any other writer of the ivar: a compound assignment
+//! (`@x ||= {}`), a multiple assignment, `instance_variable_set` or
+//! `remove_instance_variable` naming it. frozen_record's
+//! `TestHelper.load_fixture` sets `@cache ||= {}`; `unload_fixtures`'
+//! `return unless defined?(@cache) && @cache` read a flag nothing set,
+//! so it never restored a model's `base_path`, and Core's ApiChange
+//! kept the 29 test fixtures after `reset_api_versioning_test_setup`.
 
 use std::collections::BTreeSet;
 
@@ -126,6 +133,18 @@ fn assignments_in_statement_position(e: &Expr, name: &Symbol, statement: bool) -
             }
             assignments_in_statement_position(value, name, false)
         }
+        ExprNode::OpAssign { target: LValue::Ivar { name: n }, .. } if n == name => false,
+        ExprNode::MultiAssign { targets, .. }
+            if targets.iter().any(|t| matches!(t, LValue::Ivar { name: n } if n == name)) =>
+        {
+            false
+        }
+        ExprNode::Send { method, args, .. }
+            if matches!(method.as_str(), "instance_variable_set" | "remove_instance_variable")
+                && args.first().is_some_and(|a| names_ivar(a, name)) =>
+        {
+            false
+        }
         ExprNode::Seq { exprs } => {
             exprs.iter().all(|x| assignments_in_statement_position(x, name, true))
         }
@@ -144,6 +163,17 @@ fn assignments_in_statement_position(e: &Expr, name: &Symbol, statement: bool) -
             ok
         }
     }
+}
+
+/// `arg` is the ivar's name as a literal (`:@x`, `"@x"`); `name` is
+/// stored without the sigil.
+fn names_ivar(arg: &Expr, name: &Symbol) -> bool {
+    let text = match &*arg.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.as_str(),
+        _ => return false,
+    };
+    text.strip_prefix('@') == Some(name.as_str())
 }
 
 fn rewrite_guards(e: &mut Expr, names: &[Symbol]) {
