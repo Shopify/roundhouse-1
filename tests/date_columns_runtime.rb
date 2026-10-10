@@ -63,7 +63,6 @@ if ARGV.first == "native"
 else
   equal("2024-01-31", entry.due_on_raw)
   equal(String, entry[:observed_at].class) # timestamp index behavior is unchanged
-  equal(String, entry[:opens_at].class)
   ActiveSupport.use_zone("Pacific/Auckland") do
     date_value("2024-01-31", entry.due_on)
     equal("2024-01-31", entry.as_json["due_on"])
@@ -90,6 +89,10 @@ end
 equal(Time, entry.observed_at.class)
 equal("2024-01-31 23:47:19.123456", entry.observed_at.getutc.strftime("%Y-%m-%d %H:%M:%S.%6N"))
 equal(Time, entry.opens_at.class)
+# A time column's index read casts through Type::Time, as the reader does: a
+# Time on its dummy date, 2000-01-01 (Rails' type/time.rb), not the stored text.
+equal(Time, entry[:opens_at].class)
+equal("2000-01-01 17:26:43", entry[:opens_at].getutc.strftime("%Y-%m-%d %H:%M:%S"))
 equal("17:26:43", entry.opens_at.getutc.strftime("%H:%M:%S"))
 equal(false, entry.observed_at.respond_to?(:>>))
 
