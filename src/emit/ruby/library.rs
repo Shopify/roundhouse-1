@@ -994,16 +994,21 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Opti
         .then_some(first)
 }
 
-/// Where the source defines `kid`: its first body position
-/// (`first_span`), or an earlier `class X` / `module X` of it in the
-/// same file that declares nothing (`App::library_class_declarations`).
-/// Ruby defines the constant at that one. Core's component/schema.rb
-/// forward-declares `class Validator; end` above `class_attribute
-/// :_validator_class, …, default: Validator` and writes the body at the
-/// bottom; placed by the body, the block followed the seed that reads
-/// it (NameError at load).
+/// Where the source defines `kid`: its superclass, which is in its
+/// header, else its first body position (`first_span`), or an earlier
+/// `class X` / `module X` of it in the same file that declares nothing
+/// (`App::library_class_declarations`). Ruby defines the constant at
+/// that one. Core's component/schema.rb forward-declares `class
+/// Validator; end` above `class_attribute :_validator_class, …,
+/// default: Validator` and writes the body at the bottom; placed by the
+/// body, the block followed the seed that reads it (NameError at load).
+/// A body can hold members the source wrote elsewhere: Core's
+/// checkouts/one web/client.rb `SessionNegotiationInputFromResult <
+/// SessionNegotiationInput` carries copies of its superclass's
+/// `class << self` methods, which put it above the module it includes.
 fn declared_at(kid: &LibraryClass, app: &App) -> Option<crate::span::Span> {
-    let first = first_span(kid)?;
+    let header = kid.parent_span;
+    let first = if header.file.0 != 0 && header != crate::span::Span::synthetic() { header } else { first_span(kid)? };
     Some(
         app.library_class_declarations
             .iter()

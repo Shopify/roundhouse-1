@@ -88,7 +88,23 @@ end
 "##;
 
 const CLIENT: &str = r##"class Client
+  module SessionHelper
+    def build_session(token)
+      "session #{token}"
+    end
+  end
+
   class Input
+    extend(SessionHelper)
+
+    class << self
+      def from_token(token)
+        new.tap { |input| input.session = build_session(token) }
+      end
+    end
+
+    attr_accessor :session
+
     def variables
       { "base" => true }
     end
@@ -101,6 +117,7 @@ const CLIENT: &str = r##"class Client
   end
 
   class InputFromResult < Input
+    extend(SessionHelper)
     include(FromResult)
 
     def initialize(result)
@@ -150,6 +167,7 @@ class NestedForwardDeclarationTest < ActiveSupport::TestCase
   test "a nested module stays above the sibling that includes it" do
     assert_equal "from r", Client::InputFromResult.new("r").from_result
     assert_equal({ "base" => true }, Client::InputFromResult.new("r").variables)
+    assert_equal "session t", Client::Input.from_token("t").session
   end
 
   test "a nested module another file writes above its includers stays above them" do
