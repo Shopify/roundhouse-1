@@ -10136,8 +10136,11 @@ module Kernel
   private def require(feature)
     return RoundhouseAutoload.autovivify(feature) if feature.is_a?(String) && RoundhouseAutoload.implicit?(feature)
     RoundhouseAutoload::REQUIRE_BEFORE_IMPLICIT_NAMESPACES.bind_call(self, feature)
-  rescue Exception
+  rescue Exception => e
     RoundhouseAutoload.restore_autoloads
+    first = RoundhouseAutoload.reload_failure(e)
+    RoundhouseAutoload.note_failed_load(e)
+    raise first if first
     raise
   end
 end
@@ -10211,6 +10214,37 @@ const AUTOLOAD_RUNTIME: &str = r##"
       end
       true
     end
+  end
+
+  # A require that raised: each file its error left loading (a
+  # `<top (required)>` frame of the error that is not on the stack now, nor
+  # a loaded feature) is noted with that error. Ruby loads such a file
+  # again on its next require and reruns what its first load ran; Core's
+  # StrictWarning raises the reload's "already initialized constant",
+  # which would hide the error that stopped the first load (one a file
+  # statement went on past, one a batch's earlier test file met).
+  def self.note_failed_load(error)
+    frames = error.backtrace_locations
+    return unless frames
+    loading = caller_locations.filter_map { |l| l.absolute_path if l.label == "<top (required)>" }
+    frames.each do |l|
+      next unless l.label == "<top (required)>" && (file = l.absolute_path)
+      next if loading.include?(file) || $LOADED_FEATURES.include?(file)
+      (@failed_loads ||= {})[file] ||= error
+    end
+  end
+
+  REDEFINITION_WARNING = /\A(.+?):\d+: warning: (?:already initialized constant|method redefined)/
+
+  # The error a file's first load raised (note_failed_load), for a
+  # reload's redefinition warning raised in that file: named, and raised
+  # in its place, as the reload fails only because the first load ran.
+  def self.reload_failure(error)
+    return unless @failed_loads && (m = REDEFINITION_WARNING.match(error.message.to_s))
+    first = @failed_loads[m[1]] || (File.exist?(m[1]) && @failed_loads[File.realpath(m[1])])
+    return unless first && !first.equal?(error)
+    $stderr.puts "roundhouse: error[reload_after_failed_load]: #{m[1]} loaded again after its first load raised #{first.class}: #{first.message.to_s.lines.first.to_s.chomp}; the reload raised #{error.message.to_s.lines.first.to_s.chomp}; raising the first load's error"
+    first
   end
 
   # A load-time dependency on a constant whose program loads it
@@ -10287,6 +10321,8 @@ const AUTOLOAD_RUNTIME: &str = r##"
   def self.file_statement(site)
     yield
   rescue StandardError, LoadError, NotImplementedError => e
+    e = reload_failure(e) || e
+    note_failed_load(e)
     $stderr.puts "roundhouse: error[file_statement_not_run]: the file-level statement at #{site} did not run: #{e.class}: #{e.message}"
   end
 
@@ -10297,6 +10333,8 @@ const AUTOLOAD_RUNTIME: &str = r##"
   def self.file_condition(site)
     yield
   rescue StandardError, LoadError, NotImplementedError => e
+    e = reload_failure(e) || e
+    note_failed_load(e)
     $stderr.puts "roundhouse: error[file_statement_not_run]: the file-level condition at #{site} did not run: #{e.class}: #{e.message}; neither branch ran"
     NOT_RUN
   end
