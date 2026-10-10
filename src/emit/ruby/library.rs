@@ -13451,9 +13451,13 @@ fn active_model_validation_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a
 }
 
 /// Whether `lc` includes ActiveModel::Validations: in its own body, a
-/// library superclass's, or an app module either includes.
+/// library superclass's, or an app module either includes; directly or
+/// through ActiveModel::API or ActiveModel::Model, which include it
+/// (runtime/spinel/cruby/active_model_api.rb).
 pub(crate) fn includes_active_model_validations(lc: &LibraryClass, app: &App) -> bool {
-    includes_module(lc, app, "ActiveModel::Validations")
+    ["ActiveModel::Validations", "ActiveModel::API", "ActiveModel::Model"]
+        .iter()
+        .any(|module| includes_module(lc, app, module))
 }
 
 pub(crate) fn includes_module(lc: &LibraryClass, app: &App, module: &str) -> bool {
