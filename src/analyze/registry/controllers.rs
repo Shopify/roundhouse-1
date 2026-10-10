@@ -337,6 +337,25 @@ pub(in crate::analyze) fn register(
                   "key_generator", "controller_class"] {
             request.instance_methods.insert(Symbol::from(m), Ty::Untyped);
         }
+        // `ActionDispatch::TestRequest`, Rails' Request subclass a test
+        // builds by hand (the CRuby overlay's runtime/
+        // action_dispatch_request.rb is one too), named by Core's
+        // `#: ::ActionDispatch::TestRequest`. Its surface is Request's;
+        // `create` keeps whatever the runtime signature answers.
+        let mut test_request = ClassInfo::default();
+        test_request.parent = Some(request_id.clone());
+        test_request.instance_methods = request.instance_methods.clone();
+        classes.entry(ClassId(Symbol::from("ActionDispatch::TestRequest"))).or_insert(test_request);
+        // `ActionDispatch::Http::Headers`, what `request.headers` builds
+        // over the env (runtime/ruby/action_dispatch/headers.rb, shared
+        // by both Request twins), with that port's surface.
+        let mut headers = ClassInfo::default();
+        headers.instance_methods.insert(Symbol::from("[]"), Ty::Untyped);
+        headers.instance_methods.insert(Symbol::from("fetch"), Ty::Untyped);
+        headers.instance_methods.insert(Symbol::from("key?"), Ty::Bool);
+        headers.instance_methods.insert(Symbol::from("include?"), Ty::Bool);
+        headers.class_methods.insert(Symbol::from("env_name"), Ty::Str);
+        classes.entry(ClassId(Symbol::from("ActionDispatch::Http::Headers"))).or_insert(headers);
         classes.insert(request_id.clone(), request);
         let request_ty = Ty::Class { id: request_id, args: vec![] };
         // A template reads `request` too — Rails' view context
