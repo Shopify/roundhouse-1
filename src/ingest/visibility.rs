@@ -194,6 +194,9 @@ pub(super) fn marker(call: &CallNode<'_>) -> bool {
 /// directly: a body Ruby class_evals on each includer, which this pass
 /// and `walk_decl_body` read as one. A block without a `def` keeps the
 /// concern collectors' handling (accessors, DSL calls, `private :name`).
+/// A `class << self` of definitions alone counts: class_eval'd on the
+/// includer it opens the includer's singleton class, so its defs are the
+/// includer's class methods (`included_singleton_definitions`).
 pub(super) fn included_block_with_defs<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
     if call.receiver().is_some()
         || call.arguments().is_some()
@@ -204,8 +207,27 @@ pub(super) fn included_block_with_defs<'pr>(call: &ruby_prism::CallNode<'pr>) ->
     let block = call.block()?.as_block_node()?;
     super::util::flatten_statements(block.body()?)
         .iter()
-        .any(|stmt| definition(stmt).is_some())
+        .any(|stmt| definition(stmt).is_some() || included_singleton_definitions(stmt).is_some())
         .then_some(block)
+}
+
+/// `class << self … end` directly in an `included do` block whose body
+/// is only `def`s and visibility markers: the defs, which Ruby makes the
+/// includer's class methods. Any other statement there (an
+/// `attr_accessor`, a DSL call) runs on the includer's singleton class,
+/// which is not modeled, so the statement keeps the collectors' refusal.
+pub(super) fn included_singleton_definitions<'pr>(node: &Node<'pr>) -> Option<Vec<ruby_prism::DefNode<'pr>>> {
+    let sc = node.as_singleton_class_node()?;
+    sc.expression().as_self_node()?;
+    let mut defs = Vec::new();
+    for stmt in sc.body().map(super::util::flatten_statements).unwrap_or_default() {
+        if let Some(def) = definition(&stmt) {
+            defs.push(def);
+        } else if !stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && c.block().is_none() && marker(&c)) {
+            return None;
+        }
+    }
+    (!defs.is_empty()).then_some(defs)
 }
 
 /// `private attr_reader :a, :b` / `protected attr_writer(:split)` /
