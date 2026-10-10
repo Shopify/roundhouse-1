@@ -6663,6 +6663,12 @@ impl Analyzer {
                     // `self.class.m` from an instance).
                     let (owner, definer, side) = match self.inherited_param_owner(defined, class_id, method, side) {
                         Some((owner, definer)) => (owner, definer, side),
+                        None if side == MethodReceiver::Class
+                            && self.extended_param_owner(defined, class_id, method).is_some() =>
+                        {
+                            let module = self.extended_param_owner(defined, class_id, method).unwrap();
+                            (module.clone(), module, MethodReceiver::Instance)
+                        }
                         None => {
                             let other = match side {
                                 MethodReceiver::Instance => MethodReceiver::Class,
@@ -6783,6 +6789,42 @@ impl Analyzer {
                 }
                 if defined.contains(&(module.clone(), method.clone(), side)) {
                     return Some((class.clone(), module.clone()));
+                }
+                if let Some(m) = self.classes.get(module) {
+                    modules.extend(m.includes.iter());
+                }
+            }
+            let Some(parent) = &info.parent else { break };
+            cur = self.lexical_parent(&cur, parent);
+        }
+        None
+    }
+
+    /// The module whose INSTANCE `def` a class-side call keyed to
+    /// `class` reaches through an `extend` on the class or an ancestor.
+    ///
+    /// `extend Mod` makes Mod's instance methods the class's singleton
+    /// methods, so a class-body DSL call (`pre_resolve_access
+    /// expression: any(...)` in a GraphQL type whose base class extends
+    /// `GraphApi::Authorization`) reaches the module's instance `def`.
+    /// Without this the site matched no `def` and the keyword kept only
+    /// its default's type: `expression: nil` typed `NilClass`, and
+    /// `expression.present?` downstream folded to the literal `false`.
+    /// The observation is keyed to the module itself — no concern fold
+    /// moves extend sites.
+    fn extended_param_owner(&self, defined: &BTreeSet<ParamKey>, class: &ClassId, method: &Symbol) -> Option<ClassId> {
+        let mut cur = class.clone();
+        for _ in 0..32 {
+            let Some(info) = self.classes.get(&cur) else { break };
+            // The last `extend` is the nearest singleton ancestor.
+            let mut modules: Vec<&ClassId> = info.extends.iter().collect();
+            let mut seen: BTreeSet<&ClassId> = BTreeSet::new();
+            while let Some(module) = modules.pop() {
+                if !seen.insert(module) {
+                    continue;
+                }
+                if defined.contains(&(module.clone(), method.clone(), MethodReceiver::Instance)) {
+                    return Some(module.clone());
                 }
                 if let Some(m) = self.classes.get(module) {
                     modules.extend(m.includes.iter());
@@ -9074,6 +9116,14 @@ fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param) ->
     match (observed, default) {
         (Some(o), Some(d)) => Some(crate::analyze::body::union_of(o, d)),
         (Some(o), None) => Some(o),
+        // A `nil` default says nothing about what a caller passes. With
+        // no typed call site the parameter is not "always nil": its
+        // callers are unseen (a class-body DSL call, an untyped argument)
+        // or absent. Typing it `NilClass` folded `expression.present?`
+        // to `false` in `GraphApi::Authorization#pre_resolve_access`,
+        // whose every caller is a class-body `pre_resolve_access
+        // expression: any(...)`, so each such type raised at load.
+        (None, Some(Ty::Nil)) => Some(Ty::Untyped),
         (None, Some(d)) => Some(d),
         (None, None) => None,
     }
