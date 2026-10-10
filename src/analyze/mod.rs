@@ -95,17 +95,16 @@ pub(crate) use body::union_of;
 pub use preload::{missing_preload_report, PreloadCoverage};
 
 use std::collections::BTreeSet;
-use crate::det::HashMap;
+use crate::det::{HashMap, HashSet};
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::DeclarationId;
 
 use crate::adapter::{DatabaseAdapter, SqliteAdapter};
 use crate::App;
 use crate::app::ParamKey;
-use crate::dialect::MethodReceiver;
 use crate::dialect::{
-    Action, Controller, ControllerBodyItem, Filter, FilterKind, LayoutDecl, MethodDef, Model,
-    ModelBodyItem, RenderTarget,
+    Action, Controller, ControllerBodyItem, Filter, FilterKind, LayoutDecl, LibraryClassOrigin,
+    MethodDef, MethodReceiver, Model, ModelBodyItem, RenderTarget,
 };
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -214,6 +213,9 @@ pub struct Analyzer {
     setup_scan: setup_scan::SetupScan,
     /// Library-class constant initializer typings across passes.
     init_memo: Vec<(ClassId, Vec<Option<InitTyping>>)>,
+    /// Registered Data factories that use the generated initializer, so
+    /// `.new` call-site types do not manufacture a source `initialize`.
+    data_factories_without_custom_initialize: HashSet<ClassId>,
     /// The controller/mailer→view channel as the last production
     /// typing pass harvested it. See [`ViewSeeds`].
     view_seeds: Option<ViewSeeds>,
@@ -1452,6 +1454,15 @@ impl Analyzer {
         superclass_binding::bind(app, &const_resolver, &mut classes);
 
         let data_factories = data::register(app, &const_resolver, &mut classes);
+        let data_factories_without_custom_initialize = app
+            .library_classes
+            .iter()
+            .filter(|class| {
+                matches!(class.origin, Some(LibraryClassOrigin::DataFactory { .. }))
+                    && !class.methods.iter().any(|method| method.name.as_str() == "initialize")
+            })
+            .map(|class| class.name.clone())
+            .collect();
 
         Self {
             classes,
@@ -1480,6 +1491,7 @@ impl Analyzer {
             typed_constants: IdentityHashMap::default(),
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
+            data_factories_without_custom_initialize,
             fixpoint_rounds: FixpointRounds::default(),
             constant_rounds: 0,
             incremental: incremental::Incremental::new(incremental::Mode::from_env()),
@@ -7511,7 +7523,9 @@ impl Analyzer {
                         Some(_) => MethodReceiver::Instance,
                     };
                     for class_id in recv_classes {
-                        if record_initialize {
+                        if record_initialize
+                            && !self.data_factories_without_custom_initialize.contains(&class_id)
+                        {
                             out.push((
                                 class_id.clone(),
                                 Symbol::from("initialize"),

@@ -949,9 +949,11 @@ impl Visibility {
         }
     }
 
-    /// Walk one lexical body. A refusal keeps the innermost statement
-    /// as its site; a body that walks clean hands the enclosing
-    /// statement back to the caller's refusals.
+    /// Walk one lexical body, starting public. A refusal keeps the innermost
+    /// statement as its site; a body that walks clean hands the enclosing
+    /// statement back to the caller's refusals. Nested classes and recognized
+    /// Data factory blocks have separate declaration passes, so their methods
+    /// and visibility markers do not affect this scope.
     fn walk(
         &mut self,
         body: Option<Node<'_>>,
@@ -1194,6 +1196,9 @@ impl Visibility {
             }
             // Nested classes have their own declaration pass and namespace.
             if node.as_class_node().is_some() {
+                continue;
+            }
+            if super::data_factory::declaration(node).is_some() {
                 continue;
             }
             if let Some(module) = node.as_module_node() {

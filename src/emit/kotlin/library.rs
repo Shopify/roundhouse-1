@@ -1182,6 +1182,31 @@ fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
     }
 
+    // Signal 1.25: `initialize` assigns the ivar an object (`@cache_control
+    // = CacheControlStore.new`) and nothing assigns it a nilable value. A
+    // READ carries `T | nil` (unset before `initialize`), which signal 1.5
+    // would take first, but the slot is never nil once constructed.
+    let mut nilable_assigned: HashSet<String> = HashSet::default();
+    for m in methods {
+        collect_nilable_ivar_assigns(&m.body, &mut nilable_assigned);
+    }
+    for m in methods.iter().filter(|m| m.name.as_str() == "initialize") {
+        let stmts: Vec<&Expr> = match &*m.body.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            _ => vec![&m.body],
+        };
+        for st in stmts {
+            if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*st.node {
+                let n = camel(name.as_str());
+                if let Some(ty @ Ty::Class { .. }) = value.ty.as_ref() {
+                    if !nilable_assigned.contains(&n) {
+                        out.entry(n).or_insert_with(|| ty.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // Signal 1.5: a concrete `Ty` carried on an ivar read/assign node (the
     // typer often knows it — e.g. `@comments_cache` reads as
     // `Array[Comment]` from the has_many association) — for ivars not
@@ -1218,6 +1243,24 @@ fn collect_ivar_node_types(e: &Expr, out: &mut BTreeMap<String, Ty>) {
     }
     for child in expr_children(e) {
         collect_ivar_node_types(child, out);
+    }
+}
+
+/// Ivars some assignment gives a nil or nil-able value.
+fn collect_nilable_ivar_assigns(e: &Expr, out: &mut HashSet<String>) {
+    if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*e.node {
+        let nilable = match value.ty.as_ref() {
+            Some(Ty::Nil) => true,
+            Some(Ty::Union { variants }) => variants.iter().any(|v| matches!(v, Ty::Nil)),
+            None | Some(Ty::Untyped | Ty::Var { .. }) => true,
+            _ => false,
+        };
+        if nilable {
+            out.insert(camel(name.as_str()));
+        }
+    }
+    for child in expr_children(e) {
+        collect_nilable_ivar_assigns(child, out);
     }
 }
 

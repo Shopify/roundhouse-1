@@ -271,6 +271,13 @@ pub const FROM_PARAMS_EXPECT: u64 = 1 << 28;
 /// refusal stub.
 pub const CONSTRUCTOR_KEYWORDS_AS_WRITTEN: u64 = 1 << 29;
 
+/// A statement whose value the enclosing sequence discards (not its tail).
+pub const DISCARDED_VALUE: u64 = 1 << 9;
+
+/// A `Preloader.new(records:, associations:).call` the analyzer admitted:
+/// discarded, over one model's records. Only this one lowers.
+pub const ADMITTED_PRELOADER_CALL: u64 = 1 << 10;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by

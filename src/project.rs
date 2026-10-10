@@ -1430,16 +1430,30 @@ fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(
         return Ok(());
     }
     // A `Struct.new`/`Data.define` body block is emitted around the
-    // runtime's own factory, which only the Ruby family has.
-    if let Some(class) = app.library_classes.iter().find(|class| {
-        matches!(class.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
-    }) {
-        return Err(format!(
-            "{}: {} is built by a Struct.new/Data.define body block, which this target has no \
-             representation for; use Ruby or Spinel",
+    // runtime's own factory, which only the Ruby family has. Each one is
+    // named at its factory call; the Data factories the analyzer admitted
+    // (below) are named the same way.
+    let mut found = false;
+    for class in &app.library_classes {
+        let Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }) = &class.origin else {
+            continue;
+        };
+        found = true;
+        let construct = match &*factory.node {
+            crate::expr::ExprNode::Send { recv: Some(recv), method, .. }
+                if matches!(&*recv.node, crate::expr::ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "Struct"))
+                    && method.as_str() == "new" => "Struct.new",
+            _ => "Data.define",
+        };
+        emit::diagnostics::report_unsupported(
+            factory.span,
             target.as_str(),
-            class.name.0.as_str()
-        ));
+            construct,
+            &format!(
+                "{} is built by a body block, which this target has no representation for; use Ruby or Spinel",
+                class.name.0.as_str()
+            ),
+        );
     }
     // A file of constants alone (`RemoteDomain = DomainSubscription`)
     // is written as those constants at the top level, which only the
@@ -1466,12 +1480,11 @@ fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(
         }
         expr.node.for_each_child(&mut |child| visit(child, target, found));
     }
-    let mut found = false;
     crate::lower::for_each_forwarding_body_ref(app, &mut |expr| {
         visit(expr, target.as_str(), &mut found);
     });
     if found {
-        return Err(format!("{}: Data.define is not supported; use Ruby or Spinel", target.as_str()));
+        return Err(format!("{}: Data.define/Struct.new factories are not supported; use Ruby or Spinel", target.as_str()));
     }
     Ok(())
 }
@@ -4023,6 +4036,7 @@ fn ruby_family_files(
              # commonmark-java Markly shim — from the same list, minus that\n\
              # one name.)\n\
              require_relative \"module_delegate\"\n\
+             require_relative \"open_telemetry_facade\"\n\
              require_relative \"rails_configuration\"\n\
              require_relative \"rails_autoloaders\"\n\
              {}{}{}",
@@ -4060,6 +4074,7 @@ fn ruby_family_files(
                  require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
              require_relative \"rails_autoloaders\"\n\
+                 require_relative \"open_telemetry_facade\"\n\
                  {}{}",
                 markly_require,
                 gem_require_block(&jruby_excluded, app.gem_lock.as_ref()),
@@ -12789,6 +12804,14 @@ fn spinel_files_with_assertions(
         // spin_shape replaces it with `require "nokogiri"` (spinel-nokogiri)
         // when the app names Nokogiri.
         "nokogiri_facade",
+        // OpenTelemetry's non-recording-span stub — never swapped for a
+        // real gem (see the file's own header); still its own file, same
+        // whole-file-grain reasoning. `gem_facades.rb`'s own
+        // `require_relative` anchors it for Spinel; the CRuby/JRuby
+        // rewrite below (which replaces that file's content outright)
+        // carries its own matching `require_relative` so it is never
+        // dropped there.
+        "open_telemetry_facade",
         "inflector",
         "inflector_ext",
         "json_builder",

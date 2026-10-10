@@ -2616,6 +2616,17 @@ impl<'a> BodyTyper<'a> {
                     Some(r) => Some(self.analyze_expr(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
+                // Not a value: Rails' `call` answers the loaders, which `preload_associations` does not.
+                if crate::lower::preloader::LOWERS_TO_MODEL_LOADER
+                    && method.as_str() == "call" && args.is_empty() && block.is_none()
+                    && expr.decisions & crate::expr::DISCARDED_VALUE != 0
+                    && let Some(r) = recv.as_mut()
+                    && crate::lower::preloader::preloader_new(r, |id| self.classes().get(id).is_some_and(|c| c.table.is_some())).is_some()
+                {
+                    crate::lower::preloader::clear_refusals(r);
+                    expr.decisions |= crate::expr::ADMITTED_PRELOADER_CALL;
+                    return Ty::Nil;
+                }
                 // Inside the class-side method, the instance a class-side
                 // `new` built (`Ty::SelfInstance`, see below) answers the
                 // methods of the class the `def` sits in: the receiving
@@ -3497,7 +3508,11 @@ impl<'a> BodyTyper<'a> {
                         }
                         _ => false,
                     };
+                    let tail = i + 1 == exprs.len();
                     let e = &mut exprs[i];
+                    if !tail {
+                        e.decisions |= crate::expr::DISCARDED_VALUE;
+                    }
                     if !matches!(&*e.node, ExprNode::Assign { target: LValue::Var { .. }, .. }) {
                         forget_class_object_writes(e, &mut local_ctx);
                     }
