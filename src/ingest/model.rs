@@ -1687,11 +1687,18 @@ pub(super) fn expand_enum_decl(
         })
         .collect::<Option<Vec<_>>>();
     let writes = mapping_constant_writes(&mapping_node, file)?;
+    // The declaration's comments ride the first item, so with constant
+    // writes ahead of the generated items they move to the first write.
+    let mut doc_comments = if writes.is_empty() {
+        Vec::new()
+    } else {
+        std::mem::take(items[0].leading_comments_mut())
+    };
     items.splice(
         0..0,
         writes.into_iter().map(|expr| ModelBodyItem::Unknown {
             expr,
-            leading_comments: Vec::new(),
+            leading_comments: std::mem::take(&mut doc_comments),
             leading_blank_line: false,
         }),
     );

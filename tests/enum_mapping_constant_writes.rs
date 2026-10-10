@@ -1,6 +1,6 @@
 //! An enum mapping that assigns its constants as it is built.
 //!
-//! Core's `markets_pro/flow_commerce/application.rb`:
+//! A mapping may define a constant for each label as it is written:
 //!
 //! ```ruby
 //! enum :status, { pending: PENDING = "pending", … }
@@ -44,4 +44,35 @@ puts "enum constants"
     assert!(parse_errors.is_empty(), "{parse_errors:?} in:\n{source}");
     run.assert_passes();
     assert_eq!(run.stdout, "enum constants\n");
+}
+
+/// The comment above an `enum` rides its first class-body item, which is
+/// the first constant write, so it stays above the constants.
+#[test]
+fn the_enums_comment_stays_above_its_constant_writes() {
+    use roundhouse::ModelBodyItem;
+
+    let source = br#"
+class Article < ApplicationRecord
+  # Titles with a fixed vocabulary.
+  enum :title, {
+    one: ONE = "one",
+    two: TWO = "two",
+  }
+end
+"#;
+    let schema = roundhouse::schema::Schema::default();
+    let model = roundhouse::ingest::ingest_model(source, "<inline>", &schema, &Default::default())
+        .unwrap()
+        .unwrap();
+
+    let ModelBodyItem::Unknown { leading_comments, .. } = &model.body[0] else {
+        panic!("expected the first constant write first, got {:?}", model.body[0]);
+    };
+    assert_eq!(leading_comments.len(), 1);
+    assert_eq!(leading_comments[0].text.as_str(), "# Titles with a fixed vocabulary.");
+    assert!(matches!(model.body[1], ModelBodyItem::Unknown { .. }));
+    for item in &model.body[1..] {
+        assert!(item.leading_comments().is_empty(), "comment duplicated on {item:?}");
+    }
 }

@@ -1862,10 +1862,9 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
         // A range binds looser than every infix operator and `||`/`&&`:
-        // Core's `search_ranges << (start...limit)` written bare is
-        // `(search_ranges << start)...limit`, which pushes the Integer
-        // (and `ruby -w` flags the range as void), and `(a..b) == r` bare
-        // is `a..(b == r)`.
+        // `out << (start...limit)` written bare is `(out << start)...limit`,
+        // which pushes the Integer (and `ruby -w` flags the range as
+        // void), and `(a..b) == r` bare is `a..(b == r)`.
         ExprNode::Range { .. } => Some(".."),
         _ => None,
     }
@@ -1883,7 +1882,7 @@ fn binop_prec(op: &str) -> u8 {
         "&" => 55,
         "|" | "^" => 50,
         ">" | ">=" | "<" | "<=" => 40,
-        "==" | "!=" | "<=>" | "=~" | "===" => 30,
+        "==" | "!=" | "<=>" | "=~" | "!~" | "===" => 30,
         // Below every infix operator above; `&&` binds tighter than `||`,
         // and the `and`/`or` word forms are the loosest of all.
         "&&" => 26,

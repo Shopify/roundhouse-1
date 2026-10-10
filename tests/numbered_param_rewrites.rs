@@ -3,12 +3,10 @@
 //!
 //! - `rows.map { _1.values_at(*keys) }` was rewritten to
 //!   `keys.map { |__k| _1[__k] }`, and a block with an ordinary
-//!   parameter cannot read the outer block's `_1` (Core's
-//!   `resource_feedbacks/bulk_writer.rb`).
-//! - `value.tap { _1.delete!("​") }` was rewritten to
-//!   `_1 = _1.delete(…)`, and `_1` cannot be assigned (Core's
-//!   `selected_options_loader_common.rb`); the tapped string was also
-//!   left unchanged.
+//!   parameter cannot read the outer block's `_1`.
+//! - `value.tap { _1.delete!("\u200b") }` was rewritten to
+//!   `_1 = _1.delete(…)`, and `_1` cannot be assigned; the tapped
+//!   string was also left unchanged.
 //!
 //! Native Ruby on the same source is the oracle.
 
@@ -24,13 +22,13 @@ const PROBE: &str = r##"module Numlab
     end
 
     def self.clean(value)
-      value&.strip&.tap { _1.delete!("​") }
+      value&.strip&.tap { _1.delete!("\u200b") }
     end
 
     def self.report
       [
         values([{ a: 1, b: 2 }, { a: 3 }], [:b, :a]),
-        clean(" a​b "),
+        clean(" a\u200bb "),
         clean(nil),
       ]
     end

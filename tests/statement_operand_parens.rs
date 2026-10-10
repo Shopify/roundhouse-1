@@ -1,10 +1,10 @@
 //! A statement-shaped operand keeps the parentheses its position needs.
 //!
-//! Two shapes of Core's r17 emit did not parse:
+//! Two shapes did not parse:
 //!
-//! - a splatted modifier conditional, `[*(handles unless ready), :z]`
-//!   (six files), was written bare, `[*handles unless ready, :z]`, where
-//!   the modifier ends the array element;
+//! - a splatted modifier conditional, `[*(handles unless ready), :z]`,
+//!   was written bare, `[*handles unless ready, :z]`, where the modifier
+//!   ends the array element;
 //! - a multiple assignment as a condition,
 //!   `return unless (previous, current = record.status_change)`, lost
 //!   its parentheses, and `unless a, b = pair` does not parse.
