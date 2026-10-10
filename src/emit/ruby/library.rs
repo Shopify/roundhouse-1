@@ -1006,9 +1006,22 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Opti
 /// checkouts/one web/client.rb `SessionNegotiationInputFromResult <
 /// SessionNegotiationInput` carries copies of its superclass's
 /// `class << self` methods, which put it above the module it includes.
+/// One with no position of its own is placed at its declaration when
+/// the source declares it in one file: hedwig's
+/// configuration/enqueue_retry_handler.rb `module Interface`, whose
+/// sig-only body carries nothing, above the class that includes it.
 fn declared_at(kid: &LibraryClass, app: &App) -> Option<crate::span::Span> {
     let header = kid.parent_span;
-    let first = if header.file.0 != 0 && header != crate::span::Span::synthetic() { header } else { first_span(kid)? };
+    let first = if header.file.0 != 0 && header != crate::span::Span::synthetic() {
+        header
+    } else if let Some(first) = first_span(kid) {
+        first
+    } else {
+        let declared: Vec<crate::span::Span> =
+            app.library_class_declarations.iter().filter(|(name, _)| *name == kid.name).map(|(_, at)| *at).collect();
+        let first = declared.iter().min_by_key(|at| at.start)?;
+        return declared.iter().all(|at| at.file == first.file).then_some(*first);
+    };
     Some(
         app.library_class_declarations
             .iter()

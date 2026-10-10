@@ -190,3 +190,42 @@ fn a_forward_declared_nested_class_loads_before_the_body_statements_below_it() {
         .run_test("test/models/nested_forward_declaration_test.rb")
         .assert_passes();
 }
+
+/// A nested module whose body keeps no member of its own (hedwig's
+/// configuration/enqueue_retry_handler.rb: `module Interface` holds only
+/// `extend T::Sig`, `interface!` and abstract sig-only methods) above the
+/// sibling class that includes it. With no position, the module was
+/// written after the class: NameError at load, so `Hedwig::Configuration`
+/// never loaded and its `run_load_hooks(:hedwig)` never fired.
+const HANDLER: &str = r##"class Handler
+  module Interface
+  end
+
+  class InMemory
+    include Interface
+
+    def label
+      "in memory"
+    end
+  end
+end
+"##;
+
+const HANDLER_TEST: &str = r##"require "test_helper"
+
+class PositionlessNestedModuleTest < ActiveSupport::TestCase
+  test "a nested module with no members stays above the sibling that includes it" do
+    assert_equal "in memory", Handler::InMemory.new.label
+    assert Handler::InMemory.include?(Handler::Interface)
+  end
+end
+"##;
+
+#[test]
+fn a_nested_module_with_no_members_loads_before_the_sibling_that_includes_it() {
+    emit_and_run::empty_app()
+        .write("app/models/handler.rb", HANDLER)
+        .write("test/models/positionless_nested_module_test.rb", HANDLER_TEST)
+        .run_test("test/models/positionless_nested_module_test.rb")
+        .assert_passes();
+}
