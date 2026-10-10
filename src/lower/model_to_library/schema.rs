@@ -114,8 +114,13 @@ pub(super) fn push_schema_methods(
             // model body must win, and `push_user_methods` runs after
             // this and drops collisions — so the synthesized writer
             // yields here (same dance as `synth_belongs_to_writer`).
+            // The ruby family keeps it beside the model's def: it lands in
+            // GeneratedAttributeMethods, where the def's `super` finds it
+            // (activerecord attribute_methods.rb `define_attribute_methods`).
             let writer_name = Symbol::from(format!("{}=", col.name.as_str()));
-            if !super::associations::model_defines_instance_method(model, &writer_name) {
+            if crate::emit::ruby::native_keywords()
+                || !super::associations::model_defines_instance_method(model, &writer_name)
+            {
                 methods.push(synth_temporal_writer(owner, col));
             }
         }

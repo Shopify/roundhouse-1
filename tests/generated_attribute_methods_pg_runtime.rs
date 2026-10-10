@@ -16,6 +16,7 @@ const STRUCTURE: &str = r#"CREATE TABLE shops (
     id bigserial NOT NULL,
     name character varying,
     code character varying,
+    seen_at timestamp without time zone,
     CONSTRAINT shops_pkey PRIMARY KEY (id)
 );
 "#;
@@ -107,6 +108,10 @@ const SHOP: &str = r##"class Shop < ApplicationRecord
   def code?
     super && code != "none"
   end
+
+  def seen_at=(value)
+    super(value.to_s.start_with?("2") ? value : nil)
+  end
 end
 "##;
 
@@ -125,6 +130,10 @@ const PROBE: &str = r##"class GeneratedAttributesProbe
     out << "persisted: #{t.name.inspect} #{t.code.inspect} #{t.trace.inspect}"
     t.code = "none"
     out << "predicate: #{t.code?} #{Shop.new.code?}"
+    s.seen_at = "2026-01-02 03:04:05"
+    kept = s.seen_at.strftime("%F %T")
+    s.seen_at = "garbage"
+    out << "temporal writer: #{kept} #{s.seen_at.inspect} #{Shop.instance_method(:seen_at=).super_method.owner}"
     out << "owners: #{Shop.instance_method(:name=).owner} #{Shop.instance_method(:name=).super_method.owner} #{Shop.instance_method(:code=).owner}"
     at = Shop.ancestors.index(Shop.instance_method(:name=).super_method.owner)
     out << "ancestor: #{at > 0 && at < Shop.ancestors.index(ApplicationRecord)}"
@@ -141,11 +150,12 @@ require_relative "vendor/gems/tracing-1.0.0/lib/tracing"
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 6] = [
+const EXPECTED: [&str; 7] = [
     r#"writers: "a" "x" ["code=x"]"#,
     r#"macro writer clears: nil y"#,
     r#"persisted: "a" "y" []"#,
     r#"predicate: false false"#,
+    r#"temporal writer: 2026-01-02 03:04:05 nil Shop::GeneratedAttributeMethods"#,
     r#"owners: Shop Shop::GeneratedAttributeMethods Shop"#,
     r#"ancestor: true"#,
 ];
@@ -204,6 +214,8 @@ fn column_accessors_are_written_in_the_generated_module() {
     let module_body = &shop[module..include];
     assert!(module_body.contains("    def code=("), "{shop}");
     assert!(module_body.contains("    def name"), "{shop}");
+    // A temporal column's writer stays in the module beside the class's own override.
+    assert!(module_body.contains("    def seen_at=("), "{shop}");
     assert!(!module_body.contains("strip"), "{shop}");
     assert!(shop[include..].contains("super(value.to_s.strip)"), "{shop}");
     assert!(shop[include..].contains("clears_cache_on"), "{shop}");
