@@ -186,6 +186,10 @@ pub const BODY_STATEMENT: u64 = 1 << 26;
 /// methods): Ruby runs it with the singleton class as `self`, definee
 /// and innermost lexical scope. The Ruby family writes it back inside a
 /// `class << self … end` of its own, in place.
+///
+/// On the `extend M` a `class << self; include M; end` is ingested as:
+/// the Ruby family writes the `include` back in a `class << self`, so
+/// `M.included` fires with the singleton class, as in Ruby.
 pub const SINGLETON_BODY: u64 = 1 << 27;
 
 /// Whether `expr` is a [`SELF_BINDING`] cast.

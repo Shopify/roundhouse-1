@@ -2899,7 +2899,12 @@ end
     // statement shape is left to it, `initializer_programs::collect`).
     if declared_database_adapter(vfs, dir).ok().flatten().is_some_and(|(adapter, _)| adapter == "postgresql") {
         let (class_hooks, fired) =
-            super::initializer_programs::class_load_hooks(&sources, dir, &app.initializer_files);
+            super::initializer_programs::class_load_hooks(
+                &sources,
+                dir,
+                &app.initializer_files,
+                &super::initializer_programs::known_constants(&app),
+            );
         app.class_load_hooks = class_hooks;
         let load_path: Vec<PathBuf> = std::iter::once(dir.join("lib"))
             .chain(path_gems.iter().map(|gem| gem.join("lib")))

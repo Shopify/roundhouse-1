@@ -4196,10 +4196,17 @@ fn walk_decl_body_in<'pr>(
                                 args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
                             })
                         {
+                            // Ruby's `include` fires `M.included(singleton)`,
+                            // not `M.extended`: the Ruby family writes it
+                            // back as that `include` in a `class << self`
+                            // (`expr::SINGLETON_BODY`). activeresource
+                            // 6.2.0's ThreadsafeAttributes extends its
+                            // `ClassMethods` onto the singleton there.
                             if let Ok(mut e) = ingest_expr(&stmt, file) {
                                 if let ExprNode::Send { method, .. } = &mut *e.node {
                                     *method = Symbol::from("extend");
                                 }
+                                e.decisions |= crate::expr::SINGLETON_BODY;
                                 out.unknown_calls.push(e);
                             }
                             continue;

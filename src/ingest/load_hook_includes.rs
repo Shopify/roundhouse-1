@@ -66,7 +66,12 @@ pub(super) fn lift<V: Vfs + ?Sized>(
     sources: &[SourceFile],
     boot_initializers: &[PathBuf],
 ) {
-    let (sites, _) = super::initializer_programs::class_load_hooks(sources, dir, &app.initializer_files);
+    let (sites, _) = super::initializer_programs::class_load_hooks(
+        sources,
+        dir,
+        &app.initializer_files,
+        &super::initializer_programs::known_constants(app),
+    );
     let mut lifted_from: crate::det::HashSet<crate::span::FileId> = crate::det::HashSet::default();
     // What `qualify_relative_includes` resolves against.
     let known: Known =

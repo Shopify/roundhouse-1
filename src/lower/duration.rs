@@ -116,13 +116,9 @@ pub fn apply_duration_lowering(app: &mut App) {
 /// operand, and the arithmetic rewrite hides one behind `.to_i` — after
 /// it runs, `<t> - <dur>` is no longer distinguishable from the numeric
 /// `Time - Time` shape.
-pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool) {
-    apply_duration_rewrites_on(body, temporal_predicates, false);
-}
-
-/// [`apply_duration_rewrites`] on a tree that does (`zone_port`) or
-/// does not carry the time zone port, which keeps `<t> ± <dur>` (see
-/// the module header).
+///
+/// On a tree that carries the time zone port (`zone_port`) `<t> ± <dur>`
+/// is kept (see the module header).
 pub(crate) fn apply_duration_rewrites_on(body: &mut Expr, temporal_predicates: bool, zone_port: bool) {
     rewrite_durations(body);
     if temporal_predicates {

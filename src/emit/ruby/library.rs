@@ -6302,10 +6302,14 @@ fn is_url_helpers_chain(e: &Expr) -> bool {
 /// Delete when the view pipeline migrates to shared lowerings. Every
 /// other body class arrives already grounded (re-running is an
 /// idempotent no-op — `Time.current` no longer occurs).
+///
+/// A PostgreSQL tree's views keep Rails' zone-aware `Time.current`
+/// (`lower::time_current::carries_zone_port`), as its other bodies do.
 pub(crate) fn apply_time_current_lowering(lcs: &mut [LibraryClass], app: &App) {
+    let zone_port = crate::lower::time_current::carries_zone_port(app);
     for lc in lcs.iter_mut() {
         for m in &mut lc.methods {
-            crate::lower::time_current::rewrite_time_current(&mut m.body, &app.time_formats);
+            crate::lower::time_current::rewrite_time_current_on(&mut m.body, &app.time_formats, zone_port);
         }
     }
 }
@@ -6322,7 +6326,7 @@ pub(crate) fn apply_time_current_lowering(lcs: &mut [LibraryClass], app: &App) {
 /// The Time-vs-Duration comparison rule reads a receiver type the view
 /// pipeline doesn't stamp, so in practice only the unit, predicate and
 /// arithmetic rules bite here; running the full sequence keeps the one
-/// order declaration (`lower::duration::apply_duration_rewrites`).
+/// order declaration (`lower::duration::apply_duration_rewrites_on`).
 /// Ruby-family pre-emit pass: a fixture ACCESSOR is memoized, because
 /// Rails' is.
 ///
@@ -6478,9 +6482,10 @@ fn memoized_fixture_body(label: &Symbol, lookup: &Expr) -> Expr {
 
 pub(crate) fn apply_duration_lowering(lcs: &mut [LibraryClass], app: &App) {
     let temporal_predicates = !crate::lower::duration::app_defines_temporal_predicates(app);
+    let zone_port = crate::lower::time_current::carries_zone_port(app);
     for lc in lcs.iter_mut() {
         for m in &mut lc.methods {
-            crate::lower::duration::apply_duration_rewrites(&mut m.body, temporal_predicates);
+            crate::lower::duration::apply_duration_rewrites_on(&mut m.body, temporal_predicates, zone_port);
         }
     }
 }
@@ -9338,7 +9343,7 @@ fn emit_library_class_decl_inner(
     let mut flowing_statements: Vec<&Expr> = Vec::new();
     if super::expr::native_keywords() && !railtie {
         for call in lc.unknown_calls.iter().filter(|c| is_body_statement(c)) {
-            match body_statement_place(lc, call) {
+            match body_statement_place(lc, call, app) {
                 Some(Some(at)) => positioned_statements.push((at, call)),
                 Some(None) => flowing_statements.push(call),
                 None => {}
@@ -12019,7 +12024,7 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
     // A Concern's own body statement runs once, on the module, as the
     // module loads (its `included do` is what runs on each includer);
     // the emitted module is a plain one its includers include.
-    if !replays && !self_calls_answered(lc, call) {
+    if !replays && !self_calls_answered(lc, call) && !singleton_answered_by_app(lc, call, app) {
         return false;
     }
     // The emitted module writes no `extend ActiveSupport::Concern`
@@ -12031,7 +12036,41 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
     {
         return false;
     }
-    body_statement_place(lc, call).is_some()
+    body_statement_place(lc, call, app).is_some()
+}
+
+/// Whether `call`, a body statement of `lc`'s `class << self`
+/// (`expr::SINGLETON_BODY`), runs on a singleton class no runtime base
+/// gives methods to: `lc` is a module, or a class whose superclasses are
+/// the app's own classes up to a core class. What it calls is then the
+/// singleton's Ruby methods or what the app's own code gives it, so the
+/// tree runs it as Ruby does. activeresource 6.2.0's `ActiveResource::Base`
+/// has `class << self; include ThreadsafeAttributes; threadsafe_attribute
+/// :_headers, …`: the include's `included` hook extends the singleton with
+/// the macro.
+fn singleton_answered_by_app(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    if call.decisions & crate::expr::SINGLETON_BODY == 0 {
+        return false;
+    }
+    if lc.is_module {
+        return true;
+    }
+    let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
+    let mut parent = lc.parent.as_ref();
+    while let Some(p) = parent {
+        let name = p.0.as_str().trim_start_matches("::");
+        if is_core_class_name(name) {
+            return true;
+        }
+        if is_model_named(name, app) || seen.contains(&name) {
+            return false;
+        }
+        let classes = library_classes_named(name, app);
+        let Some(class) = classes.iter().find(|c| !c.is_module) else { return false };
+        seen.push(name);
+        parent = class.parent.as_ref();
+    }
+    true
 }
 
 /// Where a carried body statement is written: `Some(None)` among the
@@ -12042,7 +12081,7 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
 /// in source order, or a def is above it and a constant, replayed call or
 /// class-side initializer the body runs before the defs is below it (a
 /// body statement below it is written after it, below the same def).
-fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>> {
+fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Option<usize>> {
     let here = |span: Span| !span.is_synthetic() && span.file == call.span.file;
     let above = |span: Span| here(span) && span.start < call.span.start;
     let below = |span: Span| here(span) && span.start > call.span.start;
@@ -12085,6 +12124,10 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
     // identity_client's `LEGACY_METHODS = LEGACY_ATTR_WRITERS + [...]`
     // below its `LEGACY_ATTR_WRITERS.each do |a| define_method(...) end`.
     let defines_only = only_defines(call);
+    // A replayed call that runs the class's own code (`self.format =
+    // :json` through the body's `def self.format=`) is a tail effect,
+    // written after every def (`tail_effects`), so after the statement.
+    let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
     let later_effect = lc
         .constants
         .iter()
@@ -12093,7 +12136,12 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
         .chain(
             lc.unknown_calls
                 .iter()
-                .filter(|c| !is_body_statement(c) && !(defines_only && defines_apart(lc, call, c)))
+                .filter(|c| {
+                    !is_body_statement(c)
+                        && !(defines_only && defines_apart(lc, call, c))
+                        && !own.runs(c)
+                        && !commutes_with_singleton_statement(call, c, app)
+                })
                 .map(|c| c.span),
         )
         .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
@@ -12102,6 +12150,35 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
         return None;
     }
     Some(Some(defs.iter().find(|(_, span)| below(*span)).map(|(i, _)| *i).unwrap_or(lc.methods.len())))
+}
+
+/// Whether `later`, a replayed call the body writes before its defs,
+/// leaves `statement`, a body statement of the class's `class << self`
+/// (`expr::SINGLETON_BODY`) the source has above it, as Ruby leaves it
+/// when run first: an instance-side `alias_method`, which the singleton
+/// does not reach, or an `extend` of modules whose `self.extended` the
+/// app does not define, whose methods the singleton's own (what the
+/// statement defines) come before however the two are ordered.
+/// activeresource 6.2.0's `ActiveResource::Base` ends its body with
+/// `extend ActiveModel::Naming` and `alias_method
+/// :respond_to_without_attributes?, :respond_to?` below its `class <<
+/// self; threadsafe_attribute :_headers, …`.
+fn commutes_with_singleton_statement(statement: &Expr, later: &Expr, app: &App) -> bool {
+    if statement.decisions & crate::expr::SINGLETON_BODY == 0 {
+        return false;
+    }
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*later.node else { return false };
+    match method.as_str() {
+        "alias_method" => true,
+        "extend" => !args.is_empty() && args.iter().all(|arg| {
+            let ExprNode::Const { path } = &*arg.node else { return false };
+            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            library_classes_named(name.trim_start_matches("::"), app).iter().all(|m| {
+                !m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "extended")
+            })
+        }),
+        _ => false,
+    }
 }
 
 /// Whether all `call` does as the body loads is define methods: it

@@ -273,6 +273,19 @@ pub fn emit_expr(e: &Expr) -> String {
         let body = if text.contains("<<") { text.to_string() } else { indent_lines(text, 1) };
         return format!("class << self\n{body}\nend");
     }
+    // `class << self; include M; end`, ingested as `extend M`
+    // (`SINGLETON_BODY` on the call): the `include`, which fires
+    // `M.included` with the singleton class where `extend` fires
+    // `M.extended`.
+    if e.decisions & crate::expr::SINGLETON_BODY != 0
+        && native_keywords()
+        && let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && method.as_str() == "extend"
+        && !args.is_empty()
+    {
+        let modules: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("class << self\n  include {}\nend", modules.join(", "));
+    }
     // A replayed `NAME = value` the source wrote in `class << self`
     // (`SINGLETON_CONSTANT_WRITE`).
     if e.decisions & crate::expr::SINGLETON_CONSTANT_WRITE != 0

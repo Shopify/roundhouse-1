@@ -175,10 +175,20 @@ pub(super) struct FiredHooks {
 /// without a word: neither the model nor the library-class ingest carries
 /// an explicit-receiver class-body call.) Those inside a method fire when
 /// the method runs; their names count as fired.
+///
+/// A relative constant base resolves as Ruby's lexical lookup would at
+/// the call, against the scopes enclosing it: activeresource 6.2.0's
+/// base.rb ends `module ActiveResource` with
+/// `ActiveSupport.run_load_hooks(:active_resource, Base)`, and the call
+/// the emitted file runs outside that body names `ActiveResource::Base`.
+/// A scope's constant counts when this file or `known` (the app's
+/// classes and modules) declares it; one neither declares stays as
+/// written, for the top level.
 pub(super) fn class_load_hooks(
     sources: &[crate::span::SourceFile],
     dir: &Path,
     skip: &[String],
+    known: &crate::det::HashSet<String>,
 ) -> (Vec<ClassLoadHook>, FiredHooks) {
     let mut hooks = Vec::new();
     let mut fired = FiredHooks::default();
@@ -193,8 +203,18 @@ pub(super) fn class_load_hooks(
         let result = ruby_prism::parse(source.text.as_bytes());
         let root = result.node();
         let Some(program) = root.as_program_node() else { continue };
-        let mut walk = SiteWalk { src: &source.text, rel: &rel, file: &source.path, hooks: &mut hooks, fired: &mut fired };
-        walk.body(program.statements().body().iter().collect(), &[], None);
+        let mut declared = crate::det::HashSet::default();
+        declarations(program.statements().body().iter().collect(), &[], &mut declared);
+        let mut walk = SiteWalk {
+            src: &source.text,
+            rel: &rel,
+            file: &source.path,
+            declared: &declared,
+            known,
+            hooks: &mut hooks,
+            fired: &mut fired,
+        };
+        walk.body(program.statements().body().iter().collect(), &[], &[], None);
         // Inside methods and blocks: the name fires when that code runs.
         let mut deep = DeepSites { names: Vec::new() };
         ruby_prism::Visit::visit(&mut deep, &root);
@@ -205,10 +225,30 @@ pub(super) fn class_load_hooks(
     (hooks, fired)
 }
 
+/// Every class and module `stmts` declare, nested ones too, by full name.
+fn declarations(stmts: Vec<Node<'_>>, nesting: &[String], out: &mut crate::det::HashSet<String>) {
+    for stmt in stmts {
+        let (path, body) = if let Some(class) = stmt.as_class_node() {
+            (class_name_path(&class), class.body())
+        } else if let Some(module) = stmt.as_module_node() {
+            (module_name_path(&module), module.body())
+        } else {
+            continue;
+        };
+        let Some(path) = path else { continue };
+        let full: Vec<String> = nesting.iter().cloned().chain(path).collect();
+        out.insert(full.join("::"));
+        declarations(body.map(flatten_statements).unwrap_or_default(), &full, out);
+    }
+}
+
 struct SiteWalk<'a> {
     src: &'a str,
     rel: &'a str,
     file: &'a str,
+    /// The classes and modules this file declares ([`declarations`]).
+    declared: &'a crate::det::HashSet<String>,
+    known: &'a crate::det::HashSet<String>,
     hooks: &'a mut Vec<ClassLoadHook>,
     fired: &'a mut FiredHooks,
 }
@@ -237,25 +277,36 @@ impl SiteWalk<'_> {
         }
     }
 
-    /// `nesting` is the enclosing class/module path; `last` the last
+    /// The constant a relative `text` names at a call in `scopes` (the
+    /// lexical scopes, outermost first, by full name): the innermost
+    /// scope's that the file or the app declares, else `text`.
+    fn resolve(&self, text: String, scopes: &[String]) -> String {
+        scopes
+            .iter()
+            .rev()
+            .map(|scope| format!("{scope}::{text}"))
+            .find(|full| self.declared.contains(full) || self.known.contains(full))
+            .unwrap_or(text)
+    }
+
+    /// `nesting` is the enclosing class/module path; `scopes` the lexical
+    /// scopes (`module A::B` opens one, `A::B`); `last` the last
     /// top-level declaration of the file, for a file-level call.
-    fn body(&mut self, stmts: Vec<Node<'_>>, nesting: &[String], mut last: Option<String>) {
+    fn body(&mut self, stmts: Vec<Node<'_>>, nesting: &[String], scopes: &[String], mut last: Option<String>) {
         for stmt in stmts {
-            if let Some(class) = stmt.as_class_node() {
-                if let Some(path) = class_name_path(&class) {
+            let declaration = if let Some(class) = stmt.as_class_node() {
+                Some((class_name_path(&class), class.body()))
+            } else {
+                stmt.as_module_node().map(|module| (module_name_path(&module), module.body()))
+            };
+            if let Some((path, inner)) = declaration {
+                if let Some(path) = path {
                     let full: Vec<String> = nesting.iter().cloned().chain(path).collect();
-                    last = Some(full.join("::"));
-                    let inner = class.body().map(flatten_statements).unwrap_or_default();
-                    self.body(inner, &full, None);
-                }
-                continue;
-            }
-            if let Some(module) = stmt.as_module_node() {
-                if let Some(path) = module_name_path(&module) {
-                    let full: Vec<String> = nesting.iter().cloned().chain(path).collect();
-                    last = Some(full.join("::"));
-                    let inner = module.body().map(flatten_statements).unwrap_or_default();
-                    self.body(inner, &full, None);
+                    let name = full.join("::");
+                    last = Some(name.clone());
+                    let scopes: Vec<String> = scopes.iter().cloned().chain(std::iter::once(name)).collect();
+                    let inner = inner.map(flatten_statements).unwrap_or_default();
+                    self.body(inner, &full, &scopes, None);
                 }
                 continue;
             }
@@ -270,7 +321,8 @@ impl SiteWalk<'_> {
                     // `self` at a file's top level is `main`.
                     _ => continue,
                 },
-                Base::Const(text) => text,
+                Base::Const(text) => self.resolve(text, scopes),
+                Base::Absolute(text) => text,
                 Base::Other => continue,
             };
             // A file-level call with an explicit base ends that class's file
@@ -294,6 +346,18 @@ impl SiteWalk<'_> {
             });
         }
     }
+}
+
+/// The app's classes and modules by full name, for
+/// [`class_load_hooks`] to resolve a relative base against.
+pub(super) fn known_constants(app: &App) -> crate::det::HashSet<String> {
+    app.models
+        .iter()
+        .map(|m| m.name.0.as_str().to_string())
+        .chain(app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()))
+        .chain(app.controllers.iter().map(|c| c.name.0.as_str().to_string()))
+        .chain(app.concern_model_items.keys().map(|k| k.0.as_str().to_string()))
+        .collect()
 }
 
 /// Every literal-named `ActiveSupport.run_load_hooks` inside a `def` or
@@ -324,7 +388,10 @@ impl<'pr> ruby_prism::Visit<'pr> for DeepSites {
 enum Base {
     Default,
     SelfRef,
+    /// A relative constant, as written.
     Const(String),
+    /// `::A::B`.
+    Absolute(String),
     Other,
 }
 
@@ -342,6 +409,14 @@ fn hook_name(node: &Node<'_>) -> Option<(String, String)> {
 }
 
 /// `ActiveSupport.run_load_hooks(<name>[, base])` as a statement.
+/// Whether a constant path starts at `::`.
+fn is_absolute(node: &Node<'_>) -> bool {
+    match node.as_constant_path_node() {
+        Some(path) => path.parent().is_none_or(|parent| is_absolute(&parent)),
+        None => false,
+    }
+}
+
 fn run_load_hooks_call(stmt: &Node<'_>, _src: &str) -> Option<(String, String, Base)> {
     let call = stmt.as_call_node()?;
     if constant_id_str(&call.name()) != "run_load_hooks" || call.block().is_some() {
@@ -356,6 +431,7 @@ fn run_load_hooks_call(stmt: &Node<'_>, _src: &str) -> Option<(String, String, B
         None => Base::Default,
         Some(b) if b.as_self_node().is_some() => Base::SelfRef,
         Some(b) => match constant_path_segments_strs(b) {
+            Some(p) if is_absolute(b) => Base::Absolute(p.join("::")),
             Some(p) => Base::Const(p.join("::")),
             None => Base::Other,
         },

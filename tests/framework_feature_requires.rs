@@ -48,6 +48,8 @@ require "active_support/logger"
 require "action_controller/metal/exceptions"
 require "action_view"
 require "active_support/core_ext/string/strip"
+# activeresource 6.2.0's base.rb.
+require "active_support/core_ext/kernel/reporting"
 require "active_support/core_ext/module/attribute_accessors.rb"
 require "active_support/core_ext/class/attribute_accessors"
 require "active_support/core_ext/class"
@@ -272,6 +274,28 @@ module ProbeGem
      "  \n    z".strip_heredoc]
   end
 
+  # activeresource 6.2.0's `prefix=` redefines its readers in
+  # `silence_warnings`.
+  def self.reporting
+    verbose = $VERBOSE
+    seen = []
+    silence_warnings { seen << $VERBOSE }
+    enable_warnings { seen << $VERBOSE }
+    with_warnings(false) { seen << $VERBOSE }
+    raised = begin
+      silence_warnings { raise ArgumentError, "inside" }
+    rescue ArgumentError => e
+      [e.message, $VERBOSE == verbose]
+    end
+    suppressed = suppress(ZeroDivisionError, KeyError) { 1 / 0 }
+    other = begin
+      suppress(KeyError) { raise IndexError, "kept" }
+    rescue IndexError => e
+      e.message
+    end
+    [seen, $VERBOSE == verbose, raised, suppressed, other, suppress { :value }, Kernel.respond_to?(:silence_warnings, true)]
+  end
+
   def self.notifications
     events = []
     subscriber = ActiveSupport::Notifications.subscribe("probe_gem.ran") { |event| events << [event.name, event.payload] }
@@ -328,6 +352,7 @@ module ProbeGem
       try: try,
       hash_keys: hash_keys,
       strip: strip,
+      reporting: reporting,
       mattr: mattr,
       class_ext: class_ext,
       numeric: numeric,
@@ -419,6 +444,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         "class_ext: [:base, :child, :child, :base, :instance, :child, true, true, false, [], true, false, false, false, \"1 is not a symbol nor a string\", :s, [\"ProbeGem::AttrChild\", \"ProbeGem::AttrGrandChild\"], [\"ProbeGem::AttrChild\"], [], 10, true, 20, :private, 2]",
         "mattr: [:warn, :warn, [:block], [:block], :io, false, true, false, 2, 2, 5, \"invalid attribute name: bad-name\", \"module attributes should be defined directly on class, not singleton\", \"probe_gem.rb\", \"probe_gem.rb\"]",
         "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
+        "reporting: [[nil, true, false], true, [\"inside\", true], nil, \"kept\", :value, true]",
         "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",
         "Unknown key: :z. Valid keys are: :a, :b",
         "load_hooks: [[:ran, :base]]",
@@ -448,7 +474,7 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     // Every other Rails feature with no port (Integer#months, the whole
     // core_ext set): by name, not as a plain
     // `cannot load such file`, which is left to everything else.
-    for feature in ["active_support/core_ext/date/zones", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
+    for feature in ["active_support/core_ext/string/filters", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
         let line = format!(
             "{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded\n"
         );
