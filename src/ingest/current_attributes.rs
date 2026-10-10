@@ -720,6 +720,23 @@ fn synthesized_source(
     if !defines("set") {
         body.push_str(&set_source(lc, attrs, delegates));
     }
+    // `attributes`: activesupport 8.2's `attr_accessor :attributes`, the
+    // Symbol-keyed Hash holding each attribute assigned so far (a default
+    // counts, `resolve_defaults` stores it). The storage here is an ivar
+    // per attribute, so the Hash is built from the ones assigned, in
+    // assignment order: Core's
+    // `GlobalDb::Current#shop_island_id` reads `attributes[:shop_island_id]`
+    // and `Podding::Current.attributes` snapshots the context. Writing
+    // into the returned Hash does not assign the attribute.
+    if !defines("attributes") && !attrs.is_empty() {
+        // In the order they were assigned, as the Hash keeps them.
+        body.push_str("  def attributes\n    h = {}\n    instance_variables.each do |name|\n      case name\n");
+        for a in attrs {
+            let a = a.as_str();
+            body.push_str(&format!("      when :@{a} then h[:{a}] = @{a}\n"));
+        }
+        body.push_str("      end\n    end\n    h\n  end\n\n");
+    }
 
     // Class-level forwarders — the surface app code actually calls
     // (`Current.user`, `Current.account`). Rails gets these from
@@ -748,6 +765,9 @@ fn synthesized_source(
         {
             forwarded.push((m.name.as_str().to_string(), forwarder_signature(m)));
         }
+    }
+    if !defines("attributes") && !attrs.is_empty() {
+        forwarded.push(("attributes".to_string(), None));
     }
     // The generated `set` (an app-written one forwards as written).
     if !defines("set") {
