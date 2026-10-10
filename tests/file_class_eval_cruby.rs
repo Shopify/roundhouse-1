@@ -92,3 +92,40 @@ fn file_level_class_eval_runs_as_in_cruby() {
     assert!(!stderr.contains("file_statement_not_carried"), "{stderr}");
     assert_eq!(lines(&run.stdout), EXPECTED, "emitted Ruby diverges from CRuby in {}", tree.display());
 }
+
+/// essentials' patches/action_view_ext.rb reopens `ActionView::Helpers::
+/// AssetUrlHelper`, which the runtime does not define. Its `module_eval`
+/// was written bare, so the NameError ended the file and the engine's
+/// `lib/patches/**` glob that required it, and none of the patches after
+/// it (the MessageEncryptor key-length one among them) loaded. Under
+/// `file_statement` it is named and the file's next statement still runs.
+const PARTIAL_PATCH: &str = r#"Absent::Helper.module_eval do
+  def compute_asset_path(source) = source
+end
+
+Settings.singleton_class.class_eval do
+  def mode = "patched"
+end
+"#;
+
+#[test]
+fn a_file_level_class_eval_on_an_absent_receiver_is_named_and_the_file_goes_on() {
+    let (tree, _errors) = emit_and_run::empty_app()
+        .write("lib/settings.rb", SETTINGS)
+        .write("lib/partial_patch.rb", PARTIAL_PATCH)
+        .emit(BuildTarget::Ruby);
+    let run = Command::new("ruby")
+        .current_dir(&tree)
+        .env("BLOG_DB", ":memory:")
+        .arg("-e")
+        .arg("require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\nputs Settings.mode")
+        .output()
+        .expect("spawn ruby");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "emitted tree failed in {}: {stderr}", tree.display());
+    assert!(
+        stderr.contains("error[file_statement_not_run]") && stderr.contains("lib/partial_patch.rb:1") && stderr.contains("Absent"),
+        "{stderr}"
+    );
+    assert_eq!(lines(&run.stdout), ["patched"], "emitted tree in {}", tree.display());
+}

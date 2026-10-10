@@ -10175,6 +10175,21 @@ const AUTOLOAD_RUNTIME: &str = r##"
     files.map { |file| path(file) }
   end
 
+  # A carried engine's `Dir[config.root.join(pattern)].each { |file|
+  # require file }`: each file `carried_files` lists, required in turn
+  # as the loop requires it. One that raises is named, and the loop goes
+  # on to the next file, where natively the error would end the loop and
+  # the initializer: essentials' lib/patches/** holds 108 patch files, and
+  # one the tree cannot load (patches/action_view_ext.rb reopens a helper
+  # the runtime lacks) left the other patches unloaded, unnamed.
+  def self.require_carried_files(pattern, files, not_carried)
+    carried_files(pattern, files, not_carried).each do |file|
+      require file
+    rescue StandardError, LoadError, NotImplementedError => e
+      $stderr.puts "roundhouse: error[engine_glob_file_not_loaded]: #{file.delete_prefix("#{File.dirname(ROOT)}/")} (matched by #{pattern}) did not load: #{e.class}: #{e.message}; the glob's other files still load"
+    end
+  end
+
   # Register `mod`'s children: an autoload for each file, an implicit
   # module for a namespace only other files open (autovivified on first
   # reference, `implicit_autoload`). A child already
