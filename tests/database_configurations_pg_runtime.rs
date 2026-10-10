@@ -288,7 +288,7 @@ fn postgresql_tree_defines_configurations_once() {
     }
     assert!(shim.contains("def self.instantiate_named"), "{shim}");
     let gem_home = std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
     let script = r#"
 module Warning
   def self.warn(message, **)

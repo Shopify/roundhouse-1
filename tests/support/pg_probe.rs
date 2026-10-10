@@ -30,7 +30,7 @@ pub fn native_and_emitted(
     // The pg gem and Rails' native extensions come from Core's gem home,
     // as the oracle (tests/support/rails_oracle.rb) loads them.
     let gem_home = std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
     let jemalloc = std::env::var("RH_JEMALLOC").unwrap_or_else(|_| {
         "/nix/store/c04j2i0fkin1bw5fab35gx896558knsd-jemalloc-5.3.0-unstable-2025-09-12/lib/libjemalloc.so.2".into()
     });
