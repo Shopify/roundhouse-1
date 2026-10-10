@@ -5579,6 +5579,15 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         calls: &["mattr_reader", "mattr_writer", "mattr_accessor", "cattr_reader", "cattr_writer", "cattr_accessor"],
         at_require_rails: true,
     },
+    // core_ext/class/attribute requires it, so it is loaded at `require
+    // "rails"`; measured 3.2.1's `redefine_method("#{unit}=")` has no
+    // require of its own.
+    BootCoreExtension {
+        feature: "active_support/core_ext/module/redefine_method",
+        ports: &["active_support_redefine_method"],
+        calls: &["redefine_method", "redefine_singleton_method", "silence_redefinition_of_method"],
+        at_require_rails: true,
+    },
     BootCoreExtension {
         feature: "active_support/core_ext/class/attribute",
         ports: &["active_support_class_attribute"],
@@ -15432,7 +15441,10 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     // active_model_api.rb).
     let validations = record_validations
         || carries_active_model_api(files)
-        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks"])
+        || carries_named(
+            files,
+            &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks", "ActiveModel::EachValidator"],
+        )
         || calls_runtime_validates(files);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [

@@ -143,5 +143,21 @@ module ActiveRecord # :nodoc:
       unloaded = @__unloaded_columns
       unloaded ? names - unloaded.map(&:to_s) : names
     end
+
+    # activerecord/lib/active_record/attribute_methods.rb: the column
+    # object for `name` (its precision and scale for a writer's rounding),
+    # a NullColumn for a name the table lacks.
+    def column_for_attribute(name)
+      self.class.column_for_attribute(name)
+    end
+
+    # activerecord/lib/active_record/attribute_methods/write.rb: a gem's
+    # unit-name writer (`write_attribute(unit_field_name, name)`) reaches the
+    # column through the model's generated `[]=`, which casts as the
+    # attribute writers do. (Not `read_attribute`: the validations ports
+    # test `respond_to?(:read_attribute)` to pick another read path.)
+    def write_attribute(attr_name, value)
+      self[attr_name] = value
+    end
   end
 end
