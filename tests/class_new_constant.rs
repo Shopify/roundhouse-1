@@ -68,7 +68,7 @@ fn go_test() -> &'static str {
 }
 
 #[test]
-fn class_new_with_a_dynamic_or_missing_parent_stays_an_error() {
+fn class_new_with_a_dynamic_parent_stays_an_error() {
     let (_, errors) = errors_app(r#"module Foo
   def self.base
     StandardError
@@ -83,7 +83,8 @@ end
     .write("test/foo_test.rb", go_test())
     .emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("Dynamic")), "a computed parent is not admitted: {errors:#?}");
-    assert!(errors.iter().any(|e| e.contains("Bare")), "a parentless Class.new is not admitted: {errors:#?}");
+    // `Bare = Class.new` is `class Bare; end`: an Object subclass.
+    assert!(!errors.iter().any(|e| e.contains("Bare")), "a parentless Class.new is a class: {errors:#?}");
 }
 
 #[test]

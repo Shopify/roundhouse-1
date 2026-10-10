@@ -119,8 +119,10 @@ fn library_classes(
         Some(mut class) => {
             if name.as_str().contains("::") {
                 path_written.insert(class.name.clone());
-                if let ExprNode::Send { args, .. } = &*value.node {
-                    class.parent_span = args[0].span;
+                if let ExprNode::Send { args, .. } = &*value.node
+                    && let Some(parent) = args.first()
+                {
+                    class.parent_span = parent.span;
                 }
             }
             top_level.push(class);
@@ -956,8 +958,8 @@ fn take_class_new_declarations(owner: &mut LibraryClass) -> Vec<LibraryClass> {
 /// (`Error = Class.new(StandardError)`). The parent stays as written,
 /// to resolve lexically like any `class X < Parent`.
 ///
-/// A parent that is not a constant path, or a missing parent
-/// (`Class.new`) is not this shape and stays a constant, which analysis
+/// `NAME = Class.new` is `class NAME; end`. A parent that is not a
+/// constant path is not this shape and stays a constant, which analysis
 /// reports. A block body that defines methods is a class too, which
 /// `factory_class::factory_classes` builds (the body walks skip it).
 fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<LibraryClass> {
@@ -969,12 +971,20 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     if !is_class || method.as_str() != "new" {
         return None;
     }
-    let [parent] = args.as_slice() else { return None };
-    let ExprNode::Const { path } = &*parent.node else { return None };
-    let parent: Vec<&str> = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect();
-    if parent.is_empty() {
-        return None;
-    }
+    // `Class.new` with no argument is a subclass of Object, as `class
+    // NAME; end` is.
+    let parent: Vec<&str> = match args.as_slice() {
+        [] => Vec::new(),
+        [parent] => {
+            let ExprNode::Const { path } = &*parent.node else { return None };
+            let parent: Vec<&str> = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect();
+            if parent.is_empty() {
+                return None;
+            }
+            parent
+        }
+        _ => return None,
+    };
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
@@ -983,7 +993,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
-        parent: Some(ClassId(Symbol::from(parent.join("::")))),
+        parent: (!parent.is_empty()).then(|| ClassId(Symbol::from(parent.join("::")))),
         parent_span: Default::default(),
         includes: Vec::new(),
         methods: Vec::new(),
