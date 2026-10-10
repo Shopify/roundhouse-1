@@ -3667,6 +3667,38 @@ fn keep_carried_body_statements(app: &mut App) {
             lc.unknown_calls[j].decisions |= crate::expr::BODY_STATEMENT;
         }
     }
+    // A call on one of the app's own classes, to a class method it
+    // compiled (`Types.register(factory, [Symbol, Time])` in paquito
+    // 1.0.2's `Paquito::Types::ActiveRecordPacker` body), runs as Ruby
+    // runs it: written in place where it can be. One the body cannot
+    // keep stays the dropped class-body call it was.
+    let mut by_name: crate::det::HashMap<&str, Vec<usize>> = crate::det::HashMap::default();
+    for (i, lc) in app.library_classes.iter().enumerate() {
+        by_name.entry(lc.name.0.as_str().trim_start_matches("::")).or_default().push(i);
+    }
+    let app_calls: Vec<Vec<usize>> = app
+        .library_classes
+        .iter()
+        .map(|lc| {
+            if !lc.unknown_calls.iter().any(|c| app_class_method_call(lc, c, app, &by_name)) {
+                return Vec::new();
+            }
+            crate::emit::ruby::dropped_class_body_calls(lc, app)
+                .into_iter()
+                .filter(|c| app_class_method_call(lc, c, app, &by_name))
+                .filter_map(|c| lc.unknown_calls.iter().position(|u| std::ptr::eq(u, c)))
+                .collect()
+        })
+        .collect();
+    for (i, at) in app_calls.iter().enumerate() {
+        for &j in at {
+            app.library_classes[i].unknown_calls[j].decisions |= crate::expr::BODY_STATEMENT;
+            let lc = &app.library_classes[i];
+            if !crate::emit::ruby::carries_body_statement(lc, &lc.unknown_calls[j], app) {
+                app.library_classes[i].unknown_calls[j].decisions &= !crate::expr::BODY_STATEMENT;
+            }
+        }
+    }
     let verdicts: Vec<Vec<bool>> = app
         .library_classes
         .iter()
@@ -3736,6 +3768,36 @@ fn keep_carried_body_statements(app: &mut App) {
 /// `[…].m …` / `%i[…].m …`: a call whose receiver is a literal list.
 fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
     matches!(&*call.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if matches!(&*r.node, crate::expr::ExprNode::Array { .. }))
+}
+
+/// `Const.method(...)` in `lc`'s body where `Const`, looked up from
+/// `lc`'s namespace outward, is one of the app's library classes and
+/// `method` a class method it defines.
+fn app_class_method_call(
+    lc: &crate::dialect::LibraryClass,
+    call: &crate::expr::Expr,
+    app: &App,
+    by_name: &crate::det::HashMap<&str, Vec<usize>>,
+) -> bool {
+    use crate::expr::ExprNode;
+    let ExprNode::Send { recv: Some(r), method, .. } = &*call.node else { return false };
+    let ExprNode::Const { path } = &*r.node else { return false };
+    let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    if written.is_empty() {
+        return false;
+    }
+    let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    let scope: Vec<&str> = lc.name.0.as_str().trim_start_matches("::").split("::").collect();
+    let depths: Vec<usize> = if rooted { vec![0] } else { (0..=scope.len()).rev().collect() };
+    for depth in depths {
+        let name = scope[..depth].iter().chain(written.iter()).copied().collect::<Vec<_>>().join("::");
+        if let Some(at) = by_name.get(name.as_str()) {
+            return at.iter().any(|&i| {
+                app.library_classes[i].methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name == *method)
+            });
+        }
+    }
+    false
 }
 
 /// `include <expr>` / `self.include(<expr>)` (or `extend`, `prepend`)
