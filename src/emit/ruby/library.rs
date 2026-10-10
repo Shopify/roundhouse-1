@@ -1033,6 +1033,54 @@ fn declared_at(kid: &LibraryClass, app: &App) -> Option<crate::span::Span> {
     )
 }
 
+/// The `require_relative` lines, in source order, of the nested classes
+/// of `parent` that keep a file of their own (a module's children) and
+/// that `at`'s source file declares above it, not yet in `required`.
+/// Natively a module body's statement runs after the classes written
+/// above it; their own files loaded after the module's file, so the
+/// statement ran first. Core's GraphApiTestSchemaHelper calls
+/// `api_versioning_test_setup`, declares its test schema's classes
+/// (whose `visibility:` names fixture-only ApiChange handles), then
+/// `reset_api_versioning_test_setup`: the reset ran before the classes,
+/// and each `visibility:` raised InvalidApiChange.
+fn nested_files_above(
+    parent: &LibraryClass,
+    at: crate::span::Span,
+    app: &App,
+    out_path: &Path,
+    required: &mut BTreeSet<String>,
+) -> Vec<String> {
+    if !super::expr::native_keywords() || at == crate::span::Span::synthetic() || at.file.0 == 0 {
+        return Vec::new();
+    }
+    let owner = parent.name.0.as_str().trim_start_matches("::");
+    let prefix = format!("{owner}::");
+    let mut kids: Vec<(usize, String)> = Vec::new();
+    for kid in &app.library_classes {
+        let name = kid.name.0.as_str().trim_start_matches("::");
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        if rest.contains("::") || required.contains(name) || kids.iter().any(|(_, k)| k == name) {
+            continue;
+        }
+        if file_owner(name, app) != name || is_model_named(name, app) {
+            continue;
+        }
+        let Some(declared) = declared_at(kid, app) else { continue };
+        if declared.file == at.file && declared.start < at.start {
+            kids.push((declared.start as usize, name.to_string()));
+        }
+    }
+    kids.sort();
+    let dir = out_path.parent().unwrap_or(Path::new(""));
+    kids.into_iter()
+        .map(|(_, name)| {
+            let anchor = format!("app/models/{}", super::library_file_stem(&name, app));
+            required.insert(name);
+            format!("require_relative {:?}", relpath(dir, &anchor))
+        })
+        .collect()
+}
+
 /// Whether `parent`'s body includes `module`, or prepends or extends it
 /// by a replayed call naming it (relative to `parent` or in full).
 fn mixes_in(parent: &LibraryClass, module: &ClassId) -> bool {
@@ -9884,6 +9932,7 @@ fn emit_library_class_decl_inner(
     }
     let railtie_root = app.railties.iter().find(|r| r.name == lc.name).and_then(|r| r.root.clone());
     let mut sources: Option<std::rc::Rc<CarriedSources>> = None;
+    let mut nested_required: BTreeSet<String> = BTreeSet::new();
     for effect in &body_effects {
         flush_late(&mut s, Some(effect.span));
         // A nested class the source writes above this call, below an
@@ -9892,6 +9941,9 @@ fn emit_library_class_decl_inner(
             NestedPlacement::place(&lc.name, &mut s, |kid| {
                 kid.file == effect.span.file && kid.start < effect.span.start && !below_deferred(kid)
             });
+            for line in nested_files_above(lc, effect.span, app, &out_path, &mut nested_required) {
+                writeln!(s, "{body_pad}{line}").unwrap();
+            }
         }
         let text = if railtie {
             super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
@@ -10032,6 +10084,9 @@ fn emit_library_class_decl_inner(
         writeln!(s).unwrap();
     }
     for effect in &tail_effects {
+        for line in nested_files_above(lc, effect.span, app, &out_path, &mut nested_required) {
+            writeln!(s, "{body_pad}{line}").unwrap();
+        }
         for line in super::emit_expr(effect).lines() {
             if line.is_empty() {
                 writeln!(s).unwrap();
