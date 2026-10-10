@@ -33,6 +33,11 @@ module Db
     map = PG::BasicTypeMapForResults.new(conn)
     map.default_type_map = PG::TypeMapAllStrings.new
     map.add_coder(MoneyDecoder.new(oid: 790, name: "money"))
+    # update_typemap_for_default_timezone: a `timestamp` (without time
+    # zone) is UTC under Active Record's default `default_timezone`
+    # (:utc), not the process's local zone the pg gem's decoder reads.
+    utc = !(defined?(ActiveRecord) && ActiveRecord.respond_to?(:default_timezone)) || ActiveRecord.default_timezone == :utc
+    map.add_coder((utc ? PG::TextDecoder::TimestampUtc : PG::TextDecoder::TimestampWithoutTimeZone).new(oid: 1114, name: "timestamp"))
     map
   end
 

@@ -23,7 +23,8 @@
 #   (a record, a serializer) is asked, everything else follows
 #   core_ext/object/json. A String, Symbol, Float, Hash or Array
 #   subclass that defines its own `as_json` is not asked.
-#   ActiveSupport::TimeWithZone is not ported; a Time answers as Time.
+#   ActiveSupport::TimeWithZone answers its own as_json
+#   (runtime/active_support_time_with_zone.rb); a Time answers as Time.
 #   `to_json` is not rerouted through this encoder.
 # - The encoder is JSONGemEncoder. Rails picks JSONGemCoderEncoder when
 #   json >= 2.15.2 (Core's bundle has 2.19); the two produce the same

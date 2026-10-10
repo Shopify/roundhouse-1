@@ -297,6 +297,10 @@ else
   "UTC"
 end
 ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(tz_name, tz_name)
+# Where the tree carries Time.zone (runtime/active_support_time_with_zone.rb):
+# railties' and activerecord's time zone initializers, so Time.current
+# and a datetime attribute read answer an ActiveSupport::TimeWithZone.
+ActiveSupport.initialize_time_zone(tz_name) if ActiveSupport.respond_to?(:initialize_time_zone)
 # `config.active_support.cache_format_version` (from `load_defaults` or
 # written outright, lifted at ingest onto the reopen) reaches the
 # ActiveSupport::Cache port before any app code runs, as activesupport's

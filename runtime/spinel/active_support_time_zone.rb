@@ -4,15 +4,14 @@
 # activesupport/lib/active_support/values/time_zone.rb) over the tzinfo
 # gem, as Rails has it natively; Rails' doc comments dropped.
 #
-# The one difference: this tree has no ActiveSupport::TimeWithZone. A
-# zone answers a time where Rails answers a TimeWithZone (`local`, `at`,
-# `iso8601`, `parse`, `rfc3339`, `strptime`, `now`) with the same instant
-# as a Time at the zone's offset then (`__time_in_zone` /
-# `__local_time_in_zone`), as the tree's `Time.zone` lowering does
-# (ActiveSupport.present / in_time_zone). A local time in a DST gap moves
-# forward an hour, as TimeWithZone#get_period_and_ensure_valid_local_time
-# does. `now` reads the tree's clock (`ActiveSupport.now`, which
-# `travel_to` moves) where Rails reads the stubbed Time.now.
+# A zone answers an ActiveSupport::TimeWithZone (`local`, `at`, `iso8601`,
+# `parse`, `rfc3339`, `strptime`, `now`), as natively: TimeWithZone and
+# the core_ext time/zones methods are runtime/active_support_time_with_zone.rb,
+# required at the end of this file. The differences: `now` and `today`
+# read the tree's clock (`ActiveSupport.clock`, Time.now moved by
+# `travel`, which `travel_to`'s stub of Time.now also moves) where Rails
+# reads Time.now and `tzinfo.now`; the Ractor sharing
+# (`make_shareable!`) is not ported.
 #
 # The PostgreSQL CRuby tree only (`project::apply_postgres_bootstrap`).
 
@@ -312,11 +311,11 @@ module ActiveSupport
 
     def local(*args)
       time = Time.utc(*args)
-      __local_time_in_zone(time)
+      ActiveSupport::TimeWithZone.new(nil, self, time)
     end
 
     def at(*args)
-      __time_in_zone(Time.at(*args).utc)
+      Time.at(*args).utc.in_time_zone(self)
     end
 
     def iso8601(str)
@@ -346,9 +345,9 @@ module ActiveSupport
       )
 
       if parts[:offset]
-        __time_in_zone(time.utc)
+        TimeWithZone.new(time.utc, self)
       else
-        __local_time_in_zone(time)
+        TimeWithZone.new(nil, self, time)
       end
 
     rescue Date::Error, KeyError
@@ -374,7 +373,7 @@ module ActiveSupport
         parts.fetch(:offset)
       )
 
-      __time_in_zone(time.utc)
+      TimeWithZone.new(time.utc, self)
     end
 
     def strptime(str, format, now = now())
@@ -382,7 +381,7 @@ module ActiveSupport
     end
 
     def now
-      __time_in_zone(time_now.utc)
+      time_now.utc.in_time_zone(self)
     end
 
     def today
@@ -464,38 +463,16 @@ module ActiveSupport
         end
 
         if parts[:offset] || parts[:seconds]
-          __time_in_zone(time.utc)
+          TimeWithZone.new(time.utc, self)
         else
-          __local_time_in_zone(time)
+          TimeWithZone.new(nil, self, time)
         end
       end
 
       def time_now
-        ActiveSupport.respond_to?(:now) ? ActiveSupport.now : Time.now
-      end
-
-      # TimeWithZone.new(utc, self): the instant at this zone's offset,
-      # a UTC Time where TimeWithZone#utc? (the period's abbreviation).
-      def __time_in_zone(utc)
-        __in_period(utc, period_for_utc(utc))
-      end
-
-      def __in_period(utc, period)
-        abbreviation = period.abbreviation
-        abbreviation == "UTC" || abbreviation == "UCT" ? utc.getutc : utc.getlocal(period.utc_total_offset)
-      end
-
-      # TimeWithZone.new(nil, self, time): `time`'s wall clock read in
-      # this zone (its own offset ignored).
-      def __local_time_in_zone(time)
-        local = Time.utc(time.year, time.month, time.day, time.hour, time.min, time.sec + time.subsec)
-        begin
-          period = period_for_local(local)
-        rescue TZInfo::PeriodNotFound
-          local += 3600
-          retry
-        end
-        __in_period(local - period.utc_total_offset, period)
+        ActiveSupport.respond_to?(:clock) ? ActiveSupport.clock : Time.now
       end
   end
 end
+
+require_relative "active_support_time_with_zone"

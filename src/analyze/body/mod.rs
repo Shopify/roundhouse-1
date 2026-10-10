@@ -3036,6 +3036,10 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some(id.0.as_str())
                         }
+                        // String#in_time_zone is core_ext/string/zones on the PostgreSQL
+                        // tree (runtime/active_support_time_with_zone.rb), which a call loads
+                        // (project.rs::BOOT_LOADED_CORE_EXTENSIONS).
+                        Some(Ty::Str) if method.as_str() == "in_time_zone" && self.carries_postgresql_base() => None,
                         Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d") => Some("String extension"),
                         Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
                         _ if method.as_str() == "not_nil!" => Some("not_nil!"),

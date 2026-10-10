@@ -788,7 +788,42 @@ module ActiveRecord
         return block ? block.call(name) : ActiveModel::Type.default_value
       end
       cache = (@__attribute_types ||= {})
-      cache.fetch(name) { cache[name] = _cast_type_for_spec(name, spec) }
+      cache.fetch(name) { cache[name] = _hook_attribute_type(name, _cast_type_for_spec(name, spec)) }
+    end
+
+    # attribute_methods/time_zone_conversion.rb (8.2.0.alpha): the class
+    # attributes, with the railtie's `time_zone_aware_attributes = true`
+    # applied by the boot where the tree carries Time.zone
+    # (runtime/active_support_time_with_zone.rb); `hook_attribute_type`
+    # wraps a schema column's datetime or time type in a TimeZoneConverter
+    # when conversion is on for it. A type declared with `attribute` is
+    # not wrapped. Each attribute is the class's own value once assigned,
+    # else its superclass's, as class_attribute is.
+    %i[time_zone_aware_attributes skip_time_zone_conversion_for_attributes time_zone_aware_types].each do |attr|
+      defaults = { time_zone_aware_attributes: false, skip_time_zone_conversion_for_attributes: [], time_zone_aware_types: %i[datetime time] }
+      define_singleton_method(attr) do
+        return instance_variable_get(:"@#{attr}") if instance_variable_get(:"@__#{attr}_assigned")
+        equal?(ActiveRecord::Base) ? defaults[attr] : superclass.public_send(attr)
+      end
+      define_singleton_method(:"#{attr}=") do |value|
+        instance_variable_set(:"@__#{attr}_assigned", true)
+        instance_variable_set(:"@#{attr}", value)
+      end
+      define_singleton_method(:"#{attr}?") { public_send(attr) ? true : false }
+    end
+
+    def self._hook_attribute_type(name, cast_type)
+      if _create_time_zone_conversion_attribute?(name, cast_type)
+        cast_type = ActiveRecord::AttributeMethods::TimeZoneConversion::TimeZoneConverter.new(cast_type)
+      end
+      cast_type
+    end
+
+    def self._create_time_zone_conversion_attribute?(name, cast_type)
+      return false unless ::Time.respond_to?(:zone)
+      enabled_for_column = time_zone_aware_attributes &&
+        !skip_time_zone_conversion_for_attributes.include?(name.to_sym)
+      enabled_for_column && time_zone_aware_types.include?(cast_type.type)
     end
     
     def self.attribute_types
@@ -2393,5 +2428,78 @@ module ActiveRecord
     end
 
     COMPILED = CompiledEntry.new
+  end
+end
+
+require "delegate"
+
+module ActiveRecord
+  module AttributeMethods
+    # time_zone_conversion.rb's TimeZoneConverter (8.2.0.alpha) over
+    # Ruby's SimpleDelegator, where Rails' DelegateClass(Type::Value)
+    # names the delegated methods ahead; QueryPredicates::Decorator is
+    # not ported.
+    module TimeZoneConversion
+      class TimeZoneConverter < SimpleDelegator # :nodoc:
+        def self.new(subtype)
+          self === subtype ? subtype : super
+        end
+
+        def subtype
+          __getobj__
+        end
+
+        def deserialize(value)
+          convert_time_to_time_zone(super)
+        end
+
+        def cast(value)
+          return if value.nil?
+
+          if value.is_a?(::Hash)
+            set_time_zone_without_conversion(super)
+          elsif value.respond_to?(:in_time_zone)
+            begin
+              result = super(__getobj__.user_input_in_time_zone(value)) || super
+              if result && type == :time
+                result = result.change(year: 2000, month: 1, day: 1)
+              end
+              result
+            rescue ArgumentError
+              nil
+            end
+          elsif value.respond_to?(:infinite?) && value.infinite?
+            value
+          else
+            map(super) { |v| cast(v) }
+          end
+        end
+
+        def ==(other)
+          other.is_a?(self.class) && __getobj__ == other.__getobj__
+        end
+
+        private
+          def convert_time_to_time_zone(value)
+            return if value.nil?
+
+            if value.acts_like?(:time)
+              converted = value.in_time_zone
+              if type == :time && converted
+                converted = converted.change(year: 2000, month: 1, day: 1)
+              end
+              converted
+            elsif value.respond_to?(:infinite?) && value.infinite?
+              value
+            else
+              map(value) { |v| convert_time_to_time_zone(v) }
+            end
+          end
+
+          def set_time_zone_without_conversion(value)
+            ::Time.zone.local_to_utc(value)&.in_time_zone if value
+          end
+      end
+    end
   end
 end

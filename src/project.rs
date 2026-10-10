@@ -4645,7 +4645,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
         "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
-        "active_support_time_change", "active_support_time_zone",
+        "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -5410,7 +5410,17 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/numeric/conversions", &["active_support_numeric_conversions"]),
     ("active_support/core_ext/integer/time", &["active_support_integer_time"]),
     ("active_support/core_ext/big_decimal/conversions", &["active_support_big_decimal_conversions"]),
-    ("active_support/values/time_zone", &["active_support_time_zone"]),
+    // TimeZone's port requires TimeWithZone's, which carries core_ext/
+    // time/zones, date_and_time/zones, date/zones, string/zones,
+    // object/acts_like and time_formats (and the calculations they call).
+    ("active_support/values/time_zone", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/time_with_zone", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/time_formats", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/core_ext/time/zones", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/core_ext/date_and_time/zones", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/core_ext/date/zones", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/core_ext/string/zones", &["active_support_time_zone", "active_support_time_with_zone"]),
+    ("active_support/core_ext/object/acts_like", &["active_support_time_zone", "active_support_time_with_zone"]),
     ("active_support/number_helper", &["active_support_number_helper"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
@@ -5496,10 +5506,18 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         calls: &[".change"],
         at_require_rails: false,
     },
+    // With TimeWithZone and core_ext/time/zones (runtime/
+    // active_support_time_with_zone.rb, which the TimeZone port requires),
+    // also where app code names Time.zone or a lowered zone helper
+    // (`ActiveSupport.use_zone`, `.in_time_zone`): the boot then sets
+    // Time.zone_default from config.time_zone.
     BootCoreExtension {
         feature: "active_support/values/time_zone",
-        ports: &["active_support_time_zone"],
-        calls: &["ActiveSupport::TimeZone"],
+        ports: &["active_support_time_zone", "active_support_time_with_zone"],
+        calls: &[
+            "ActiveSupport::TimeZone", "ActiveSupport::TimeWithZone", "Time.zone", ".zone=", ".use_zone", ".zone_default",
+            ".in_time_zone", "ActiveSupport.use_zone", "ActiveSupport.in_time_zone",
+        ],
         at_require_rails: false,
     },
 ];
@@ -12064,6 +12082,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_integer_time.rb"
         && p != "runtime/active_support_time_change.rb"
         && p != "runtime/active_support_time_zone.rb"
+        && p != "runtime/active_support_time_with_zone.rb"
         && p != "runtime/active_support_big_decimal_conversions.rb"
         && p != "runtime/active_support_number_helper.rb"
         && p != "runtime/active_support_numeric_conversions.rb"
