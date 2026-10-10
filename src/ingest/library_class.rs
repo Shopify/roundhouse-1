@@ -292,13 +292,26 @@ fn conditionally_declared(
     let Some(body) = body else { return Ok(Vec::new()) };
     let outer: Vec<String> = owner.0.as_str().split("::").map(str::to_string).collect();
     let mut out = Vec::new();
-    for stmt in flatten_statements(body) {
-        let Some(conditional) = visibility::conditional_definition(&stmt) else { continue };
+    fn walk(
+        conditional: &visibility::ConditionalDefinition<'_>,
+        file: &str,
+        outer: &[String],
+        out: &mut Vec<LibraryClass>,
+    ) -> IngestResult<()> {
         for (_, statements) in &conditional.arms {
-            for declaration in statements.iter().filter(|s| visibility::is_declaration(s)) {
-                out.extend(declared_classes_in(declaration, file, usize::MAX, &outer)?);
+            for stmt in statements {
+                if visibility::is_declaration(stmt) {
+                    out.extend(declared_classes_in(stmt, file, usize::MAX, outer)?);
+                } else if let Some(nested) = visibility::conditional_definition(stmt) {
+                    walk(&nested, file, outer, out)?;
+                }
             }
         }
+        Ok(())
+    }
+    for stmt in flatten_statements(body) {
+        let Some(conditional) = visibility::conditional_definition(&stmt) else { continue };
+        walk(&conditional, file, &outer, &mut out)?;
     }
     Ok(out)
 }
@@ -3416,7 +3429,17 @@ fn conditional_definitions(
         let condition = condition.as_ref().map(|c| ingest_expr(c, file)).transpose()?;
         let mut members = Vec::new();
         let mut declarations = Vec::new();
+        let mut nested = Vec::new();
         for stmt in statements {
+            // A conditional nested in the branch: a statement of its
+            // own, run only when this branch runs.
+            if let Some(inner) = visibility::conditional_definition(stmt) {
+                let (inner_methods, record) =
+                    conditional_definitions(stmt, &inner, owner, file, force_class_receiver, visibility)?;
+                methods.extend(inner_methods);
+                nested.push(record);
+                continue;
+            }
             // Ingested as library classes of their own
             // (`conditionally_declared`); recorded here by name.
             if visibility::is_declaration(stmt) {
@@ -3492,7 +3515,7 @@ fn conditional_definitions(
             members.push(crate::dialect::ConditionalMember::of(&m));
             methods.push(m);
         }
-        arms.push(crate::dialect::ConditionalArm { condition, methods: members, declarations });
+        arms.push(crate::dialect::ConditionalArm { condition, methods: members, declarations, nested });
     }
     let location = statement.location();
     let span = Span {
