@@ -2803,6 +2803,7 @@ end
             && lc.origin.is_none();
         !(bodiless && model_names.contains(lc.name.0.as_str()))
     });
+    app.library_class_declarations = library_class_declarations(&app.library_classes, &sources);
     app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes, &sources);
 
     // `on_load(:shop) { class Shop; include Extension; end }`: the
@@ -7142,6 +7143,82 @@ fn merge_library_class_reopens(
     }
     *classes = slots.into_iter().flatten().collect();
     merged
+}
+
+/// `App::library_class_declarations`: the span of each `class X` /
+/// `module X` statement of a class several declarations open, one of
+/// which has no member of its own (`declares_on_class`). That one is
+/// where Ruby defines the constant when it comes first, and the merged
+/// class keeps no position of it: Core's component/schema.rb writes
+/// `class Validator; end` above the `class_attribute … default:
+/// Validator` that reads it, and the body at the bottom. Only the files
+/// whose text names such a declaration are parsed.
+fn library_class_declarations(
+    classes: &[LibraryClass],
+    sources: &[crate::span::SourceFile],
+) -> Vec<(crate::ident::ClassId, crate::span::Span)> {
+    let mut groups: crate::det::HashMap<&str, (usize, bool)> = crate::det::HashMap::default();
+    for lc in classes {
+        let entry = groups.entry(lc.name.0.as_str()).or_insert((0, false));
+        entry.0 += 1;
+        entry.1 |= !declares_on_class(lc);
+    }
+    let wanted: crate::det::HashSet<&str> =
+        groups.iter().filter(|(_, (count, bare))| *count > 1 && *bare).map(|(name, _)| *name).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let needles: crate::det::HashSet<String> = wanted
+        .iter()
+        .map(|name| name.rsplit("::").next().unwrap_or(name).to_string())
+        .collect();
+    fn walk(
+        node: &ruby_prism::Node<'_>,
+        scope: &[String],
+        file: crate::span::FileId,
+        wanted: &crate::det::HashSet<&str>,
+        out: &mut Vec<(crate::ident::ClassId, crate::span::Span)>,
+    ) {
+        let declared = if let Some(c) = node.as_class_node() {
+            Some((super::util::class_name_path(&c), c.body()))
+        } else {
+            node.as_module_node().map(|m| (super::util::module_name_path(&m), m.body()))
+        };
+        if let Some((path, body)) = declared {
+            let Some(path) = path else { return };
+            let mut inner = scope.to_vec();
+            inner.extend(path);
+            let name = inner.join("::");
+            if wanted.contains(name.as_str()) {
+                let loc = node.location();
+                let span = crate::span::Span { file, start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
+                out.push((crate::ident::ClassId(crate::ident::Symbol::from(name.as_str())), span));
+            }
+            if let Some(body) = body {
+                walk(&body, &inner, file, wanted, out);
+            }
+            return;
+        }
+        if let Some(p) = node.as_program_node() {
+            walk(&p.statements().as_node(), scope, file, wanted, out);
+        } else if let Some(s) = node.as_statements_node() {
+            for stmt in s.body().iter() {
+                walk(&stmt, scope, file, wanted, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let named = needles
+            .iter()
+            .any(|leaf| source.text.contains(&format!("class {leaf}")) || source.text.contains(&format!("module {leaf}")));
+        if !named || !source.path.ends_with(".rb") {
+            continue;
+        }
+        let parsed = ruby_prism::parse(source.text.as_bytes());
+        walk(&parsed.node(), &[], crate::span::FileId(index as u32 + 1), &wanted, &mut out);
+    }
+    out
 }
 
 /// Whether one declaration of a class gives it a member of its own: a

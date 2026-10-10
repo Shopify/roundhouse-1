@@ -711,6 +711,18 @@ pub struct App {
     /// `class << self` and reads it there (`emit::ruby::singleton_scoped`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub singleton_scoped_classes: Vec<ClassId>,
+    /// Where the source declares each library class that several
+    /// declarations open, at least one of them without a member of its
+    /// own: the span of each `class X` / `module X` statement. Merged
+    /// into one class (`ingest::app::merge_library_class_reopens`), such
+    /// a class's members all sit at a later declaration, while Ruby
+    /// defines the constant at the first: Core's component/schema.rb
+    /// forward-declares `class Validator; end` above the
+    /// `class_attribute … default: Validator` that reads it, and
+    /// writes its body at the bottom. The Ruby family writes a nested
+    /// class at its earliest declaration (`emit::ruby::library`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_class_declarations: Vec<(ClassId, crate::span::Span)>,
     /// The `included do` statements a plain includer runs where its
     /// `include` runs, keyed by the includer, each with the direct include
     /// it runs after (the root its Concern hangs off), in the order Rails
@@ -1480,6 +1492,7 @@ impl App {
             current_attribute_classes: Vec::new(),
             carried_included_blocks: Vec::new(),
             singleton_scoped_classes: Vec::new(),
+            library_class_declarations: Vec::new(),
             included_block_statements: HashMap::default(),
             included_class_attributes: HashMap::default(),
             render_edges: HashMap::default(),

@@ -632,6 +632,32 @@ fn nested_blocks(
     // [VariantInput]`) runs after it as natively. A block of its own
     // after the enclosing one ran that body first: NameError at load.
     let (kids, hosted) = hosted_kids(kids);
+    // In the order the source declares them, within each file: Ruby runs
+    // `module ErrorHandler` above `class BadRequest …; include
+    // ErrorHandler` (rack-oauth2's server/authorize/error.rb; Core's
+    // checkouts/one test helper web/client.rb), and the collection may
+    // list modules after the classes. Each file's kids take the slots
+    // that file's kids had, so kids of different files and those with
+    // no position keep their places.
+    let kids: Vec<&LibraryClass> = {
+        let at: Vec<Option<crate::span::Span>> = kids.iter().map(|kid| declared_at(kid, app)).collect();
+        let mut sorted = kids.clone();
+        let mut files: Vec<crate::span::FileId> = Vec::new();
+        for span in at.iter().flatten() {
+            if !files.contains(&span.file) {
+                files.push(span.file);
+            }
+        }
+        for file in files {
+            let slots: Vec<usize> = (0..kids.len()).filter(|&i| at[i].is_some_and(|span| span.file == file)).collect();
+            let mut by_start = slots.clone();
+            by_start.sort_by_key(|&i| at[i].map(|span| span.start));
+            for (&slot, &i) in slots.iter().zip(&by_start) {
+                sorted[slot] = kids[i];
+            }
+        }
+        sorted
+    };
     let kids = &kids[..];
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
@@ -793,7 +819,7 @@ fn nested_blocks(
             .collect();
         let Some(block) = unwrapped(&body, depth) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
-        blocks.push((nested_position(parent, kid), block));
+        blocks.push((nested_position(parent, kid, app), block));
         names.push(kid.name.0.as_str().to_string());
         if inline.is_some() {
             continue;
@@ -958,14 +984,39 @@ fn in_singleton_scopes(block: &str, depth: usize, kid: &str) -> String {
 /// `include Summary` (or `prepend`), and placed among the constants it
 /// was written below the include (NameError: uninitialized constant
 /// `Ledger::Summary`).
-fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::span::Span> {
+fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Option<crate::span::Span> {
     if mixes_in(parent, &kid.name) {
         return None;
     }
-    let first = first_span(kid)?;
+    let first = declared_at(kid, app)?;
     let above = |span: &crate::span::Span| span.file == first.file && *span != crate::span::Span::synthetic() && span.start < first.start;
     (parent.constants.iter().any(|(_, value)| above(&value.span)) || parent.unknown_calls.iter().any(|call| above(&call.span)))
         .then_some(first)
+}
+
+/// Where the source defines `kid`: its superclass, which is in its
+/// header, else its first body position (`first_span`), or an earlier
+/// `class X` / `module X` of it in the same file that declares nothing
+/// (`App::library_class_declarations`). Ruby defines the constant at
+/// that one. Core's component/schema.rb forward-declares `class
+/// Validator; end` above `class_attribute :_validator_class, …,
+/// default: Validator` and writes the body at the bottom; placed by the
+/// body, the block followed the seed that reads it (NameError at load).
+/// A body can hold members the source wrote elsewhere: Core's
+/// checkouts/one web/client.rb `SessionNegotiationInputFromResult <
+/// SessionNegotiationInput` carries copies of its superclass's
+/// `class << self` methods, which put it above the module it includes.
+fn declared_at(kid: &LibraryClass, app: &App) -> Option<crate::span::Span> {
+    let header = kid.parent_span;
+    let first = if header.file.0 != 0 && header != crate::span::Span::synthetic() { header } else { first_span(kid)? };
+    Some(
+        app.library_class_declarations
+            .iter()
+            .filter(|(name, at)| *name == kid.name && at.file == first.file && at.start < first.start)
+            .map(|(_, at)| *at)
+            .min_by_key(|at| at.start)
+            .unwrap_or(first),
+    )
 }
 
 /// Whether `parent`'s body includes `module`, or prepends or extends it

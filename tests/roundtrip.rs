@@ -157,6 +157,7 @@ fn tiny_blog_round_trips() {
         models: vec![post_model],
         library_classes: vec![],
         singleton_scoped_classes: Vec::new(),
+        library_class_declarations: Vec::new(),
         current_attribute_classes: vec![],
         carried_included_blocks: vec![],
         included_block_statements: Default::default(),
