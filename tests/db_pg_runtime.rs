@@ -664,8 +664,9 @@ fn postgres_test_helper_names_fixture_sets_for_load_once_instead_of_truncating()
         "{helper}");
     // Rails' base classes exist before boot loads any app file.
     let bases = helper.find("module ActiveSupport\n  TestCase = ::TestBase\nend\n").expect("ActiveSupport::TestCase");
-    assert!(helper.contains("module ActionController\n  class TestCase < TestBase\n  end\nend\n"), "{helper}");
-    assert!(bases < helper.find("require_relative \"../boot\"").expect("boot"), "{helper}");
+    let controller_case = helper.find("module ActionController\n  class TestCase < TestBase\n").expect("ActionController::TestCase");
+    let boot = helper.find("require_relative \"../boot\"").expect("boot");
+    assert!(bases < boot && controller_case < boot, "{helper}");
     // rails/test_help.rb: the boot-registered :active_support_test_case hooks
     // fire, then its own include (`project::test_case_load_hooks_block`).
     let fired = helper.find("ActiveSupport.run_load_hooks(:active_support_test_case, TestBase)").expect("hooks fired");
