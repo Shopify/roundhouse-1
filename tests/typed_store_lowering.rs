@@ -191,3 +191,49 @@ puts "PASS"
         )
         .assert_passes();
 }
+
+/// Block locals referenced by a default (Core's Shop does
+/// `default_money_format = "${{amount}}"` then `s.string :money_format,
+/// default: default_money_format`). The gem evaluates the default once
+/// at declaration; the accessor must carry the value, not a bare call
+/// to a local that does not exist inside the reader.
+#[test]
+fn typed_store_defaults_inline_block_locals() {
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define(version: 1) do\n  create_table :shops do |t|\n    t.text :settings\n  end\nend\n",
+        ),
+        (
+            "app/models/shop.rb",
+            r#"class Shop < ApplicationRecord
+  typed_store :settings do |s|
+    default_money_format = "${{amount}}"
+    tz = "Eastern Time (US & Canada)"
+    s.string :money_format, default: default_money_format
+    s.string :timezone, default: tz
+  end
+end
+"#,
+        ),
+    ];
+    let tree = files
+        .into_iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest tree");
+    let src = roundhouse::emit::ruby::emit_lowered_models(&app)
+        .into_iter()
+        .find(|f| f.path.to_string_lossy().ends_with("models/shop.rb"))
+        .map(|f| f.content)
+        .expect("shop.rb emitted");
+    assert!(
+        src.contains(r#"TypedStore.read(@settings, "money_format", "${{amount}}")"#),
+        "default must inline the block local's value: {src}",
+    );
+    assert!(
+        src.contains(r#"TypedStore.read(@settings, "timezone", "Eastern Time (US & Canada)")"#),
+        "default must inline the block local's value: {src}",
+    );
+    assert!(!src.contains("default_money_format"), "no bare local call left: {src}");
+}

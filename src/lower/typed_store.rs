@@ -86,7 +86,19 @@ pub(crate) fn typed_store_decls(
             _ => vec![block_body],
         };
         let mut attrs = Vec::new();
+        // The block's own locals (`default_money_format = "${{amount}}"`
+        // in Core's Shop settings), by name and value.
+        let mut locals: Vec<(Symbol, Expr)> = Vec::new();
         for stmt in stmts {
+            if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*stmt.node {
+                if let Some(value) = local_value(value, &locals) {
+                    locals.retain(|(n, _)| n != name);
+                    locals.push((name.clone(), value));
+                } else {
+                    locals.retain(|(n, _)| n != name);
+                }
+                continue;
+            }
             let ExprNode::Send { recv: Some(r), method: ty_m, args: a_args, .. } =
                 &*stmt.node
             else {
@@ -120,6 +132,7 @@ pub(crate) fn typed_store_decls(
                 }),
                 _ => None,
             });
+            let default = default.map(|d| local_value(&d, &locals).unwrap_or(d));
             attrs.push(TypedStoreAttr {
                 name,
                 is_bool: ty_m.as_str() == "boolean",
@@ -133,6 +146,49 @@ pub(crate) fn typed_store_decls(
         }
     }
     out
+}
+
+/// `value` with the block locals it reads written in, when it is a
+/// value the gem would have computed once at the declaration with the
+/// same result: literals, constants, string interpolation, arrays and
+/// hashes of them, and the locals bound to such values. The accessor
+/// evaluates the default where the block's locals are out of scope, so
+/// a default naming one was a NameError when read. Anything else is
+/// None, and a default reading it stays as written.
+fn local_value(value: &Expr, locals: &[(Symbol, Expr)]) -> Option<Expr> {
+    let local = |name: &Symbol| locals.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    let node = match &*value.node {
+        ExprNode::Lit { .. } | ExprNode::Const { .. } => return Some(value.clone()),
+        ExprNode::Var { name, .. } => return local(name),
+        // An unbound bare name parses as a call.
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            return local(method);
+        }
+        ExprNode::StringInterp { parts } => ExprNode::StringInterp {
+            parts: parts
+                .iter()
+                .map(|p| match p {
+                    crate::expr::InterpPart::Text { .. } => Some(p.clone()),
+                    crate::expr::InterpPart::Expr { expr } => {
+                        local_value(expr, locals).map(|expr| crate::expr::InterpPart::Expr { expr })
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?,
+        },
+        ExprNode::Array { elements, style } => ExprNode::Array {
+            elements: elements.iter().map(|e| local_value(e, locals)).collect::<Option<Vec<_>>>()?,
+            style: style.clone(),
+        },
+        ExprNode::Hash { entries, kwargs } => ExprNode::Hash {
+            entries: entries
+                .iter()
+                .map(|(k, v)| Some((local_value(k, locals)?, local_value(v, locals)?)))
+                .collect::<Option<Vec<_>>>()?,
+            kwargs: *kwargs,
+        },
+        _ => return None,
+    };
+    Some(Expr::new(value.span, node))
 }
 
 /// Synthesize the per-attribute accessor methods for every
