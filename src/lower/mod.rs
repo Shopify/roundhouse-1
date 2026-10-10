@@ -713,6 +713,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // reads a lifted site as a typed call; it reads nothing any pass
     // writes but the refusal itself.
     ("cruby_module_protocol", &["relation_residue"]),
+    // A replayed class macro that would evaluate a site the emit writes
+    // as a raise goes back to a refused statement, once every pass has
+    // settled what each site emits.
+    ("replay_raise_guard", &["cruby_module_protocol", "model_macro_replay"]),
 ];
 
 /// True iff `POST_ANALYZE_PASS_ORDER` is a valid topological order —
@@ -1036,6 +1040,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("relation_residue");
     object_extend::apply_cruby_module_protocol(app);
     ran!("cruby_module_protocol");
+    model_to_library::macro_replay::guard_replayed_raises(app);
+    ran!("replay_raise_guard");
     #[cfg(debug_assertions)]
     debug_assert_eq!(
         executed,

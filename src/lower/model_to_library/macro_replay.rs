@@ -264,6 +264,11 @@ const DEFERRED_BLOCK_METHODS: &[&str] = &["define_method", "define_singleton_met
 pub(crate) struct ClassSide<'a> {
     /// Whose body the calls are (for diagnostics and constant lookup).
     pub owner: &'a ClassId,
+    /// Refuse a call that would evaluate a site the emit writes as a
+    /// raise ([`emitted_raise`]). Off while the lowering that may lift a
+    /// site's refusal has yet to run ([`replay_model_macros`]); the
+    /// replays are checked again after it ([`guard_replayed_raises`]).
+    raise_guard: bool,
     app: &'a crate::App,
     own: Vec<&'a MethodDef>,
     chain: Vec<&'a Model>,
@@ -295,6 +300,57 @@ fn body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
         ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => Some(expr),
         _ => None,
     })
+}
+
+/// What a site's diagnostic makes the Ruby-family emit write there: the
+/// stub `(raise "roundhouse: ... not supported")` (an `Unsupported`
+/// kind, `emit::ruby::expr::diagnostic_stub`) or the NotImplementedError
+/// raise of a statement ingest refused, as `construct: detail`; `None`
+/// for a site that emits as itself. A runtime constant's declared type
+/// and a constructor's keywords as written emit the source, so they do
+/// not count.
+fn emitted_raise(e: &Expr) -> Option<String> {
+    use crate::diagnostic::DiagnosticKind;
+    match &e.diagnostic {
+        Some(DiagnosticKind::Unsupported { construct, detail, .. }) => {
+            let as_written = (e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
+                && matches!(construct.as_str(), "declared type" | "constant"))
+                || (e.decisions & crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN != 0
+                    && construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
+            (!as_written).then(|| if detail.is_empty() { construct.to_string() } else { format!("{construct}: {detail}") })
+        }
+        Some(DiagnosticKind::IngestRefused { detail }) => Some(format!("ingest_unsupported: {detail}")),
+        _ => None,
+    }
+}
+
+/// The first site under `e` that runs when `e` runs and emits as a raise
+/// ([`emitted_raise`]); a block's or lambda's body runs later, if at all,
+/// and is not entered.
+fn first_emitted_raise(e: &Expr) -> Option<String> {
+    if let Some(why) = emitted_raise(e) {
+        return Some(why);
+    }
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return None;
+    }
+    let mut found = None;
+    e.node.for_each_child(&mut |child| {
+        if found.is_none() {
+            found = first_emitted_raise(child);
+        }
+    });
+    found
+}
+
+/// A replayed call that the define_method expansion refused
+/// (`ingest::define_method_loops`, construct `define_method_expansion`):
+/// the refusal is about the statically expanded copies, which analysis
+/// and the other targets read; the replay runs the macro itself, as Ruby
+/// does, so its own statement emits as written.
+fn expansion_refused(call: &Expr) -> bool {
+    matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+        if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL)
 }
 
 /// `extend M, ...` (bare or `self.`): its argument expressions.
@@ -440,6 +496,7 @@ impl<'a> ClassSide<'a> {
             own,
             chain,
             extended: Vec::new(),
+            raise_guard: true,
             claimed: &[],
             declared: Vec::new(),
             base: std::cell::OnceCell::new(),
@@ -557,6 +614,23 @@ impl<'a> ClassSide<'a> {
     /// `self.` call of an app class macro, an `extend` of app modules, or
     /// a `belongs_to_required_by_default` write; `None` otherwise.
     pub(crate) fn verdict(&self, call: &Expr) -> Option<MacroVerdict> {
+        let verdict = self.reach_verdict(call)?;
+        // The call itself emitting as a raise (a stub the analysis put on
+        // the statement) would raise when the class loads; the walk
+        // refuses one in its arguments or what the macro runs.
+        if verdict == MacroVerdict::Replay
+            && self.raise_guard
+            && !expansion_refused(call)
+            && let Some(why) = emitted_raise(call)
+        {
+            return Some(MacroVerdict::Refuse(format!(
+                "the call emits as a raise ({why}), which would raise when the class loads"
+            )));
+        }
+        Some(verdict)
+    }
+
+    fn reach_verdict(&self, call: &Expr) -> Option<MacroVerdict> {
         if let Some(value) = required_by_default_write(call) {
             return Some(MacroVerdict::BelongsToRequiredByDefault(value));
         }
@@ -1012,6 +1086,15 @@ impl<'s, 'a> Walk<'s, 'a> {
     }
 
     fn expr(&mut self, expr: &Expr, aliases: &mut Vec<String>) -> Result<(), String> {
+        // A site the emit writes as a raise, run at class-body time: the
+        // replayed call would raise when the class loads, losing the
+        // whole model, where refusing drops only this call.
+        if let Some(why) = emitted_raise(expr).filter(|_| self.side.raise_guard) {
+            return Err(format!(
+                "{} evaluates a site the emit writes as a raise ({why}), which would raise when the class loads",
+                self.via()
+            ));
+        }
         match &*expr.node {
             ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
                 self.expr(value, aliases)?;
@@ -1169,19 +1252,64 @@ impl<'s, 'a> Walk<'s, 'a> {
 /// The verdicts on `model`'s body statements that call app class macros,
 /// extend app modules or write `belongs_to_required_by_default`, by item.
 pub(crate) fn model_macro_verdicts<'a>(model: &'a Model, app: &'a crate::App) -> Vec<(&'a Expr, MacroVerdict)> {
+    model_macro_verdicts_guarded(model, app, true)
+}
+
+fn model_macro_verdicts_guarded<'a>(model: &'a Model, app: &'a crate::App, raise_guard: bool) -> Vec<(&'a Expr, MacroVerdict)> {
     let mut callbacks = super::callback_dsl_calls(model, &app.models);
     callbacks.extend(super::gem_port_macro_calls(model, &app.models));
-    let side = ClassSide::of_model(model, app);
-    model
-        .body
-        .iter()
-        .filter_map(|item| match item {
-            ModelBodyItem::Unknown { expr, .. } => Some(expr),
-            _ => None,
-        })
-        .filter(|expr| !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_in_model(model, expr))
-        .filter_map(|expr| side.verdict(expr).map(|v| (expr, v)))
-        .collect()
+    let mut side = ClassSide::of_model(model, app);
+    side.raise_guard = raise_guard;
+    // Body locals whose write emits as a raise: a replayed call reading
+    // one would need the write carried (`carry_read_body_locals`), which
+    // raises when the class loads.
+    let mut raising: Vec<(&crate::ident::Symbol, String)> = Vec::new();
+    let mut out = Vec::new();
+    for item in &model.body {
+        let (ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. }) = item else { continue };
+        if let Some(name) = local_written(expr).filter(|_| raise_guard) {
+            raising.retain(|(n, _)| *n != name);
+            if let Some(why) = first_emitted_raise(expr) {
+                raising.push((name, why));
+            }
+        }
+        if !matches!(item, ModelBodyItem::Unknown { .. }) {
+            continue;
+        }
+        if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) || super::claimed_in_model(model, expr) {
+            continue;
+        }
+        let Some(verdict) = side.verdict(expr) else { continue };
+        let verdict = match raising.iter().find(|(name, _)| reads_local(expr, name)) {
+            Some((name, why)) if verdict == MacroVerdict::Replay => MacroVerdict::Refuse(format!(
+                "it reads the class-body local `{name}`, whose write emits as a raise ({why}), which would raise when the class loads"
+            )),
+            _ => verdict,
+        };
+        out.push((expr, verdict));
+    }
+    out
+}
+
+/// The local a body statement writes (`coder = ...`, `x ||= ...`).
+fn local_written(e: &Expr) -> Option<&crate::ident::Symbol> {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// Does `e` read the local `name`?
+fn reads_local(e: &Expr, name: &crate::ident::Symbol) -> bool {
+    if let ExprNode::Var { name: read, .. } = &*e.node
+        && read == name
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || reads_local(c, name));
+    found
 }
 
 /// Apply the verdicts: each replayed `Unknown` model-body statement
@@ -1204,7 +1332,7 @@ pub fn replay_model_macros(app: &mut crate::App) {
     let mut settings: Vec<Vec<(crate::span::Span, bool)>> = vec![Vec::new(); app.models.len()];
     for (i, model) in app.models.iter().enumerate() {
         let mut spans = Vec::new();
-        for (expr, verdict) in model_macro_verdicts(model, app) {
+        for (expr, verdict) in model_macro_verdicts_guarded(model, app, false) {
             match verdict {
                 MacroVerdict::Replay => spans.push(expr.span),
                 MacroVerdict::BelongsToRequiredByDefault(value) => settings[i].push((expr.span, value)),
@@ -1219,8 +1347,12 @@ pub fn replay_model_macros(app: &mut crate::App) {
         for item in &mut app.models[i].body {
             let ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else { continue };
             if spans.contains(&expr.span) {
+                let mut expr = expr.clone();
+                if expansion_refused(&expr) {
+                    expr.diagnostic = None;
+                }
                 *item = ModelBodyItem::ClassBody {
-                    expr: expr.clone(),
+                    expr,
                     leading_comments: std::mem::take(leading_comments),
                     leading_blank_line: *leading_blank_line,
                 };
@@ -1282,6 +1414,77 @@ pub fn replay_model_macros(app: &mut crate::App) {
                 {
                     *optional = !required;
                 }
+            }
+        }
+    }
+}
+
+/// The replays [`replay_model_macros`] made, checked once every lowering
+/// has settled what each site emits (after `object_extend::
+/// apply_cruby_module_protocol`, which lifts the Module protocol refusals
+/// the CRuby tree runs as written): a replayed call that would evaluate a
+/// site the emit writes as `(raise "roundhouse: ... not supported")`, in
+/// its arguments, the macro's class-body path, or a carried local it
+/// reads, would raise when the class loads, and Ruby would discard the
+/// whole model. It goes back to an `Unknown` statement, which
+/// `unclaimed_unknowns` refuses by name; the model's other statements
+/// load. A carried local write that raises and that no replayed
+/// statement reads any more goes back with it.
+pub fn guard_replayed_raises(app: &mut crate::App) {
+    let mut demote: Vec<(usize, Vec<crate::span::Span>)> = Vec::new();
+    for (i, model) in app.models.iter().enumerate() {
+        let guarded = ClassSide::of_model(model, app);
+        let mut unguarded = ClassSide::of_model(model, app);
+        unguarded.raise_guard = false;
+        let mut raising: Vec<&crate::ident::Symbol> = Vec::new();
+        let mut spans = Vec::new();
+        for item in &model.body {
+            let (ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. }) = item else { continue };
+            let replayed = matches!(item, ModelBodyItem::ClassBody { .. })
+                && unguarded.verdict(expr) == Some(MacroVerdict::Replay);
+            if replayed
+                && (matches!(guarded.verdict(expr), Some(MacroVerdict::Refuse(_)))
+                    || raising.iter().any(|name| reads_local(expr, name)))
+            {
+                spans.push(expr.span);
+            }
+            if let Some(name) = local_written(expr) {
+                raising.retain(|n| *n != name);
+                if first_emitted_raise(expr).is_some() {
+                    raising.push(name);
+                }
+            }
+        }
+        if spans.is_empty() {
+            continue;
+        }
+        // Carried writes that raise and that only the demoted calls read.
+        let body = &model.body;
+        for (k, item) in body.iter().enumerate() {
+            let ModelBodyItem::ClassBody { expr, .. } = item else { continue };
+            let Some(name) = local_written(expr) else { continue };
+            if first_emitted_raise(expr).is_none() {
+                continue;
+            }
+            let still_read = body[k + 1..].iter().any(|later| match later {
+                ModelBodyItem::ClassBody { expr: later, .. } => !spans.contains(&later.span) && reads_local(later, name),
+                _ => false,
+            });
+            if !still_read {
+                spans.push(expr.span);
+            }
+        }
+        demote.push((i, spans));
+    }
+    for (i, spans) in demote {
+        for item in &mut app.models[i].body {
+            let ModelBodyItem::ClassBody { expr, leading_comments, leading_blank_line } = item else { continue };
+            if spans.contains(&expr.span) {
+                *item = ModelBodyItem::Unknown {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
             }
         }
     }
@@ -1364,6 +1567,15 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
                     MacroVerdict::Refuse(
                         "it sets `belongs_to_required_by_default`, which is applied to a lowered model's `belongs_to` declarations, and an STI subclass's are not lowered as a model's".to_string(),
                     ),
+                ),
+                // The library emit writes the statement with its
+                // expansion refusal, as a raise.
+                MacroVerdict::Replay if expansion_refused(expr) => (
+                    expr,
+                    MacroVerdict::Refuse(format!(
+                        "the call emits as a raise ({}), which would raise when the class loads",
+                        emitted_raise(expr).unwrap_or_default()
+                    )),
                 ),
                 v => (expr, v),
             })
