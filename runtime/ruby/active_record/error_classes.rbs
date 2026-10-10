@@ -54,11 +54,6 @@ module ActiveRecord
   class ShardSwapProhibitedError < ArgumentError
   end
 
-  class RecordNotSaved < ActiveRecordError
-    def record: () -> Base?
-    def initialize: (?String? message, ?Base? record) -> void
-  end
-
   class RecordNotDestroyed < ActiveRecordError
     def record: () -> Base?
     def initialize: (?String? message, ?Base? record) -> void
@@ -110,9 +105,6 @@ module ActiveRecord
   end
 
   class ConfigurationError < ActiveRecordError
-  end
-
-  class ReadOnlyRecord < ActiveRecordError
   end
 
   class StrictLoadingViolationError < ActiveRecordError

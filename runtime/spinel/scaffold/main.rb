@@ -518,11 +518,16 @@ module Main
       res.status = 404
       res.body = "<h1>404 Not Found</h1>"
       return
-    rescue ActionController::ParameterMissing
+    rescue ActionController::ParameterMissing, ActionController::BadRequest
       # `params.expect` / `params.require` refused the request and the app
       # did not rescue it: Rails' rescue_responses answer :bad_request.
       res.status = 400
       res.body = "<h1>400 Bad Request</h1>"
+      return
+    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
+      # Not a 500: Rails' rescue_responses answer these with 422.
+      res.status = 422
+      res.body = "<h1>422 Unprocessable Content</h1>"
       return
     end
 
@@ -556,6 +561,11 @@ module Main
     elsif controller.content_type != "text/html; charset=utf-8"
       res.headers["Content-Type"] = controller.content_type
     end
+    # Compose `Cache-Control` from whatever `response.cache_control`
+    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
+    # header store, right before it is copied below — a no-op unless
+    # the action or one of its filters touched the store.
+    controller.commit_cache_control!
     # Headers the action set beyond those two — a `Content-Disposition`
     # on a download, the Cache-Control a blob route asks for. A nil
     # value is a header the app UNSET (campfire's `X-Rev` is

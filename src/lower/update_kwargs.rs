@@ -113,7 +113,7 @@ fn inline_parts(e: &Expr, keep_update: bool) -> Option<(Vec<(Symbol, Expr)>, &'s
                 };
                 out.push((value.clone(), now(e.span)));
             }
-            Some((out, "touch"))
+            Some((out, "touch_written"))
         }
         _ => None,
     }

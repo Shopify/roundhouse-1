@@ -430,6 +430,7 @@ module ActiveRecord
       raise NotImplementedError, "_adapter_insert: subclasses must override"
     end
     def _adapter_update; end
+    def _adapter_touch; end
     def _adapter_delete; end
 
     def self._adapter_count
@@ -1036,7 +1037,8 @@ module ActiveRecord
     # That lowering is `lower::column_ops` for an implicit-self call
     # (campfire's `Membership#connected`) and `lower::update_kwargs` for
     # an explicit receiver (lobsters' `@user&.touch(:last_read_newest_
-    # story)`); both reach this method with the column already written.
+    # story)`); both reach `touch_written` below with the column
+    # already written.
     #
     # `after_touch` FIRES, and that is load-bearing rather than
     # cosmetic: it is the only thing that makes `belongs_to … touch:
@@ -1048,7 +1050,28 @@ module ActiveRecord
     # when the model has an `updated_at` to touch.
     # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
     # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
+    #
+    # The bare form writes `updated_at` ALONE (`_adapter_touch`), as
+    # Rails' `touch` does. Writing the whole row put back every column
+    # the record had loaded, and a column the database keeps behind the
+    # record — campfire's trigger-maintained `rooms.messages_count`,
+    # reached by a message's `belongs_to :room, touch: true` — took the
+    # stale value.
     def touch
+      _transaction_write_begin
+      fill_timestamps(false)
+      _adapter_touch
+      @_trigger_update_callback = true if self.class.schema_columns.include?(:updated_at)
+      after_touch
+      _transaction_write_end
+      true
+    end
+
+    # `touch` after a call-site column write (`touch :connected_at`,
+    # `increment!(:connections, touch: true)`): the whole row, so the
+    # assigned column is written with the timestamp. (Change the
+    # PostgreSQL CRuby tree's copy beside `touch`'s too.)
+    def touch_written
       _transaction_write_begin
       fill_timestamps(false)
       _adapter_update

@@ -97,15 +97,6 @@ module ActiveRecord
   class ShardSwapProhibitedError < ArgumentError
   end
 
-  class RecordNotSaved < ActiveRecordError
-    attr_reader :record
-
-    def initialize(message = nil, record = nil)
-      @record = record
-      super(message)
-    end
-  end
-
   class RecordNotDestroyed < ActiveRecordError
     attr_reader :record
 
@@ -197,9 +188,6 @@ module ActiveRecord
   end
 
   class ConfigurationError < ActiveRecordError
-  end
-
-  class ReadOnlyRecord < ActiveRecordError
   end
 
   class StrictLoadingViolationError < ActiveRecordError

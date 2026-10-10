@@ -11,6 +11,14 @@ module ActionController
   class UnpermittedParameters < StandardError
   end
 
+  class BadRequest < ActionControllerError
+    def initialize: (?String msg) -> void
+  end
+
+  class InvalidAuthenticityToken < ActionControllerError
+    def initialize: (?String msg) -> void
+  end
+
   class UnknownFormat < ActionControllerError
   end
 

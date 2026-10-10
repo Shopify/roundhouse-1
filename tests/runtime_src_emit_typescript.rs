@@ -102,7 +102,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
     let classes = parse_library_with_rbs(&ruby, &rbs, "runtime/ruby/active_record/errors.rb")
         .expect("parse_library_with_rbs");
 
-    assert_eq!(classes.len(), 9, "expected 9 classes; got {}", classes.len());
+    assert_eq!(classes.len(), 11, "expected 11 classes; got {}", classes.len());
 
     let root = classes
         .iter()

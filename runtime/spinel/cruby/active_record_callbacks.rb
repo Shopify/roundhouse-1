@@ -495,7 +495,7 @@ module ActiveRecord
     # writes active_record_core.rb captured), without a redefinition
     # warning.
     [:save, :save!, :destroy!, :mark_persisted!, :_run_commit_hooks, :_transaction_rolled_back,
-     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch].each do |name|
+     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch, :_runtime_touch_written].each do |name|
       remove_method(name) if method_defined?(name, false) || private_method_defined?(name, false)
     end
     singleton_class.send(:remove_method, :create!) if singleton_class.method_defined?(:create!, false)
@@ -619,12 +619,22 @@ module ActiveRecord
         end
       end
 
-      # A copy of base.rb's `touch` (change both), in the touch chain.
+      # Copies of base.rb's `touch` and `touch_written` (change both), in
+      # the touch chain: the bare form writes `updated_at` alone, the
+      # written form the whole row with the call site's column.
       def _runtime_touch
+        _runtime_touch_with { _adapter_touch }
+      end
+
+      def _runtime_touch_written
+        _runtime_touch_with { _adapter_update }
+      end
+
+      def _runtime_touch_with
         _transaction_write_begin
         _callback_chain_run(:touch) do
           fill_timestamps(false)
-          _adapter_update
+          yield
           @_trigger_update_callback = true if self.class.schema_columns.include?(:updated_at)
           true
         end

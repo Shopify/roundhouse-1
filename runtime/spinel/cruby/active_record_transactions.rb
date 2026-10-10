@@ -1074,6 +1074,10 @@ module ActiveRecord
       with_transaction_returning_status { super }
     end
 
+    def touch_written
+      with_transaction_returning_status { super }
+    end
+
     def update_attribute(name, value)
       with_transaction_returning_status { super }
     end

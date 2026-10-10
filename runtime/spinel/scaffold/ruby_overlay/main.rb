@@ -231,10 +231,13 @@ module Main
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
       return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
-    rescue ActionController::ParameterMissing
+    rescue ActionController::ParameterMissing, ActionController::BadRequest
       # `params.expect` / `params.require` refused the request and the app
       # did not rescue it: Rails' rescue_responses answer :bad_request.
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
+      # Not a 500: Rails' rescue_responses answer these with 422.
+      return [422, "<h1>422 Unprocessable Content</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     end
 
     # Dispatch on status, not on @location nil-ness: redirect_to
@@ -287,6 +290,11 @@ module Main
         session_out.empty? ? nil : ActionDispatch::Session.signed_cookie(session_out, session_cookie)
     end
     is_redirect = controller.status >= 300 && controller.status < 400 && !controller.head_response?
+    # Compose `Cache-Control` from whatever `response.cache_control`
+    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
+    # header store, right before it is copied below — a no-op unless
+    # the action or one of its filters touched the store.
+    controller.commit_cache_control!
     # Headers the action set beyond Content-Type/Location — a
     # `Content-Disposition` on a download, the Cache-Control a blob
     # route asks for — ride as the tuple's sixth element.

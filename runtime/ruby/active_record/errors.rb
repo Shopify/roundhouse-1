@@ -114,6 +114,28 @@ module ActiveRecord
     end
   end
 
+  # Raised by app code (`raise ActiveRecord::RecordNotSaved.new(msg, record)`)
+  # to answer 422 as Rails does, and by the PostgreSQL CRuby tree's
+  # `create!`/`update!` when the save chain did not write
+  # (runtime/spinel/cruby/active_record_callbacks.rb). Rails'
+  # `(message, record)` constructor and `record` reader.
+  class RecordNotSaved < ActiveRecordError
+    attr_reader :record
+
+    def initialize(message = "ActiveRecord::RecordNotSaved", record = nil)
+      @record = record
+      super(message)
+    end
+  end
+
+  # Raised by app code, and by the PostgreSQL CRuby tree's write to a
+  # record marked `readonly!` (runtime/spinel/cruby/active_record_core.rb).
+  class ReadOnlyRecord < ActiveRecordError
+    def initialize(message = "ActiveRecord::ReadOnlyRecord")
+      super(message)
+    end
+  end
+
   # validations.rb: raised by `save!` when validation fails.
   class RecordInvalid < ActiveRecordError
     attr_reader :record

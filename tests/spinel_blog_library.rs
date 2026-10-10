@@ -38,8 +38,8 @@ fn errors_rb_ingests_and_emits_via_library_path() {
     // nesting and prepends the path to each class's syntactic name.
     assert_eq!(
         classes.len(),
-        9,
-        "expected ActiveRecordError + AdapterError + RecordNotFound + StatementInvalid + WrappedDatabaseException + ValueTooLong + RecordNotUnique + SoleRecordExceeded + RecordInvalid; got {} ({:?})",
+        11,
+        "expected ActiveRecordError + AdapterError + RecordNotFound + StatementInvalid + WrappedDatabaseException + ValueTooLong + RecordNotUnique + SoleRecordExceeded + RecordNotSaved + ReadOnlyRecord + RecordInvalid; got {} ({:?})",
         classes.len(),
         classes.iter().map(|c| c.name.0.as_str().to_string()).collect::<Vec<_>>(),
     );
@@ -52,6 +52,8 @@ fn errors_rb_ingests_and_emits_via_library_path() {
     assert!(names.contains(&"ActiveRecord::ValueTooLong"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::RecordNotUnique"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::SoleRecordExceeded"), "names: {names:?}");
+    assert!(names.contains(&"ActiveRecord::RecordNotSaved"), "names: {names:?}");
+    assert!(names.contains(&"ActiveRecord::ReadOnlyRecord"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::RecordInvalid"), "names: {names:?}");
 
     // Rails' parents: ActiveRecordError under StandardError, the
@@ -96,7 +98,7 @@ fn errors_rb_ingests_and_emits_via_library_path() {
         .iter()
         .filter(|f| f.path.extension().and_then(|e| e.to_str()) == Some("rb"))
         .count();
-    assert_eq!(rb_count, 9, "one .rb file per LibraryClass");
+    assert_eq!(rb_count, 11, "one .rb file per LibraryClass");
 
     let invalid_file = files
         .iter()

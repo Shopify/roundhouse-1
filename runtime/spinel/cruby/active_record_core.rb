@@ -344,6 +344,11 @@ module ActiveRecord
       _runtime_touch
     end
 
+    def touch_written
+      _raise_readonly_record_error if readonly?
+      _runtime_touch_written
+    end
+
     private
       def _raise_readonly_record_error
         raise ReadOnlyRecord, "#{self.class} is marked as readonly"
@@ -696,7 +701,7 @@ module ActiveRecord
     # Base's own writes, which Persistence's readonly check calls. The
     # Transactions module (active_record_transactions.rb) may already be
     # prepended, and `alias_method` would name its method.
-    [:save_after_validation, :destroy, :touch].each do |name|
+    [:save_after_validation, :destroy, :touch, :touch_written].each do |name|
       own = instance_method(name)
       own = own.super_method until own.owner == self
       define_method(:"_runtime_#{name}", own)
