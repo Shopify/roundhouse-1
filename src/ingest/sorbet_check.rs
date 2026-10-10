@@ -512,9 +512,11 @@ fn str_lit(span: Span, value: &str) -> Expr {
 /// `SorbetRuntimeCheck.type_alias { <X> }`, a type object whose block
 /// runs at its first check, as sorbet-runtime's `aliased_type` does, so
 /// a check naming the alias (`T.let(x, Name)`) reaches the type it
-/// names. `None` when `value` is not that call or its type is one the
-/// check does not read; such an alias goes, as before, with the `sig`s
-/// that read it, and a check naming it is refused as an unknown constant.
+/// names. A `T.type_alias` whose type the check does not read carries a
+/// block that raises that refusal, so a check reading it fails by name
+/// and an annotation reads it as untyped. `None` when `value` is not
+/// that call, or for a type parameter whose `fixed:` type is unread;
+/// such a parameter goes, as before, with the `sig`s that read it.
 /// `project` drops the carried alias off the CRuby / JRuby trees, which
 /// refuse every check that could read it.
 ///
@@ -524,14 +526,14 @@ fn str_lit(span: Span, value: &str) -> Expr {
 /// which is also what sorbet-runtime checks for it (nothing).
 pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
     let Some(call) = value.as_call_node() else { return Ok(None) };
-    let ty = if matches!(constant_id_str(&call.name()), "type_member" | "type_template") && call.receiver().is_none() {
-        match type_parameter_fixed(&call) {
+    let body = if matches!(constant_id_str(&call.name()), "type_member" | "type_template") && call.receiver().is_none() {
+        type_expr(&match type_parameter_fixed(&call) {
             Some(fixed) => match read_type(&fixed, file)? {
                 Ok(ty) => ty,
                 Err(_) => return Ok(None),
             },
             None => SorbetType::Untyped,
-        }
+        })
     } else {
         if constant_id_str(&call.name()) != "type_alias" || !call.receiver().is_some_and(|r| is_t(&r)) || call.arguments().is_some() {
             return Ok(None);
@@ -546,8 +548,22 @@ pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<E
         };
         let statements: Vec<Node<'_>> = body.body().iter().collect();
         let [ty] = statements.as_slice() else { return Ok(None) };
-        let Ok(ty) = read_type(ty, file)? else { return Ok(None) };
-        ty
+        match read_type(ty, file)? {
+            Ok(ty) => type_expr(&ty),
+            // A member no check reads (`T::Enum` in Observe's
+            // `AllowedValueType`): the alias is still a constant, so an
+            // annotation naming it (`{} #: Hash[K, AllowedValueType]`,
+            // never evaluated) reads it as untyped (`alias_ty`) rather
+            // than refusing the authored value as an unknown constant.
+            // A check that reads it raises here, by name.
+            Err(reason) => {
+                let loc = ty.location();
+                let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
+                let mut refused = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+                refused.diagnostic = Some(refusal(reason));
+                refused
+            }
+        }
     };
     let loc = value.location();
     let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
@@ -557,7 +573,7 @@ pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<E
             params: Vec::new(),
             rest_param: None,
             block_param: None,
-            body: type_expr(&ty),
+            body,
             block_style: crate::expr::BlockStyle::Brace,
         },
     );
@@ -592,6 +608,11 @@ pub(crate) fn alias_ty(expr: &Expr) -> Option<crate::ty::Ty> {
         return None;
     }
     let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+    if body.diagnostic.is_some() {
+        // An alias no check reads (`alias_value`): untyped, as sorbet's
+        // static reading of a member it cannot name would be.
+        return Some(crate::ty::Ty::Untyped);
+    }
     type_object_ty(body)
 }
 
