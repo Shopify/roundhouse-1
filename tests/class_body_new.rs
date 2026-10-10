@@ -279,3 +279,44 @@ fn an_unsubclassed_class_is_not_monomorphized() {
         "no subclass, no late binding, no copies:\n{src}"
     );
 }
+
+/// measured 3.2.1's shape: `Measured.build` returns `Class.new(Measurable)
+/// do ... end`, so `Measured::Weight.parse` runs `Measurable.parse` with
+/// `self` a class the tree never declares. Bound to the owner it built
+/// the abstract Measurable; the bare `new` stays, and the constant
+/// initializer, which runs in the owner's body, is still bound.
+const MEASURED: &str = r#"module Measured
+  class Measurable
+    attr_reader :value
+
+    def initialize(value)
+      @value = value
+    end
+
+    ZERO = new(0)
+
+    class << self
+      def parse(string)
+        new(string.to_i)
+      end
+    end
+  end
+
+  class << self
+    def build(&block)
+      Class.new(Measurable, &block)
+    end
+  end
+end
+"#;
+
+#[test]
+fn a_class_subclassed_at_run_time_keeps_its_bare_new() {
+    let files = emitted_files(&[("app/models/measured.rb", MEASURED)]);
+    let module = file_named(&files, "measured.rb");
+    assert!(module.contains("Class.new(Measured::Measurable"), "{module}");
+    let src = file_named(&files, "measurable.rb");
+    assert!(!src.contains("Measurable.new(string.to_i)"), "bound to the owner, `Weight.parse` builds a Measurable:\n{src}");
+    assert!(src.contains("new(string.to_i)"), "{src}");
+    assert!(src.contains("Measured::Measurable.new(0)") || src.contains("Measurable.new(0)"), "the constant is still the owner's:\n{src}");
+}

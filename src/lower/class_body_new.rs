@@ -72,6 +72,17 @@
 //! own dispatch on `self` already builds the subclass, so nothing is
 //! copied either. See [`private_constructors`].
 //!
+//! A class some code subclasses AT RUN TIME (`Class.new(Measurable)`)
+//! is the other exception: the tree's subclass set is not closed for it.
+//! measured 3.2.1's `Measured.build` returns `Class.new(Measurable) do
+//! ... end`, and `Measurable.parse` (`new(*Parser.parse_string(string))`)
+//! reached as `Measured::Weight.parse` must build a Weight; bound to the
+//! owner it built the abstract `Measurable`, whose `unit_system` raises.
+//! Its class-side methods keep the bare `new`, so Ruby's dispatch on
+//! `self` builds the subclass; a strict target is told so by a warning.
+//! A constant initializer still runs in the owner's body and is bound.
+//! See [`dynamic_superclasses`].
+//!
 //! Only `new`. `create` / `create!` are the same shape on a MODEL class
 //! body, but they are also association-scope constructors that
 //! `lower::scope_chain` already claims at implicit self
@@ -88,8 +99,10 @@ use crate::ident::Symbol;
 pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let private = private_constructors(app);
+    let dynamic = dynamic_superclasses(app);
     let mut subclassed = subclassed_names(app);
     subclassed.retain(|name| !private.contains(name));
+    diags.extend(dynamic_subclass_warnings(app, &dynamic));
 
     // Copies FIRST, while every method body still holds its bare `new`:
     // the rewrite below is what binds a receiver, and a copy taken after
@@ -114,7 +127,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
                     }
                 }
                 ModelBodyItem::Method { method, .. }
-                    if matches!(method.receiver, MethodReceiver::Class) =>
+                    if matches!(method.receiver, MethodReceiver::Class) && !dynamic.contains(&owner) =>
                 {
                     rewrite(&mut method.body, &owner);
                 }
@@ -143,12 +156,108 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
             rewrite(value, &owner);
         }
         for m in &mut lc.methods {
-            if matches!(m.receiver, MethodReceiver::Class) {
+            if matches!(m.receiver, MethodReceiver::Class) && !dynamic.contains(&owner) {
                 rewrite(&mut m.body, &owner);
             }
         }
     }
     diags
+}
+
+/// Every class of the tree that a `Class.new(X)` call names as its
+/// superclass, anywhere in a model's or library class's code: `self` in
+/// its class-side methods may be a class the tree never declares. The
+/// argument resolves by its analyzed type, else from the calling class's
+/// namespace outward, as Ruby resolves a constant.
+fn dynamic_superclasses(app: &App) -> crate::det::HashSet<String> {
+    let classes: crate::det::HashSet<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| lc.name.0.as_str()))
+        .collect();
+    let mut out = crate::det::HashSet::default();
+    fn scan(e: &Expr, scope: &str, classes: &crate::det::HashSet<&str>, out: &mut crate::det::HashSet<String>) {
+        e.node.for_each_child(&mut |c| scan(c, scope, classes, out));
+        let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return };
+        let (ExprNode::Const { path }, Some(arg)) = (&*r.node, args.first()) else { return };
+        if method.as_str() != "new" || path.last().map(|s| s.as_str()) != Some("Class") || path.len() > 1 {
+            return;
+        }
+        let ExprNode::Const { path: parent } = &*arg.node else { return };
+        if let Some(crate::ty::Ty::Class { id, .. }) = arg.ty.as_ref() {
+            if classes.contains(id.0.as_str()) {
+                out.insert(id.0.as_str().to_string());
+                return;
+            }
+        }
+        let parent = parent.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        let mut namespace: Vec<&str> = scope.split("::").collect();
+        loop {
+            let candidate =
+                if namespace.is_empty() { parent.clone() } else { format!("{}::{parent}", namespace.join("::")) };
+            if classes.contains(candidate.as_str()) {
+                out.insert(candidate);
+                return;
+            }
+            if namespace.pop().is_none() {
+                return;
+            }
+        }
+    }
+    for m in &app.models {
+        let scope = m.name.0.as_str();
+        for item in &m.body {
+            match item {
+                ModelBodyItem::Method { method, .. } => scan(&method.body, scope, &classes, &mut out),
+                ModelBodyItem::Unknown { expr, .. } => scan(expr, scope, &classes, &mut out),
+                _ => {}
+            }
+        }
+    }
+    for lc in &app.library_classes {
+        let scope = lc.name.0.as_str();
+        let exprs = lc.methods.iter().map(|m| &m.body).chain(lc.constants.iter().map(|(_, v)| v));
+        for e in exprs.chain(&lc.unknown_calls).chain(&lc.class_ivar_initializers) {
+            scan(e, scope, &classes, &mut out);
+        }
+    }
+    out
+}
+
+/// A warning for each class-side method of a [`dynamic_superclasses`]
+/// class that builds with a bare `new`: it is left bare, which the Ruby
+/// family runs as Ruby does and a strict target cannot resolve.
+fn dynamic_subclass_warnings(app: &App, dynamic: &crate::det::HashSet<String>) -> Vec<Diagnostic> {
+    let model_methods = app.models.iter().flat_map(|m| {
+        m.body.iter().filter_map(move |item| match item {
+            ModelBodyItem::Method { method, .. } => Some((m.name.0.as_str(), method)),
+            _ => None,
+        })
+    });
+    let library_methods =
+        app.library_classes.iter().flat_map(|lc| lc.methods.iter().map(move |m| (lc.name.0.as_str(), m)));
+    model_methods
+        .chain(library_methods)
+        .filter(|(owner, m)| {
+            dynamic.contains(*owner) && matches!(m.receiver, MethodReceiver::Class) && constructs(&m.body)
+        })
+        .map(|(owner, m)| {
+            let mut d = Diagnostic::unsupported(
+                Span::synthetic(),
+                None,
+                "inherited class-side constructor",
+                format!(
+                    "`{owner}.{}` builds with a bare `new` and `{owner}` is subclassed at run time \
+                     (`Class.new({owner})`), so its `new` keeps no receiver: the ruby family builds \
+                     the receiving class as Ruby does, and a strict target cannot resolve it.",
+                    m.name.as_str(),
+                ),
+            );
+            d.severity = crate::diagnostic::Severity::Warning;
+            d
+        })
+        .collect()
 }
 
 /// Ruby family: a SUBCLASSED model's own class methods get their bare
