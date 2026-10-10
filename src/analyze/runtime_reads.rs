@@ -416,6 +416,104 @@ pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> 
     }).get(module).map(Vec::as_slice)
 }
 
+/// The class methods `extend M` gives its receiver where M is a module of
+/// the ActiveModel::Validations port: M's own instance methods, and the class methods of the
+/// modules its `self.extended(base)` hook includes in `base`
+/// ([`mixed_in_class_methods`]). The ActiveModel::Callbacks port
+/// (activemodel's callbacks.rb, in active_model_validations.rb) gives
+/// `define_model_callbacks` and, by its hook's `include
+/// ActiveSupport::Callbacks`, `define_callbacks`, `set_callback` and the
+/// rest, which a gem Concern's `included do` (activeresource's
+/// ActiveResource::Callbacks) calls right after its `extend`.
+pub(crate) fn extended_class_methods(module: &str) -> Option<&'static [String]> {
+    static METHODS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    METHODS.get_or_init(|| {
+        /// The enclosing module path; each module's instance defs; each
+        /// module's `extended` hook includes as written.
+        struct Modules(Vec<String>, HashMap<String, Vec<String>>, Vec<(String, String)>);
+        impl Modules {
+            fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+                self.0.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
+                if let Some(body) = body {
+                    ruby_prism::Visit::visit(self, &body);
+                }
+                self.0.pop();
+            }
+        }
+        /// Every `include M` in an `extended` hook: receiverless, as
+        /// `base.class_eval do … end` runs it, or `base.include M`.
+        struct Includes(Vec<String>);
+        impl<'pr> ruby_prism::Visit<'pr> for Includes {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if node.name().as_slice() == b"include" {
+                    for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                        if arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some() {
+                            self.0.push(String::from_utf8_lossy(arg.location().as_slice()).into_owned());
+                        }
+                    }
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Modules {
+            fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if self.0.is_empty() {
+                    return;
+                }
+                let owner = self.0.join("::");
+                if node.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+                    if node.name().as_slice() == b"extended"
+                        && let Some(body) = node.body()
+                    {
+                        let mut includes = Includes(Vec::new());
+                        ruby_prism::Visit::visit(&mut includes, &body);
+                        self.2.extend(includes.0.into_iter().map(|written| (owner.clone(), written)));
+                    }
+                    return;
+                }
+                if node.receiver().is_none() {
+                    let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+                    self.1.entry(owner).or_default().push(name);
+                }
+            }
+        }
+        let mut modules = Modules(Vec::new(), HashMap::default(), Vec::new());
+        // The ActiveModel::Validations port, which the PostgreSQL tree
+        // carries where app code names one of its modules
+        // (`project::active_model_ports_carried`).
+        for source in ["runtime/spinel/active_model_validations.rb"] {
+            let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+            let parsed = ruby_prism::parse(text.as_bytes());
+            if parsed.errors().next().is_none() {
+                ruby_prism::Visit::visit(&mut modules, &parsed.node());
+            }
+        }
+        let Modules(_, mut own, hooks) = modules;
+        for (owner, written) in hooks {
+            let written = written.trim_start_matches("::");
+            let nested = owner.rsplit_once("::").map(|(scope, _)| format!("{scope}::{written}"));
+            let Some(methods) = nested.as_deref().and_then(mixed_in_class_methods).or_else(|| mixed_in_class_methods(written))
+            else {
+                continue;
+            };
+            let entry = own.entry(owner).or_default();
+            for name in methods {
+                if !entry.contains(name) {
+                    entry.push(name.clone());
+                }
+            }
+        }
+        own
+    }).get(module).map(Vec::as_slice)
+}
+
 /// A gated port's constant aliases of its own classes, by the alias's
 /// full name: `ActiveRecord::Type::String = ActiveModel::Type::String`
 /// in runtime/spinel/active_model_type.rb. An expression read of the
