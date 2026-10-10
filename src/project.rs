@@ -4668,8 +4668,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // the descendants tracker, which an app may already carry, and
     // Numeric's byte and Duration builders (core_ext/numeric/bytes.rb,
     // time.rb), BigDecimal#to_s (core_ext/big_decimal/conversions.rb) and
-    // File.atomic_write (core_ext/file/atomic.rb) and Digest::UUID
-    // (core_ext/digest/uuid.rb): a native gem's require of one answers
+    // File.atomic_write (core_ext/file/atomic.rb), Digest::UUID
+    // (core_ext/digest/uuid.rb) and SecureRandom.base58/.base36/.base32
+    // (core_ext/securerandom.rb): a native gem's require of one answers
     // from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
@@ -4678,6 +4679,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
         "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
         "active_support_kernel_reporting", "active_support_file_atomic", "active_support_digest_uuid",
+        "active_support_securerandom",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -5428,6 +5430,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/kernel/reporting", &["active_support_kernel_reporting"]),
     ("active_support/core_ext/file/atomic", &["active_support_file_atomic"]),
     ("active_support/core_ext/digest/uuid", &["active_support_digest_uuid"]),
+    ("active_support/core_ext/securerandom", &["active_support_securerandom"]),
     // Loaded with the Inflector before any gem (runtime/gem_facades.rb), as
     // `require "active_support"` loads it natively; Core's component gem
     // (trusted_id/global_identification.rb) requires it by name.
@@ -5552,6 +5555,12 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         feature: "active_support/core_ext/digest/uuid",
         ports: &["active_support_digest_uuid"],
         calls: &["Digest::UUID"],
+        at_require_rails: false,
+    },
+    BootCoreExtension {
+        feature: "active_support/core_ext/securerandom",
+        ports: &["active_support_securerandom"],
+        calls: &["SecureRandom.base58", "SecureRandom.base36", "SecureRandom.base32"],
         at_require_rails: false,
     },
     // Time#change only; the rest of core_ext/time/calculations is not ported.
@@ -12423,6 +12432,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_kernel_reporting.rb"
         && p != "runtime/active_support_file_atomic.rb"
         && p != "runtime/active_support_digest_uuid.rb"
+        && p != "runtime/active_support_securerandom.rb"
         && p != "runtime/active_support_module_attribute_accessors.rb"
         && p != "runtime/active_support_redefine_method.rb"
         && p != "runtime/active_support_class_attribute.rb"
