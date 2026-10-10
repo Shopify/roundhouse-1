@@ -185,3 +185,27 @@ fn a_tree_without_the_lazy_load_hooks_port_refuses_the_registration() {
         );
     }
 }
+
+/// The file program loads each `ActiveRecord::X = Class.new(...)` class
+/// where it stands, before the hook, as Ruby defines them when the file
+/// loads. Before, the program required only the module, so nothing
+/// loaded the classes: the ActiveRecord namespace autoloads none of them,
+/// and Core's Podding::JobShopLock::Callback#around (`rescue ...,
+/// ActiveRecord::ReadOnlyServerError`) raised NameError on every job.
+#[test]
+fn the_file_program_loads_its_class_new_classes_in_source_order() {
+    let (dir, errors) = pg_app().emit(BuildTarget::Ruby);
+    let errors: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter")).collect();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let program = std::fs::read_to_string(dir.join("app/models/roundhouse_files/lib/patches/active_record/granular_exceptions.rb"))
+        .expect("program");
+    let at = |needle: &str| program.find(needle).unwrap_or_else(|| panic!("no {needle}:\n{program}"));
+    let order = [
+        at("require RoundhouseAutoload.path(\"models/active_record/connection_timedout\")"),
+        at("require RoundhouseAutoload.path(\"models/active_record/connection_unavailable\")"),
+        at("require RoundhouseAutoload.path(\"models/active_record/transaction_too_large_error\")"),
+        at("require RoundhouseAutoload.path(\"models/trilogy_adapter_exceptions\")"),
+        at("ActiveSupport.on_load(:active_record_trilogyadapter)"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{program}");
+}
