@@ -194,3 +194,34 @@ end
         .run_test("test/models/mixin_test.rb");
     run.assert_passes();
 }
+
+/// Not unresolved: a carried gem that declares a `Rails::Engine` has its
+/// `app/*` autoloaded, as an in-repo engine's is (maintenance_tasks
+/// 2.17.0's `MaintenanceTasks::NullCollectionBuilder` and `Task` live in
+/// its app/models, and Core's `Task::GCSCsvCollection::Builder` subclasses
+/// the builder). Native Ruby on the same shape answers the asserted values.
+#[test]
+fn a_carried_engine_gems_app_models_autoload() {
+    const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    widget (1.0.0)\n\nDEPENDENCIES\n  activesupport\n  widget\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", CARRIED)
+        .write("Gemfile.lock", LOCK)
+        .write("vendor/gems/widget-1.0.0/lib/widget.rb", "require \"widget/engine\"\n\nmodule Widget\nend\n")
+        .write("vendor/gems/widget-1.0.0/lib/widget/engine.rb", "module Widget\n  class Engine < ::Rails::Engine\n    isolate_namespace Widget\n  end\nend\n")
+        .write("vendor/gems/widget-1.0.0/app/models/widget/null_builder.rb", "module Widget\n  class NullBuilder\n    def collection\n      []\n    end\n\n    def kind\n      \"null\"\n    end\n  end\nend\n")
+        .write("vendor/gems/widget-1.0.0/app/models/widget/task.rb", "module Widget\n  class Task\n    def self.named(name)\n      \"task:#{name}\"\n    end\n  end\nend\n")
+        .write("app/models/widget/task/csv_collection.rb", "module Widget\n  class Task\n    module CsvCollection\n      class Builder < Widget::NullBuilder\n        def collection\n          [\"a\", \"b\"]\n        end\n      end\n    end\n  end\nend\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/builder_test.rb", r#"require "test_helper"
+class BuilderTest < ActiveSupport::TestCase
+  test "the engine gem's app models load" do
+    builder = Widget::Task::CsvCollection::Builder.new
+    assert_equal ["a", "b"], builder.collection
+    assert_equal "null", builder.kind
+    assert_equal "task:x", Widget::Task.named("x")
+  end
+end
+"#)
+        .run_test("test/models/builder_test.rb");
+    run.assert_passes();
+}

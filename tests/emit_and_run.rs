@@ -4694,6 +4694,43 @@ puts "ok"
         .assert_passes();
 }
 
+/// Not dropped: `thread_cattr_accessor :x, instance_accessor: false` (Core's
+/// `BackgroundQueue::Profiler::Current`) keeps its per-thread class accessors and
+/// defines no instance ones; without the option an instance reads the same slot.
+#[test]
+fn a_thread_cattr_accessor_with_instance_options_runs_per_thread() {
+    emit_and_run::real_blog()
+        .write(
+            "lib/profiler_context.rb",
+            "module ProfilerContext\n  class Current\n    thread_cattr_accessor :params, instance_accessor: false\n    thread_cattr_accessor :mode\n  end\nend\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+
+  def remember
+    ProfilerContext::Current.params = { id: title }
+    ProfilerContext::Current.new.mode = :wall
+  end
+
+  def self.remembered
+    [ProfilerContext::Current.params, ProfilerContext::Current.mode, ProfilerContext::Current.new.mode]
+  end"#,
+        )
+        .run_ruby(
+            r#"Article.new(title: "kept", body: "long enough body").remember
+raise "lost: #{Article.remembered.inspect}" unless Article.remembered == [{ id: "kept" }, :wall, :wall]
+raise "another thread saw it" unless Thread.new { ProfilerContext::Current.params.nil? && ProfilerContext::Current.mode.nil? }.value
+raise "instance_accessor: false defined a reader" if ProfilerContext::Current.new.respond_to?(:params)
+raise "instance_accessor: false defined a writer" if ProfilerContext::Current.new.respond_to?(:params=)
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
 /// Not a String: `params.expect(article: [...])` answers the permitted hash, so a `merge` onto it has to run as one.
 #[test]
 fn an_expected_params_hash_merges() {

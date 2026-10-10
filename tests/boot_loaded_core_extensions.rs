@@ -44,9 +44,21 @@ const POSTSY: &str = r#"module Postsy
     end
   end
 
+  # active_utils 3.6.1's PostsData shape: every declaration literal, so
+  # ingest expands the hook for each includer.
+  module Connects
+    def self.included(base)
+      base.class_attribute :ssl_version
+      base.ssl_version = "TLSv1_2"
+      base.class_attribute :read_timeout, instance_writer: false
+      base.read_timeout = 10
+    end
+  end
+
   module Billing
     class Gateway
       include Postsy::PostsData
+      include Postsy::Connects
 
       mattr_reader :service, default: "gateway"
     end
@@ -83,6 +95,10 @@ const QUOTA: &str = r##"class Quota
       "nonce: #{Postsy::Billing::TokenNonce.ssl_strict} #{Postsy::Billing::TokenNonce.new.open_timeout} #{Postsy::Billing::TokenNonce.proxy_port} #{Postsy::Billing::TokenNonce.proxy_address.inspect}",
       "retries: #{Postsy::Billing::Gateway.retries} #{Postsy::Billing::StrictGateway.retries} #{lazy.retries}",
       "service: #{Postsy::Billing::Gateway.service} #{lazy.service}",
+      # An Active Record includer (Core's ShippingRateProvider includes
+      # active_utils' PostsData): the hook's writers exist at its include.
+      "model: #{Probe.ssl_strict} #{Probe.open_timeout} #{Probe.proxy_port} #{Probe.retries} #{Probe.method_defined?(:open_timeout=)} " \
+        "#{Probe.ssl_version} #{Probe.read_timeout} #{Probe.method_defined?(:read_timeout=)} #{Postsy::Billing::Gateway.ssl_version}",
       "bytes: #{size_for(3)} #{size_for(1.5)} #{2.kilobytes}",
       "window: #{window_for(2).class} #{window_for(2).to_i} #{3.hours.to_i} #{90.minutes.in_hours}",
       "to_fs: #{1234567.to_fs(:delimited)} #{12345.to_fs(:human_size)} #{0.5.to_fs(:percentage, precision: 1)}",
@@ -112,8 +128,10 @@ end
 
 /// The gem's entry, which native Bundler.require loads before the app's
 /// files; and the app file.
-const FILES: [(&str, &str); 2] = [
+const FILES: [(&str, &str); 4] = [
     ("vendor/gems/postsy-1.0.0/lib/postsy.rb", POSTSY),
+    ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+    ("app/models/probe.rb", "class Probe < ApplicationRecord\n  include Postsy::PostsData\n  include Postsy::Connects\nend\n"),
     ("app/models/quota.rb", QUOTA),
 ];
 
@@ -151,6 +169,7 @@ open_timeout: 60 60 false\n\
 nonce: true 60 8080 nil\n\
 retries: 3 3 3\n\
 service: gateway gateway\n\
+model: true 60 8080 3 false TLSv1_2 10 false TLSv1_2\n\
 bytes: 3145728 1572864.0 2048\n\
 window: ActiveSupport::Duration 172800 10800 1.5\n\
 to_fs: 1,234,567 12.1 KB 0.5%\n\

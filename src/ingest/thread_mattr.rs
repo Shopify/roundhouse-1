@@ -16,6 +16,8 @@ struct Decl {
     name: Symbol,
     reader: bool,
     writer: bool,
+    instance_reader: bool,
+    instance_writer: bool,
     /// `default:`, answered by a read in a thread that never wrote the
     /// attribute (Rails 8.2 `thread_mattr_reader`).
     default: Option<Expr>,
@@ -67,13 +69,19 @@ pub fn lower_thread_mattr(app: &mut crate::App) {
 
 // Options are taken as Rails 8.2 reads them: `default:` answers a read
 // in a thread that never wrote the attribute, and `instance_accessor:
-// false` (or `instance_reader:`/`instance_writer:` false) adds no
-// instance accessor, which is all the lowering writes. Not taken when
-// an instance accessor is asked for, an option is not a literal flag,
-// or the default could differ evaluated per read (a mutable literal,
-// a block, a call on the implicit self), which Rails evaluates once.
+// false` (or `instance_reader:`/`instance_writer:` false) drops the
+// instance accessors Rails otherwise defines. Not taken when an option
+// is not a literal flag, or the default could differ evaluated per
+// read (a mutable literal, a block, a call on the implicit self),
+// which Rails evaluates once.
 fn take_decls(lc: &mut LibraryClass) -> Vec<Decl> {
     let mut out = Vec::new();
+    let defined: Vec<Symbol> = lc
+        .methods
+        .iter()
+        .filter(|m| matches!(m.receiver, crate::dialect::MethodReceiver::Instance))
+        .map(|m| m.name.clone())
+        .collect();
     lc.unknown_calls.retain(|call| {
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return true };
         let kw = method.as_str();
@@ -90,8 +98,8 @@ fn take_decls(lc: &mut LibraryClass) -> Vec<Decl> {
             }
         }
         let mut default = None;
+        let (mut accessor, mut reader, mut writer) = (true, true, true);
         if let Some(entries) = options {
-            let (mut accessor, mut reader, mut writer) = (true, true, true);
             for (k, v) in entries {
                 let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return true };
                 let flag = match &*v.node {
@@ -106,14 +114,14 @@ fn take_decls(lc: &mut LibraryClass) -> Vec<Decl> {
                     _ => return true,
                 }
             }
-            let instance_reader = accessor && reader && !kw.ends_with("_writer");
-            let instance_writer = accessor && writer && !kw.ends_with("_reader");
-            if instance_reader || instance_writer {
-                return true;
-            }
         }
+        let instance_reader = accessor && reader && !kw.ends_with("_writer");
+        let instance_writer = accessor && writer && !kw.ends_with("_reader");
         for name in names {
+            let setter = Symbol::from(format!("{}=", name.as_str()));
             out.push(Decl {
+                instance_reader: instance_reader && !defined.contains(&name),
+                instance_writer: instance_writer && !defined.contains(&setter),
                 name,
                 reader: !kw.ends_with("_writer"),
                 writer: !kw.ends_with("_reader"),
@@ -173,6 +181,13 @@ fn synthesized_source(owner: &str, state: &str, decls: &[Decl]) -> (String, Stri
         }
         if d.writer {
             owner_src.push_str(&format!("  def self.{n}=(value)\n    __thread_state.{n} = value\n  end\n\n"));
+        }
+        // Rails' instance accessors read the same per-thread slot as the owner's.
+        if d.instance_reader {
+            owner_src.push_str(&format!("  def {n}\n    ::{owner}.{n}\n  end\n\n"));
+        }
+        if d.instance_writer {
+            owner_src.push_str(&format!("  def {n}=(value)\n    ::{owner}.{n} = value\n  end\n\n"));
         }
     }
     owner_src.push_str("end\n");

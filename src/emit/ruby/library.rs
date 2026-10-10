@@ -9634,6 +9634,30 @@ fn emit_library_class_decl_inner(
             }
         })
         .collect();
+    // So does a body statement written among the defs: Core's
+    // AttributionConfig ends its body with `raise "…" unless
+    // CONFIGS.key?(DEFAULT)` below the deferred `CONFIGS = { DEFAULT =>
+    // new(…) }`; written before the deferred tail, NameError at load.
+    positioned_statements.retain(|(_, call)| {
+        let at = deferred
+            .iter()
+            .copied()
+            .filter(|_| !railtie)
+            .filter(|&i| {
+                let value = &lc.constants[i].1;
+                !value.span.is_synthetic() && value.span.file == call.span.file && value.span.start < call.span.start
+            })
+            .max_by_key(|&i| lc.constants[i].1.span.start);
+        match at {
+            Some(i) => {
+                let calls = calls_after_deferred.entry(i).or_default();
+                calls.push(*call);
+                calls.sort_by_key(|c| c.span.start);
+                false
+            }
+            None => true,
+        }
+    });
     // A replayed call the source has above an eager constant runs
     // before it, as the class body does: Core's liquid_ext.rb
     // `remove_const :SYNTAX` and then assigns the new `SYNTAX`, which

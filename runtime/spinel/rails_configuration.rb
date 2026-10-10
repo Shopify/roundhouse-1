@@ -52,6 +52,45 @@ module Rails
     def config
       Rails.configuration
     end
+
+    # railties 8.1.4 application.rb `config_for`: config/<name>.yml read as
+    # ActiveSupport::ConfigurationFile.parse does (ERB rendered with
+    # stdlib `ERB.new(content).result` when the file has a tag, then
+    # `YAML.unsafe_load`), deep-symbolized, the env's section deep-merged
+    # over `shared:`, and a Hash answered as an OrderedOptions. Core's
+    # essentials Config reads `config_for(:memcached)` in the initializer
+    # that names Rails.cache's store.
+    def config_for(name, env: Rails.env)
+      yaml = name.is_a?(Pathname) ? name : Pathname.new("#{Rails.root.join("config")}/#{name}.yml")
+      raise "Could not load configuration. No such file - #{yaml}" unless yaml.exist?
+
+      require "erb"
+      require "yaml"
+      content = File.read(yaml.to_s)
+      warn "#{yaml} contains invisible non-breaking spaces, you may want to remove those" if content.include?(" ")
+      begin
+        source = content.include?("<%") ? ERB.new(content).tap { |e| e.filename = yaml.to_s }.result : content
+        all_configs = YAML.unsafe_load(source) || {}
+      rescue Psych::SyntaxError => error
+        raise "YAML syntax error occurred while parsing #{yaml}. " \
+              "Please note that YAML must be consistently indented using spaces. Tabs are not allowed. " \
+              "Error: #{error.message}"
+      end
+      all_configs = Configuration::Custom.deep_symbolize(all_configs)
+      config, shared = all_configs[env.to_sym], all_configs[:shared]
+
+      if shared
+        config = {} if config.nil? && shared.is_a?(Hash)
+        if config.is_a?(Hash) && shared.is_a?(Hash)
+          config = Configuration::Custom.deep_merge(shared, config)
+        elsif config.nil?
+          config = shared
+        end
+      end
+
+      config = Configuration::Custom.empty_options.update(config) if config.is_a?(Hash)
+      config
+    end
   end
 
   # `Rails.logger` on this tree is the logger railties' bootstrap
@@ -285,6 +324,20 @@ module Rails
       def self.empty_options # :nodoc:
         require_relative "active_support_ordered_options" unless defined?(::ActiveSupport::OrderedOptions)
         ::ActiveSupport::OrderedOptions.new
+      end
+
+      # Hash#deep_symbolize_keys (arrays walked too) and Hash#deep_merge,
+      # for `config_for`.
+      def self.deep_symbolize(value) # :nodoc:
+        case value
+        when Hash then value.each_with_object({}) { |(k, v), h| h[(k.to_sym rescue k)] = deep_symbolize(v) }
+        when Array then value.map { |v| deep_symbolize(v) }
+        else value
+        end
+      end
+
+      def self.deep_merge(base, other) # :nodoc:
+        base.merge(other) { |_, a, b| a.is_a?(Hash) && b.is_a?(Hash) ? deep_merge(a, b) : b }
       end
 
       private
