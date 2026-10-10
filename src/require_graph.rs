@@ -257,6 +257,75 @@ pub fn edges(files: &[(String, String)]) -> BTreeMap<String, Vec<Edge>> {
     out
 }
 
+/// A require of a constant's declarations file whose autoload is another
+/// file (its source's program): `hedwig.rb:2 requires
+/// hedwig/logging.rb, but Hedwig::Logging autoloads <program>.rb`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationRequire {
+    pub from: String,
+    pub line: usize,
+    pub to: String,
+    pub constant: String,
+    pub autoload: String,
+}
+
+impl DeclarationRequire {
+    pub fn describe(&self) -> String {
+        format!(
+            "{}.rb:{} requires {}.rb, but {} autoloads {}.rb",
+            self.from, self.line, self.to, self.constant, self.autoload
+        )
+    }
+}
+
+/// Each unguarded require of a declarations file whose constant's
+/// autoload is another file. Loaded directly, the file's `module X`
+/// fires X's autoload, that program's require of the file is a circular
+/// no-op, and X stays undefined ("constant X not defined"): such a
+/// require goes through the program (`require_through`). The program
+/// itself, and the declarations its program loads with it (a file whose
+/// own constant autoloads the same program), require it directly.
+pub fn declaration_requires(files: &[(String, String)]) -> Vec<DeclarationRequire> {
+    let Some(models) = files.iter().find(|(p, _)| p == "app/models.rb").map(|(_, c)| c) else { return Vec::new() };
+    let autoloads = autoload_files(models);
+    // `app/models/hedwig/logging` => `hedwig::logging`, the key a
+    // constant path folds to (`Hedwig::Logging`), acronyms included.
+    let fold = |s: &str| s.to_ascii_lowercase().replace('_', "");
+    let mut by_file: BTreeMap<String, (&String, &String)> = BTreeMap::new();
+    for (constant, file) in &autoloads {
+        by_file.insert(fold(&constant.replace("::", "/")), (constant, file));
+    }
+    let declared = |path: &str| path.strip_prefix("app/models/").and_then(|rest| by_file.get(&fold(rest)));
+    let present: BTreeSet<&str> = files.iter().filter_map(|(p, _)| p.strip_suffix(".rb")).collect();
+    let mut out = Vec::new();
+    for (path, content) in files {
+        let Some(own) = path.strip_suffix(".rb") else { continue };
+        if path == "app/models.rb" || !content.contains("require") {
+            continue;
+        }
+        let dir = own.rsplit_once('/').map_or("", |(d, _)| d);
+        let own_autoload = declared(own).map(|(_, file)| file.as_str());
+        for (i, line) in content.lines().enumerate() {
+            let Some((to, false)) = required(dir, line) else { continue };
+            let Some((constant, autoload)) = declared(&to) else { continue };
+            if autoload.as_str() == to || autoload.as_str() == own || own_autoload == Some(autoload.as_str()) {
+                continue;
+            }
+            if !present.contains(to.as_str()) || !present.contains(autoload.as_str()) {
+                continue;
+            }
+            out.push(DeclarationRequire {
+                from: own.to_string(),
+                line: i + 1,
+                to,
+                constant: constant.to_string(),
+                autoload: autoload.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// The cycles of the require graph: one per strongly connected component
 /// of more than one file, as a shortest cycle through its first file.
 pub fn cycles(files: &[(String, String)]) -> Vec<Cycle> {
@@ -356,6 +425,30 @@ mod tests {
             ("app/models/terms.rb", "require_relative \"plat/artifact/empty\"\n\nclass Terms\nend\n"),
         ]);
         assert!(cycles(&files).is_empty());
+    }
+
+    #[test]
+    fn a_require_of_a_declarations_file_a_program_autoloads_is_named() {
+        let models = "module RoundhouseAutoload\n  NAMESPACES = {\n    \"Hedwig\" => [[:Logging, \"models/roundhouse_files/lib/hedwig/logging\", true]],\n  }.freeze\nend\n";
+        let files = tree(&[
+            ("app/models.rb", models),
+            ("app/models/hedwig.rb", "module Hedwig\n  require_relative \"hedwig/logging\"\n\n  include Hedwig::Logging\nend\n"),
+            ("app/models/hedwig/logging.rb", "module Hedwig\n  module Logging\n  end\nend\n"),
+            (
+                "app/models/roundhouse_files/lib/hedwig/logging.rb",
+                "require \"logger\"\nrequire RoundhouseAutoload.path(\"models/hedwig/logging\")\n",
+            ),
+            (
+                "app/models/through.rb",
+                "module Through\n  defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through(\"models/roundhouse_files/lib/hedwig/logging\", \"models/hedwig/logging\") : require_relative(\"roundhouse_files/lib/hedwig/logging\")\nend\n",
+            ),
+        ]);
+        let found = declaration_requires(&files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].describe(),
+            "app/models/hedwig.rb:2 requires app/models/hedwig/logging.rb, but Hedwig::Logging autoloads app/models/roundhouse_files/lib/hedwig/logging.rb"
+        );
     }
 
     #[test]
