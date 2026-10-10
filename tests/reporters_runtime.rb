@@ -221,6 +221,20 @@ errors.reports.each { |r| show("report", r) }
 errors.reports.clear
 ActiveSupport::ExecutionContext.clear
 
+# Context values deep_dup like Object#deep_dup: a Singleton instance (Core's
+# Observe `UncompontentizedMetadata`) is not duplicable and reaches the
+# subscriber as itself; other values are copies.
+require "singleton"
+class ReportMetadata
+  include Singleton
+end
+meta = ReportMetadata.instance
+name = +"n"
+Rails.error.report(RuntimeError.new("singleton ctx"), context: { meta: meta, list: [meta], name: name })
+ctx = errors.reports.last[4]
+show("singleton context", [ctx[:meta].equal?(meta), ctx[:list].first.equal?(meta), ctx[:name] == name, ctx[:name].equal?(name)])
+errors.reports.clear
+
 # handle / record / unexpected.
 show("handle value", Rails.error.handle { 42 })
 show("handle default", Rails.error.handle { raise ArgumentError, "h1" })

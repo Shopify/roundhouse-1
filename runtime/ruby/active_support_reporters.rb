@@ -604,7 +604,10 @@ module ActiveSupport
         copy
       elsif value.is_a?(Array)
         value.map { |item| deep_dup(item) }
-      elsif value.is_a?(Method) || value.is_a?(UnboundMethod)
+      elsif value.is_a?(Method) || value.is_a?(UnboundMethod) || (defined?(::Singleton) && value.is_a?(::Singleton))
+        # Not duplicable? (core_ext/object/duplicable.rb): the value itself.
+        value
+      elsif value.respond_to?(:duplicable?) && !value.duplicable?
         value
       else
         value.dup
