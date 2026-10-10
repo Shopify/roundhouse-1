@@ -154,6 +154,12 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
     /// (`project::test_load_path_features`).
     pub test_load_path: &'a [PathBuf],
     pub loaded_support: &'a crate::det::HashSet<PathBuf>,
+    /// The files of a gem compiled from source (`App::gem_source_dirs`)
+    /// the tree carries, as a file program or declarations, relative to
+    /// the app root: a `require` of one is left as written, for the
+    /// emitted tree's compiled-gem `require` to load
+    /// (`project::compiled_gem_features`).
+    pub gem_files: &'a crate::det::HashSet<String>,
     /// Hooks a runtime port lifts by itself (`on_load_hooks::FIRED_HOOKS`
     /// on PostgreSQL): left to that reader.
     pub lifted: &'a [&'a str],
@@ -876,6 +882,16 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
             return;
         }
         if target.is_none() && STDLIB.contains(&feature.as_str()) {
+            return;
+        }
+        // A file of a gem the tree compiles from source, which runs more
+        // than declarations (Core's background_queue.rb initializer:
+        // `require "hedwig/process"` and `"hedwig/workers"`, whose
+        // `Hedwig::Process` hedwig's autoloads do not name): the emitted
+        // `require` loads its compiled program, as Ruby loads the gem's
+        // file. Refused, `Hedwig::Process.prepend(…)` below it raised
+        // NameError at boot.
+        if target.as_ref().is_some_and(|t| inputs.gem_files.contains(&relative(inputs.dir, t))) {
             return;
         }
         // On the test load path only (a test hook's `require

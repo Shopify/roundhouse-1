@@ -221,7 +221,9 @@ module Rails
       end
     end
 
-    def clear
+    # ActiveSupport::Cache::MemoryStore#clear(options = nil): the options
+    # (Verdict's `clear(namespace: ...)`) are ignored; the whole store goes.
+    def clear(options = nil)
       s = 0
       while s < SHARD_COUNT
         @mutexes[s].synchronize { @shards[s].clear }

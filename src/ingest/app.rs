@@ -2803,6 +2803,9 @@ end
             && lc.origin.is_none();
         !(bodiless && model_names.contains(lc.name.0.as_str()))
     });
+    // What each `sig` reads when its method first runs (`sig_autoloads`).
+    let known = super::initializer_programs::known_constants(&app);
+    super::sig_autoloads::carry_sig_autoloads(&mut app.library_classes, &sources, &known);
     app.library_class_declarations = library_class_declarations(&app.library_classes, &sources);
     app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes, &sources);
 
@@ -2911,6 +2914,15 @@ end
             .collect();
         let lifted: Vec<&str> = super::on_load_hooks::FIRED_HOOKS.iter().map(|(h, _)| *h).collect();
         let test_load_path: Vec<PathBuf> = app.test_load_roots.iter().map(|root| dir.join(root)).collect();
+        let in_gem_source = |rel: &String| app.gem_source_dirs.iter().any(|gem| rel.starts_with(&format!("{gem}lib/")));
+        let gem_files: crate::det::HashSet<String> = app
+            .file_programs
+            .iter()
+            .map(|program| program.source.as_str())
+            .chain(app.library_class_files.iter().map(|(source, _)| source.as_str()))
+            .map(|source| super::initializer_programs::relative(dir, Path::new(source)))
+            .filter(in_gem_source)
+            .collect();
         let inputs = super::initializer_programs::Inputs {
             vfs,
             dir,
@@ -2918,6 +2930,7 @@ end
             load_path: &load_path,
             test_load_path: &test_load_path,
             loaded_support: &loaded_support,
+            gem_files: &gem_files,
             lifted: &lifted,
         };
         super::initializer_programs::collect(&mut app, &inputs, &fired);
@@ -7284,18 +7297,29 @@ fn merge_library_class_reopens(
 /// `class Validator; end` above the `class_attribute … default:
 /// Validator` that reads it, and the body at the bottom. Only the files
 /// whose text names such a declaration are parsed.
+///
+/// Also each nested class or module none of whose declarations keeps a
+/// position: hedwig's configuration/enqueue_retry_handler.rb writes
+/// `module Interface` (only `extend T::Sig`, `interface!` and abstract
+/// sig-only methods, none of them carried) above `class InMemory;
+/// include Interface`, and without a position the module followed the
+/// class that includes it (NameError at load).
 fn library_class_declarations(
     classes: &[LibraryClass],
     sources: &[crate::span::SourceFile],
 ) -> Vec<(crate::ident::ClassId, crate::span::Span)> {
-    let mut groups: crate::det::HashMap<&str, (usize, bool)> = crate::det::HashMap::default();
+    let mut groups: crate::det::HashMap<&str, (usize, bool, bool)> = crate::det::HashMap::default();
     for lc in classes {
-        let entry = groups.entry(lc.name.0.as_str()).or_insert((0, false));
+        let entry = groups.entry(lc.name.0.as_str()).or_insert((0, false, false));
         entry.0 += 1;
         entry.1 |= !declares_on_class(lc);
+        entry.2 |= has_position(lc);
     }
-    let wanted: crate::det::HashSet<&str> =
-        groups.iter().filter(|(_, (count, bare))| *count > 1 && *bare).map(|(name, _)| *name).collect();
+    let wanted: crate::det::HashSet<&str> = groups
+        .iter()
+        .filter(|(name, (count, bare, positioned))| (*count > 1 && *bare) || (!*positioned && name.contains("::")))
+        .map(|(name, _)| *name)
+        .collect();
     if wanted.is_empty() {
         return Vec::new();
     }
@@ -7340,16 +7364,39 @@ fn library_class_declarations(
     }
     let mut out = Vec::new();
     for (index, source) in sources.iter().enumerate() {
-        let named = needles
-            .iter()
-            .any(|leaf| source.text.contains(&format!("class {leaf}")) || source.text.contains(&format!("module {leaf}")));
-        if !named || !source.path.ends_with(".rb") {
+        if !source.path.ends_with(".rb") || !declares_any(&source.text, &needles) {
             continue;
         }
         let parsed = ruby_prism::parse(source.text.as_bytes());
         walk(&parsed.node(), &[], crate::span::FileId(index as u32 + 1), &wanted, &mut out);
     }
     out
+}
+
+/// Whether `text` has a `class X` / `module X` (or `A::X`) statement
+/// whose last segment is one of `leaves`: one pass over the text, as
+/// the leaves can number in the thousands.
+fn declares_any(text: &str, leaves: &crate::det::HashSet<String>) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':';
+    ["class ", "module "].iter().any(|keyword| {
+        text.match_indices(keyword).any(|(at, _)| {
+            let rest = &text[at + keyword.len()..];
+            let path = &rest[..rest.find(|c: char| !word(c)).unwrap_or(rest.len())];
+            leaves.contains(path.rsplit("::").next().unwrap_or(path))
+        })
+    })
+}
+
+/// Whether a library-class declaration keeps a source position: its
+/// superclass header or a member's (the spans `emit::ruby::library`
+/// places a nested block by).
+fn has_position(lc: &LibraryClass) -> bool {
+    std::iter::once(lc.parent_span)
+        .chain(lc.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
+        .chain(lc.constants.iter().map(|(_, e)| e.span))
+        .chain(lc.unknown_calls.iter().map(|e| e.span))
+        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
+        .any(|span| span.file.0 != 0 && span != crate::span::Span::synthetic())
 }
 
 /// Whether one declaration of a class gives it a member of its own: a

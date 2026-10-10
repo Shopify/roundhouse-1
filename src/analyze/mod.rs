@@ -1353,7 +1353,7 @@ impl Analyzer {
                 let classes = &classes;
                 let alias_table = &alias_table;
                 methods.iter().map(move |(name, ty)| {
-                    let scoped = body::expand_type_aliases_by(
+                    let scoped = body::expand_type_aliases_in(
                         ty,
                         class_id.0.as_str(),
                         &|owner, name| alias_table.get(owner).and_then(|m| m.get(name)).cloned(),
@@ -1361,6 +1361,7 @@ impl Analyzer {
                             body::lexical_class(id, scope, body::Classes::new(classes, None))
                                 .unwrap_or_else(|| id.clone())
                         },
+                        &|scope| body::cref_ancestors(scope, body::Classes::new(classes, None)),
                         false,
                     );
                     (class_id.clone(), name.clone(), ty.clone(), scoped)
