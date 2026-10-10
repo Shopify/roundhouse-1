@@ -191,7 +191,7 @@ fn require_loop(
     let args: Vec<Node<'_>> = require.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     let required = matches!(args.as_slice(), [arg]
         if arg.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == param));
-    if require.receiver().is_some()
+    if !kernel_receiver(&require)
         || require.block().is_some()
         || !matches!(&*constant_id_str(&require.name()), "require" | "require_relative")
         || !required
@@ -678,7 +678,7 @@ fn engine_glob_loop(statement: &Node<'_>, listing: &[String], roots: &[(String, 
     });
     let arg = receiver.as_ref().unwrap_or(arg);
     let required = arg.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == param);
-    if require.receiver().is_some() || require.block().is_some() || constant_id_str(&require.name()) != "require" || !required {
+    if !kernel_receiver(&require) || require.block().is_some() || constant_id_str(&require.name()) != "require" || !required {
         return None;
     }
     let base = cleanpath(&join(std::iter::once(engine_root.as_str()).chain(parts.iter().map(String::as_str))));
@@ -686,6 +686,13 @@ fn engine_glob_loop(statement: &Node<'_>, listing: &[String], roots: &[(String, 
     let mut matched: Vec<String> = listing.iter().filter(|f| f.ends_with(".rb") && glob_matches(&pattern, f)).cloned().collect();
     dir_order(&mut matched);
     (!matched.is_empty()).then_some(matched)
+}
+
+/// A require with no receiver, or Kernel's own (`Kernel.require(file)`,
+/// checkout_protobuf_definitions.rb's loop over its `*_pb.rb` files):
+/// the same method.
+fn kernel_receiver(require: &ruby_prism::CallNode<'_>) -> bool {
+    require.receiver().is_none_or(|r| constant_full_name(&r).is_some_and(|name| name == "Kernel"))
 }
 
 /// `A::B::C` (or `::A::B::C`) as `"A::B::C"`.
@@ -738,6 +745,10 @@ mod tests {
         assert_eq!(found[0].1, expected);
         let found = features("dir = File.dirname(__FILE__)\nDir[\"#{dir}/x/*.rb\"].sort.each { |f| require f }\n");
         assert_eq!(found[0].1, vec!["x/a", "x/ab", "x/b"]);
+        // Kernel's own `require`, as Core's checkout_protobuf_definitions.rb calls it.
+        let found = features("Dir.glob(File.join(__dir__, \"x\", \"**\", \"*.rb\")).each do |file|\n  Kernel.require(file)\nend\n");
+        assert_eq!(found[0].1, expected);
+        assert!(features("Dir[File.join(__dir__, \"x/*.rb\")].each { |f| Other.require f }\n").is_empty());
         // `../` out of the file's own directory.
         let up = file_glob_requires("Dir[__dir__ + \"/../lib/x/*.rb\"].each { |f| require f }\n", "g/test/t.rb", &listing);
         assert_eq!(up[0].1, vec!["../lib/x/a", "../lib/x/ab", "../lib/x/b"]);
