@@ -1492,6 +1492,29 @@ fn is_sorbet_enum_parent(parent: &ClassId) -> bool {
     parent.0.as_str() == "T::Enum"
 }
 
+/// A class this file lowered from `class X < T::Enum`: its synthesized
+/// `initialize(serialized, const_name)` and `serialize`. The lowering
+/// drops the parent so a tree without sorbet-runtime still builds the
+/// members, but code still asks whether the class IS a `T::Enum`
+/// (Core's `sorbet_enum_attribute` checks
+/// `enum_class.ancestors.include?(T::Enum)`, and its essentials
+/// component reopens `T::Enum`), so a Ruby tree that loads sorbet-runtime
+/// keeps the parent: the synthesized methods are the class's own and
+/// override sorbet's.
+pub fn is_lowered_sorbet_enum(lc: &LibraryClass) -> bool {
+    let synthesized = |name: &str| {
+        lc.methods.iter().find(|m| {
+            m.receiver == MethodReceiver::Instance && m.name.as_str() == name && m.name_span.is_synthetic()
+        })
+    };
+    !lc.is_module
+        && lc.parent.is_none()
+        && synthesized("serialize").is_some()
+        && synthesized("initialize").is_some_and(|m| {
+            m.params.iter().map(|p| p.name.as_str()).eq(["serialized", "const_name"])
+        })
+}
+
 /// The `enums do … end` call in the collected class-body calls. The
 /// members were read out of it as constants by the body walk, so
 /// replaying the call would re-declare them against a `T::Enum` that

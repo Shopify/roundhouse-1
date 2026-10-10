@@ -328,3 +328,91 @@ puts "PASS"
         )
         .assert_passes();
 }
+
+/// Code the model body does not hold reads the store as Rails hands it
+/// out: Core's `ShopBillingSetting::Extension` (an included concern)
+/// keeps `@status_was = status_was` in a `before_save` and compares
+/// `@status_was.values_at(*FIELDS)` with `self[:status].values_at(*FIELDS)`.
+/// The column reader, `self[:col]` and `<col>_was` answered the
+/// serialized String: NoMethodError `values_at`, and `"…"["plan_name"]`
+/// a substring rather than the value.
+#[test]
+fn a_concern_reads_the_store_and_its_previous_value_as_hashes() {
+    emit_and_run::empty_app()
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :billings do |t|\n    t.text :status\n  end\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        )
+        .write(
+            "app/models/billing/extension.rb",
+            r#"module Billing::Extension
+  extend ActiveSupport::Concern
+
+  FIELDS = ["plan_name", "plan_period"]
+
+  included do
+    before_save :compare_plan
+  end
+
+  def plan_changed
+    @plan_changed
+  end
+
+  def compare_plan
+    @plan_changed = @status_changed && @status_was.values_at(*FIELDS) != self[:status].values_at(*FIELDS)
+  end
+
+  def previous_plan
+    @status_was["plan_name"]
+  end
+
+  def status_summary
+    self[:status].slice(*FIELDS).symbolize_keys.compact
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/billing.rb",
+            r#"class Billing < ApplicationRecord
+  before_save :store_dirty
+  include Billing::Extension
+
+  typed_store :status do |s|
+    s.string :plan_name
+    s.string :plan_period, default: "monthly"
+    s.boolean :customized, default: false
+  end
+
+  def store_dirty
+    @status_changed = status_changed?
+    @status_was = status_was
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+b = Billing.new
+b.plan_name = "basic"
+b.save!
+raise "view #{b[:status].inspect}" unless b[:status]["plan_name"] == "basic" && b[:status][:plan_period] == "monthly"
+raise "summary #{b.status_summary.inspect}" unless b.status_summary == { plan_name: "basic", plan_period: "monthly" }
+b = Billing.find(b.id)
+b.plan_name = "plus"
+raise "was #{b.status_was.inspect}" unless b.status_was["plan_name"] == "basic" && b.status_was[:plan_period] == "monthly"
+b.save!
+raise "previous #{b.previous_plan.inspect}" unless b.previous_plan == "basic"
+raise "changed" unless b.plan_changed == true
+b.customized = true
+b.save!
+raise "unchanged plan" unless b.plan_changed == false
+puts "PASS"
+"#,
+        )
+        .assert_passes();
+}

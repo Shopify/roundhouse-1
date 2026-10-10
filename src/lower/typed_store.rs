@@ -382,12 +382,20 @@ fn push_dirty_methods(
 /// runtime's `TypedStore::Accessor` over three generated private
 /// methods: `__rh_<col>_keys`, `__rh_<col>_default(key)` (the
 /// declared default, evaluated when that key is read) and
-/// `__rh_<col>_cast(key, value)` (a boolean attribute's cast). Only a
-/// model whose own body reads the column as a Hash gets it, so a store
-/// read through its accessors alone (lobsters' `User#settings`) keeps
-/// the column reader every target has.
+/// `__rh_<col>_cast(key, value)` (a boolean attribute's cast). A Ruby
+/// family tree (whose runtime carries the view) gives it to every
+/// store, as the gem does: the column is read as a Hash from code the
+/// model body does not see, an included concern's `self[:status]` or
+/// `@status_was["plan_name"]` (Core's `ShopBillingSetting::Extension`).
+/// Elsewhere only a model whose own body reads the column as a Hash
+/// gets it, so a store read through its accessors alone (lobsters'
+/// `User#settings`) keeps the column reader every target has.
+///
+/// `self[:<col>]` reads the same view ([`column_hash_read`]), and
+/// `<col>_was` the Hash of the value before the pending change
+/// (`TypedStore.snapshot`), as Rails' dirty tracking answers it.
 fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Symbol, attrs: &[TypedStoreAttr]) {
-    if !reads_store_as_hash(model, col) {
+    if !store_reads_as_hash(model, col) {
         return;
     }
     let Some(reader) = methods
@@ -396,14 +404,31 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
     else {
         return;
     };
-    reader.body = sp_expr(ExprNode::Send {
-        recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore"), Symbol::from("Accessor")] })),
-        method: Symbol::from("new"),
-        args: vec![sp_expr(ExprNode::SelfRef), str_lit(col.as_str())],
-        block: None,
-        parenthesized: true,
-    });
+    reader.body = accessor(col);
     reader.signature = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
+    let was_name = format!("{}_was", col.as_str());
+    if let Some(was) = methods.iter_mut().find(|m| {
+        m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == was_name && m.params.is_empty()
+    }) {
+        was.body = sp_expr(ExprNode::Send {
+            recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore")] })),
+            method: Symbol::from("snapshot"),
+            args: vec![
+                sp_expr(ExprNode::SelfRef),
+                str_lit(col.as_str()),
+                sp_expr(ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("attribute_was"),
+                    args: vec![str_lit(col.as_str())],
+                    block: None,
+                    parenthesized: true,
+                }),
+            ],
+            block: None,
+            parenthesized: true,
+        });
+        was.signature = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
+    }
     let key = Symbol::from("key");
     let value = Symbol::from("value");
     let key_ref = || sp_expr(ExprNode::Var { id: VarId(0), name: key.clone() });
@@ -475,6 +500,33 @@ fn reads_store_as_hash(model: &Model, col: &Symbol) -> bool {
         found
     }
     model.body.iter().any(|item| matches!(item, ModelBodyItem::Method { method, .. } if walk(&method.body, col)))
+}
+
+/// Whether `col`'s reader is the store's Hash view
+/// ([`push_store_hash_methods`]).
+fn store_reads_as_hash(model: &Model, col: &Symbol) -> bool {
+    crate::emit::ruby::native_keywords() || reads_store_as_hash(model, col)
+}
+
+/// `TypedStore::Accessor.new(self, "<col>")`.
+fn accessor(col: &Symbol) -> Expr {
+    sp_expr(ExprNode::Send {
+        recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore"), Symbol::from("Accessor")] })),
+        method: Symbol::from("new"),
+        args: vec![sp_expr(ExprNode::SelfRef), str_lit(col.as_str())],
+        block: None,
+        parenthesized: true,
+    })
+}
+
+/// `record[:<col>]` on a typed_store column whose reader is the Hash
+/// view: the same view, as Rails' `read_attribute` answers the
+/// deserialized store. `None` for every other column.
+pub(crate) fn column_hash_read(model: &Model, column: &Symbol) -> Option<Expr> {
+    typed_store_decls(&model.body)
+        .iter()
+        .any(|(col, _)| col == column && store_reads_as_hash(model, col))
+        .then(|| accessor(column))
 }
 
 fn str_lit(value: &str) -> Expr {

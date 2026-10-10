@@ -56,7 +56,14 @@ fn emitted(source: &str, file: &str) -> String {
 #[test]
 fn the_base_class_is_gone_and_its_surface_is_in_the_class() {
     let emitted = emitted(ENUM, "mode.rb");
-    assert!(!emitted.contains("T::Enum"), "got:\n{emitted}");
+    // The parent is sorbet-runtime's own `T::Enum` only where that is
+    // loaded (`a_tree_with_sorbet_runtime_keeps_the_t_enum_ancestor`);
+    // the `enums do` it ran is gone either way.
+    assert!(
+        emitted.contains("class Mode < (defined?(::T::Enum) ? ::T::Enum : ::Object)"),
+        "got:\n{emitted}"
+    );
+    assert!(!emitted.contains("enums do"), "got:\n{emitted}");
     for method in [
         "def serialize",
         "def self.values",
@@ -183,4 +190,47 @@ end
         !values.contains("DEFAULT_LABEL"),
         "a plain constant is not a member; got:\n{values}"
     );
+}
+
+/// Core's `sorbet_enum_attribute :issue_type, IssueType` first checks
+/// `enum_class.ancestors.include?(T::Enum)` and raised TypeError on
+/// every lowered enum (GiftCard::IssueType at load). Where sorbet-runtime
+/// is loaded the lowered class keeps the real parent, and the
+/// synthesized surface still answers over sorbet's; without it the
+/// class loads as the plain Ruby it was.
+#[test]
+fn a_tree_with_sorbet_runtime_keeps_the_t_enum_ancestor() {
+    let emitted = emitted(ENUM, "mode.rb");
+    let dir = std::env::temp_dir().join(format!("rh_sorbet_enum_parent_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mode.rb"), &emitted).unwrap();
+    let gem_home = std::env::var("CORE_GEM_HOME")
+        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+    let run = |prelude: &str, checks: &str| {
+        let out = std::process::Command::new("ruby")
+            .env("GEM_HOME", &gem_home)
+            .env("GEM_PATH", &gem_home)
+            .arg("-e")
+            .arg(format!("{prelude}\nload {:?}\n{checks}", dir.join("mode.rb")))
+            .output()
+            .expect("ruby is on PATH");
+        assert!(
+            out.status.success(),
+            "{prelude}\n{}\n{}\nemitted:\n{emitted}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(
+        "require \"sorbet-runtime\"",
+        r##"raise "not a T::Enum" unless Mode.ancestors.include?(T::Enum) && Mode::Fill.is_a?(T::Enum)
+raise "values" unless Mode.values == [Mode::Fill, Mode::Drain]
+raise "deserialize" unless Mode.deserialize("drain").equal?(Mode::Drain) && Mode.try_deserialize("x").nil?
+raise "serialize" unless Mode::Fill.serialize == "fill" && Mode.serialize(Mode::Fill) == "fill"
+raise "to_s" unless Mode::Fill.to_s == "#<Mode::Fill>"
+raise "each_value" unless Mode.each_value.to_a == [Mode::Fill, Mode::Drain]
+begin; Mode.from_serialized("x"); raise "no KeyError"; rescue KeyError => e; raise e.message unless e.message.include?('"x"'); end"##,
+    );
+    run("", r#"raise "parent" unless Mode.superclass == Object && Mode::Fill.serialize == "fill""#);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
