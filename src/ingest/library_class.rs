@@ -574,7 +574,9 @@ fn program_items(
         // `ActiveRecord::ReadOnlyServerError = Class.new(...)` above an
         // `on_load`; its program loaded none of the six, and Core's
         // `rescue ActiveRecord::ReadOnlyServerError` was a NameError.
-        if (stmt.as_constant_write_node().is_some() || file_class_new_path_write(stmt).is_some())
+        if (stmt.as_constant_write_node().is_some()
+            || file_class_new_path_write(stmt).is_some()
+            || file_call_path_write(stmt).is_some())
             && !in_branch
             && !*guarded
         {
@@ -1113,6 +1115,10 @@ fn file_level_constants(
             out.push((Symbol::from(path.join("::")), ingest_expr(&write.value(), file)?, after_declarations));
             continue;
         }
+        if let Some((path, write)) = file_call_path_write(&stmt) {
+            out.push((Symbol::from(path), ingest_expr(&write.value(), file)?, after_declarations));
+            continue;
+        }
         let Some(cw) = stmt.as_constant_write_node() else { continue };
         if is_sorbet_type_alias(&cw.value()) {
             if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
@@ -1167,6 +1173,30 @@ fn file_class_new_path_write<'pr>(
         return None;
     }
     let path = static_path(&write.target().as_node())?;
+    Some((path, write))
+}
+
+/// `A::B = recv.call(...)` at file level: a constant named by its
+/// written path, carried like a file-level `NAME = value` and, as in a
+/// class body, written where the source writes it. measured 3.2.1's
+/// units/weight.rb is `Measured::Weight = Measured.build do ... end`;
+/// left a file statement, no index declared `Measured::Weight` and each
+/// of Core's reads of it was an unknown constant. Only a call that builds
+/// no class itself (a factory block, `Class.new` and a Sorbet alias keep
+/// their own paths).
+fn file_call_path_write<'pr>(
+    stmt: &ruby_prism::Node<'pr>,
+) -> Option<(String, ruby_prism::ConstantPathWriteNode<'pr>)> {
+    let write = stmt.as_constant_path_write_node()?;
+    let value = write.value();
+    value.as_call_node()?;
+    if super::initializer_constants::is_class_new_declaration(&value)
+        || super::factory_class::factory_block(&value).is_some()
+        || is_sorbet_type_alias(&value)
+    {
+        return None;
+    }
+    let path = super::util::written_constant_path(&write.target())?;
     Some((path, write))
 }
 
@@ -3697,6 +3727,53 @@ pub(super) fn factory_class_body(
     Ok(FactoryClassBody { includes, methods, constants: own, unknown_calls, visibility_overrides })
 }
 
+/// Forwardable's `delegate` in a `class << self` that extends it:
+/// `delegate unit_names: :unit_system` (measured 3.2.1's Measurable) is
+/// `instance_delegate`, which defines `unit_names` on the singleton's
+/// instances, the class, forwarding to `unit_system`. Each method of
+/// each `methods => accessor` pair becomes
+/// `singleton_class.def_delegator(accessor, method)`, which
+/// `ingest::delegate` expands on the class side. ActiveSupport's
+/// `delegate`, which Forwardable's replaces there, would raise for want
+/// of `to:`. `None` for any other argument shape.
+fn singleton_forwardable_delegators(call: &Expr) -> Option<Vec<Expr>> {
+    let ExprNode::Send { recv: None, args, block: None, .. } = &*call.node else { return None };
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let sym = |e: &Expr| matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }).then(|| e.clone());
+    let mut out = Vec::new();
+    for (methods, accessor) in entries {
+        let accessor = sym(accessor)?;
+        let methods = match &*methods.node {
+            ExprNode::Array { elements, .. } => elements.iter().map(sym).collect::<Option<Vec<_>>>()?,
+            _ => vec![sym(methods)?],
+        };
+        for method in methods {
+            let singleton = Expr::new(
+                call.span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("singleton_class"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            out.push(Expr::new(
+                call.span,
+                ExprNode::Send {
+                    recv: Some(singleton),
+                    method: Symbol::from("def_delegator"),
+                    args: vec![accessor.clone(), method],
+                    block: None,
+                    parenthesized: true,
+                },
+            ));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn walk_decl_body<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
@@ -3807,6 +3884,19 @@ fn walk_decl_body_in<'pr>(
     let statements = flatten_statements(b);
     let glob_autoload_loops: Vec<usize> =
         super::autoload_glob::body_loops(&statements, file, None).into_iter().map(|found| found.start).collect();
+    // `class << self` with `extend Forwardable`: its `delegate` is
+    // Forwardable's (`singleton_forwardable_delegators`).
+    let forwardable_extend = |stmt: &ruby_prism::Node<'_>| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none()
+                && constant_id_str(&call.name()) == "extend"
+                && call.arguments().is_some_and(|a| {
+                    let args: Vec<_> = a.arguments().iter().collect();
+                    matches!(args.as_slice(), [arg] if constant_path_of(arg).is_some_and(|p| p.join("::") == "Forwardable"))
+                })
+        })
+    };
+    let singleton_forwardable = force_class_receiver && statements.iter().any(|stmt| forwardable_extend(stmt));
     let mut body_locals: Vec<BodyLocal> = Vec::new();
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
@@ -4753,7 +4843,19 @@ fn walk_decl_body_in<'pr>(
                             let splats = call
                                 .arguments()
                                 .is_some_and(|a| a.arguments().iter().any(|arg| arg.as_splat_node().is_some()));
-                            if force_class_receiver
+                            let forwarded = (singleton_forwardable && kw == "delegate" && !splats)
+                                .then(|| ingest_expr(&stmt, file).ok().and_then(|e| singleton_forwardable_delegators(&e)))
+                                .flatten();
+                            if let Some(definers) = forwarded {
+                                out.unknown_calls.extend(definers);
+                            } else if singleton_forwardable && forwardable_extend(&stmt) {
+                                // The `extend Forwardable` itself: spent
+                                // once its definers are expanded
+                                // (`ingest::delegate`), as a class body's.
+                                if let Ok(e) = ingest_expr(&stmt, file) {
+                                    out.unknown_calls.push(e);
+                                }
+                            } else if force_class_receiver
                                 && captures_statements
                                 && (kw == "delegate" && splats
                                     || !matches!(
@@ -5955,7 +6057,11 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         // DomainSubscription`, `Pair = Struct.new(:a, :b)`) declares
         // those, which the library ingest carries.
         let writes_constants = root.as_program_node().is_some_and(|program| {
-            program.statements().body().iter().any(|stmt| stmt.as_constant_write_node().is_some())
+            program
+                .statements()
+                .body()
+                .iter()
+                .any(|stmt| stmt.as_constant_write_node().is_some() || file_call_path_write(&stmt).is_some())
         });
         return writes_constants.then_some(ClassKind::LibraryClass);
     };
