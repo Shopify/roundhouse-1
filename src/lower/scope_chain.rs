@@ -1455,11 +1455,22 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
         }
         for a in m.associations() {
             match a {
-                Association::BelongsTo { name, target, foreign_key, .. } => {
+                Association::BelongsTo { name, target, foreign_key, primary_key, .. } => {
                     let t = reg.table_for(target);
+                    // Rails' `association_primary_key`: the declaration's
+                    // `primary_key:`, else the target's own primary key.
+                    // Core's `belongs_to :product, foreign_key:
+                    // "product_uuid", primary_key: "uuid"` joined on
+                    // `products.id` (a uuid) against a varchar fk.
+                    let pk = primary_key
+                        .clone()
+                        .or_else(|| {
+                            models.iter().find(|o| &o.name == target).and_then(|o| o.primary_key.clone())
+                        })
+                        .unwrap_or_else(|| Symbol::from("id"));
                     reg.join_tails.insert(
                         (m.name.clone(), name.clone()),
-                        format!("{t} ON {t}.id = {own}.{foreign_key}"),
+                        format!("{t} ON {t}.{pk} = {own}.{foreign_key}"),
                     );
                     reg.belongs_to_fk
                         .insert((m.name.clone(), name.clone()), foreign_key.clone());
@@ -1470,7 +1481,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if name.as_str() != t {
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.id = {own}.{foreign_key}"),
+                            format!("{t} {name} ON {name}.{pk} = {own}.{foreign_key}"),
                         );
                     }
                 }
@@ -1557,7 +1568,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     let Some(thr_model) = models.iter().find(|tm| &tm.name == thr_target) else {
                         continue;
                     };
-                    let Some(Association::BelongsTo { foreign_key: src_fk, .. }) =
+                    let Some(Association::BelongsTo { foreign_key: src_fk, primary_key: src_pk, .. }) =
                         thr_model.associations().find(|a| {
                             matches!(a, Association::BelongsTo { target: t, .. } if t == target)
                         })
@@ -1566,11 +1577,17 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     };
                     let thr_table = reg.table_for(thr_target);
                     let target_table = reg.table_for(target);
+                    let src_pk = src_pk
+                        .clone()
+                        .or_else(|| {
+                            models.iter().find(|o| &o.name == target).and_then(|o| o.primary_key.clone())
+                        })
+                        .unwrap_or_else(|| Symbol::from("id"));
                     reg.join_tails.insert(
                         (m.name.clone(), name.clone()),
                         format!(
                             "{thr_table} ON {thr_table}.{thr_fk} = {own}.id \
-                             INNER JOIN {target_table} ON {target_table}.id = {thr_table}.{src_fk}"
+                             INNER JOIN {target_table} ON {target_table}.{src_pk} = {thr_table}.{src_fk}"
                         ),
                     );
                     reg.assoc_table
@@ -5961,6 +5978,29 @@ mod tests {
                    INNER JOIN stories ON stories.id = taggings.story_id"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn registry_belongs_to_join_uses_declared_primary_key() {
+        // Core's `belongs_to :product, foreign_key: "product_uuid",
+        // primary_key: "uuid"` — Rails joins on `products.uuid`; the
+        // `products.id` join compared a PG uuid with a varchar fk.
+        let price = ingest(
+            "class Price < ApplicationRecord\n  belongs_to :product, foreign_key: \"product_uuid\", primary_key: \"uuid\"\nend\n",
+            "app/models/price.rb",
+        );
+        let product = ingest("class Product < ApplicationRecord\nend\n", "app/models/product.rb");
+        let reg = build_assoc_registry(&[price, product]);
+        let price = ClassId(Symbol::from("Price"));
+        let product = Symbol::from("product");
+        assert_eq!(
+            reg.join_tail(&price, &product),
+            Some(&"products ON products.uuid = prices.product_uuid".to_string())
+        );
+        assert_eq!(
+            reg.aliased_join_tail(&price, &product),
+            Some(&"products product ON product.uuid = prices.product_uuid".to_string())
         );
     }
 
