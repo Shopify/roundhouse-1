@@ -1679,7 +1679,14 @@ impl Analyzer {
                         || (!rooted && body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str())
                         || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str())
-                        || crate::project::gem_port_declaring(&name).is_some();
+                        || crate::project::gem_port_declaring(&name).is_some()
+                        // As for a library class: a module a loaded gem's
+                        // installed source declares (Core's ActiveModel
+                        // `Checkouts::UiExtension` includes SmartProperties).
+                        || matches!(
+                            self.gem_sources.provider(&name, if rooted { "" } else { model.name.0.as_str() }),
+                            Some(crate::gem_boundary::SourceProvider::Declared { .. })
+                        );
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {
