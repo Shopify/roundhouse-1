@@ -936,6 +936,35 @@ module RoundhouseMinitestLifecycleHooks
 end
 TestBase.include(RoundhouseMinitestLifecycleHooks)
 
+# ActiveSupport::TestCase descends from Minitest::Test, so a module the
+# app prepends to Minitest::Test is in every test's chain, below the test
+# case's own modules and above Minitest's lifecycle hooks: Core's
+# MochaStrictStubbing::TestHook (`before_setup`, which picks strict or
+# legacy stubbing per test) and ResetWebMockAfterTeardown. TestBase is
+# ActiveSupport::TestCase here and not a Minitest::Test, so each such
+# prepend is also included into RoundhouseMinitestTestPrepends, which
+# TestBase includes above the hooks (a module's later include reaches the
+# classes that already include it), in the order Ruby stacks prepends.
+# Only prepends: Minitest::Test's includes (mocha's adapter) are the
+# runner's to serve.
+module RoundhouseMinitestTestPrepends
+end
+TestBase.include(RoundhouseMinitestTestPrepends)
+
+module RoundhouseMinitestTestPrepend
+  def prepend(*modules)
+    result = super
+    RoundhouseMinitestTestPrepends.include(*modules) if equal?(Minitest::Test)
+    result
+  end
+end
+Minitest::Test.singleton_class.prepend(RoundhouseMinitestTestPrepend)
+# Those an app file prepended before this file loaded (a support file
+# program the boot ran), innermost first.
+Minitest::Test.ancestors.take_while { |m| !m.equal?(Minitest::Test) }.reverse_each do |m|
+  RoundhouseMinitestTestPrepends.include(m)
+end
+
 # ---- ActiveSupport::Testing::SetupAndTeardown (ActiveSupport 8.2) ----
 #
 # The `setup` and `teardown` class macros that app code calls as it runs

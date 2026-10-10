@@ -4229,6 +4229,7 @@ fn ruby_family_files(
     if matches!(flavor, RubyFlavor::CRuby) {
         apply_test_helper_connection(&mut files, app)?;
         apply_test_harness_methods(&mut files, app)?;
+        emit::ruby::source_map::apply(&mut files, app)?;
     }
     if primary_postgresql(app) {
         apply_postgres_bootstrap(&mut files, app)?;

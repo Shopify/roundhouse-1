@@ -30,6 +30,7 @@ pub(crate) use library::{body_statement_classes, carried_body_statement_spans, c
 mod rbs;
 pub mod shake;
 mod shared;
+pub mod source_map;
 pub mod source_markers;
 
 /// Render a `Ty` to its RBS string form (`String`, `Array[Comment]`,
