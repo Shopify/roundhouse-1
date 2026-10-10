@@ -319,6 +319,7 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
     // weight that still has to type-check.
     let mut recast: HashSet<ClassId> = HashSet::default();
     let types = type_names(app, &bases);
+    let named = runtime_sti_named(app);
     // Inside a subclass's OWN class method the receiver is implicit:
     // campfire's `Rooms::Direct.find_for` writes `all.joins(:users)
     // .detect { … }`, and Rails scopes that `all` to the subclass. Left
@@ -360,19 +361,19 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
         }
     }
     let cols = sti_columns(app);
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &cols, &mut recast));
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &named, &cols, &mut recast));
     for view in &mut app.views {
-        rewrite(&mut view.body, &roots, &types, &cols, &mut recast);
+        rewrite(&mut view.body, &roots, &types, &named, &cols, &mut recast);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &roots, &types, &cols, &mut recast);
+            rewrite(setup, &roots, &types, &named, &cols, &mut recast);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &roots, &types, &cols, &mut recast);
+            rewrite(&mut t.body, &roots, &types, &named, &cols, &mut recast);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &roots, &types, &cols, &mut recast);
+            rewrite(&mut m.body, &roots, &types, &named, &cols, &mut recast);
         }
     }
     push_becomes_from(app, &bases, &recast);
@@ -430,6 +431,7 @@ fn stamp_sti_subclasses(app: &mut App, bases: &HashMap<ClassId, ClassId>) {
 /// own (a timestamp column reaches `@created_at_raw`) and the indexer
 /// is where each model already writes that mapping down.
 fn push_becomes_from(app: &mut App, bases: &HashMap<ClassId, ClassId>, recast: &HashSet<ClassId>) {
+    let named = runtime_sti_named(app);
     // Column list per base model, read before the mutable borrow below.
     let columns: HashMap<ClassId, Vec<Symbol>> = app
         .models
@@ -486,12 +488,16 @@ fn push_becomes_from(app: &mut App, bases: &HashMap<ClassId, ClassId>, recast: &
             }
             let value = if col.as_str() == column_of(&sti_cols, base) {
                 // The stamp: a recast row belongs to the new subclass.
-                Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Lit {
-                        value: Literal::Str { value: lc.name.0.as_str().to_string() },
-                    },
-                )
+                if named.contains(&lc.name) {
+                    sti_name_call(Span::synthetic(), lc.name.0.as_str())
+                } else {
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lit {
+                            value: Literal::Str { value: lc.name.0.as_str().to_string() },
+                        },
+                    )
+                }
             } else {
                 index_read(var_ref(&source), col)
             };
@@ -666,6 +672,142 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
     out
 }
 
+/// The STI classes (subclasses and their base models) whose stored type
+/// is the app's own `sti_name` rather than the class's full name. Rails
+/// writes and filters `sti_name` (`type_condition` maps `([self] +
+/// descendants)` through it) and instantiates through `find_sti_class`,
+/// which asks `sti_class_for`. An app overrides them on the base or a
+/// subclass (Core's `CustomerOauthApplication.sti_name` is
+/// `name.demodulize`), extends a module that defines `sti_name`
+/// (`StiLookupTable`), or sets `store_full_sti_class` /
+/// `store_full_class_name`. Such a hierarchy carries `<Class>.sti_name`
+/// where the others carry the name literal, which every target can
+/// compare, and the Ruby family hydrates it through the runtime
+/// `find_sti_class`. Apps without such a hierarchy are left
+/// byte-identical.
+pub(crate) fn runtime_sti_named(app: &App) -> HashSet<ClassId> {
+    let bases = sti_bases(app);
+    let mut out: HashSet<ClassId> = HashSet::default();
+    if bases.is_empty() {
+        return out;
+    }
+    const OVERRIDES: [&str; 3] = ["sti_name", "sti_class_for", "find_sti_class"];
+    const SETTINGS: [&str; 2] = ["store_full_sti_class=", "store_full_class_name="];
+    let modules: Vec<&crate::dialect::LibraryClass> = app.library_classes.iter().filter(|lc| lc.is_module).collect();
+    let module_named = |name: &str| {
+        modules.iter().copied().find(|m| {
+            let full = m.name.0.as_str();
+            full == name || full.ends_with(&format!("::{name}"))
+        })
+    };
+    // A body call that sets a naming option, or extends a module that
+    // defines `sti_name` / `sti_class_for` or sets one.
+    let renames = |call: &Expr| -> bool {
+        let mut found = false;
+        visit_sends(call, &mut |method, args| {
+            if SETTINGS.contains(&method) {
+                found = true;
+            } else if method == "extend" {
+                for a in args {
+                    let ExprNode::Const { path } = &*a.node else { continue };
+                    let Some(m) = module_named(const_class_id(path).0.as_str()) else { continue };
+                    let defines = m.methods.iter().any(|d| OVERRIDES.contains(&d.name.as_str()));
+                    let sets = m.methods.iter().any(|d| {
+                        let mut s = false;
+                        visit_sends(&d.body, &mut |n, _| s = s || SETTINGS.contains(&n));
+                        s
+                    });
+                    found = found || defines || sets;
+                }
+            }
+        });
+        found
+    };
+    let class_override = |m: &MethodDef| m.receiver == MethodReceiver::Class && OVERRIDES.contains(&m.name.as_str());
+    let mut parent_of: HashMap<&ClassId, &ClassId> = HashMap::default();
+    let mut own: HashMap<&ClassId, bool> = HashMap::default();
+    for lc in &app.library_classes {
+        if let Some(p) = &lc.parent {
+            parent_of.entry(&lc.name).or_insert(p);
+        }
+        let named = lc.methods.iter().any(class_override)
+            || lc.unknown_calls.iter().any(renames)
+            || lc.class_ivar_initializers.iter().any(renames);
+        *own.entry(&lc.name).or_insert(false) |= named;
+    }
+    for m in &app.models {
+        if let Some(p) = &m.parent {
+            parent_of.entry(&m.name).or_insert(p);
+        }
+        let named = m.methods().any(class_override)
+            || m.body.iter().any(|item| match item {
+                crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => renames(expr),
+                _ => false,
+            });
+        *own.entry(&m.name).or_insert(false) |= named;
+    }
+    // A hierarchy is its base model, the base's ancestors and every
+    // subclass; any one of them renaming makes them all runtime-named.
+    let mut renamed_bases: HashSet<&ClassId> = HashSet::default();
+    for (sub, base) in &bases {
+        let mut chain = vec![sub];
+        let mut cursor = parent_of.get(sub).copied();
+        for _ in 0..12 {
+            let Some(p) = cursor else { break };
+            chain.push(p);
+            cursor = parent_of.get(p).copied();
+        }
+        if chain.iter().any(|c| own.get(*c).copied().unwrap_or(false)) {
+            renamed_bases.insert(base);
+        }
+    }
+    for (sub, base) in &bases {
+        if renamed_bases.contains(base) {
+            out.insert(sub.clone());
+            out.insert(base.clone());
+        }
+    }
+    out
+}
+
+/// Each `Send` in `expr`: its method name and arguments.
+fn visit_sends(expr: &Expr, f: &mut dyn FnMut(&str, &[Expr])) {
+    if let ExprNode::Send { method, args, .. } = &*expr.node {
+        f(method.as_str(), args);
+    }
+    expr.node.for_each_child(&mut |c| visit_sends(c, f));
+}
+
+/// `<Class>.sti_name`, the runtime type value of a runtime-named class.
+pub(crate) fn sti_name_call(span: Span, class: &str) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(span, ExprNode::Const { path: class.split("::").map(Symbol::from).collect() })),
+            method: Symbol::from("sti_name"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    )
+}
+
+/// The class names a type value carries: a name literal or a runtime
+/// `<Class>.sti_name`.
+fn type_value_name(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "sti_name" && args.is_empty() => {
+            match &*r.node {
+                ExprNode::Const { path } => Some(const_class_id(path).0.as_str().to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Each STI subclass's `type` values: its own name, then every STI
 /// class below it (`GoldBadge` -> `GoldBadge`, `PlatinumBadge`), the
 /// `type IN (...)` Rails' `type_condition` writes from `descendants`.
@@ -710,10 +852,11 @@ fn rewrite(
     expr: &mut Expr,
     bases: &HashMap<ClassId, ClassId>,
     types: &HashMap<ClassId, Vec<String>>,
+    named: &HashSet<ClassId>,
     cols: &HashMap<ClassId, Symbol>,
     recast: &mut HashSet<ClassId>,
 ) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, types, cols, recast));
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, types, named, cols, recast));
     if rewrite_becomes(expr, bases, recast) {
         return;
     }
@@ -730,19 +873,19 @@ fn rewrite(
     // stays synthetic, so the Ruby family can seed it on `self` instead
     // (`unseat_implicit_roots`).
     let implicit = r.span.is_synthetic();
-    let named = ClassId(Symbol::from(
+    let class = ClassId(Symbol::from(
         path.iter()
             .map(|s| s.as_str().trim_start_matches("::"))
             .collect::<Vec<_>>()
             .join("::"),
     ));
-    let Some(_) = bases.get(&named) else { return };
-    let column = column_of(cols, &named).to_string();
+    let Some(_) = bases.get(&class) else { return };
+    let column = column_of(cols, &class).to_string();
     if constructing {
-        stamp_type(expr, &named, &column);
+        stamp_type(expr, &class, &column, named.contains(&class));
         return;
     }
-    let base = bases.get(&named).expect("checked above");
+    let base = bases.get(&class).expect("checked above");
     let span = expr.span;
     let root_span = if implicit { Span::synthetic() } else { span };
     let mut root = Expr::new(root_span, ExprNode::Const { path: base.0.as_str().split("::").map(Symbol::from).collect() });
@@ -767,7 +910,7 @@ fn rewrite(
                                 value: Literal::Sym { value: Symbol::from(column.as_str()) },
                             },
                         ),
-                        type_value(span, &named, types),
+                        type_value(span, &class, types, named),
                     )],
                     kwargs: true,
                 },
@@ -803,6 +946,7 @@ pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClas
         return;
     }
     let types = type_names(app, &bases);
+    let named = runtime_sti_named(app);
     let cols = sti_columns(app);
     let relation = Symbol::from("relation");
     for lc in lcs.iter_mut() {
@@ -818,7 +962,7 @@ pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClas
             ExprNode::Hash {
                 entries: vec![(
                     Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column.as_str()) } }),
-                    type_value(span, &lc.name, &types),
+                    type_value(span, &lc.name, &types, &named),
                 )],
                 kwargs: true,
             },
@@ -833,6 +977,27 @@ pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClas
                 parenthesized: true,
             },
         );
+        // Rails reads `Sub.find(id)` through the relation too, so the
+        // runtime finders take the relation path for the class.
+        if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == TYPE_CONDITIONED) {
+            lc.methods.push(MethodDef {
+                visibility: crate::dialect::MethodVisibility::Public,
+                unsupported_formals: None,
+                has_anonymous_block: false,
+                name_span: Span::synthetic(),
+                name: Symbol::from(TYPE_CONDITIONED),
+                receiver: MethodReceiver::Class,
+                params: vec![],
+                body: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: true } }),
+                signature: None,
+                effects: crate::effect::EffectSet::default(),
+                enclosing_class: Some(lc.name.0.clone()),
+                kind: AccessorKind::Method,
+                is_async: false,
+                mutates_self: false,
+                block_param: None,
+            });
+        }
         lc.methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
@@ -854,6 +1019,7 @@ pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClas
 }
 
 const TYPE_CONDITION: &str = "_apply_type_condition";
+const TYPE_CONDITIONED: &str = "_type_conditioned?";
 
 /// Ruby family: in an STI subclass's own class methods, the implicit
 /// receiver `apply_sti_scope_lowering` rooted on the base with the
@@ -925,13 +1091,9 @@ fn is_implicit_root(expr: &Expr, root: &ImplicitRoot) -> bool {
     let ExprNode::Hash { entries, .. } = &*args[0].node else { return false };
     let [(key, value)] = entries.as_slice() else { return false };
     let key_ok = matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == root.column);
-    let str_of = |e: &Expr| match &*e.node {
-        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-        _ => None,
-    };
     let values: Option<Vec<String>> = match &*value.node {
-        ExprNode::Array { elements, .. } if root.names.len() > 1 => elements.iter().map(str_of).collect(),
-        _ if root.names.len() == 1 => str_of(value).map(|v| vec![v]),
+        ExprNode::Array { elements, .. } if root.names.len() > 1 => elements.iter().map(type_value_name).collect(),
+        _ if root.names.len() == 1 => type_value_name(value).map(|v| vec![v]),
         _ => None,
     };
     key_ok && values.as_deref() == Some(root.names)
@@ -979,15 +1141,22 @@ fn reads_implicit_all(expr: &Expr, model: &ClassId) -> bool {
 }
 
 /// `"Rooms::Open"`, or `["GoldBadge", "PlatinumBadge"]` when STI
-/// classes sit below the subclass.
-fn type_value(span: Span, named: &ClassId, types: &HashMap<ClassId, Vec<String>>) -> Expr {
-    let str_lit = |value: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: value.to_string() } });
-    match types.get(named) {
+/// classes sit below the subclass; `Rooms::Open.sti_name` for each
+/// class of a runtime-named hierarchy ([`runtime_sti_named`]).
+fn type_value(span: Span, class: &ClassId, types: &HashMap<ClassId, Vec<String>>, named: &HashSet<ClassId>) -> Expr {
+    let value_of = |value: &str| {
+        if named.contains(&ClassId(Symbol::from(value))) {
+            sti_name_call(span, value)
+        } else {
+            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: value.to_string() } })
+        }
+    };
+    match types.get(class) {
         Some(names) if names.len() > 1 => Expr::new(
             span,
-            ExprNode::Array { elements: names.iter().map(|n| str_lit(n)).collect(), style: Default::default() },
+            ExprNode::Array { elements: names.iter().map(|n| value_of(n)).collect(), style: Default::default() },
         ),
-        _ => str_lit(named.0.as_str()),
+        _ => value_of(class.0.as_str()),
     }
 }
 
@@ -1060,7 +1229,7 @@ fn const_class_id(path: &[Symbol]) -> ClassId {
 /// (a params object, a variable) is left alone, because there is no
 /// literal to fold into and building a `merge` here would hand the
 /// constructor a shape it does not take.
-fn stamp_type(expr: &mut Expr, sub: &ClassId, column: &str) {
+fn stamp_type(expr: &mut Expr, sub: &ClassId, column: &str, runtime_named: bool) {
     let span = expr.span;
     let ExprNode::Send { args, .. } = &mut *expr.node else { return };
     let Some(attrs) = args.last_mut() else { return };
@@ -1077,9 +1246,10 @@ fn stamp_type(expr: &mut Expr, sub: &ClassId, column: &str) {
             span,
             ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column) } },
         ),
-        Expr::new(
-            span,
-            ExprNode::Lit { value: Literal::Str { value: sub.0.as_str().to_string() } },
-        ),
+        if runtime_named {
+            sti_name_call(span, sub.0.as_str())
+        } else {
+            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: sub.0.as_str().to_string() } })
+        },
     ));
 }

@@ -1188,8 +1188,7 @@ module ActiveRecord
         __rh_load_schema[:content_columns]
       end
 
-      # inheritance.rb's descends_from_active_record? and sti_name
-      # (`store_full_sti_class` is Rails' default true, not modeled).
+      # inheritance.rb's descends_from_active_record? and sti_name.
       def descends_from_active_record?
         if self == Base
           false
@@ -1201,7 +1200,7 @@ module ActiveRecord
       end
 
       def sti_name
-        store_full_class_name ? name : name.demodulize
+        store_full_sti_class && store_full_class_name ? name : name.demodulize
       end
 
       def column_for_attribute(name)

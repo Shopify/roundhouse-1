@@ -817,6 +817,76 @@ module ActiveRecord
       namespace.const_get(name)
     end
 
+    # inheritance.rb `class_attribute :store_full_sti_class, default:
+    # true`: with it false, `sti_name` is the demodulized name and
+    # `sti_class_for` resolves it relative to the class.
+    def self.store_full_sti_class
+      return @store_full_sti_class if @__store_full_sti_class_assigned
+      return true if equal?(ActiveRecord::Base)
+      parent = superclass #: untyped
+      parent.store_full_sti_class
+    end
+
+    def self.store_full_sti_class=(value)
+      @__store_full_sti_class_assigned = true
+      @store_full_sti_class = value
+    end
+
+    def self.store_full_sti_class?
+      store_full_sti_class ? true : false
+    end
+
+    # inheritance.rb's sti_class_for: the class a stored type value
+    # names, the full name constantized, or (with `store_full_sti_class`
+    # or `store_full_class_name` false) found relative to the class as
+    # compute_type does. An app may override it on the base.
+    def self.sti_class_for(type_name)
+      namespace = Object #: untyped
+      if store_full_sti_class && store_full_class_name
+        namespace.const_get(type_name)
+      else
+        _compute_type(type_name)
+      end
+    rescue NameError
+      raise ActiveRecord::SubclassNotFound,
+        "The single-table inheritance mechanism failed to locate the subclass: '#{type_name}'. " \
+        "This error is raised because the column '#{inheritance_column}' is reserved for storing the class in case of inheritance. " \
+        "Please rename this column if you didn't intend it to be used for storing the inheritance class " \
+        "or overwrite #{name}.inheritance_column to use another column for that information. " \
+        "If you wish to disable single-table inheritance for #{name} set " \
+        "#{name}.inheritance_column to nil"
+    end
+
+    # inheritance.rb's find_sti_class: what a row's type value
+    # instantiates, which must be the class or one of its descendants.
+    def self.find_sti_class(type_name)
+      subclass = sti_class_for(type_name) #: untyped
+      unless subclass.is_a?(Class) && subclass <= self
+        raise ActiveRecord::SubclassNotFound, "Invalid single-table inheritance type: #{subclass.name} is not a subclass of #{name}"
+      end
+      subclass
+    end
+
+    # inheritance.rb's compute_type: `type_name` in the class's lexical
+    # scopes, innermost first, then at the top level.
+    def self._compute_type(type_name)
+      namespace = Object #: untyped
+      return namespace.const_get(type_name) if type_name.start_with?("::")
+      candidates = [] #: Array[String]
+      parts = name.to_s.split("::")
+      parts.length.downto(1) { |n| candidates << "#{parts.first(n).join("::")}::#{type_name}" }
+      candidates << type_name
+      candidates.each do |candidate|
+        constant = begin
+          namespace.const_get(candidate)
+        rescue NameError
+          nil
+        end
+        return constant if constant && candidate == constant.to_s
+      end
+      raise NameError.new("uninitialized constant #{candidates.first}", candidates.first)
+    end
+
     # The model's column name => cast-type spec table. Emitted models
     # override it from the schema (emit::ruby::attribute_api). The base and
     # an abstract class have no table, so no columns; any other class
@@ -1415,9 +1485,15 @@ module ActiveRecord
     end
 
     # Whether the class's finders read through a relation: a default
-    # scope applies, or a `scoping` block of the class is running.
+    # scope applies, a `scoping` block of the class is running, or the
+    # class is an STI subclass, whose `find` carries its type condition.
     def self._scoped_reads?
-      _default_scope_applies? || !current_scope.nil?
+      _default_scope_applies? || !current_scope.nil? || _type_conditioned?
+    end
+
+    # An STI subclass answers true (`sti_scope::push_type_condition_methods`).
+    def self._type_conditioned?
+      false
     end
 
     # A join onto this model (`Shelf.joins(:docs)`) carries its default

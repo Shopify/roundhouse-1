@@ -80,7 +80,11 @@ pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, (Symbol, Vec<St
     let chains: HashMap<&ClassId, Vec<&ClassId>> =
         bases.keys().map(|other| (other, ancestors(&lc_parent, other))).collect();
     let mut names: HashMap<ClassId, (Symbol, Vec<String>)> = HashMap::default();
-    for sub in bases.keys() {
+    // A runtime-named hierarchy stores the app's `sti_name`, not the
+    // class name; its objects hydrate as their class
+    // (`find_sti_class`), so `is_a?` is left to answer.
+    let runtime_named = crate::lower::sti_scope::runtime_sti_named(app);
+    for sub in bases.keys().filter(|s| !runtime_named.contains(*s)) {
         let mut set: Vec<String> = vec![sub.0.as_str().to_string()];
         for other in bases.keys() {
             if other != sub && chains[other].contains(&sub) {

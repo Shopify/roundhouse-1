@@ -83,6 +83,7 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
     // column that does not exist. `sti_bases` is the one authority on
     // which subclasses are STI ones — it is what checks for the column.
     let sti = crate::lower::sti_scope::sti_columns(app);
+    let named = crate::lower::sti_scope::runtime_sti_named(app);
     // The declarations `lower::subclass_macros` lowers with the model's
     // chains (options and all) are its own.
     let lowered = crate::lower::subclass_macros::callback_spans(app);
@@ -93,7 +94,8 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
             // its parent's stamp, which names the parent; its own runs
             // after it (see `stamp_inheritance_column`).
             if let Some(col) = sti.get(&lc.name) {
-                stamp_inheritance_column(lc, false, col.as_str());
+                let runtime_named = named.contains(&lc.name);
+                stamp_inheritance_column(lc, false, col.as_str(), runtime_named);
             }
             continue;
         }
@@ -111,7 +113,8 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
             }
         }
         if let Some(col) = sti.get(&lc.name) {
-            stamp_inheritance_column(lc, true, col.as_str());
+            let runtime_named = named.contains(&lc.name);
+            stamp_inheritance_column(lc, true, col.as_str(), runtime_named);
         }
     }
 }
@@ -154,9 +157,12 @@ fn fold_targets(call: &Expr) -> Option<(&'static str, Vec<Symbol>)> {
 /// an explicit `type:` still wins, and otherwise the deepest class's
 /// stamp, which runs last, names the class Rails' `sti_name` would.
 ///
+/// A runtime-named hierarchy (`sti_scope::runtime_sti_named`) stamps
+/// `<Name>.sti_name`, as Rails' `ensure_proper_type` writes `sti_name`.
+///
 /// Declines when the subclass writes its own `initialize` — a
 /// hand-written constructor is somebody else's contract.
-fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool, column: &str) {
+fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool, column: &str, runtime_named: bool) {
     if lc.methods.iter().any(|m| m.name.as_str() == "initialize") {
         return;
     }
@@ -203,9 +209,11 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool,
     let stamp = syn(ExprNode::Send {
         recv: Some(syn(ExprNode::SelfRef)),
         method: Symbol::from(format!("{column}=")),
-        args: vec![syn(ExprNode::Lit {
-            value: Literal::Str { value: lc.name.0.as_str().to_string() },
-        })],
+        args: vec![if runtime_named {
+            crate::lower::sti_scope::sti_name_call(span, lc.name.0.as_str())
+        } else {
+            syn(ExprNode::Lit { value: Literal::Str { value: lc.name.0.as_str().to_string() } })
+        }],
         block: None,
         parenthesized: true,
     });

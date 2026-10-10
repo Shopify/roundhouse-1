@@ -3766,6 +3766,7 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
         return;
     }
     let cols = crate::lower::sti_scope::sti_columns(app);
+    let runtime_named = crate::lower::sti_scope::runtime_sti_named(app);
     let mut subs_of: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for (sub, base) in &bases {
         subs_of.entry(base.clone()).or_default().push(sub.clone());
@@ -3822,7 +3823,11 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
                     }
                     _ => continue,
                 };
-                *value = sti_dispatch(value.clone(), &type_read, subs, &new_args, value.span);
+                *value = if runtime_named.contains(&base) {
+                    sti_class_dispatch(value.clone(), &type_read, &new_args, value.span)
+                } else {
+                    sti_dispatch(value.clone(), &type_read, subs, &new_args, value.span)
+                };
                 break;
             }
         }
@@ -3868,6 +3873,51 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], args: &[Expr
         guard: None,
         body: base_new,
     });
+    Expr::new(span, ExprNode::Case { scrutinee: type_read.clone(), arms })
+}
+
+/// `case <type_read> when nil, "" then <base_new> else
+/// find_sti_class(<type_read>).new(<args>) end`
+///
+/// A runtime-named hierarchy (`sti_scope::runtime_sti_named`) stores
+/// the app's `sti_name`, so its rows hydrate as Rails'
+/// `discriminate_class_for_record` does: a present type goes through
+/// `find_sti_class`, which asks the app's `sti_class_for` and raises
+/// SubclassNotFound for a type naming no subclass.
+fn sti_class_dispatch(base_new: Expr, type_read: &Expr, args: &[Expr], span: Span) -> Expr {
+    let blank = |value: Literal| crate::expr::Arm {
+        pattern: crate::expr::Pattern::Lit { value },
+        guard: None,
+        body: base_new.clone(),
+    };
+    let found = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("find_sti_class"),
+            args: vec![type_read.clone()],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let arms = vec![
+        blank(Literal::Nil),
+        blank(Literal::Str { value: String::new() }),
+        crate::expr::Arm {
+            pattern: crate::expr::Pattern::Wildcard,
+            guard: None,
+            body: Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(found),
+                    method: Symbol::from("new"),
+                    args: args.to_vec(),
+                    block: None,
+                    parenthesized: true,
+                },
+            ),
+        },
+    ];
     Expr::new(span, ExprNode::Case { scrutinee: type_read.clone(), arms })
 }
 

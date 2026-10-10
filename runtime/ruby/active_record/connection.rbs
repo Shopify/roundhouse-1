@@ -76,6 +76,12 @@ module ActiveRecord
     def self.store_full_class_name?: () -> bool
     def self.polymorphic_name: () -> String
     def self.polymorphic_class_for: (String name) -> untyped
+    def self.store_full_sti_class: () -> bool
+    def self.store_full_sti_class=: (bool value) -> bool
+    def self.store_full_sti_class?: () -> bool
+    def self.sti_class_for: (String type_name) -> untyped
+    def self.find_sti_class: (String type_name) -> untyped
+    def self._compute_type: (String type_name) -> untyped
     def self.schema_column_types: () -> Hash[String, Array[(Symbol | Integer | String)?]]
     def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> ActiveModel::Type::Value } -> ActiveModel::Type::Value
     def self.attribute_types: () -> Hash[String, ActiveModel::Type::Value]
@@ -134,6 +140,7 @@ module ActiveRecord
     def self._apply_type_condition: (Relation relation) -> Relation
     def self._default_scope_attributes: () -> Hash[Symbol, untyped]
     def self._default_scope_applies?: () -> bool
+    def self._type_conditioned?: () -> bool
     def self._join_scope_sql: () -> String
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def _seed_default_scope_attributes: (Hash[Symbol, untyped] attrs) -> void
