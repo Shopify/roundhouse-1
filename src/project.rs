@@ -10200,7 +10200,10 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # loading now (entered, not yet a loaded feature), when it is the file
   # being required on its way: then the declarations file, as the program
   # itself loads it. Requiring the in-flight program is a circular
-  # require natively absent, which Core's StrictWarning raises.
+  # require natively absent, which Core's StrictWarning raises. So is
+  # requiring that declarations file while it loads: its class is open,
+  # and natively the reference finds it (a card class's `implements
+  # Card`, whose module names the card classes back).
   #
   # `from`: the requiring file, when the program declares it too and
   # another program loads it first (load_declarations_through_their_program).
@@ -10221,7 +10224,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
     elsif $LOADED_FEATURES.include?(path(program))
       @loaded_programs[program] = true
       require path(program)
-    else
+    elsif !loading?(declarations)
       require path(declarations)
     end
   end
