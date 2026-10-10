@@ -211,9 +211,9 @@ pub(crate) struct ClassSide<'a> {
     /// The body calls whose `attribute`/`query_constraints` the model's
     /// compiled columns answer (`Model::claimed_body_calls`).
     claimed: &'a [crate::span::Span],
-    /// The body calls whose `belongs_to` the model compiled as an
-    /// association (`ingest::macro_associations`), which the class
-    /// answers with its reflection at class-body run time.
+    /// The body calls whose `belongs_to`/`has_one`/`has_many` the model
+    /// compiled as an association (`ingest::macro_associations`), which
+    /// the class answers with its reflection at class-body run time.
     declared: Vec<crate::span::Span>,
     /// The class-method modules every model inherits from
     /// ActiveRecord::Base's boot includes, with the include
@@ -842,7 +842,7 @@ impl<'s, 'a> Walk<'s, 'a> {
         }
         // The compiled class answers these from the association
         // (`macro_associations::push_reflection_methods`).
-        if self.declares_association && matches!(name, "belongs_to" | "reflect_on_association") {
+        if self.declares_association && matches!(name, "belongs_to" | "has_one" | "has_many" | "reflect_on_association") {
             return Ok(());
         }
         if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {

@@ -71,6 +71,7 @@ module ActiveRecord
       @havings = []
       @select_sql = nil
       @distinct = false
+      @readonly = false
       @limit = nil
       @offset = nil
       @includes = []
@@ -864,6 +865,16 @@ module ActiveRecord
       self
     end
 
+    # Rails' `readonly(value = true)`: the records the relation loads are
+    # marked readonly (`readonly!`), so saving or destroying one raises
+    # ReadOnlyRecord. Core's `readonly_has_many` scopes its association
+    # with it (`build_readonly_scope`).
+    def readonly(value = true)
+      @records = nil
+      @readonly = value
+      self
+    end
+
     # `includes`/`preload`/`eager_load` — eager-load hints. The specs
     # (Symbols, or Hashes for nested includes like `story: :user`) are
     # recorded here and executed by `to_a`, which hands them to the
@@ -1035,6 +1046,7 @@ module ActiveRecord
           record
         end
       end
+      records.each { |record| record.readonly! } if @readonly
       if @includes.length > 0 && !@skip_preloading && records.length > 0
         pending = ActiveRecord::PendingPreload.new(@model, records, @includes.dup)
         records.each { |record| record._pend_preload(pending) }

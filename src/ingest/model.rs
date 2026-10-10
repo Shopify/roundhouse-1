@@ -2903,7 +2903,7 @@ pub(super) fn parse_association(
                 }
                 "join_table" => join_table = string_value(&value),
                 "polymorphic" => polymorphic = bool_value(&value),
-                "as" => as_interface = symbol_value(&value),
+                "as" => as_interface = super::util::symbol_or_string_value(&value),
                 "autosave" => autosave = bool_value(&value),
                 "validate" => validate = bool_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not

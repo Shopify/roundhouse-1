@@ -23,14 +23,14 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 
-/// The body calls whose `belongs_to` the model compiled: an Association
+/// The body calls whose association the model compiled: an Association
 /// item shares the macro call's span.
 pub(crate) fn declaring_calls(model: &Model) -> Vec<Span> {
     declared(model).into_iter().map(|(span, _)| span).collect()
 }
 
-/// The `belongs_to` associations a class macro declares, with the call's
-/// span. The call is an `Unknown` statement until `replay_model_macros`
+/// The `belongs_to`/`has_one`/`has_many` associations a class macro
+/// declares, with the call's span. The call is an `Unknown` statement until `replay_model_macros`
 /// makes it a `ClassBody` one.
 fn declared(model: &Model) -> Vec<(Span, &Association)> {
     let calls: Vec<Span> = model
@@ -45,8 +45,11 @@ fn declared(model: &Model) -> Vec<(Span, &Association)> {
         .body
         .iter()
         .filter_map(|item| match item {
-            ModelBodyItem::Association { assoc: assoc @ Association::BelongsTo { .. }, span, .. }
-                if !span.is_synthetic() && calls.contains(span) =>
+            ModelBodyItem::Association {
+                assoc: assoc @ (Association::BelongsTo { .. } | Association::HasOne { .. } | Association::HasMany { .. }),
+                span,
+                ..
+            } if !span.is_synthetic() && calls.contains(span) =>
             {
                 Some((*span, assoc))
             }
@@ -118,20 +121,36 @@ pub(super) fn push_reflection_methods(methods: &mut Vec<MethodDef>, model: &Mode
     // association's reflection, which takes the options the macro
     // passes (the macro may add its own: Core's
     // `accelerated_readonly_belongs_to` merges `autosave: false`), or an
-    // error naming one never compiled.
-    if !methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "belongs_to") {
+    // error naming one never compiled. `has_one`/`has_many` alike, for
+    // Core's `readonly_has_one`/`readonly_has_many`; a has_many's
+    // `extend:` modules are carried in the reflection's options but not
+    // mixed into the compiled collection, whose reader answers an Array.
+    for macro_name in ["belongs_to", "has_one", "has_many"] {
+        let kind_declared = declared.iter().any(|(_, assoc)| {
+            matches!(
+                (macro_name, assoc),
+                ("belongs_to", Association::BelongsTo { .. })
+                    | ("has_one", Association::HasOne { .. })
+                    | ("has_many", Association::HasMany { .. })
+            )
+        });
+        if !kind_declared || methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == macro_name) {
+            continue;
+        }
         // `runtime_src` reads required positionals only: the params are
         // written plain and given their kinds below.
-        let source = "def self.belongs_to(name, _args, options)\n  \
+        let source = format!(
+            "def self.{macro_name}(name, _args, options)\n  \
              reflection = reflect_on_association(name)\n  \
              if reflection.nil?\n    \
-             raise NotImplementedError, \"#{self.name}.belongs_to :#{name} at class-body run time: the compiler lowers \
+             raise NotImplementedError, \"#{{self.name}}.{macro_name} :#{{name}} at class-body run time: the compiler lowers \
              only the associations a class macro declares from its call\"\n  \
              end\n  \
              reflection._roundhouse_declared(options)\n\
-             end\n";
-        let parsed = crate::runtime_src::parse_methods(source)
-            .unwrap_or_else(|e| panic!("macro_associations: generated `belongs_to` failed to parse: {e}\n{source}"));
+             end\n"
+        );
+        let parsed = crate::runtime_src::parse_methods(&source)
+            .unwrap_or_else(|e| panic!("macro_associations: generated `{macro_name}` failed to parse: {e}\n{source}"));
         for mut m in parsed {
             m.enclosing_class = Some(model.name.0.clone());
             m.name_span = Span::synthetic();
