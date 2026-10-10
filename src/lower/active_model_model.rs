@@ -63,6 +63,13 @@ const MODULE: &str = "ActiveModel::Model";
 
 pub fn apply_active_model_model_synthesis(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    // The PostgreSQL Ruby-family tree carries ActiveModel::Model itself
+    // (runtime/spinel/cruby/active_model_api.rb, `project::
+    // carries_active_model_api`), so the include stands there and the
+    // class gets all of it, as in Rails.
+    if app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) {
+        return diags;
+    }
     for lc in &mut app.library_classes {
         if !lc.includes.iter().any(|i| i.0.as_str() == MODULE) {
             continue;
@@ -420,10 +427,6 @@ impl<'a> PortIndex<'a> {
         false
     }
 
-    /// `crate::emit::ruby::includes_module`.
-    fn includes(&self, start: usize, module: &str) -> bool {
-        self.walk(start, &mut |name| name == module)
-    }
 }
 
 /// How an errors lowering treats an `errors` read
@@ -462,7 +465,13 @@ impl ValidationsPort {
         let port: Vec<usize> = (0..classes.len())
             .filter(|&j| {
                 let lc = &classes[j];
-                !lc.is_module && !index.below_model(lc) && index.includes(j, "ActiveModel::Validations")
+                // ActiveModel::API and Model include Validations
+                // (runtime/spinel/cruby/active_model_api.rb).
+                !lc.is_module
+                    && !index.below_model(lc)
+                    && index.walk(j, &mut |name| {
+                        matches!(name, "ActiveModel::Validations" | "ActiveModel::API" | "ActiveModel::Model")
+                    })
             })
             .collect();
         if port.is_empty() {

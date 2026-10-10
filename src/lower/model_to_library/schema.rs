@@ -466,8 +466,17 @@ pub(super) fn push_schema_methods(
     // — when the key column is not called `id`. Rails' `record.id`
     // reads the primary-key attribute whatever its column is named,
     // and the base's `attr_accessor :id` would answer the unsaved
-    // sentinel instead (#90).
-    if let Some(key) = table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id") {
+    // sentinel instead (#90). The key is the model's `self.primary_key =`
+    // where it names a column and the table has no `id` (Core's
+    // ThemeTemplateBody declares "cityhash" over a composite
+    // `(cityhash, island)` table key), else the schema's.
+    let has_id_column = table.columns.iter().any(|c| c.name.as_str() == "id");
+    let declared_key = model
+        .primary_key
+        .as_ref()
+        .filter(|_| model.composite_primary_key.is_empty() && !has_id_column)
+        .and_then(|pk| table.columns.iter().find(|c| c.name == *pk));
+    if let Some(key) = declared_key.or_else(|| table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id")) {
         methods.push(synth_key_alias_reader(owner, key));
         methods.push(synth_key_alias_writer(owner, key));
     }

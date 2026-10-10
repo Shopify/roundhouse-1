@@ -4623,6 +4623,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let core = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_core.rb")
         .map_err(|e| format!("read Active Record core runtime: {e}"))?;
     files.push(("runtime/active_record_core.rb".into(), core));
+    // ActiveModel::API, Access and Model (activemodel 8.2.0.alpha api.rb,
+    // access.rb, model.rb), over active_record_core.rb's
+    // AttributeAssignment and the Validations and Conversion ports, where
+    // app code names them.
+    let carries_api = carries_active_model_api(files);
+    if carries_api {
+        let api = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_model_api.rb")
+            .map_err(|e| format!("read ActiveModel::API runtime: {e}"))?;
+        files.push(("runtime/active_model_api.rb".into(), api));
+    }
     // ActiveRecord::Base's callback registration called at runtime
     // (`base.before_create(:x)` from a concern's `included` hook) and the
     // chains it runs with the compiled hooks (activerecord 8.2.0.alpha
@@ -4862,6 +4872,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                         .chain([
                             "active_record_active_model",
                             "active_record_core",
+                        ])
+                        .chain(carries_api.then_some("active_model_api"))
+                        .chain([
                             "active_record_callbacks",
                             "active_record_fixture_set",
                             "active_support_string_inquirer",
@@ -15400,7 +15413,10 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     // macro `lower::model_to_library::macro_replay` replays: Core's
     // Denormalize#define_denormalized_foreign_key) builds its validators
     // on the port too.
+    // ActiveModel::API includes Validations (runtime/spinel/cruby/
+    // active_model_api.rb).
     let validations = record_validations
+        || carries_active_model_api(files)
         || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks"])
         || calls_runtime_validates(files);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
@@ -15414,6 +15430,12 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(carried, port)| carried.then_some(port))
     .collect()
+}
+
+/// True where app code names ActiveModel::API or ActiveModel::Model,
+/// which runtime/spinel/cruby/active_model_api.rb defines.
+fn carries_active_model_api(files: &[(String, String)]) -> bool {
+    carries_named(files, &["ActiveModel::API", "ActiveModel::Model"])
 }
 
 /// True where app code (not the runtime, not a test body) calls a
