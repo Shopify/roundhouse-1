@@ -9,6 +9,13 @@
 //! `shop_id` reader falling back to the same lookup. Against native
 //! Rails 8.2 on the same local PostgreSQL database. The modules are
 //! Core's, without their Sorbet `requires_ancestor`/`mixes_in_class_methods` lines.
+//!
+//! The calls are replayed in the class body: the `shop` association is
+//! compiled from them, and the validation and callback they declare at
+//! run time register with the PostgreSQL tree's base (RuntimeValidations,
+//! active_record_callbacks.rb), so `shop_id` fills from the order on
+//! save, the readers fall back to the same lookup, and the readonly
+//! decorator marks the shop it answers.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -41,6 +48,8 @@ CREATE TABLE client_details (
     CONSTRAINT client_details_pkey PRIMARY KEY (id)
 );
 "#;
+
+const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    concurrent-ruby (1.3.5)\n    i18n (1.15.2)\n      concurrent-ruby (~> 1.0)\n\nDEPENDENCIES\n  i18n\n";
 
 const DATABASE_YML: &str = r#"default: &default
   adapter: postgresql
@@ -463,6 +472,24 @@ const PROBE: &str = r##"class ShopThroughProbe
     l = LineItem.create!(order: o1, shop_id: s2.id, title: "a")
     l = LineItem.find(l.id)
     out << "line item: #{l.shop.name} #{LineItem.reflect_on_association(:shop).foreign_key}"
+    out << "options: #{r.options.inspect}"
+    filled = ClientDetail.create!(order: o1)
+    out << "fill: #{filled.shop_id == s1.id} #{ClientDetail.find(filled.id).shop_id == s1.id}"
+    fresh = ClientDetail.new(order: o1)
+    out << "fallback reader: #{fresh.shop_id == s1.id}"
+    fresh = ClientDetail.new(order: o1)
+    out << "prepended reader: #{fresh.shop.name} #{fresh[:shop_id] == s1.id}"
+    Shop.current = s2
+    out << "current: #{ClientDetail.new.shop_id == s2.id}"
+    Shop.current = nil
+    orphan = ClientDetail.new
+    # The driver's native app keeps Rails' framework default
+    # `belongs_to_required_by_default = false`; the emitted one reads
+    # Core's `load_defaults`, so its belongs_to presence errors differ.
+    out << "invalid: #{orphan.valid?} #{orphan.errors.full_messages.include?("Shop can't be blank")}"
+    li = LineItem.create!(order: o1, title: "b")
+    li = LineItem.find(li.id)
+    out << "readonly: #{li.shop_id == s1.id} #{li.shop.readonly?} #{li.shop.name}"
     out
   end
 end
@@ -470,21 +497,18 @@ end
 
 /// Native Rails 8.2 on the same PostgreSQL, so two identical wrong
 /// answers still fail.
-const EXPECTED: [&str; 4] = [
+const EXPECTED: [&str; 11] = [
     "reflection: belongs_to shop_id Shop belongs_to",
     "reader: one true one",
     "writer: two",
     "line item: two shop_id",
-];
-
-/// What does not run: Denormalize's `define_denormalized_foreign_key`
-/// declares a `before_validation` callback at class-body run time, which
-/// the compiled model has no place for, so the call is refused by name
-/// (the prepended `shop` reader and the readonly decorator with it); the
-/// `shop` association it declares is compiled from the call.
-const REFUSED: [&str; 2] = [
-    "model macro call on `ClientDetail` not lowered; `belongs_to_shop_through` → `define_denormalized_foreign_key` reaches `validates`",
-    "model macro call on `LineItem` not lowered; `readonly_belongs_to_shop_through` → `belongs_to_shop_through` → `define_denormalized_foreign_key` reaches `validates`",
+    "options: {primary_key: :id, foreign_key: :shop_id, inverse_of: false}",
+    "fill: true true",
+    "fallback reader: true",
+    "prepended reader: one true",
+    "current: true",
+    "invalid: false true",
+    "readonly: true true one",
 ];
 
 /// What native Rails requires, in order.
@@ -501,8 +525,9 @@ const LOADS: [&str; 10] = [
     "app/models/shop_through_probe",
 ];
 
-const FILES: [(&str, &str); 14] = [
+const FILES: [(&str, &str); 15] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
+    ("Gemfile.lock", LOCK),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ("db/structure.sql", STRUCTURE),
@@ -537,13 +562,8 @@ fn belongs_to_shop_through_matches_native_rails_on_postgresql() {
         &LOADS,
     );
     assert_eq!(native, EXPECTED, "native");
-    for refused in REFUSED {
-        assert!(
-            errors.iter().any(|e| e.contains(refused) && e.contains("its `shop` association is compiled from the call")),
-            "{refused}\n{}",
-            errors.join("\n")
-        );
-    }
+    let refused: Vec<&String> = errors.iter().filter(|e| e.contains("belongs_to_shop_through")).collect();
+    assert!(refused.is_empty(), "{refused:#?}");
     assert_eq!(emitted_lines, native, "emitted");
 }
 
@@ -559,4 +579,24 @@ fn belongs_to_shop_through_compiles_its_shop_association() {
         assert!(text.contains("  def shop\n"), "{model}: no `shop` reader\n{text}");
         assert!(text.contains(r#"FROM \"shops\" WHERE \"id\" = $1"#), "{model}: `shop` does not read shops by id\n{text}");
     }
+}
+
+/// The calls are replayed, not refused: what the macros declare at run
+/// time (`validates(:shop_id, presence: true)`, a `before_validation`
+/// block) the PostgreSQL tree's base registers, on the
+/// ActiveModel::Validations port the tree then carries; without
+/// PostgreSQL.
+#[test]
+fn belongs_to_shop_through_replays_its_runtime_validation_and_callback() {
+    let (emitted, errors) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
+    let refused: Vec<&String> = errors.iter().filter(|e| e.contains("belongs_to_shop_through")).collect();
+    assert!(refused.is_empty(), "{refused:#?}");
+    for (model, call) in [
+        ("client_detail", "  belongs_to_shop_through :order, primary_key: :id, foreign_key: :shop_id, inverse_of: false\n"),
+        ("line_item", "  readonly_belongs_to_shop_through :order, clone: true, primary_key: :id, foreign_key: :shop_id, inverse_of: nil\n"),
+    ] {
+        let text = std::fs::read_to_string(emitted.join(format!("app/models/{model}.rb"))).unwrap();
+        assert!(text.contains(call), "{model}: the call is not replayed\n{text}");
+    }
+    assert!(emitted.join("runtime/active_model_validations.rb").exists(), "the validations port is not carried");
 }
