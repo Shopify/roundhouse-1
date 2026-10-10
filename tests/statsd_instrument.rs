@@ -52,9 +52,13 @@ end
 /// the stdlib's `OpenSSL::PKey::RSA`, as json-jwt does.
 const ZORK_RBI: &str = "# typed: true\nmodule Zork\n  class Widget\n    def label; end\n  end\nend\n\nmodule ActiveRecord\n  def self.zork_mode; end\n  module ZorkExtension\n    def zork; end\n  end\nend\n\nclass OpenSSL::PKey::RSA\n  def to_zork; end\nend\n";
 
+/// The gem the tree declares where an `app/` body names its constant.
+const GEMS: &str = "runtime_gems:\n  - {constant: StatsD, gem: statsd-instrument}\n";
+
 fn statsd_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/statsd-instrument@3.11.1.rbi", STATSD_RBI)
         .write("sorbet/rbi/gems/zork@1.0.rbi", ZORK_RBI)

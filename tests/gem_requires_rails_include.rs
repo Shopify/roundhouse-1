@@ -11,10 +11,15 @@ use roundhouse::project::BuildTarget;
 
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    ar_transaction_changes (1.1.11)\n\nDEPENDENCIES\n  activesupport\n  ar_transaction_changes\n";
 
+/// A gem whose load closure reaches Rails (`rails_dependent`).
+const GEMS: &str = "rails_dependent:\n  - {gem: ar_transaction_changes, why: \"requiring it loads 163 Rails framework files\"}\n";
+
 const RBI: &str = "# typed: true\nmodule ArTransactionChanges\n  def transaction_changed_attributes; end\nend\n";
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
+        .write("roundhouse.yml", "extensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/ar_transaction_changes@1.1.11.rbi", RBI)
 }

@@ -467,6 +467,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let _test_hooks = super::on_load_reopen::defer_test_hooks(
         declared_database_adapter(vfs, dir).ok().flatten().is_some_and(|(adapter, _)| adapter == "postgresql"),
     );
+    install_extensions(vfs, dir)?;
     let gem_sources = gem_source_dirs(vfs, dir)?;
     let mut path_gems = path_gem_dirs(vfs, dir);
     path_gems.extend(gem_sources.iter().map(|(_, gem)| gem.clone()));
@@ -9045,6 +9046,19 @@ struct RoundhouseConfig {
     /// The absolute gem home the CRuby tree's Bundler resolves the
     /// natively loaded gems in (`ingest::gem_source_constants`).
     gem_home: Option<PathBuf>,
+    /// Extension directories (`crate::extensions`): gem facts the app
+    /// supplies. Absolute, or relative to this file's directory.
+    extensions: Vec<PathBuf>,
+}
+
+/// Install the gem facts of `roundhouse.yml`'s `extensions:` (none when
+/// the app lists none), replacing the previous app's.
+fn install_extensions<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<()> {
+    let listed = roundhouse_config(vfs, dir)?.map(|(config, _)| config.extensions).unwrap_or_default();
+    let loaded = crate::extensions::load(vfs, &crate::extensions::resolve_dirs(dir, &listed))
+        .map_err(|e| IngestError::Parse { file: e.file, message: e.message })?;
+    crate::extensions::install(loaded);
+    Ok(())
 }
 
 /// `roundhouse.yml`'s `gem_home:`, which must be absolute.

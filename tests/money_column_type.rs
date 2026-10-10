@@ -14,8 +14,13 @@ use std::path::PathBuf;
 use roundhouse::analyze::{diagnose, Analyzer};
 use roundhouse::ingest::ingest_app_from_tree;
 
+/// The money DSL's attribute macros (`macros.yml`).
+const MACROS: &str = "attribute_macros:\n  - {name: money_column, positional: true}\n  - {name: money_bags, hash_key: attributes}\n";
+
 fn failures(model_body: &str) -> Vec<String> {
     let files: Vec<(&str, String)> = vec![
+        ("roundhouse.yml", "extensions:\n  - ext\n".into()),
+        ("ext/macros.yml", MACROS.into()),
         (
             "db/schema.rb",
             "ActiveRecord::Schema.define do\n  create_table \"checkouts\", force: :cascade do |t|\n    t.decimal \"total_price\"\n    t.decimal \"amount\"\n  end\nend\n".into(),

@@ -53,9 +53,13 @@ DRbObject = DRb::DRbObject
 /// A gem nothing loads that reopens drb's class, and sorts before it.
 const ARMOR_RBI: &str = "# typed: true\nclass DRb::DRbObject\n  def armored; end\nend\n";
 
+/// dRuby, a bundled gem the tree declares where an `app/` body names it.
+const GEMS: &str = "runtime_gems:\n  - {constant: DRb, gem: drb}\n  - {constant: DRbObject, gem: drb}\n";
+
 fn drb_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/drb@2.2.3.rbi", DRB_RBI)
         .write("sorbet/rbi/gems/armor@1.0.rbi", ARMOR_RBI)

@@ -48,9 +48,13 @@ const READER: &str = r#"class Traced
 end
 "#;
 
+/// The tracing API the tree loads, and a gem whose load closure reaches Rails.
+const GEMS: &str = "runtime_gems:\n  - {constant: OpenTelemetry, gem: opentelemetry-api}\n  - {constant: \"OpenTelemetry::Instrumentation::PG\", gem: opentelemetry-instrumentation-pg}\nrails_dependent:\n  - {gem: shopify_errors, why: \"requiring it loads 91 Rails framework files\"}\n";
+
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/opentelemetry-api@1.10.1.rbi", OTEL_RBI)
         .write("sorbet/rbi/gems/shopify_errors@1.0.0.rbi", ERRORS_RBI)

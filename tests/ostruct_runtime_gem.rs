@@ -29,9 +29,13 @@ class OpenStruct
 end
 "#;
 
+/// OpenStruct, a bundled gem since Ruby 4.0, declared where an `app/` body names it.
+const GEMS: &str = "runtime_gems:\n  - {constant: OpenStruct, gem: ostruct}\n";
+
 fn ostruct_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/ostruct@0.6.3.rbi", OSTRUCT_RBI)
         .write("test/test_helper.rb", "require \"active_support/test_case\"\n")

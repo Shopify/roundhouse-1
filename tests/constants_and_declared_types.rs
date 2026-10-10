@@ -15,7 +15,8 @@ use std::path::Path;
 use std::process::Command;
 
 const FILES: &[(&str, &str)] = &[
-    ("roundhouse.yml", "test_paths:\n  - test\n"),
+    ("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n"),
+    ("ext/gems.yml", "lock_gated_requires:\n  - {require: dry-types, gem: dry-types}\n"),
     ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    dry-types (1.8.2)\n\nDEPENDENCIES\n  dry-types\n"),
     (
         "sorbet/rbi/gems/dry-types@1.8.2.rbi",

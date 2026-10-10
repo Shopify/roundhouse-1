@@ -85,6 +85,9 @@ Liquid::Render::SYNTAX = T.let(T.unsafe(nil), Regexp)
 Liquid::VariableSegment = T.let(T.unsafe(nil), Regexp)
 "#;
 
+/// The gem the tree's `require "liquid"` loads, gated on the lockfile.
+const GEMS: &str = "lock_gated_requires:\n  - {require: liquid, gem: liquid}\n";
+
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    liquid (5.13.0)\n\nDEPENDENCIES\n  activesupport\n  liquid (= 5.13.0)\n";
 
 /// The shape of Core's liquid_ext.rb, reduced to this gem's surface.
@@ -221,11 +224,15 @@ fn reopen_runs_as_in_cruby(rbi: bool) {
     }
     assert!(!String::from_utf8_lossy(&native.stderr).contains("already initialized constant"));
 
-    let app = emit_and_run::empty_app().write("Gemfile.lock", LOCK).write("lib/patches/liquid_ext.rb", PATCH);
+    let app = emit_and_run::empty_app()
+        .write("Gemfile.lock", LOCK)
+        .write("lib/patches/liquid_ext.rb", PATCH)
+        .write("ext/gems.yml", GEMS);
     let app = if rbi {
-        app.write("roundhouse.yml", "test_paths:\n  - test\n").write("sorbet/rbi/gems/liquid@5.13.0.rbi", RBI)
+        app.write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+            .write("sorbet/rbi/gems/liquid@5.13.0.rbi", RBI)
     } else {
-        app.write("roundhouse.yml", &format!("test_paths:\n  - test\ngem_home: {}\n", home.display()))
+        app.write("roundhouse.yml", &format!("test_paths:\n  - test\nextensions:\n  - ext\ngem_home: {}\n", home.display()))
     };
     let (tree, errors) = app.emit(BuildTarget::Ruby);
     let patch_errors: Vec<&String> = errors.iter().filter(|e| !e.contains("FileId(0)")).collect();
