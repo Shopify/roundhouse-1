@@ -59,6 +59,10 @@ mod params_wrapper;
 mod io_process_constants_contract;
 #[path = "spinel_toolchain/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "support/campfire_caches.rs"]
+mod campfire_caches_contract;
+#[path = "spinel_toolchain/campfire_caches.rs"]
+mod campfire_caches;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]

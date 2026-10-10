@@ -452,6 +452,9 @@ fn ar_instance_ty(kind: crate::catalog::ReturnKind) -> Option<Ty> {
         ReturnKind::HashSymStr => {
             Some(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) })
         }
+        ReturnKind::HashStrUntyped => {
+            Some(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) })
+        }
         ReturnKind::ArrayOfSym => Some(Ty::Array { elem: Box::new(Ty::Sym) }),
         ReturnKind::ArrayOfInt => Some(Ty::Array { elem: Box::new(Ty::Int) }),
         ReturnKind::ClassRef(path) => {

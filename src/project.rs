@@ -3427,6 +3427,33 @@ fn ruby_family_files(
                         require \"typeid\"\n"
                 .to_string();
         }
+        // `SQLite3::Database`: the sqlite3 gem the CRuby tree's Db shim
+        // already loads. JRuby has no sqlite3 gem (its Db shim is JDBC),
+        // so there the constant is refused at emit
+        // (`unavailable_class_module_construct`) and the file is empty.
+        if path == "runtime/sqlite3_database.rb" {
+            *content = if flavor == RubyFlavor::JRuby {
+                "# SQLite3::Database is not available on JRuby: the sqlite3 gem is\n\
+                 # CRuby's, and this tree's Db shim is JDBC. A program naming it is\n\
+                 # refused at emit — see `project::unavailable_class_module_construct`.\n"
+                    .to_string()
+            } else {
+                "# The sqlite3 gem's own SQLite3::Database — see\n\
+                 # `project::ruby_runtime_files`. The port at\n\
+                 # runtime/spinel/sqlite3_database.rb is spinel's, over the FFI.\n\
+                 require \"sqlite3\"\n"
+                    .to_string()
+            };
+        }
+        // `Rack::Utils`: the rack gem the overlay's Puma already loads,
+        // under the port's require path.
+        if path == "runtime/rack_utils.rb" {
+            *content = "# The rack gem's own Rack::Utils — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/rack_utils.rb exists for the targets\n\
+                        # that have no rack to load.\n\
+                        require \"rack/utils\"\n"
+                .to_string();
+        }
         if path == "runtime/zlib.rb" {
             *content = "# Ruby's own zlib — see `project::ruby_runtime_files`.\n\
                         # The port at runtime/ruby/zlib.rb exists for the targets\n\
@@ -3683,7 +3710,6 @@ fn ruby_family_files(
             crate::runtime_files::read_to_string("runtime/spinel/active_support_cache.rb")
                 .map_err(|e| format!("read runtime/spinel/active_support_cache.rb: {e}"))?,
         ));
-        drop_harness_memory_store(&mut files)?;
     }
     // MemCacheStore (activesupport 8.1.4 on the dalli gem), where app code
     // names the class: Core's VersionedMemCacheStore subclasses it. It
@@ -4105,6 +4131,11 @@ fn ruby_family_files(
         "",
         &mut files,
     )?;
+    // After the overlay: its boot.rb (which supersedes the base's at
+    // dedupe) requires the MemoryStore model too.
+    if carries_cache {
+        drop_memory_store_model(&mut files)?;
+    }
 
     // Library classes (app/models/<stem>.rb for the ingested support
     // classes) and the regenerated app/views.rb aggregator are inherited
@@ -6935,6 +6966,17 @@ fn apply_content_layout(files: &mut [(String, String)], app: &App) {
             }
         }
     }
+    // Action Text's own attachable, after the app's: a blob's node
+    // renders `active_storage/blobs/_blob` with the ATTACHMENT as `blob`
+    // (it delegates to the blob, as Rails' does), when the tree carries
+    // the app's copy of that partial. campfire overrides it to show an
+    // embedded file by name rather than making a preview on view.
+    if files.iter().any(|(path, _)| path.ends_with("app/views/active_storage/blobs/_blob.rb")) {
+        by_model.push_str(
+            "      when \"ActiveStorage::Blob\"\n        \
+             attachment.blob.nil? ? \"\" : Views::ActiveStorage::Blobs.blob(attachment)\n",
+        );
+    }
     let built = if built_by_content_type.is_empty() {
         None
     } else {
@@ -7083,6 +7125,47 @@ fn apply_cable_channels(files: &mut [(String, String)], app: &App) {
 
     for (path, content) in files.iter_mut() {
         if !path.ends_with("/action_cable.rb") {
+            continue;
+        }
+        let Some(start) = content.find(HEAD) else { continue };
+        let Some(rel_end) = content[start..].find(TAIL) else { continue };
+        let end = start + rel_end + TAIL.len();
+        content.replace_range(start..end, &generated);
+    }
+}
+
+/// `ActiveRecord::Base.instantiate_named` (runtime/spinel/
+/// active_record_db_config.rb): one arm per model, by the name
+/// `record.class.name` answers for it, and an STI subclass name the
+/// base hydrates. See `lower::record_snapshot`.
+fn apply_instantiate_named(files: &mut [(String, String)], app: &App) {
+    const HEAD: &str = "      # >>> generated: instantiate-named\n";
+    const TAIL: &str = "      # <<< generated: instantiate-named\n";
+    let mut arms: Vec<(String, String)> = Vec::new();
+    for model in &app.models {
+        let name = model.name.0.as_str().to_string();
+        arms.push((name.clone(), name.clone()));
+        for sub in &model.sti_subclass_names {
+            if !app.models.iter().any(|m| m.name == *sub) {
+                arms.push((sub.0.as_str().to_string(), name.clone()));
+            }
+        }
+    }
+    // No models, no arms: the default body (a NameError) stays.
+    if arms.is_empty() {
+        return;
+    }
+    let mut generated = String::from(HEAD);
+    generated.push_str("      case name\n");
+    for (name, class) in &arms {
+        generated.push_str(&format!(
+            "      when {name:?} then {class}.instantiate(attributes)\n"
+        ));
+    }
+    generated.push_str("      else raise NameError, \"uninitialized constant #{name}\"\n      end\n");
+    generated.push_str(TAIL);
+    for (path, content) in files.iter_mut() {
+        if !path.ends_with("active_record_db_config.rb") {
             continue;
         }
         let Some(start) = content.find(HEAD) else { continue };
@@ -11246,16 +11329,86 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Struct" | "Mutex" | "Fiber" | "Process" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"
-        | "JSON::GeneratorError");
+        | "JSON::GeneratorError"
+        // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
+        // the ruby family; no strict target loads either.
+        | "Rack::Utils"
+        // `runtime/ruby/active_support_ext.rb` ships to the ruby family
+        // and spinel only.
+        | "ActiveSupport::JSON"
+        // The sqlite3 gem on the ruby family, `runtime/spinel/
+        // sqlite3_database.rb` over the FFI on spinel; `FileUtils` is a
+        // default gem / `packages/fileutils`; the Rails classes come
+        // with `runtime/spinel/active_record_db_config.rb`.
+        | "SQLite3::Database" | "SQLite3::Exception" | "SQLite3::CantOpenException"
+        | "SQLite3::BusyException" | "SQLite3::SQLException"
+        | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter"
+        // runtime/spinel/active_support_cache.rb.
+        | "ActiveSupport::Cache" | "ActiveSupport::Cache::MemoryStore"
+        // rqrcode_core's / spinel-rqrcode's.
+        | "RQRCodeCore::QRCodeRunTimeError" | "RQRCodeCore::QRCodeArgumentError");
     if !bundled {
         return None;
     }
-    // Nokogiri does not supply HTML5 on JRuby. The other bundled
-    // values remain available there.
-    if target == "jruby" && name != "Rails::HTML5::SafeListSanitizer" {
+    // Nokogiri does not supply HTML5 on JRuby, and the sqlite3 gem does
+    // not run there. The other bundled values remain available.
+    if target == "jruby" && name != "Rails::HTML5::SafeListSanitizer" && !name.starts_with("SQLite3::") {
         return None;
     }
     Some("bundled_constant")
+}
+
+/// Class methods of a stdlib class whose shared port (`runtime/ruby/`)
+/// stops short of them: Ruby's own library serves them on the ruby
+/// family and spinel's package on spinel, while a strict target's port
+/// has no body to call. `Zlib.gzip` needs a deflate the CRC-32 port
+/// (`runtime/ruby/zlib.rb`) does not have. A Rails class method served
+/// only by a ruby-family/spinel runtime file is gated the same way.
+const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
+    ("Zlib", "gzip"),
+    // Answered from the Db shim (`runtime/spinel/
+    // active_record_db_config.rb`); a strict target's Db glue has none.
+    ("ActiveRecord::Base", "connection_db_config"),
+    ("ActiveRecord::Base", "connection_pool"),
+    // `lower::record_snapshot`'s closed-world `constantize` — the
+    // generated `case` lives in the same ruby-family/spinel file.
+    ("ActiveRecord::Base", "instantiate_named"),
+];
+
+/// Instance methods only the ruby family and spinel can answer: a model's
+/// `attributes_before_type_cast` is a Hash of every column's raw stored
+/// value, one value type per column, which a strict target's Hash cannot
+/// hold.
+const RUBY_SPINEL_ONLY_INSTANCE_METHODS: &[&str] = &["attributes_before_type_cast"];
+
+/// True only for an application model instance (including nullable model
+/// unions) that does not define its own method with this spelling.
+fn is_unported_model_instance_method(
+    recv: &crate::expr::Expr,
+    method: &str,
+    app: &App,
+) -> bool {
+    fn model_ids(ty: &crate::ty::Ty, out: &mut Vec<crate::ident::ClassId>) {
+        match ty {
+            crate::ty::Ty::Class { id, .. } => out.push(id.clone()),
+            crate::ty::Ty::Union { variants } => {
+                for variant in variants {
+                    model_ids(variant, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(&*recv.node, crate::expr::ExprNode::Const { .. }) {
+        return false;
+    }
+    let Some(ty) = &recv.ty else { return false };
+    let mut ids = Vec::new();
+    model_ids(ty, &mut ids);
+    ids.iter().any(|id| {
+        app.models.iter().any(|model| model.name == *id)
+            && !crate::analyze::source_instance_method(app, id, method)
+        })
 }
 
 /// True when the app already defines `id` as a class/module value, so
@@ -11588,6 +11741,36 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 if RUBY_FAMILY_RUNTIME_CONSTANTS.contains(&name.as_str()) {
                     report_unavailable_class_value(app, target, &name, expr.span);
                 }
+            }
+        }
+        if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
+            && target != "spinel"
+            && target != "jruby"
+            && !expr.span.is_synthetic()
+            && RUBY_SPINEL_ONLY_INSTANCE_METHODS.contains(&method.as_str())
+            && is_unported_model_instance_method(recv, method.as_str(), app)
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_method",
+                format!("#{method} is only available on the ruby family and spinel"),
+            );
+        }
+        if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
+            && target != "spinel"
+            && target != "jruby"
+            && !expr.span.is_synthetic()
+            && let crate::expr::ExprNode::Const { path } = &*recv.node
+        {
+            let owner = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            if RUBY_SPINEL_ONLY_METHODS.contains(&(owner.as_str(), method.as_str())) {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "bundled_method",
+                    format!("{owner}.{method} is only available on the ruby family and spinel"),
+                );
             }
         }
         // A mapped JSON call does not emit a Ruby module object. Skip
@@ -12275,6 +12458,10 @@ fn spinel_files_with_assertions(
         // ruby family reaches Ruby's own through a bare `require`, so
         // this one only has to exist where that does not.
         "ipaddr",
+        // rack's `Utils.q_values` / `select_best_encoding`, ported for
+        // spinel (no rack gem to load); the ruby family swaps it for
+        // `require "rack/utils"` below, as ipaddr and zlib are swapped.
+        "rack_utils",
         // Ruby's `Logger` plus the two ActiveSupport wrappers in front
         // of it. Same arrangement as ipaddr, with one difference the
         // file's header gives: NOT swapped for Ruby's own on the
@@ -12502,6 +12689,7 @@ fn spinel_files_with_assertions(
     // chosen. Generating on only one lane would leave the other calling
     // a method nothing defined.
     apply_global_id_locate(&mut files, app);
+    apply_instantiate_named(&mut files, app);
     apply_attachable_locate(&mut files, app);
     apply_views_aggregator(&mut files);
     apply_models_aggregator(&mut files);
@@ -12937,6 +13125,7 @@ const GEM_REQUIRES: &[&str] = &[
     "parslet",
     "typeid",
     "rqrcode",
+    "rqrcode_core",
     "SVG/Graph/TimeSeries",
     "sentry-ruby",
     "rails-html-sanitizer",
@@ -13598,7 +13787,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 44] = [
+    const RUNTIME_GEMS: [(Marker, &str); 45] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -13608,6 +13797,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         (Marker::Constant("Parslet"), "parslet"),
         (Marker::Constant("TypeID"), "typeid"),
         (Marker::Constant("RQRCode"), "rqrcode"),
+        (Marker::Constant("RQRCodeCore"), "rqrcode_core"),
         // campfire's web push builds one `Net::HTTP::Persistent` pool
         // per process (`WebPush::Pool`), and the gem went undeclared
         // exactly as bcrypt did — the façade names the constant and
@@ -14802,7 +14992,7 @@ const ACTIVE_SUPPORT_CACHE_NAMES: &[&str] = &[
 /// True where the app's own emitted code (not the runtime, not a test
 /// body) names a namespace the cache port declares. A test body's
 /// `ActiveSupport::Cache::MemoryStore.new` alone is the harness's
-/// (`drop_harness_memory_store`), so tests do not count.
+/// (the bounded `MemoryStore` model, `drop_memory_store_model`), so tests do not count.
 fn carries_active_support_cache(files: &[(String, String)]) -> bool {
     carries_named(files, ACTIVE_SUPPORT_CACHE_NAMES)
 }
@@ -14850,25 +15040,32 @@ fn carries_named(files: &[(String, String)], names: &[&str]) -> bool {
     })
 }
 
-/// The Ruby-family test harness answers `ActiveSupport::Cache::MemoryStore.new`
-/// with the store `Rails.cache` is (`test/test_helper.rb`), for a test
-/// that swaps a memory store in and has no MemoryStore otherwise. A tree
-/// that carries the real one drops that reopen: its `self.new` would be
-/// inherited by every subclass (Core's `TestCacheStore.new` would build
-/// a `Rails::MemoryStore`), and `MemoryStore.new(size: n)` would not
-/// take its options.
-fn drop_harness_memory_store(files: &mut [(String, String)]) -> Result<(), String> {
-    const REOPEN: &str = "module ActiveSupport\n  module Cache\n    class MemoryStore\n      def self.new\n        Rails.cache.class.new\n      end\n    end\n  end\nend\n";
-    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
-        return Ok(());
-    };
-    if helper.matches(REOPEN).count() != 1 {
-        return Err("drop_harness_memory_store: expected one ActiveSupport::Cache::MemoryStore reopen in test/test_helper.rb".into());
+/// Every Ruby-family and spinel tree carries the bounded
+/// `ActiveSupport::Cache::MemoryStore` model, a `Rails::Cache`
+/// (runtime/spinel/active_support_cache_memory.rb, which boot.rb
+/// requires), for a campfire-shaped app that swaps a memory store into
+/// `Rails.cache`. A tree that carries the activesupport port drops the
+/// model and its require: two `MemoryStore`s with different superclasses
+/// are a TypeError at load, and Core's `TestCacheStore` subclasses the
+/// port's, which takes the port's options.
+fn drop_memory_store_model(files: &mut Vec<(String, String)>) -> Result<(), String> {
+    const MODEL: &str = "runtime/active_support_cache_memory.rb";
+    const REQUIRE: &str = "require_relative \"runtime/active_support_cache_memory\"\n";
+    let before = files.len();
+    files.retain(|(p, _)| p != MODEL);
+    if files.len() + 1 != before {
+        return Err(format!("drop_memory_store_model: expected one {MODEL} in the tree"));
     }
-    *helper = helper.replace(
-        REOPEN,
-        "# (ActiveSupport::Cache::MemoryStore is runtime/active_support_cache.rb's\n# on this tree; the harness's stand-in is dropped.)\n",
-    );
+    // Every boot.rb: the base's and the overlay's that supersedes it.
+    for (_, boot) in files.iter_mut().filter(|(p, _)| p == "boot.rb") {
+        if boot.matches(REQUIRE).count() != 1 {
+            return Err("drop_memory_store_model: expected one require of the MemoryStore model in boot.rb".into());
+        }
+        *boot = boot.replace(
+            REQUIRE,
+            "# (ActiveSupport::Cache is runtime/active_support_cache.rb's on this\n# tree, required by runtime/gem_facades.rb.)\n",
+        );
+    }
     Ok(())
 }
 
@@ -15256,7 +15453,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)], stdlib: &[(&str, &st
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 17] = [
+const BUNDLED: [(&str, &str); 18] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -15318,6 +15515,10 @@ const BUNDLED: [(&str, &str); 17] = [
     // it), but an app file reaches the tree without its requires.
     // Spinel takes `packages/pty`.
     ("PTY", "pty"),
+    // `FileUtils.mkdir_p` / `remove_entry` — campfire's WAL checkpointer
+    // makes its lock directory. A default gem on CRuby/JRuby (Rails has
+    // loaded it); spinel takes `packages/fileutils`.
+    ("FileUtils", "fileutils"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,
@@ -17030,11 +17231,18 @@ mod tests {
         assert!(!with_harness[0].1.contains("ActiveSupport.freeze(ActiveSupport.now"), "the stand-in freeze_time would shadow the port's");
         assert!(use_ported_time_helpers(&mut with_harness).is_err(), "the stand-in is replaced once");
 
-        drop_harness_memory_store(&mut files).unwrap();
-        let dropped = &files[0].1;
-        assert!(!dropped.contains("Rails.cache.class.new"), "{dropped}");
-        assert_eq!(dropped.len() < helper.len(), true);
-        assert!(drop_harness_memory_store(&mut files).is_err(), "a second drop finds no stand-in");
+        let boot = crate::runtime_files::read_to_string("runtime/spinel/scaffold/ruby_overlay/boot.rb").unwrap();
+        files.push(("runtime/active_support_cache_memory.rb".to_string(), String::new()));
+        // The base's boot.rb and the overlay's that supersedes it at dedupe.
+        let base_boot = crate::runtime_files::read_to_string("runtime/spinel/scaffold/boot.rb").unwrap();
+        files.push(("boot.rb".to_string(), base_boot));
+        files.push(("boot.rb".to_string(), boot.clone()));
+        drop_memory_store_model(&mut files).unwrap();
+        assert!(!files.iter().any(|(p, _)| p == "runtime/active_support_cache_memory.rb"));
+        for (_, dropped) in files.iter().filter(|(p, _)| p == "boot.rb") {
+            assert!(!dropped.contains("runtime/active_support_cache_memory\""), "{dropped}");
+        }
+        assert!(drop_memory_store_model(&mut files).is_err(), "a second drop finds no model");
     }
 
     /// The messages port rides along where app code names one of its
@@ -17103,6 +17311,59 @@ mod tests {
         for name in ["ActiveModel::Type::Integer", "ActiveModel::Type::String", "ActiveModel::Type::Boolean", "ActiveModel::Type::DateTime", "ActiveRecord::Type::Text", "ActiveRecord::Type::DateTime"] {
             assert!(declared.contains(name), "{name}: {declared:?}");
         }
+    }
+
+    #[test]
+    fn bundled_instance_method_gate_is_scoped_to_model_receivers() {
+        use crate::expr::{Expr, ExprNode};
+        use crate::ident::{ClassId, Symbol};
+        use crate::span::Span;
+        use crate::ty::Ty;
+
+        let tree = [
+            ("app/models/article.rb", "class Article < ApplicationRecord; end\n"),
+            ("app/models/custom.rb", "class Custom < ApplicationRecord\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/parent.rb", "class Parent < ApplicationRecord\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/child.rb", "class Child < Parent; end\n"),
+            ("app/models/concerns/raw_values.rb", "module RawValues\n  def attributes_before_type_cast; {}; end\nend\n"),
+            ("app/models/included.rb", "class Included < ApplicationRecord\n  include RawValues\nend\n"),
+            ("app/services/probe.rb", "class Probe; end\n"),
+        ].into_iter().map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec())).collect();
+        let mut app = crate::ingest::ingest_app_from_tree(tree).unwrap();
+        let mut empty_reopen = app.library_classes.iter()
+            .find(|class| class.name.0.as_str() == "RawValues")
+            .unwrap().clone();
+        empty_reopen.methods.clear();
+        app.library_classes.insert(0, empty_reopen);
+        let receiver = |node, ty| {
+            let mut expr = Expr::new(Span::synthetic(), node);
+            expr.ty = Some(ty);
+            expr
+        };
+        let receiver_for = |name: &str| {
+            receiver(ExprNode::Var {
+                id: crate::ident::VarId(0),
+                name: Symbol::new("receiver"),
+            }, Ty::Class { id: ClassId(Symbol::new(name)), args: vec![] })
+        };
+
+        assert!(is_unported_model_instance_method(&receiver_for("Article"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Probe"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Custom"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Child"), "attributes_before_type_cast", &app));
+        assert!(!is_unported_model_instance_method(&receiver_for("Included"), "attributes_before_type_cast", &app));
+        assert!(is_unported_model_instance_method(
+            &receiver(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::new("receiver") },
+                Ty::Union { variants: vec![Ty::Class { id: ClassId(Symbol::new("Article")), args: vec![] }, Ty::Nil] }),
+            "attributes_before_type_cast",
+            &app,
+        ));
+        assert!(!is_unported_model_instance_method(
+            &receiver(ExprNode::Const { path: vec![Symbol::new("Article")] },
+                Ty::Class { id: ClassId(Symbol::new("Article")), args: vec![] }),
+            "attributes_before_type_cast",
+            &app,
+        ));
     }
 
     #[test]

@@ -41,6 +41,13 @@ class Object
   def to_param
     to_s
   end
+
+  # `deep_dup` (core_ext/object/deep_dup.rb) on a receiver inference
+  # could not type; a typed Hash/Array is grounded to the same function
+  # by `lower::symbolize_keys`.
+  def deep_dup
+    ActiveSupport.deep_dup(self)
+  end
 end
 
 # `compact_blank` (core_ext/enumerable.rb + core_ext/hash.rb) — the

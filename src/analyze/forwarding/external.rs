@@ -30,6 +30,10 @@ use crate::det::{HashMap, HashSet};
 /// Runtime files whose methods follow the native source: each says so in
 /// its header and has a parity test (`tests/*_runtime.rs`) that runs the
 /// same observations against the native library and the port.
+/// The bounded `ActiveSupport::Cache::MemoryStore` model the tree carries
+/// when app code does not name the cache port.
+const MEMORY_STORE_MODEL: &str = "runtime/spinel/active_support_cache_memory.rb";
+
 pub(super) const SIGNATURE_PORTS: &[&str] = &[
     "runtime/spinel/active_support_cache.rb",
     "runtime/spinel/active_support_mem_cache_store.rb",
@@ -117,6 +121,12 @@ pub(super) fn world() -> &'static World {
         }
         let mut scans = Vec::new();
         for (path, text) in crate::runtime_files::ruby_sources() {
+            // The bounded MemoryStore model never ships beside the port
+            // above (`project::drop_memory_store_model`); scanning both
+            // would read each `MemoryStore` method as defined twice.
+            if path == MEMORY_STORE_MODEL {
+                continue;
+            }
             let mut scan = Scan { port: SIGNATURE_PORTS.contains(&path), ..Scan::default() };
             let parsed = ruby_prism::parse(text.as_bytes());
             ruby_prism::Visit::visit(&mut scan, &parsed.node());

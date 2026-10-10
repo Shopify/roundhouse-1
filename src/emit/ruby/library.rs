@@ -505,6 +505,7 @@ fn merge_at_path(out: &mut Vec<EmittedFile>, at_path: &mut crate::det::HashMap<P
     }
 }
 
+
 /// A child's `require_relative` target, expressed from its parent's
 /// file instead of its own.
 ///
@@ -5752,62 +5753,16 @@ fn rewrite_helper_calls(
         return;
     }
 
-    // Bare `<x>_url` whose `<x>_path` sibling is generated — the
-    // absolute variant grounds to protocol + configured domain + the
-    // path helper (same convention as `rewrite_url_helpers_absolute`'s
-    // host-kwarg form): `"#{Rails.application.protocol}#{
-    // Rails.application.domain}#{RouteHelpers.<x>_path(args)}"`. Lobsters' hats page links
-    // `request_hat_url` bare.
+    // Bare `<x>_url` whose `<x>_path` sibling is generated — use the
+    // shared view URL seam so request-derived origins get the same port
+    // normalization as jbuilder. It still resolves Rails.application.domain,
+    // preserving apps' canonical-domain overrides. Lobsters' hats page
+    // links `request_hat_url` bare.
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
         if let Some(stem) = method.as_str().strip_suffix("_url") {
             let path_name = Symbol::from(format!("{stem}_path"));
             if route_helpers.contains(&path_name) {
-                let span = expr.span;
-                let args = args.clone();
-                let domain = Expr::new(
-                    span,
-                    ExprNode::Send {
-                        recv: Some(Expr::new(
-                            span,
-                            ExprNode::Send {
-                                recv: Some(Expr::new(
-                                    span,
-                                    ExprNode::Const { path: vec![Symbol::from("Rails")] },
-                                )),
-                                method: Symbol::from("application"),
-                                args: vec![],
-                                block: None,
-                                parenthesized: false,
-                            },
-                        )),
-                        method: Symbol::from("domain"),
-                        args: vec![],
-                        block: None,
-                        parenthesized: false,
-                    },
-                );
-                let path_call = Expr::new(
-                    span,
-                    ExprNode::Send {
-                        recv: Some(Expr::new(
-                            span,
-                            ExprNode::Const { path: vec![Symbol::from("RouteHelpers")] },
-                        )),
-                        method: path_name,
-                        args,
-                        block: None,
-                        parenthesized: true,
-                    },
-                );
-                *expr.node = ExprNode::StringInterp {
-                    parts: vec![
-                        crate::expr::InterpPart::Expr {
-                            expr: crate::lower::view_to_library::rails_application_call("protocol"),
-                        },
-                        crate::expr::InterpPart::Expr { expr: domain },
-                        crate::expr::InterpPart::Expr { expr: path_call },
-                    ],
-                };
+                *expr = crate::lower::view_to_library::absolute_url_interp(stem, args.clone());
                 return;
             }
         }
@@ -15461,6 +15416,15 @@ fn require_path_for_body_const(
         // (`project::IPADDR_STDLIB`) — so runtime code reads octets
         // everywhere and never `to_i`.
         "IPAddr" => Some("runtime/ipaddr".to_string()),
+        // `Rack::Utils` — rack's encoding negotiation, ported into
+        // `runtime/ruby/rack_utils.rb` for spinel and the rack gem's own
+        // on the ruby family (`project::ruby_runtime_files`). Anchored so
+        // a file that names it loads the one its tree has.
+        "Rack" => Some("runtime/rack_utils".to_string()),
+        // `SQLite3::Database` — the gem on the ruby family, the FFI port
+        // (`runtime/spinel/sqlite3_database.rb`) on spinel; one require
+        // path either way.
+        "SQLite3" => Some("runtime/sqlite3_database".to_string()),
         // `Resolv` — Ruby's resolver, ported into
         // `runtime/ruby/resolv.rb` for the targets that have none and
         // swapped for the stdlib on the ruby family. Anchored for the

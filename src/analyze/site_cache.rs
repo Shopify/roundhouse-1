@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 
 use crate::det::HashMap;
 
-use super::{incremental, observe_into, Analyzer, ParamSite, ParamTables, UnifyScope};
+use super::{bound_param_row, incremental, observe_into, Analyzer, ParamSite, ParamTables, UnifyScope};
 use crate::app::ParamKey;
 use crate::dialect::MethodReceiver;
 use crate::ident::{ClassId, Symbol};
@@ -292,6 +292,9 @@ impl Analyzer {
                     observe_into(slots, arg_tys.clone());
                 }
             }
+            if let Some(slots) = entry.as_mut() {
+                bound_param_row(slots);
+            }
             match entry {
                 Some(slots) => {
                     cache.table.insert(key.clone(), slots);
@@ -311,9 +314,8 @@ impl Analyzer {
             let mut fresh: HashMap<ParamKey, Vec<Ty>> = HashMap::default();
             let sites = self.collect_param_sites(app, scope);
             let mut memo = HashMap::default();
-            for (key, arg_tys) in self.place_param_sites(sites, &tables.shapes, &tables.defined, &mut memo) {
-                super::observe_param_site(&mut fresh, key, arg_tys);
-            }
+            let observations = self.place_param_sites(sites, &tables.shapes, &tables.defined, &mut memo);
+            super::fold_param_observations(&mut fresh, observations);
             if fresh != cache.table {
                 let differing = fresh
                     .iter()

@@ -132,6 +132,96 @@ fn destructure_target(
     Ok(out)
 }
 
+/// Ruby writes a nested multi-write's targets depth first, in source
+/// order; the desugar above writes one level at a time (the flat level,
+/// then each group). The two agree unless a variable is written twice
+/// and its LAST write moves — `(x, y), x = [1, 2], 3` leaves `x` at 3 in
+/// Ruby and would leave it at 1 here — so that shape is refused rather
+/// than answered wrong.
+fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> IngestResult<()> {
+    fn name_of(node: &Node<'_>) -> Option<String> {
+        if let Some(t) = node.as_local_variable_target_node() {
+            return Some(constant_id_str(&t.name()).to_string());
+        }
+        if let Some(t) = node.as_instance_variable_target_node() {
+            return Some(constant_id_str(&t.name()).to_string());
+        }
+        None
+    }
+    fn source_order<'pr>(
+        lefts: impl Iterator<Item = Node<'pr>>,
+        writes: &mut Vec<(String, usize)>,
+        targets: &mut Vec<usize>,
+    ) {
+        for left in lefts {
+            if let Some(group) = left.as_multi_target_node() {
+                source_order(group.lefts().iter(), writes, targets);
+            } else {
+                let at = left.location().start_offset();
+                targets.push(at);
+                if let Some(name) = name_of(&left) {
+                    writes.push((name, at));
+                }
+            }
+        }
+    }
+    // The desugar's order: this level's plain targets, then each group's
+    // (recursively, in the same shape).
+    fn desugar_order<'pr>(
+        lefts: Vec<Node<'pr>>,
+        writes: &mut Vec<(String, usize)>,
+        targets: &mut Vec<usize>,
+    ) {
+        let mut groups = Vec::new();
+        for left in lefts {
+            if let Some(group) = left.as_multi_target_node() {
+                groups.push(group);
+            } else {
+                let at = left.location().start_offset();
+                targets.push(at);
+                if let Some(name) = name_of(&left) {
+                    writes.push((name, at));
+                }
+            }
+        }
+        for group in groups {
+            desugar_order(group.lefts().iter().collect(), writes, targets);
+        }
+    }
+    fn has_setter_target<'pr>(lefts: impl Iterator<Item = Node<'pr>>) -> bool {
+        lefts.into_iter().any(|left| {
+            if let Some(group) = left.as_multi_target_node() {
+                has_setter_target(group.lefts().iter())
+            } else {
+                left.as_call_target_node().is_some()
+            }
+        })
+    }
+    let mut ruby_targets = Vec::new();
+    let mut ruby = Vec::new();
+    source_order(mw.lefts().iter(), &mut ruby, &mut ruby_targets);
+    let mut ours_targets = Vec::new();
+    let mut ours = Vec::new();
+    desugar_order(mw.lefts().iter().collect(), &mut ours, &mut ours_targets);
+    let last = |writes: &[(String, usize)], name: &str| {
+        writes.iter().rev().find(|(n, _)| n == name).map(|(_, at)| *at)
+    };
+    if ruby.iter().any(|(name, _)| last(&ruby, name) != last(&ours, name)) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "nested multi-write that writes one variable twice out of source order is not modeled".into(),
+        });
+    }
+    let has_setter = has_setter_target(mw.lefts().iter());
+    if has_setter && ruby_targets != ours_targets {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "nested multi-write with assignment-method targets would reorder setter side effects".into(),
+        });
+    }
+    Ok(())
+}
+
 /// A fresh local for one nested destructuring level, unique by the
 /// node's offset and clear of every name the source already uses.
 fn nested_temp(node: &Node<'_>, _span: Span) -> Symbol {
@@ -158,6 +248,7 @@ fn ingest_multi_write(
     // destructured from it after the flat assignment. The whole
     // expression still answers the RHS, as Ruby's does.
     if mw.rest().is_none() && mw.lefts().iter().any(|l| l.as_multi_target_node().is_some()) {
+        reject_reordered_rewrite(mw, file)?;
         let rhs = nested_temp(&mw.as_node(), span);
         let rhs_read =
             || Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: rhs.clone() });

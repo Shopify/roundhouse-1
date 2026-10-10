@@ -234,6 +234,21 @@ module ActionView
     # for the two lanes that can use it. A poly walk over untyped values
     # and an `Array#sort` are not shapes every strict target's emit
     # answers, and this seam keeps them off those trees.
+    # A view's `<% cache key do %>` reads and writes its fragment through
+    # these two (`lower::view_to_library::walker`, `emit_cached_fragment`):
+    # `nil` from the read is a miss, and the write answers what it stored.
+    # This shared form is the runtime's own store; the ruby family and
+    # spinel reopen both (runtime/action_controller_fragment_caching.rb)
+    # to go through the controller as Rails' CacheHelper does —
+    # `perform_caching`, `combined_fragment_cache_key`, `cache_store`.
+    def self.fragment_read(key)
+      Rails.cache.read_str(key)
+    end
+
+    def self.fragment_write(key, value, ttl)
+      Rails.cache.write_str(key, value, ttl)
+    end
+
     def self.to_query(params)
       to_query_pairs(params, "")
     end
@@ -585,6 +600,7 @@ module ActionView
     # `authenticity_token` value is the form-field name; the token value
     # is empty here because spinel-blog doesn't sign sessions.
     def self.csrf_meta_tags
+      return "" if ActionController.forgery_switched_off
       %(<meta name="csrf-param" content="authenticity_token" />\n<meta name="csrf-token" content="#{html_escape(form_authenticity_token)}" />)
     end
 
@@ -863,6 +879,7 @@ module ActionView
       # on that lane). The explicit comparison is false for every
       # target's unset shape and for `false` alike.
       return "" if @broadcast_rendering == true
+      return "" if ActionController.forgery_switched_off
       %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
     end
 

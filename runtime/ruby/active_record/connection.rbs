@@ -19,7 +19,7 @@ module ActiveRecord
     @rows: Array[Hash[String, untyped]]
 
     def initialize: (Array[Hash[String, untyped]] rows) -> void
-    def rows: () -> Array[Hash[String, untyped]]
+    def rows: () -> Array[Array[untyped]]
     def to_a: () -> Array[Hash[String, untyped]]
     def first: () -> Hash[String, untyped]?
     def each: () { (Hash[String, untyped]) -> void } -> Array[Hash[String, untyped]]

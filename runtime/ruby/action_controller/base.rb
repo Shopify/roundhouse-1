@@ -22,6 +22,23 @@ module ActionController
     FORGERY_SLOT[0] = value
   end
 
+  # Whether an app turned forgery protection OFF, as Rails' generated
+  # config/environments/test.rb does (`allow_forgery_protection =
+  # false`). Rails' views then write no token: `form_with`, `button_to`
+  # and `csrf_meta_tags` all ask `protect_against_forgery?`. Its own
+  # slot, not `FORGERY_SLOT`'s false, because that false is also the
+  # default on a target with no token generator, whose forms keep the
+  # input as Rails' production forms do.
+  FORGERY_OFF_SLOT = [false]
+
+  def self.forgery_switched_off
+    FORGERY_OFF_SLOT[0] == true
+  end
+
+  def self.set_forgery_switched_off(value)
+    FORGERY_OFF_SLOT[0] = value
+  end
+
   # Empty until `authenticity_token.rb` reopens these: strict-target
   # emit of this file must not call `Current.session` or XOR bytes.
   # Strict targets therefore issue no token and check none (see
@@ -391,6 +408,7 @@ module ActionController
 
     def self.allow_forgery_protection=(value)
       ActionController.set_forgery_flag(value)
+      ActionController.set_forgery_switched_off(!value)
     end
 
     attr_accessor :params, :session, :flash, :request_method, :request_path, :request_format

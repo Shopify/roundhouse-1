@@ -1076,6 +1076,19 @@ pub fn insert_db_stub(
             Ty::Bool,
         ),
     );
+    // `ActiveRecord::Base.transaction`'s per-thread nesting depth
+    // (connection.rb) — boxed behind this accessor instead of a raw
+    // `Thread.current`/`Fiber[]` read so the body-typer resolves it
+    // concretely, same as every other Db call here. See the contract
+    // note in runtime/ruby/db.rbs.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth="),
+        fn_sig(vec![(Symbol::from("value"), Ty::Int)], Ty::Int),
+    );
     classes.insert(ClassId(Symbol::from("Db")), db_info);
 
     // MessageDigest — the keyed-digest primitive surface, same
@@ -1253,6 +1266,7 @@ pub(crate) fn insert_framework_stubs(
         "render",
         "time_ago_in_words",
         "number_to_human",
+        "number_to_human_size",
         "number_with_delimiter",
         "pluralize",
         "raw",
@@ -4367,25 +4381,16 @@ pub(crate) fn view_helpers_call(method: &str, args: Vec<Expr>) -> Expr {
     send(Some(recv), method, args, None, true)
 }
 
-/// `"#{Rails.application.protocol}#{Rails.application.domain}#{RouteHelpers.<stem>_path(args)}"`
-/// — the grounding for bare `<x>_url` absolute route helpers
-/// (RouteHelpers only generates `_path` functions; the convention
-/// matches `rewrite_url_helpers_absolute`'s host-kwarg form). Shared
-/// by the form-action resolver and the URL-position classifier. The
-/// scheme is the request's, as Rails' `url_for` takes it: a literal
-/// `http://` was mixed content on every https page behind a proxy.
-pub(super) fn absolute_url_interp(stem: &str, args: Vec<Expr>) -> Expr {
+/// `ActionView::ViewHelpers.url_for_path(RouteHelpers.<stem>_path(args))`
+/// — the grounding for bare `<x>_url` helpers in ERB views.
+/// `url_for_path` is the shared URL seam used by jbuilder too: Ruby-family
+/// views preserve `Rails.application.domain` overrides and normalize the
+/// scheme's standard port, while strict targets keep the path because
+/// their views have no request context. Shared by ERB helper rewriting,
+/// the form-action resolver, and the URL-position classifier.
+pub(crate) fn absolute_url_interp(stem: &str, args: Vec<Expr>) -> Expr {
     let path_call = route_helpers_call(&format!("{stem}_path"), args);
-    Expr::new(
-        Span::synthetic(),
-        ExprNode::StringInterp {
-            parts: vec![
-                InterpPart::Expr { expr: rails_application_call("protocol") },
-                InterpPart::Expr { expr: rails_application_call("domain") },
-                InterpPart::Expr { expr: path_call },
-            ],
-        },
-    )
+    view_helpers_call("url_for_path", vec![path_call])
 }
 
 /// `Rails.application.<method>` — the framework-default readers

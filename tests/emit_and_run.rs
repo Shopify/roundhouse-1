@@ -56,6 +56,12 @@ mod controller_super_ivars;
 mod assoc_pluck_typed;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
+#[path = "support/campfire_caches.rs"]
+mod campfire_caches_contract;
+#[path = "emit_and_run/campfire_caches.rs"]
+mod campfire_caches;
+#[path = "emit_and_run/action_text_markdown.rs"]
+mod action_text_markdown;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -1665,6 +1671,120 @@ puts "action_text markdown storage passed"
         .assert_passes();
 }
 
+/// The pinned Writebook Page tests exercise this exact behavior: a new
+/// Page's `markable` method returns the raw Markdown stored by `has_markdown`.
+/// Keep the source-shaped `ActionText::Markdown < Record` declaration here so
+/// the emitted model resolves the Action Text base against shared runtime code.
+#[test]
+fn writebook_page_markable_runs_against_emitted_markdown_runtime() {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "pages", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+  end
+
+  create_table "action_text_markdowns", force: :cascade do |t|
+    t.text "content", default: "", null: false
+    t.string "name", null: false
+    t.bigint "record_id", null: false
+    t.string "record_type", null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+  end
+end
+"#,
+        )
+        .write(
+            "lib/rails_ext/action_text_markdown.rb",
+            r#"module ActionText
+  class Markdown < Record
+    belongs_to :record, polymorphic: true
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/page.rb",
+            r#"class Page < ApplicationRecord
+  has_markdown :body
+
+  def markable
+    body.content.to_s
+  end
+end
+"#,
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .run_ruby(
+            r###"
+page = Page.new(body: "## Markdown Content\n\nWith **bold** text.")
+raise "raw markdown changed: #{page.markable.inspect}" unless page.markable == "## Markdown Content\n\nWith **bold** text."
+empty = Page.new(body: "")
+raise "empty markdown changed: #{empty.markable.inspect}" unless empty.markable == ""
+puts "Writebook Page markable behavior passed"
+"###,
+        )
+        .assert_passes();
+}
+
+/// A nested include file must load after the parent class is established,
+/// so its namespace can reopen the intended class rather than a placeholder.
+#[test]
+fn nested_included_module_loads_inside_its_parent_class() {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :action_text_markdowns do |t|\n    t.text :content\n  end\nend\n",
+        )
+        .write(
+            "app/models/action_text/markdown.rb",
+            r#"module ActionText
+  class Markdown < ApplicationRecord
+    include ActionText::Markdown::Uploads
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/action_text/markdown/uploads.rb",
+            r#"module ActionText
+  class Markdown < ApplicationRecord
+    module Uploads
+      def nested_upload_module_loaded?
+        true
+      end
+    end
+  end
+end
+"#,
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .run_ruby(r#"
+raise "nested module was not included" unless ActionText::Markdown.new.nested_upload_module_loaded?
+puts "nested include namespace passed"
+"#)
+        .assert_passes();
+}
+
 /// Named plain-text association (`has_markdown :body`): assign through
 /// the owner, autosave on save, reload scoped by owner/name. Abstract
 /// overlay — Writebook `Page#body` is extra fixture coverage only.
@@ -2902,6 +3022,8 @@ fn assert_cached_collection_probe(n: i64, second: i64) {
 Article.delete_all
 {n}.times {{ |i| Article.create!(title: "row-#{{i}}", body: "long enough body") }}
 rows = ActiveRecord::Relation.new(Article).to_a.sort_by {{ |a| a.title }}
+ActionController::Base.perform_caching = true
+ActionController::Current.controller = ActionController::Base.new
 Article.reset_render_count
 a = Views::Articles.probe(rows)
 raise "first #{{Article.render_count}}: #{{a}}" unless Article.render_count == {n}
@@ -10889,6 +11011,364 @@ begin
   raise "a bare String fragment passed the column check"
 rescue ArgumentError
 end
+"#)
+        .assert_passes();
+}
+
+/// A concern's `before_update -> { … }` lambda callback, Rails'
+/// `attachment_changes`, and commit callbacks that run after `after_save`
+/// — campfire's `Message::Searchable` reindexes a message whose file was
+/// replaced: the lambda notes `attachment_changes.key?("attachment")`,
+/// and the `after_update_commit` reads the NEW file's name, which only
+/// exists once the save's own `after_save` has attached it. The lambda
+/// was dropped from the concern, `attachment_changes` didn't exist, and
+/// the commit hooks fired before `after_save`.
+#[test]
+fn a_replaced_attachment_is_seen_by_the_commit_callback() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  include Tracked\n  has_one_attached :file\nend\n")
+        .write("app/models/doc/tracked.rb", r#"module Doc::Tracked
+  extend ActiveSupport::Concern
+
+  included do
+    before_update -> { @file_replaced = attachment_changes.key?("file") }
+    after_update_commit :note_file, if: :file_replaced?
+  end
+
+  def seen
+    @seen
+  end
+
+  private
+    def file_replaced?
+      @file_replaced
+    end
+
+    def note_file
+      @seen = file.filename.to_s
+    end
+end
+"#)
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+doc = Doc.create!(name: "first", file: upload.("a.txt"))
+doc.update!(name: "renamed")
+raise "a rename noted a file: #{doc.seen.inspect}" unless doc.seen.nil?
+doc.update!(file: upload.("b.txt"))
+raise "the commit callback saw #{doc.seen.inspect}" unless doc.seen == "b.txt"
+raise "the change outlived the save: #{doc.attachment_changes.inspect}" unless doc.attachment_changes.empty?
+"#)
+        .assert_passes();
+}
+
+/// Three things Rails' test environment does that campfire's tests lean
+/// on, given on the CRuby tree's test support:
+/// - `allow_forgery_protection = false` (Rails' generated test.rb) means
+///   forms carry no authenticity token, so a cached fragment and a fresh
+///   render of it are the same bytes (campfire's messages caching test);
+/// - `ActiveSupport::Notifications.subscribe(regexp)` hears the fragment
+///   cache's reads and writes, keys in Rails' shape, until unsubscribed;
+/// - `freeze_time` stops `Time.current` on the instant records are
+///   stamped with (campfire's user test compares the two).
+#[test]
+fn rails_test_environment_tokens_cache_events_and_clock() {
+    emit_and_run::real_blog()
+        .edit("app/views/articles/_article.html.erb", "<div id=\"<%= dom_id(article) %>\"", "<% cache article do %>\n<div id=\"<%= dom_id(article) %>\"")
+        .edit("app/views/articles/_article.html.erb", "  </div>\n</div>\n", "  </div>\n</div>\n<% end %>\n")
+        .write(
+            "test/controllers/test_environments_controller_test.rb",
+            r#"require "test_helper"
+
+class TestEnvironmentsControllerTest < ActionDispatch::IntegrationTest
+  test "forms carry no token while forgery protection is off" do
+    get new_article_url
+    assert_select "form"
+    assert_select "input[name='authenticity_token']", count: 0
+    get articles_url
+    assert_select "form.button_to"
+    assert_select "input[name='authenticity_token']", count: 0
+  end
+
+  test "a subscriber hears fragment cache reads and writes until it unsubscribes" do
+    keys = []
+    subscriber = ActiveSupport::Notifications.subscribe(/\Acache_(read|write)\.active_support\z/) do |*, payload|
+      keys << payload[:key]
+    end
+    previous_caching = ActionController::Base.perform_caching
+    ActionController::Base.perform_caching = true
+    begin
+      get articles_url
+      assert keys.any? { |key| key.include?("articles/_article/articles/") }, keys.inspect
+      heard = keys.size
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+      get articles_url
+      assert_equal heard, keys.size
+    ensure
+      ActionController::Base.perform_caching = previous_caching
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+  end
+
+  test "freeze_time stops Time.current on the instant records are stamped with" do
+    freeze_time
+    article = Article.create!(title: "Frozen", body: "A sufficiently long article body.")
+    assert_equal Time.current, article.created_at
+    assert_equal Time.current, Article.find(article.id).updated_at
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/test_environments_controller_test.rb")
+        .assert_passes();
+}
+
+/// A Duration handed to the stdlib as a timeout, and `Timeout.timeout`
+/// answering its block's value — campfire's unfurl (`DEADLINE =
+/// 10.seconds` around the fetch, `open_timeout: 7.seconds` into
+/// `Net::HTTP.start`). The Duration did no arithmetic, so
+/// `TCPSocket.new(connect_timeout:)` could not convert it and every fetch failed;
+/// and `Timeout.timeout { record }` typed Untyped, so `render json:`
+/// wrote the record's `inspect` instead of its JSON.
+#[test]
+fn a_duration_times_out_the_stdlib_and_a_timed_block_keeps_its_type() {
+    emit_and_run::real_blog()
+        .edit("config/routes.rb", "  resources :articles do\n", "  get \"/timed/:id\", to: \"articles#timed\"\n  get \"/twice\", to: \"articles#twice\"\n  resources :articles do\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", r#"class ArticlesController < ApplicationController
+  LIMIT = 2.seconds
+
+  def timed
+    card = Timeout.timeout(LIMIT) { Card.new(title: Article.find(params[:id]).title) }
+    render json: card
+  end
+
+  def twice
+    first = Article.first
+    again = Article.first
+    render plain: (first.id == again.id).to_s
+  end
+
+"#)
+        .write("app/models/card.rb", "class Card\n  include ActiveModel::Model\n\n  attr_accessor :title\nend\n")
+        .write(
+            "test/controllers/timed_articles_controller_test.rb",
+            r#"require "test_helper"
+
+require "active_record/testing/query_assertions"
+
+class TimedArticlesControllerTest < ActionDispatch::IntegrationTest
+  include ActiveRecord::Assertions::QueryAssertions
+
+  test "a request replays an identical query, as Rails' query cache does" do
+    assert_queries_count(1) { get "/twice" }
+    assert_equal "true", response.body
+    assert_queries_count(2) { Article.first; Article.first }
+  end
+
+  test "the timed lookup renders the model's JSON" do
+    article = articles(:one)
+    get "/timed/#{article.id}"
+    assert_response :success
+    assert_equal article.title, JSON.parse(response.body)["title"]
+  end
+
+  test "duration works with socket and stdlib timeout APIs" do
+    server = TCPServer.new("127.0.0.1", 0)
+    socket = TCPSocket.new("127.0.0.1", server.addr[1], connect_timeout: 1.second)
+    socket.close
+    server.close
+    assert_nil IO.select(nil, nil, nil, 0.01.seconds)
+    assert_equal :ok, Timeout.timeout(1.second) { :ok }
+    http = Net::HTTP.new("127.0.0.1", 80)
+    http.open_timeout = 1.second
+    assert_equal 1.0, http.open_timeout
+    assert_equal 1.5, (2.seconds - 0.5).to_f
+    assert_equal 1.5, (2.seconds - 0.5.seconds).to_f
+    assert_operator 1.second, :<, 2
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/timed_articles_controller_test.rb")
+        .assert_passes();
+}
+
+/// Destroying a record takes its attachments with it, as `dependent:`
+/// says: Rails' default `:purge_later` deletes the join row and purges
+/// the blob in an `ActiveStorage::PurgeJob` (run inline here, with no
+/// queue adapter), and `dependent: false` leaves both. Without it
+/// campfire's `Room#destroy_one_message_at_a_time` left every message's
+/// attachment row and file behind.
+#[test]
+fn destroying_an_owner_purges_its_attachments_as_dependent_says() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", "class Doc < ApplicationRecord\n  has_one_attached :file\n  has_one_attached :keep, dependent: false\nend\n")
+        .run_ruby(r#"
+upload = ->(name) { { io: StringIO.new("bytes"), filename: name, content_type: "text/plain" } }
+count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT count(*) FROM #{table}") }
+doc = Doc.create!(name: "first", file: upload.("a.txt"), keep: upload.("b.txt"))
+raise "attached #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 2
+doc.destroy
+raise "rows left: #{count.("active_storage_attachments")}" unless count.("active_storage_attachments") == 1
+raise "blobs left: #{count.("active_storage_blobs")}" unless count.("active_storage_blobs") == 1
+raise "PurgeJob not recorded" unless ActiveJob.performed.include?("ActiveStorage::PurgeJob")
+"#)
+        .assert_passes();
+}
+
+/// Fixtures load the way Rails' `insert_fixtures_set` loads them: raw
+/// rows, no validations and no callbacks. A callback that raises would
+/// abort the load if it ran; campfire's Message `after_create_commit`
+/// marked memberships unread at load time, so the fixture users began
+/// with unread rooms Rails never gives them.
+#[test]
+fn fixture_rows_load_without_running_callbacks() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", "class Comment < ApplicationRecord\n  before_save { raise \"a callback ran for a fixture row\" }\n  after_create_commit { raise \"a commit callback ran for a fixture row\" }\n")
+        .write(
+            "test/models/fixture_load_test.rb",
+            r#"require "test_helper"
+
+class FixtureLoadTest < ActiveSupport::TestCase
+  test "every comment fixture is in the table, stamped" do
+    assert_operator Comment.count, :>, 0
+    assert Comment.all.all? { |comment| comment.created_at && comment.updated_at }
+  end
+end
+"#,
+        )
+        .run_test("test/models/fixture_load_test.rb")
+        .assert_passes();
+}
+
+/// `owner.assoc.create!(attributes)` in a test, with the attributes in a
+/// local: the test-side association rewrite kept only a LITERAL hash and
+/// replaced anything else with the foreign key alone, so campfire's
+/// `rooms(:pets).messages.create!(attributes)` saved a message with no
+/// creator ("Validation failed: Creator must exist"). The value now
+/// merges the key in, and the association's key wins over the caller's,
+/// as in Rails.
+#[test]
+fn an_association_create_keeps_attributes_held_in_a_local() {
+    emit_and_run::real_blog()
+        .write(
+            "test/models/assoc_create_test.rb",
+            r#"require "test_helper"
+
+class AssocCreateTest < ActiveSupport::TestCase
+  test "attributes in a local reach the record" do
+    attributes = { commenter: "Reader", body: "Comment body" }
+    comment = articles(:one).comments.create!(attributes)
+    assert_equal "Reader", comment.commenter
+    assert_equal articles(:one).id, comment.article_id
+  end
+
+  test "the association's key wins over the caller's" do
+    comment = articles(:one).comments.create!(commenter: "Lit", body: "Literal body", article_id: articles(:two).id)
+    assert_equal articles(:one).id, comment.article_id
+  end
+end
+"#,
+        )
+        .run_test("test/models/assoc_create_test.rb")
+        .assert_passes();
+}
+
+/// Active Storage's "was it made?" questions, as campfire's
+/// presentation asks them so a view never makes a preview: a variant is
+/// `processed?` once its record exists, and its `image` is that record's
+/// (both looked up, not made — asked of a file that cannot be decoded,
+/// `image` used to raise the decode error again);
+/// `preview(:poster)` names a variant the owner's `has_one_attached`
+/// block declares; and `url_for` of a Preview held in a typed local is
+/// the preview's representation URL, not the object.
+#[test]
+fn a_variant_is_processed_once_its_record_exists_and_a_preview_resolves_its_name() {
+    header_values_app()
+        .edit("db/schema.rb", "\nend\n", r#"
+  create_table "active_storage_variant_records", force: :cascade do |t|
+    t.bigint "blob_id", null: false
+    t.string "variation_digest", null: false
+  end
+end
+"#)
+        .write("app/models/doc.rb", r#"class Doc < ApplicationRecord
+  has_one_attached :file do |attachable|
+    attachable.variant :thumb, resize_to_limit: [ 10, 10 ]
+    attachable.variant :poster, format: :webp, resize_to_limit: [ 10, 10 ]
+  end
+
+  def poster_url
+    poster = file.preview(:poster)
+    ActionView::ViewHelpers.url_for(poster)
+  end
+end
+"#)
+        .run_ruby(r#"
+doc = Doc.create!(name: "first", file: { io: StringIO.new("bytes"), filename: "a.mov", content_type: "video/quicktime" })
+thumb = doc.file.representation(:thumb)
+raise "processed before any record" if thumb.processed?
+raise "image made a variant of bytes that are no image" unless thumb.image.nil?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 0
+image = ActiveStorage::Blob.create_and_upload!("png", "a.png", "image/png")
+connection = ActiveRecord::Base.connection
+connection.execute("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (#{doc.file.blob.id}, '#{thumb.variation.digest}')")
+record_id = connection.select_value("SELECT max(id) FROM active_storage_variant_records")
+connection.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES ('image', 'ActiveStorage::VariantRecord', #{record_id}, #{image.id}, '2026-01-01')")
+raise "not processed once its record exists" unless doc.file.representation(:thumb).processed?
+raise "variant records: #{ActiveStorage::VariantRecord.count}" unless ActiveStorage::VariantRecord.count == 1
+raise "no image once its record exists" if doc.file.representation(:thumb).image.nil?
+preview = doc.file.preview(:poster)
+raise "preview named #{preview.variation&.name.inspect}" unless preview.variation.name == "poster"
+url = doc.poster_url
+raise "url_for(preview) answered #{url.inspect}" unless url.is_a?(String) && url.include?("/representations/")
+"#)
+        .assert_passes();
+}
+
+/// `insert_all!` and `insert_all` are one raw INSERT per row in Rails:
+/// no validations, no callbacks, timestamps filled. `insert_all!`
+/// raises on a duplicate and answers an `ActiveRecord::Result` of the
+/// RETURNING columns, whose `rows` are Arrays of values (campfire's
+/// search test reads new ids with `.rows.flatten`); `insert_all` skips
+/// a duplicate. Both used to run the save callbacks, and `insert_all!`
+/// was undefined.
+#[test]
+fn bulk_inserts_skip_callbacks_and_insert_all_bang_returns_its_rows() {
+    emit_and_run::real_blog()
+        .edit("app/models/comment.rb", "class Comment < ApplicationRecord\n", r#"class Comment < ApplicationRecord
+  after_create_commit { raise "a callback ran for a bulk insert" }
+
+  def self.bulk_ids(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all!(rows, returning: %w[ id commenter ]).rows
+  end
+
+  def self.bulk_skipping(article, names)
+    rows = names.map { |name| { article_id: article.id, commenter: name, body: "Bulk body" } }
+    Comment.insert_all(rows)
+  end
+"#)
+        .run_ruby(r#"
+article = Article.create!(title: "Bulk", body: "A sufficiently long article body.")
+rows = Comment.bulk_ids(article, ["a", "b"])
+raise "rows #{rows.inspect}" unless rows.map(&:last) == ["a", "b"] && rows.all? { |r| r.first.is_a?(Integer) }
+raise "timestamps" unless Comment.where(article_id: article.id).all? { |c| c.created_at && c.updated_at }
+Comment.bulk_skipping(article, ["c"])
+raise "count #{Comment.where(article_id: article.id).count}" unless Comment.where(article_id: article.id).count == 3
 "#)
         .assert_passes();
 }

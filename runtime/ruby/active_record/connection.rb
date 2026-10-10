@@ -205,8 +205,11 @@ module ActiveRecord
       @rows = rows
     end
 
+    # Rails' shape: each row an Array of its values, in column order
+    # (`to_a` is the hashes). campfire reads ids an `insert_all!`
+    # returned with `.rows.flatten`.
     def rows
-      @rows
+      @rows.map { |row| row.values }
     end
 
     def to_a
@@ -538,26 +541,79 @@ module ActiveRecord
     end
 
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with
-    # ROLLBACK + re-raise on any exception. Flat transactions only: the
-    # corpus never nests (a nested BEGIN would error in SQLite rather
-    # than silently join, which is the honest failure).
+    # ROLLBACK + re-raise on any exception. A nested call JOINS the
+    # outer transaction, as Rails' default (`requires_new: false`) does:
+    # no BEGIN of its own, and an exception from it rolls back the whole
+    # outer transaction when it reaches the outer block. The depth is
+    # per thread, like the connection the transaction runs on.
     #
     # `isolation:`, `requires_new:`, and `joinable:` are Rails'
     # `DatabaseStatements#transaction` keyword options (the same three
     # `with_lock` forwards — see base.rb). All three are accepted and
-    # ignored: no isolation levels, and no SAVEPOINT-backed nesting
-    # under this flat implementation. They exist on the signature so a
-    # call that passes them (directly, or via `with_lock`) doesn't
-    # raise `ArgumentError`.
+    # ignored: no isolation levels, and no SAVEPOINT-backed `requires_new:`
+    # under this joined-by-default implementation. They exist on the
+    # signature so a call that passes them (directly, or via `with_lock`)
+    # doesn't raise `ArgumentError`.
+    #
+    # The depth reset on an exception is explicit, in the `rescue`
+    # itself, rather than left to the `ensure` below: Spinel
+    # (matz/spinel#8182) skips a `begin/rescue/ensure`'s ensure when the
+    # exception leaves through the rescue (re-raised) or matches no
+    # rescue, and a depth left at 1 turns every later transaction on the
+    # thread into a "nested" one with no BEGIN — writes that a ROLLBACK
+    # then cannot undo. The `ensure` still carries the SAME reset (CRuby
+    # runs both; harmless, since both set the identical value) because a
+    # non-local exit from the block — `return`/`break`/`next` out of
+    # `transaction { ... }` — never reaches `rescue` at all, only
+    # `ensure`. As Rails does, a non-local exit (no exception) COMMITS
+    # the outermost transaction rather than rolling it back; `rolled_back`
+    # tells `ensure` which happened so the two paths can't double-apply.
+    #
+    # The depth itself reads/writes through `Db._txn_depth`/`=` (see
+    # runtime/ruby/db.rbs) rather than `Thread.current` directly: a raw
+    # `Thread.current[:k]` read has no declared return type for this
+    # narrow RBS-only probe (unlike the full pipeline's stdlib model),
+    # so it type-checked as the unresolved `Var` here, not the honest
+    # gradual `Untyped` — `Db`'s own contract keeps this method
+    # concretely typed the same way its `Db.exec` calls already are.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
-      Db.exec("BEGIN")
-      begin
-        result = yield
-        Db.exec("COMMIT")
-        result
-      rescue => e
-        Db.exec("ROLLBACK")
-        raise e
+      depth = Db._txn_depth
+      if depth > 0
+        Db._txn_depth = depth + 1
+        begin
+          result = yield
+        rescue Exception => e
+          Db._txn_depth = depth
+          raise e
+        ensure
+          Db._txn_depth = depth
+        end
+      else
+        Db.exec("BEGIN")
+        Db._txn_depth = 1
+        rolled_back = false
+        begin
+          result = yield
+        rescue Exception => e
+          rolled_back = true
+          Db._txn_depth = 0
+          begin
+            Db.exec("ROLLBACK")
+          rescue StandardError
+            # SQLite may already have ended the transaction itself (a
+            # constraint violation it resolves by aborting the whole
+            # transaction, not just the statement, does this) — the
+            # ROLLBACK's own failure must not hide the real error below.
+          end
+          raise e
+        ensure
+          if rolled_back
+            nil
+          else
+            Db._txn_depth = 0
+            Db.exec("COMMIT")
+          end
+        end
       end
     end
 

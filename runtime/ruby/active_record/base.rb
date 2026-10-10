@@ -318,6 +318,14 @@ module ActiveRecord
       []
     end
 
+    def self.schema_boolean_columns
+      []
+    end
+
+    def self.schema_decimal_columns
+      []
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end
@@ -814,6 +822,22 @@ module ActiveRecord
       @_trigger_destroy_callback
     end
 
+    # A row inserted raw, as Rails' fixture loader (`insert_fixtures_set`)
+    # and bulk inserts (`insert_all` / `insert_all!`) write one: no
+    # validations and NO CALLBACKS. Timestamps the attributes left out
+    # are filled, as Rails fills them. Running the save
+    # callbacks here was wrong in a way a test can see: campfire's
+    # Message `after_create_commit` marks the room's memberships unread,
+    # so loading the message fixtures left the fixture users with unread
+    # rooms Rails never gives them.
+    def _insert_row
+      fill_timestamps(true)
+      self.id = _adapter_insert
+      @persisted = true
+      _note_hydrated
+      true
+    end
+
     # ---- Saved-change tracking (ActiveModel::Dirty subset) ----------
     # Rails exposes what the last save changed via `saved_changes` /
     # `id_previously_changed?` / the per-attribute predicates the
@@ -953,6 +977,17 @@ module ActiveRecord
     def attribute_changed?(name)
       changes = changes_to_save
       changes.key?(name)
+    end
+
+    # Rails' `changed?` / `has_changes_to_save?`: any column pending.
+    # campfire's `RecordCache` snapshots only records with none.
+    def changed?
+      changes = changes_to_save
+      !changes.empty?
+    end
+
+    def has_changes_to_save?
+      changed?
     end
 
     def attribute_was(name)

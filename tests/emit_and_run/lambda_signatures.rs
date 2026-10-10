@@ -39,12 +39,28 @@ fn a_block_callback_with_keyword_parameters_is_not_spliced_unbound() {
     let (tree, errors) = app().emit(roundhouse::project::BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let model = std::fs::read_to_string(tree.join("app/models/article.rb")).unwrap();
-    let bind = model.find("key = 7").unwrap_or_else(|| panic!("{model}"));
-    assert!(bind < model.find("#{key}").unwrap(), "{model}");
+    // The bound name is a fresh local (folded callbacks keep their own).
+    let bind = model.find(" = 7\n").unwrap_or_else(|| panic!("{model}"));
+    let body = model.find("self.body = \"#{self.body} ").unwrap_or_else(|| panic!("{model}"));
+    assert!(bind < body, "{model}");
     app()
         .run_ruby(
             "a = Article.create!(title: \"One\", body: \"A sufficiently long body.\")\nraise \"body: #{a.body}\" unless a.body == \"A sufficiently long body. 7 0\"\nputs \"ok\"\n",
         )
+        .assert_passes();
+}
+
+/// Folding callbacks into one hook must not make nested lambdas from
+/// different callbacks capture the same generated default local.
+#[test]
+fn callbacks_keep_distinct_captured_default_locals() {
+    super::emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  before_save { |a: \"first\", key: a| @callback = -> { key } }\n  before_save { |key: \"second\"| self.body = @callback.call }\n",
+        )
+        .run_ruby("article = Article.create!(title: \"T\", body: \"long enough body\")\nraise \"expected first callback's captured value, got #{article.body.inspect}\" unless article.body == \"first\"\nputs \"ok\"\n")
         .assert_passes();
 }
 
@@ -101,5 +117,20 @@ end
 "##,
         )
         .run_test("test/controllers/shouts_controller_test.rb")
+        .assert_passes();
+}
+
+/// A destructured parameter beside an optional one: the destructuring
+/// binds through a temp (`destructure_block_params`) and the default
+/// stays in the signature, in a `->` literal and in a block alike.
+#[test]
+fn a_destructured_parameter_beside_a_default_runs() {
+    super::emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.destructured_defaults\n    pair = ->((a, b), scale = 10) { (a.to_i + b.to_i) * scale.to_i }\n    [pair.call([1, 2]), pair.call([1, 2], 2), [[3, 4]].map { |(a, b), bonus = 1| a.to_i * b.to_i + bonus.to_i }.sum].join(\"|\")\n  end\n",
+        )
+        .run_ruby("got = Article.destructured_defaults\nraise \"expected 30|6|4, got #{got}\" unless got == \"30|6|4\"\nputs \"ok\"\n")
         .assert_passes();
 }

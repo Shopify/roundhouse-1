@@ -177,6 +177,28 @@ module ActionView
       format("%.#{precision}f", value.to_f)
     end
 
+    # `number_to_human_size(1234)` → "1.21 KB" — Rails'
+    # NumberToHumanSizeConverter with its defaults: powers of 1024, three
+    # significant digits, insignificant zeros stripped, and the byte
+    # count itself below one KB ("1 Byte", "123 Bytes"). campfire's
+    # `active_storage/blobs/_blob` shows a file's size with it.
+    def self.number_to_human_size(value)
+      number = value.to_f
+      bytes = number.to_i
+      return bytes.to_s + (bytes == 1 ? " Byte" : " Bytes") if bytes < 1024
+      units = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"]
+      exp = (Math.log(number) / Math.log(1024)).to_i
+      exp = units.length - 1 if exp > units.length - 1
+      human = number / (1024.0**exp)
+      multiplier = 10.0**((Math.log10(human) + 1).floor - 3)
+      rounded = (human / multiplier).round * multiplier
+      precision = 3 - (Math.log10(rounded) + 1).floor
+      precision = 0 if precision < 0
+      text = format("%.#{precision}f", rounded)
+      text = text.sub(/0+\z/, "").sub(/\.\z/, "") if text.include?(".")
+      text + " " + units[exp]
+    end
+
     # `number_to_human(5, format: "%n%u")` → "5"; `number_to_human(1500)`
     # → "1 Thousand". Rails scales by powers of 1000 with a unit label.
     # lobsters' `upvoter_score` passes a small INTEGER score + format

@@ -15,6 +15,14 @@ module SqlAdapterQueries
     Db.changes
   end
 
+  # Quote one schema-validated SQL identifier (not a value) — Rails'
+  # `connection.quote_column_name`, which relation extrema project with.
+  # Always double-quoted, as both SQLite's and PostgreSQL's adapters do
+  # (`quote_identifier` leaves SQLite names bare, and `order` is a keyword).
+  def quote_column_name(name)
+    "\"" + name.to_s.gsub("\"", "\"\"") + "\""
+  end
+
   def all(table)
     select_rows("SELECT * FROM #{quote_identifier(table)}")
   end

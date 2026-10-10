@@ -1,8 +1,10 @@
 module ActiveSupport
   module JSON
-    def self.encode: (Hash[untyped, untyped] value) -> String
-    def self.encode_scalar: (untyped item) -> String
+    def self.encode: (untyped value) -> String
+    def self.decode: (String text) -> untyped
+    def self.jsonable: (untyped value) -> untyped
   end
+  def self.deep_dup: (untyped value) -> untyped
   def self.blank?: (untyped value) -> bool
 
   def self.present?: (untyped value) -> bool

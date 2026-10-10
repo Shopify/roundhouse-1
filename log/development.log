@@ -17,3 +17,98 @@ Dalli::Server#connect 127.0.0.1:32793
 Dalli::Server#connect 127.0.0.1:32793
 Dalli::Server#connect 127.0.0.1:32793
 Dalli::Server#connect 127.0.0.1:32793
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 0) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 1) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+127.0.0.1:1 is down
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+Dalli::Server#connect 127.0.0.1:42349
+Dalli::Server#connect 127.0.0.1:42349
+Dalli::Server#connect 127.0.0.1:42349
+Dalli::Server#connect 127.0.0.1:42349
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 0) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 1) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+127.0.0.1:1 is down
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.997 seconds left)
+Dalli::Server#connect 127.0.0.1:36979
+Dalli::Server#connect 127.0.0.1:36979
+Dalli::Server#connect 127.0.0.1:36979
+Dalli::Server#connect 127.0.0.1:36979
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 0) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 1) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+127.0.0.1:1 is down
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+Dalli::Server#connect 127.0.0.1:34053
+Dalli::Server#connect 127.0.0.1:34053
+Dalli::Server#connect 127.0.0.1:34053
+Dalli::Server#connect 127.0.0.1:34053
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 0) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 1) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+127.0.0.1:1 is down
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+Dalli::Server#connect 127.0.0.1:37239
+Dalli::Server#connect 127.0.0.1:37239
+Dalli::Server#connect 127.0.0.1:37239
+Dalli::Server#connect 127.0.0.1:37239
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 0) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+Dalli::Server#connect 127.0.0.1:1
+127.0.0.1:1 failed (count: 1) Errno::ECONNREFUSED: Connection refused - connect(2) for "127.0.0.1" port 1
+127.0.0.1:1 is down
+down_retry_delay not reached for 127.0.0.1:1 (30.000 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.999 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+down_retry_delay not reached for 127.0.0.1:1 (29.998 seconds left)
+Dalli::Server#connect 127.0.0.1:36977
+Dalli::Server#connect 127.0.0.1:36977
+Dalli::Server#connect 127.0.0.1:36977
+Dalli::Server#connect 127.0.0.1:36977

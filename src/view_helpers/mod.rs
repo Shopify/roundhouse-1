@@ -61,6 +61,7 @@ pub(crate) const QUALIFIED: &[&str] = &[
     "number_with_precision",
     "number_with_delimiter",
     "number_to_human",
+    "number_to_human_size",
     "content_security_policy_nonce",
     "class_names",
     "label_tag",

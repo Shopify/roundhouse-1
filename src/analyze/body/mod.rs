@@ -2707,6 +2707,14 @@ impl<'a> BodyTyper<'a> {
                 ) {
                     return t;
                 }
+                if let Some(t) = self.relation_extreme_ty(
+                    recv.as_ref(),
+                    recv_ty.as_ref(),
+                    method,
+                    args,
+                ) {
+                    return t;
+                }
                 if let Some(t) =
                     self.column_attribute_access_ty(recv_ty.as_ref(), method, args)
                 {
@@ -6719,6 +6727,13 @@ mod tests {
             Ty::Union { variants: vec![Ty::Int, Ty::Var { var: TyVar(4) }] },
             Ty::Union { variants: vec![Ty::Untyped, Ty::Nil] },
             Ty::Union { variants: vec![Ty::Var { var: TyVar(5) }, Ty::Nil] },
+            Ty::Union { variants: vec![Ty::Var { var: TyVar(6) }, Ty::Untyped, Ty::Nil] },
+            Ty::Union {
+                variants: vec![
+                    Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+                    Ty::Nil,
+                ],
+            },
         ]);
         let mut out: Vec<Ty> = Vec::new();
         for t in raw {
@@ -6748,6 +6763,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn param_slot_join_is_a_lattice_join() {
+        check_carried_slot_join_laws("unify_param_ty", crate::analyze::unify_param_ty);
+    }
+
+    /// Two pending observations: the result must not depend on which
+    /// one arrived first (it kept the later one).
+    #[test]
+    fn param_slot_join_of_two_pending_values_commutes() {
+        let (v1, v2) = (Ty::Var { var: TyVar(1) }, Ty::Var { var: TyVar(2) });
+        let join = crate::analyze::unify_param_ty;
+        assert_eq!(join(v1.clone(), v2.clone()), join(v2, v1));
+    }
+
+    /// An `untyped` arm inside a union is classified like a bare
+    /// `untyped`, so the answer doesn't depend on whether a producer
+    /// joined `Int` and `Str` first.
+    #[test]
+    fn param_slot_join_classifies_untyped_arms_inside_unions() {
+        let join = crate::analyze::unify_param_ty;
+        let str_or_untyped = Ty::Union { variants: vec![Ty::Str, Ty::Untyped] };
+        assert_eq!(
+            join(Ty::Int, str_or_untyped),
+            join(join(Ty::Int, Ty::Str), Ty::Untyped),
+        );
+    }
+
+    /// `nil` alone doesn't absorb `untyped` (#617, rule (a)): a nil
+    /// observation beside an untyped one is no evidence the parameter
+    /// is always nil. A non-nil concrete type still absorbs it.
+    #[test]
+    fn param_slot_join_keeps_untyped_beside_nil_alone() {
+        let join = crate::analyze::unify_param_ty;
+        let nil_or_untyped = Ty::Union { variants: vec![Ty::Untyped, Ty::Nil] };
+        assert_eq!(join(Ty::Nil, Ty::Untyped), nil_or_untyped);
+        assert_eq!(join(Ty::Untyped, Ty::Nil), nil_or_untyped);
+        let str_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+        assert_eq!(join(nil_or_untyped.clone(), Ty::Str), str_or_nil);
+        assert_eq!(join(Ty::Str, nil_or_untyped), str_or_nil);
+    }
+
+    /// A parameter observed as `{}` at one call site and as a filled
+    /// Hash at another is that Hash, as for an ivar.
+    #[test]
+    fn param_slot_join_drops_pending_inside_hash_spines() {
+        let filled = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Int) };
+        assert_eq!(crate::analyze::unify_param_ty(empty_hash(), filled.clone()), filled);
     }
 
     #[test]
