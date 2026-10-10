@@ -6281,10 +6281,16 @@ pub fn ingest_concern_class_method_spans(
                 // `included do def self.x … end end` is class_eval'd on
                 // the includer: `x` is ITS class method, which
                 // `walk_decl_body` keeps on the concern for this splice.
+                // So is a `def` in its `class << self`.
                 if let Some(body) = visibility::included_block_with_defs(&call).and_then(|b| b.body()) {
                     for inner in flatten_statements(body) {
                         if let Some(def) = visibility::definition(&inner) {
                             if def.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+                                spans.push(super::util::def_name_span(&def, file));
+                            }
+                        }
+                        for def in visibility::included_singleton_definitions(&inner).into_iter().flatten() {
+                            if def.receiver().is_none() {
                                 spans.push(super::util::def_name_span(&def, file));
                             }
                         }
@@ -6887,6 +6893,11 @@ fn ingest_concern_hook_items(
             };
             for inner in stmts {
                 if class_side.as_ref().is_some_and(|c| c.consumed.contains(&inner.location().start_offset())) {
+                    continue;
+                }
+                // `class << self` of defs: the includer's class methods,
+                // which `walk_decl_body` keeps for the concern splice.
+                if hook == "included" && visibility::included_singleton_definitions(&inner).is_some() {
                     continue;
                 }
                 // `enum` inside `included do` belongs to every includer
