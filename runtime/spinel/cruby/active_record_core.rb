@@ -445,6 +445,13 @@ module ActiveRecord
         false
       end
 
+      # Rails' AssociationReflection#through_reflection: nil, as only a
+      # ThroughReflection reaches through another association (Core's
+      # DisconnectedFixtureSet.collection_fixture_names branches on it).
+      def through_reflection
+        nil
+      end
+
       def polymorphic?
         options[:polymorphic]
       end
@@ -614,6 +621,30 @@ module ActiveRecord
 
       def foreign_type
         source_reflection.foreign_type
+      end
+    end
+  end
+
+  module Associations
+    # Rails' Association#reflection (`attr_reader :reflection`): the
+    # reflection of the association the object stands for, here the one
+    # the owner's class answers for its name (`reflect_on_association`,
+    # emit::ruby::library::apply_association_reflections). Core's
+    # Customers::CustomerActiveRecord.has_many_association? asks
+    # `association.reflection.through_reflection?`.
+    class Association
+      def reflection
+        klass = @owner.class
+        unless klass.respond_to?(:reflect_on_association)
+          raise NotImplementedError, "roundhouse: #{klass.name}#association(:#{@name}).reflection: " \
+            "#{klass.name} answers no reflections (reflect_on_association is emitted where the app calls it)"
+        end
+        reflection = klass.reflect_on_association(@name)
+        if reflection.nil?
+          raise NotImplementedError, "roundhouse: #{klass.name}#association(:#{@name}).reflection: " \
+            "#{klass.name}.reflect_on_association(:#{@name}) answers no reflection"
+        end
+        reflection
       end
     end
   end

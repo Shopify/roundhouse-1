@@ -1942,24 +1942,38 @@ module ActiveRecord
     # `Rooms::Direct.find_or_create_for` does exactly that: `find_for`
     # plucks the user ids, then hands the SAME relation to `grant_to`,
     # which built memberships for user 0.
-    def pluck(col)
+    #
+    # Rails' `pluck(*column_names)`: one column answers its values, two
+    # or more answer one Array per row in the order named
+    # (`pluck(:id, :root_inventory_group_id).to_h`, Core's
+    # MigratedNamedQuantityInitializer).
+    def pluck(*cols)
+      if cols.length == 0
+        raise NotImplementedError, "roundhouse: #{@model}.pluck with no column names is not ported"
+      end
       prior = @select_sql
       # A column with a declared type reads through it, as Rails' does; an
       # alias names its column.
-      name = @model._attribute_name(col.to_s)
-      @select_sql = "#{@table}.#{name} AS v"
+      names = cols.map { |col| @model._attribute_name(col.to_s) }
+      @select_sql = names.each_with_index.map { |name, i| "#{@table}.#{name} AS v#{i}" }.join(", ")
       rows = ActiveRecord.adapter.select_rows(to_sql)
       @select_sql = prior
-      rows.map { |row| @model._attribute_deserialize(name, row["v"]) }
+      if names.length == 1
+        name = names[0]
+        return rows.map { |row| @model._attribute_deserialize(name, row["v0"]) }
+      end
+      rows.map do |row|
+        names.each_with_index.map { |name, i| @model._attribute_deserialize(name, row["v#{i}"]) }
+      end
     end
 
     # `pick(col)` — Rails' `limit(1).pluck(col).first`: the single value
     # from the first row, or nil when the relation matches nothing.
     # Lobsters reads every Keystore counter through it.
-    def pick(col)
+    def pick(*cols)
       prior = @limit
       @limit = 1
-      rows = pluck(col)
+      rows = pluck(*cols)
       @limit = prior
       rows.length == 0 ? nil : rows[0]
     end

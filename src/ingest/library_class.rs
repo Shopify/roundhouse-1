@@ -554,10 +554,27 @@ fn program_items(
         // A constant before any guard rides on the file's first class
         // (`carry_file_constants`); after one, or in a branch, it is a
         // statement.
+        // A `NAME = Class.new(C)` or `A::B = Class.new(C)` there is a
+        // class with a file of its own (`class_new_declaration`), which
+        // the program loads where it stands, as a `class` statement.
+        // essentials' patches/active_record/granular_exceptions.rb writes
+        // `ActiveRecord::ReadOnlyServerError = Class.new(...)` above an
+        // `on_load`; its program loaded none of the six, and Core's
+        // `rescue ActiveRecord::ReadOnlyServerError` was a NameError.
         if (stmt.as_constant_write_node().is_some() || file_class_new_path_write(stmt).is_some())
             && !in_branch
             && !*guarded
         {
+            let class_new = match (stmt.as_constant_write_node(), file_class_new_path_write(stmt)) {
+                (_, Some((path, _))) => Some(path.join("::")),
+                (Some(write), None) if super::initializer_constants::is_class_new_declaration(&write.value()) => {
+                    Some(constant_id_str(&write.name()).to_string())
+                }
+                _ => None,
+            };
+            if let Some(name) = class_new.filter(|name| carried.contains(name.as_str())) {
+                out.push(ProgramItem::Declared(vec![ClassId(Symbol::from(name))]));
+            }
             continue;
         }
         // A Zeitwerk loader the file holds (`LOADER =` above, or a
