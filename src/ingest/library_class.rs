@@ -4383,6 +4383,22 @@ fn walk_decl_body_in<'pr>(
                             // Kept as an unknown call: the Ruby family
                             // replays it, the rest see a class body they
                             // cannot model.
+                            //
+                            // `include blocker` of a body local (Core's
+                            // MemcachedHelper includes the `TestAccessBlocker
+                            // < Module` instance it built and registered on
+                            // above) runs where it stands, after those
+                            // calls: a body statement (`body_statement`),
+                            // carried in source order or reported.
+                            if captures_statements
+                                && !default_visibility_nonpublic
+                                && !module_function_active
+                                && args.arguments().iter().any(|arg| arg.as_local_variable_read_node().is_some())
+                            {
+                                out.discarded.push(Discarded::of(&statement, "an include of a computed module"));
+                                out.unknown_calls.extend(body_statement(&statement, file));
+                                continue;
+                            }
                             if args.arguments().iter().any(|arg| {
                                 constant_path_of(&arg).is_none() && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                             }) {
