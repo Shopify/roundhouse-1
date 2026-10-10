@@ -9466,7 +9466,12 @@ fn unroll_literal_require_loops(files: &mut [(String, String)], app: &App) {
 /// podding/sorting_hat.rb program requires its children, and the
 /// namespace file a test initializer's reopen of `Podding::SortingHat`
 /// declares autoloads that program. File programs' source trees
-/// (models/roundhouse_files) are paths, not namespaces.
+/// (models/roundhouse_files) are paths, not namespaces. A namespace with
+/// no declarations file whose constant autoloads a file elsewhere
+/// (`autoloads_from`: hedwig's `Hedwig::Status::Track`, the status/track.rb
+/// program) requires that file first: hedwig's status/options.rb needs
+/// `Track::None` at load, and none.rb loaded first fired Track's
+/// autoload into a program that came back to base.rb.
 fn require_namespace_files_first(
     files: &mut [(String, String)],
     app: &App,
@@ -9579,13 +9584,19 @@ fn require_namespace_files_first(
                 // app/models/<a>/<b>/<c> => app/models/<a>, app/models/<a>/<b>
                 for n in 3..segments.len() {
                     let namespace = segments[..n].join("/");
-                    if !present.contains(&namespace)
-                        || before.contains(&namespace)
-                        || encloses(&namespace)
-                        || reaches(&edges, &namespace, &own)
-                    {
+                    // Without a declarations file, the file its constant
+                    // autoloads, if any.
+                    let file = if present.contains(&namespace) {
+                        namespace.clone()
+                    } else if let Some(target) = autoloads_from.get(&namespace).filter(|t| present.contains(*t)) {
+                        target.clone()
+                    } else {
+                        continue;
+                    };
+                    if before.contains(&file) || encloses(&namespace) || reaches(&edges, &file, &own) {
                         continue;
                     }
+                    let namespace = file;
                     let indent = &line[..line.len() - line.trim_start().len()];
                     let rel = relative_path(&dir, &namespace);
                     // Under the require's own guard: the namespace loads
@@ -10128,11 +10139,35 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # of the app sources the pattern matched, resolved when the tree was
   # emitted, and a named error for each matched source the tree does not
   # carry (it does not load, as the native glob would load it).
+  # Its `each` (essentials' `Dir[...].each { |file| require file }`) runs
+  # the block for every file and names one that raises,
+  # error[engine_glob_file_not_run], as boot names an initializer
+  # statement that cannot run: one patch the runtime cannot load yet
+  # (action_view_ext's ActionView::Helpers::AssetUrlHelper) left the 81
+  # after it unloaded, Syck::MergeKey among them, which Event's
+  # serializer constantizes at load.
+  class CarriedFiles < Array
+    def initialize(pattern, files)
+      super(files)
+      @pattern = pattern
+    end
+
+    def each
+      return to_enum(:each) unless block_given?
+      super do |file|
+        yield file
+      rescue StandardError, LoadError, NotImplementedError => e
+        $stderr.puts "roundhouse: error[engine_glob_file_not_run]: #{file} (matched by #{@pattern}) did not load: #{e.class}: #{e.message}"
+      end
+      self
+    end
+  end
+
   def self.carried_files(pattern, files, not_carried)
     not_carried.each do |source|
       $stderr.puts "roundhouse: error[engine_glob_file_not_carried]: #{source} matches #{pattern} in the source, but the tree carries no file for it; it was not loaded"
     end
-    files.map { |file| path(file) }
+    CarriedFiles.new(pattern, files.map { |file| path(file) })
   end
 
   # Register `mod`'s children: an autoload for each file, an implicit
