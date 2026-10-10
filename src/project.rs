@@ -15294,7 +15294,7 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
     // Denormalize#define_denormalized_foreign_key) builds its validators
     // on the port too.
     let validations = record_validations
-        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"])
+        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks"])
         || calls_runtime_validates(files);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [

@@ -894,6 +894,11 @@ pub(super) fn splice_into_library_includers(
         };
         let sti = !lc.is_module && below_model(lc);
         let mut accessors: Vec<&Expr> = Vec::new();
+        // The class-side names a carried statement gave the includer
+        // (an `extend`, the callbacks a `define_model_callbacks`
+        // defines), which a later statement of this or a later
+        // Concern's block calls, as Ruby runs them in order.
+        let mut gained: HashSet<String> = HashSet::default();
         for (root, concern) in &reached {
             let Some(items) = app.concern_model_items.get(concern) else { continue };
             let declared = super::class_attribute::declared_names(items);
@@ -963,6 +968,24 @@ pub(super) fn splice_into_library_includers(
                     }
                     continue;
                 }
+                // An `extend` of an app module or an ActiveModel port
+                // module (activeresource's `extend ActiveModel::Callbacks`):
+                // run on the includer as written, after the include.
+                if !job
+                    && !lc.is_module
+                    && hook.is_none()
+                    && let Some(surface) = extended_surface(item, concern, &defined, app)
+                {
+                    gained.extend(surface);
+                    let root_id = top(&lc.includes[*root]);
+                    let class_attributes: &[Symbol] = &declared;
+                    if let ModelBodyItem::Unknown { expr, .. } =
+                        super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                    {
+                        plan.statements.push((root_id, expr));
+                    }
+                    continue;
+                }
                 // Any other call on the includer (`field :x, ...`,
                 // `filter_param :tag, ... do ... end`): Ruby class_evals
                 // the block on it, so it runs as written right after the
@@ -975,9 +998,13 @@ pub(super) fn splice_into_library_includers(
                     && let ExprNode::Send { recv, method, .. } = &*expr.node
                     && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                     && (class_side.contains(method.as_str())
+                        || gained.contains(method.as_str())
                         || gem_class_side(lc, method.as_str())
                         || test_case_side(lc, method.as_str()))
                 {
+                    if method.as_str() == "define_model_callbacks" {
+                        gained.extend(model_callback_names(expr));
+                    }
                     let root_id = top(&lc.includes[*root]);
                     let class_attributes: &[Symbol] = &declared;
                     if let ModelBodyItem::Unknown { expr, .. } =
@@ -1324,9 +1351,71 @@ fn seed_span(items: &[ModelBodyItem], name: &Symbol) -> Span {
 /// The modules a carried `include M, …` names, each resolved in the
 /// Concern's lexical scope (the block's), innermost first.
 fn included_modules(item: &ModelBodyItem, concern: &ClassId, defined: &HashSet<String>) -> Vec<ClassId> {
+    written_modules(item, "include", concern, defined)
+}
+
+/// The class methods a carried `extend M, …` gives the includer, when
+/// each M is an app module (its instance methods) or a module of the
+/// ActiveModel::Validations port (`runtime_reads::extended_class_methods`:
+/// ActiveModel::Callbacks' `define_model_callbacks`, and
+/// ActiveSupport::Callbacks' `define_callbacks` and `set_callback`).
+/// `None` for any other `extend`, which stays refused by name.
+fn extended_surface(item: &ModelBodyItem, concern: &ClassId, defined: &HashSet<String>, app: &App) -> Option<Vec<String>> {
+    let modules = written_modules(item, "extend", concern, defined);
+    if modules.is_empty() {
+        return None;
+    }
+    let mut surface = Vec::new();
+    for module in modules {
+        if let Some(lc) = app.library_classes.iter().find(|lc| lc.is_module && lc.name == module) {
+            surface.extend(
+                lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name.as_str().to_string()),
+            );
+        } else if !defined.contains(module.0.as_str()) {
+            surface.extend(crate::analyze::runtime_reads::extended_class_methods(module.0.as_str())?.iter().cloned());
+        } else {
+            return None;
+        }
+    }
+    Some(surface)
+}
+
+/// The class methods a `define_model_callbacks :save, …` defines
+/// (activemodel's callbacks.rb): `before_save`, `around_save` and
+/// `after_save` for each literal name, or the kinds its `only:` names.
+fn model_callback_names(call: &Expr) -> Vec<String> {
+    let ExprNode::Send { args, .. } = &*call.node else { return Vec::new() };
+    let sym = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let mut kinds = vec!["before".to_string(), "around".to_string(), "after".to_string()];
+    let mut names = Vec::new();
+    for arg in args {
+        if let ExprNode::Hash { entries, .. } = &*arg.node {
+            for (key, value) in entries {
+                if sym(key).as_deref() != Some("only") {
+                    continue;
+                }
+                kinds = match &*value.node {
+                    ExprNode::Array { elements, .. } => elements.iter().filter_map(sym).collect(),
+                    _ => sym(value).into_iter().collect(),
+                };
+            }
+        } else if let Some(name) = sym(arg) {
+            names.push(name);
+        }
+    }
+    names.iter().flat_map(|name| kinds.iter().map(move |kind| format!("{kind}_{name}"))).collect()
+}
+
+/// The modules a carried `include M, …` or `extend M, …` (`verb`) names,
+/// each resolved in the Concern's lexical scope (the block's), innermost
+/// first.
+fn written_modules(item: &ModelBodyItem, verb: &str, concern: &ClassId, defined: &HashSet<String>) -> Vec<ClassId> {
     let ModelBodyItem::Unknown { expr, .. } = item else { return Vec::new() };
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return Vec::new() };
-    if method.as_str() != "include" || args.is_empty() {
+    if method.as_str() != verb || args.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
