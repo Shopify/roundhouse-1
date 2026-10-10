@@ -38,6 +38,40 @@ module Arel
 
     def not_in: (ActiveRecord::Relation | SelectManager subquery) -> String
   end
+
+  module Nodes
+    class Node
+    end
+
+    class NodeExpression < Node
+    end
+
+    class Unary < NodeExpression
+      @expr: untyped
+
+      def expr: () -> untyped
+
+      def initialize: (untyped expr) -> void
+    end
+
+    class Grouping < Unary
+      def to_sql: () -> String
+    end
+
+    class BoundSqlLiteral < NodeExpression
+      @sql_with_placeholders: String
+      @positional_binds: Array[untyped]
+      @named_binds: Hash[Symbol, untyped]
+
+      def sql_with_placeholders: () -> String
+
+      def positional_binds: () -> Array[untyped]
+
+      def named_binds: () -> Hash[Symbol, untyped]
+
+      def initialize: (String sql_with_placeholders, Array[untyped] positional_binds, Hash[Symbol, untyped] named_binds) -> void
+    end
+  end
 end
 
 module ActiveRecord

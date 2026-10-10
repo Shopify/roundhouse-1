@@ -13472,6 +13472,13 @@ const GEM_REQUIRES: &[&str] = &[
     "google/protobuf",
 ];
 
+/// `GEM_REQUIRES` gems with the lock dependencies requiring them loads,
+/// where the lock resolves them, so their constants run as the gems'.
+/// Measured in the emitted Core tree (r19, CRuby): `require
+/// "rails-html-sanitizer"` loads loofah 2.25.2 (and its crass), whose
+/// `Loofah.fragment` Core's `String#sanitize_without_defaults` calls.
+const GEM_REQUIRE_DEPENDENCIES: &[(&str, &[&str])] = &[("rails-html-sanitizer", &["loofah", "crass"])];
+
 /// Shopify Core's Bundler.require, in its Gemfile order, as (require
 /// path, lockfile gem): the default-group entries whose load closure is
 /// Rails-free (the rest are `RAILS_DEPENDENT_GEMS` or unclassified).
@@ -14091,6 +14098,12 @@ pub(crate) fn lock_loaded_gems(
             .filter(|gem| gem.envs.is_empty() || gem.envs.iter().any(|e| e == "test"))
             .map(|gem| gem.name.as_str()),
     );
+    for (gem, deps) in GEM_REQUIRE_DEPENDENCIES {
+        if lock.has(gem) {
+            loaded.insert(gem.to_string());
+            loaded.extend(deps.iter().filter(|dep| lock.has(dep)).map(|dep| dep.to_string()));
+        }
+    }
     while let Some(gem) = stack.pop() {
         if loaded.insert(gem.to_string()) {
             stack.extend(

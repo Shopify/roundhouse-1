@@ -77,6 +77,47 @@ module Arel
       "#{@qualified} NOT IN (#{subquery.to_sql})"
     end
   end
+
+  # Arel's node hierarchy (activerecord 8.2 arel/nodes), as far as code
+  # outside Arel names it: `x.is_a?(Arel::Nodes::Node)` (Core's
+  # pagination resolves a sort field given as a node to its SQL) and
+  # the node classes a condition's AST may be. This runtime composes
+  # SQL as strings and builds no node, so no value it produces is one,
+  # exactly as such a check finds for a String in Rails.
+  module Nodes
+    class Node
+    end
+
+    class NodeExpression < Node
+    end
+
+    class Unary < NodeExpression
+      attr_reader :expr
+
+      def initialize(expr)
+        @expr = expr
+      end
+    end
+
+    # `(<expr>)`, its operand a SQL fragment or anything with `to_sql`.
+    class Grouping < Unary
+      def to_sql
+        inner = expr.respond_to?(:to_sql) ? expr.to_sql : expr.to_s
+        "(#{inner})"
+      end
+    end
+
+    # `Arel.sql("a = ?", 1)` in Rails: SQL with bind placeholders.
+    class BoundSqlLiteral < NodeExpression
+      attr_reader :sql_with_placeholders, :positional_binds, :named_binds
+
+      def initialize(sql_with_placeholders, positional_binds, named_binds)
+        @sql_with_placeholders = sql_with_placeholders
+        @positional_binds = positional_binds
+        @named_binds = named_binds
+      end
+    end
+  end
 end
 
 module ActiveRecord
