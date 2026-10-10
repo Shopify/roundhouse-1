@@ -163,3 +163,53 @@ end
     };
     assert_eq!(value.ty, Some(roundhouse::ty::Ty::Int), "{value:?}");
 }
+
+#[test]
+fn a_model_body_ivar_write_is_a_class_side_initializer() {
+    // Core's `Event` seeds `@admin_timeline_subject_types = {}` in its
+    // class body and reads it through a `class << self` accessor; each
+    // `event_timeline_types` initializer's `register_admin_timeline_subject_type`
+    // then does `admin_timeline_subject_types[type] = builder`. The model
+    // walk dropped the write without a diagnostic, so the first
+    // registration met nil.
+    let source = r#"class Room < ApplicationRecord
+  DEFAULT_AUTHOR = "Shopify"
+
+  @subject_types = {}
+
+  class << self
+    attr_accessor :subject_types
+
+    def register_subject_type(type, builder)
+      subject_types[type] = builder
+    end
+  end
+end
+"#;
+    let src = emitted_model(source);
+    let seed = src.find("@subject_types = {}").unwrap_or_else(|| panic!("{src}"));
+    assert!(src.contains("def self.subject_types\n"), "{src}");
+    assert!(src.find("DEFAULT_AUTHOR = ").is_some_and(|c| c < seed), "{src}");
+    // The seed runs in the class body, not inside a method.
+    let line = src[..seed].rsplit('\n').next().unwrap();
+    assert_eq!(line, "  ", "{src}");
+}
+
+fn emitted_model(source: &str) -> String {
+    let files: Vec<(&str, &str)> = vec![
+        ("db/schema.rb", SCHEMA),
+        ("app/models/room.rb", source),
+        ("config/routes.rb", "Rails.application.routes.draw do\n  resources :rooms\nend\n"),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .into_iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    let _ = roundhouse::session::analyze_and_lower(&mut app);
+    ruby::emit_lowered_models(&app)
+        .into_iter()
+        .find(|f| f.path.to_string_lossy().ends_with("room.rb"))
+        .map(|f| f.content)
+        .expect("room.rb")
+}

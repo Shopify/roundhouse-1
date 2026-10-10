@@ -648,6 +648,28 @@ pub(super) fn ingest_model_with_enum_constants(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
+            // `@x = {}` in the class body writes the class object's own
+            // ivar where it stands, as a library class's does
+            // (`library_class::with_class_body_ivar_writes`). Core's
+            // `Event` seeds `@admin_timeline_subject_types = {}` for its
+            // `class << self` accessor; left Unknown, it was dropped.
+            if stmt.as_instance_variable_write_node().is_some()
+                || stmt.as_instance_variable_or_write_node().is_some()
+                || stmt.as_instance_variable_and_write_node().is_some()
+                || stmt.as_instance_variable_operator_write_node().is_some()
+            {
+                match ingest_expr(&stmt, file) {
+                    Ok(expr) => body.push(ModelBodyItem::ClassBody {
+                        expr,
+                        leading_comments: leading,
+                        leading_blank_line: leading_blank,
+                    }),
+                    Err(err) if super::survey::is_active() => super::survey::record(&err),
+                    Err(err) => return Err(err),
+                }
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             let items = match ingest_model_body_items(
                 &stmt,
                 &owner,
