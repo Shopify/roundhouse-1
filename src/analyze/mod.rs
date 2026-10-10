@@ -4662,9 +4662,13 @@ impl Analyzer {
                 deps.note(body::DepKey::Instance(&lc.name, &method.name));
                 deps.note(body::DepKey::ClassMethod(&lc.name, &method.name));
             }
+            // A module's body typed with its sole includer as `self` still
+            // reads constants from the module's cref, as Ruby does:
+            // `@mapping = nil #: Mapping?` in `Fn::Graph::FieldExt` names
+            // `Fn::Graph::Mapping` whichever class includes it.
             let class_ctx = Ctx {
                 self_ty: Some(Ty::Class { id: self_id.clone(), args: vec![] }),
-                lexical_self: None,
+                lexical_self: (self_id != lc.name).then(|| Ty::Class { id: lc.name.clone(), args: vec![] }),
                 ivar_bindings: HashMap::default(),
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),

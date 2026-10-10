@@ -68,6 +68,9 @@ struct FileAnswers {
     class_definitions: HashSet<Box<str>>,
     alias_definitions: HashSet<Box<str>>,
     runtime_namespace_aliases: HashMap<Box<str>, Box<str>>,
+    /// Each `X = Y` naming a class or module: X's full name, and the full
+    /// name of the namespace Ruby binds it to.
+    namespace_aliases: HashMap<Box<str>, Box<str>>,
     /// Each `class X < Y` this file writes: X's full name, and the full
     /// name of the class Ruby's lookup binds `Y` to.
     superclasses: Vec<(Box<str>, Box<str>)>,
@@ -97,6 +100,10 @@ pub(crate) struct ConstResolver {
     /// Each source constant's declaration by its full name; `None` where
     /// two declarations share the name.
     source_constants: HashMap<Box<str>, Option<DeclarationId>>,
+    /// Each source constant alias of a namespace (`State = CaptureState`
+    /// in `Capture`) by its full name, to the namespace's; `None` where
+    /// two definitions disagree.
+    namespace_aliases: HashMap<Box<str>, Option<Box<str>>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -584,6 +591,19 @@ impl ConstResolver {
                 }
             }
         }
+        let mut namespace_aliases: HashMap<Box<str>, Option<Box<str>>> = HashMap::default();
+        for (alias, target) in files.iter().flatten().flat_map(|file| file.namespace_aliases.iter()) {
+            match namespace_aliases.entry(alias.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Some(target.clone()));
+                }
+                Entry::Occupied(mut slot) => {
+                    if slot.get().as_ref() != Some(target) {
+                        slot.insert(None);
+                    }
+                }
+            }
+        }
         Self {
             files,
             stdlib_namespaces,
@@ -591,6 +611,7 @@ impl ConstResolver {
             source_namespaces,
             nested_namespaces,
             source_constants,
+            namespace_aliases,
             source_fingerprint: source_fingerprint(sources),
             postgresql_runtime,
         }
@@ -699,6 +720,30 @@ impl ConstResolver {
     /// The one source declaration of the constant `name` (full name).
     pub(crate) fn source_constant(&self, name: &str) -> Option<DeclarationId> {
         self.source_constants.get(name).copied().flatten()
+    }
+
+    /// `name` (full) with each constant alias of a namespace along its
+    /// path replaced by the namespace it names, as Ruby's lookup follows
+    /// it: `PaymentsPartners::Capture::State::Unprocessed` is
+    /// `PaymentsPartners::CaptureState::Unprocessed` where `Capture` writes
+    /// `State = CaptureState`. `None` when no alias is on the path.
+    pub(crate) fn dealiased(&self, name: &str) -> Option<String> {
+        let mut current = name.to_owned();
+        let mut changed = false;
+        // Bounded: an alias cycle is no class.
+        'outer: for _ in 0..8 {
+            let mut ends: Vec<usize> = current.match_indices("::").map(|(at, _)| at).collect();
+            ends.push(current.len());
+            for end in ends {
+                if let Some(Some(target)) = self.namespace_aliases.get(&current[..end]) {
+                    current = format!("{target}{}", &current[end..]);
+                    changed = true;
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+        changed.then_some(current)
     }
 
     /// The source classes and modules declared inside the source class
@@ -1215,6 +1260,9 @@ fn answer_file(
                 }
                 if let Some(Definition::ConstantAlias(alias)) = definition {
                     answers.alias_definitions.insert(full.clone().into());
+                    if let Some(target) = resolved_namespace(graph, *alias.target_name_id()) {
+                        answers.namespace_aliases.insert(full.clone().into(), hoisted_name(target.name()).into());
+                    }
                     if let Some(target) = resolved_namespace(graph, *alias.target_name_id())
                         .filter(|target| is_runtime_declaration(graph, target))
                     {

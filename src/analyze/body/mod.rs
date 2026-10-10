@@ -670,6 +670,28 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
+    /// A class name written in `scope` that names a class through a
+    /// constant alias of a namespace (`Capture::State::Unprocessed` where
+    /// `Capture` writes `State = CaptureState`), resolved lexically.
+    fn dealiased_class(&self, written: &ClassId, scope: &str) -> Option<ClassId> {
+        let resolver = self.const_resolver.as_ref()?;
+        let name = written.0.as_str().trim_start_matches("::");
+        let rooted = written.0.as_str().starts_with("::");
+        let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty() && !rooted).collect();
+        loop {
+            let candidate = if parts.is_empty() { name.to_owned() } else { format!("{}::{name}", parts.join("::")) };
+            if let Some(target) = resolver.dealiased(&candidate) {
+                let target = ClassId(Symbol::from(target.as_str()));
+                if self.classes().contains_key(&target) {
+                    return Some(target);
+                }
+            }
+            if parts.pop().is_none() {
+                return None;
+            }
+        }
+    }
+
     /// The nearest ancestor of the enclosing class that models `name`,
     /// in Ruby's order: each class's included modules (the last included
     /// first), then its superclass. A superclass counts by its modeled
@@ -3891,10 +3913,12 @@ impl<'a> BodyTyper<'a> {
                         target_ty,
                         scope.0.as_str(),
                         &|_, _| None,
-                        &|id, scope| cref_class(id, scope, self.classes()).unwrap_or_else(|| id.clone()),
+                        &|id, scope| cref_class(id, scope, self.classes())
+                            .or_else(|| self.dealiased_class(id, scope))
+                            .unwrap_or_else(|| id.clone()),
                         false,
                     ),
-                _ => target_ty.clone(),
+                _ => target_ty.map_class_ids(&|id| self.dealiased_class(id, "").unwrap_or_else(|| id.clone())),
                 };
                 let missing = std::cell::RefCell::new(Vec::new());
                 // Lowerers also synthesize casts whose identities were proven
