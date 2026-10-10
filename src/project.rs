@@ -9131,7 +9131,10 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     for (namespace, children) in &namespaces {
         for (name, child) in children {
             let Some(file) = child.file.as_ref() else { continue };
-            if let Some(program) = program_of_file.get(file) {
+            // A program whose declarations load in place keeps the autoload a
+            // gem registers for them (`in_place_program`): a plain `require`
+            // of it meets the same circular autoload.
+            if let Some(program) = program_of_file.get(file).or_else(|| in_place_program.get(file)) {
                 program_constants.entry(program.clone()).or_default().push((namespace, name));
             } else if program_anchors.contains(file) || requires_first(file) {
                 program_constants.entry(file.clone()).or_default().push((namespace, name));
@@ -10187,7 +10190,9 @@ module Kernel
 
   private def require(feature)
     return RoundhouseAutoload.autovivify(feature) if feature.is_a?(String) && RoundhouseAutoload.implicit?(feature)
-    RoundhouseAutoload::REQUIRE_BEFORE_IMPLICIT_NAMESPACES.bind_call(self, feature)
+    loaded = RoundhouseAutoload.requiring { RoundhouseAutoload::REQUIRE_BEFORE_IMPLICIT_NAMESPACES.bind_call(self, feature) }
+    RoundhouseAutoload.flush_autoloaded
+    loaded
   rescue Exception => e
     RoundhouseAutoload.restore_autoloads
     first = RoundhouseAutoload.reload_failure(e)
@@ -10625,10 +10630,38 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # Zeitwerk `on_load("Cpath")` callback names (AUTOLOAD_CALLBACK_CPATHS):
   # the loaders run its callbacks with its value and the file, as
   # Zeitwerk's `on_file_autoloaded` does (runtime/rails_autoloaders.rb).
+  #
+  # Zeitwerk calls them from its `Kernel#require` once the file's require
+  # returned. The trailer runs inside the file, still in progress, so
+  # while a `require` is on the stack the report waits (`flush_autoloaded`,
+  # called as each `require` returns): a callback that loads a subclass
+  # would otherwise meet the subclass's require of this file as circular.
   def self.autoloaded(cpath, file)
     return unless defined?(Rails) && Rails.respond_to?(:autoloaders)
+    return (@reported_loads ||= []) << [cpath, file] if @requiring.to_i > 0
+    report_autoloaded(cpath, file)
+  end
+
+  def self.report_autoloaded(cpath, file)
     value = Object.const_get(cpath, false)
     Rails.autoloaders.each { |loader| loader.__on_file_autoloaded(cpath, value, file) }
+    nil
+  end
+
+  def self.requiring
+    @requiring = @requiring.to_i + 1
+    yield
+  ensure
+    @requiring -= 1
+  end
+
+  # The reports of the files whose require has returned, in load order.
+  def self.flush_autoloaded
+    return if @reported_loads.nil? || @reported_loads.empty?
+    ready = @reported_loads.select { |_, file| $LOADED_FEATURES.include?(file) }
+    return if ready.empty?
+    @reported_loads -= ready
+    ready.each { |cpath, file| report_autoloaded(cpath, file) }
     nil
   end
 
