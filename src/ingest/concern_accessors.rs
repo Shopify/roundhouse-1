@@ -927,6 +927,8 @@ pub(super) fn splice_into_library_includers(
                     contested.push(name);
                 }
             }
+            // The modules this block has included so far, in its order.
+            let mut block_included: Vec<ClassId> = Vec::new();
             for item in items {
                 if is_candidate(item) {
                     let ModelBodyItem::Unknown { expr, .. } = item else { unreachable!() };
@@ -937,6 +939,7 @@ pub(super) fn splice_into_library_includers(
                 }
                 if !included_modules(item, concern, &defined).is_empty() {
                     for module in included_modules(item, concern, &defined) {
+                        block_included.push(module.clone());
                         if !lc.includes.iter().any(|own| top(own) == module)
                             && !plan.includes.iter().any(|(_, planned)| *planned == module)
                         {
@@ -967,7 +970,20 @@ pub(super) fn splice_into_library_includers(
                 // `filter_param :tag, ... do ... end`): Ruby class_evals
                 // the block on it, so it runs as written right after the
                 // include, ordered against the block's class_attribute
-                // seeds as written (`emit::ruby::library`).
+                // seeds as written (`emit::ruby::library`). A macro a
+                // loaded gem module the block itself included earlier
+                // mixes in (Core's Apps::Extension: `include
+                // SmartProperties`, then `property :uuid`) exists only
+                // once that include has run, so it is written after that
+                // include rather than the includer's.
+                let gem_anchor = |method: &str| -> Option<ClassId> {
+                    let name = Symbol::from(method);
+                    block_included
+                        .iter()
+                        .rev()
+                        .find(|m| app.gem_boundary.loaded_mixed_in_class_methods(&top(m)).contains(&name))
+                        .map(top)
+                };
                 if !job
                     && !lc.is_module
                     && hook.is_none()
@@ -976,9 +992,10 @@ pub(super) fn splice_into_library_includers(
                     && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                     && (class_side.contains(method.as_str())
                         || gem_class_side(lc, method.as_str())
+                        || gem_anchor(method.as_str()).is_some()
                         || test_case_side(lc, method.as_str()))
                 {
-                    let root_id = top(&lc.includes[*root]);
+                    let root_id = gem_anchor(method.as_str()).unwrap_or_else(|| top(&lc.includes[*root]));
                     let class_attributes: &[Symbol] = &declared;
                     if let ModelBodyItem::Unknown { expr, .. } =
                         super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)

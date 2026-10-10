@@ -347,3 +347,114 @@ fn a_macro_the_gem_mixin_does_not_declare_stays_dropped_and_reported() {
     assert!(loose.contains("property(:kept)") || loose.contains("property :kept"), "{loose}");
     assert!(!loose.contains("widget_macro"), "{loose}");
 }
+
+/// Core's `Apps::Extension`: a Concern whose `included do` block includes
+/// the gem and then calls its macros, so they run on each includer after
+/// `include SmartProperties` has extended it (`property :uuid`, then the
+/// includer's own `property :key`).
+const EXTENSION: &str = r#"module Apps
+  module Extension
+    extend ActiveSupport::Concern
+
+    included do
+      include SmartProperties
+
+      property :uuid
+      property! :app_id
+      property :development, default: false
+
+      def development?
+        development
+      end
+    end
+  end
+end
+"#;
+
+const TEST_EXTENSION: &str = r#"module Apps
+  module Extensions
+    class TestExtension
+      include Apps::Extension
+
+      property :key
+    end
+  end
+end
+"#;
+
+/// Core's Checkouts::UiExtension: an ActiveModel class, which is lowered
+/// as a model, including the Concern and the gem itself, then calling the
+/// gem's macros in its own body.
+const UI_EXTENSION: &str = r#"module Checkouts
+  class UiExtension
+    include Apps::Extension
+    include SmartProperties
+    include ActiveModel::Validations
+
+    property! :name
+    property :features, default: 2
+
+    validates :name, presence: true
+  end
+end
+"#;
+
+const EXTENSION_SCRIPT: &str = r##"
+e = Apps::Extensions::TestExtension.new(app_id: 4, key: "k")
+puts [e.app_id, e.uuid, e.development?, e.key].inspect
+puts Apps::Extensions::TestExtension.properties.keys.inspect
+begin
+  Apps::Extensions::TestExtension.new
+rescue SmartProperties::MissingValueError => ex
+  puts "raised: #{ex.message}"
+end
+u = Checkouts::UiExtension.new(app_id: 5, name: "n")
+puts [u.app_id, u.name, u.features, u.valid?].inspect
+puts Checkouts::UiExtension.properties.keys.inspect
+"##;
+
+#[test]
+fn a_concern_included_block_s_gem_macros_run_on_the_includer_as_in_cruby() {
+    let root = scratch("concern");
+    let home = gem_home(&root);
+    let gem_path = gem_path(&home);
+    let native = emit_and_run::ruby()
+        .env("GEM_PATH", &gem_path)
+        .arg("-e")
+        .arg(format!("require \"active_model\"\nrequire \"smart_properties\"\n{EXTENSION}\n{TEST_EXTENSION}\n{UI_EXTENSION}\n{EXTENSION_SCRIPT}"))
+        .output()
+        .expect("CRuby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = lines(&native.stdout);
+    assert_eq!(
+        expected,
+        [
+            "[4, nil, false, \"k\"]",
+            "[:uuid, :app_id, :development, :key]",
+            "raised: Apps::Extensions::TestExtension requires the property app_id to be set",
+            "[5, \"n\", 2, true]",
+            "[:uuid, :app_id, :development, :name, :features]",
+        ],
+        "native control"
+    );
+    let (tree, errors) = emit_and_run::empty_app()
+        .write("Gemfile.lock", LOCK)
+        .write("roundhouse.yml", &format!("gem_home: {}\n", home.display()))
+        .write("app/models/apps/extension.rb", EXTENSION)
+        .write("app/models/apps/extensions/test_extension.rb", TEST_EXTENSION)
+        .write("app/models/checkouts/ui_extension.rb", UI_EXTENSION)
+        .emit(BuildTarget::Ruby);
+    let run = Command::new("ruby")
+        .current_dir(&tree)
+        .env("GEM_PATH", &gem_path)
+        .env("BLOG_DB", ":memory:")
+        .arg("-e")
+        .arg(format!("require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\n{EXTENSION_SCRIPT}"))
+        .output()
+        .expect("spawn ruby");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "emitted tree failed in {}: {stderr}\nerrors: {errors:#?}", tree.display());
+    assert_eq!(lines(&run.stdout), expected, "emitted Ruby diverges from CRuby line for line\nerrors: {errors:#?}");
+    assert!(errors.is_empty(), "{errors:#?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -283,6 +283,10 @@ pub(crate) struct ClassSide<'a> {
     /// Whether the class, or a model ancestor, has a compiled table, so
     /// it answers [`SCHEMA_CLASS_METHODS`].
     schema: bool,
+    /// The body's statements in order, each `include` of a loaded gem
+    /// module with the class methods that module mixes in
+    /// ([`ClassSide::gem_mixin_macro`]).
+    gem_includes: Vec<(&'a Expr, std::collections::BTreeSet<crate::ident::Symbol>)>,
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -352,7 +356,60 @@ impl<'a> ClassSide<'a> {
         side.claimed = &model.claimed_body_calls;
         side.declared = super::macro_associations::declaring_calls(model);
         side.schema |= app.schema.tables.contains_key(&model.table.0);
+        side.gem_includes = body_statements(model).map(|e| (e, side.gem_mixin_methods(e))).collect();
         side
+    }
+
+    /// The class methods a loaded gem module mixes into the class when
+    /// `call` includes it (smart_properties' `included(base)` runs
+    /// `base.extend(ClassMethods)`: `property`, `property!`), named as
+    /// Ruby resolves the constant from the owner's namespace outwards; an
+    /// app constant of that name hides the gem's. Empty for any other
+    /// statement.
+    fn gem_mixin_methods(&self, call: &Expr) -> std::collections::BTreeSet<crate::ident::Symbol> {
+        let mut out = std::collections::BTreeSet::new();
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return out };
+        if method.as_str() != "include" {
+            return out;
+        }
+        let boundary = &self.app.gem_boundary;
+        for arg in args {
+            let ExprNode::Const { path } = &*arg.node else { continue };
+            let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+            let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            let mut scope: Vec<&str> = if rooted { Vec::new() } else { self.owner.0.as_str().split("::").collect() };
+            loop {
+                let candidate = if scope.is_empty() { written.clone() } else { format!("{}::{written}", scope.join("::")) };
+                let id = ClassId(crate::ident::Symbol::from(candidate.as_str()));
+                if boundary.loaded_reopen(&id).is_some() || boundary.loaded_source_reopen(&id).is_some() {
+                    if boundary.is_loaded_gem_module(&id) {
+                        out.extend(boundary.loaded_mixed_in_class_methods(&id));
+                    }
+                    break;
+                }
+                if self.app.models.iter().any(|m| m.name == id) || self.app.library_classes.iter().any(|c| c.name == id) {
+                    break;
+                }
+                if scope.pop().is_none() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Is `call` a body call of a class method a loaded gem module the
+    /// body included above it mixes in (Core's `include SmartProperties`
+    /// then `property! :name, accepts: String`, on an ActiveModel class
+    /// lowered as a model)? The gem runs the hook and defines the method,
+    /// so replaying the call is what Ruby runs.
+    fn gem_mixin_macro(&self, call: &Expr, name: &str) -> bool {
+        let name = crate::ident::Symbol::from(name);
+        self.gem_includes
+            .iter()
+            .take_while(|(statement, _)| !std::ptr::eq(*statement, call))
+            .any(|(_, methods)| methods.contains(&name))
+            && self.gem_includes.iter().any(|(statement, _)| std::ptr::eq(*statement, call))
     }
 
     /// The class side of a class whose own class methods are `own`, whose
@@ -387,6 +444,7 @@ impl<'a> ClassSide<'a> {
             declared: Vec::new(),
             base: std::cell::OnceCell::new(),
             schema,
+            gem_includes: Vec::new(),
         };
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
@@ -520,7 +578,19 @@ impl<'a> ClassSide<'a> {
         if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) || is_model_dsl(method.as_str()) {
             return None;
         }
-        let (def, module) = self.class_method(method.as_str())?;
+        let Some((def, module)) = self.class_method(method.as_str()) else {
+            if !self.gem_mixin_macro(call, method.as_str()) {
+                return None;
+            }
+            // The call's own arguments run in the class body.
+            let mut walk = Walk::new(self, method.as_str());
+            let mut aliases = Vec::new();
+            let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
+            return Some(match result {
+                Ok(()) => MacroVerdict::Replay,
+                Err(reason) => MacroVerdict::Refuse(reason),
+            });
+        };
         let mut walk = Walk::new(self, method.as_str());
         walk.answered = self.claimed.contains(&call.span);
         walk.declares_association = self.declared.contains(&call.span);
