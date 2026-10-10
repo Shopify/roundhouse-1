@@ -2860,6 +2860,7 @@ end
     super::on_load_reopen::apply_pending(&mut app);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
+    drop_class_methods_block_mixes_in(&mut app, &concern_class_method_spans);
     splice_deferred_mixes_in_extends(&mut app, &concern_class_method_spans);
     carry_test_class_extends(&mut app, &test_class_extends)?;
     // Before the macro expansions: a macro's generated body may read the
@@ -5054,6 +5055,58 @@ fn splice_deferred_mixes_in_extends(app: &mut App, carriers: &[ConcernClassMetho
                 splices.push(crate::app::ClassMethodsCarrierSplice { carrier, methods: Vec::new(), extend: true });
             }
         }
+    }
+}
+
+/// `mixes_in_class_methods(ClassMethods)` in a Concern whose class side
+/// is a `class_methods do … end` block (essentials'
+/// `MaintenanceTasks::Task::DangerouslySkipWriteThrottle`):
+///
+/// ```ruby
+/// module DangerouslySkipWriteThrottle
+///   extend ActiveSupport::Concern
+///   class_methods do
+///     def dangerously_skip_write_throttle = (@dangerously_skip_write_throttle = true)
+///   end
+///   mixes_in_class_methods(ClassMethods)
+/// end
+/// ```
+///
+/// `class_methods` defines the module's `ClassMethods`, and Concern's
+/// `append_features` extends each includer with it; sorbet's hook
+/// extends the includer with the same module again, which changes
+/// nothing. Here the block's defs are class methods of the Concern that
+/// the concern splice copies onto every includer, and no `ClassMethods`
+/// is emitted, so the call read an undefined constant: the module's
+/// file raised NameError at load, and its next require warned "already
+/// initialized constant" for every constant before it. The argument
+/// naming that module goes; the call goes with its last one.
+fn drop_class_methods_block_mixes_in(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
+    use crate::expr::ExprNode;
+    let defined: crate::det::HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_owned()).collect();
+    let block_carriers: crate::det::HashSet<&crate::ident::ClassId> = carriers
+        .iter()
+        .filter(|c| !c.has_nested_carrier && !c.concern_extensions.is_empty() && !c.methods.is_empty())
+        .map(|c| &c.owner)
+        .collect();
+    for lc in app.library_classes.iter_mut().filter(|lc| lc.is_module && block_carriers.contains(&lc.name)) {
+        let own = format!("{}::ClassMethods", lc.name.0.as_str());
+        if defined.contains(&own) {
+            continue;
+        }
+        lc.unknown_calls.retain_mut(|call| {
+            if !super::sorbet_check::is_mixes_in(call) {
+                return true;
+            }
+            let ExprNode::Send { args, .. } = &mut *call.node else { return true };
+            let before = args.len();
+            let mut at = 0;
+            args.retain(|arg| {
+                at += 1;
+                !(at > 1 && matches!(&*arg.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ClassMethods"))
+            });
+            args.len() == before || args.len() > 1
+        });
     }
 }
 
