@@ -20,7 +20,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Rails.app` is railties' alias of `application`.
     // `Rails.autoloaders` is runtime/spinel/rails_autoloaders.rb's, gated
     // (`analyze::runtime_reads`) to the trees that carry it.
-    for m in ["application", "app", "logger", "cache", "configuration", "autoloaders", "root", "gem_version", "public_path"] {
+    // `Rails.cache=` is railties' `attr_writer :cache` (runtime/ruby/rails.rb
+    // answers it); Core's test memcached helper swaps the store with it.
+    for m in ["application", "app", "logger", "cache", "cache=", "configuration", "autoloaders", "root", "gem_version", "public_path"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
