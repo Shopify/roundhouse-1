@@ -1093,8 +1093,8 @@ module ActiveRecord
     # applied by the boot where the tree carries Time.zone
     # (runtime/active_support_time_with_zone.rb); `hook_attribute_type`
     # wraps a schema column's datetime or time type in a TimeZoneConverter
-    # when conversion is on for it. A type declared with `attribute` is
-    # not wrapped. Each attribute is the class's own value once assigned,
+    # when conversion is on for it, and so does attribute_registration.rb's
+    # `attribute` for a declared type. Each attribute is the class's own value once assigned,
     # else its superclass's, as class_attribute is.
     %i[time_zone_aware_attributes skip_time_zone_conversion_for_attributes time_zone_aware_types].each do |attr|
       defaults = { time_zone_aware_attributes: false, skip_time_zone_conversion_for_attributes: [], time_zone_aware_types: %i[datetime time] }
@@ -1407,7 +1407,8 @@ module ActiveRecord
         inherited = parent <= ActiveRecord::Base ? parent._declared_attribute_types : {}
         own = {}
         (@__declared_attribute_types || {}).each do |n, (type, options)|
-          own[n] = type.is_a?(Symbol) ? ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) : type
+          type = ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) if type.is_a?(Symbol)
+          own[n] = _hook_attribute_type(n, type)
         end
         types = inherited.merge(own)
         decorations = @__attribute_decorations || [] #: Array[[String, untyped]]

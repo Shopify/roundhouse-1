@@ -26,7 +26,9 @@
 #   #in, the beginning_of/end_of day, hour and minute methods,
 #   #seconds_since_midnight, #seconds_until_end_of_day, #sec_fraction,
 #   the coercing #<=>, #eql? and #-, and #next_/#prev_ day, month and
-#   year are ported; #change is runtime/active_support_time_change.rb.
+#   year are ported; #change is runtime/active_support_time_change.rb,
+#   required here: TimeWithZone#change (TimeZoneConverter#cast's) calls
+#   it, and active_support/all loads it natively with the zones.
 #   Time#+ and #- with a Duration are the overlay's
 #   (runtime/active_support_duration.rb). Of DateAndTime::Calculations
 #   only #past?, #future?, #today?, #tomorrow?, #yesterday?,
@@ -58,6 +60,7 @@ require "time"
 require "json"
 require "yaml"
 require_relative "active_support_isolated_execution_state"
+require_relative "active_support_time_change"
 
 # core_ext/object/acts_like.rb and the acts_like files.
 class Object
