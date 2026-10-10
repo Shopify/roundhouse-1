@@ -372,3 +372,82 @@ end
     );
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+/// `GraphApi::Authorization`'s shape: every caller of
+/// `pre_resolve_access` is a class-body DSL call the param-site walk
+/// cannot type, so `expression` kept only its `nil` default's type and
+/// `expression.present?` folded to the literal `false` — every GraphQL
+/// type that passed `expression:` with a docs description raised
+/// `UnexpectedPublicDocsDescription` at load.
+#[test]
+fn nil_default_kwarg_without_typed_callers_is_not_folded_to_nil() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+class ScopeExpression
+  def initialize(terms:)
+    @terms = terms
+  end
+end
+
+module Authorization
+  def pre_resolve_access(access_scope = false, public_docs_description: nil, expression: nil, &block)
+    validate(access_scope: access_scope, public_docs_description: public_docs_description, expression: expression, block: block)
+  end
+
+  def any(*scopes)
+    ScopeExpression.new(terms: scopes)
+  end
+
+  private
+
+  def validate(access_scope:, public_docs_description:, expression:, block:)
+    checked = !block.nil? || access_scope.present? || expression.present?
+    raise ArgumentError if !checked && public_docs_description.present?
+  end
+end
+
+class BaseObject
+  extend Authorization
+end
+
+class Address < BaseObject
+  pre_resolve_access expression: any(:read_a, :read_b), public_docs_description: "Needs access."
+end
+"#,
+    );
+    let validate = out.split("def validate").nth(1).expect("validate emitted");
+    let checked = validate.lines().nth(1).unwrap_or("");
+    assert!(checked.contains("expression"), "expression.present? must not fold away:\n{out}");
+    assert!(!checked.trim_end().ends_with("|| false"), "expression.present? folded to false:\n{out}");
+    assert!(!validate.lines().nth(2).unwrap_or("").contains("&& false"), "public_docs_description.present? folded:\n{out}");
+}
+
+/// A class-side call through `extend` reaches the module's INSTANCE
+/// `def`: the typed argument is evidence for its keyword.
+#[test]
+fn extended_module_method_takes_class_side_call_site_types() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+module Labeling
+  def label(name: nil)
+    return "none" unless name.present?
+    name
+  end
+end
+
+class Widget
+  extend Labeling
+
+  def self.build
+    label(name: "gear")
+  end
+end
+"#,
+    );
+    let label = out.split("def label").nth(1).expect("label emitted");
+    assert!(label.contains("name"), "name.present? must ground on the value:\n{out}");
+    assert!(!label.contains("unless true") && !label.contains("unless false"), "folded:\n{out}");
+    // Typed `String?` from the site grounds statically; an unplaced site
+    // would leave `name` untyped and route to the runtime predicate.
+    assert!(!label.contains("ActiveSupport.present?"), "call site through extend not placed:\n{out}");
+}
