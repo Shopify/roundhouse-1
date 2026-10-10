@@ -204,6 +204,13 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
 /// at boot ahead of them. Other trees, which have no lazy_load_hooks
 /// port, keep the reopen.
 ///
+/// So is a hook of a hooked class on a PostgreSQL tree whose block only
+/// `prepend`s literal modules on that class (Core's
+/// essentials/lib/patches/active_record/attributes_coercion.rb:18
+/// `on_load(:active_record) { prepend ActiveRecordAttributesCoercion }`):
+/// the runtime's lazy_load_hooks runs it on the base, where before it
+/// was dropped in silence and Base#init_with never saw the coercion.
+///
 /// [`TEST_LOAD_HOOKS`]: super::initializer_programs::TEST_LOAD_HOOKS
 pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
     if constant_id_str(&call.name()) != "on_load"
@@ -217,7 +224,7 @@ pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
         return false;
     };
     let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
-    if hook_class(&hook).is_some() && !deferred_test_hook(&hook) {
+    if hook_class(&hook).is_some() && !deferred_test_hook(&hook) && !(postgresql_tree() && prepends_only(&block)) {
         return false;
     }
     block.body().is_none_or(|body| {
@@ -251,6 +258,31 @@ pub(super) fn defer_test_hooks(postgresql: bool) -> DeferTestHooks {
 fn deferred_test_hook(hook: &str) -> bool {
     DEFER_TEST_HOOKS.with(|cell| cell.get())
         && super::initializer_programs::TEST_LOAD_HOOKS.iter().any(|(name, _, _)| *name == hook)
+}
+
+/// Whether this ingest is of a PostgreSQL tree, whose runtime ports
+/// lazy_load_hooks ([`defer_test_hooks`]).
+fn postgresql_tree() -> bool {
+    DEFER_TEST_HOOKS.with(|cell| cell.get())
+}
+
+/// A load hook's block whose statements are all receiverless
+/// `prepend Mod` calls with literal module paths.
+fn prepends_only(block: &ruby_prism::BlockNode<'_>) -> bool {
+    let Some(body) = block.body() else { return false };
+    let stmts = flatten_statements(body);
+    !stmts.is_empty()
+        && stmts.iter().all(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && constant_id_str(&call.name()) == "prepend"
+                    && call.block().is_none()
+                    && call.arguments().is_some_and(|args| {
+                        args.arguments().iter().next().is_some()
+                            && args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                    })
+            })
+        })
 }
 
 /// The framework class a load hook hands its block, for the hooks whose
