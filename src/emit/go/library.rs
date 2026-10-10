@@ -130,6 +130,14 @@ pub fn emit_library_class_with_registry(
     }
     if embedded_parent.is_none() && fields.is_empty() && !is_ar_base {
         out.push_str(&format!("type {name} struct{{}}\n\n"));
+        // An empty class is still constructible, as a subclass that
+        // embeds it builds it (`ActionController::Base < Metal`).
+        let has_initialize = class.methods.iter().any(|m| {
+            matches!(m.receiver, MethodReceiver::Instance) && m.name.as_str() == "initialize"
+        });
+        if !class.is_module && !has_initialize {
+            out.push_str(&format!("func New{name}() *{name} {{\n\treturn &{name}{{}}\n}}\n\n"));
+        }
     } else {
         out.push_str(&format!("type {name} struct {{\n"));
         if let Some(ref parent_ty) = embedded_parent {

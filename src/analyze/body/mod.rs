@@ -446,7 +446,7 @@ pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) ->
         ty,
         scope,
         &|owner, name| classes.get(owner).and_then(|info| info.type_aliases.get(name).cloned()),
-        &|id, _| id.clone(),
+        &|id, scope| cref_class(id, scope, classes).unwrap_or_else(|| id.clone()),
         &|scope| cref_ancestors(scope, classes),
         true,
     )
@@ -668,6 +668,42 @@ impl<'a> BodyTyper<'a> {
             target.extend(rest.iter().cloned());
             Some(target)
         })
+    }
+
+    /// A constant read through an app value constant whose value only
+    /// Ruby computes: `Types::DryTypes::Array`, where `Component::Schema`
+    /// writes `DryTypes = Dry.Types(default: :nominal)`, which returns a
+    /// module dry-types fills at runtime. Ruby evaluates the prefix and
+    /// looks the rest up in the object it holds. Returns the value's full
+    /// name and the path qualified by it; `None` when the longest prefix
+    /// Rubydex answers is a namespace, a modeled class, or a typed value.
+    fn value_scoped_constant(&self, span: crate::span::Span, path: &[Symbol]) -> Option<(ClassId, ClassId)> {
+        let resolver = self.const_resolver.as_ref()?;
+        if span.is_synthetic() {
+            return None;
+        }
+        for split in (1..path.len()).rev() {
+            let suffix = path[split..].iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            let end = span.end.checked_sub(u32::try_from(suffix.len() + 2).ok()?)?;
+            let prefix = crate::span::Span { end, ..span };
+            match resolver.reference(prefix, &path[..split]) {
+                Some(Some(ResolvedConstant::Value { stdlib: false, name, declaration, singleton: false, runtime: None })) => {
+                    if self.classes().contains_key(name.as_ref()) {
+                        return None;
+                    }
+                    let opaque = match self.typed_constant(declaration) {
+                        None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => true,
+                        Some(_) => false,
+                    };
+                    return opaque.then(|| {
+                        (name.as_ref().clone(), ClassId(Symbol::from(format!("{}::{suffix}", name.0).as_str())))
+                    });
+                }
+                Some(Some(_)) => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// A class name written in `scope` that names a class through a
@@ -1775,6 +1811,31 @@ impl<'a> BodyTyper<'a> {
                             }
                         })
                     }
+                };
+                // Read through an app value only Ruby computes
+                // (`value_scoped_constant`): the CRuby tree evaluates the
+                // value and looks the rest up in it, gradually typed;
+                // every other tree refuses it, as a runtime-provided
+                // constant (`DECLARED_TYPE_RUNTIME_CONSTANT`).
+                let ty = match ty {
+                    ty @ Ty::Var { .. } if indexed_source && !generated => match self.value_scoped_constant(expr_span, path) {
+                        Some((value, full)) => {
+                            let written = written_class_id(path);
+                            qualify_resolved_path(path, &full);
+                            expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("constant"),
+                                detail: format!(
+                                    "{} is looked up in the value of {}, which only Ruby computes; the CRuby tree evaluates it, so the read runs there",
+                                    written.0, value.0,
+                                ),
+                            });
+                            Ty::Untyped
+                        }
+                        None => ty,
+                    },
+                    ty => ty,
                 };
                 // A constant nothing indexes that a gem the CRuby tree
                 // loads natively declares in its installed source

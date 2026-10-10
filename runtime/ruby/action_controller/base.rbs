@@ -1,4 +1,7 @@
 module ActionController
+  class Metal
+  end
+
   def self.header_key_ok?: (String? k) -> bool
   def self.header_value_ok?: (String? v) -> bool
   def self.header_control?: (String c) -> bool
@@ -40,7 +43,7 @@ module ActionController
   # their actions and override process_action. (`cookies` is a
   # CRuby-only overlay feature — see runtime/action_controller_cookies.rb
   # — so it isn't declared on the shared/transpiled Base.)
-  class Base
+  class Base < ActionController::Metal
     def self.allow_forgery_protection: () -> bool
     def self.allow_forgery_protection=: (bool) -> void
     # `attr_accessor` produces getter+setter pairs for each name.

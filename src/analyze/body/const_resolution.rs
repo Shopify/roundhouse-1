@@ -1176,7 +1176,9 @@ fn answer_file(
         // that offset; such a path reference (`extend
         // Article::Identification` in `class Article`) is the path's
         // final name, which `reference` looks up at the span end minus
-        // the name's length, as for any other written path.
+        // the name's length, as for any other written path. A rooted
+        // top-level mixin (`extend ::SorbetEnumAttribute` in GiftCard)
+        // has the bare `::` for its owner.
         let written = text.get(offset.start() as usize..offset.end() as usize);
         let name = graph
             .names()
@@ -1186,7 +1188,7 @@ fn answer_file(
             (Some(name), Some(written)) if written == name.as_str() => offset.start(),
             (Some(name), Some(written))
                 if written.strip_suffix(name.as_str()).is_some_and(|owner| {
-                    owner.len() > 2
+                    owner.len() >= 2
                         && owner.ends_with("::")
                         && owner.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
                 }) =>

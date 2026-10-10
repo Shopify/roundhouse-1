@@ -3,6 +3,13 @@ require_relative "../action_dispatch/session"
 require_relative "../action_view"
 
 module ActionController
+  # Rails' `ActionController::Base < Metal`. Metal carries no behavior
+  # here; Base holds it all. It exists so a controller answers
+  # `is_a?(ActionController::Metal)` as in Rails (Core's
+  # PublicException::Metadata asks it).
+  class Metal
+  end
+
   # One-slot array so class-level CSRF state is a store every target
   # can index, not a `self` ivar or `class << self` writer.
   #
@@ -401,7 +408,7 @@ module ActionController
   # runtime stays target-agnostic — a CookieJar in this transpiled
   # file would have to satisfy every strict target's type system for
   # a feature none of them exercise yet.
-  class Base
+  class Base < ActionController::Metal
     def self.allow_forgery_protection
       ActionController.forgery_flag
     end
