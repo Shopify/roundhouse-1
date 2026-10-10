@@ -13,7 +13,7 @@
 //!
 //! The rewrite is the one that document prescribes, done once here
 //! instead of by hand in each app: `defined?(@x)` becomes a read of
-//! `@x_defined`, and every assignment to `@x` in the class sets the
+//! `@x_defined`, and every assignment to `@x` in the app sets the
 //! flag after the value lands —
 //!
 //! ```ruby
@@ -28,7 +28,7 @@
 //! `compute` that raises leaves the object as CRuby would: unassigned.
 //!
 //! Scope and refusal. The guard is rewritten only when EVERY assignment
-//! to that ivar in the class sits in statement position (a `Seq`
+//! to that ivar anywhere in the app sits in statement position (a `Seq`
 //! element or a body's sole expression), where the three-statement
 //! replacement is an ordinary sequence. An assignment nested inside an
 //! expression the pass cannot expand leaves the `defined?` untouched:
@@ -51,8 +51,18 @@ use crate::ident::Symbol;
 use crate::ty::Ty;
 
 pub fn apply_defined_ivar_memo_lowering(app: &mut App) {
+    // One pool for the whole app, not one per class: an ivar is the
+    // receiver's, and the receiver's writers need not live in the class
+    // that guards it. A module's `defined?(@x)` reads whatever the host
+    // assigned — Core's `GraphApi::HasNestedBreadthResolver#breadth_resolver`
+    // guards `@breadth_resolver`, which the extending class's inherited
+    // `Resolver.breadth_resolver=` sets — and a superclass or subclass
+    // writer is just as invisible to a per-class scan. Pooled, every
+    // writer of the name sets the flag (a flag on an unrelated class is
+    // an inert extra ivar) and any one writer the flag cannot follow
+    // keeps every guard of that name a real `defined?`.
+    let mut bodies: Vec<&mut Expr> = Vec::new();
     for model in &mut app.models {
-        let mut bodies: Vec<&mut Expr> = Vec::new();
         for item in &mut model.body {
             match item {
                 ModelBodyItem::Method { method, .. } => bodies.push(&mut method.body),
@@ -60,25 +70,21 @@ pub fn apply_defined_ivar_memo_lowering(app: &mut App) {
                 _ => {}
             }
         }
-        rewrite_class(bodies);
     }
     for lc in &mut app.library_classes {
-        let bodies: Vec<&mut Expr> = lc.methods.iter_mut().map(|m| &mut m.body).collect();
-        rewrite_class(bodies);
+        bodies.extend(lc.methods.iter_mut().map(|m| &mut m.body));
     }
     if let Some(lc) = &mut app.rails_application {
-        let bodies: Vec<&mut Expr> = lc.methods.iter_mut().map(|m| &mut m.body).collect();
-        rewrite_class(bodies);
+        bodies.extend(lc.methods.iter_mut().map(|m| &mut m.body));
     }
     for controller in &mut app.controllers {
-        let mut bodies: Vec<&mut Expr> = Vec::new();
         for item in &mut controller.body {
             if let ControllerBodyItem::Action { action, .. } = item {
                 bodies.push(&mut action.body);
             }
         }
-        rewrite_class(bodies);
     }
+    rewrite_class(bodies);
 }
 
 fn rewrite_class(mut bodies: Vec<&mut Expr>) {
@@ -90,13 +96,11 @@ fn rewrite_class(mut bodies: Vec<&mut Expr>) {
         return;
     }
     // An ivar whose every assignment can take the flag.
-    let rewritable: Vec<Symbol> = guarded
-        .iter()
-        .filter(|name| {
-            bodies.iter().all(|body| assignments_in_statement_position(body, name, true))
-        })
-        .cloned()
-        .collect();
+    let mut blocked: BTreeSet<Symbol> = BTreeSet::new();
+    for body in bodies.iter() {
+        collect_blocked(body, true, &mut blocked);
+    }
+    let rewritable: BTreeSet<Symbol> = guarded.difference(&blocked).cloned().collect();
     if rewritable.is_empty() {
         return;
     }
@@ -121,62 +125,67 @@ fn collect_guarded(e: &Expr, out: &mut BTreeSet<Symbol>) {
     e.node.for_each_child(&mut |c| collect_guarded(c, out));
 }
 
-/// Every `@name = …` in `e` is a statement — `statement` says whether
-/// `e` itself is one. A `Seq`'s elements are; so is a body's sole
-/// expression; a branch of an `If` is; an assignment anywhere else is
-/// a value some emitter would have to expand in place.
-fn assignments_in_statement_position(e: &Expr, name: &Symbol, statement: bool) -> bool {
+/// Every ivar some `@name = …` in `e` assigns outside statement
+/// position — `statement` says whether `e` itself is one. A `Seq`'s
+/// elements are; so is a body's sole expression; a branch of an `If`
+/// is; an assignment anywhere else is a value some emitter would have
+/// to expand in place. Compound, multiple and reflective writers block
+/// their ivar wherever they sit.
+fn collect_blocked(e: &Expr, statement: bool, out: &mut BTreeSet<Symbol>) {
     match &*e.node {
-        ExprNode::Assign { target: LValue::Ivar { name: n }, value } => {
-            if n == name && !statement {
-                return false;
+        ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+            if !statement {
+                out.insert(name.clone());
             }
-            assignments_in_statement_position(value, name, false)
+            collect_blocked(value, false, out);
+            return;
         }
-        ExprNode::OpAssign { target: LValue::Ivar { name: n }, .. } if n == name => false,
-        ExprNode::MultiAssign { targets, .. }
-            if targets.iter().any(|t| matches!(t, LValue::Ivar { name: n } if n == name)) =>
-        {
-            false
+        ExprNode::OpAssign { target: LValue::Ivar { name }, .. } => {
+            out.insert(name.clone());
+        }
+        ExprNode::MultiAssign { targets, .. } => {
+            for t in targets {
+                if let LValue::Ivar { name } = t {
+                    out.insert(name.clone());
+                }
+            }
         }
         ExprNode::Send { method, args, .. }
-            if matches!(method.as_str(), "instance_variable_set" | "remove_instance_variable")
-                && args.first().is_some_and(|a| names_ivar(a, name)) =>
+            if matches!(method.as_str(), "instance_variable_set" | "remove_instance_variable") =>
         {
-            false
+            if let Some(name) = args.first().and_then(literal_ivar_name) {
+                out.insert(name);
+            }
         }
         ExprNode::Seq { exprs } => {
-            exprs.iter().all(|x| assignments_in_statement_position(x, name, true))
+            for x in exprs {
+                collect_blocked(x, true, out);
+            }
+            return;
         }
         ExprNode::If { cond, then_branch, else_branch } => {
-            assignments_in_statement_position(cond, name, false)
-                && assignments_in_statement_position(then_branch, name, true)
-                && assignments_in_statement_position(else_branch, name, true)
+            collect_blocked(cond, false, out);
+            collect_blocked(then_branch, true, out);
+            collect_blocked(else_branch, true, out);
+            return;
         }
-        _ => {
-            let mut ok = true;
-            e.node.for_each_child(&mut |c| {
-                if ok && !assignments_in_statement_position(c, name, false) {
-                    ok = false;
-                }
-            });
-            ok
-        }
+        _ => {}
     }
+    e.node.for_each_child(&mut |c| collect_blocked(c, false, out));
 }
 
-/// `arg` is the ivar's name as a literal (`:@x`, `"@x"`); `name` is
-/// stored without the sigil.
-fn names_ivar(arg: &Expr, name: &Symbol) -> bool {
+/// `arg` is an ivar's name as a literal (`:@x`, `"@x"`), returned
+/// without the sigil as ivars are stored.
+fn literal_ivar_name(arg: &Expr) -> Option<Symbol> {
     let text = match &*arg.node {
         ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
         ExprNode::Lit { value: Literal::Str { value } } => value.as_str(),
-        _ => return false,
+        _ => return None,
     };
-    text.strip_prefix('@') == Some(name.as_str())
+    text.strip_prefix('@').map(Symbol::from)
 }
 
-fn rewrite_guards(e: &mut Expr, names: &[Symbol]) {
+fn rewrite_guards(e: &mut Expr, names: &BTreeSet<Symbol>) {
     e.node.for_each_child_mut(&mut |c| rewrite_guards(c, names));
     let span = e.span;
     let replacement = match &*e.node {
@@ -201,7 +210,7 @@ fn rewrite_guards(e: &mut Expr, names: &[Symbol]) {
 /// expression). Where it is not, the rewrite ends at the flag: a bare
 /// trailing `@x` in void context is a CRuby warning ("possibly useless
 /// use of a variable"), which Core's StrictWarning raises.
-fn rewrite_assignments(e: &mut Expr, names: &[Symbol], statement: bool, used: bool) {
+fn rewrite_assignments(e: &mut Expr, names: &BTreeSet<Symbol>, statement: bool, used: bool) {
     match &mut *e.node {
         ExprNode::Seq { exprs } => {
             let last = exprs.len().saturating_sub(1);
