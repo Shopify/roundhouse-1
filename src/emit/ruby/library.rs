@@ -9632,13 +9632,16 @@ fn emit_library_class_decl_inner(
         if wrote_def {
             writeln!(s).unwrap();
         }
-        for seed in lc.class_ivar_initializers.iter().filter(|e| groups().any(|g| g.seeds.contains(&e.span))) {
+        let mut seeds = lc.class_ivar_initializers.iter().filter(|e| groups().any(|g| g.seeds.contains(&e.span))).peekable();
+        let write_seed = |s: &mut String, seed: &Expr| {
             for line in super::emit_expr(seed).lines() {
                 writeln!(s, "{body_pad}{line}").unwrap();
             }
-        }
+        };
         // The include's carried `included do` statements, where Ruby runs
-        // them: right after it (`App::included_block_statements`).
+        // them: right after it (`App::included_block_statements`), each
+        // after the seeds its block writes above it and before those
+        // below it, in the block's own order.
         for (_, statement) in app
             .included_block_statements
             .get(&lc.name)
@@ -9646,6 +9649,10 @@ fn emit_library_class_decl_inner(
             .flatten()
             .filter(|(after, _)| after.0.as_str().trim_start_matches("::") == root)
         {
+            let at = statement.span;
+            while let Some(seed) = seeds.next_if(|seed| seed.span.file != at.file || seed.span.start < at.start) {
+                write_seed(s, seed);
+            }
             for line in super::emit_expr(statement).lines() {
                 if line.is_empty() {
                     writeln!(s).unwrap();
@@ -9653,6 +9660,9 @@ fn emit_library_class_decl_inner(
                     writeln!(s, "{body_pad}{line}").unwrap();
                 }
             }
+        }
+        for seed in seeds {
+            write_seed(s, seed);
         }
     };
     // An include whose `self.included(base)` hook calls class methods of

@@ -672,6 +672,52 @@ pub(super) fn splice_into_library_includers(
         }
     }
     defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
+    // The names an app class answers on its class side: its own
+    // `def self.x`, and a module's methods, which an `extend` (or a
+    // Concern's `ClassMethods`) puts there. A receiverless call in an
+    // `included do` naming none of them is a framework DSL a plain
+    // includer may not have on this runtime, and stays refused.
+    let class_side: HashSet<&str> = app
+        .library_classes
+        .iter()
+        .flat_map(|lc| {
+            lc.methods
+                .iter()
+                .filter(move |m| lc.is_module || m.receiver == MethodReceiver::Class)
+                .map(|m| m.name.as_str())
+        })
+        .collect();
+    // Or a gem class above it answers it (`QueryLayer::Response.field`,
+    // by the gem's RBI), or a gem module it includes mixes it in.
+    let gem_class_side = |lc: &crate::dialect::LibraryClass, method: &str| -> bool {
+        let boundary = &app.gem_boundary;
+        let name = Symbol::from(method);
+        if lc.includes.iter().any(|inc| boundary.loaded_mixed_in_class_methods(&top(inc)).contains(&name)) {
+            return true;
+        }
+        let mut scope = lc.name.0.as_str().to_string();
+        let mut at = lc.parent.clone();
+        for _ in 0..32 {
+            let Some(parent) = at.take() else { return false };
+            let resolved = boundary.resolve_written(&scope, &parent).unwrap_or_else(|| top(&parent));
+            if let Some(class) = boundary.loaded_reopen(&resolved) {
+                let owner = resolved.0.as_str();
+                if class.class_methods.contains_key(&name)
+                    || class.extends.iter().filter_map(|e| boundary.resolve_written(owner, e))
+                        .any(|e| boundary.loaded_instance_surface(&e).contains(&name))
+                {
+                    return true;
+                }
+                scope = owner.to_string();
+                at = class.parent.clone();
+            } else {
+                let Some(app_class) = app.library_classes.iter().find(|c| c.name == resolved) else { return false };
+                scope = app_class.name.0.as_str().to_string();
+                at = app_class.parent.clone();
+            }
+        }
+        false
+    };
     let block_includes = |concern: &ClassId| -> Vec<ClassId> {
         app.concern_model_items
             .get(concern)
@@ -860,6 +906,28 @@ pub(super) fn splice_into_library_includers(
                 if job
                     && let ModelBodyItem::Unknown { expr, .. } = item
                     && crate::lower::job_class_side::is_callbacks_port_call(expr)
+                {
+                    let root_id = top(&lc.includes[*root]);
+                    let class_attributes: &[Symbol] = &declared;
+                    if let ModelBodyItem::Unknown { expr, .. } =
+                        super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                    {
+                        plan.statements.push((root_id, expr));
+                    }
+                    continue;
+                }
+                // Any other call on the includer (`field :x, ...`,
+                // `filter_param :tag, ... do ... end`): Ruby class_evals
+                // the block on it, so it runs as written right after the
+                // include, ordered against the block's class_attribute
+                // seeds as written (`emit::ruby::library`).
+                if !job
+                    && !lc.is_module
+                    && hook.is_none()
+                    && let ModelBodyItem::Unknown { expr, .. } = item
+                    && let ExprNode::Send { recv, method, .. } = &*expr.node
+                    && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                    && (class_side.contains(method.as_str()) || gem_class_side(lc, method.as_str()))
                 {
                     let root_id = top(&lc.includes[*root]);
                     let class_attributes: &[Symbol] = &declared;
