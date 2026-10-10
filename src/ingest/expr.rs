@@ -1211,13 +1211,29 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // skips the call where Ruby's `&.` would dispatch (nil is
             // the only value `&.` guards) — acceptable until a real
             // call site cares, at which point Send grows a `safe` flag.
+            //
+            // A receiver that is itself an `&&` (`a&.b&.c`, so `(a && a.b)`)
+            // is truthy only as its right operand, so the guarded call
+            // goes to that operand: `(a && a.b) && a.b.c`, not
+            // `(a && a.b) && (a && a.b).c`. Same value, `a` read once less,
+            // and the call's receiver is the `a.b` read itself.
             match (c.is_safe_navigation(), recv) {
-                (true, Some(r)) => ExprNode::BoolOp {
-                    op: crate::expr::BoolOpKind::And,
-                    surface: crate::expr::BoolOpSurface::Symbol,
-                    left: r,
-                    right: Expr::new(span, send),
-                },
+                (true, Some(r)) => {
+                    let mut send = send;
+                    if let (
+                        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right: guarded, .. },
+                        ExprNode::Send { recv: send_recv, .. },
+                    ) = (&*r.node, &mut send)
+                    {
+                        *send_recv = Some(guarded.clone());
+                    }
+                    ExprNode::BoolOp {
+                        op: crate::expr::BoolOpKind::And,
+                        surface: crate::expr::BoolOpSurface::Symbol,
+                        left: r,
+                        right: Expr::new(span, send),
+                    }
+                }
                 _ => send,
             }
         }

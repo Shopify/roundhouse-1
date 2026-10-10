@@ -1368,6 +1368,19 @@ module ActiveRecord
       record
     end
 
+    # `last!` and `take!`, the same bang over `last` and `take`.
+    def last!
+      record = last
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
+    def take!
+      record = take
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
     def last
       rows = last_n(1)
       rows.length == 0 ? nil : rows[0]

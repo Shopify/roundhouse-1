@@ -23,9 +23,10 @@
 //! source and the arguments are literal: a Symbol name, an `id_class`
 //! constant that resolves to `Component::TrustedId` or a subclass (the
 //! macro's own `TypeError` check), and a literal `attribute:`. The
-//! `attribute: :id` form is left alone: its body branches on
-//! `composite_primary_key?`, which this step does not evaluate. A call
-//! left alone stays a dropped model-DSL statement.
+//! `attribute: :id` form (Shop's `trusted_id_attribute :id`) gets the
+//! heredoc's other branch, which tests `self.class.composite_primary_key?`
+//! when it runs, as Ruby's does. A call left alone stays a dropped
+//! model-DSL statement.
 //!
 //! Interim: this step is keyed on the module and macro name, which a
 //! lowering should not be. It stays as a measurement until generic model
@@ -220,20 +221,29 @@ fn parse_call(expr: &Expr, owner: &str, known: &HashSet<String>) -> Option<Call>
             attribute = sym(v)?;
         }
     }
-    (is_method_name(&attr_name) && is_method_name(&attribute) && attribute != "id").then_some(Call {
+    (is_method_name(&attr_name) && is_method_name(&attribute)).then_some(Call {
         attr_name,
         id_class,
         attribute,
     })
 }
 
-/// The heredoc's `def trusted_<attr_name>` (non-`id` branch) and the
-/// class-attribute merge, as Ruby evaluates them.
+/// The heredoc's `def trusted_<attr_name>` (the branch `attribute`
+/// selects) and the class-attribute merge, as Ruby evaluates them.
 fn lower_call(owner: &ClassId, call: &Call, span: Span) -> Option<(MethodDef, Expr)> {
     let Call { attr_name, id_class, attribute } = call;
     let ivar = format!("@_trusted_{attr_name}");
+    let reader = if attribute == "id" {
+        format!(
+            "  def trusted_{attr_name}\n    if self.class.composite_primary_key?\n      return [] unless id?\n      return {ivar} if {ivar}&.map(&:db_id) == id\n      {ivar} = id.zip(::{id_class}).map {{ |id_value, klass| klass.new(id_value) }}\n    else\n      db_id = id\n      return nil unless db_id\n\n      return {ivar} if {ivar}&.db_id == db_id\n      {ivar} = ::{id_class}.new(db_id)\n    end\n  end\n"
+        )
+    } else {
+        format!(
+            "  def trusted_{attr_name}\n    db_id = {attribute}\n    return nil unless db_id\n\n    return {ivar} if {ivar}&.db_id == db_id\n    {ivar} = ::{id_class}.new(db_id)\n  end\n"
+        )
+    };
     let src = format!(
-        "class RoundhouseTrustedIdAttribute\n  def trusted_{attr_name}\n    db_id = {attribute}\n    return nil unless db_id\n\n    return {ivar} if {ivar}&.db_id == db_id\n    {ivar} = ::{id_class}.new(db_id)\n  end\n\n  def self.roundhouse_merge\n    self.{ATTR} = {ATTR}.merge({attr_name}: ::{id_class})\n  end\nend\n"
+        "class RoundhouseTrustedIdAttribute\n{reader}\n  def self.roundhouse_merge\n    self.{ATTR} = {ATTR}.merge({attr_name}: ::{id_class})\n  end\nend\n"
     );
     let classes = match super::ingest_library_classes(src.as_bytes(), "<trusted_id_attribute>") {
         Ok(classes) => classes,

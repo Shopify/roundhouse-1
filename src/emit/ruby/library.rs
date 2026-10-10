@@ -2238,6 +2238,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let names = crate::lower::scope_chain::all_scope_names(&scopes);
     let user_returns = crate::lower::scope_chain::build_user_method_returns(&app.models);
     let unique_keys = crate::lower::scope_chain::build_unique_keys(&app.models, &app.schema);
+    let shadowed =
+        crate::lower::scope_chain::shadowed_models(&app.models, app.library_classes.iter().map(|c| c.name.0.as_str()));
     let regs = crate::lower::scope_chain::Registries {
         scopes: &scopes,
         models: &models,
@@ -2247,6 +2249,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         unique_keys: &unique_keys,
         track_targets,
         plain_subclasses: &plain_subclasses,
+        shadowed: &shadowed,
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");

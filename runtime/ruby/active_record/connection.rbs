@@ -112,7 +112,8 @@ module ActiveRecord
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
     def self._primary_key_from_database: (untyped value) -> untyped
-    def update_column: (String | Symbol name, untyped value) -> bool
+    def update_column: (String | Symbol name, untyped value, ?touch: untyped) -> bool
+    def update_columns: (Hash[String | Symbol, untyped] attributes) -> bool
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Nil and uncastable request keys reject before the scalar adapter.
     def self.exists?: (?(Integer | Float | String | nil) id) -> bool
