@@ -468,6 +468,20 @@ pub(super) fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_has_literal_list_call(m.body())
         || body_has_mixin_include(m.body())
         || !concerning_calls(m.body()).is_empty()
+        || body_is_only_calls(m.body())
+}
+
+/// A body of calls alone, nothing nested: `module BooleanType; freeze;
+/// end` in Core's component/schema.rb, whose `when
+/// BooleanType.singleton_class` reads the module. Ruby defines the
+/// module whatever its body holds; a namespace is a module that nests
+/// declarations, and this one nests none. Surfaced as a module of its
+/// own, each call is replayed or reported dropped by its class-body
+/// rules, as a class's would be.
+fn body_is_only_calls(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    let stmts = flatten_statements(body);
+    !stmts.is_empty() && stmts.iter().all(|stmt| stmt.as_call_node().is_some())
 }
 
 /// A body that includes a module by constant: the module is a mixin
