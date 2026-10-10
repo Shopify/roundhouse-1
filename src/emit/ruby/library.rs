@@ -9948,6 +9948,15 @@ fn emit_library_class_decl_inner(
             write_seed(s, seed);
         }
     };
+    // The defs an ordered body wrote above.
+    let written_in_state: Vec<usize> = state_body
+        .iter()
+        .filter_map(|item| match item {
+            StateItem::Method(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    let instance_form = extend_self_instance_defs(lc, app, &replayed);
     // An include whose `self.included(base)` hook calls class methods of
     // this class runs after them, as in the source (see
     // `hooked_include_position`); the rest open the body as before. An
@@ -9991,6 +10000,36 @@ fn emit_library_class_decl_inner(
     for (_, inc) in &positioned {
         extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
     }
+    // A load-time require that reaches back for this module (a cycle)
+    // runs the module's `included`/`extended`/`prepended`/`inherited`
+    // hooks as it loads, so a hook the source defines above its body
+    // statements exists before the requires, as in Ruby, where a `def`
+    // runs where it stands (Module#included, Class#inherited).
+    let hoisted_hooks: Vec<usize> = if in_body_after_includes.is_empty() {
+        Vec::new()
+    } else {
+        lc.methods
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.receiver == MethodReceiver::Class
+                    && matches!(m.name.as_str(), "included" | "extended" | "prepended" | "inherited")
+                    && !carried_method(m)
+                    && !written_in_state.contains(i)
+                    && !instance_form.get(*i).copied().unwrap_or(false)
+                    && inherited_alias(lc, m).is_none()
+                    && !lc.conditional_definitions.iter().any(|c| c.contains(m))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    for &index in &hoisted_hooks {
+        writeln!(s).unwrap();
+        write_library_method(&mut s, lc, index, &body_pad, &instance_form);
+    }
+    if !hoisted_hooks.is_empty() {
+        writeln!(s).unwrap();
+    }
     for r in &in_body_after_includes {
         writeln!(s, "{body_pad}{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
     }
@@ -10009,7 +10048,6 @@ fn emit_library_class_decl_inner(
     // reading them) emit after the methods, which is where the source
     // had them. `emit_deferred_constants` renders that tail.
     // (The replayed class-body calls are computed above the includes.)
-    let instance_form = extend_self_instance_defs(lc, app, &replayed);
     // A replayed `prepend` whose module's `self.prepended(base)` hook
     // reaches this class's methods is written after them, the way
     // `hooked_include_position` places an include; the rest stay with
@@ -10282,14 +10320,6 @@ fn emit_library_class_decl_inner(
             None => render_constants(&mut s, &eager),
         }
     }
-    // The defs an ordered body wrote above.
-    let written_in_state: Vec<usize> = state_body
-        .iter()
-        .filter_map(|item| match item {
-            StateItem::Method(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
     // One below every eagerly written constant: after them, unless a
     // constant written after the methods is above it too, or a
     // class-body call written below them (`nested_position`), which it
@@ -10513,6 +10543,10 @@ fn emit_library_class_decl_inner(
         }
         // Written in an ordered body's source order (`state_body`).
         if written_in_state.contains(&index) {
+            continue;
+        }
+        // Written above the load-cycle requires (`hoisted_hooks`).
+        if hoisted_hooks.contains(&index) {
             continue;
         }
         let conditional = lc.conditional_definitions.iter().position(|c| c.contains(m));
