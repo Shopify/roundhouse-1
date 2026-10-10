@@ -216,3 +216,65 @@ fn symbol_enum_matches_native_rails_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted_lines, native, "emitted");
 }
+
+/// Core's symbol_enum.rb verbatim: the Sorbet `extend T::Helpers` and
+/// `requires_ancestor` lines in the module body.
+const SYMBOL_ENUM_CORE: &str = r#"# typed: true
+# frozen_string_literal: true
+
+module SymbolEnum
+  extend T::Helpers
+
+  requires_ancestor { Module }
+  requires_ancestor { ActiveModel::Validations::ClassMethods }
+  def symbol_enum(column, possible_values, **options)
+    singleton_class.send(:define_method, column.to_s.pluralize) do
+      possible_values
+    end
+
+    define_method(column) { super()&.to_sym }
+
+    if options[:optional]
+      validates(column, inclusion: { in: possible_values }, allow_nil: true)
+    else
+      validates(column, presence: true)
+      validates(column, inclusion: { in: possible_values })
+    end
+  end
+end
+"#;
+
+/// PlaybookAction's shape: an abstract app superclass between the model
+/// and ApplicationRecord, constants before the calls.
+const SHOP_RECORD: &str = "class ShopRecord < ApplicationRecord\n  self.abstract_class = true\nend\n";
+
+const PLAYBOOK_ACTION_SHAPE: &str = r#"# typed: strict
+# frozen_string_literal: true
+
+class Playbook < ShopRecord
+  self.table_name = "playbooks"
+
+  extend SymbolEnum
+
+  BUDGET_TARGET = "budget"
+
+  symbol_enum :status, [:active, :paused, :errored], optional: true
+  symbol_enum :kind, [:manual, :auto]
+end
+"#;
+
+/// Core's module and PlaybookAction's model shape replay the same way.
+#[test]
+fn core_symbol_enum_under_an_abstract_superclass_replays_as_written() {
+    let (emitted, errors) = overlay()
+        .write("app/models/symbol_enum.rb", SYMBOL_ENUM_CORE)
+        .write("app/models/shop_record.rb", SHOP_RECORD)
+        .write("app/models/playbook.rb", PLAYBOOK_ACTION_SHAPE)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let text = std::fs::read_to_string(emitted.join("app/models/playbook.rb")).unwrap();
+    assert!(load_time_raises(&text).is_empty(), "{text}");
+    assert!(text.contains("  symbol_enum :status, [:active, :paused, :errored], optional: true\n"), "{text}");
+    assert!(text.contains("  symbol_enum :kind, [:manual, :auto]\n"), "{text}");
+    let refused: Vec<&String> = errors.iter().filter(|e| e.contains("symbol_enum")).collect();
+    assert!(refused.is_empty(), "{refused:#?}");
+}
