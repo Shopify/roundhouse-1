@@ -917,11 +917,23 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
             // `belongs_to` declarations they decide.
             Some((_, macro_replay::MacroVerdict::Replay | macro_replay::MacroVerdict::BelongsToRequiredByDefault(_))) => continue,
             Some((_, macro_replay::MacroVerdict::Refuse(reason))) => {
+                // The association the call declares
+                // (`ingest::macro_associations`) is compiled even so.
+                let declared = model.body.iter().find_map(|i| match i {
+                    crate::dialect::ModelBodyItem::Association { assoc, span, .. } if *span == expr.span => Some(assoc),
+                    _ => None,
+                });
+                let declared = declared.map_or_else(String::new, |a| {
+                    format!(
+                        "; its `{}` association is compiled from the call, and the rest of the macro does not run",
+                        a.name().as_str()
+                    )
+                });
                 out.push(Diagnostic::unsupported(
                     expr.span,
                     None,
                     dropped_statement_name(expr).as_str(),
-                    format!("model macro call on `{}` not lowered; {reason}", model.name.0.as_str()),
+                    format!("model macro call on `{}` not lowered; {reason}{declared}", model.name.0.as_str()),
                 ));
                 continue;
             }
