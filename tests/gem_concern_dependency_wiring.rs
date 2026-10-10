@@ -18,14 +18,14 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesu
 
 const SCHEMA: &str = "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"notes\", force: :cascade do |t|\n    t.string \"title\"\n  end\nend\n";
 
-const GEM_ENTRY: &str = "require \"active_support\"\nrequire \"active_support/concern\"\nrequire \"active_record\"\nrequire \"miniredact/metadata\"\nrequire \"miniredact/redactable\"\nrequire \"miniredact/railtie\"\n";
+const GEM_ENTRY: &str = "require \"active_support\"\nrequire \"active_support/concern\"\nrequire \"active_record\"\nrequire \"miniredact/concerns/metadata\"\nrequire \"miniredact/concerns/redactable\"\nrequire \"miniredact/railtie\"\n";
 
 const METADATA: &str = "module Miniredact\n  module Metadata\n    extend ActiveSupport::Concern\n\n    module ClassMethods\n      def documented = :documented\n    end\n  end\nend\n";
 
 const REDACTABLE: &str = "module Miniredact\n  module Redactable\n    extend ActiveSupport::Concern\n\n    included do\n      class_attribute :redaction_strategies, default: {}\n    end\n\n    module ClassMethods\n      def custom_strategy(field, with:)\n        self.redaction_strategies = redaction_strategies.merge(field => with)\n      end\n    end\n\n    def redact_title = self.class.redaction_strategies.fetch(:title).call(self)\n  end\nend\n";
 
 fn railtie(hook: &str) -> String {
-    format!("module Miniredact\n  class Railtie < ::Rails::Railtie\n{hook}\n  end\nend\n")
+    format!("require \"rails\"\nrequire \"rails/railtie\"\nrequire \"miniredact/concerns/metadata\"\nrequire \"miniredact/concerns/redactable\"\n\nmodule Miniredact\n  class Railtie < ::Rails::Railtie\n    config.eager_load_namespaces << Miniredact\n\n{hook}\n  end\nend\n")
 }
 
 const INITIALIZER: &str = "    initializer \"miniredact.attach\" do\n      Miniredact::Metadata.include Miniredact::Redactable\n    end";
@@ -51,8 +51,8 @@ fn app(railtie_body: &str) -> emit_and_run::Overlay {
         .write("roundhouse.yml", "test_paths:\n  - test\ngem_sources:\n  miniredact: vendor/gems/miniredact-1.0.0\n")
         .write("Gemfile.lock", LOCK)
         .write("vendor/gems/miniredact-1.0.0/lib/miniredact.rb", GEM_ENTRY)
-        .write("vendor/gems/miniredact-1.0.0/lib/miniredact/metadata.rb", METADATA)
-        .write("vendor/gems/miniredact-1.0.0/lib/miniredact/redactable.rb", REDACTABLE)
+        .write("vendor/gems/miniredact-1.0.0/lib/miniredact/concerns/metadata.rb", METADATA)
+        .write("vendor/gems/miniredact-1.0.0/lib/miniredact/concerns/redactable.rb", REDACTABLE)
         .write("vendor/gems/miniredact-1.0.0/lib/miniredact/railtie.rb", &railtie(railtie_body))
         .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
         .write("db/schema.rb", SCHEMA)
