@@ -159,7 +159,8 @@ fn unconsumed_hook_from(includes: Vec<ClassId>, app: &App, job: bool) -> Option<
                             && (method.name_span.file != expr.span.file
                                 || method.name_span.start < expr.span.start))
                     });
-                let consumed = job
+                let consumed = (!intercepts_registration && extend_only_hook(class, method, app))
+                    || job
                     && class.is_module
                     // A Concern's own `included` would stand in for the one
                     // its `included do` calls.
@@ -187,6 +188,62 @@ fn unconsumed_hook_from(includes: Vec<ClassId>, app: &App, job: bool) -> Option<
         }
     }
     None
+}
+
+/// A plain module's `def self.included(base) base.extend(ClassMethods)
+/// end` (query_layer-active_record's QueryLayer::ActiveRecord): the
+/// emitted include runs it, as Ruby does, at the include's position, and
+/// all it does is put an app module's methods on the includer's
+/// singleton chain. A carried `class_attribute` or `attr_accessor`
+/// defines the includer's own methods, which win over an extended
+/// module's in either order, and a carried call dispatches through the
+/// chain the emitted includes build. Only an extended module defining
+/// none of the macros a carry lowers is admitted, and a Concern (whose
+/// own `included` would replace the one its block registers) is not.
+fn extend_only_hook(class: &crate::dialect::LibraryClass, method: &crate::dialect::MethodDef, app: &App) -> bool {
+    if !class.is_module
+        || method.name.as_str() != "included"
+        || method.receiver != MethodReceiver::Class
+        || method.params.len() != 1
+        || method.params[0].keyword
+        || method.params[0].default.is_some()
+        || method.block_param.is_some()
+        || app.concern_model_items.get(&class.name).is_some_and(|items| !items.is_empty())
+    {
+        return false;
+    }
+    let base = &method.params[0].name;
+    let statements: Vec<&Expr> = match &*method.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&method.body],
+    };
+    let extends_app_module = |expr: &Expr| {
+        let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+            return false;
+        };
+        if method.as_str() != "extend"
+            || !matches!(&*recv.node, ExprNode::Var { name, .. } if name == base)
+            || args.len() != 1
+        {
+            return false;
+        }
+        let ExprNode::Const { path } = &*args[0].node else { return false };
+        let path = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+        let nested = format!("{}::{path}", class.name.0.as_str());
+        let module = |name: &str| app.library_classes.iter().find(|lc| lc.is_module && lc.name.0.as_str() == name);
+        let Some(module) = module(&nested).or_else(|| module(&path)) else {
+            return false;
+        };
+        !module.methods.iter().any(|m| {
+            m.receiver == MethodReceiver::Instance
+                && matches!(
+                    m.name.as_str(),
+                    "class_attribute" | "attr_accessor" | "attr_reader" | "attr_writer"
+                        | "included" | "extended" | "append_features"
+                )
+        })
+    };
+    !statements.is_empty() && statements.into_iter().all(extends_app_module)
 }
 
 /// The model splice supplies only direct inclusions. Refuse other activated
@@ -862,6 +919,33 @@ pub(super) fn splice_into_library_includers(
         }
         false
     };
+    // The Concerns whose block a class other than a library class or a
+    // model runs (a controller, a test's class, a module): their block
+    // `def`s stay on the Concern (`carry_block_defs`).
+    let mut hosted_elsewhere: HashSet<ClassId> = HashSet::default();
+    for &index in &bases {
+        let lc = &app.library_classes[index];
+        let (inherited, _) = ancestry(lc);
+        let (reached, blocked) = reach(lc, &inherited);
+        if lc.is_module {
+            hosted_elsewhere.extend(reached.into_iter().map(|(_, id)| id));
+        }
+        hosted_elsewhere.extend(blocked);
+    }
+    let mut stack: Vec<ClassId> = app
+        .controllers
+        .iter()
+        .flat_map(crate::analyze::controller_includes)
+        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter()).flat_map(|c| c.includes.iter().cloned()))
+        .map(|id| top(&id))
+        .collect();
+    while let Some(id) = stack.pop() {
+        if hosted_elsewhere.insert(id.clone()) {
+            stack.extend(module_includes.get(&id).into_iter().flatten().cloned());
+            stack.extend(block_includes(&id));
+        }
+    }
+    let mut moved: HashSet<ClassId> = HashSet::default();
     let mut planned: Vec<Plan> = Vec::new();
     let mut refusals: Vec<(Span, String)> = Vec::new();
     let mut dropped: HashMap<Span, (String, ClassId, Vec<ClassId>)> = HashMap::default();
@@ -1031,6 +1115,25 @@ pub(super) fn splice_into_library_includers(
                     }
                     continue;
                 }
+                // `unless method_defined?(:to_h) define_method :to_h do
+                // ... end end` (Apps::Extension): Ruby asks the includer,
+                // with what the block included so far, so it runs as
+                // written after the last of those includes.
+                if !job
+                    && !lc.is_module
+                    && hook.is_none()
+                    && let ModelBodyItem::Unknown { expr, .. } = item
+                    && guarded_define_method(expr)
+                {
+                    let root_id = block_included.last().map(top).unwrap_or_else(|| top(&lc.includes[*root]));
+                    let class_attributes: &[Symbol] = &declared;
+                    if let ModelBodyItem::Unknown { expr, .. } =
+                        super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                    {
+                        plan.statements.push((root_id, expr));
+                    }
+                    continue;
+                }
                 let attribute = match item {
                     ModelBodyItem::Method { method, .. } => declared.iter().find(|n| generated_for(method, n)),
                     ModelBodyItem::ClassBody { expr, .. } => {
@@ -1123,6 +1226,21 @@ pub(super) fn splice_into_library_includers(
                     _ => unreachable!(),
                 }
             }
+            // The block's `def`s: Ruby class_evals them onto the
+            // includer, above every module the block includes, which
+            // the Concern's own methods sit below. Carried onto the
+            // includer when the block includes one, so `super` and
+            // dispatch follow Ruby's order (Apps::Extension's
+            // `initialize(app_id:, **config)` ahead of SmartProperties').
+            // An own method of the includer wins, as one it writes after
+            // the include does in Ruby.
+            if !block_included.is_empty() && !lc.is_module && !hosted_elsewhere.contains(concern) {
+                let owns = |m: &crate::dialect::MethodDef| {
+                    lc.methods.iter().any(|own| own.receiver == m.receiver && own.name == m.name)
+                };
+                carry_block_defs(app, concern, &lc.name, owns, &defined, &mut plan.methods);
+                moved.insert(concern.clone());
+            }
         }
         for expr in accessors {
             supply_accessor(lc, owner, expr, hook.as_ref(), &mut plan.methods, &mut refusals);
@@ -1134,6 +1252,66 @@ pub(super) fn splice_into_library_includers(
             || !plan.carried.is_empty()
         {
             planned.push(plan);
+        }
+    }
+    // A model runs the same blocks (`analyze` splices their includes
+    // after its own `include`), so it takes their `def`s too, once, at
+    // the topmost model whose chain includes the Concern.
+    let model_parents: HashMap<&ClassId, &ClassId> =
+        app.models.iter().filter_map(|m| Some((&m.name, m.parent.as_ref()?))).collect();
+    let model_reach = |model: &crate::dialect::Model| -> Vec<ClassId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<ClassId> = crate::analyze::model_includes(model).iter().map(top).rev().collect();
+        let mut seen = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !verified.contains(&id) || !seen.insert(id.clone()) {
+                continue;
+            }
+            stack.extend(module_includes.get(&id).into_iter().flatten().cloned());
+            stack.extend(block_includes(&id));
+            out.push(id);
+        }
+        out
+    };
+    let mut model_methods: Vec<(usize, Vec<crate::dialect::MethodDef>)> = Vec::new();
+    for (index, model) in app.models.iter().enumerate() {
+        let mut inherited: HashSet<ClassId> = HashSet::default();
+        let mut at = model_parents.get(&model.name).map(|p| top(p));
+        for _ in 0..32 {
+            let Some(parent) = at.take() else { break };
+            let Some(parent_model) = app.models.iter().find(|m| m.name == parent) else { break };
+            inherited.extend(model_reach(parent_model));
+            at = model_parents.get(&parent_model.name).map(|p| top(p));
+        }
+        let mut methods = Vec::new();
+        for concern in model_reach(model) {
+            if inherited.contains(&concern) || block_includes(&concern).is_empty() || hosted_elsewhere.contains(&concern) {
+                continue;
+            }
+            let owns = |m: &crate::dialect::MethodDef| {
+                model.body.iter().any(|item| {
+                    matches!(item, ModelBodyItem::Method { method: own, .. } if own.receiver == m.receiver && own.name == m.name)
+                })
+            };
+            carry_block_defs(app, &concern, &model.name, owns, &defined, &mut methods);
+            moved.insert(concern);
+        }
+        if !methods.is_empty() {
+            model_methods.push((index, methods));
+        }
+    }
+    for (index, methods) in model_methods {
+        app.models[index].body.extend(methods.into_iter().map(|method| ModelBodyItem::Method {
+            method,
+            leading_comments: Vec::new(),
+            leading_blank_line: true,
+        }));
+    }
+    // A carried block `def` is the includer's; the Concern keeps none.
+    for concern in &moved {
+        let span = included_call(app, concern);
+        for c in app.library_classes.iter_mut().filter(|c| c.name == *concern) {
+            c.methods.retain(|m| !block_def(m, span));
         }
     }
     for plan in planned {
@@ -1272,6 +1450,94 @@ fn included_call(app: &App, concern: &ClassId) -> Span {
                 if method.as_str() == "included")
         })
         .map_or_else(Span::synthetic, |e| e.span)
+}
+
+
+/// An instance `def` written in the Concern's `included do` (`span`).
+fn block_def(method: &crate::dialect::MethodDef, span: Span) -> bool {
+    method.receiver == MethodReceiver::Instance
+        && !method.name_span.is_synthetic()
+        && !span.is_synthetic()
+        && method.name_span.file == span.file
+        && span.start <= method.name_span.start
+        && method.name_span.end <= span.end
+}
+
+/// The Concern's block `def`s as the includer's own methods
+/// (`splice_into_library_includers`). A constant keeps the block's
+/// lexical scope: one the Concern's enclosing namespaces define is
+/// qualified, and the Concern's own resolve through the includer's
+/// ancestry, as `super::app::rehome_carried` does for statements.
+fn carry_block_defs(
+    app: &App,
+    concern: &ClassId,
+    owner: &ClassId,
+    owns: impl Fn(&crate::dialect::MethodDef) -> bool,
+    defined: &HashSet<String>,
+    methods: &mut Vec<crate::dialect::MethodDef>,
+) {
+    fn qualify(e: &mut Expr, scopes: &[String], defined: &HashSet<String>) {
+        if let ExprNode::Const { path } = &mut *e.node
+            && let Some(first) = path.first()
+            && !first.as_str().is_empty()
+        {
+            let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            if let Some(scope) = scopes.iter().find(|scope| defined.contains(&format!("{scope}::{written}"))) {
+                let mut full: Vec<Symbol> = scope.split("::").map(Symbol::from).collect();
+                full.append(path);
+                *path = full;
+            }
+            return;
+        }
+        e.node.for_each_child_mut(&mut |child| qualify(child, scopes, defined));
+    }
+    let span = included_call(app, concern);
+    let segments: Vec<&str> = concern.0.as_str().split("::").collect();
+    let scopes: Vec<String> = (1..segments.len()).rev().map(|n| segments[..n].join("::")).collect();
+    for c in app.library_classes.iter().filter(|c| c.name == *concern) {
+        for method in c.methods.iter().filter(|m| block_def(m, span)) {
+            if owns(method) {
+                continue;
+            }
+            let mut method = method.clone();
+            qualify(&mut method.body, &scopes, defined);
+            method.enclosing_class = Some(owner.0.clone());
+            methods.retain(|m| !(m.receiver == method.receiver && m.name == method.name));
+            methods.push(method);
+        }
+    }
+}
+
+/// `if`/`unless` over the includer's `method_defined?(:name)` (or its
+/// private/public/protected spellings) whose branches only
+/// `define_method(:literal) do ... end` on it.
+fn guarded_define_method(expr: &Expr) -> bool {
+    fn receiverless(expr: &Expr) -> Option<(&str, &[Expr], bool)> {
+        let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return None };
+        recv.as_ref()
+            .is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            .then(|| (method.as_str(), args.as_slice(), block.is_some()))
+    }
+    fn literal(args: &[Expr]) -> bool {
+        matches!(args, [arg] if matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }))
+    }
+    fn defines(expr: &Expr) -> bool {
+        match &*expr.node {
+            ExprNode::Seq { exprs } => exprs.iter().all(defines),
+            ExprNode::Lit { value: Literal::Nil } => true,
+            _ => receiverless(expr).is_some_and(|(method, args, block)| method == "define_method" && block && literal(args)),
+        }
+    }
+    let ExprNode::If { cond, then_branch, else_branch } = &*expr.node else { return false };
+    let guard = receiverless(cond).is_some_and(|(method, args, block)| {
+        !block
+            && literal(args)
+            && matches!(
+                method,
+                "method_defined?" | "public_method_defined?" | "private_method_defined?" | "protected_method_defined?"
+            )
+    });
+    guard && defines(then_branch) && defines(else_branch)
 }
 
 /// Up to three names, then how many more.
