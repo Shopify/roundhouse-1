@@ -780,3 +780,132 @@ fn the_included_drop_warning_fires_only_for_an_includer_without_the_block() {
     assert!(!drops.iter().any(|m| m.contains("`Shared`")), "{drops:#?}");
     assert!(drops.iter().any(|m| m.contains("`Served`")), "{drops:#?}");
 }
+
+// ---- A sibling module's extend-only `included` hook --------------------------
+
+/// Core's Sales::Query::LineItemResponse shape: a QueryLayer::Response
+/// subclass includes query_layer-active_record's QueryLayer::ActiveRecord
+/// (`def self.included(base) base.extend(ClassMethods) end`) ahead of
+/// SalesAggregateValuesBatchLoading, whose `included do` calls the
+/// superclass's `field` macro and declares `class_attribute
+/// :sale_aggregate_mapping`, which its `class_methods` macro then writes
+/// from the includer's body. The hook only extends the includer, so the
+/// block is carried; it was refused, and every `sales_aggregate_field`
+/// raised NoMethodError at load.
+const RESPONSE: &str = r##"class Response
+  def self.field(name, **options)
+    (@fields ||= []) << [name, options.keys.sort]
+  end
+
+  def self.fields = @fields
+end
+"##;
+
+const RECORD_BACKED: &str = r##"module RecordBacked
+  module ClassMethods
+    def model = :record
+  end
+
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+end
+"##;
+
+const AGGREGATED: &str = r##"module Aggregated
+  extend ActiveSupport::Concern
+
+  included do
+    field(
+      :sales_aggregate,
+      depends_on: [:id],
+      batch_load: true
+    )
+
+    class_attribute(
+      :sale_aggregate_mapping,
+      instance_accessor: false,
+      instance_predicate: false,
+      instance_writer: false,
+      instance_reader: true,
+      default: {}
+    )
+  end
+
+  class_methods do
+    def sales_aggregate_field(field_name, sale_fields:, depends_on: [])
+      field(field_name, depends_on: [:sales_aggregate, *depends_on])
+      klass = self
+      klass.sale_aggregate_mapping[field_name] = Array.wrap(sale_fields)
+    end
+  end
+
+  def mapped(field) = sale_aggregate_mapping[field]
+end
+"##;
+
+const LINE_RESPONSE: &str = r##"class LineResponse < Response
+  include RecordBacked
+  include Aggregated
+
+  sales_aggregate_field :total, sale_fields: "amount"
+  sales_aggregate_field :tax, sale_fields: ["tax", "duty"]
+end
+"##;
+
+const AGGREGATED_SCRIPT: &str = r##"p LineResponse.fields
+p LineResponse.sale_aggregate_mapping
+p [LineResponse.model, LineResponse.new.mapped(:tax), LineResponse.new.respond_to?(:sale_aggregate_mapping=)]
+p [Response.respond_to?(:sale_aggregate_mapping), LineResponse.respond_to?(:sale_aggregate_mapping?)]
+"##;
+
+#[test]
+fn an_extend_only_hook_beside_the_concern_leaves_its_block_carried_as_native() {
+    let classes = [
+        ("app/models/response.rb", RESPONSE),
+        ("app/models/concerns/record_backed.rb", RECORD_BACKED),
+        ("app/models/concerns/aggregated.rb", AGGREGATED),
+        ("app/models/line_response.rb", LINE_RESPONSE),
+    ];
+    let program: String = classes.iter().map(|(_, source)| *source).collect();
+    let expected = native(
+        "aggregated",
+        &format!("{NATIVE_PRELUDE}require \"active_support/core_ext/array/wrap\"\n{program}{AGGREGATED_SCRIPT}"),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        expected,
+        [
+            "[[:sales_aggregate, [:batch_load, :depends_on]], [:total, [:depends_on]], [:tax, [:depends_on]]]",
+            r#"{total: ["amount"], tax: ["tax", "duty"]}"#,
+            r#"[:record, ["tax", "duty"], false]"#,
+            "[false, false]",
+        ],
+        "native control"
+    );
+    let run = classes
+        .iter()
+        .fold(emit_and_run::real_blog(), |overlay, (path, source)| {
+            overlay.write(path, source)
+        })
+        .run_ruby(AGGREGATED_SCRIPT);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
+}
+
+/// A hook that does more than extend the includer still blocks the carry.
+#[test]
+fn a_hook_doing_more_than_extend_still_refuses_the_carry() {
+    let hooked = "module Hooked\n  module ClassMethods\n    def model = :record\n  end\n\n  def self.included(base)\n    base.extend(ClassMethods)\n    base.define_method(:x) { 1 }\n  end\nend\n";
+    let (gaps, _) = refused(&[
+        ("app/models/concerns/hooked.rb", hooked),
+        ("app/models/concerns/aggregated.rb", AGGREGATED),
+        ("app/models/response.rb", RESPONSE),
+        ("app/models/line_response.rb", "class LineResponse < Response\n  include Hooked\n  include Aggregated\nend\n"),
+    ]);
+    assert!(
+        gaps.iter().any(|g| g.contains("class_attribute :sale_aggregate_mapping on LineResponse: cannot be carried alongside an unconsumed included hook")),
+        "{gaps:#?}"
+    );
+}
