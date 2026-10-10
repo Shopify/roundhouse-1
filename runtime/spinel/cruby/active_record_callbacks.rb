@@ -16,7 +16,8 @@
 # from class methods and `included` hooks the same way.
 #
 # The registration methods are Base's class methods: before_/around_/
-# after_ save, create, update and destroy; after_find and after_touch;
+# after_ save, create, update and destroy; after_initialize, after_find
+# and after_touch;
 # before_validation and after_validation; after_commit, after_save_commit,
 # after_create_commit, after_update_commit, after_destroy_commit and
 # after_rollback. Each takes Rails' filters (a method name, a block or
@@ -52,6 +53,18 @@
 #   callbacks before initialize callbacks. A reload re-marks a persisted
 #   record and runs none, as Rails' reload runs them on a fresh object it
 #   discards.
+# - initialize: the end of `new`, after the constructor assigned the
+#   attributes and yielded to its block, and the end of a hydration
+#   (`instantiate`, `from_stmt`), after the find chain, as Rails' `new`
+#   and `init_with_attributes` run `_run_initialize_callbacks`. The first
+#   runtime `after_initialize` on a class wraps those class methods, and
+#   `after_initialize` itself, on it and on every subclass
+#   (InitializeHooks): `new` inside a hydration factory builds the empty
+#   shell the factory fills, and runs nothing; a class whose compiled
+#   code already calls its declared `after_initialize` hook runs the
+#   chain from that call, once. state_machines-audit_trail's
+#   `audit_trail` registers its initial-transition log from a
+#   `state_machine` block (Core's Sales::Subscriptions::ContractIdentity).
 # A readonly record runs the save (or destroy) chain up to the write,
 # which raises ActiveRecord::ReadOnlyRecord, as Rails raises it inside the
 # chain (the Persistence methods of runtime/active_record_core.rb are
@@ -76,9 +89,12 @@
 # - The validation callbacks run inside `save` and `save!`, around
 #   `valid?`, as the compiled ones do (runtime/active_record/connection.rb's
 #   `save`); a direct `valid?` runs neither, where Rails runs both.
-# - `after_initialize` and `before_commit` registered at runtime raise
-#   NotImplementedError naming the class: the compiled constructor and
-#   transaction call their hooks directly, with no chain to join.
+# - `before_commit` registered at runtime raises NotImplementedError
+#   naming the class: the transaction calls its hook directly, with no
+#   chain to join.
+# - `dup` and STI `becomes` build through `new`, so a class with runtime
+#   `after_initialize` callbacks runs them there, where Rails' `dup` runs
+#   them on the copy and `becomes` runs none.
 # - The after-commit order reads `run_after_transaction_callbacks_in_order_defined`
 #   from `Rails.application.active_record_run_after_transaction_callbacks_in_order_defined`
 #   when the application answers it, and Rails' default (false, as Core
@@ -104,6 +120,7 @@ module ActiveRecord
       destroy: { skip_after_if_halted: true, model: true, before: :before_destroy, after: :after_destroy },
       touch: { skip_after_if_halted: true, model: true, after: :after_touch },
       find: { skip_after_if_halted: true, model: true },
+      initialize: { skip_after_if_halted: true, model: true, after: :after_initialize },
       commit: {
         skip_after_if_halted: false,
         compiled: :_compiled_commit_hooks,
@@ -124,6 +141,30 @@ module ActiveRecord
 
       def changed! # :nodoc:
         @generation += 1
+      end
+
+      # Wraps `klass` and its subclasses for the initialize chain, once
+      # per class (Base's `inherited` wraps the subclasses defined later).
+      def install_initialize_hooks(klass) # :nodoc:
+        return if klass.instance_variable_get(:@__initialize_hooks)
+        klass.instance_variable_set(:@__initialize_hooks, true)
+        klass.prepend(InitializeHooks)
+        klass.singleton_class.prepend(InitializeHooks.class_side(klass))
+        klass.subclasses.each { |sub| install_initialize_hooks(sub) }
+      end
+
+      # The class whose hydration factory is running on this thread: its
+      # `new` builds the shell the factory fills.
+      def hydrating # :nodoc:
+        Thread.current[:__roundhouse_hydrating]
+      end
+
+      def hydrate(klass) # :nodoc:
+        previous = Thread.current[:__roundhouse_hydrating]
+        Thread.current[:__roundhouse_hydrating] = klass
+        yield
+      ensure
+        Thread.current[:__roundhouse_hydrating] = previous
       end
 
       # The chain `klass` runs for `event`, rebuilt when a registration
@@ -191,7 +232,7 @@ module ActiveRecord
               name = config[kind]
               next if name.nil?
               owner = compiled_owner(klass, [name])
-              next if owner.nil? && klass.instance_method(name).owner.equal?(ActiveRecord::Base)
+              next if owner.nil? && klass.instance_method(name).owner.then { |o| o.equal?(ActiveRecord::Base) || o.equal?(InitializeHooks) }
               after = kind == :after
               entries << [Compiled.new(kind, name, after, after && config[:model]), owner]
             end
@@ -206,7 +247,7 @@ module ActiveRecord
           until c.nil? || c.equal?(ActiveRecord::Base)
             parent = c.superclass
             own = parent ? c.ancestors - parent.ancestors : c.ancestors
-            if own.any? { |m| names.any? { |n| m.method_defined?(n, false) || m.private_method_defined?(n, false) } }
+            if own.any? { |m| !m.equal?(InitializeHooks) && names.any? { |n| m.method_defined?(n, false) || m.private_method_defined?(n, false) } }
               return c
             end
             c = parent
@@ -330,6 +371,46 @@ module ActiveRecord
       end
     end
 
+    # The initialize chain's entry points on a class with runtime
+    # `after_initialize` callbacks (Callbacks.install_initialize_hooks).
+    # Prepended to each such class, so a subclass's compiled
+    # `after_initialize` is wrapped too: the outermost runs the chain, in
+    # which the compiled hook's entry calls through to the compiled method.
+    module InitializeHooks # :nodoc:
+      def after_initialize
+        return super if @__initialize_running
+        _run_initialize_chain
+      end
+
+      # The class methods for `owner`; a copy prepended to a superclass
+      # answers the subclass's calls by passing them on.
+      def self.class_side(owner)
+        Module.new do
+          define_method(:new) do |*args, **kwargs, &block|
+            return super(*args, **kwargs, &block) unless equal?(owner)
+            record = super(*args, **kwargs, &block)
+            return record if Callbacks.hydrating.equal?(self)
+            record.send(:_finish_initialize)
+            record
+          end
+
+          define_method(:from_row) do |row|
+            return super(row) unless equal?(owner)
+            Callbacks.hydrate(self) { super(row) }
+          end
+
+          [:instantiate, :from_stmt].each do |factory|
+            define_method(factory) do |source|
+              return super(source) unless equal?(owner)
+              record = Callbacks.hydrate(self) { super(source) }
+              record.send(:_finish_initialize) if record.is_a?(ActiveRecord::Base)
+              record
+            end
+          end
+        end
+      end
+    end
+
     # Run state: ActiveSupport::Callbacks::Filters::Environment.
     Environment = Struct.new(:halted, :value) # :nodoc:
 
@@ -360,8 +441,8 @@ module ActiveRecord
       end
 
       def after_initialize(*args, **options, &block)
-        raise NotImplementedError, "#{name}.after_initialize called at runtime: the compiled constructor " \
-          "and hydration run the class's declared after_initialize hook only"
+        Callbacks.install_initialize_hooks(self)
+        _model_callback(:initialize, :after, args, options, block)
       end
 
       # active_model/validations/callbacks.rb
@@ -490,6 +571,15 @@ module ActiveRecord
 
   class Base
     extend Callbacks::ClassMethods
+
+    class << self
+      prepend(Module.new do
+        def inherited(subclass)
+          super
+          Callbacks.install_initialize_hooks(subclass) if instance_variable_get(:@__initialize_hooks)
+        end
+      end)
+    end
 
     # The methods below replace base.rb's and connection.rb's (and the
     # writes active_record_core.rb captured), without a redefinition
@@ -666,6 +756,27 @@ module ActiveRecord
           when :update then _transaction_include_update?
           when :destroy then _transaction_include_destroy?
           end
+        end
+      end
+
+      # The initialize chain, from the wrapped `after_initialize` (the
+      # compiled code's call of its declared hook) or from the end of
+      # `new` or a hydration that made none.
+      def _run_initialize_chain
+        @__initialize_running = true
+        _callback_chain_run(:initialize) { true }
+        @__initialize_ran = true
+        nil
+      ensure
+        remove_instance_variable(:@__initialize_running)
+      end
+
+      def _finish_initialize
+        if defined?(@__initialize_ran)
+          remove_instance_variable(:@__initialize_ran)
+        else
+          _run_initialize_chain
+          remove_instance_variable(:@__initialize_ran) if defined?(@__initialize_ran)
         end
       end
 
