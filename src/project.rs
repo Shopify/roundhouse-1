@@ -4331,6 +4331,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     )?;
     let configuration = database_configuration_source(app, yml);
     files.retain(|(p, _)| p != "runtime/sqlite_adapter.rb" && p != "runtime/active_record_sqlite3_adapter.rb");
+    strip_db_shim_config(files);
     let adapter = crate::runtime_files::read_to_string("runtime/spinel/postgres_adapter.rb")
         .map_err(|e| format!("read PostgreSQL adapter: {e}"))?;
     files.push(("runtime/postgres_adapter.rb".into(), adapter));
@@ -7131,6 +7132,37 @@ fn apply_cable_channels(files: &mut [(String, String)], app: &App) {
         let Some(rel_end) = content[start..].find(TAIL) else { continue };
         let end = start + rel_end + TAIL.len();
         content.replace_range(start..end, &generated);
+    }
+}
+
+/// Drop the Db shim's own `ActiveRecord::DatabaseConfigurations::HashConfig`,
+/// `ConnectionAdapters::DbPool`, `Base.connection_db_config` and
+/// `Base.connection_pool` (the `db-shim-config` spans of runtime/spinel/
+/// active_record_db_config.rb) from a tree that carries Rails' own:
+/// database_configuration.rb assigns `ActiveRecord::DatabaseConfigurations`
+/// (an "already initialized constant" warning over the shim's module) and
+/// active_record_connection_handling.rb defines both class methods.
+fn strip_db_shim_config(files: &mut [(String, String)]) {
+    for (path, content) in files.iter_mut() {
+        if path != "runtime/active_record_db_config.rb" {
+            continue;
+        }
+        let mut out = String::with_capacity(content.len());
+        let (mut inside, mut closed) = (false, false);
+        for line in content.split_inclusive('\n') {
+            match line.trim() {
+                "# >>> db-shim-config" => inside = true,
+                "# <<< db-shim-config" => (inside, closed) = (false, true),
+                // The blank line that separated the span from what follows.
+                "" if closed => closed = false,
+                _ if !inside => {
+                    out.push_str(line);
+                    closed = false;
+                }
+                _ => {}
+            }
+        }
+        *content = out;
     }
 }
 

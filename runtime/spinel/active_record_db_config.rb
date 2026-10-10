@@ -21,10 +21,17 @@
 #   part after the authority, up to the query; `URI.parse(db.split("?")
 #   .first).opaque` for `file:x` is what follows `file:`.
 #
+# The `db-shim-config` spans (HashConfig, DbPool, `connection_db_config`,
+# `connection_pool`) are the Db shim's own answers; a PostgreSQL CRuby
+# tree carries Rails' (runtime/database_configurations.rb,
+# active_record_connection_handling.rb) and drops the spans
+# (`project::strip_db_shim_config`), so each is defined once.
+#
 # Ruby family and spinel only (every Db shim lives under runtime/spinel/
 # and ships to both); a strict target is refused at the call
 # (`project::RUBY_SPINEL_ONLY_METHODS`).
 module ActiveRecord
+  # >>> db-shim-config
   module DatabaseConfigurations
     class HashConfig
       def initialize(env_name, name, database, adapter)
@@ -51,8 +58,10 @@ module ActiveRecord
       end
     end
   end
+  # <<< db-shim-config
 
   module ConnectionAdapters
+    # >>> db-shim-config
     # The face of the Db shim's own pool: Rails' `with_connection` runs
     # the block with the holder's connection, leasing one only when it
     # holds none, which is what `ActiveRecord::Base.connection` (a
@@ -62,6 +71,7 @@ module ActiveRecord
         yield ActiveRecord::Base.connection
       end
     end
+    # <<< db-shim-config
 
     # The CRuby overlay's adapter (active_record_sqlite3_adapter.rb, loaded
     # after this file) is `Base.connection`'s class, a `Connection`; open it
@@ -94,6 +104,7 @@ module ActiveRecord
   end
 
   class Base
+    # >>> db-shim-config
     def self.connection_db_config
       env = Rails.env_name.to_s
       env = "development" if env.empty?
@@ -103,6 +114,7 @@ module ActiveRecord
     def self.connection_pool
       ActiveRecord::ConnectionAdapters::DbPool.new
     end
+    # <<< db-shim-config
 
     # `name.constantize.instantiate(attributes)` (`lower::record_snapshot`):
     # the app's models are a closed set, so the class is a `case` over

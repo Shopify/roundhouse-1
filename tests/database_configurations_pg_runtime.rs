@@ -268,3 +268,49 @@ fn configurations_stay_a_named_gap_without_the_postgresql_runtime() {
         assert!(errors.iter().any(|e| e.contains(expected)), "no {expected:?} in:\n{}", errors.join("\n"));
     }
 }
+
+/// The PostgreSQL tree carries Rails' configuration classes and
+/// connection handling, so the Db shim's own (runtime/spinel/
+/// active_record_db_config.rb's `db-shim-config` spans) are not emitted:
+/// `ActiveRecord::DatabaseConfigurations` is assigned once (Core's
+/// strict_warnings turns "already initialized constant" into a boot
+/// failure) and `connection_db_config` / `connection_pool` are the
+/// port's. The tree boots verbose with a constant redefinition an error,
+/// as under Core's strict_warnings (which tolerates method redefinition).
+#[test]
+#[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn postgresql_tree_defines_configurations_once() {
+    let (emitted, errors) = overlay(&FILES).emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let shim = std::fs::read_to_string(emitted.join("runtime/active_record_db_config.rb")).unwrap();
+    for gone in ["# >>> db-shim-config", "module DatabaseConfigurations", "class DbPool", "def self.connection_db_config", "def self.connection_pool"] {
+        assert!(!shim.contains(gone), "{gone} still in the shim:\n{shim}");
+    }
+    assert!(shim.contains("def self.instantiate_named"), "{shim}");
+    let gem_home = std::env::var("CORE_GEM_HOME")
+        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+    let script = r#"
+module Warning
+  def self.warn(message, **)
+    raise message if message.include?("already initialized constant")
+    super
+  end
+end
+$VERBOSE = true
+require File.expand_path("main", Dir.pwd)
+puts [ActiveRecord::DatabaseConfigurations.equal?(::DatabaseConfigurations::Configurations),
+      ActiveRecord::Base.method(:connection_db_config).source_location[0].end_with?("active_record_connection_handling.rb"),
+      ActiveRecord::Base.method(:connection_pool).source_location[0].end_with?("active_record_connection_handling.rb"),
+      defined?(ActiveRecord::ConnectionAdapters::DbPool).inspect].join(" ")
+"#;
+    let out = std::process::Command::new("ruby")
+        .args(["-e", script])
+        .current_dir(&*emitted)
+        .env("GEM_HOME", &gem_home)
+        .env("GEM_PATH", &gem_home)
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.trim(), "true true true nil");
+}
