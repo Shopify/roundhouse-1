@@ -12417,7 +12417,7 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
     // A Concern's own body statement runs once, on the module, as the
     // module loads (its `included do` is what runs on each includer);
     // the emitted module is a plain one its includers include.
-    if !replays && !self_calls_answered(lc, call) && !singleton_answered_by_app(lc, call, app) {
+    if !replays && !self_calls_answered(lc, call, app) && !singleton_answered_by_app(lc, call, app) {
         return false;
     }
     // The emitted module writes no `extend ActiveSupport::Concern`
@@ -12521,16 +12521,34 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Opt
     // :json` through the body's `def self.format=`) is a tail effect,
     // written after every def (`tail_effects`), so after the statement.
     let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
+    // A call the body drops (`dropped_class_body_calls`, reported where
+    // it stands) is written nowhere, so no order is kept against it:
+    // paquito's `TYPES.freeze` below its `begin; require
+    // "msgpack/bigint"; TYPES << { … }; rescue LoadError; end`.
+    let dropped = dropped_class_body_calls(lc, app);
+    // Below a deferred constant (written after the defs), the statement
+    // is written after it with the replayed calls the source has below
+    // it, in source order (`calls_after_deferred`), and the deferred
+    // constants below follow: neither is written before it. paquito's
+    // `TYPES.freeze` below its `begin … TYPES << { … } … end`, both
+    // below the deferred `TYPES = [{ packer: method(:time_pack), … }]`.
+    let (_, deferred, _) = partition_deferred_constants(lc, app);
+    let after_deferred = !carried_railtie(lc, app) && deferred.iter().any(|&i| above(lc.constants[i].1.span));
     let later_effect = lc
         .constants
         .iter()
+        .enumerate()
+        .filter(|(i, _)| !(after_deferred && deferred.contains(i)))
+        .map(|(_, c)| c)
         .filter(|(_, value)| !(defines_only && !calls_on_self(value)))
         .map(|(_, value)| value.span)
         .chain(
             lc.unknown_calls
                 .iter()
+                .filter(|_| !after_deferred)
                 .filter(|c| {
                     !is_body_statement(c)
+                        && !dropped.iter().any(|d| std::ptr::eq(*d, *c))
                         && !(defines_only && defines_apart(lc, call, c))
                         && !own.runs(c)
                         && !names_own_method_above(lc, c)
@@ -12809,7 +12827,7 @@ const ANY_CLASS_SELF_CALLS: &[&str] = &[
     "name", "to_s", "inspect", "ancestors", "superclass", "singleton_class", "instance_variable_get",
     "instance_variable_set", "instance_variable_defined?", "respond_to?", "is_a?", "kind_of?", "frozen?",
     "raise", "fail", "warn", "puts", "print", "p", "format", "sprintf", "lambda", "proc", "loop",
-    "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex", "caller", "caller_locations", "freeze",
+    "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex", "caller", "caller_locations", "freeze", "method",
 ];
 
 /// Whether every call `call` makes on the class itself (no receiver, or
@@ -12817,7 +12835,7 @@ const ANY_CLASS_SELF_CALLS: &[&str] = &[
 /// class method `lc` defines. A `define_method` block is a method body,
 /// run later on an instance, so its calls are not the class's. A block
 /// that rebinds `self` (`instance_eval`, `class_exec`, …) is not read.
-fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
+fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
     // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
     // singleton class, which the class's own class methods do not answer.
     let singleton = call.decisions & crate::expr::SINGLETON_BODY != 0;
@@ -12827,7 +12845,7 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
         .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
         .map(|m| &m.name)
         .collect();
-    fn walk(e: &Expr, own: &[&Symbol], ok: &mut bool) {
+    fn walk(e: &Expr, own: &[&Symbol], app: &App, ok: &mut bool) {
         if !*ok {
             return;
         }
@@ -12836,6 +12854,9 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
                 None => true,
                 Some(r) => matches!(&*r.node, ExprNode::SelfRef),
             };
+            if on_self && method.as_str() == "require" && block.is_none() && requires_library(args, app) {
+                return;
+            }
             if matches!(
                 method.as_str(),
                 "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec"
@@ -12848,23 +12869,44 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
                 return;
             }
             if let Some(r) = recv {
-                walk(r, own, ok);
+                walk(r, own, app, ok);
             }
             for a in args {
-                walk(a, own, ok);
+                walk(a, own, app, ok);
             }
             if let Some(b) = block
                 && !(on_self && method.as_str() == "define_method")
             {
-                walk(b, own, ok);
+                walk(b, own, app, ok);
             }
             return;
         }
-        e.node.for_each_child(&mut |child| walk(child, own, ok));
+        e.node.for_each_child(&mut |child| walk(child, own, app, ok));
     }
     let mut ok = true;
-    walk(call, &own, &mut ok);
+    walk(call, &own, app, &mut ok);
     ok
+}
+
+/// Whether `require`'s `args` are one literal feature Kernel#require
+/// loads as it does natively: a library on the load path (the process's
+/// gems and stdlib), not a file the app carries (whose emitted copy the
+/// tree's own loader names) nor a Rails feature (the runtime ports answer
+/// it). paquito's `Paquito::Types` body runs `begin; require
+/// "msgpack/bigint"; TYPES << { … class: "Integer" … }; rescue LoadError;
+/// end`.
+fn requires_library(args: &[Expr], app: &App) -> bool {
+    let [arg] = args else { return false };
+    let ExprNode::Lit { value: crate::expr::Literal::Str { value: feature } } = &*arg.node else { return false };
+    if feature.is_empty() || feature.starts_with('.') || feature.starts_with('/') || crate::project::is_framework_feature(feature) {
+        return false;
+    }
+    let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+    let (lib, nested) = (format!("lib/{rb}"), format!("/lib/{rb}"));
+    !app.sources.iter().any(|f| {
+        let path = relative_source_path(app, &f.path);
+        path == lib || path.ends_with(&nested)
+    })
 }
 
 /// Whether `lc` is a `class_eval` block's body (`ProgramItem::ClassEval`).
@@ -15442,6 +15484,30 @@ fn program_constants(lc: &LibraryClass, app: &App) -> Vec<(usize, String)> {
         .collect();
     if moved.is_empty() {
         return moved;
+    }
+    // A body statement or a constant's own effect the class's file
+    // writes (`carries_body_statement`, `gem_source_body_effects`) below
+    // a moved constant runs on it, so it must follow it, which the
+    // program's reopening cannot keep: the constants stay in the
+    // class's file, which the program requires where the declaration
+    // stands. paquito's types.rb runs `begin; require "active_support";
+    // …; rescue LoadError; end` above `module Paquito`, and below
+    // `TYPES = [ … ]` its body runs `begin; require "msgpack/bigint";
+    // TYPES << { … class: "Integer" … }; rescue LoadError; end` and
+    // `TYPES.freeze`.
+    let effects = gem_source_body_effects(lc, app);
+    let follows_moved = |call: &Expr| {
+        !call.span.is_synthetic()
+            && moved.iter().any(|(j, _)| {
+                let at = lc.constants[*j].1.span;
+                at.file == call.span.file && at.start < call.span.start
+            })
+    };
+    if lc.unknown_calls.iter().any(|c| {
+        follows_moved(c)
+            && (effects.iter().any(|e| std::ptr::eq(*e, c)) || (is_body_statement(c) && carries_body_statement(lc, c, app)))
+    }) {
+        return Vec::new();
     }
     let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
     for (j, (_, value)) in lc.constants.iter().enumerate() {

@@ -118,7 +118,7 @@ fn emitted(lib: &Path) -> (emit_and_run::Run, String) {
 
 /// The lines the gem's module-body statements after TYPES produce:
 /// `begin require "msgpack/bigint"; TYPES << {code: 10, ...}; rescue
-/// LoadError; end` and `TYPES.freeze`. See the ignored test below.
+/// LoadError; end` and `TYPES.freeze`, which the test below checks.
 fn after_types_statement(line: &str) -> bool {
     line.starts_with("[10, ") || line.starts_with("frozen: ")
 }
@@ -143,16 +143,17 @@ fn paquito_types_takes_its_methods_like_the_gem() {
     assert!(got.contains(&"date unpacked: 2024-02-29".to_string()), "{got:#?}");
 }
 
-/// KNOWN GAP. The module body's statements after TYPES are not emitted:
-/// the class-body walk (`walk_decl_body_with_visibility`, ingest
-/// library_class.rs) keeps no `begin ... rescue` statement, so the
-/// bigint extension type (code 10) is dropped without a diagnostic, and
-/// `TYPES.freeze` is captured as a class-body call the Ruby emitter
-/// drops (`report_dropped_class_body_call`) because Paquito::Types is
-/// no foreign-base body. Natively TYPES ends with the Integer entry and
-/// is frozen.
+/// The module body's statements after TYPES run where the gem has
+/// them: `begin require "msgpack/bigint"; TYPES << { code: 10, class:
+/// "Integer", … }; rescue LoadError; end`, then `TYPES.freeze`. The
+/// carrier refused the `begin` (`require` was no call it knew any class
+/// answers, `TYPES.freeze` below it had no place it kept), and the
+/// file program's reopening took TYPES from the class's file above its
+/// statements; without the Integer entry every
+/// `Paquito::Types.register(factory, [Integer, …])` raised `KeyError: No
+/// type found for "Integer" with format_version=1` (Core's
+/// VersionedMemcacheCoder).
 #[test]
-#[ignore = "paquito's module-body `begin require \"msgpack/bigint\"; TYPES << ...; rescue LoadError; end` and `TYPES.freeze` are not emitted"]
 fn paquito_types_runs_its_module_body_statements_like_the_gem() {
     let lib = paquito_lib();
     let expected = native(&lib);
