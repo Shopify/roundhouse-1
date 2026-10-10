@@ -591,6 +591,10 @@ struct NestedBlocks {
     blocks: Vec<(Option<crate::span::Span>, String)>,
     /// The class each of `blocks` renders.
     names: Vec<String>,
+    /// Whether each of `blocks` builds the parent with a def the source
+    /// has above it (`builds_after_parent_defs`): it goes after the
+    /// parent's methods.
+    late: Vec<bool>,
     sidecar_blocks: Vec<String>,
     hoisted: Vec<String>,
 }
@@ -745,6 +749,7 @@ fn nested_blocks(
     let kids = &kids[..];
     let mut blocks: Vec<(Option<crate::span::Span>, String)> = Vec::new();
     let mut names: Vec<String> = Vec::new();
+    let mut late: Vec<bool> = Vec::new();
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
@@ -820,7 +825,10 @@ fn nested_blocks(
             .collect();
         let Some(block) = unwrapped(&body, depth) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
-        blocks.push((nested_position(parent, kid, app), block));
+        let after_defs = builds_after_parent_defs(parent, kid, app);
+        let at = nested_position(parent, kid, app).or_else(|| after_defs.then(|| declared_at(kid, app)).flatten());
+        blocks.push((at, block));
+        late.push(after_defs && at.is_some());
         names.push(kid.name.0.as_str().to_string());
         if inline.is_some() {
             continue;
@@ -844,7 +852,7 @@ fn nested_blocks(
             }
         }
     }
-    NestedBlocks { blocks, names, sidecar_blocks, hoisted }
+    NestedBlocks { blocks, names, late, sidecar_blocks, hoisted }
 }
 
 /// `kids` split into those no other kid encloses, and, for each of
@@ -993,6 +1001,68 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Opti
     let above = |span: &crate::span::Span| span.file == first.file && *span != crate::span::Span::synthetic() && span.start < first.start;
     (parent.constants.iter().any(|(_, value)| above(&value.span)) || parent.unknown_calls.iter().any(|call| above(&call.span)))
         .then_some(first)
+}
+
+/// Whether `kid`'s body, as it loads, builds `parent` or calls one of its
+/// class methods (`Parent.new(…)`, `Parent.m`) through a def `parent`'s
+/// source has above `kid`. Core's checkouts/one web/violation_error_message.rb
+/// writes `def initialize(code, non_localized_description, …)` and then
+/// `module Proposal; LineItemLimitReached = ViolationErrorMessage.new(…)`:
+/// written above the parent's methods the constant reached
+/// `BasicObject#initialize` (given 3, expected 0) at load.
+fn builds_after_parent_defs(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> bool {
+    let Some(at) = declared_at(kid, app) else { return false };
+    let parent_name = parent.name.0.as_str();
+    let defined_above = |name: &str, receiver: crate::dialect::MethodReceiver| {
+        parent.methods.iter().any(|m| {
+            m.receiver == receiver
+                && m.name.as_str() == name
+                && !m.name_span.is_synthetic()
+                && m.name_span.file == at.file
+                && m.name_span.start < at.start
+        })
+    };
+    fn names_parent(recv: &Option<Expr>, parent_name: &str) -> bool {
+        let Some(r) = recv else { return false };
+        let ExprNode::Const { path } = &*r.node else { return false };
+        let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        let joined = joined.trim_start_matches("::");
+        joined == parent_name || parent_name.ends_with(&format!("::{joined}"))
+    }
+    fn walk(e: &Expr, hit: &mut dyn FnMut(&str) -> bool, parent_name: &str) -> bool {
+        match &*e.node {
+            ExprNode::Lambda { .. } => false,
+            ExprNode::Send { recv, method, args, block, .. } => {
+                if names_parent(recv, parent_name) && hit(method.as_str()) {
+                    return true;
+                }
+                recv.iter().chain(args.iter()).any(|a| walk(a, hit, parent_name))
+                    || (!stores_block(recv, method.as_str())
+                        && block.as_ref().is_some_and(|b| match &*b.node {
+                            ExprNode::Lambda { body, .. } => walk(body, hit, parent_name),
+                            _ => walk(b, hit, parent_name),
+                        }))
+            }
+            _ => {
+                let mut found = false;
+                e.node.for_each_child(&mut |child| {
+                    if !found && walk(child, hit, parent_name) {
+                        found = true;
+                    }
+                });
+                found
+            }
+        }
+    }
+    let mut hit = |method: &str| {
+        if method == "new" {
+            defined_above("initialize", crate::dialect::MethodReceiver::Instance)
+        } else {
+            defined_above(method, crate::dialect::MethodReceiver::Class)
+        }
+    };
+    kid.constants.iter().any(|(_, value)| walk(value, &mut hit, parent_name))
+        || kid.unknown_calls.iter().any(|call| walk(call, &mut hit, parent_name))
 }
 
 /// Where the source defines `kid`: its superclass, which is in its
@@ -1167,8 +1237,9 @@ struct NestedPlacement;
 
 struct NestedPending {
     owner: String,
-    /// Index into `NestedBlocks::blocks`, position, block, placed.
-    blocks: Vec<(usize, crate::span::Span, String, bool)>,
+    /// Index into `NestedBlocks::blocks`, position, block, placed, and
+    /// whether it waits for the owner's methods (`NestedBlocks::late`).
+    blocks: Vec<(usize, crate::span::Span, String, bool, bool)>,
     /// The blocks of classes a load-time conditional of the owner
     /// declares (`ConditionalArm::declarations`): index, class, block,
     /// placed. Only that conditional's branch writes them.
@@ -1198,7 +1269,7 @@ impl NestedPlacement {
             .iter()
             .enumerate()
             .filter(|(j, _)| !declared_in(&nested.names[*j]))
-            .filter_map(|(j, (at, block))| at.map(|at| (j, at, block.clone(), false)))
+            .filter_map(|(j, (at, block))| at.map(|at| (j, at, block.clone(), false, nested.late[j])))
             .collect();
         let declared = nested
             .blocks
@@ -1238,13 +1309,24 @@ impl NestedPlacement {
     }
 
     /// Write, in load order, the pending blocks of `owner` that `here`
-    /// accepts by their source position.
+    /// accepts by their source position, except those that wait for the
+    /// owner's methods.
     fn place(owner: &ClassId, s: &mut String, here: impl Fn(&crate::span::Span) -> bool) {
+        Self::place_where(owner, s, |at, late| !late && here(at));
+    }
+
+    /// Write the pending blocks that wait for the owner's methods, and
+    /// that `here` accepts: called once those methods are written.
+    fn place_late(owner: &ClassId, s: &mut String, here: impl Fn(&crate::span::Span) -> bool) {
+        Self::place_where(owner, s, |at, late| late && here(at));
+    }
+
+    fn place_where(owner: &ClassId, s: &mut String, here: impl Fn(&crate::span::Span, bool) -> bool) {
         NESTED_PLACEMENT.with(|slot| {
             let mut slot = slot.borrow_mut();
             let Some(pending) = slot.as_mut().filter(|p| p.owner == owner.0.as_str()) else { return };
-            for (_, at, block, placed) in pending.blocks.iter_mut() {
-                if !*placed && here(at) {
+            for (_, at, block, placed, late) in pending.blocks.iter_mut() {
+                if !*placed && here(at, *late) {
                     s.push_str(block);
                     s.push('\n');
                     *placed = true;
@@ -10247,6 +10329,9 @@ fn emit_library_class_decl_inner(
         }
     }
 
+    // A nested class whose body builds this class with its own defs
+    // (`builds_after_parent_defs`) follows them, as the source has it.
+    NestedPlacement::place_late(&lc.name, &mut s, |kid| !below_deferred(kid));
     if !deferred.is_empty() {
         if !lc.methods.is_empty() {
             writeln!(s).unwrap();
@@ -10268,6 +10353,7 @@ fn emit_library_class_decl_inner(
         }
         NestedPlacement::place(&lc.name, &mut s, |_| true);
     }
+    NestedPlacement::place_late(&lc.name, &mut s, |_| true);
 
     if !railtie && !replays_foreign_class_body(lc, app) && let Some(call) = trailing_freeze(lc, app) {
         writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();

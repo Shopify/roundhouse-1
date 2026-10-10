@@ -2213,6 +2213,30 @@ module ActiveRecord
       created
     end
 
+    # Rails' `find_or_create_by!`: `find_by(attributes) ||
+    # create!(attributes, &block)`.
+    def find_or_create_by!(conditions, &block)
+      record = find_by(conditions)
+      return record if !record.nil?
+      created = build(conditions)
+      block.call(created) if block
+      raise RecordInvalid, created unless created.save
+      created
+    end
+
+    # Rails' `find_or_initialize_by`: `find_by(attributes) ||
+    # new(attributes, &block)`, the new record unsaved and carrying the
+    # relation's scope attributes and the given ones. Core's
+    # `ThemeTemplate.find_or_initialize_by_name_normalized` falls back to
+    # `find_or_initialize_by(shop_id:, prefix:, name:)`.
+    def find_or_initialize_by(conditions, &block)
+      record = find_by(conditions)
+      return record if !record.nil?
+      built = build(conditions)
+      block.call(built) if block
+      built
+    end
+
     # ---- SQL composition --------------------------------------------
 
     def to_sql

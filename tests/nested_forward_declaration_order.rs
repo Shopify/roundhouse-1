@@ -229,3 +229,56 @@ fn a_nested_module_with_no_members_loads_before_the_sibling_that_includes_it() {
         .run_test("test/models/positionless_nested_module_test.rb")
         .assert_passes();
 }
+
+/// A nested module whose constants build the enclosing class, written
+/// below that class's `initialize` (Core's checkouts/one
+/// web/violation_error_message.rb: `def initialize(code,
+/// non_localized_description, msg_args: {}, i18n_key: nil)` then
+/// `module Proposal; LineItemLimitReached = ViolationErrorMessage.new(…)`).
+/// Placed above the parent's methods, each constant reached
+/// `BasicObject#initialize` (given 3, expected 0) at load.
+const VIOLATION: &str = r##"module Checkout
+  class Violation
+    module Codes
+      LIMIT = "proposal.limit"
+    end
+
+    def self.from(violation)
+      violation
+    end
+
+    def initialize(code, description, i18n_key: nil)
+      @code = code
+      @description = description
+      @i18n_key = i18n_key
+    end
+
+    attr_reader :code, :description, :i18n_key
+
+    module Proposal
+      LimitReached = Violation.new(Codes::LIMIT, "Too many lines.", i18n_key: "errors.limit")
+      Again = Violation.from(LimitReached)
+    end
+  end
+end
+"##;
+
+const VIOLATION_TEST: &str = r##"require "test_helper"
+
+class NestedConstantBuildsParentTest < ActiveSupport::TestCase
+  test "a nested module's constant built with the parent's initialize loads after it" do
+    assert_equal "proposal.limit", Checkout::Violation::Proposal::LimitReached.code
+    assert_equal "errors.limit", Checkout::Violation::Proposal::LimitReached.i18n_key
+    assert_same Checkout::Violation::Proposal::LimitReached, Checkout::Violation::Proposal::Again
+  end
+end
+"##;
+
+#[test]
+fn a_nested_module_building_its_parent_loads_after_the_parents_defs() {
+    emit_and_run::empty_app()
+        .write("app/models/checkout/violation.rb", VIOLATION)
+        .write("test/models/nested_constant_builds_parent_test.rb", VIOLATION_TEST)
+        .run_test("test/models/nested_constant_builds_parent_test.rb")
+        .assert_passes();
+}

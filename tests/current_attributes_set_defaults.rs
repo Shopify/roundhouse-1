@@ -43,6 +43,10 @@ const CURRENT: &str = r#"class Current < ActiveSupport::CurrentAttributes
     super || :never
   end
 
+  def a_or_none
+    attributes[:a] || :none
+  end
+
   def greet(name, punct: "!")
     "hi #{name}#{punct} #{b}"
   end
@@ -116,6 +120,11 @@ const PROBE: &str = r#"class CurrentProbe
       out << e.message.inspect
     end
     out << Current.greet("x").inspect << Current.greet("y", punct: "?").inspect
+    Current.reset
+    out << Current.attributes.inspect << Current.a_or_none.inspect
+    Current.a = "8"
+    Current.log_seen = nil
+    out << Current.attributes.inspect << Current.a_or_none.inspect << Current.instance.attributes.keys.inspect
     out << Current.respond_to?(:secret).inspect
     out << Current.d.inspect
     Current.d = :dd
@@ -162,6 +171,8 @@ fn set_defaults_and_writer_super_run_like_activesupport() {
     // attribute.
     assert_eq!(lines[7..10], ["[]", "false", ":dflt"], "{native}");
     assert!(native.contains("[:broke, :broke]\n"), "{native}");
+    // `attributes` holds the defaults, then each attribute as assigned.
+    assert!(native.contains("{b: :dflt, c: [], d: [], counter: 0}\n:none\n{b: :dflt, c: [], d: [], counter: 0, a: 8, log_seen: nil}\n8\n"), "{native}");
     // The literal pairs in `with`'s order: `pod_id=` clears the
     // `pod_name` just written, and its restore clears it again.
     assert!(native.ends_with("[5, nil]\n[nil, nil]\n"), "{native}");
