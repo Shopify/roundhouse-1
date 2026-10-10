@@ -9461,6 +9461,13 @@ fn emit_library_class_decl_inner(
                 "class {seg} < {}",
                 super::expr::singleton_scoped_path(&lexically_qualified(p.0.as_str(), &segments[..i], app))
             ),
+            (true, None)
+                if library_classes_named(&qualified, app)
+                    .into_iter()
+                    .any(crate::ingest::library_class::is_lowered_sorbet_enum) =>
+            {
+                format!("class {seg} < (defined?(::T::Enum) ? ::T::Enum : ::Object)")
+            }
             (true, None) => format!("class {seg}"),
             (false, _) => format!("module {seg}"),
         }
@@ -9498,6 +9505,11 @@ fn emit_library_class_decl_inner(
                     // its owner's singleton class (`singleton_scoped_path`).
                     let parent = super::expr::singleton_scoped_path(&lexically_qualified(&written, &segments[..depth - 1], app));
                     writeln!(s, "{pad}class {last} < {parent}").unwrap()
+                }
+                // A lowered `T::Enum` subclasses the real one where
+                // sorbet-runtime is loaded (`is_lowered_sorbet_enum`).
+                (_, None) if crate::ingest::library_class::is_lowered_sorbet_enum(lc) => {
+                    writeln!(s, "{pad}class {last} < (defined?(::T::Enum) ? ::T::Enum : ::Object)").unwrap()
                 }
                 (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
             }
