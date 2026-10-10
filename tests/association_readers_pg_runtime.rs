@@ -103,6 +103,7 @@ const PROBE: &str = r##"class ReadersProbe
     built = fresh.send(items).build(title: "y")
     out << "new owner build: #{built.new_record?} #{built.shop_id.inspect} #{fresh.items.map(&:title).inspect}"
     out << "where on proxy: #{loaded.send(items).where(title: "b").map(&:title).inspect}"
+    out << "sum on proxy: #{loaded.send(items).sum(:id) == Item.where(shop_id: shop.id).map(&:id).sum}"
 
     item = Item.find(created.id)
     out << "cached before: #{item.association_cached?(:shop)} #{item.association_cached?(:nope)}"
@@ -118,6 +119,11 @@ const PROBE: &str = r##"class ReadersProbe
     out << "approver set: #{item.approver_type} #{item.approver_id == shop.id} #{item.approver.equal?(shop)}"
     out << "approver read: #{Item.find(item.id).approver == shop} #{Item.find(item.id).approver.name}"
 
+    gone = Shop.find(shop.id)
+    gone.items.to_a
+    gone.send(items).destroy_all
+    out << "destroy_all: #{gone.items.map(&:title).inspect} #{Item.where(shop_id: shop.id).count}"
+
     account = Account.new(shop: Shop.new(name: "u", uuid: "u-1"))
     account.save!
     out << "pk autosave: #{account.shop_uuid.inspect} #{account.shop.persisted?} #{Account.find(account.id).shop.name}"
@@ -128,7 +134,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 14] = [
+const EXPECTED: [&str; 16] = [
     "send create: true true 1 1",
     r#"loaded create!: ["a", "b"] true"#,
     "first!: a",
@@ -136,12 +142,14 @@ const EXPECTED: [&str; 14] = [
     "new owner create: You cannot call create unless the parent is saved",
     r#"new owner build: true nil ["y"]"#,
     r#"where on proxy: ["b"]"#,
+    "sum on proxy: true",
     "cached before: false false",
     "cached after: true",
     "cached has_many: false true",
     "approver nil: nil",
     "approver set: Shop true true",
     "approver read: true s",
+    "destroy_all: [] 0",
     r#"pk autosave: "u-1" true u"#,
 ];
 

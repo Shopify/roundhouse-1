@@ -535,9 +535,10 @@ module ActiveRecord
     # (RecordNotSaved for an unsaved owner, "You cannot call create
     # unless the parent is saved"), `first!` / `last!` / `take!` over
     # the loaded records (RecordNotFound when there are none), `find`
-    # with an id, `scope`, `proxy_association`, `loaded?` (always:
-    # the reader loads), and any other Relation method, which runs on
-    # the scope. Array's own methods keep Array's meaning, which for a
+    # with an id, a column `sum`, `destroy_all` / `delete_all` (which
+    # empty the target), `reload`, `scope`, `proxy_association`,
+    # `loaded?` (always: the reader loads), and any other Relation
+    # method, which runs on the scope. Array's own methods keep Array's meaning, which for a
     # loaded proxy is Rails' (`first`, `size`, `each`, `include?`);
     # `<<` / `push` stay Array's (the lowering writes a statically seen
     # `owner.items << record` as `Association.concat`).
@@ -610,6 +611,32 @@ module ActiveRecord
       def find(*args, &block)
         return super(*args, &block) if block
         scope.find(*args)
+      end
+
+      # A column sum is a query (`Enumerable#sum` keeps the block and
+      # numeric forms).
+      def sum(*args, &block)
+        return super(*args, &block) if block || args.empty? || !(args[0].is_a?(Symbol) || args[0].is_a?(String))
+        scope.sum(*args)
+      end
+
+      # The rows go, and so do the records the owner holds.
+      def destroy_all
+        destroyed = scope.destroy_all
+        clear
+        destroyed
+      end
+
+      def delete_all
+        deleted = scope.delete_all
+        clear
+        deleted
+      end
+
+      # The association read again, as Rails' `proxy.reload`.
+      def reload
+        @proxy_owner.instance_variable_set(:"@#{@proxy_name}_loaded", false)
+        @proxy_owner.public_send(@proxy_name)
       end
 
       def method_missing(method, *args, **kwargs, &block)
