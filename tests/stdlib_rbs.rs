@@ -143,6 +143,8 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesu
 fn a_gem_constant_stays_the_gems() {
     let (_, errors) = emit_and_run::empty_app()
         .write("Gemfile.lock", LOCK)
+        .write("roundhouse.yml", "extensions:\n  - ext\n")
+        .write("ext/gems.yml", "runtime_gems:\n  - {constant: OpenStruct, gem: ostruct}\n")
         .write("sorbet/rbi/gems/ostruct@0.6.3.rbi", "# typed: true\nclass OpenStruct\n  def initialize(hash = T.unsafe(nil)); end\nend\n")
         .write("lib/payload.rb", "class Payload\n  def account\n    OpenStruct.new({ name: \"Ada\" })\n  end\nend\n")
         .emit(BuildTarget::Rust);

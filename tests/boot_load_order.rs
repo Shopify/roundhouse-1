@@ -28,9 +28,13 @@ use roundhouse::project::BuildTarget;
 /// and dalli, a gem the tree's runtime/gem_facades.rb requires.
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    cgi (0.4.2)\n    dalli (3.2.9)\n    mocha (2.5.0)\n      ruby2_keywords (>= 0.0.5)\n    ruby2_keywords (0.0.5)\n\nDEPENDENCIES\n  activesupport\n  cgi\n  dalli\n  mocha\n";
 
+/// The gem the tree declares and requires on demand.
+const GEMS: &str = "runtime_gems:\n  - {constant: Dalli, gem: dalli}\n";
+
 fn mocha_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write(
             "sorbet/rbi/gems/dalli@3.2.9.rbi",

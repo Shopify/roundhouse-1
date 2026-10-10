@@ -261,7 +261,8 @@ fn a_call_a_gem_superclass_answers_is_replayed() {
         ("sorbet/rbi/gems/query_layer@0.1.27.rbi", RBI),
         ("app/models/aggregating.rb", concern),
         ("app/models/line_item_response.rb", includer),
-        ("roundhouse.yml", "test_paths:\n  - test\n"),
+        ("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n"),
+        ("ext/gems.yml", "lock_gated_requires:\n  - {require: query_layer, gem: query_layer}\n"),
     ]
     .iter()
     .map(|(path, text)| (std::path::PathBuf::from(path), text.as_bytes().to_vec()))

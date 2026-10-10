@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use roundhouse::analyze::diagnose;
 use roundhouse::ingest::ingest_app_from_tree;
 
+/// The gem the tree's `require "shopify_metafields"` loads, gated on the lockfile.
+const GEMS: &str = "lock_gated_requires:\n  - {require: shopify_metafields, gem: shopify_metafields}\n";
+
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    shopify_metafields (0.12.31)\n\nDEPENDENCIES\n  shopify_metafields\n";
 
 const RBI: &str = r#"# typed: true
@@ -74,6 +77,8 @@ fn errors() -> Vec<String> {
         ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
         ("Gemfile.lock", LOCK),
+        ("roundhouse.yml", "extensions:\n  - ext\n"),
+        ("ext/gems.yml", GEMS),
         ("sorbet/rbi/gems/shopify_metafields@0.12.31.rbi", RBI),
         ("app/models/metafields/types.rb", TYPES),
         ("app/models/metafields/types/company_reference_type.rb", ROOTED),

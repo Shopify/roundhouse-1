@@ -60,9 +60,13 @@ fn fake_gem_home() -> PathBuf {
     home
 }
 
+/// The tracing API the tree loads, and a Bundler.required gem.
+const GEMS: &str = "runtime_gems:\n  - {constant: OpenTelemetry, gem: opentelemetry-api}\n  - {constant: \"OpenTelemetry::Instrumentation::PG\", gem: opentelemetry-instrumentation-pg}\nlock_gated_requires:\n  - {require: roaring, gem: roaring}\n";
+
 fn app(home: &Path) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", &format!("test_paths:\n  - test\ngem_home: {}\n", home.display()))
+        .write("roundhouse.yml", &format!("test_paths:\n  - test\nextensions:\n  - ext\ngem_home: {}\n", home.display()))
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
         .write("config/initializers/00_tracing.rb", TRACING)
@@ -166,7 +170,8 @@ fn other_trees_refuse_it() {
 #[test]
 fn no_gem_home_no_decision() {
     let (dir, errors) = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", "test_paths:\n  - test\nextensions:\n  - ext\n")
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
         .write("config/initializers/00_tracing.rb", TRACING)

@@ -42,9 +42,13 @@ class NoteTest < ActiveSupport::TestCase
 end
 "#;
 
+/// A gem whose load closure reaches Rails (`rails_dependent`).
+const GEMS: &str = "rails_dependent:\n  - {gem: softer_delete, why: \"requiring it loads 167 Rails framework files\"}\n";
+
 fn app(config: &str) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", config)
+        .write("roundhouse.yml", &format!("{config}extensions:\n  - ext\n"))
+        .write("ext/gems.yml", GEMS)
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/softer_delete@0.9.0.rbi", RBI)
         .write("vendor/gems/softer_delete-0.9.0/lib/softer_delete.rb", ENTRY)

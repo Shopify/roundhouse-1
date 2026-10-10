@@ -13507,198 +13507,18 @@ const GEM_REQUIRES: &[&str] = &[
 /// `Loofah.fragment` Core's `String#sanitize_without_defaults` calls.
 const GEM_REQUIRE_DEPENDENCIES: &[(&str, &[&str])] = &[("rails-html-sanitizer", &["loofah", "crass"])];
 
-/// Shopify Core's Bundler.require, in its Gemfile order, as (require
-/// path, lockfile gem): the default-group entries whose load closure is
-/// Rails-free (the rest are `RAILS_DEPENDENT_GEMS` or unclassified).
-/// Unlike `GEM_REQUIRES` these load only where the app's Gemfile.lock
-/// resolves the gem, so a tree's load set does not follow whatever gems
-/// the machine has installed.
-///
-/// Rails-free is measured (`runs/rails-free-probe`, docs/RUNTIME_GEMS.md):
-/// the entry requires with no error and no Rails gem loaded, both bare
-/// and with the runtime's `Rails`/`ActiveSupport`/`ActiveRecord`/
+/// The default-group Bundler.require entries the emitted tree loads, as
+/// (require path, lockfile gem), in Gemfile order: an app's extensions
+/// supply them (`extensions`, `lock_gated_requires`). They load only where
+/// the app's Gemfile.lock resolves the gem, so a tree's load set does not
+/// follow whatever gems the machine has installed. Each is a gem whose load
+/// closure is Rails-free: it requires with no Rails gem loaded, bare and
+/// with the runtime's `Rails`/`ActiveSupport`/`ActiveRecord`/
 /// `ActionController` modules defined, and registers no
-/// `ActiveSupport.on_load` hook. Left out though Rails-free: rbtrace,
-/// which starts a tracer when required.
-const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
-    ("stringio", "stringio"),
-    ("fstring/all", "symbol-fstring"),
-    ("rake", "rake"),
-    ("rack", "rack"),
-    ("brotli", "brotli"),
-    ("roaring", "roaring"),
-    ("ipaddr", "ipaddr"),
-    ("json", "json"),
-    ("bootsnap", "bootsnap"),
-    ("tzinfo/data", "tzinfo-data"),
-    ("csv", "csv"),
-    ("gda", "gda"),
-    ("redis", "redis"),
-    ("hiredis-client", "hiredis-client"),
-    ("ephemeral_cache_header", "ephemeral_cache_header"),
-    ("stack_frames", "stack_frames"),
-    ("snappy", "snappy"),
-    ("lz4_flex", "lz4_flex"),
-    ("zstd-ruby", "zstd-ruby"),
-    ("graphql", "graphql"),
-    ("graphql-c_parser", "graphql-c_parser"),
-    ("graphql/batch", "graphql-batch"),
-    ("rollouts_mutex", "rollouts_mutex"),
-    ("liquid", "liquid"),
-    ("liquid_rewriter", "liquid_rewriter"),
-    ("liquid_extensions", "liquid_extensions"),
-    ("dev_dashboard_design_system", "dev_dashboard_design_system"),
-    ("address_validation", "address_validation"),
-    ("braintree", "braintree"),
-    ("stripe", "stripe"),
-    ("mail", "mail"),
-    ("browser_sniffer", "browser_sniffer"),
-    ("search_query_parser", "search_query_parser"),
-    ("cel", "cel"),
-    ("mruby_engine", "mruby_engine"),
-    ("enterprise_script_service", "enterprise_script_service"),
-    ("redis-namespace", "redis-namespace"),
-    ("aws-sdk-s3", "aws-sdk-s3"),
-    ("aws-sdk-sns", "aws-sdk-sns"),
-    ("aws-sdk-eventbridge", "aws-sdk-eventbridge"),
-    ("aws-sdk-sqs", "aws-sdk-sqs"),
-    ("ruby-saml", "ruby-saml"),
-    ("barby", "barby"),
-    ("chunky_png", "chunky_png"),
-    ("rqrcode_core", "rqrcode_core"),
-    ("blake3-rb", "blake3-rb"),
-    ("RedCloth", "RedCloth"),
-    ("redcarpet", "redcarpet"),
-    ("rack/sanitizer", "rack-sanitizer"),
-    ("raindrops", "raindrops"),
-    ("hsluv", "hsluv"),
-    ("mini_mime", "mini_mime"),
-    ("geoip", "geoip"),
-    ("maxmind/geoip2/reader", "maxmind-geoip2"),
-    ("h3", "h3"),
-    ("faraday", "faraday"),
-    ("faraday/net_http_persistent", "faraday-net_http_persistent"),
-    ("faraday/retry", "faraday-retry"),
-    ("faraday/gzip", "faraday-gzip"),
-    ("faraday/typhoeus", "faraday-typhoeus"),
-    ("async/http", "async-http"),
-    ("async", "async"),
-    ("prawn", "prawn"),
-    ("prawn-svg", "prawn-svg"),
-    ("prawn/table", "prawn-table"),
-    ("combine_pdf", "combine_pdf"),
-    ("public_suffix", "public_suffix"),
-    ("simpleidn", "simpleidn"),
-    ("whois", "whois"),
-    ("escape_utils", "escape_utils"),
-    ("cityhash", "cityhash"),
-    ("concurrent-ruby", "concurrent-ruby"),
-    ("opentelemetry-instrumentation-concurrent_ruby", "opentelemetry-instrumentation-concurrent_ruby"),
-    ("opentelemetry-instrumentation-action_view", "opentelemetry-instrumentation-action_view"),
-    ("opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-trilogy"),
-    ("opentelemetry-instrumentation-pg", "opentelemetry-instrumentation-pg"),
-    ("opentelemetry-instrumentation-grpc", "opentelemetry-instrumentation-grpc"),
-    ("lru_redux", "lru_redux"),
-    ("diffy", "diffy"),
-    ("jaro_winkler", "jaro_winkler"),
-    ("tiny_segmenter", "tiny_segmenter"),
-    ("dry-validation", "dry-validation"),
-    ("dry-types", "dry-types"),
-    ("json_schema", "json_schema"),
-    ("perfect_toml", "perfect_toml"),
-    ("base32/crockford", "base32-crockford"),
-    ("addressable", "addressable"),
-    ("holidays", "holidays"),
-    ("smart_properties", "smart_properties"),
-    ("sqlite3", "sqlite3"),
-    ("sassc", "sassc"),
-    ("execjs", "execjs"),
-    ("terser", "terser"),
-    ("premailer", "premailer"),
-    ("sprockets", "sprockets"),
-    ("schmooze", "schmooze"),
-    ("google_service_account_faraday", "google_service_account_faraday"),
-    ("dns_manager", "dns_manager"),
-    ("trilogy", "trilogy"),
-    ("pg", "pg"),
-    ("shopify_metrics/autoload", "shopify_metrics"),
-    ("shopify_metrics/client_adapters", "shopify_metrics"),
-    ("fast_blank", "fast_blank"),
-    ("vernier", "vernier"),
-    ("stackprof", "stackprof"),
-    ("openssl", "openssl"),
-    ("acme-client", "acme-client"),
-    ("net/sftp", "net-sftp"),
-    ("ed25519", "ed25519"),
-    ("bcrypt_pbkdf", "bcrypt_pbkdf"),
-    ("i18n", "i18n"),
-    ("rbnacl", "rbnacl"),
-    ("ruby-vips", "ruby-vips"),
-    ("image_size", "image_size"),
-    ("exiftool_vendored", "exiftool_vendored"),
-    ("connection_pool", "connection_pool"),
-    ("type_toolkit", "type_toolkit"),
-    ("rollouts", "rollouts"),
-    ("shopify_bots", "shopify_bots"),
-    ("shopify_bots/agent_classification_identifier", "shopify_bots"),
-    ("shopify_bots/rack/middleware", "shopify_bots"),
-    ("shopify_bots/request_extension", "shopify_bots"),
-    ("shopify_bots/session/object_agent_classification_record", "shopify_bots"),
-    ("shopify_bots/session/agent_classification_updater", "shopify_bots"),
-    ("image_transformations", "image_transformations"),
-    ("query_layer", "query_layer"),
-    ("cloud_storage_utils", "cloud_storage_utils"),
-    ("shipping_base", "shipping_base"),
-    ("shipify/client", "shipify-client"),
-    ("sabertooth", "sabertooth"),
-    ("sabertooth/prelude", "sabertooth"),
-    ("messenger", "messenger"),
-    ("splunk_formatter", "splunk_formatter"),
-    ("shopify-opensrs", "shopify-opensrs"),
-    ("global_phone", "global_phone"),
-    ("jp_postal_codes", "jp_postal_codes"),
-    ("service_operation", "service_operation"),
-    ("customer_privacy_api_ruby", "customer_privacy_api_ruby"),
-    ("shopify/adt", "shopify-adt"),
-    ("shopifyql_parser", "shopifyql_parser"),
-    ("credit_card_bin", "credit_card_bin"),
-    ("merchant_category_codes", "merchant_category_codes"),
-    ("i18n/compact", "i18n-compact"),
-    ("monorail-schemas", "monorail-schemas"),
-    ("bugsnag", "bugsnag"),
-    ("observe/instrument", "observe-instrument"),
-    ("production_change_events", "production_change_events"),
-    ("mcp-ruby", "mcp-ruby"),
-    ("payment_service_client", "payment_service_client"),
-    ("magellan-ruby", "magellan-ruby"),
-    ("shopify-types", "shopify-types"),
-    ("theraphosa", "theraphosa"),
-    ("shopify_metafields", "shopify_metafields"),
-    ("shopify_mysql_utf8mb4_general_ci_compat", "shopify_mysql_utf8mb4_general_ci_compat"),
-    ("bluejay", "bluejay"),
-    ("filter_values_sorter", "filter_values_sorter"),
-    ("cloudflare_ruby", "cloudflare_ruby"),
-    ("cube_api_client", "cube_api_client"),
-    ("hosted_fields", "hosted_fields"),
-    ("nuevo_protobuf", "nuevo_protobuf"),
-    ("shopify_session", "shopify_session"),
-    ("shopkv", "shopkv"),
-    ("feast-sdk", "feast-sdk"),
-    ("shopify/exp/bandits", "exp-bandits-ruby"),
-    ("adyen_ruby", "adyen_ruby"),
-    ("dhm", "dhm"),
-    ("pitchfork", "pitchfork"),
-    ("webrick", "webrick"),
-    ("openai", "ruby-openai"),
-    ("twilio-ruby", "twilio-ruby"),
-    ("vonage", "vonage"),
-    ("rugged", "rugged"),
-    ("benchmark", "benchmark"),
-    ("resolv", "resolv"),
-    ("jose", "jose"),
-    ("tiktoken_ruby", "tiktoken_ruby"),
-    ("colorize", "colorize"),
-];
+/// `ActiveSupport.on_load` hook.
+fn lock_gated_requires() -> Vec<(&'static str, &'static str)> {
+    crate::extensions::active().lock_gated_requires.clone()
+}
 
 /// The guarded-require block, minus any gem this tree provides another
 /// way. Guarded because an app that uses none of them — the blog — must
@@ -13962,7 +13782,7 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
 
 /// Shopify Core's Gemfile entries outside the default group whose
 /// Bundler.require is measured Rails-free (`runs/rails-free-probe`,
-/// verdicts.tsv "test-group", by `LOCK_GATED_REQUIRES`' method): the
+/// verdicts.tsv "test-group", by `lock_gated_requires`' method): the
 /// gem's own require (or Bundler's `-` to `/` fallback) loads no Rails
 /// gem, bare or with the runtime's Rails modules defined, and registers
 /// no `ActiveSupport.on_load` hook. Not the measurement's minitest and
@@ -13993,11 +13813,11 @@ const PORT_BACKED_BUNDLER_GEMS: &[(&str, &[&str])] = &[
 
 /// The app's Bundler.require entries (`App::bundler_gems`) the emitted
 /// tree requires as installed gems, beyond `GEM_REQUIRES` and
-/// `LOCK_GATED_REQUIRES`: resolved by the lock, not carried as source
+/// `lock_gated_requires`: resolved by the lock, not carried as source
 /// (a carried gem's entry is a file program the boot loads), and
 /// measured Rails-free (`BUNDLER_GROUP_RAILS_FREE_GEMS`) or backed by the
 /// runtime's Rails ports (`PORT_BACKED_BUNDLER_GEMS`). The rest of
-/// Core's default group is `LOCK_GATED_REQUIRES`, Rails-dependent, or
+/// Core's default group is `lock_gated_requires`, Rails-dependent, or
 /// unclassified (runtime-engine-client's `runtime/engine/client` does
 /// not exist, so native Bundler.require skips it too). `require: false`
 /// gems are not in `App::bundler_gems`: they still need the app's own
@@ -14015,7 +13835,7 @@ pub(crate) fn bundler_required_runtime_gems<'a>(
                 && (BUNDLER_GROUP_RAILS_FREE_GEMS.contains(&gem.name.as_str())
                     || PORT_BACKED_BUNDLER_GEMS.iter().any(|(g, _)| *g == gem.name))
                 && !GEM_REQUIRES.contains(&gem.name.as_str())
-                && !LOCK_GATED_REQUIRES.iter().any(|(_, g)| *g == gem.name)
+                && !lock_gated_requires().iter().any(|(_, g)| *g == gem.name)
         })
         .collect()
 }
@@ -14064,7 +13884,7 @@ fn bundler_gem_require_block(bundler: &[crate::app::BundlerGem], lock: Option<&c
 /// and `ruby/tlsh` both miss and it skips the gem (docs/RUNTIME_GEMS.md
 /// "unclassified"), and Core's theme_template_body.rb and
 /// theme_identification/vp_tree.rb `require "ruby_tlsh"` themselves. The
-/// tree loads them with `LOCK_GATED_REQUIRES`, at boot rather than where
+/// tree loads them with `lock_gated_requires`, at boot rather than where
 /// the app file requires them; each is measured Rails-free the same way
 /// (ruby_tlsh loads sorbet-runtime and its C extension, no Rails gem, no
 /// `on_load`). Without it `Tlsh` was undefined and every
@@ -14072,13 +13892,14 @@ fn bundler_gem_require_block(bundler: &[crate::app::BundlerGem], lock: Option<&c
 const APP_REQUIRED_GEMS: &[(&str, &str)] = &[("ruby_tlsh", "ruby-tlsh")];
 
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
-    let gated = LOCK_GATED_REQUIRES
-        .iter()
-        .chain(APP_REQUIRED_GEMS)
+    let gated = lock_gated_requires()
+        .into_iter()
+        .chain(APP_REQUIRED_GEMS.iter().copied())
         .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)) && !exclude.contains(gem))
         .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
         .iter()
+        .copied()
         .filter(|g| !exclude.contains(g))
         .chain(gated)
         .map(|g| format!("{g:?}"))
@@ -14101,11 +13922,23 @@ fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> 
 /// No other tree loads any gem, so a constant only a gem's RBI declares
 /// runs here or nowhere.
 pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
-    runtime_gems().iter().any(|(_, loaded)| *loaded == gem) || CRUBY_TEST_GEMS.contains(&gem)
+    base_tree_loads_gem(gem) || crate::extensions::active().runtime_gems.iter().any(|(_, loaded)| *loaded == gem)
+}
+
+/// Whether requiring a lock-gated gem was seen to load `gem`
+/// (`LOCK_GATED_DEPENDENCIES`).
+pub(crate) fn loaded_by_lock_gated_gem(gem: &str) -> bool {
+    LOCK_GATED_DEPENDENCIES.contains(&gem)
+}
+
+/// [`ruby_tree_loads_gem`] by the compiler's own rows, before any extension
+/// (`extensions::load` validates an extension's facts against it).
+pub(crate) fn base_tree_loads_gem(gem: &str) -> bool {
+    base_runtime_gems().iter().any(|(_, loaded)| *loaded == gem) || CRUBY_TEST_GEMS.contains(&gem)
 }
 
 /// The gems `lock` resolves that the CRuby tree's Bundler.require
-/// (`LOCK_GATED_REQUIRES`) loads, with the specs they depend on that
+/// (`lock_gated_requires`) loads, with the specs they depend on that
 /// requiring them loads too (shopify_session's jwt), so their constants
 /// run as the gems'. A lockfile dependency alone is not a load:
 /// payment_service_client depends on cusco but autoloads it, and cusco
@@ -14119,7 +13952,7 @@ pub(crate) fn lock_loaded_gems(
 ) -> std::collections::BTreeSet<String> {
     let mut loaded = std::collections::BTreeSet::new();
     let mut stack: Vec<&str> =
-        LOCK_GATED_REQUIRES.iter().chain(APP_REQUIRED_GEMS).map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
+        lock_gated_requires().into_iter().chain(APP_REQUIRED_GEMS.iter().copied()).map(|(_, gem)| gem).filter(|gem| lock.has(gem)).collect();
     stack.extend(
         bundler_required_runtime_gems(bundler, Some(lock))
             .into_iter()
@@ -14145,10 +13978,10 @@ pub(crate) fn lock_loaded_gems(
     loaded
 }
 
-/// The gems, outside `LOCK_GATED_REQUIRES`, that requiring its entries
+/// The gems, outside `lock_gated_requires`, that requiring its entries
 /// was seen to load: each entry required in its own process against
 /// Core's pinned gem home, with the runtime's Rails modules defined
-/// (`LOCK_GATED_REQUIRES` describes the probe), and the gem directories
+/// (`lock_gated_requires` describes the probe), and the gem directories
 /// in `$LOADED_FEATURES` read back. 127 of the 232 lockfile-only
 /// dependencies; the rest, Rails and the Rails-dependent gems among them,
 /// were not loaded. Artifact: runs/rails-free-probe/observed-deps.txt
@@ -14192,12 +14025,27 @@ const LOCK_GATED_DEPENDENCIES: [&str; 127] = [
 /// (`BUNDLER_GROUP_RAILS_FREE_GEMS`).
 const CRUBY_TEST_GEMS: [&str; 2] = ["minitest", "minitest-reporters"];
 
-fn runtime_gems() -> &'static [(Marker, &'static str)] {
+fn runtime_gems() -> Vec<(Marker, &'static str)> {
+    let mut gems = base_runtime_gems();
+    gems.extend(crate::extensions::active().runtime_gems.iter().map(|&(marker, gem)| {
+        (
+            match marker {
+                crate::extensions::DemandMarker::Constant(c) => Marker::Constant(c),
+                crate::extensions::DemandMarker::AnyText(t) => Marker::AnyText(t),
+            },
+            gem,
+        )
+    }));
+    gems
+}
+
+/// The compiler's own demand rows; an app's extensions append to them.
+fn base_runtime_gems() -> Vec<(Marker, &'static str)> {
     // Kept in step with the guarded list in `runtime/gem_facades.rb`:
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 45] = [
+    const RUNTIME_GEMS: [(Marker, &str); 16] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -14284,207 +14132,18 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // installed, which the app's own Gemfile (image_processing →
         // ruby-vips) already asked of the machine.
         (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
-        // Shopify Core reports query and CI timings through the real
-        // client (`StatsD::Instrument::Client.from_env`); the analyzer
-        // types it from the gem's Tapioca RBI, which loads nothing.
-        (Marker::Constant("StatsD"), "statsd-instrument"),
-        // dRuby, a bundled gem since Ruby 3.4 (so a Bundler tree must
-        // declare it). Core's test parallelization reaches it at boot
-        // (`DRbObject.new_with_uri`, `rescue DRb::DRbConnError`). Its
-        // runtime dependencies are none: no Rails in its load closure.
-        (Marker::Constant("DRb"), "drb"),
-        (Marker::Constant("DRbObject"), "drb"),
-        // OpenStruct, a bundled gem since Ruby 4.0 (Core runs 4.0 and
-        // locks ostruct 0.6.3). Core's test support builds GraphQL
-        // mock payloads from it. It defines OpenStruct and patches no
-        // other library, so requiring it at boot changes nothing else.
-        (Marker::Constant("OpenStruct"), "ostruct"),
-        // Shopify Core's cache client. Essentials' Config#initialize runs
-        // `Dalli.register(Dalli::OpentelemetryMiddleware)` at boot (the
-        // middleware is the Shopify dalli fork's own), and Core's Gemfile
-        // Bundler.requires the gem.
-        (Marker::Constant("Dalli"), "dalli"),
-        // Protocol buffers, which Core's Gemfile Bundler.requires.
-        (Marker::Constant("Google::Protobuf"), "google-protobuf"),
-        // Core's generated messages, under the gem's `gen` require path.
-        // Core declares it `require: false`: the app's own `require
-        // "proto/shopify/common/island_name"` loads it (Podding::Discovery::
-        // Island at boot), so it is declared here and not in GEM_REQUIRES.
-        // It depends on google-protobuf.
-        (Marker::Constant("Proto::Shopify"), "proto"),
-        // Shopify Core's Redis clients, all Bundler.required. Essentials'
-        // test config boots an in-process Redis and rescues
-        // `Redis::CommandError`; the engine registers middleware on
-        // `RedisClient`. hiredis-client has no constant of its own:
-        // loading it makes hiredis RedisClient's default driver, as on
-        // Core.
-        (Marker::Constant("Redis"), "redis"),
-        (Marker::Constant("RedisClient"), "redis-client"),
-        (Marker::Constant("Redis"), "hiredis-client"),
-        // Online Store's theme bodies and Paquito's codecs compress
-        // through it.
-        (Marker::Constant("Snappy"), "snappy"),
-        // Essentials' boot path, all Bundler.required by Core and loaded
-        // natively without Rails: Rack's request and utils in the logging
-        // middleware, Faraday's errors (faraday_exceptions.rb, at load),
-        // Trilogy's errors rescued by the daemonset pool provider (Core
-        // reopens `class Trilogy`, so only the gem's RBI types its
-        // errors), the Redis Lua runner's Sabertooth, the domains
-        // OpenSRS client and Podding discovery's Magellan.
-        (Marker::Constant("Rack"), "rack"),
-        (Marker::Constant("Faraday"), "faraday"),
-        (Marker::Constant("Faraday"), "faraday-gzip"),
-        (Marker::Constant("Trilogy"), "trilogy"),
-        (Marker::Constant("Sabertooth"), "sabertooth"),
-        (Marker::Constant("OpenSRS"), "shopify-opensrs"),
-        (Marker::Constant("Magellan"), "magellan-ruby"),
-        // More of Essentials' load-time constants, each Bundler.required by
-        // Core and loaded natively without Rails: query capture's
-        // StackFrames buffer, the middlewares' LruRedux cache, ShopifyBots
-        // (with its listed requires) and customer account's
-        // CustomerPrivacyApiRuby.
-        (Marker::Constant("StackFrames"), "stack_frames"),
-        (Marker::Constant("LruRedux"), "lru_redux"),
-        (Marker::Constant("ShopifyBots"), "shopify_bots"),
-        (Marker::Constant("CustomerPrivacyApiRuby"), "customer_privacy_api_ruby"),
-        // Bundler.required by Core and loaded natively without Rails:
-        // Shopify::Adt's Optional and graphql-ruby's query AST
-        // (`GraphQL::Language::Nodes`). Not kafka-shopify or
-        // graphql-client: each loads ActiveSupport when required.
-        (Marker::Constant("Shopify::Adt"), "shopify-adt"),
-        (Marker::Constant("GraphQL"), "graphql"),
-        // Core's tracing, as far as its Rails-free instrumentations load
-        // it: each requires the API and the instrumentation base.
-        // opentelemetry-shopify, the SDK entry, is in
-        // `RAILS_DEPENDENT_GEMS`.
-        (Marker::Constant("OpenTelemetry"), "opentelemetry-api"),
-        (Marker::Constant("OpenTelemetry::Instrumentation::Trilogy"), "opentelemetry-instrumentation-trilogy"),
-        (Marker::Constant("OpenTelemetry::Instrumentation::PG"), "opentelemetry-instrumentation-pg"),
-        // Demand only: Core's own `require "opentelemetry-helpers-sql-
-        // obfuscation"` and `require "prism"` (a default gem, in Core's
-        // lock) load these, as on Core.
-        (Marker::Constant("OpenTelemetry::Helpers::SqlObfuscation"), "opentelemetry-helpers-sql-obfuscation"),
-        (Marker::Constant("Prism"), "prism"),
     ];
-    &RUNTIME_GEMS
+    RUNTIME_GEMS.into()
 }
 
-/// Gems in Core's Bundler.require list whose load closure reaches Rails,
-/// with the evidence. The emitted runtime defines `Rails`,
+/// Why `gem`'s load closure reaches Rails, when an extension lists it as
+/// `rails_dependent` (`extensions`): the emitted runtime defines `Rails`,
 /// `ActiveSupport` and `ActiveRecord`, so a gem's `if defined?(...)`
-/// integration fires there too. These gems are compiled as app code
-/// through `gem_sources:` or their constants are refused by name
-/// (construct `gem_requires_rails`); they are never required natively. Verdicts: docs/RUNTIME_GEMS.md
-/// (core-transpile). The first nine were read by hand; the rest are the
-/// probe's findings for the remaining default-group entries
-/// (`LOCK_GATED_REQUIRES` describes the probe).
-const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
-    ("app_profiler", "app_profiler.rb requires active_support and its core_ext, and uses ActiveSupport::Deprecation"),
-    ("secure_headers", "view_helper.rb calls `ActiveSupport.on_load(:action_view)` when ActiveSupport is defined"),
-    ("shopify-money", "money.rb requires money_column when ActiveRecord is defined"),
-    ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),
-    ("opentelemetry-shopify", "it requires its railtie, and with it `active_support/parameter_filter`, when Rails is defined"),
-    // Not opentelemetry-sdk or opentelemetry-instrumentation-rack: each
-    // requires no Rails framework file (the gem home's probe loads none),
-    // and only opentelemetry-shopify requires them. Compiled as a gem
-    // source, its `require "opentelemetry/sdk"` loads the SDK natively,
-    // so the SDK's constants (`Samplers::Result`, read by its verbosity
-    // sampler at load) run as the gem's
-    // (`ingest::gem_source_constants::scan_gem_source_requires`); with
-    // no tree requiring them, they are a gem no emitted tree loads.
-    ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
-    ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
-    ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
-    ("gurgel", "requiring it loads 2 Rails framework files"),
-    ("activeresource", "requiring it loads 55 Rails framework files"),
-    ("responders", "requiring it loads 107 Rails framework files"),
-    ("activemodel-serializers-xml", "requiring it loads 55 Rails framework files"),
-    ("activerecord-typedstore", "requiring it loads 28 Rails framework files"),
-    ("activerecord-rescue_from_duplicate", "requiring it loads 35 Rails framework files"),
-    ("frozen_record", "requiring it loads 79 Rails framework files"),
-    ("validate_url", "requiring it loads 81 Rails framework files"),
-    ("activerecord-session_store", "requiring it loads 198 Rails framework files"),
-    ("asset_cloud", "requiring it loads 28 Rails framework files"),
-    ("ar_transaction_changes", "requiring it loads 163 Rails framework files"),
-    ("checkout_address_validator", "requiring it loads 35 Rails framework files"),
-    ("active_utils", "requiring it loads 44 Rails framework files"),
-    ("activemerchant", "requiring it loads 47 Rails framework files"),
-    ("progressrus", "with the runtime's Rails modules defined it raises NameError"),
-    ("job-iteration", "requiring it loads 176 Rails framework files"),
-    ("maintenance_tasks", "requiring it loads 384 Rails framework files"),
-    ("oauth2", "it loads 46 Rails framework files when Rails is defined"),
-    ("measured", "requiring it loads 168 Rails framework files"),
-    ("better_html", "requiring it loads 71 Rails framework files"),
-    ("sass", "it registers `ActiveSupport.on_load` hooks (:before_configuration)"),
-    ("rtlize", "with the runtime's Rails modules defined it raises NameError"),
-    ("premailer-rails", "requiring it loads 64 Rails framework files"),
-    ("sassc-rails", "requiring it loads 247 Rails framework files"),
-    ("sprockets-commoner", "with the runtime's Rails modules defined it raises NameError"),
-    ("active_model_serializers", "requiring it loads 82 Rails framework files"),
-    ("activerecord-yugabyte-db-adapter", "requiring it loads 163 Rails framework files"),
-    ("paquito", "requiring it loads 69 Rails framework files"),
-    ("worldwide", "requiring it loads 28 Rails framework files"),
-    ("graphql-client", "requiring it loads 21 Rails framework files"),
-    ("query_layer-active_record", "requiring it loads 163 Rails framework files"),
-    ("softer_delete", "requiring it loads 167 Rails framework files"),
-    ("key_value_model", "requiring it loads 196 Rails framework files"),
-    ("comms-platform", "requiring it loads 168 Rails framework files"),
-    ("impertinent", "it registers `ActiveSupport.on_load` hooks (:before_configuration)"),
-    ("active_shipping", "requiring it loads 168 Rails framework files"),
-    ("shipment_tracking", "requiring it loads 168 Rails framework files"),
-    ("identifications", "requiring it loads 16 Rails framework files"),
-    ("shopify-throttle", "requiring it loads 47 Rails framework files"),
-    ("common-validators", "requiring it loads 81 Rails framework files"),
-    ("safe_redirect", "requiring it loads 57 Rails framework files"),
-    ("typed_parameters", "requiring it loads 163 Rails framework files"),
-    ("shopify-payments-configuration", "requiring it loads 79 Rails framework files"),
-    ("cusco", "requiring it loads 59 Rails framework files"),
-    ("security_reports", "requiring it loads 151 Rails framework files"),
-    ("monorail", "requiring it loads 43 Rails framework files"),
-    ("kafka-shopify", "requiring it loads 43 Rails framework files"),
-    ("privacy_enforcer", "requiring it loads 151 Rails framework files"),
-    ("blacklisted_credentials_client", "requiring it loads 28 Rails framework files"),
-    ("identity_client", "requiring it loads 199 Rails framework files"),
-    ("device_manager_client", "requiring it loads 75 Rails framework files"),
-    ("active_tax", "requiring it loads 62 Rails framework files"),
-    ("polaris", "requiring it loads 237 Rails framework files"),
-    ("shop_user_recognition", "requiring it loads 20 Rails framework files"),
-    ("memory_mapped_store", "requiring it loads 45 Rails framework files"),
-    ("apps_runtime", "requiring it loads 69 Rails framework files"),
-    ("active_kafka", "requiring it loads 2 Rails framework files"),
-    ("tailor", "requiring it loads 28 Rails framework files"),
-    ("market_managers", "requiring it loads 62 Rails framework files"),
-    ("datastores_best_practices", "with the runtime's Rails modules defined it raises NameError"),
-    ("schema-migrations", "requiring it loads 46 Rails framework files"),
-    ("verdict", "requiring it loads 125 Rails framework files"),
-    ("graphql-shopify", "requiring it loads 164 Rails framework files"),
-    ("shopify-i18n", "requiring it loads 52 Rails framework files"),
-    ("country_db", "requiring it loads 35 Rails framework files"),
-    ("shopify_spanner", "it registers `ActiveSupport.on_load` hooks (:active_record)"),
-    ("courier", "requiring it loads 65 Rails framework files"),
-    ("sequenced_column", "requiring it loads 28 Rails framework files"),
-    ("paypal_ruby", "requiring it loads 168 Rails framework files"),
-    ("theme_settings_compiler", "requiring it loads 168 Rails framework files"),
-    ("abacus_client", "requiring it loads 44 Rails framework files"),
-    ("hedwig", "requiring it loads 177 Rails framework files"),
-    ("trust_battery_client", "requiring it loads 168 Rails framework files"),
-    ("api_versioning", "requiring it loads 136 Rails framework files"),
-    ("web_pixels_manager", "requiring it loads 168 Rails framework files"),
-    ("carriers_db", "requiring it loads 182 Rails framework files"),
-    ("shopify-cdp", "requiring it loads 168 Rails framework files"),
-    ("buyer-risk-ml", "keys.rb requires active_support/core_ext/object/blank"),
-    ("token_protocol", "requiring it loads 170 Rails framework files"),
-    ("monorepo_slices", "requiring it loads 90 Rails framework files"),
-    ("session_awareness", "requiring it loads 170 Rails framework files"),
-    ("shopify_errors", "requiring it loads 91 Rails framework files"),
-    ("ledger", "requiring it loads 308 Rails framework files"),
-    ("shopify_ledger", "requiring it loads 250 Rails framework files"),
-];
-
-/// Why `gem`'s load closure reaches Rails, when it is in
-/// `RAILS_DEPENDENT_GEMS`.
+/// integration fires there too. Such a gem is compiled as app code through
+/// `gem_sources:` or its constants are refused by name (construct
+/// `gem_requires_rails`); it is never required natively.
 pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
-    RAILS_DEPENDENT_GEMS.iter().find(|(g, _)| *g == gem).map(|(_, why)| *why)
+    crate::extensions::active().rails_dependent.iter().find(|(g, _)| *g == gem).map(|(_, why)| *why)
 }
 
 /// Gems a runtime port stands in for, with the port's files by source
@@ -14653,7 +14312,7 @@ pub(crate) fn gem_port_declaring(name: &str) -> Option<(&'static str, &'static s
 /// grpc_fork_safety, which depends on Core's grpc fork.
 fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>, gem_sources: &[String]) {
     let mut needed: Vec<&str> = Vec::new();
-    for &(ref marker, gem) in runtime_gems() {
+    for (marker, gem) in runtime_gems() {
         // `app/` only. The runtime tree names several of these itself (the
         // façade lists all nine), and a scan that saw those would declare
         // every gem for every app — the same self-fulfilling wiring the
@@ -14673,7 +14332,7 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     // The lock-gated Bundler.require entries load whatever app/ names,
     // so a GIT-sourced one (Core's sprockets fork) is activated too.
     let gated: Vec<&str> = lock
-        .map(|l| LOCK_GATED_REQUIRES.iter().chain(APP_REQUIRED_GEMS).map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
+        .map(|l| lock_gated_requires().into_iter().chain(APP_REQUIRED_GEMS.iter().copied()).map(|(_, gem)| gem).filter(|gem| l.has(gem)).collect())
         .unwrap_or_default();
     if needed.is_empty() && gated.is_empty() && gem_sources.is_empty() {
         return;
@@ -17628,9 +17287,6 @@ mod tests {
         assert!(lock_loaded_gems(&lock, &[]).contains("ruby-tlsh"));
         let empty = crate::gems::Lockfile::parse("GEM\n  specs:\n\nDEPENDENCIES\n");
         assert!(!gem_require_block(&[], Some(&empty)).contains("ruby_tlsh"));
-        for (_, gem) in APP_REQUIRED_GEMS {
-            assert!(!RAILS_DEPENDENT_GEMS.iter().any(|(g, _)| g == gem), "{gem} is Rails-dependent");
-        }
     }
 
     /// A gem the tree loads or a runtime port stands in for is never
@@ -17638,12 +17294,8 @@ mod tests {
     /// declares only.
     #[test]
     fn ported_and_loaded_gems_are_not_refused_as_rails_dependent() {
-        for (gem, _) in RAILS_DEPENDENT_GEMS {
-            assert!(gem_port_files(gem).is_none(), "{gem} has a runtime port");
-            assert!(!ruby_tree_loads_gem(gem), "{gem} is loaded by every CRuby tree");
-            assert!(!LOCK_GATED_REQUIRES.iter().any(|(_, g)| g == gem), "{gem} is Bundler.required");
-            assert!(!LOCK_GATED_DEPENDENCIES.contains(gem), "{gem} is loaded by a Bundler.required gem");
-        }
+        // The extension loader refuses a `rails_dependent` gem that the tree
+        // loads or a port stands in for (`extensions::load`).
         for (name, file) in [
             ("Semian", "runtime/semian.rb"),
             ("Semian::BaseError", "runtime/semian.rb"),

@@ -18,6 +18,7 @@ pub mod effect;
 pub mod emit;
 pub mod erb;
 pub mod expr;
+pub mod extensions;
 pub mod facades;
 /// The generated Rails fixtures (`fixtures/real-blog`, `fixtures/store`)
 /// the test suites read, resolved with the generating command in the

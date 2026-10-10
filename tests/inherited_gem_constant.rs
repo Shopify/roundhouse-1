@@ -14,6 +14,9 @@ use roundhouse::ingest::ingest_app_from_tree;
 
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    shopify_metrics (2.0.0)\n\nDEPENDENCIES\n  shopify_metrics\n";
 
+/// The Bundler.required gem whose constants the tree loads.
+const GEMS: &str = "lock_gated_requires:\n  - {require: shopify_metrics, gem: shopify_metrics}\n";
+
 const RBI: &str = r#"# typed: true
 module ShopifyMetrics; end
 module ShopifyMetrics::Middlewares; end
@@ -85,6 +88,8 @@ fn errors() -> Vec<String> {
         ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
         ("Gemfile.lock", LOCK),
+        ("roundhouse.yml", "extensions:\n  - ext\n"),
+        ("ext/gems.yml", GEMS),
         ("sorbet/rbi/gems/shopify_metrics@2.0.0.rbi", RBI),
         ("app/models/stats_middleware.rb", MIDDLEWARE),
         ("app/models/shopify_metrics/cache_entry.rb", PATCH),

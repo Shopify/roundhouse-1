@@ -112,6 +112,9 @@ end
 SmartProperties::VERSION = T.let(T.unsafe(nil), String)
 "#;
 
+/// The gem the tree's `require "smart_properties"` loads, gated on the lockfile.
+const GEMS: &str = "lock_gated_requires:\n  - {require: smart_properties, gem: smart_properties}\n";
+
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    smart_properties (1.17.0)\n\nDEPENDENCIES\n  activesupport\n  smart_properties (= 1.17.0)\n";
 
 /// A plain class including the gem module, with bare and `self.` calls.
@@ -270,11 +273,11 @@ fn mixin_macros_run_as_in_cruby(rbi: bool) {
         "native control"
     );
 
-    let app = emit_and_run::empty_app().write("Gemfile.lock", LOCK);
+    let app = emit_and_run::empty_app().write("Gemfile.lock", LOCK).write("ext/gems.yml", GEMS);
     let app = if rbi {
-        app.write("sorbet/rbi/gems/smart_properties@1.17.0.rbi", RBI)
+        app.write("roundhouse.yml", "extensions:\n  - ext\n").write("sorbet/rbi/gems/smart_properties@1.17.0.rbi", RBI)
     } else {
-        app.write("roundhouse.yml", &format!("gem_home: {}\n", home.display()))
+        app.write("roundhouse.yml", &format!("extensions:\n  - ext\ngem_home: {}\n", home.display()))
     };
     let (tree, errors) = app
         .write("app/models/entitlements.rb", ENTITLEMENTS)
@@ -312,6 +315,8 @@ fn a_macro_the_gem_mixin_does_not_declare_stays_dropped_and_reported() {
     const SHADOW: &str = "module Shadow\n  module SmartProperties\n    def self.marker\n      :app\n    end\n  end\n\n  class Thing\n    include SmartProperties\n\n    property :hidden\n  end\nend\n";
     let tree: HashMap<PathBuf, Vec<u8>> = [
         ("Gemfile.lock", LOCK),
+        ("roundhouse.yml", "extensions:\n  - ext\n"),
+        ("ext/gems.yml", GEMS),
         ("sorbet/rbi/gems/smart_properties@1.17.0.rbi", RBI),
         ("app/models/loose.rb", LOOSE),
         ("app/models/shadow.rb", SHADOW),
@@ -439,7 +444,8 @@ fn a_concern_included_block_s_gem_macros_run_on_the_includer_as_in_cruby() {
     );
     let (tree, errors) = emit_and_run::empty_app()
         .write("Gemfile.lock", LOCK)
-        .write("roundhouse.yml", &format!("gem_home: {}\n", home.display()))
+        .write("roundhouse.yml", &format!("extensions:\n  - ext\ngem_home: {}\n", home.display()))
+        .write("ext/gems.yml", GEMS)
         .write("app/models/apps/extension.rb", EXTENSION)
         .write("app/models/apps/extensions/test_extension.rb", TEST_EXTENSION)
         .write("app/models/checkouts/ui_extension.rb", UI_EXTENSION)

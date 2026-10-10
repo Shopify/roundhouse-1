@@ -12,6 +12,21 @@ mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 
+/// Core's gem facts are the project extension `extensions/core` of the
+/// core-transpile checkout (docs/PROJECT_EXTENSIONS.md), not the compiler's:
+/// every app here lists it, so these tests run against the same rows the
+/// harness emits with. `ROUNDHOUSE_CORE_EXTENSION` overrides the path.
+fn core_extension() -> String {
+    let dir = std::env::var("ROUNDHOUSE_CORE_EXTENSION").unwrap_or_else(|_| "/home/tobi/core-transpile/extensions/core".into());
+    assert!(std::path::Path::new(&dir).join("gems.yml").exists(), "Core's gem facts are not at {dir}/gems.yml (ROUNDHOUSE_CORE_EXTENSION)");
+    dir
+}
+
+/// The test app's roundhouse.yml: test roots, `extra` keys, Core's extension.
+fn config(extra: &str) -> String {
+    format!("test_paths:\n  - test\n{extra}extensions:\n  - {}\n", core_extension())
+}
+
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    dalli (3.2.9)\n    google-protobuf (3.25.8)\n    proto (2026.10.02.63343)\n      google-protobuf (>= 3.25, < 5.0)\n\nDEPENDENCIES\n  activesupport\n  dalli\n  google-protobuf\n  proto\n";
 
 /// The parts of Core's Tapioca RBIs this app reaches.
@@ -42,7 +57,7 @@ end
 
 fn boot_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", LOCK)
         .write("sorbet/rbi/gems/dalli@3.2.9.rbi", DALLI_RBI)
         .write("sorbet/rbi/gems/google-protobuf@3.25.8.rbi", PROTOBUF_RBI)
@@ -153,7 +168,7 @@ const TEST_CONFIG_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n
 
 fn test_config_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", TEST_CONFIG_LOCK)
         .write("sorbet/rbi/gems/redis@5.4.0.rbi", "# typed: true\nclass Redis\n  def initialize(options = {}); end\nend\nclass Redis::BaseError < ::StandardError; end\nclass Redis::CommandError < ::Redis::BaseError; end\n")
         .write("sorbet/rbi/gems/redis-client@0.28.0.rbi", "# typed: true\nclass RedisClient\n  class << self\n    def register(middleware); end\n  end\nend\n")
@@ -242,7 +257,7 @@ const PLATFORM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n   
 fn platform_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", PLATFORM_LOCK)
         .write("sorbet/rbi/gems/rack@2.2.24.rbi", &rbi("module Rack; end\nclass Rack::Request\n  def initialize(env); end\n  def path; end\nend\n"))
         .write("sorbet/rbi/gems/faraday@2.14.3.rbi", &rbi("module Faraday; end\nclass Faraday::Error < ::StandardError; end\nclass Faraday::TimeoutError < ::Faraday::Error; end\n"))
@@ -334,7 +349,7 @@ const MIDDLEWARE_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n 
 fn middleware_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", MIDDLEWARE_LOCK)
         .write("sorbet/rbi/gems/stack_frames@0.1.3.rbi", &rbi("module StackFrames; end\nclass StackFrames::Buffer\n  def initialize(size); end\nend\n"))
         .write("sorbet/rbi/gems/lru_redux@1.1.0.rbi", &rbi("module LruRedux; end\nclass LruRedux::Cache\n  def initialize(max_size); end\nend\nclass LruRedux::ThreadSafeCache < ::LruRedux::Cache; end\n"))
@@ -389,7 +404,7 @@ const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  spec
 fn rails_dependent_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", RAILS_DEPENDENT_LOCK)
         .write("sorbet/rbi/gems/secure_headers@5.2.0.rbi", &rbi("module SecureHeaders; end\nclass SecureHeaders::StrictTransportSecurity; end\nSecureHeaders::StrictTransportSecurity::HEADER_NAME = T.let(T.unsafe(nil), String)\n"))
         .write("sorbet/rbi/gems/shopify-money@4.1.1.rbi", &rbi("class Money\n  def initialize(value, currency); end\nend\n"))
@@ -471,9 +486,9 @@ const SEMIAN_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    a
 /// the names it declares run as the port; the gem's net_http adapter is
 /// not ported.
 fn semian_app(postgresql: bool) -> emit_and_run::Overlay {
-    let config = if postgresql { "test_paths:\n  - test\ndatabase_adapter: postgresql\n" } else { "test_paths:\n  - test\n" };
+    let config = config(if postgresql { "database_adapter: postgresql\n" } else { "" });
     let mut app = emit_and_run::empty_app()
-        .write("roundhouse.yml", config)
+        .write("roundhouse.yml", &config)
         .write("Gemfile.lock", SEMIAN_LOCK)
         .write("sorbet/rbi/gems/semian@0.28.3.rbi", "# typed: true\nmodule Semian; end\nclass Semian::BaseError < ::StandardError; end\nclass Semian::TimeoutError < ::Semian::BaseError; end\nclass Semian::OpenCircuitError < ::Semian::BaseError; end\nmodule Semian::AdapterError; end\nmodule Semian::NetHTTP; end\nmodule Semian::Redis; end\n")
         .write("lib/resilience.rb", r#"class Resilience
@@ -556,7 +571,7 @@ const GLOBALID_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n   
 /// (runtime/global_id.rb); SignedGlobalID is not ported.
 fn globalid_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", GLOBALID_LOCK)
         .write("sorbet/rbi/gems/globalid@1.4.0.rbi", "# typed: true\nclass GlobalID\n  def initialize(gid, options = T.unsafe(nil)); end\n  def model_id; end\nend\nmodule GlobalID::Identification; end\nclass SignedGlobalID < ::GlobalID; end\n")
         .write("lib/identified.rb", r#"class Identified
@@ -599,7 +614,7 @@ const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n  
 #[test]
 fn an_app_s_own_money_does_not_declare_shopify_money() {
     let (dir, errors) = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", OWN_MONEY_LOCK)
         .write("lib/money.rb", "class Money\n  def initialize(value, currency)\n    @value = value\n  end\nend\n")
         .write("lib/price.rb", PRICE)
@@ -615,7 +630,7 @@ const SERVICES_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n   
 fn services_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", SERVICES_LOCK)
         .write("sorbet/rbi/gems/shopify-adt@1.2.0.rbi", &rbi("module Shopify; end\nmodule Shopify::Adt; end\nclass Shopify::Adt::Optional\n  def present?; end\nend\n"))
         .write("sorbet/rbi/gems/graphql@2.6.11.rbi", &rbi("module GraphQL; end\nmodule GraphQL::Language; end\nmodule GraphQL::Language::Nodes; end\nclass GraphQL::Language::Nodes::AbstractNode; end\nclass GraphQL::Language::Nodes::Field < ::GraphQL::Language::Nodes::AbstractNode\n  def name; end\nend\n"))
@@ -741,7 +756,7 @@ const BUNDLED_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    
 fn bundled_app(lock: &str) -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", lock)
         .write("sorbet/rbi/gems/stripe@18.4.2.rbi", &rbi("module Stripe; end\nclass Stripe::Customer\n  def id; end\nend\n"))
         .write("sorbet/rbi/gems/jwt@2.10.1.rbi", &rbi("module JWT; end\nclass JWT::DecodeError < StandardError; end\n"))
@@ -834,7 +849,7 @@ fn a_lockfile_dependency_requiring_does_not_load_is_refused() {
 #[test]
 fn an_app_whose_lock_omits_core_s_gems_requires_none_of_them() {
     for lock in [Some(OWN_MONEY_LOCK), None] {
-        let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+        let mut app = emit_and_run::empty_app().write("roundhouse.yml", &config(""));
         if let Some(lock) = lock {
             app = app.write("Gemfile.lock", lock);
         }
@@ -870,7 +885,7 @@ fn core_s_lock_requires_its_bundler_require_list_in_gemfile_order() {
     let deps: String = gems.iter().map(|g| format!("  {g}\n")).collect();
     let lock = format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nDEPENDENCIES\n{deps}");
     let (dir, errors) = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("roundhouse.yml", &config(""))
         .write("Gemfile.lock", &lock)
         .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
