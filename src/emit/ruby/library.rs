@@ -14376,13 +14376,25 @@ fn rewrite_carried_loads(
                 let mut anchors: Vec<Expr> = Vec::new();
                 let mut missing: Vec<Expr> = Vec::new();
                 for source in &matched {
-                    match table.anchors.get(source) {
-                        Some(anchor) => {
-                            if !anchors.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Str { value } } if value == anchor)) {
-                                anchors.push(lit(span, anchor));
-                            }
+                    let Some(anchor) = table.anchors.get(source) else {
+                        missing.push(lit(span, source));
+                        continue;
+                    };
+                    // A file with no program loads every class and module
+                    // it declares, as a boot `require` of it does
+                    // (`declarations_by_source`): essentials'
+                    // patches/request.rb declares RequestHelperMethods and
+                    // reopens ActionDispatch::Request to include it, and
+                    // its one anchor (the module's) left the reopen, which
+                    // nothing autoloads, unloaded.
+                    let files = match table.declarations.get(source) {
+                        Some(files) if !files.is_empty() => crate::project::namespace_files_first(files),
+                        _ => vec![anchor.clone()],
+                    };
+                    for file in files {
+                        if !anchors.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Str { value } } if *value == file)) {
+                            anchors.push(lit(span, &file));
                         }
-                        None => missing.push(lit(span, source)),
                     }
                 }
                 let array = |elements: Vec<Expr>| mk(span, ExprNode::Array { elements, style: Default::default() });

@@ -31,4 +31,20 @@ module ActiveRecord
       out.join(", ")
     end
   end
+
+  # Rails 8.2 QueryMethods#select: with a block, Enumerable's select over
+  # the loaded records (an Array), and a block with fields is an
+  # ArgumentError. The compiler renames the call sites it types as a
+  # relation to `filter` (`relation_select_block`); one it cannot type
+  # (a relation answered by an untyped helper) reached the shared
+  # projection, which raised. CRuby-only, so the shared `select` stays
+  # monomorphic for the strict targets.
+  module RelationSelectBlock
+    def select(*fields, &block)
+      return super(*fields) unless block
+      raise ArgumentError, "'select' with block doesn't take arguments." if fields.any?
+      filter(&block)
+    end
+  end
+  Relation.prepend(RelationSelectBlock)
 end

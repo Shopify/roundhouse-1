@@ -611,6 +611,18 @@ fn program_items(
             if on_load && !in_branch && !super::on_load_reopen::registered_as_written(&call) {
                 continue;
             }
+            // A hook whose block reopens its own base is registered with
+            // the reopen's body as the block's (`hook_base_reopen`).
+            if let Some((hook, class)) = on_load.then(|| super::on_load_reopen::hook_base_reopen(&call)).flatten() {
+                let statements: Vec<ruby_prism::Node<'_>> = class.body().map(flatten_statements).unwrap_or_default();
+                let receiver = call.receiver().map(|r| ingest_expr(&r, file));
+                out.push(match (receiver, class_eval_parts(source, &statements, file, "on_load")) {
+                    (Some(Ok(receiver)), Ok(parts)) => ProgramItem::ClassEval { receiver, method: format!("on_load(:{hook})"), parts },
+                    (_, Err(message)) => not_carried(stmt, message),
+                    _ => not_carried(stmt, "the ingest cannot carry this `on_load` receiver".to_string()),
+                });
+                continue;
+            }
         }
         // `$VERBOSE = true`: the expression ingest reads a global and
         // writes none, so a file-level write is carried here.

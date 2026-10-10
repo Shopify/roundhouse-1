@@ -224,12 +224,73 @@ pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
         return false;
     };
     let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+    if hook_base_reopen(call).is_some() {
+        return true;
+    }
     if hook_class(&hook).is_some() && !deferred_test_hook(&hook) && !(postgresql_tree() && prepends_only(&block)) {
         return false;
     }
     block.body().is_none_or(|body| {
         find_all_classes_with_scope(&body).is_empty() && find_all_modules_with_scope(&body).is_empty()
     })
+}
+
+/// A hook of a PostgreSQL tree whose block is only a reopen of the
+/// class the hook hands it, through its enclosing modules (Core's
+/// essentials/lib/patches/action_dispatch_request_buyer_session.rb:
+/// `on_load(:action_controller_test_case) { module ActionController;
+/// class TestCase; def buyer_session … end; end; end }`): the hook's
+/// name and that class's node. Rails runs the block under
+/// `base.class_eval` once the base loads, and the reopen opens that same
+/// base, so its body is the hook's body: the file program registers the
+/// hook with the body written straight into the block
+/// (`library_class::file_program`), which the runtime's lazy_load_hooks
+/// runs on the base where Rails does. A test-case base is defined by
+/// the emitted test helper, after boot, so a reopen carried at boot
+/// would open the class too early; before this, the whole block was
+/// dropped and `buyer_session` was undefined in every controller test.
+///
+/// Not this shape: a superclass on the reopen, a body that writes a
+/// constant (Ruby writes it on the base, the block on the file's scope),
+/// anything beside the reopen in the block or its modules, a block with
+/// parameters, a hook [`hook_class`] does not name.
+pub(super) fn hook_base_reopen<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<(String, ruby_prism::ClassNode<'pr>)> {
+    if !postgresql_tree()
+        || constant_id_str(&call.name()) != "on_load"
+        || call.receiver().and_then(|r| constant_path_of(&r)).map(|p| p.join("::")).as_deref() != Some("ActiveSupport")
+    {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let [hook] = args.as_slice() else { return None };
+    let hook = hook.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())?;
+    let base = hook_class(&hook)?;
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let mut path: Vec<String> = Vec::new();
+    let mut node = block.body()?;
+    loop {
+        let [only] = <[Node<'pr>; 1]>::try_from(flatten_statements(node)).ok()?;
+        if let Some(module) = only.as_module_node() {
+            path.extend(super::util::module_name_path(&module)?);
+            node = module.body()?;
+            continue;
+        }
+        let class = only.as_class_node()?;
+        path.extend(class_name_path(&class)?);
+        if path.join("::") != base || class.superclass().is_some() {
+            return None;
+        }
+        if let Some(body) = class.body() {
+            body.as_statements_node()?;
+            if flatten_statements(body).iter().any(|s| s.as_constant_write_node().is_some() || s.as_constant_path_write_node().is_some()) {
+                return None;
+            }
+        }
+        return Some((hook, class));
+    }
 }
 
 thread_local! {
