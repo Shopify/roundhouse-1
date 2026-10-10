@@ -1411,13 +1411,21 @@ fn emit_arg(e: &Expr) -> String {
 }
 
 /// Does `e` emit as a paren-less call with arguments AND a `do` block
-/// (`tag.details class: "x" do ... end`)? Fine in statement position;
-/// as a call argument it needs wrapping parens (see `emit_arg`).
+/// (`tag.details class: "x" do ... end`), or as any call with a literal
+/// `do ... end` block? Fine in statement position; as a call argument
+/// it needs wrapping parens (see `emit_arg`). A `do` block binds to the
+/// outermost paren-less command, so Core's `custom_redaction_strategy
+/// attr, redacted_value: (proc do |r| ... end)` emitted without the
+/// source parens hands the block to `custom_redaction_strategy` and
+/// leaves a block-less `proc` (ArgumentError at class load).
 fn renders_as_command_with_block(e: &Expr) -> bool {
-    matches!(
-        &*e.node,
-        ExprNode::Send { args, block: Some(_), parenthesized: false, .. } if !args.is_empty()
-    )
+    match &*e.node {
+        ExprNode::Send { args, block: Some(b), parenthesized, .. } => {
+            (!parenthesized && !args.is_empty())
+                || matches!(&*b.node, ExprNode::Lambda { block_style: crate::expr::BlockStyle::Do, .. })
+        }
+        _ => false,
+    }
 }
 
 /// Does `e` emit with an argument that runs to the end of the
@@ -2552,6 +2560,37 @@ mod tests {
         let arg_position = emit_expr(&send(None, "f", vec![inner]));
         assert!(arg_position.starts_with("f((g :a do"), "got: {arg_position}");
         assert!(arg_position.trim_end().ends_with("end))"), "got: {arg_position}");
+    }
+
+    #[test]
+    fn argless_do_block_hash_value_of_a_command_is_parenthesized() {
+        // Core's `custom_redaction_strategy store_attribute,
+        // redacted_value: (proc do |r| ... end)`: ingest drops the source
+        // parens, and bare the `do` block binds to the outer command,
+        // leaving `proc` block-less (ArgumentError "tried to create Proc
+        // object without a block" at class load).
+        let block = Expr::new(
+            Span::default(),
+            ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,
+                params: vec![],
+                block_param: None,
+                body: lit_sym("body"),
+                block_style: crate::expr::BlockStyle::Do,
+            },
+        );
+        let mut procx = send(None, "proc", vec![]);
+        if let ExprNode::Send { block: b, .. } = &mut *procx.node {
+            *b = Some(block);
+        }
+        let hash = Expr::new(
+            Span::default(),
+            ExprNode::Hash { entries: vec![(lit_sym("redacted_value"), procx.clone())], kwargs: true },
+        );
+        let out = emit_expr(&cmd_send(None, "custom_redaction_strategy", vec![lit_sym("data"), hash]));
+        assert!(out.starts_with("custom_redaction_strategy :data, redacted_value: (proc do"), "got: {out}");
+        assert!(out.trim_end().ends_with("end)"), "got: {out}");
+        // Statement position stays bare.
+        assert!(emit_expr(&procx).starts_with("proc do"), "got: {}", emit_expr(&procx));
     }
 
     /// Paren-less command-style send (`recv.method arg, ...`).
