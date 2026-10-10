@@ -1072,10 +1072,10 @@ fn raw_value_expr(v: &crate::lower::fixtures::RawFixtureValue) -> Expr {
         V::Float(f) => crate::lower::typing::lit_float(*f),
         V::Str(s) => lit_str(s.clone()),
         V::Structured(value) => yaml_value_expr(value),
-        V::Ruby(expr) => expr.clone(),
+        V::Ruby(expr) => erb_scalar(expr),
         V::RubyReference { value, uuid, integer_passes, identifier } => {
             let mut args = vec![
-                value.clone(),
+                erb_scalar(value),
                 lit_str(if *uuid { "uuid" } else { "integer" }.to_string()),
                 crate::lower::typing::lit_bool(*integer_passes),
             ];
@@ -1096,6 +1096,18 @@ fn raw_value_expr(v: &crate::lower::fixtures::RawFixtureValue) -> Expr {
             Ty::Untyped,
         ),
     }
+}
+
+/// A field that is one whole `<%= … %>` tag: Rails' YAML reads the text
+/// the tag wrote (`TestFixtures.erb_scalar`), so `<%= h.to_json.inspect %>`
+/// is the JSON text, not its quoted form. A tag inside other text comes
+/// from ingest as an interpolated string whose literal parts YAML has
+/// already read, and stays as is.
+fn erb_scalar(expr: &Expr) -> Expr {
+    if matches!(&*expr.node, ExprNode::StringInterp { .. }) {
+        return expr.clone();
+    }
+    send(Some(test_fixtures_const()), "erb_scalar", vec![expr.clone()], Ty::Untyped)
 }
 
 fn yaml_value_expr(v: &serde_yaml_ng::Value) -> Expr {
