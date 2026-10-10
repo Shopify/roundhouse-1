@@ -670,13 +670,9 @@ pub(super) fn ingest_model_with_enum_constants(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
-            let items = match ingest_model_body_items(
-                &stmt,
-                &owner,
-                file,
-                leading,
-                Some(&mut class_attr_defaults),
-            ) {
+            let items = match in_model_class_body(|| {
+                ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults))
+            }) {
                 Ok(items) => items,
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
@@ -1086,6 +1082,19 @@ fn expand_mattr_cattr(
 
 /// `leading_comments` is attached regardless of variant so every item
 /// keeps its inline docs.
+thread_local! {
+    /// Set while a model's own class-body statement is classified, as
+    /// opposed to a concern's `included do` or a `class_eval` body.
+    static IN_MODEL_CLASS_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn in_model_class_body<T>(f: impl FnOnce() -> T) -> T {
+    let outer = IN_MODEL_CLASS_BODY.replace(true);
+    let out = f();
+    IN_MODEL_CLASS_BODY.set(outer);
+    out
+}
+
 pub(super) fn ingest_model_body_item(
     stmt: &Node<'_>,
     owner: &ClassId,
@@ -1141,7 +1150,10 @@ pub(super) fn ingest_model_body_item(
         // `included do`. Record before the latter drops the Unknown,
         // and before ingesting a block that may contain further gaps.
         // Name the DSL shape, not unverified gem ownership.
-        if matches!(method.as_str(), "aasm" | "state_machine")
+        // A model's own `state_machine` is carried into the lowered class
+        // body and runs against the loaded state_machines gem
+        // (`lower::state_machines`); a concern's is not spliced.
+        if (method == "aasm" || (method == "state_machine" && !IN_MODEL_CLASS_BODY.get()))
             && call.block().and_then(|b| b.as_block_node()).is_some()
         {
             super::survey::record(&IngestError::Unsupported {

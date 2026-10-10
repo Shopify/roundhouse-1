@@ -1534,8 +1534,11 @@ module ActiveRecord
     # version, which stays for the strict-target runtime transpiles
     # (no Relation class in their tables); this file is walked only
     # into the ruby-family trees. Lowered call-sites don't land here —
-    # they drive a Relation or `_adapter_*` directly.
-    def self.where(conditions)
+    # they drive a Relation or `_adapter_*` directly. A String or an
+    # Array (`where(["state IN (?)", values])`, state_machines' `with_*`
+    # scopes) is Relation#where's SQL form.
+    def self.where(conditions, *args)
+      return ActiveRecord::Relation.new(self).where(conditions, *args) if conditions.is_a?(String) || conditions.is_a?(Array)
       ActiveRecord::Relation.new(self).where(conditions.to_h)
     end
 

@@ -3893,6 +3893,18 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_job_callbacks.rb: {e}"))?,
         ));
     }
+    // The `:validation` `:around` chain the state_machines integration
+    // registers on a model whose `state_machine` the lowered class body
+    // runs (`lower::state_machines`).
+    let carries_state_machines =
+        app.models.iter().any(|m| crate::lower::state_machines::state_machine_calls(m).next().is_some());
+    if carries_state_machines {
+        files.push((
+            "runtime/active_record_state_machines.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_record_state_machines.rb")
+                .map_err(|e| format!("read runtime/spinel/active_record_state_machines.rb: {e}"))?,
+        ));
+    }
     if carries_callbacks {
         files.push((
             "runtime/active_support_callbacks.rb".to_string(),
@@ -4095,6 +4107,11 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_callbacks {
         format!("{gem_facades}require_relative \"active_support_callbacks\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_state_machines {
+        format!("{gem_facades}require_relative \"active_record_state_machines\"\n")
     } else {
         gem_facades
     };
@@ -13884,11 +13901,28 @@ const BUNDLER_GROUP_RAILS_FREE_GEMS: &[&str] = &[
     "rubydex", "vcr", "webmock",
 ];
 
+/// Gems of Core's default group whose load closure requires Rails only
+/// through features the runtime ports answer, with the lockfile specs
+/// requiring them loads. The state_machines integrations require
+/// `active_record`, `active_model`, `active_support` and
+/// `active_support/core_ext/{hash/keys,module/attribute_accessors}`
+/// (`FRAMEWORK_FEATURE_PORTS`), so on the CRuby tree they register
+/// against the runtime's `ActiveRecord::Base` and load no Rails gem: the
+/// emitted Core tree loads all four through its component entry files
+/// (sales.rb's `require "state_machines-activerecord"`, ledger's), with
+/// gem_facades.rb's Rails-load guard silent. The model's `state_machine`
+/// runs against them (`lower::state_machines`).
+const PORT_BACKED_BUNDLER_GEMS: &[(&str, &[&str])] = &[
+    ("state_machines-audit_trail", &["state_machines"]),
+    ("state_machines-activerecord", &["state_machines-activemodel", "state_machines"]),
+];
+
 /// The app's Bundler.require entries (`App::bundler_gems`) the emitted
 /// tree requires as installed gems, beyond `GEM_REQUIRES` and
 /// `LOCK_GATED_REQUIRES`: resolved by the lock, not carried as source
 /// (a carried gem's entry is a file program the boot loads), and
-/// measured Rails-free (`BUNDLER_GROUP_RAILS_FREE_GEMS`). The rest of
+/// measured Rails-free (`BUNDLER_GROUP_RAILS_FREE_GEMS`) or backed by the
+/// runtime's Rails ports (`PORT_BACKED_BUNDLER_GEMS`). The rest of
 /// Core's default group is `LOCK_GATED_REQUIRES`, Rails-dependent, or
 /// unclassified (runtime-engine-client's `runtime/engine/client` does
 /// not exist, so native Bundler.require skips it too). `require: false`
@@ -13904,7 +13938,8 @@ pub(crate) fn bundler_required_runtime_gems<'a>(
         .filter(|gem| {
             lock.has(&gem.name)
                 && !lock.is_in_repo(&gem.name)
-                && BUNDLER_GROUP_RAILS_FREE_GEMS.contains(&gem.name.as_str())
+                && (BUNDLER_GROUP_RAILS_FREE_GEMS.contains(&gem.name.as_str())
+                    || PORT_BACKED_BUNDLER_GEMS.iter().any(|(g, _)| *g == gem.name))
                 && !GEM_REQUIRES.contains(&gem.name.as_str())
                 && !LOCK_GATED_REQUIRES.iter().any(|(_, g)| *g == gem.name)
         })
@@ -14023,6 +14058,8 @@ pub(crate) fn lock_loaded_gems(
                 lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
                     .filter(|dep| LOCK_GATED_DEPENDENCIES.contains(dep)),
             );
+            let backed = PORT_BACKED_BUNDLER_GEMS.iter().filter(|(g, _)| *g == gem);
+            stack.extend(backed.flat_map(|(_, deps)| deps.iter().copied()).filter(|dep| lock.has(dep)));
         }
     }
     loaded
@@ -14291,12 +14328,10 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("ar_transaction_changes", "requiring it loads 163 Rails framework files"),
     ("checkout_address_validator", "requiring it loads 35 Rails framework files"),
     ("active_utils", "requiring it loads 44 Rails framework files"),
-    ("state_machines-audit_trail", "with the runtime's Rails modules defined it raises NameError"),
     ("activemerchant", "requiring it loads 47 Rails framework files"),
     ("progressrus", "with the runtime's Rails modules defined it raises NameError"),
     ("job-iteration", "requiring it loads 176 Rails framework files"),
     ("maintenance_tasks", "requiring it loads 384 Rails framework files"),
-    ("state_machines-activerecord", "requiring it loads 163 Rails framework files"),
     ("oauth2", "it loads 46 Rails framework files when Rails is defined"),
     ("measured", "requiring it loads 168 Rails framework files"),
     ("better_html", "requiring it loads 71 Rails framework files"),

@@ -1346,7 +1346,9 @@ fn callbacks_port_methods() -> &'static [String] {
 /// them into the lowered class as class-body statements in body order
 /// (`collect_class_attr_initializers`), which the Ruby family writes
 /// below the synthesized `table_name` they read; a tree without the
-/// port file refuses the include. A class method of the model's own, or an
+/// port file refuses the include. The state_machines gem's
+/// `state_machine`, which the gem gives every class, is one too
+/// (`lower::state_machines`). A class method of the model's own, or an
 /// ancestor's, of the same name answers instead, so its call is not one.
 pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Vec<&'a Expr> {
     let mut chain: Vec<&Model> = vec![model];
@@ -1364,6 +1366,9 @@ pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Ve
         .filter_map(|module| crate::analyze::runtime_reads::mixed_in_class_methods(module.0.as_str()))
         .flatten()
         .map(String::as_str)
+        // The state_machines gem's macro, which it defines on every class
+        // (`lower::state_machines`).
+        .chain(crate::lower::state_machines::state_machine_calls(model).next().map(|_| crate::lower::state_machines::MACRO))
         .collect();
     if provided.is_empty() {
         return Vec::new();

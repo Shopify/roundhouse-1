@@ -100,10 +100,8 @@ end
                 "app/models/article.rb",
                 "state-machine DSL block `aasm` is not modeled"
             ),
-            (
-                "app/models/article.rb",
-                "state-machine DSL block `state_machine` is not modeled"
-            ),
+            // Article's own `state_machine` is carried
+            // (`lower::state_machines`), so it is no gap.
             (
                 "app/models/concerns/workflow.rb",
                 "state-machine DSL block `aasm` is not modeled"

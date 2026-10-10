@@ -303,7 +303,8 @@ module ActiveRecord
       self
     end
 
-    # `where(hash)` / `where("raw sql")` / `where("a = ? AND b = ?", x, y)`.
+    # `where(hash)` / `where("raw sql")` / `where("a = ? AND b = ?", x, y)`
+    # / `where(["a IN (?)", values])` (Rails' sanitize_sql_array form).
     def where(condition = nil, *args)
       add_condition(condition, args, false, true)
       self
@@ -394,6 +395,8 @@ module ActiveRecord
       return false if condition.nil?
       sql = if condition.is_a?(Hash)
         hash_conditions(condition, note)
+      elsif condition.is_a?(Array)
+        substitute_binds(condition[0].to_s, condition.drop(1) + args)
       else
         substitute_binds(condition.to_s, args)
       end
@@ -2500,7 +2503,7 @@ module ActiveRecord
       index = 0
       while index < parts.length - 1
         if index < args.length
-          result = result + ActiveRecord.adapter.escape_value(args[index])
+          result = result + bind_value_sql(args[index])
         else
           result = result + "?"
         end
@@ -2508,6 +2511,14 @@ module ActiveRecord
         index += 1
       end
       result
+    end
+
+    # One `?` bind's SQL: Rails quotes an Array (an `IN (?)` list) as its
+    # escaped elements joined by commas, and an empty one as NULL.
+    def bind_value_sql(value)
+      return ActiveRecord.adapter.escape_value(value) unless value.is_a?(Array)
+      return "NULL" if value.empty?
+      escape_list(value)
     end
 
     # Rails' named binds: `having("COUNT(*) = :size AND … IN (:user_ids)",
