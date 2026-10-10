@@ -14,6 +14,8 @@
 //!   already of the class the type casts to (a hydrated value, a typed
 //!   assignment), which the type would hand back unchanged. A temporal
 //!   writer casts before formatting its stored text.
+//! - the writer of a type declared with `attribute` over no column
+//!   casts through it too, without the pass-through test.
 //! - `[]=` (Rails' `write_attribute`) casts the same way, and `[]`
 //!   reads the cast value without a pre-cast.
 //! - `initialize`, `update`, `update!` and row hydration hand the value
@@ -98,6 +100,7 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             cast_writes(lc, &cols);
         }
         cast_key_writer(lc, model, table, &specs);
+        cast_declared_writers(lc, model, table);
         public_attributes(lc, model, table);
         nil_unsaved_id(lc, model, table);
         let row_class = format!("{}Row", model.name.0.as_str());
@@ -131,6 +134,58 @@ fn cast_key_writer(lc: &mut LibraryClass, model: &Model, table: &Table, specs: &
             cast_writer(m, col, kind);
         }
     }
+}
+
+/// A type declared with `attribute :name, :<type>` over no column: the
+/// shared lowering's writer assigns `@name = value` as given, where
+/// Rails casts every assignment through the declared type (with its
+/// TimeZoneConverter where time zone aware), so Core's
+/// `attribute :publish_on, :time` reads a TimeWithZone, not the String
+/// assigned. The writer casts through `type_for_attribute`, for a type
+/// the port carries (`schema_column_types` names it); `:boolean` keeps
+/// the lowering's own cast.
+fn cast_declared_writers(lc: &mut LibraryClass, model: &Model, table: &Table) {
+    let kinds = spec_symbols(lc);
+    for (name, ty) in crate::lower::model_to_library::attribute_api_decls(&model.body) {
+        if ty.as_str() == "boolean" || table.columns.iter().any(|c| c.name == name) {
+            continue;
+        }
+        if !kinds.iter().any(|(n, k)| n == name.as_str() && k != "unported") {
+            continue;
+        }
+        let setter = format!("{}=", name.as_str());
+        for m in lc.methods.iter_mut() {
+            if !m.name_span.is_synthetic() || m.receiver != MethodReceiver::Instance || m.name.as_str() != setter {
+                continue;
+            }
+            let Some(param) = m.params.first().map(|p| p.name.clone()) else { continue };
+            if let ExprNode::Assign { target: LValue::Ivar { name: slot }, value } = &mut *m.body.node {
+                if *slot == name && is_var(value, &param) {
+                    *value = cast_named(name.as_str(), var(&param));
+                }
+            }
+        }
+    }
+}
+
+/// The name => spec kind symbol of the model's `schema_column_types`.
+fn spec_symbols(lc: &LibraryClass) -> Vec<(String, String)> {
+    let Some(m) = lc.methods.iter().find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "schema_column_types")
+    else {
+        return Vec::new();
+    };
+    let ExprNode::Hash { entries, .. } = &*m.body.node else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(k, v)| {
+            let ExprNode::Lit { value: Literal::Str { value: name } } = &*k.node else { return None };
+            let ExprNode::Array { elements, .. } = &*v.node else { return None };
+            let ExprNode::Lit { value: Literal::Sym { value } } = &*elements.first()?.node else { return None };
+            Some((name.clone(), value.as_str().to_string()))
+        })
+        .collect()
 }
 
 /// Rails' new record has no id (`Owner.new.id` is nil): the `id`
@@ -211,7 +266,7 @@ fn spec_kinds(lc: &LibraryClass) -> Vec<(String, Option<Kind>)> {
                     "string" | "text" | "immutable_string" => Some(Kind::Text),
                     "decimal" | "uuid" => Some(Kind::Always),
                     "date" => Some(Kind::Date),
-                    "datetime" | "timestamp" => Some(Kind::Time),
+                    "datetime" | "timestamp" | "time" => Some(Kind::Time),
                     _ => None,
                 },
                 _ => None,
@@ -271,10 +326,14 @@ fn or(left: Expr, right: Expr) -> Expr {
 
 /// `self.class._cast_column("<col>", value)`.
 fn cast_call(col: &Column, value: Expr) -> Expr {
+    cast_named(col.name.as_str(), value)
+}
+
+fn cast_named(name: &str, value: Expr) -> Expr {
     let mut e = send(
         send(self_ref(), "class", vec![]),
         "_cast_column",
-        vec![lit(Literal::Str { value: col.name.as_str().to_string() }), value],
+        vec![lit(Literal::Str { value: name.to_string() }), value],
     );
     e.ty = Some(Ty::Untyped);
     e

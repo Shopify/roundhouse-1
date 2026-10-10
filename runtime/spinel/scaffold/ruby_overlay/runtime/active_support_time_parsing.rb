@@ -81,6 +81,12 @@ module ActiveSupport
       usec = m[7] ? "#{m[7]}000000"[0, 6].to_i : 0
       return ActiveSupport.present(Time.utc(m[1].to_i, m[2].to_i, m[3].to_i, m[4].to_i, m[5].to_i, m[6].to_i, usec))
     end
+    # A `time` column's text ("16:00:00[.ffffff]"): Type::Time reads the
+    # clock on its dummy date, 2000-01-01 UTC, not today's.
+    if (m = /\A(\d\d):(\d\d):(\d\d)(?:\.(\d+))?\z/.match(str))
+      usec = m[4] ? "#{m[4]}000000"[0, 6].to_i : 0
+      return ActiveSupport.present(Time.utc(2000, 1, 1, m[1].to_i, m[2].to_i, m[3].to_i, usec))
+    end
     t = str =~ /(Z|[+-]\d\d:?\d\d)\z/ ? Time.parse(str) : Time.parse("#{str} UTC")
     # Present in the app's zone, exactly as ActiveRecord returns
     # TimeWithZone values in Time.zone: main.rb pins ENV["TZ"] to the
