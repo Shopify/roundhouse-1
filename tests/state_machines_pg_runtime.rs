@@ -46,8 +46,8 @@ gem "state_machines-activerecord", "~> 0.9"
 
 const LOCK: &str = r#"GIT
   remote: https://github.com/Shopify/rails.git
-  revision: 5813559f4aedd8f37cb8af46fcb24f64ec3d6e7f
-  branch: sep-21-plus-query-constraints
+  revision: 5eb8c4c45beef65a2396d3a57a2310510c3d6906
+  branch: sep-29-plus-query-constraints
   specs:
     activemodel (8.2.0.alpha)
       activesupport (= 8.2.0.alpha)
@@ -196,10 +196,23 @@ const FILES: [(&str, &str); 12] = [
     ("app/models/state_machines_probe.rb", PROBE),
 ];
 
+/// The lock's Rails entry follows the gem home the oracle runs on:
+/// `CORE_GEM_HOME` of the previous Core holds Rails 5813559f4aed, the
+/// default one 5eb8c4c45bee.
+fn lock() -> String {
+    let previous = std::env::var("CORE_GEM_HOME").is_ok_and(|home| home.contains("kr4swvh5mw01"));
+    if previous {
+        LOCK.replace("5eb8c4c45beef65a2396d3a57a2310510c3d6906", "5813559f4aedd8f37cb8af46fcb24f64ec3d6e7f")
+            .replace("sep-29-plus-query-constraints", "sep-21-plus-query-constraints")
+    } else {
+        LOCK.to_string()
+    }
+}
+
 fn overlay() -> emit_and_run::Overlay {
-    FILES
-        .iter()
-        .fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
+    FILES.iter().fold(emit_and_run::empty_app(), |app, (path, text)| {
+        app.write(path, &if *path == "Gemfile.lock" { lock() } else { text.to_string() })
+    })
 }
 
 /// `check`'s errors other than the PostgreSQL adapter notice every
