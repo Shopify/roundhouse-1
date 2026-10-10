@@ -23,9 +23,21 @@
 #   raise NotImplementedError naming the class for an ActiveRecord::Base
 #   class, which does not answer `_reflect_on_association` here; any
 #   other class raises the NoMethodError Rails raises.
-# - validates_uniqueness_of and UniquenessValidator (validations/
-#   uniqueness.rb, a query per validation) are not ported: declaring one
-#   raises NotImplementedError naming the class and attributes.
+# - UniquenessValidator (validations/uniqueness.rb) queries through the
+#   runtime's Relation (runtime/active_record/relation.rb) the way the
+#   compiled `uniqueness:` rule does: `Relation.new(finder, false)` is
+#   `finder_class.unscoped` (an STI subclass keeps its type condition),
+#   and PostgreSQL's comparisons are written out: `case_sensitive: false`
+#   on a string or text column is `LOWER(col) = LOWER(value)` (the
+#   adapter's case_insensitive_comparison; citext, uuid and other columns
+#   compare with `=`), anything else `=`, a nil value `IS NULL`. A
+#   `belongs_to` attribute binds its foreign key (and foreign type) to
+#   the associated record's key; a `belongs_to` scope binds the record's
+#   own foreign key (and type) columns, where Rails reads the association
+#   (the same key unless an unsaved target was assigned). `validation_needed?`'s
+#   unique-index shortcut, which only spares a query whose answer the
+#   index already guarantees, is not taken: a persisted record always
+#   queries. Enum mapping applies where the class answers `defined_enums`.
 module ActiveRecord
   module Validations
     def self.included(base) # :nodoc:
@@ -205,12 +217,151 @@ module ActiveRecord
       end
     end
 
-    # ---- validations/uniqueness.rb (not ported; see the header)
+    # ---- validations/uniqueness.rb
     class UniquenessValidator < ActiveModel::EachValidator # :nodoc:
+      # The column types PostgreSQL's `lower()` takes, directly or through
+      # a cast (can_perform_case_insensitive_comparison_for?); citext is
+      # case-insensitive itself.
+      LOWER_TYPES = [:string, :text].freeze
+
       def initialize(options)
-        raise NotImplementedError, "#{options[:class]&.name}: ActiveRecord::Validations::UniquenessValidator " \
-          "(#{Array(options[:attributes]).map(&:inspect).join(", ")}) is not ported"
+        if options[:conditions] && !options[:conditions].respond_to?(:call)
+          raise ArgumentError, "#{options[:conditions]} was passed as :conditions but is not callable. " \
+                               "Pass a callable instead: `conditions: -> { where(approved: true) }`"
+        end
+        unless Validations.wrap(options[:scope]).all? { |scope| scope.respond_to?(:to_sym) }
+          raise ArgumentError, "#{options[:scope]} is not supported format for :scope option. " \
+            "Pass a symbol or an array of symbols instead: `scope: :user_id`"
+        end
+        super
+        @klass = options[:class]
       end
+
+      def validate_each(record, attribute, value)
+        finder_class = find_finder_class_for(record)
+        value = map_enum_attribute(finder_class, attribute, value)
+
+        relation = build_relation(finder_class, attribute, value)
+        if record.persisted?
+          primary_key = finder_class.primary_key
+          if primary_key
+            id = record.respond_to?(:id_in_database) ? record.id_in_database : record.id
+            relation = relation.not(primary_key.to_sym => [id])
+          else
+            raise UnknownPrimaryKey.new(finder_class, "Cannot validate uniqueness for persisted record without primary key.")
+          end
+        end
+        relation = scope_relation(record, relation)
+
+        if options[:conditions]
+          conditions = options[:conditions]
+
+          relation = if conditions.arity.zero?
+            relation.instance_exec(&conditions)
+          else
+            relation.instance_exec(record, &conditions)
+          end
+        end
+
+        if relation.exists?
+          error_options = options.except(:case_sensitive, :scope, :conditions)
+          error_options[:value] = value
+
+          record.errors.add(attribute, :taken, **error_options)
+        end
+      end
+
+      private
+        # The class hierarchy is searched upwards to the class declaring
+        # the validation, for the lowest class that is not abstract.
+        def find_finder_class_for(record)
+          current_class = record.class
+          found_class = nil
+          loop do
+            found_class = current_class unless current_class.abstract_class?
+            break if current_class.equal?(@klass) || current_class.superclass.nil? ||
+              (defined?(ActiveRecord::Base) && current_class.equal?(ActiveRecord::Base))
+            current_class = current_class.superclass
+          end
+          found_class
+        end
+
+        def build_relation(klass, attribute, value)
+          relation = ActiveRecord::Relation.new(klass, false)
+          reflection = belongs_to_reflection(klass, attribute)
+          return bind_association(relation, reflection, value) if reflection
+
+          column = attribute.to_s
+          if value.nil? || !options.key?(:case_sensitive) || options[:case_sensitive] || !lower_comparable?(klass, column)
+            relation.where(column.to_sym => value)
+          else
+            relation.where("LOWER(#{klass._table_sql}.#{quote_column(column)}) = LOWER(?)", value)
+          end
+        end
+
+        def scope_relation(record, relation)
+          Validations.wrap(options[:scope]).each do |scope_item|
+            reflection = belongs_to_reflection(record.class, scope_item)
+            if reflection
+              relation = relation.where(reflection.foreign_key.to_sym => read_column(record, reflection.foreign_key))
+              if reflection.polymorphic?
+                relation = relation.where(reflection.foreign_type.to_sym => read_column(record, reflection.foreign_type))
+              end
+            else
+              unless column?(record.class, scope_item.to_s) || record.class.respond_to?(:reflect_on_association)
+                raise NotImplementedError, "#{record.class.name}: UniquenessValidator scope #{scope_item.inspect} names no column, " \
+                  "and the class carries no association reflections to resolve it"
+              end
+              relation = relation.where(scope_item.to_sym => read_column(record, scope_item))
+            end
+          end
+          relation
+        end
+
+        # PredicateBuilder's AssociationQueryValue for `where(assoc => record)`.
+        def bind_association(relation, reflection, target)
+          key = target.nil? ? nil : target.public_send(reflection.association_primary_key)
+          relation = relation.where(reflection.foreign_key.to_sym => key)
+          if reflection.polymorphic?
+            type = target.nil? ? nil : target.class.polymorphic_name
+            relation = relation.where(reflection.foreign_type.to_sym => type)
+          end
+          relation
+        end
+
+        # `record.read_attribute(name)`: a compiled model holds a column in
+        # its instance variable, past any reader the class overrides.
+        def read_column(record, name)
+          return record.read_attribute(name) if record.respond_to?(:read_attribute)
+          ivar = :"@#{name}"
+          record.instance_variable_defined?(ivar) ? record.instance_variable_get(ivar) : record.send(name)
+        end
+
+        def belongs_to_reflection(klass, name)
+          return nil unless klass.respond_to?(:reflect_on_association)
+          reflection = klass.reflect_on_association(name)
+          reflection if reflection.respond_to?(:belongs_to?) && reflection.belongs_to?
+        end
+
+        def column?(klass, column)
+          !klass.respond_to?(:schema_column_types) || klass.schema_column_types.key?(column)
+        end
+
+        def lower_comparable?(klass, column)
+          spec = klass.respond_to?(:schema_column_types) ? klass.schema_column_types[column] : nil
+          spec.nil? || LOWER_TYPES.include?(Validations.wrap(spec).first)
+        end
+
+        def quote_column(column)
+          "\"#{column.gsub('"', '""')}\""
+        end
+
+        def map_enum_attribute(klass, attribute, value)
+          return value unless klass.respond_to?(:defined_enums)
+          mapping = klass.defined_enums[attribute.to_s]
+          value = mapping[value] if value && mapping
+          value
+        end
     end
 
     module ClassMethods
