@@ -1085,9 +1085,14 @@ module ActiveRecord
     def _transaction_write_begin; end
     def _transaction_write_end; end
 
+    # Rails keys transaction candidates by the record itself: `hash`/`eql?`
+    # use class and id once the id is present (all parts for a composite key)
+    # and object identity before that. The id is never compared with 0 or "",
+    # which also keeps app id types such as UUID value objects out of it.
     def _transaction_record_key # :nodoc:
       key = id
-      new_record? || key.nil? || key == 0 || key == "" ? self : [self.class, key]
+      present = key.is_a?(Array) ? key.all? : key
+      present ? [self.class, key] : self
     end
 
     def before_committed! # :nodoc:
