@@ -15,7 +15,12 @@
 //! in the analyzer registry and the name resolves nowhere on the
 //! chain (own methods, attribute row, includes, then parents — the
 //! same order dispatch uses). A class the registry doesn't know, or
-//! a name any hop knows, keeps its default untouched. The analyzer
+//! a name any hop knows, keeps its default untouched. A class method's
+//! default resolves on the class side (its own and its parents' class
+//! methods, then the instance methods of the modules it extends):
+//! Core's `def apply!(reader = query_engine_reader)` in `class << self`
+//! names the private class method below it, and was grounded to the
+//! raise because no instance method had that name. The analyzer
 //! already ledgers these sites (`unresolved_type` on reads of the
 //! poisoned param), so no new diagnostic is added here.
 
@@ -23,7 +28,7 @@ use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
-use crate::dialect::Param;
+use crate::dialect::{MethodReceiver, Param};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::ClassId;
 
@@ -32,19 +37,24 @@ pub fn apply_dead_default_lowering(app: &mut App, registry: &HashMap<ClassId, Cl
         let class = model.name.clone();
         for item in &mut model.body {
             if let crate::dialect::ModelBodyItem::Method { method, .. } = item {
-                ground_params(&mut method.params, &class, registry);
+                ground_params(&mut method.params, &class, method.receiver, registry);
             }
         }
     }
     for lc in &mut app.library_classes {
         let class = lc.name.clone();
         for method in &mut lc.methods {
-            ground_params(&mut method.params, &class, registry);
+            ground_params(&mut method.params, &class, method.receiver, registry);
         }
     }
 }
 
-fn ground_params(params: &mut [Param], class: &ClassId, registry: &HashMap<ClassId, ClassInfo>) {
+fn ground_params(
+    params: &mut [Param],
+    class: &ClassId,
+    receiver: MethodReceiver,
+    registry: &HashMap<ClassId, ClassInfo>,
+) {
     if !registry.contains_key(class) {
         return;
     }
@@ -53,7 +63,11 @@ fn ground_params(params: &mut [Param], class: &ClassId, registry: &HashMap<Class
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*default.node else {
             continue;
         };
-        if !args.is_empty() || resolves(class, method.as_str(), registry, 0) {
+        let known = match receiver {
+            MethodReceiver::Instance => resolves(class, method.as_str(), registry, 0),
+            MethodReceiver::Class => resolves_on_class(class, method.as_str(), registry, 0),
+        };
+        if !args.is_empty() || known {
             continue;
         }
         let span = default.span;
@@ -98,6 +112,41 @@ fn resolves(
     }
     match &info.parent {
         Some(parent) => resolves(parent, name, registry, depth + 1),
+        None => false,
+    }
+}
+
+/// [`resolves`] for a class method's default: the class's own class
+/// methods, the instance methods of the modules it extends, then its
+/// parent's class side. A name every class answers (Module's and
+/// Kernel's own, `name`, `superclass`) resolves without a registry entry.
+fn resolves_on_class(
+    class: &ClassId,
+    name: &str,
+    registry: &HashMap<ClassId, ClassInfo>,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return true;
+    }
+    const MODULE_METHODS: &[&str] = &[
+        "name", "to_s", "inspect", "superclass", "ancestors", "class", "hash", "object_id",
+        "itself", "frozen?", "freeze", "dup", "clone", "new", "allocate", "instance_methods",
+        "constants", "module_parent", "module_parent_name", "caller", "binding", "block_given?",
+        "__method__", "rand", "logger",
+    ];
+    if MODULE_METHODS.contains(&name) {
+        return true;
+    }
+    let Some(info) = registry.get(class) else { return true };
+    if info.class_methods.keys().any(|m| m.as_str() == name) {
+        return true;
+    }
+    if info.extends.iter().any(|m| resolves(m, name, registry, depth + 1)) {
+        return true;
+    }
+    match &info.parent {
+        Some(parent) => resolves_on_class(parent, name, registry, depth + 1),
         None => false,
     }
 }
