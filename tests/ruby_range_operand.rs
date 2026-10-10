@@ -1,12 +1,11 @@
 //! A range operand of an infix or boolean operator keeps its parentheses.
 //!
 //! `..`/`...` bind looser than every infix operator and than `&&`/`||`.
-//! Core's v4a_patch `search_ranges << (expected_pos...limit)` written
-//! bare is `(search_ranges << expected_pos)...limit`: it pushes the
-//! Integer, and `ruby -w` reports "possibly useless use of ... in void
-//! context", which Core's strict_warnings.rb raises on when the file
-//! loads. `(a..b) == r` bare is `a..(b == r)`, and `r || (a..b)` bare is
-//! `(r || a)..b`.
+//! `out << (start...limit)` written bare is `(out << start)...limit`: it
+//! pushes the Integer, and `ruby -w` reports "possibly useless use of ...
+//! in void context", which a warnings-as-errors handler raises on when
+//! the file loads. `(a..b) == r` bare is `a..(b == r)`, and
+//! `r || (a..b)` bare is `(r || a)..b`.
 
 use std::process::Command;
 
@@ -39,6 +38,7 @@ fn a_range_argument_of_an_infix_operator_is_parenthesized() {
     assert_eq!(emit(&binop(var("out"), "<<", range("a", "b", true))), "out << (a...b)");
     assert_eq!(emit(&binop(var("out"), "<<", range("a", "b", false))), "out << (a..b)");
     assert_eq!(emit(&binop(var("r"), "==", range("a", "b", false))), "r == (a..b)");
+    assert_eq!(emit(&binop(var("x"), "!~", range("a", "b", false))), "x !~ (a..b)");
 }
 
 #[test]

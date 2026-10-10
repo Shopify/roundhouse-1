@@ -3,11 +3,11 @@
 //! Ruby binds a brace block to the nearest call, so `f a, b { }` passes
 //! the block to `b`, and `f a, k: 1 { }` does not parse. Ingest turns a
 //! symbol block-pass (`&:upcase`) into a `{ |x| x.upcase }` block of the
-//! call. The emitter wrote it after the paren-less arguments, so 47 files
-//! of Core's r17 emit (graphql `field :name, :string, null: false,
-//! &:mask_sensitive_data`) did not parse. Such a call now takes its
-//! arguments in parentheses, so the block is the call's own, as in the
-//! source. Native Ruby on the same source is the oracle.
+//! call. The emitter wrote it after the paren-less arguments, so a DSL
+//! call such as `field :name, :string, &:upcase` did not parse. Such a
+//! call now takes its arguments in parentheses, so the block is the
+//! call's own, as in the source. Native Ruby on the same source is the
+//! oracle.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -22,8 +22,8 @@ const BUILDER: &str = r##"module Bracelab
       @fields = []
     end
 
-    def field(name, type = nil, null: true, description: nil, &blk)
-      @fields << [name, type, null, description, blk ? blk.call("ab") : :no_block]
+    def field(name, type = nil, options = {}, &blk)
+      @fields << [name, type, options.fetch(:null, true), options[:description], blk ? blk.call("ab") : :no_block]
       self
     end
 
