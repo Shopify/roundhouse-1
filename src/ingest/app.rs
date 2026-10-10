@@ -1438,8 +1438,15 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
         if let Some(name) = extract_app_namespace(&source) {
             let app_name = crate::naming::underscore(&name);
+            // `Rails::Engine#engine_name`, the application's railtie name
+            // (railties railtie.rb `generate_railtie_name`: the class
+            // name underscored, `/` as `_`): kafka-shopify's
+            // `kafka.configure` initializer sets `KafkaShopify.app_name`
+            // from it, without which every produce raises
+            // InvalidConfiguration.
+            let engine_name = format!("{}_application", app_name.replace('/', "_"));
             if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
-                "def global_id_app\n  {app_name:?}\nend\n"
+                "def global_id_app\n  {app_name:?}\nend\n\ndef engine_name\n  {engine_name:?}\nend\n"
             )) {
                 methods.append(&mut synth);
             }
