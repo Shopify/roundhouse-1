@@ -618,9 +618,14 @@ pub(super) const SHAPE_DETAIL: &str =
 /// - `include M`: M included into the includer after the Concern (a
 ///   Concern M's block then runs there as well).
 ///
-/// Any other statement of the block (a validation, a callback, a gem's
-/// class-body DSL) is reported, once per statement: the emitted includer
-/// would run without it. So is the whole block of a Concern this cannot
+/// On an STI subclass (a library class below a model), any other
+/// statement of the block (`typed_store`, `serialize`, a validation, a
+/// callback) joins the subclass's own body calls, ahead of them, as the
+/// block runs where the `include` is: the STI subclass lowering then
+/// defines or refuses it as if the subclass body wrote it
+/// ([`sti_subclass_statement`]). On any other includer such a statement
+/// (a validation, a callback, a gem's class-body DSL) is reported, once
+/// per statement: the emitted includer would run without it. So is the whole block of a Concern this cannot
 /// verify (`class_configuration::framework_concern_verdicts`), with why.
 ///
 /// The base is whoever performed the include: a Concern defers its own
@@ -843,6 +848,20 @@ pub(super) fn splice_into_library_includers(
     };
 
     let jobs = crate::lower::job_class_side::job_class_names(&app.library_classes);
+    // A class whose superclass chain reaches a model: an STI subclass,
+    // which Rails gives the model DSL its body (and an included block)
+    // declares.
+    let below_model = |lc: &crate::dialect::LibraryClass| -> bool {
+        let mut at = lc.parent.as_ref().map(top);
+        for _ in 0..8 {
+            let Some(parent) = at else { return false };
+            if models.contains(&parent) {
+                return true;
+            }
+            at = by_name.get(&parent).and_then(|c| c.parent.as_ref()).map(top);
+        }
+        false
+    };
     let mut planned: Vec<Plan> = Vec::new();
     let mut refusals: Vec<(Span, String)> = Vec::new();
     let mut dropped: HashMap<Span, (String, ClassId, Vec<ClassId>)> = HashMap::default();
@@ -871,7 +890,9 @@ pub(super) fn splice_into_library_includers(
             includes: Vec::new(),
             statements: Vec::new(),
             class_attributes: Vec::new(),
+            carried: Vec::new(),
         };
+        let sti = !lc.is_module && below_model(lc);
         let mut accessors: Vec<&Expr> = Vec::new();
         for (root, concern) in &reached {
             let Some(items) = app.concern_model_items.get(concern) else { continue };
@@ -983,6 +1004,10 @@ pub(super) fn splice_into_library_includers(
                     {
                         continue;
                     }
+                    if sti && let Some(expr) = sti_subclass_statement(item, concern, &lc.name, &declared, &defined, sources) {
+                        plan.carried.push(expr);
+                        continue;
+                    }
                     let (span, name) = dropped_statement(item, included_call(app, concern), sources);
                     let entry = dropped.entry(span).or_insert_with(|| (name, concern.clone(), Vec::new()));
                     if !entry.2.contains(&lc.name) {
@@ -1062,6 +1087,7 @@ pub(super) fn splice_into_library_includers(
             || !plan.initializers.is_empty()
             || !plan.includes.is_empty()
             || !plan.statements.is_empty()
+            || !plan.carried.is_empty()
         {
             planned.push(plan);
         }
@@ -1077,6 +1103,7 @@ pub(super) fn splice_into_library_includers(
         }
         let lc = &mut app.library_classes[plan.index];
         lc.methods.extend(plan.methods);
+        lc.unknown_calls.splice(0..0, plan.carried);
         // Run where the `include` ran, which the emitted body writes
         // ahead of every class-body statement.
         lc.class_ivar_initializers.splice(0..0, plan.initializers);
@@ -1225,6 +1252,48 @@ struct Plan {
     /// The carried `class_attribute` defs and seeds, by the include they
     /// run after (`App::included_class_attributes`).
     class_attributes: Vec<crate::app::IncludedClassAttributes>,
+    /// An STI subclass's model DSL statements, in block order, ahead of
+    /// its own body calls ([`sti_subclass_statement`]).
+    carried: Vec<Expr>,
+}
+
+/// An `included do` statement as a body call of the STI subclass
+/// `includer`, its constants resolved from the Concern's scope
+/// (`app::rehome_carried`): the statement itself or, for one ingest
+/// recognized as a declaration (a validation, a callback, an
+/// association or a scope, which keep no expression), its source read
+/// again at its span. Not a method the block defines or a macro
+/// generated.
+fn sti_subclass_statement(
+    item: &ModelBodyItem,
+    concern: &ClassId,
+    includer: &ClassId,
+    class_attributes: &[Symbol],
+    defined: &HashSet<String>,
+    sources: &[crate::span::SourceFile],
+) -> Option<Expr> {
+    let expr = match item {
+        ModelBodyItem::Method { .. } => return None,
+        ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => expr.clone(),
+        _ => {
+            let span = item.span();
+            if span.is_synthetic() {
+                return None;
+            }
+            let source = span.file.0.checked_sub(1).and_then(|i| sources.get(i as usize))?;
+            let parsed = ruby_prism::parse(source.text.as_bytes());
+            let root = parsed.node();
+            let node = super::define_method_loops::node_at(&root, span.start as usize, span.end as usize, |n| {
+                n.as_call_node().is_some()
+            })?;
+            super::expr::ingest_expr(&node, &source.path).ok()?
+        }
+    };
+    let item = ModelBodyItem::Unknown { expr, leading_comments: Vec::new(), leading_blank_line: false };
+    match super::app::rehome_carried(item, concern, includer, class_attributes, defined) {
+        ModelBodyItem::Unknown { expr, .. } => Some(expr),
+        _ => None,
+    }
 }
 
 /// The `class_attribute` names a library class body seeds.

@@ -300,10 +300,11 @@ fn macros_the_lowered_model_cannot_run_are_refused_with_the_reason() {
         "checks_presence not supported (all targets): model macro call on `Post` not lowered; `checks_presence` reaches `validates`, which the lowered model declares statically from its body, not at class-body run time",
         "extend not supported (all targets): model macro call on `Author` not lowered; `extend Attributed`: `Attributed.extended` calls `class_attribute`, which the lowered `Author` does not define",
         "extend not supported (all targets): model macro call on `Memo` not lowered; it sets `belongs_to_required_by_default`, which is applied to a lowered model's `belongs_to` declarations, and an STI subclass's are not lowered as a model's",
-        "belongs_to not supported (all targets): STI subclass body call on `Memo` not lowered",
         "attribute_flag not supported (all targets): model macro call on `Author` not lowered; `attribute_flag` comes from `Attributed`, whose extend is not replayed",
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "{expected}: {errors:#?}");
     }
-    assert_eq!(errors.len(), 6, "{errors:#?}");
+    // The STI subclass's own `belongs_to :owner` is lowered (it is not
+    // among the refusals).
+    assert_eq!(errors.len(), 5, "{errors:#?}");
 }

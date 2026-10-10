@@ -78,6 +78,9 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
         names.extend(call_names);
     }
+    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+        names.extend(lc.unknown_calls.iter().filter_map(|e| sti_serialized_column(e, table)).map(|c| c.as_str().to_string()));
+    }
     names.extend(defaulted_attributes(model, app).iter().map(|c| c.as_str().to_string()));
     table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())).map(|c| c.name.clone()).collect()
 }
@@ -418,6 +421,22 @@ pub(crate) fn carries_query_constraints(expr: &Expr, columns: &[Symbol]) -> bool
 /// (`ModelBodyItem::ClassBody`) for the runtime's `serialize`. A json
 /// column, `default:` and other options stay unclaimed.
 pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
+    serialized_column_with(expr, table, false)
+}
+
+/// [`serialized_column`] in an STI subclass body (its own statement, or
+/// one a Concern's `included do` runs there), `coder: JSON` included:
+/// the model's static JSON path (`lower::serialize`) is the model's
+/// own, and Rails decorates the column's type on the subclass alone.
+/// The column takes the retypable path on the model, which passes a
+/// value through where no type is declared (the model, a sibling), and
+/// the call runs on the subclass at load (`claimed_body_calls`), where
+/// the runtime's `serialize` builds the column serializer.
+pub(crate) fn sti_serialized_column(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
+    serialized_column_with(expr, table, true)
+}
+
+fn serialized_column_with(expr: &Expr, table: &crate::schema::Table, json: bool) -> Option<Symbol> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
     if method.as_str() != "serialize" || !on_self(recv) {
         return None;
@@ -435,7 +454,8 @@ pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Op
         let fits = match key.as_str() {
             "coder" => {
                 coder = true;
-                !matches!(&*value.node, ExprNode::Const { path } if path.last().is_some_and(|l| matches!(l.as_str(), "JSON" | "YAML")))
+                !matches!(&*value.node, ExprNode::Const { path }
+                    if path.last().is_some_and(|l| l.as_str() == "YAML" || (!json && l.as_str() == "JSON")))
             }
             "type" => matches!(&*value.node, ExprNode::Const { .. }),
             "comparable" => matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } }),
@@ -512,6 +532,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         out.extend(body_statements(model).filter(|e| macro_alias_pairs(&side, e, table).is_some()).map(|e| e.span));
         for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
             out.extend(lc.unknown_calls.iter().filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
+            out.extend(lc.unknown_calls.iter().filter(|e| sti_serialized_column(e, table).is_some()).map(|e| e.span));
         }
     }
     let side = ClassSide::of(model, app);

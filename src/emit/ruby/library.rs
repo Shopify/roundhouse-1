@@ -13141,6 +13141,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || gem_effects.iter().any(|e| std::ptr::eq(*e, *c))
                 || validations.iter().any(|e| std::ptr::eq(*e, *c))
                 || claimed(c)
+                || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
         })
         .collect()
 }

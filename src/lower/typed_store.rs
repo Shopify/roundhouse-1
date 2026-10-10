@@ -48,6 +48,23 @@ impl TypedStoreAttr {
     }
 }
 
+/// A `typed_store :<col>[, options] do |s| … end` statement (bare or
+/// `self.`) of an STI subclass (a library class below a model, which
+/// ingest does not lower as one), its own or run there by a Concern's
+/// `included do`: written into the subclass body as is, where the
+/// runtime base's class-side `typed_store` (the CRuby overlay's
+/// runtime/typed_store.rb) defines its accessors on the subclass at
+/// load, as the gem does, over the shared table's column. A model's own
+/// declaration is lowered statically ([`push_typed_store_methods`]).
+pub(crate) fn replays_on_sti_subclass(lc: &crate::dialect::LibraryClass, call: &Expr, app: &crate::App) -> bool {
+    let ExprNode::Send { recv, method, args, block: Some(_), .. } = &*call.node else { return false };
+    method.as_str() == "typed_store"
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }))
+        && !lc.is_module
+        && super::active_model_model::below_model(lc, app)
+}
+
 /// Parse every `typed_store :<col> do |s| … end` declaration in a
 /// model body into (column, attributes) pairs. Attribute lines are
 /// `s.<type> :name[, default: <lit>, …]` sends on the block param;

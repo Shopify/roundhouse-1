@@ -1278,15 +1278,41 @@ module ActiveRecord
         end
     end
 
-    # attribute_methods/serialization.rb's `build_column_serializer` for
-    # `owner.serialize(attr_name, coder:, type:)`. The JSON and YAML
-    # coders, and the configured default one a call without `coder:`
-    # takes, are not ported: they raise NotImplementedError, naming the
-    # call.
-    def self.column_serializer(owner, attr_name, coder, type)
-      if coder.nil? || coder == ::JSON || (defined?(::YAML) && coder == ::YAML)
-        raise NotImplementedError, "#{owner}.serialize(#{attr_name.inspect}, coder: #{coder.inspect}): the default, JSON and YAML column coders are not ported"
+    # coders/json.rb (8.2.0.alpha): what `coder: JSON` serializes
+    # through, Active Support's encoder without HTML escaping, and a
+    # blank payload loads as nil.
+    class JSON # :nodoc:
+      DEFAULT_ENCODE_OPTIONS = { escape: false }.freeze
+
+      def initialize(encode_options: nil, decode_options: nil)
+        @encode_options = encode_options ? DEFAULT_ENCODE_OPTIONS.merge(encode_options) : DEFAULT_ENCODE_OPTIONS
+        @decode_options = decode_options
       end
+
+      # A tree without runtime/active_support_json.rb has only
+      # active_support_ext.rb's one-argument encoder.
+      def dump(obj)
+        return ActiveSupport::JSON.encode(obj) if ActiveSupport::JSON.method(:encode).arity == 1
+        ActiveSupport::JSON.encode(obj, @encode_options)
+      end
+
+      def load(json)
+        return if json.nil? || json.to_s.strip.empty?
+        return ActiveSupport::JSON.decode(json) unless @decode_options
+        ActiveSupport::JSON.decode(json, @decode_options)
+      end
+    end
+
+    # attribute_methods/serialization.rb's `build_column_serializer` for
+    # `owner.serialize(attr_name, coder:, type:)`; `coder: JSON` goes
+    # through Active Support's encoder (`Coders::JSON`). The YAML coder,
+    # and the configured default one a call without `coder:` takes, are
+    # not ported: they raise NotImplementedError, naming the call.
+    def self.column_serializer(owner, attr_name, coder, type)
+      if coder.nil? || (defined?(::YAML) && coder == ::YAML)
+        raise NotImplementedError, "#{owner}.serialize(#{attr_name.inspect}, coder: #{coder.inspect}): the default and YAML column coders are not ported"
+      end
+      coder = Coders::JSON.new if coder == ::JSON || coder == Coders::JSON
       if coder.respond_to?(:new) && !coder.respond_to?(:load)
         coder.new(attr_name, type)
       elsif type && type != Object

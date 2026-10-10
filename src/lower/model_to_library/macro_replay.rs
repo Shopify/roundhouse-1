@@ -202,6 +202,14 @@ const RUNTIME_CLASS_SETTINGS: &[&str] = &[
     "store_full_class_name=", "store_full_class_name?",
 ];
 
+/// The class-side DSL of a gem the Ruby-family runtime ports onto the
+/// base, which defines what it declares when it runs: the typed_store
+/// gem's `typed_store` (its accessors, on the calling class) and the
+/// `typed_stores` / `store_accessors` it records (the CRuby overlay's
+/// runtime/typed_store.rb). Core's Payments::Vault `redactable_typed_store`
+/// macro calls `typed_store`, then reads `typed_stores`.
+const RUNTIME_CLASS_MACROS: &[&str] = &["typed_store", "typed_stores", "store_accessors"];
+
 /// Blocks that run later, or with another `self`: their bodies are not
 /// class-body effects of the macro.
 const DEFERRED_BLOCK_METHODS: &[&str] = &["define_method", "define_singleton_method", "lambda", "proc"];
@@ -876,7 +884,11 @@ impl<'s, 'a> Walk<'s, 'a> {
             self.path.pop();
             return walked;
         }
-        if CLASS_SIDE_BUILTINS.contains(&name) || RUNTIME_CLASS_SETTINGS.contains(&name) || self.side.synthesized(name) {
+        if CLASS_SIDE_BUILTINS.contains(&name)
+            || RUNTIME_CLASS_SETTINGS.contains(&name)
+            || RUNTIME_CLASS_MACROS.contains(&name)
+            || self.side.synthesized(name)
+        {
             return Ok(());
         }
         Err(format!("{} calls `{name}`, which the lowered `{}` does not define", self.via(), self.side.owner.0.as_str()))
