@@ -36,6 +36,9 @@ const REGION: &str = r#"module Markets
   class Region < ApplicationRecord
     validates :type, presence: true
 
+    scope :ca_or_on, -> { where(code: "CA").or(where(code: "ON")) }
+    scope :not_ca_or_nil, -> { where.not(code: "CA").or(where(code: nil)) }
+
     class << self
       def find_or_initialize_all(attribute_sets)
         return [] if attribute_sets.empty?
@@ -95,6 +98,7 @@ const PROBE: &str = r##"class StiBaseImplicitSelfProbe
     out << "none: #{Markets::Country.find_or_initialize_all([{ "code" => "ON" }]).map { |r| "#{r.class.name}:#{r.persisted?}" }.join(",")}"
     out << "built: #{Markets::Subdivision.built("X").class.name} #{Markets::Country.fresh("Y").class.name} #{Markets::Region.fresh("Z").class.name}"
     out << "where: #{Markets::Country.coded("ON").size} #{Markets::Subdivision.coded("ON").map { |r| r.class.name }.join(",")} #{Markets::Region.coded("CA").map { |r| r.class.name }.join(",")} #{Markets::Country.nothing.size}"
+    out << "or scopes: #{Markets::Region.ca_or_on.map(&:code).sort.join(",")} #{Markets::Subdivision.ca_or_on.map(&:code).sort.join(",")} #{Markets::Region.not_ca_or_nil.map(&:code).sort.join(",")}"
     out
   end
 end
@@ -102,12 +106,13 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 5] = [
+const EXPECTED: [&str; 6] = [
     "found: Markets::Subdivision:ON:true,Markets::Subdivision:QC:false",
     "saved: Markets::Country:CA,Markets::Subdivision:ON,Markets::Subdivision:QC",
     "none: Markets::Country:false",
     "built: Markets::Subdivision Markets::Country Markets::Region",
     "where: 0 Markets::Subdivision Markets::Country 0",
+    "or scopes: CA,ON ON ON,QC",
 ];
 
 const LOADS: [&str; 5] = [
