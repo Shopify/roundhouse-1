@@ -199,9 +199,14 @@ module ActiveSupport
           end.to_s
         end
 
+        # Rails `require`s "active_support/cache/#{store}" and takes the
+        # constant: an app's own store on the load path (Core's essentials
+        # lib/active_support/cache/versioned_mem_cache_store.rb) is found
+        # too. Here the app's store is its compiled class, defined or
+        # autoloadable under ActiveSupport::Cache by the time it is named.
         def retrieve_store_class(store)
           name = store.to_s.split("_").map(&:capitalize).join
-          loaded = UNPORTED_STORES.key?(store) && ActiveSupport::Cache.const_defined?(name, false)
+          loaded = ActiveSupport::Cache.const_defined?(name, false)
           unless PORTED_STORES.include?(store) || loaded
             reason = UNPORTED_STORES.fetch(store) { "cannot load such file -- active_support/cache/#{store}" }
             raise "Could not find cache store adapter for #{store} (#{reason})"

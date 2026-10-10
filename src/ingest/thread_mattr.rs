@@ -16,6 +16,8 @@ struct Decl {
     name: Symbol,
     reader: bool,
     writer: bool,
+    instance_reader: bool,
+    instance_writer: bool,
 }
 
 pub fn lower_thread_mattr(app: &mut crate::App) {
@@ -47,9 +49,16 @@ pub fn lower_thread_mattr(app: &mut crate::App) {
     app.library_classes.extend(states);
 }
 
-// Not taken when any option is passed: `default:` and `instance_accessor:` change what a read answers.
+// Not taken when `default:` or any other option is passed: `default:` changes what a read answers.
+// `instance_accessor:`/`instance_reader:`/`instance_writer:` `false` only drop the instance methods.
 fn take_decls(lc: &mut LibraryClass) -> Vec<Decl> {
     let mut out = Vec::new();
+    let defined: Vec<Symbol> = lc
+        .methods
+        .iter()
+        .filter(|m| matches!(m.receiver, crate::dialect::MethodReceiver::Instance))
+        .map(|m| m.name.clone())
+        .collect();
     lc.unknown_calls.retain(|call| {
         let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return true };
         let kw = method.as_str();
@@ -57,17 +66,35 @@ fn take_decls(lc: &mut LibraryClass) -> Vec<Decl> {
             return true;
         }
         let mut names = Vec::new();
-        for a in args {
+        let (mut instance_reader, mut instance_writer) = (true, true);
+        for (i, a) in args.iter().enumerate() {
             match &*a.node {
                 ExprNode::Lit { value: Literal::Sym { value } } => names.push(value.clone()),
+                ExprNode::Hash { entries, .. } if i + 1 == args.len() => {
+                    for (k, v) in entries {
+                        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return true };
+                        let ExprNode::Lit { value: Literal::Bool { value: false } } = &*v.node else { return true };
+                        match key.as_str() {
+                            "instance_accessor" => (instance_reader, instance_writer) = (false, false),
+                            "instance_reader" => instance_reader = false,
+                            "instance_writer" => instance_writer = false,
+                            _ => return true,
+                        }
+                    }
+                }
                 _ => return true,
             }
         }
         for name in names {
+            let reader = !kw.ends_with("_writer");
+            let writer = !kw.ends_with("_reader");
+            let setter = Symbol::from(format!("{}=", name.as_str()));
             out.push(Decl {
+                instance_reader: reader && instance_reader && !defined.contains(&name),
+                instance_writer: writer && instance_writer && !defined.contains(&setter),
                 name,
-                reader: !kw.ends_with("_writer"),
-                writer: !kw.ends_with("_reader"),
+                reader,
+                writer,
             });
         }
         false
@@ -96,6 +123,13 @@ fn synthesized_source(owner: &str, state: &str, decls: &[Decl]) -> (String, Stri
         }
         if d.writer {
             owner_src.push_str(&format!("  def self.{n}=(value)\n    __thread_state.{n} = value\n  end\n\n"));
+        }
+        // Rails' instance accessors read the same per-thread slot as the owner's.
+        if d.instance_reader {
+            owner_src.push_str(&format!("  def {n}\n    ::{owner}.{n}\n  end\n\n"));
+        }
+        if d.instance_writer {
+            owner_src.push_str(&format!("  def {n}=(value)\n    ::{owner}.{n} = value\n  end\n\n"));
         }
     }
     owner_src.push_str("end\n");

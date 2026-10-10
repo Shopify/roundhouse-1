@@ -115,8 +115,55 @@ pub(super) fn expand(app: &mut App) {
             })
             .map(|(i, _)| i)
             .collect();
-        if includers.is_empty() {
+        // An Active Record model that includes it (Core's
+        // `ShippingRateProvider` includes active_utils 3.6.1's PostsData):
+        // the defs go into its body ahead of the `include`, as a
+        // library-class includer's go ahead of its methods.
+        let model_includers: Vec<(usize, usize)> = app
+            .models
+            .iter()
+            .enumerate()
+            .filter_map(|(i, model)| model_include_at(model, &module, &app.library_classes).map(|at| (i, at)))
+            .collect();
+        if includers.is_empty() && model_includers.is_empty() {
             continue;
+        }
+        for (i, at) in model_includers {
+            let owner = app.models[i].name.clone();
+            let defined = |model: &crate::dialect::Model, method: &MethodDef| {
+                model.body.iter().any(|item| {
+                    matches!(item, crate::dialect::ModelBodyItem::Method { method: d, .. } if d.name == method.name && d.receiver == method.receiver)
+                })
+            };
+            let mut added: Vec<crate::dialect::ModelBodyItem> = Vec::new();
+            for method in decls.iter().flat_map(|(_, d)| match d {
+                Declaration::Cattr(c) => c.methods(&owner),
+                _ => d.decls().iter().flat_map(|decl| super::class_attribute::methods(&owner, decl)).collect(),
+            }) {
+                let seen = added.iter().any(|item| {
+                    matches!(item, crate::dialect::ModelBodyItem::Method { method: d, .. } if d.name == method.name && d.receiver == method.receiver)
+                });
+                if !seen && !defined(&app.models[i], &method) {
+                    added.push(crate::dialect::ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false });
+                }
+            }
+            // A nil seed per name, as the hook's own seeds write at the
+            // include right after: it marks the attribute declared in the
+            // model body, its ivars gradual (`class_attribute::declared_names`).
+            for decl in decls.iter().flat_map(|(_, d)| d.decls()) {
+                added.extend(decl.names.iter().map(|name| crate::dialect::ModelBodyItem::ClassBody {
+                    expr: Expr::new(
+                        decl.span,
+                        ExprNode::Assign {
+                            target: crate::expr::LValue::Ivar { name: storage_ivar(name) },
+                            value: Expr::new(decl.span, ExprNode::Lit { value: Literal::Nil }),
+                        },
+                    ),
+                    leading_comments: Vec::new(),
+                    leading_blank_line: false,
+                }));
+            }
+            app.models[i].body.splice(at..at, added);
         }
         for i in includers {
             let owner = app.library_classes[i].name.clone();
@@ -153,6 +200,48 @@ pub(super) fn expand(app: &mut App) {
         }
         let span = hook.body.span;
         hook.body = Expr::new(span, ExprNode::Seq { exprs: statements });
+    }
+}
+
+/// The body index of `model`'s `include M` naming `module`, resolved
+/// from the model's lexical nesting outward (`include PostsData` inside
+/// `ActiveUtils` names `ActiveUtils::PostsData`).
+fn model_include_at(
+    model: &crate::dialect::Model,
+    module: &crate::ident::ClassId,
+    classes: &[crate::dialect::LibraryClass],
+) -> Option<usize> {
+    let name = model.name.0.as_str();
+    model.body.iter().position(|item| {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return false };
+        if method.as_str() != "include" {
+            return false;
+        }
+        args.iter().any(|arg| {
+            let Some(written) = const_path(arg) else { return false };
+            if let Some(absolute) = written.strip_prefix("::") {
+                return absolute == module.0.as_str();
+            }
+            let mut scope: Vec<&str> = name.split("::").collect();
+            loop {
+                let candidate = if scope.is_empty() { written.clone() } else { format!("{}::{written}", scope.join("::")) };
+                if classes.iter().any(|c| c.name.0.as_str() == candidate) {
+                    return candidate == module.0.as_str();
+                }
+                if scope.pop().is_none() {
+                    return false;
+                }
+            }
+        })
+    })
+}
+
+/// `A::B` for a constant (path) expression.
+fn const_path(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
+        _ => None,
     }
 }
 
