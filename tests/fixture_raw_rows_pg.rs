@@ -16,6 +16,10 @@
 //!   table's columns from the database, and so does the runtime for a key
 //!   the compiled columns lack. Under FasterFixtures a `keeper:` key whose
 //!   `keeper_id` column is ignored is that reference.
+//! - Each accessor finds the row as it was inserted (Rails'
+//!   `Fixture#find`, `find_by!` on the model's key columns of the row,
+//!   with no default scope): a key an ERB tag produced, on a single or composite key,
+//!   is the value the INSERT used, and a default scope does not hide it.
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +57,13 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
     t.jsonb "layout"
     t.string "legacy_code"
     t.bigint "keeper_id"
+  end
+  create_table "badges", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "slots", primary_key: ["shop_id", "name"], force: :cascade do |t|
+    t.bigint "shop_id", null: false
+    t.string "name", null: false
   end
 end
 "#;
@@ -111,6 +122,17 @@ const GARAGES_FASTER_FIXTURES: &str = r#"north:
   keeper: alice
 "#;
 
+/// Keys an ERB tag produces, which the compiler cannot know.
+const BADGES: &str = r#"gold:
+  id: <%= 40 + 2 %>
+  name: Gold
+"#;
+
+const SLOTS: &str = r#"ab:
+  shop_id: <%= 6 * 7 %>
+  name: <%= "a" + "b" %>
+"#;
+
 const PROBE_TEST: &str = r#"require "test_helper"
 
 class FixtureRawRowsTest < ActiveSupport::TestCase
@@ -118,6 +140,8 @@ class FixtureRawRowsTest < ActiveSupport::TestCase
     assert_equal "Beetle", cars(:beetle).name
     assert_equal "Alice", owners(:alice).name
     assert_equal "Hauler", trucks(:hauler).name
+    assert_equal 42, badges(:gold).id
+    assert_equal [42, "ab"], [slots(:ab).shop_id, slots(:ab).name]
   end
 end
 "#;
@@ -165,6 +189,14 @@ fn fixture_app(tag: &str, faster_fixtures: bool) -> PathBuf {
         "app/models/owner.rb",
         "class Owner < ApplicationRecord\n  def name=(value)\n    raise ArgumentError, \"Owner#name= ran while loading fixtures\"\n  end\nend\n",
     );
+    // Rails' fixture accessor finds without the default scope, which
+    // hides gold, and without calling the model's `unscoped`, which an
+    // app may override (Core's Shop does).
+    write(
+        "app/models/badge.rb",
+        "class Badge < ApplicationRecord\n  default_scope { where(name: \"none\") }\n\n  def self.unscoped(&block)\n    raise \"Badge.unscoped ran\"\n  end\nend\n",
+    );
+    write("app/models/slot.rb", "class Slot < ApplicationRecord\n  self.primary_key = [:shop_id, :name]\nend\n");
     write("db/schema.rb", SCHEMA);
     write("roundhouse.yml", "database_adapter: postgresql\n");
     write("config/database.yml", DATABASE_YML);
@@ -175,6 +207,8 @@ fn fixture_app(tag: &str, faster_fixtures: bool) -> PathBuf {
     write("test/fixtures/trucks.yml", &trucks);
     write("test/fixtures/owners.yml", OWNERS);
     write("test/fixtures/garages.yml", if faster_fixtures { GARAGES_FASTER_FIXTURES } else { GARAGES });
+    write("test/fixtures/badges.yml", BADGES);
+    write("test/fixtures/slots.yml", SLOTS);
     write("test/models/fixture_raw_rows_test.rb", PROBE_TEST);
     app
 }
@@ -245,8 +279,15 @@ fn sti_subclass_sets_insert_rows_into_the_base_table() {
         assert!(cars.contains(&needle), "no {needle} in:\n{cars}");
     }
     assert!(!cars.contains("\"owner\" =>"), "the reference stayed a key:\n{cars}");
-    // Each accessor finds its row by the generated key, memoized.
-    assert!(cars.contains(&format!("@__fx_beetle = Car.find({beetle_id}) if @__fx_beetle.nil?")), "{cars}");
+    // Each accessor finds its row as inserted, memoized: the load keeps
+    // the rows the INSERT used.
+    assert!(cars.contains("@__fx_beetle = ActiveRecord::TestFixtures.fixture_find(Car, @__fixture_rows, 0) if @__fx_beetle.nil?"), "{cars}");
+    assert!(cars.contains("@__fx_mini = ActiveRecord::TestFixtures.fixture_find(Car, @__fixture_rows, 1) if @__fx_mini.nil?"), "{cars}");
+    assert!(cars.contains("@__fixture_rows = ActiveRecord::TestFixtures.insert_fixture_rows(\"vehicles\", "), "{cars}");
+    // An ERB key is not a compile-time nil: the find reads the inserted row.
+    let slots = read(&out, "test/fixtures/slots.rb");
+    assert!(!slots.contains("find([nil"), "{slots}");
+    assert!(slots.contains("ActiveRecord::TestFixtures.fixture_find(Slot, @__fixture_rows, 0)"), "{slots}");
     // No model is built to load the rows.
     for absent in ["Car.new", "instance.", "save_after_validation"] {
         assert!(!cars.contains(absent), "{absent} in:\n{cars}");
@@ -351,12 +392,12 @@ fn run_on_postgresql(out: &Path) -> String {
     assert!(result.status.success(), "stdout={stdout}\nstderr={stderr}");
     assert!(!stdout.contains("fixture_set_not_loaded") && !stderr.contains("fixture_set_not_loaded"), "stdout={stdout}\nstderr={stderr}");
     // The runner's own result record: the authored test passed with its
-    // 3 assertions, and no set was refused.
+    // 5 assertions, and no set was refused.
     let results = std::fs::read_to_string(out.join("results.jsonl")).expect("results.jsonl");
     let result: serde_json::Value = serde_json::from_str(results.trim()).expect("one result");
     assert_eq!(result["id"], "FixtureRawRowsTest#test_fixture_rows_load", "{results}");
     assert_eq!(result["status"], "pass", "{results}\nstdout={stdout}\nstderr={stderr}");
-    assert_eq!(result["assertions"], 3, "{results}");
+    assert_eq!(result["assertions"], 5, "{results}");
     assert!(result.get("fixture_sets_not_loaded").is_none(), "{results}");
     let beetle = roundhouse::lower::fixtures::fixture_identify("beetle");
     let alice = roundhouse::lower::fixtures::fixture_identify("alice");
@@ -393,6 +434,8 @@ begin
     c.exec('CREATE TABLE "owners" ("id" bigserial PRIMARY KEY, "name" character varying, "created_at" timestamp(6))')
     c.exec('CREATE TABLE "vehicles" ("id" bigserial PRIMARY KEY, "type" character varying, "name" character varying, "nickname" character varying, "wheels" integer, "owner_id" bigint, "specs" text, "created_at" timestamp(6), "updated_at" timestamp(6))')
     c.exec('CREATE TABLE "garages" ("id" bigserial PRIMARY KEY, "layout" jsonb, "legacy_code" character varying, "keeper_id" bigint)')
+    c.exec('CREATE TABLE "badges" ("id" bigserial PRIMARY KEY, "name" character varying)')
+    c.exec('CREATE TABLE "slots" ("shop_id" bigint NOT NULL, "name" character varying NOT NULL, PRIMARY KEY ("shop_id", "name"))')
   end
   results = File.join(root, "results.jsonl")
   File.delete(results) if File.exist?(results)
