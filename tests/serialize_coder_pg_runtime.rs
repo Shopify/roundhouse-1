@@ -45,7 +45,10 @@ end
 
 const NOTE: &str = r#"class Note < ApplicationRecord
   serialize :tags, coder: PipeCoder, type: Array
-  serialize :meta, coder: PairsCoder.new(";"), type: Hash
+  # A coder built in a class-body local, as Core's Checkout builds
+  # its `line_items` one: Ruby runs the write where it stands.
+  pairs = PairsCoder.new(";")
+  serialize :meta, coder: pairs, type: Hash
   serialize :body, coder: UpcaseCoder
   serialize :points, coder: PackCoder, type: Array
 end
@@ -218,6 +221,8 @@ fn serialize_with_an_app_coder_runs_at_class_load() {
         r#"self.class._attribute_deserialize("tags", value)"#,
         "  serialize :tags, coder: PipeCoder, type: Array\n",
         "  serialize :body, coder: UpcaseCoder\n",
+        "  pairs = PairsCoder.new(\";\")\n",
+        "  serialize :meta, coder: pairs, type: Hash\n",
     ] {
         assert!(note.contains(expected), "missing {expected:?} in:\n{note}");
     }
