@@ -96,19 +96,21 @@ fn real_errors(errors: &[String]) -> Vec<&String> {
 
 // ---- 1. a macro that computes the attribute name and installs its type
 
-const WRAPPED_TYPE: &str = r##"class WrappedType < ActiveModel::Type::String
-  def initialize(key, owner)
-    super()
-    @key = key
-    @owner = owner
-  end
+const WRAPPED_TYPE: &str = r##"module Wrapping
+  class WrappedType < ActiveRecord::Type::String
+    def initialize(key, owner)
+      super()
+      @key = key
+      @owner = owner
+    end
 
-  def serialize(value)
-    value.nil? ? nil : "#{@key}:#{value}"
-  end
+    def serialize(value)
+      value.nil? ? nil : "#{@key}:#{value}"
+    end
 
-  def deserialize(value)
-    value.nil? ? nil : value.delete_prefix("#{@key}:")
+    def deserialize(value)
+      value.nil? ? nil : value.delete_prefix("#{@key}:")
+    end
   end
 end
 "##;
@@ -175,8 +177,8 @@ const WRAPPED: Case = Case {
     database: "rh_e2e_attribute_macros_wrapped",
     probe: "WrappedProbe",
     app: &[
-        ("app/models/wrapped_type.rb", WRAPPED_TYPE),
         ("app/models/concerns/wrapping.rb", WRAPPING),
+        ("app/models/concerns/wrapping/wrapped_type.rb", WRAPPED_TYPE),
         ("app/models/account.rb", ACCOUNT),
         ("app/models/wrapped_probe.rb", WRAPPED_PROBE),
     ],
@@ -284,8 +286,9 @@ const FLAG_PROBE: &str = r##"class FlagProbe
     Class.new(BaseKind) do
       include Flagged
       self.ignored = true
-      self.generated = true
-      self.origin = origin
+      klass = self #: as untyped
+      klass.generated = true
+      klass.origin = origin
     end
   end
 
