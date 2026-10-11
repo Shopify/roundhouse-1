@@ -711,6 +711,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "eq", "not_eq", "in", "not_in", "gt", "gteq", "lt", "lteq",
         "matches", "does_not_match", "between", "eq_any", "in_any",
         "asc", "desc", "count", "sum", "minimum", "maximum", "average",
+        // math.rb: `attribute + 1` builds a grouped infix node.
+        "+", "-", "*", "/", "&", "|", "^", "<<", ">>",
+        // function methods (factory_methods.rb, expressions.rb)
+        "lower", "upper", "coalesce", "extract", "cast", "as",
     ] {
         arel_attribute.instance_methods.insert(Symbol::from(pred), arel_node.clone());
     }
@@ -719,7 +723,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Arel::Node` boolean combinators chain into nodes; `where(node)`
     // already accepts any argument type.
     let mut arel_node_cls = ClassInfo::default();
-    for m in ["and", "or", "not"] {
+    for m in ["and", "or", "not", "as", "+", "-", "*", "/", "over"] {
         arel_node_cls.instance_methods.insert(Symbol::from(m), arel_node.clone());
     }
     classes.insert(ClassId(Symbol::from("Arel::Node")), arel_node_cls);

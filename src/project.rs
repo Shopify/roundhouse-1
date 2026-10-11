@@ -4679,6 +4679,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let fixture_set = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_fixture_set.rb")
         .map_err(|e| format!("read Active Record fixture set runtime: {e}"))?;
     files.push(("runtime/active_record_fixture_set.rb".into(), fixture_set));
+    // Arel's node tree (activerecord 8.2.0.alpha arel/*), and its binding
+    // to the connection, the models' `arel_table` and the Relation's
+    // clauses; app code builds nodes (`Arel::Nodes::Case`,
+    // `Arel::Table.new`) and hands them to `where`, `order` and `joins`.
+    let arel = crate::runtime_files::read_to_string("runtime/spinel/cruby/arel.rb")
+        .map_err(|e| format!("read Arel runtime: {e}"))?;
+    files.push(("runtime/arel.rb".into(), arel));
+    let active_record_arel = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_arel.rb")
+        .map_err(|e| format!("read Active Record Arel runtime: {e}"))?;
+    files.push(("runtime/active_record_arel.rb".into(), active_record_arel));
     // ActiveSupport::StringInquirer (activesupport 8.2.0.alpha
     // string_inquirer.rb), verbatim.
     let inquirer = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inquirer.rb")
@@ -4987,6 +4997,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 "# `require \"active_support\"` loads active_support/deprecation and\n\
                  # deprecator before any app code: ActiveSupport::Deprecation, ported.\n\
                  require_relative \"runtime/active_support_deprecation\"\n\
+                 # Arel's node tree over the adapter, the models and the Relation,\n\
+                 # replacing the runtime's string-composed Arel shim.\n\
+                 require_relative \"runtime/active_record_arel\"\n\
                  # `require \"active_support/core_ext\"` mixes ActiveSupport::Tryable\n\
                  # into Object before any app code: `Object#try`, ported.\n\
                  require_relative \"runtime/active_support_tryable\"\n\
