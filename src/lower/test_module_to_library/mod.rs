@@ -146,7 +146,7 @@ pub fn lower_test_modules_with_inner(
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Vec<LoweredTestModule> {
     lower_test_modules_with_assertions(test_modules, fixtures, models, extras, route_id_segments,
-        inline_assertions::AssertionMode::Inline, false)
+        inline_assertions::AssertionMode::Inline, false, &crate::det::HashMap::default())
 }
 
 /// `join_association_targets`: the tree's has_many readers keep what
@@ -160,6 +160,7 @@ pub fn lower_test_modules_with_assertions(
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
     assertion_mode: inline_assertions::AssertionMode,
     join_association_targets: bool,
+    shadowed_fixture_accessors: &crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>,
 ) -> Vec<LoweredTestModule> {
     let mut classes: HashMap<ClassId, ClassInfo> = HashMap::default();
     for (id, info) in extras {
@@ -246,10 +247,15 @@ pub fn lower_test_modules_with_assertions(
     let mut out: Vec<LoweredTestModule> = Vec::new();
     let mut all_lcs: Vec<LibraryClass> = test_modules
         .iter()
-        .map(|tm| build_library_class(tm, route_id_segments, assertion_mode))
-        .map(|mut lc| {
+        .map(|tm| {
+            let mut lc = build_library_class(tm, route_id_segments, assertion_mode);
+            // A name the class answers itself is no fixture reader here.
+            let names: Vec<Symbol> = match shadowed_fixture_accessors.get(&tm.name) {
+                Some(shadowed) => fixture_names.iter().filter(|n| !shadowed.contains(*n)).cloned().collect(),
+                None => fixture_names.clone(),
+            };
             for m in &mut lc.methods {
-                m.body = crate::lower::rewrite_fixture_calls(&m.body, &fixture_names);
+                m.body = crate::lower::rewrite_fixture_calls(&m.body, &names);
             }
             lc
         })

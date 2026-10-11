@@ -1271,6 +1271,7 @@ pub fn emit_with_assertions(
             // The CRuby / JRuby trees' has_many readers keep their
             // target (`library::apply_collection_memoization`).
             expr::native_keywords(),
+            &crate::lower::shadowed_fixture_accessors(&test_modules, &app.library_classes),
         );
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
@@ -2222,7 +2223,7 @@ fn splice_test_body_statements(content: &str, class_name: &str, statements: &[cr
                 out.push_str(&text);
                 out.push('\n');
             } else if text.contains('\n') {
-                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) do", format!("{source}:{}", statement.line)).unwrap();
+                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) do", format!("{}:{}", statement.source.as_deref().unwrap_or(source), statement.line)).unwrap();
                 for line in text.lines() {
                     if line.trim().is_empty() {
                         out.push('\n');
@@ -2232,7 +2233,7 @@ fn splice_test_body_statements(content: &str, class_name: &str, statements: &[cr
                 }
                 out.push_str("end\n");
             } else {
-                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) {{ {text} }}", format!("{source}:{}", statement.line)).unwrap();
+                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) {{ {text} }}", format!("{}:{}", statement.source.as_deref().unwrap_or(source), statement.line)).unwrap();
             }
         }
         out
@@ -2987,7 +2988,7 @@ mod nested_test_class_splice_tests {
                 parenthesized: true,
             },
         );
-        let statement = TestBodyStatement { expr: call, line: 3, after_definitions: false, after_setup_blocks: false, after_teardown_blocks: false };
+        let statement = TestBodyStatement { expr: call, line: 3, after_definitions: false, after_setup_blocks: false, after_teardown_blocks: false, source: None };
         let out = splice_test_body_statements(NESTED, "PlaybookActionTest::ApprovedTest", &[statement], "t.rb", std::path::Path::new("test/models/t.rb"));
         let at = out.find("use_gcs").expect(&out);
         let inner = out.find("class ApprovedTest").unwrap();

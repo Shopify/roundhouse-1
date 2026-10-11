@@ -2939,6 +2939,7 @@ end
         &concern_class_method_spans,
         &framework_shadow_scopes,
     )?;
+    super::test_class_concerns::carry(&mut app, &sources, &concern_class_method_spans, &framework_shadow_scopes);
     app.carried_included_blocks =
         super::concern_accessors::carried_included_blocks(&app, &concern_class_method_spans);
     super::anonymous_class_concerns::expand(&mut app);
