@@ -505,10 +505,10 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     assert!(facades.contains("require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n"), "{facades}");
 }
 
-/// The number helpers translate through I18n: with no i18n in the lock
-/// the tree carries neither them nor core_ext/numeric (all three Numeric
-/// extensions), which the refusal then names, while the byte and
-/// Duration builders still answer their own features.
+/// Numeric#to_fs and the I18n-backed number helpers translate through I18n:
+/// with no i18n in the lock the tree carries neither them nor core_ext/numeric
+/// (all three Numeric extensions), which the refusal then names, while the
+/// byte and Duration builders still answer their own features.
 #[test]
 fn core_ext_numeric_needs_i18n_for_its_number_helpers() {
     let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    concurrent-ruby (1.3.5)\n\nDEPENDENCIES\n  concurrent-ruby\n";
@@ -524,7 +524,13 @@ fn core_ext_numeric_needs_i18n_for_its_number_helpers() {
     for absent in ["numeric.rb", "numeric/conversions.rb"] {
         assert!(!features.join(absent).exists(), "{absent} without i18n");
     }
-    assert!(!tree.join("runtime/active_support_number_helper.rb").exists());
+    // The shared Ruby-family NumberHelper (runtime/ruby, translation tables of
+    // its own) stays: action_view_number_helper.rb and active_support_ext.rb
+    // require it whatever the lock carries. What i18n adds is the port that
+    // translates through I18n, which this tree must not carry.
+    let helper = std::fs::read_to_string(tree.join("runtime/active_support_number_helper.rb")).expect("number helper");
+    assert!(helper.contains("A finite translation backend"), "{helper}");
+    assert!(!helper.contains("active_support_i18n"), "the I18n-backed number helper without i18n");
     for present in ["numeric/bytes.rb", "numeric/time.rb", "class.rb", "string/strip.rb", "module/attribute_accessors.rb"] {
         assert!(features.join(present).exists(), "{present}");
     }

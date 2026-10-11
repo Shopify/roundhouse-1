@@ -6629,6 +6629,15 @@ fn query_log_tags_block(app: &App) -> String {
     let lifted = |reader: &str| {
         app.rails_application.as_ref().is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == reader))
     };
+    // The initializer's body runs only under `query_log_tags_enabled`
+    // (railtie.rb:405-437 `if app.config.active_record.query_log_tags_enabled`),
+    // so an app that never writes it registers a hook that does nothing; and
+    // it has no `Rails.application.config` to register it on without an
+    // Application class.
+    let enabled_reader = crate::ingest::app::applied_framework_config_reader("active_record.query_log_tags_enabled");
+    if !lifted(&enabled_reader) {
+        return String::new();
+    }
     let args: Vec<String> = QUERY_LOG_TAGS_KEYS
         .iter()
         .map(|(key, keyword)| {
