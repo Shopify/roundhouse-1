@@ -1983,7 +1983,9 @@ impl<'a> Scope<'a> {
     }
 
     /// `Array` (or `::Array`) where no app constant of that name is in
-    /// the lexical scope.
+    /// the lexical scope. An app's own top-level `class Array` (a core
+    /// extension file) reopens the core class rather than shadowing it,
+    /// so only a nested `Scope::Array` counts.
     fn names_core_constant(&self, node: &ruby_prism::Node<'_>, name: &str) -> bool {
         let written = node
             .as_constant_read_node()
@@ -1994,9 +1996,7 @@ impl<'a> Scope<'a> {
                 })
             })
             .unwrap_or(false);
-        written
-            && definer(self.constants, &self.nesting, name).is_none()
-            && !self.constants.contains(name)
+        written && definer(self.constants, &self.nesting, name).is_none()
     }
 
     /// `const_get("#{name.upcase}_ID")` on the class: a constant its body

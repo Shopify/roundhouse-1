@@ -256,6 +256,31 @@ fn a_concern_macro_called_with_literal_symbols_matches_native() {
     assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
 }
 
+/// An app's own top-level `class Array` (a core-extension file) reopens the
+/// core class: `Array.wrap(names)` in a macro still names the core class, so
+/// the macro expands as it does without the reopen.
+const ARRAY_REOPEN: &str = "class Array\n  def second = self[1]\nend\n";
+
+#[test]
+fn a_macro_wrapping_with_array_expands_when_the_app_reopens_array() {
+    let expected = native(
+        "session_accessor_array_reopen",
+        &format!(
+            "{NATIVE_PRELUDE}{ARRAY_REOPEN}{SESSION_ACCESSOR_CONCERN}{USER_SESSION_ATTRIBUTES}{EMPLOYEE_SESSION_ATTRIBUTES}{SESSION_SCRIPT}"
+        ),
+    );
+    let run = emit_and_run::real_blog()
+        .write("app/models/array.rb", ARRAY_REOPEN)
+        .write("app/models/concerns/session_accessor_concern.rb", SESSION_ACCESSOR_CONCERN)
+        .write("app/models/user_session_attributes.rb", USER_SESSION_ATTRIBUTES)
+        .write("app/models/employee_session_attributes.rb", EMPLOYEE_SESSION_ATTRIBUTES)
+        .run_ruby(SESSION_SCRIPT);
+    run.assert_passes();
+    assert!(!run.errors.iter().any(|e| e.contains("define_method_expansion")), "{:#?}", run.errors);
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected.lines().collect::<Vec<_>>(), "emitted Ruby diverges from native line for line");
+}
+
 // ---- Shape 3: an extended module's macro on a model ----------------------
 
 const IDENTIFICATION: &str = r##"class Article
