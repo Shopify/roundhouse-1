@@ -50,10 +50,15 @@ module Futamura
       value.respond_to?(primary_key) ? value.public_send(primary_key) : value
     end
 
-    def records(key, binds, owner: nil, association: nil, &fallback)
+    # `root:` is the `self` of a chain written against an implicit class
+    # self: the statement is the model's own, so any other class (a subclass
+    # adds its type condition, a concern's method is shared) runs the chain.
+    def records(key, binds, owner: nil, association: nil, root: nil, &fallback)
       return fallback.call if binds.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
       statement = @statements.fetch(key)
+      return fallback.call if root && !root.equal?(statement.model)
+
       model = statement.model
       compiled = nil
       records = model.with_connection do |connection|

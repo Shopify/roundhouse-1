@@ -84,6 +84,10 @@ struct Chain {
     limited: bool,
     /// Rooted at `Model.unscoped`, which drops the model's default scopes.
     unscoped: bool,
+    /// Rooted at the implicit self of a class method: the statement is for
+    /// the model it was written in, so the call site passes `self` and a
+    /// subclass (which adds its own type condition) runs Rails' chain.
+    implicit_self: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -135,10 +139,18 @@ impl<'a> Specializer<'a> {
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
-    pub fn method_body(&self, body: &Expr, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
+    /// `class_self` is the model when the body is one of its class methods,
+    /// where a receiver-less `where`/`find_by` is a call on that model.
+    pub fn method_body(&self, body: &Expr, class_self: Option<&ClassId>, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
         let mut locals = HashMap::new();
         collect_locals(body, &mut locals);
-        let cx = Cx { locals: &locals, depth: Default::default(), args: HashMap::new(), self_chain: None };
+        let cx = Cx {
+            locals: &locals,
+            depth: Default::default(),
+            args: HashMap::new(),
+            self_chain: None,
+            class_self: class_self.cloned(),
+        };
         self.visit(body, &cx, sites, residue);
     }
 
@@ -208,7 +220,8 @@ impl<'a> Specializer<'a> {
             Some((owner, name)) => format!(", owner: {owner}, association: :{}", name.as_str()),
             None => String::new(),
         };
-        let call = format!("Futamura.records(:{key}, [{}]{owner}) {{ {{orig}} }}", binds.join(", "));
+        let root = if chain.implicit_self { ", root: self" } else { "" };
+        let call = format!("Futamura.records(:{key}, [{}]{owner}{root}) {{ {{orig}} }}", binds.join(", "));
         Ok(Site { span: e.span, call, define })
     }
 
@@ -251,6 +264,17 @@ impl<'a> Specializer<'a> {
                 // named without it.
                 let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
                 match self.models.get(name.as_str()) {
+                    // Analysis names the implicit self of a class method with a
+                    // synthetic constant; the source says only `where(...)`, which
+                    // runs on whichever class the method is called on.
+                    Some(m) if e.span.is_synthetic() => {
+                        if cx.class_self.as_ref() != Some(&m.name) {
+                            return Err(format!("implicit receiver `{name}` outside its own class method"));
+                        }
+                        let mut root = Chain::new(m.name.clone(), None);
+                        root.implicit_self = true;
+                        Ok(root)
+                    }
                     Some(m) => Ok(Chain::new(m.name.clone(), None)),
                     None => Err(format!("`{name}` is not a model")),
                 }
@@ -259,7 +283,17 @@ impl<'a> Specializer<'a> {
                 // Inside an inlined scope body, a bare call is a link on
                 // the relation the scope was called on.
                 Some(chain) => Ok(self.apply(chain.clone(), method, args, cx)?.0),
-                None => Err(format!("implicit-self `{}`", method.as_str())),
+                None => match &cx.class_self {
+                    Some(model) => {
+                        let mut root = Chain::new(model.clone(), None);
+                        root.implicit_self = true;
+                        match self.apply(root, method, args, cx)? {
+                            (chain, Terminal::Link) => Ok(chain),
+                            _ => Err(format!("`{}` mid-chain loads records", method.as_str())),
+                        }
+                    }
+                    None => Err(format!("implicit-self `{}`", method.as_str())),
+                },
             },
             ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
                 if let Some(root) = self.assoc_root(recv, method, args, cx)? {
@@ -490,7 +524,7 @@ impl<'a> Specializer<'a> {
         for (p, a) in scope.params.iter().zip(args) {
             bound.insert(p.name.clone(), self.value(a, cx)?);
         }
-        let inner = Cx { locals: cx.locals, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()) };
+        let inner = Cx { locals: cx.locals, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None };
         let ExprNode::Send { recv, method, args, block: None, .. } = &*body.node else {
             return Err(format!("scope `{}` body is not a call chain", scope.name.as_str()));
         };
@@ -655,6 +689,8 @@ struct Cx<'b> {
     args: HashMap<Symbol, Val>,
     /// The relation an inlined scope body runs against.
     self_chain: Option<Chain>,
+    /// The model whose class method this body is.
+    class_self: Option<ClassId>,
 }
 
 impl Chain {
@@ -668,6 +704,7 @@ impl Chain {
             ordered: false,
             limited: false,
             unscoped: false,
+            implicit_self: false,
         }
     }
 }

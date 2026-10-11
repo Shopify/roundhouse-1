@@ -694,3 +694,37 @@ mod more_links_and_values {
         assert!(report.residue.iter().any(|r| r.contains("select with a non-literal argument")), "{:?}", report.residue);
     }
 }
+
+/// A receiver-less `where` in a class method is a call on the model itself
+/// (the method's self), so its chain roots at that model.
+mod implicit_class_self {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_class_method_chain_roots_at_its_model_and_passes_self_to_guard_subclasses() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"pages\", force: :cascade do |t|\n    t.string \"slug\"\n    t.boolean \"live\"\n  end\nend\n"),
+            (
+                "app/models/page.rb",
+                "class Page < ApplicationRecord\n  def self.live_by(slug)\n    where(slug: slug, live: true).order(:id).first\n  end\n  def current(slug)\n    where(slug: slug).first\n  end\nend\n",
+            ),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let page = &tree_files.iter().find(|(p, _)| p == "app/models/page.rb").unwrap().1;
+        assert!(page.contains("[slug], root: self) { where(slug: slug, live: true).order(:id).first }"), "{page}");
+        let init = &tree_files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
+        assert!(init.contains("Page, one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
+        // The instance method's `where` is not a class call: it stays Rails'.
+        assert!(page.contains("    where(slug: slug).first\n"), "{page}");
+    }
+}

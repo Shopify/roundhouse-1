@@ -18,7 +18,7 @@ mod scoping;
 use std::collections::BTreeMap;
 
 use crate::App;
-use crate::dialect::{ControllerBodyItem, ModelBodyItem};
+use crate::dialect::{ControllerBodyItem, MethodReceiver, ModelBodyItem};
 
 const RUNTIME: &str = include_str!("futamura.rb");
 pub const INITIALIZER: &str = "config/initializers/futamura.rb";
@@ -38,20 +38,21 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
     for c in &app.controllers {
         for item in &c.body {
             if let ControllerBodyItem::Action { action, .. } = item {
-                spec.method_body(&action.body, &mut sites, &mut residue);
+                spec.method_body(&action.body, None, &mut sites, &mut residue);
             }
         }
     }
     for m in &app.models {
         for item in &m.body {
             if let ModelBodyItem::Method { method, .. } = item {
-                spec.method_body(&method.body, &mut sites, &mut residue);
+                let class_self = (method.receiver == MethodReceiver::Class).then_some(&m.name);
+                spec.method_body(&method.body, class_self, &mut sites, &mut residue);
             }
         }
     }
     for lc in &app.library_classes {
         for method in &lc.methods {
-            spec.method_body(&method.body, &mut sites, &mut residue);
+            spec.method_body(&method.body, None, &mut sites, &mut residue);
         }
     }
 
