@@ -102,3 +102,36 @@ fn a_validation_guard_is_demand() {
     assert!(src.contains(r#"attribute_changed?("about")"#), "{src}");
     assert!(src.contains("def email_changed?"), "{src}");
 }
+
+fn emit_user_with_concern(model_src: &str, concern_src: &str) -> String {
+    let files: HashMap<PathBuf, Vec<u8>> = [
+        (
+            PathBuf::from("db/schema.rb"),
+            b"ActiveRecord::Schema.define do\n  create_table \"users\", force: :cascade do |t|\n    t.string \"username\", null: false\n    t.string \"email\", null: false\n    t.string \"about\"\n  end\nend\n".to_vec(),
+        ),
+        (PathBuf::from("app/models/user.rb"), model_src.as_bytes().to_vec()),
+        (PathBuf::from("app/models/concerns/trackable.rb"), concern_src.as_bytes().to_vec()),
+    ]
+    .into_iter()
+    .collect();
+    let mut app = ingest_app_from_tree(files).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    ruby::emit_lowered_models(&app)
+        .iter()
+        .find(|f| f.path.ends_with("user.rb"))
+        .expect("no user.rb emitted")
+        .content
+        .clone()
+}
+
+/// A name only a concern's method sends is demand too: the concern's
+/// methods run on the including model's record.
+#[test]
+fn a_name_sent_by_a_concern_method_is_synthesized() {
+    let src = emit_user_with_concern(
+        "class User < ApplicationRecord\n  include Trackable\nend\n",
+        "module Trackable\n  extend ActiveSupport::Concern\n\n  def log_rename\n    return unless username_changed?\n    puts username_was\n  end\nend\n",
+    );
+    assert!(src.contains("def username_changed?"), "{src}");
+    assert!(src.contains("def username_was"), "{src}");
+}

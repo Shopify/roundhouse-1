@@ -2012,8 +2012,154 @@ module ActiveRecord
     # `saved_change_to_attribute?` documents. Ruby-family only — see
     # base.rb's stub for why the indexing cannot live there.
     def attribute_previously_was(name)
-      pair = saved_changes[name]
-      pair.nil? ? nil : pair[0]
+      attribute_before_last_save(name)
+    end
+
+    # ---- The rest of ActiveRecord::AttributeMethods::Dirty and
+    # ActiveModel::Dirty's read surface (activerecord/lib/active_record/
+    # attribute_methods/dirty.rb, activemodel/lib/active_model/dirty.rb,
+    # Rails 8.2.0.alpha 5eb8c4c45bee). Rails routes each through a
+    # mutation tracker; here the two trackers are the two diffs this
+    # file already keeps: `saved_changes` (the last save, Rails'
+    # `mutations_before_last_save`) and `changes_to_save` (pending
+    # against the baseline, `mutations_from_database`). Names are
+    # Strings or Symbols (`attr_name.to_s`, as Rails does).
+
+    # mutations_before_last_save.any_changes?
+    def saved_changes?
+      !saved_changes.empty?
+    end
+
+    def saved_change_to_attribute?(attr_name, **options)
+      _dirty_changed?(saved_changes, attr_name, options)
+    end
+
+    def saved_change_to_attribute(attr_name)
+      saved_changes[attr_name.to_s]
+    end
+
+    # `mutations_before_last_save.original_value`: the changed
+    # attribute's value before the save, else its current value; nil
+    # before any save (NullMutationTracker).
+    def attribute_before_last_save(attr_name)
+      return nil if @saved_changes.nil?
+      pair = @saved_changes[attr_name.to_s]
+      pair.nil? ? _attribute_snapshot[attr_name.to_s] : pair[0]
+    end
+
+    # ActiveModel::Dirty#attribute_previously_changed?
+    def attribute_previously_changed?(attr_name, **options)
+      _dirty_changed?(saved_changes, attr_name, options)
+    end
+
+    def attribute_previous_change(attr_name)
+      saved_changes[attr_name.to_s]
+    end
+
+    def will_save_change_to_attribute?(attr_name, **options)
+      _dirty_changed?(changes_to_save, attr_name, options)
+    end
+
+    def attribute_changed?(attr_name, **options)
+      _dirty_changed?(changes_to_save, attr_name, options)
+    end
+
+    def attribute_change_to_be_saved(attr_name)
+      changes_to_save[attr_name.to_s]
+    end
+
+    def attribute_change(attr_name)
+      changes_to_save[attr_name.to_s]
+    end
+
+    # The value in the database: the pending change's original, else
+    # the current value (`mutations_from_database.original_value`).
+    def attribute_in_database(attr_name)
+      attribute_was(attr_name)
+    end
+
+    def changed_attribute_names_to_save
+      changes_to_save.keys
+    end
+
+    # ActiveModel::Dirty#changed, #changes, #changed_attributes and
+    # AR's #attributes_in_database: the pending diff, as names, as
+    # `[was, now]` pairs, and as the original values.
+    def changed
+      changed_attribute_names_to_save
+    end
+
+    def changes
+      changes_to_save
+    end
+
+    def changed_attributes
+      changes_to_save.transform_values { |pair| pair[0] }
+    end
+
+    def attributes_in_database
+      changed_attributes
+    end
+
+    # ActiveModel::Dirty#restore_attributes: write each changed
+    # attribute's original value back and drop the change.
+    def restore_attributes(attr_names = changed)
+      attr_names.each { |attr_name| restore_attribute!(attr_name) }
+    end
+
+    def restore_attribute!(attr_name)
+      attr_name = attr_name.to_s
+      if attribute_changed?(attr_name)
+        __send__("#{attr_name}=", attribute_was(attr_name))
+        clear_attribute_change(attr_name)
+      end
+    end
+
+    def clear_attribute_changes(attr_names)
+      attr_names.each { |attr_name| clear_attribute_change(attr_name) }
+    end
+
+    def clear_attribute_change(attr_name)
+      attr_name = attr_name.to_s
+      return unless _attribute_snapshot.key?(attr_name)
+      @__last_saved_attributes = (@__last_saved_attributes || {}).merge(attr_name => _attribute_snapshot[attr_name])
+      nil
+    end
+
+    # ActiveModel::Dirty#changes_applied: the pending changes become
+    # the last save's and nothing is pending (`_create_record` and
+    # `_update_record` call it after the write).
+    def changes_applied
+      changes = changes_to_save
+      @__last_saved_attributes = _attribute_snapshot
+      @saved_changes = changes
+      nil
+    end
+
+    # ActiveModel::AttributeMutationTracker#changed?: a change, and when
+    # `from:`/`to:` are given its original/current value must equal the
+    # given one (type-cast, as `type_cast(attr_name, from)` does). The
+    # snapshot keeps a timestamp as its stored text, so the compared
+    # value is read through the same text form.
+    def _dirty_changed?(changes, attr_name, options)
+      attr_name = attr_name.to_s
+      pair = changes[attr_name]
+      return false if pair.nil?
+      return false if options.key?(:from) && pair[0] != _dirty_cast(attr_name, options[:from])
+      return false if options.key?(:to) && pair[1] != _dirty_cast(attr_name, options[:to])
+      true
+    end
+
+    def _dirty_cast(attr_name, value)
+      type = begin
+        self.class.type_for_attribute(attr_name)
+      rescue NotImplementedError
+        nil
+      end
+      return value if type.nil?
+      cast = type.cast(value)
+      return cast unless type.respond_to?(:type) && type.type == :datetime && cast.respond_to?(:utc)
+      _attribute_snapshot.fetch(attr_name, nil).is_a?(String) ? ActiveSupport.format_db_time(cast) : cast
     end
 
     # What Dirty compares: a compiled model's String-keyed column values
@@ -2145,6 +2291,7 @@ module ActiveRecord
     # `_attribute_snapshot` form, so a datetime column answers its raw
     # stored text, as `attribute_previously_was` already does.
     def attribute_was(name)
+      name = name.to_s
       pair = changes_to_save[name]
       pair.nil? ? _attribute_snapshot[name] : pair[0]
     end

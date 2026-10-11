@@ -1,7 +1,7 @@
 //! Schema-driven methods: attr accessors, table_name, schema_columns,
 //! instantiate, initialize, attributes, [], []=, update.
 
-use crate::dialect::{AccessorKind, Association, MethodDef, MethodReceiver, Model, Param};
+use crate::dialect::{AccessorKind, Association, LibraryClass, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
 use crate::expr::{ArrayStyle, BoolOpKind, BoolOpSurface, Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
@@ -2374,19 +2374,10 @@ pub(crate) fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSe
 /// state every such call was in before this synthesis existed.
 fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
     use crate::dialect::ModelBodyItem;
-    fn walk(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
-        match &*e.node {
-            ExprNode::Send { method, .. } => {
-                out.insert(method.clone());
-            }
-            ExprNode::Lit { value: Literal::Sym { value } } => {
-                out.insert(value.clone());
-            }
-            _ => {}
-        }
-        e.node.for_each_child(&mut |c| walk(c, out));
-    }
-    let mut out = crate::det::HashSet::default();
+    let walk = walk_names;
+    let mut out: crate::det::HashSet<Symbol> = LIBRARY_DEMAND
+        .with(|slot| slot.borrow().as_ref().map(|names| (**names).clone()))
+        .unwrap_or_default();
     for model in models {
         for item in &model.body {
             match item {
@@ -2411,6 +2402,53 @@ fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
         }
     }
     out
+}
+
+/// Every method name `e` sends or names as a Symbol.
+fn walk_names(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+    match &*e.node {
+        ExprNode::Send { method, .. } => {
+            out.insert(method.clone());
+        }
+        ExprNode::Lit { value: Literal::Sym { value } } => {
+            out.insert(value.clone());
+        }
+        _ => {}
+    }
+    e.node.for_each_child(&mut |c| walk_names(c, out));
+}
+
+thread_local! {
+    static LIBRARY_DEMAND: std::cell::RefCell<Option<std::rc::Rc<crate::det::HashSet<Symbol>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previously installed library demand when dropped.
+pub(crate) struct LibraryDemandGuard<'a>(
+    Option<std::rc::Rc<crate::det::HashSet<Symbol>>>,
+    std::marker::PhantomData<&'a [LibraryClass]>,
+);
+
+impl Drop for LibraryDemandGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        LIBRARY_DEMAND.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Count the names the app's library classes (a concern module's
+/// methods, which run on the including model's record) send as demand
+/// for [`model_body_names`], for the guard's life. Install it before the
+/// first demand set of the models is computed.
+pub(crate) fn share_library_demand(classes: &[LibraryClass]) -> LibraryDemandGuard<'_> {
+    let mut names = crate::det::HashSet::default();
+    for class in classes {
+        for method in &class.methods {
+            walk_names(&method.body, &mut names);
+        }
+    }
+    let previous = LIBRARY_DEMAND.with(|slot| slot.borrow_mut().replace(std::rc::Rc::new(names)));
+    LibraryDemandGuard(previous, std::marker::PhantomData)
 }
 
 /// The names a validation rule sends or names: its method, its Symbol

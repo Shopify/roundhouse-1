@@ -676,7 +676,10 @@ module ActiveRecord
               end
             else
               _callback_chain_run(:update) do
-                fill_timestamps(false)
+                # Timestamp#should_record_timestamps?: with partial updates
+                # (the default) a save with nothing pending stamps nothing,
+                # so `saved_changes?` stays false for it.
+                fill_timestamps(false) if has_changes_to_save?
                 _adapter_update
                 @_trigger_update_callback = true
                 __track_saved_changes(was_new)

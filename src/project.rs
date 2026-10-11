@@ -3411,6 +3411,7 @@ fn ruby_family_files(
     // (`emit::ruby::library::generated_attribute_methods`) synthesizes
     // its columns' methods over `app.models`; one demand set of their
     // bodies serves them all, as in the model lowering.
+    let _library_demand = crate::lower::model_to_library::schema::share_library_demand(&app.library_classes);
     let _body_names = crate::lower::model_to_library::schema::share_model_body_names(&app.models, &Default::default());
     let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
     crate::timings::lap_start();

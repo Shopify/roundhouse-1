@@ -361,6 +361,7 @@ pub(crate) fn materialize_models(
     // …and a class method of a model with subclasses reading its
     // implicit `all`, which `apply_scope_lowering` seeds on `self`.
     assoc_scopes.extend(crate::lower::sti_scope::subclassed_self_reads(app));
+    let _library_demand = crate::lower::model_to_library::schema::share_library_demand(&app.library_classes);
     let lcs = crate::lower::model_to_library::lower_models_inner_for_dialect(
         &app.models,
         &app.schema,
