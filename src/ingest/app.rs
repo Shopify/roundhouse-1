@@ -2935,6 +2935,9 @@ end
     // After the splice: a concern's association names its class
     // relative to the includer, as Rails' `compute_type` reads it.
     qualify_association_targets(&mut app);
+    // After qualification, so the source association's target is the
+    // model Rails' `compute_type` found for it.
+    resolve_has_one_through_targets(&mut app);
     // After the splice too: the inverse `has_many …, as: :owner` may be
     // declared in a concern's `included do`.
     resolve_polymorphic_targets(&mut app);
@@ -8831,6 +8834,68 @@ fn qualify_association_targets(app: &mut App) {
         let owner = model.name.clone();
         for target in model.body.iter_mut().filter_map(target_of) {
             qualify_target(&owner, target, &models);
+        }
+    }
+}
+
+/// A `has_one :x, through: :y` names no class of its own: Rails'
+/// `ThroughReflection#klass` is the source reflection's klass, the
+/// association `x` (or `source:`) on the through model, so a written
+/// `class_name:` on THAT association decides the class
+/// (activerecord reflection.rb `source_reflection` / `klass`). The
+/// ingest reads the name-derived class; replace it with the source
+/// association's target when the derived one is no model and the
+/// through model's source association names one that is.
+fn resolve_has_one_through_targets(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+    use crate::ident::{ClassId, Symbol};
+
+    let known: crate::det::HashSet<String> =
+        app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let mut resolved: Vec<(ClassId, Symbol, ClassId)> = Vec::new();
+    for model in &app.models {
+        for assoc in model.associations() {
+            let Association::HasOne { name, target, through: Some(thr), source, .. } = assoc else { continue };
+            if known.contains(target.0.as_str()) {
+                continue;
+            }
+            let Some(thr_target) = model.associations().find_map(|a| match a {
+                Association::HasMany { name, target, .. } | Association::HasOne { name, target, .. }
+                    if name == thr =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(thr_model) = app.models.iter().find(|m| &m.name == thr_target) else { continue };
+            let source_name = source.as_ref().unwrap_or(name);
+            let found = thr_model.associations().find_map(|a| match a {
+                Association::BelongsTo { name, target, .. }
+                | Association::HasOne { name, target, .. }
+                | Association::HasMany { name, target, .. }
+                    if name == source_name =>
+                {
+                    Some(target.clone())
+                }
+                _ => None,
+            });
+            if let Some(found) = found.filter(|t| known.contains(t.0.as_str())) {
+                resolved.push((model.name.clone(), name.clone(), found));
+            }
+        }
+    }
+    for (owner, assoc_name, new_target) in resolved {
+        let Some(model) = app.models.iter_mut().find(|m| m.name == owner) else { continue };
+        for item in &mut model.body {
+            let ModelBodyItem::Association { assoc: Association::HasOne { name, target, .. }, .. } = item
+            else {
+                continue;
+            };
+            if *name == assoc_name {
+                *target = new_target.clone();
+            }
         }
     }
 }

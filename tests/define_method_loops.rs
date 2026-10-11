@@ -455,3 +455,54 @@ fn a_collision_with_an_existing_method_is_refused() {
         errors.join("\n")
     );
 }
+
+// ---- Shape 4: a class method answering a literal collection ---------------
+
+const STATUS_NAMES: &str = r##"class StatusNames
+  class << self
+    def all
+      [
+        "draft",
+        "published",
+        "frozen",
+      ]
+    end
+  end
+end
+"##;
+
+const ARTICLE_STATUSES: &str = "  validates :body, presence: true, length: { minimum: 10 }\n\n  \
+     StatusNames.all.each do |status|\n    name = status == \"frozen\" ? \"status_frozen\" : status\n    \
+     define_method \"#{name}?\" do\n      title == status\n    end\n  end\n";
+
+const STATUS_SCRIPT: &str = r##"a = Article.create!(title: "draft", body: "a body long enough")
+p [a.draft?, a.published?, a.status_frozen?]
+p Article.public_method_defined?(:status_frozen?)
+p Article.public_method_defined?(:frozen?)
+"##;
+
+#[test]
+fn a_loop_over_a_class_method_answering_a_literal_array_matches_native() {
+    let expected = native(
+        "status_names",
+        &format!(
+            "{NATIVE_PRELUDE}\
+             ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
+             ActiveRecord::Schema.verbose = false\n\
+             ActiveRecord::Schema.define {{ create_table(:articles) {{ |t| t.string :title; t.text :body; t.timestamps }} }}\n\
+             {STATUS_NAMES}\
+             class Article < ActiveRecord::Base\n  validates :title, presence: true\n{ARTICLE_STATUSES}end\n\
+             {STATUS_SCRIPT}"
+        ),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected, ["[true, false, false]", "true", "true"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/models/status_names.rb", STATUS_NAMES)
+        .edit("app/models/article.rb", ARTICLE_FIND, ARTICLE_STATUSES)
+        .run_ruby(STATUS_SCRIPT);
+    run.assert_passes();
+    assert!(!run.errors.iter().any(|e| e.contains("not supported")), "{:#?}", run.errors);
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
+}
