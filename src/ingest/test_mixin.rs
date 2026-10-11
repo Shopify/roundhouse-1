@@ -922,7 +922,7 @@ impl TestMixins {
     }
 
     /// Whether a module `tm` includes gives it a class method that
-    /// declares tests (`refuse_test_macro_calls`).
+    /// declares tests (`mark_test_macro_calls`).
     pub(super) fn gives_test_macros(&self, tm: &TestModule) -> bool {
         !self.macro_modules.is_empty() && !self.included_test_macros(tm).is_empty()
     }
@@ -930,18 +930,19 @@ impl TestMixins {
     /// Each statement of `tm`'s class body that calls a test-declaring
     /// class method an included module gives it (`test_input_field_
     /// authorization(ProductInput, :vendor, …)`, whose `ClassMethods`
-    /// body runs `generate_test`) declares tests ingest does not see: a
-    /// named gap, so they are not lost without a word. Strict ingest fails.
-    /// The statement is not carried to run in the emitted class either
-    /// (`TestModule::body_statements`): the macro it calls is not there.
-    pub(super) fn refuse_test_macro_calls(&self, tm: &mut TestModule, source: &[u8], file: &str) -> IngestResult<()> {
+    /// body runs `generate_test`) declares tests ingest does not see. The
+    /// statement is carried (`TestModule::body_statements`) and the
+    /// included module's class method is the app's, so the emitted class
+    /// declares them as it loads: the class lists them then
+    /// (`TestModule::tests_at_load`).
+    pub(super) fn mark_test_macro_calls(&self, tm: &mut TestModule, source: &[u8], file: &str) {
         let macros = self.included_test_macros(tm);
         if macros.is_empty() {
-            return Ok(());
+            return;
         }
         let result = super::prism::parse_silent(source);
         let root = result.node();
-        let Some((class, _)) = find_class(&root, &[], tm.name.0.as_str()) else { return Ok(()) };
+        let Some((class, _)) = find_class(&root, &[], tm.name.0.as_str()) else { return };
         for stmt in class.body().map(flatten_statements).unwrap_or_default() {
             if stmt.as_def_node().is_some()
                 || stmt.as_class_node().is_some()
@@ -950,25 +951,11 @@ impl TestMixins {
             {
                 continue;
             }
-            let hit = self_calls(&stmt)
-                .into_iter()
-                .find_map(|(called, at)| macros.iter().find(|(m, _)| *m == called).map(|(m, owner)| (m.clone(), owner.clone(), at)));
-            let Some((method, owner, at)) = hit else { continue };
-            if super::test::macro_call_expanded(file, stmt.location().start_offset()) {
-                continue;
+            let hit = self_calls(&stmt).into_iter().any(|(called, _)| macros.iter().any(|(m, _)| *m == called));
+            if hit && !super::test::macro_call_expanded(file, stmt.location().start_offset()) {
+                tm.tests_at_load = true;
             }
-            let start = stmt.location().start_offset() as u32;
-            tm.body_statements.retain(|carried| carried.expr.span.start != start);
-            let line = super::sources::line_at(file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
-            super::survey::continue_or_fail(IngestError::Unsupported {
-                file: file.into(),
-                message: format!(
-                    "tests declared by a class method an included module gives the class are not modeled; they will not run (`{}` line {line}: `{method}` of `{owner}`)",
-                    tm.name.0
-                ),
-            })?;
         }
-        Ok(())
     }
 
     /// Test classes `ingest_test_files` did not reach that include shared
@@ -1385,6 +1372,7 @@ impl TestMixins {
             teardowns: Vec::new(),
             block_teardown: false,
             block_helpers: Vec::new(),
+            block_statements: Vec::new(),
             class_defs: Vec::new(),
             block_wins: Vec::new(),
             includes_out: Vec::new(),
@@ -1457,6 +1445,11 @@ struct ClassWalk<'a> {
     /// last of its name, and only while no later class-body `def`
     /// replaced it.
     block_helpers: Vec<MethodDef>,
+    /// The statements of `included do` blocks that declare tests ingest
+    /// cannot list (a loop over a computed collection): Ruby runs them
+    /// on the class where the `include` stands, so the emitted class runs
+    /// them as it loads (`TestModule::tests_at_load`).
+    block_statements: Vec<crate::dialect::TestBodyStatement>,
     /// The methods the class body has `def`ined so far, as (name,
     /// receiver): `def self.label` and `def label` are different methods.
     class_defs: Vec<(String, MethodReceiver)>,
@@ -1676,10 +1669,25 @@ impl ClassWalk<'_> {
                     continue;
                 }
                 if hidden_test_declaration(&stmt).is_some() {
-                    return Err(format!(
-                        "a test declared {} by an `included do` statement ingest does not model",
-                        at(file, stmt.location().start_offset())
-                    ));
+                    // `class_eval` runs it on the class where the include
+                    // stands: carried, declared as the class loads.
+                    return match super::test::carried_body_statement(&stmt, &self.class, file).map_err(message)? {
+                        Some(mut expr) => {
+                            self.qualify_block(&mut expr);
+                            self.block_statements.push(crate::dialect::TestBodyStatement {
+                                expr,
+                                line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+                                after_definitions: true,
+                                after_setup_blocks: false,
+                                after_teardown_blocks: false,
+                            });
+                            continue;
+                        }
+                        None => Err(format!(
+                            "a test declared {} by an `included do` statement ingest does not model",
+                            at(file, stmt.location().start_offset())
+                        )),
+                    };
                 }
                 if is_extend_declarative(&stmt) {
                     // Every test class already has it (`ActiveSupport::TestCase`).
@@ -1832,6 +1840,7 @@ impl ClassWalk<'_> {
             teardowns,
             block_teardown,
             mut block_helpers,
+            mut block_statements,
             block_wins,
             includes_out,
             file,
@@ -2117,6 +2126,9 @@ impl ClassWalk<'_> {
             for h in &mut helpers {
                 unqualify(&mut h.body, &qualified);
             }
+            for statement in &mut block_statements {
+                unqualify(&mut statement.expr, &qualified);
+            }
         }
 
         let mut out = tm.clone();
@@ -2145,6 +2157,10 @@ impl ClassWalk<'_> {
         out.tests = tests;
         out.helpers = helpers;
         out.constants = constants;
+        if !block_statements.is_empty() {
+            out.body_statements.extend(block_statements);
+            out.tests_at_load = true;
+        }
         // Each `RoundhouseSuper…` where its shared module's include stands,
         // so a plain module included after the shared one still comes
         // first in the lookup; one placed nowhere is included last.
@@ -4019,7 +4035,7 @@ end
     }
 
     #[test]
-    fn a_call_to_an_included_test_macro_is_a_named_gap() {
+    fn a_call_to_an_included_test_macro_runs_as_the_class_loads() {
         // AccessAndAuth::InputFieldsAuthorizationHelper: a concern whose
         // `ClassMethods#test_input_field_authorization` runs
         // `generate_test`, called in the includer's class body.
@@ -4035,15 +4051,11 @@ end
         let mut tms = crate::ingest::test::ingest_test_files(class.as_bytes(), "input_test.rb").unwrap();
         assert!(mixins.gives_test_macros(&tms[0]));
         assert_eq!(tms[0].body_statements.len(), 3, "{:#?}", tms[0].body_statements);
-        let err = mixins.refuse_test_macro_calls(&mut tms[0], class.as_bytes(), "input_test.rb").unwrap_err().to_string();
-        assert!(err.contains("tests declared by a class method an included module gives the class are not modeled") && err.contains("`test_field` of `AuthHelper`"), "{err}");
-        crate::ingest::survey::activate();
-        mixins.refuse_test_macro_calls(&mut tms[0], class.as_bytes(), "input_test.rb").unwrap();
-        // `label(:x)` still runs; the macro calls are named, not run.
-        assert_eq!(tms[0].body_statements.len(), 1, "{:#?}", tms[0].body_statements);
-        let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
-        assert_eq!(gaps.len(), 2, "{gaps:#?}");
-        assert!(gaps[1].contains("`test_fields` of `AuthHelper`"), "{}", gaps[1]);
+        assert!(!tms[0].tests_at_load);
+        mixins.mark_test_macro_calls(&mut tms[0], class.as_bytes(), "input_test.rb");
+        // The macro calls stay carried, and the class lists what they declare as it loads.
+        assert!(tms[0].tests_at_load);
+        assert_eq!(tms[0].body_statements.len(), 3, "{:#?}", tms[0].body_statements);
         assert_eq!(names(&tms[0]), ["test_own"]);
     }
 

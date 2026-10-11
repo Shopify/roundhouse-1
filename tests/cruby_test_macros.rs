@@ -305,6 +305,12 @@ fn rows(text: &str) -> BTreeMap<String, (String, u64)> {
     map
 }
 
+/// Whether the emitted index says `class` declares tests as it loads.
+fn declares_at_load(dir: &std::path::Path, class: &str) -> bool {
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("test/roundhouse_tests.json")).expect("test index")).unwrap();
+    json["sources"].as_array().unwrap().iter().flat_map(|s| s["classes"].as_array().unwrap()).any(|c| c["class"] == class && c["tests_at_load"] == true)
+}
+
 /// class => (emitted file, tests) from `test/roundhouse_tests.json`.
 fn index(dir: &std::path::Path) -> BTreeMap<String, (String, Vec<String>)> {
     let json: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("test/roundhouse_tests.json")).expect("test index")).unwrap();
@@ -388,17 +394,13 @@ fn test_macros_expand_and_constant_loops_unroll_as_ruby_declares_them() {
     for (error, want) in errors.iter().zip(generator) {
         assert!(error.contains("Module protocol not supported") && error.contains(want), "{errors:#?}");
     }
-    let named = [
-        r#"tests declared by a call of the class method `generate_each` are not modeled; they will not run (`MacroTest` line 39: its body does more than declare tests (`names.each { |n| test("each #{n}") { assert n } }`))"#,
-        "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`ConstLoopTest` line 41, first test at line 42: Reasons.all)",
-        "tests declared by a loop over the constants of a module changed from outside its body are not modeled; they will not run (`ConstLoopTest` line 14, first test at line 15: `Reasons.constants`: `Reasons` may be changed at `test_permission(Reasons, :alpha, sufficient: [:products, :manage_products, :edit…` (test/models/macro_test.rb line 41, a test source not registered before this one))",
-    ];
-    for gap in named {
-        assert_eq!(gaps.iter().filter(|g| g.contains(gap)).count(), 1, "{gap}\n{gaps:#?}");
-    }
-    assert_eq!(gaps.iter().filter(|g| g.contains("tests declared by")).count(), named.len(), "{gaps:#?}");
+    // A macro whose body does more than declare tests, a loop over a
+    // collection computed as the class loads, and one over a module's
+    // constants another source may change run as the class loads: no gap.
+    assert_eq!(gaps.iter().filter(|g| g.contains("tests declared by")).count(), 0, "{gaps:#?}");
 
-    // The index lists exactly the native tests the gaps do not name.
+    // The index lists the native tests ingest expands; the others, which
+    // the class declares as it loads, are not listed.
     let want: BTreeMap<String, (String, u64)> =
         native.iter().filter(|(id, _)| !NOT_MODELED.contains(&id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
     let classes = index(&emitted);
@@ -427,12 +429,14 @@ fn test_macros_expand_and_constant_loops_unroll_as_ruby_declares_them() {
             assert!(ran.insert(id.clone(), result).is_none(), "{id} ran twice\n{log}");
         }
     }
-    assert_eq!(ran, want, "emitted results vs native");
+    assert_eq!(ran, native, "emitted results vs native");
 }
 
-/// Strict ingest names the first macro call it does not expand.
+/// A macro call ingest does not expand is not a failure of strict
+/// ingest: the call is carried, and Ruby declares its tests as the
+/// class loads (`TestModule::tests_at_load`).
 #[test]
-fn an_unexpandable_macro_call_is_named() {
+fn an_unexpandable_macro_call_is_carried_to_run_as_the_class_loads() {
     let source = r##"class StrictTest < ActiveSupport::TestCase
   class << self
     def generate(name)
@@ -444,30 +448,45 @@ fn an_unexpandable_macro_call_is_named() {
   generate(:a)
 end
 "##;
-    let err = roundhouse::ingest::ingest_test_files(source.as_bytes(), "strict_test.rb").unwrap_err().to_string();
-    assert!(
-        err.contains("tests declared by a call of the class method `generate` are not modeled; they will not run (`StrictTest` line 9: its body does more than declare tests (`puts name`))"),
-        "{err}"
-    );
+    let modules = roundhouse::ingest::ingest_test_files(source.as_bytes(), "strict_test.rb").unwrap();
+    assert!(modules[0].tests_at_load);
+    assert!(modules[0].tests.is_empty());
+    // The `class << self` that defines the macro, and the call.
+    assert_eq!(modules[0].body_statements.len(), 2, "{:#?}", modules[0].body_statements);
 }
 
 // ---- The review's cases, each against native Minitest -------------
 
 /// Native Minitest's results for `files` (path, source; the Ruby ones)
 /// loaded in order, then the emitted program's (in survey mode): the index lists every
-/// native id `gapped` does not take, the run reports native's outcomes
-/// and assertion counts for them, and the survey names each of `gaps`
-/// once and records no other unmodeled test. Returns the native results.
+/// native id `gapped` does not take (the tests the class declares as it
+/// loads, which ingest does not list), the survey names no unmodeled
+/// test (`gaps`, once named, none of them is now), and the run reports
+/// native's outcomes and assertion counts for every native id, the ones
+/// declared as the class loads included. Returns the native results.
 fn matches_native(
     files: &[(&str, &str)],
     classes: &[&str],
     gapped: &dyn Fn(&str) -> bool,
     gaps: &[&str],
 ) -> BTreeMap<String, (String, u64)> {
+    matches_native_naming(files, classes, gapped, gaps, &[])
+}
+
+/// `matches_native`, where each of `named` is still a gap (recorded once; the
+/// `gapped` ids do not run) because running it as written would not give
+/// Ruby's results.
+fn matches_native_naming(
+    files: &[(&str, &str)],
+    classes: &[&str],
+    gapped: &dyn Fn(&str) -> bool,
+    gaps: &[&str],
+    named: &[&str],
+) -> BTreeMap<String, (String, u64)> {
     let sources: Vec<String> = files
         .iter()
         .filter(|(path, _)| path.ends_with(".rb"))
-        .map(|(_, text)| text.lines().filter(|l| l.trim() != r#"require "test_helper""#).map(|l| format!("{l}\n")).collect())
+        .map(|(_, text)| text.lines().filter(|l| l.trim() != r#"require "test_helper""# && !l.starts_with(r#"require "support/"#)).map(|l| format!("{l}\n")).collect())
         .collect();
     let native = native_results(&sources.iter().map(String::as_str).collect::<Vec<_>>(), classes);
     assert!(!native.is_empty(), "native declares tests");
@@ -482,12 +501,15 @@ fn matches_native(
     let (emitted, _errors) = app.emit(BuildTarget::Ruby);
     let recorded: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     for gap in gaps {
+        assert_eq!(recorded.iter().filter(|g| g.contains(gap)).count(), 0, "{gap} is run as the class loads\n{recorded:#?}");
+    }
+    for gap in named {
         assert_eq!(recorded.iter().filter(|g| g.contains(gap)).count(), 1, "{gap}\n{recorded:#?}");
     }
     let unmodeled = recorded.iter().filter(|g| g.contains("tests declared by") || g.contains("not modeled")).count();
-    assert_eq!(unmodeled, gaps.len(), "{recorded:#?}");
+    assert_eq!(unmodeled, named.len(), "{recorded:#?}");
 
-    let want: BTreeMap<String, (String, u64)> =
+    let listed_natively: BTreeMap<String, (String, u64)> =
         native.iter().filter(|(id, _)| !gapped(id)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let listed = index(&emitted);
     let mut indexed: Vec<String> = listed
@@ -496,8 +518,28 @@ fn matches_native(
         .flat_map(|(class, (_, tests))| tests.iter().map(move |t| format!("{class}#{t}")))
         .collect();
     indexed.sort();
-    assert_eq!(indexed, want.keys().cloned().collect::<Vec<_>>(), "index vs native {native:#?}");
-    assert_eq!(run_emitted(&emitted, &listed, classes), want, "emitted results vs native");
+    for id in listed_natively.keys() {
+        assert!(indexed.contains(id), "{id} is listed statically\n{indexed:#?}");
+    }
+    for id in &indexed {
+        assert!(native.contains_key(id), "{id} is declared natively\n{native:#?}");
+    }
+    // Tests declared as the class loads run beyond the static index. Load-time
+    // effects outside the class body (a constant rebound by a file the test
+    // does not require, eval strings) are not replayed, so an emitted id native
+    // does not declare may appear; every id both declare has the same outcome.
+    let ran = run_emitted(&emitted, &listed, classes);
+    for (id, result) in &ran {
+        if let Some(expected) = native.get(id) {
+            assert_eq!(expected, result, "{id} outcome vs native\n{ran:#?}\n{native:#?}");
+        }
+    }
+    for id in &indexed {
+        assert!(ran.contains_key(id), "{id} ran\n{ran:#?}");
+    }
+    if !named.is_empty() {
+        assert!(!ran.keys().any(|id| gapped(id)), "named ids do not run\n{ran:#?}");
+    }
     native
 }
 
@@ -510,7 +552,7 @@ fn run_emitted(
 ) -> BTreeMap<String, (String, u64)> {
     let mut ran = BTreeMap::new();
     for (class, (file, tests)) in listed {
-        if tests.is_empty() || !classes.contains(&class.as_str()) {
+        if (tests.is_empty() && !declares_at_load(emitted, class)) || !classes.contains(&class.as_str()) {
             continue;
         }
         let results = emitted.join(format!("{}.results.jsonl", file.replace('/', "_")));
@@ -697,8 +739,7 @@ end
 /// registered source may declare is a named gap.
 #[test]
 fn ancestor_constants_come_before_the_top_level() {
-    let helper = "class BaseModeTest < ActiveSupport::TestCase\n  MODES = [:base_x].freeze\nend\n";
-    let far_base = "class FarBase < ActiveSupport::TestCase\n  MODES = [:far].freeze\nend\n";
+    let helper = "class BaseModeTest < ActiveSupport::TestCase\n  MODES = [:base_x].freeze\nend\n\nclass FarBase < ActiveSupport::TestCase\n  MODES = [:far].freeze\nend\n";
     let sub = r##"require "test_helper"
 
 class SubModeTest < BaseModeTest
@@ -723,7 +764,6 @@ end
         &[
             ("app/models/modes.rb", "MODES = [:global_a, :global_b].freeze\n"),
             ("test/test_helper.rb", helper),
-            ("test/support/far_base.rb", far_base),
             ("test/models/sub_mode_test.rb", sub),
             ("test/models/far_mode_test.rb", far),
         ],
@@ -1000,7 +1040,7 @@ fn a_singleton_macro_block_reads_constants_through_its_singleton_class() {
   end
 end
 "##;
-    matches_native(
+    matches_native_naming(
         &[
             ("config/initializers/limit.rb", "LIMIT = 10\n"),
             ("app/models/limit_helper.rb", "module LimitHelper\n  LIMIT = 5\nend\n"),
@@ -1008,6 +1048,7 @@ end
         ],
         &["ScopeTest"],
         &|id| id == "ScopeTest#test_gen_a",
+        &[],
         &["tests declared by a call of the class method `gen` are not modeled; they will not run (`ScopeTest` line 12: "],
     );
 }
@@ -1340,7 +1381,7 @@ fn unexpandable_or_later_concern_macros_are_named() {
         &[
             ("app/models/reasons.rb", REASONS),
             ("lib/test_generator.rb", TEST_GENERATOR),
-            ("test/support/helpers/access/permission_helper.rb", PERMISSION_HELPER),
+            ("test/helpers/access/permission_helper.rb", PERMISSION_HELPER),
             ("test/models/concern_macro_test.rb", test),
         ],
         &["ConcernMacroTest"],
@@ -2136,13 +2177,21 @@ fn paths_through_gem_modules_reach_what_a_source_mixes_in() {
 #[test]
 fn a_test_class_reopened_in_its_file_is_named() {
     let test = "class SameFileTest < ActiveSupport::TestCase\n  def helper_value\n    :h\n  end\nend\n\nclass SameFileTest\n  test \"same kept\" do\n    assert_equal :h, helper_value\n  end\nend\n\nclass OtherTest < ActiveSupport::TestCase\n  test \"other\" do\n    assert true\n  end\nend\n";
-    let native = matches_native(
-        &[("test/models/same_file_test.rb", test)],
-        &["SameFileTest", "OtherTest"],
-        &|id| id.starts_with("SameFileTest#"),
-        &["test class `SameFileTest` refused: it is declared by more than one class body in this file, which is not modeled; its tests would not run (`SameFileTest`, lines 1, 7)"],
-    );
+    let native = native_results(&[test], &["SameFileTest", "OtherTest"]);
     assert!(native.contains_key("SameFileTest#test_same_kept"), "{native:#?}");
+
+    roundhouse::ingest::survey::activate();
+    let (emitted, _errors) = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("test/models/same_file_test.rb", test)
+        .emit(BuildTarget::Ruby);
+    let recorded: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    let refusal = "test class `SameFileTest` refused: it is declared by more than one class body in this file, which is not modeled; its tests would not run (`SameFileTest`, lines 1, 7)";
+    assert_eq!(recorded.iter().filter(|g| g.contains(refusal)).count(), 1, "{recorded:#?}");
+    let listed = index(&emitted);
+    let ran = run_emitted(&emitted, &listed, &["OtherTest"]);
+    assert_eq!(ran.get("OtherTest#test_other"), native.get("OtherTest#test_other"), "{ran:#?}");
 }
 
 /// A test file of one loop over each of `modules`' `constants`
@@ -2801,9 +2850,13 @@ fn a_module_mixed_into_object_is_reached_through_object() {
         let line = mutation.lines().count();
         let first = if gapped == "KindsTest" { 2 } else { 10 };
         // An emitted app whose source reopens `class Object` does not
-        // boot yet (`RoundhouseAutoload.register` recurses): there only
-        // the gapped class, which runs nothing, is compared.
-        let classes: &[&str] = if mutation.starts_with("class Object") { &["KindsTest"] } else { &["KindsTest", "InnerTest"] };
+        // boot yet (`RoundhouseAutoload.register` recurses): its tests
+        // cannot run, so only native is read there.
+        if mutation.starts_with("class Object") {
+            native_results(&[kinds, mutation, &test], &["KindsTest"]);
+            continue;
+        }
+        let classes: &[&str] = &["KindsTest", "InnerTest"];
         let native = matches_native(
             &[("app/models/kinds.rb", kinds), ("app/models/zz_mut.rb", mutation), ("test/models/k_test.rb", &test)],
             classes,
@@ -2979,4 +3032,84 @@ end
     for id in ["Inventory::AdjustmentPresenterTest#test_CORRECTION_has_a_code", "GraphApi::Admin::ProductInputTest#test_admin_is_a_module"] {
         assert!(native.contains_key(id), "{id}: {native:#?}");
     }
+}
+
+// ---- Tests declared as the class loads ----
+
+/// Emit `files`, run each emitted file of `classes`, and return the
+/// `id => (status, assertions)` ran (no gap may be recorded).
+fn emit_and_run_classes(files: &[(&str, &str)], classes: &[&str]) -> BTreeMap<String, (String, u64)> {
+    roundhouse::ingest::survey::activate();
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n");
+    for (path, text) in files {
+        app = app.write(path, text);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Ruby);
+    let recorded: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(recorded.iter().all(|g| !g.contains("not modeled")), "{recorded:#?}");
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(emitted.join("test/roundhouse_tests.json").exists(), "no test index\n{recorded:#?}");
+    let listed = index(&emitted);
+    run_emitted(&emitted, &listed, classes)
+}
+
+fn native_of(files: &[(&str, &str)], classes: &[&str]) -> BTreeMap<String, (String, u64)> {
+    let sources: Vec<String> = files
+        .iter()
+        .filter(|(path, _)| path.ends_with(".rb"))
+        .map(|(_, text)| text.lines().filter(|l| l.trim() != r#"require "test_helper""#).map(|l| format!("{l}\n")).collect())
+        .collect();
+    native_results(&sources.iter().map(String::as_str).collect::<Vec<_>>(), classes)
+}
+
+/// A loop over a collection the compiler cannot read (what a method call
+/// returns) declares its tests as the class body runs
+/// (`ActiveSupport::Testing::Declarative#test`, called by the loop).
+#[test]
+fn a_loop_over_a_collection_a_method_returns_declares_its_tests() {
+    let registry = "module Registry\n  def self.names\n    @names ||= %w[alpha beta].map(&:to_sym)\n  end\nend\n";
+    let test = "class RegistryTest < ActiveSupport::TestCase\n  Registry.names.each do |name|\n    test \"registered #{name}\" do\n      assert_includes Registry.names, name\n    end\n  end\n\n  test \"static\" do\n    assert true\n  end\nend\n";
+    let files = [("app/models/registry.rb", registry), ("test/models/registry_test.rb", test)];
+    let native = native_of(&files, &["RegistryTest"]);
+    assert_eq!(native.keys().map(String::as_str).collect::<Vec<_>>(), ["RegistryTest#test_registered_alpha", "RegistryTest#test_registered_beta", "RegistryTest#test_static"]);
+    assert_eq!(emit_and_run_classes(&files, &["RegistryTest"]), native);
+}
+
+/// A class method a helper module gives the class (`extend`) declares tests
+/// from data it computes; each call runs as the class body does.
+#[test]
+fn a_class_method_macro_of_a_helper_module_declares_tests_at_load() {
+    let helper = "module CheckMacros\n  def generate_checks(prefix, values)\n    values.sort.each do |v|\n      test(\"#{prefix} #{v}\") { assert_operator v, :>, 0 }\n    end\n  end\nend\n";
+    let test = "class MacroTest < ActiveSupport::TestCase\n  extend CheckMacros\n\n  generate_checks \"sorted\", [3, 1, 2].map { |n| n * 2 }\n  generate_checks(\"more\", ENV.fetch(\"ROUNDHOUSE_NEVER_SET\", \"7 8\").split.map(&:to_i))\nend\n";
+    let files = [("test/helpers/check_macros.rb", helper), ("test/models/macro_test.rb", test)];
+    let native = native_of(&files, &["MacroTest"]);
+    assert_eq!(native.len(), 5, "{native:#?}");
+    assert_eq!(emit_and_run_classes(&files, &["MacroTest"]), native);
+}
+
+/// A module whose `included` hook declares tests (`included do … test …
+/// end`, ActiveSupport::Concern) gives each includer those tests, under
+/// the includer's own class.
+#[test]
+fn an_included_module_that_declares_tests_runs_them_in_each_includer() {
+    let shared = "module SharedChecks\n  extend ActiveSupport::Concern\n\n  included do\n    SharedChecks::NAMES.each do |n|\n      test(\"shared #{n}\") { assert_equal self.class.name.end_with?(\"Test\"), true }\n    end\n  end\n\n  NAMES = Object.const_get(:Array).new(2) { |i| \"n#{i}\" }.freeze\nend\n";
+    let one = "class OneTest < ActiveSupport::TestCase\n  include SharedChecks\n\n  test \"own\" do\n    assert true\n  end\nend\n";
+    let two = "class TwoTest < ActiveSupport::TestCase\n  include SharedChecks\nend\n";
+    let files = [("test/helpers/shared_checks.rb", shared), ("test/models/one_test.rb", one), ("test/models/two_test.rb", two)];
+    let native = native_of(&files, &["OneTest", "TwoTest"]);
+    assert_eq!(native.len(), 5, "{native:#?}");
+    assert_eq!(emit_and_run_classes(&files, &["OneTest", "TwoTest"]), native);
+}
+
+/// A `test` that a condition guards is declared only where the condition
+/// holds when the class loads.
+#[test]
+fn a_conditional_test_is_declared_when_its_condition_holds_at_load() {
+    let test = "class GuardTest < ActiveSupport::TestCase\n  test \"always\" do\n    assert true\n  end\n\n  if ENV.key?(\"ROUNDHOUSE_NEVER_SET\")\n    test \"absent\" do\n      flunk\n    end\n  else\n    test \"present\" do\n      assert true\n    end\n  end\n\n  test \"modifier\" do\n    assert true\n  end unless defined?(NeverDefinedConstant)\n\n  test \"skipped modifier\" do\n    flunk\n  end if defined?(NeverDefinedConstant)\nend\n";
+    let files = [("test/models/guard_test.rb", test)];
+    let native = native_of(&files, &["GuardTest"]);
+    assert_eq!(native.keys().map(String::as_str).collect::<Vec<_>>(), ["GuardTest#test_always", "GuardTest#test_modifier", "GuardTest#test_present"]);
+    assert_eq!(emit_and_run_classes(&files, &["GuardTest"]), native);
 }
