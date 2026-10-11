@@ -101,3 +101,31 @@ fn an_unreferenced_initializer_module_stays_out() {
         app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect::<Vec<_>>()
     );
 }
+
+/// A nested module of constants an initializer defines is kept when an
+/// `app/` file reads it through its full path, not only when another
+/// initializer does: the initializer ran at boot, before the app code.
+#[test]
+fn a_nested_initializer_module_read_by_app_code_through_its_path_is_kept() {
+    let files: Vec<(&str, &str)> = vec![
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/room.rb",
+            "class Room < ApplicationRecord\n  POD = Shared::Settings::Enum::LEADER.freeze\nend\n",
+        ),
+        (
+            "config/initializers/settings.rb",
+            "module Shared\n  module Settings\n    module Enum\n      LEADER = \"0\"\n    end\n  end\nend\n",
+        ),
+        (
+            "config/initializers/unread.rb",
+            "module Other\n  module Settings\n    module Enum\n      LEADER = \"1\"\n    end\n  end\nend\n",
+        ),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    let names: Vec<&str> = app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+    assert!(names.contains(&"Shared::Settings::Enum"), "classes = {names:?}");
+    assert!(!names.contains(&"Other::Settings::Enum"), "classes = {names:?}");
+}
