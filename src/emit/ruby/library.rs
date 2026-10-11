@@ -12505,11 +12505,12 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
     // nowhere itself (`VALID = statuses`, which a class-body macro
     // above it defined on the singleton) waits for the replayed class-body
     // calls the source has above it: those are written after the
-    // eager constants.
+    // eager constants. A model's replayed calls are its class-ivar
+    // initializers (`collect_class_attr_initializers`).
     let reads_macro_defined = |value: &Expr| {
         !value.span.is_synthetic()
             && calls_unowned_class_method(value, &own)
-            && lc.unknown_calls.iter().any(|c| {
+            && lc.unknown_calls.iter().chain(&lc.class_ivar_initializers).any(|c| {
                 !c.span.is_synthetic() && c.span.file == value.span.file && c.span.end <= value.span.start
             })
     };

@@ -430,6 +430,26 @@ module ActiveRecord
         @klass ||= Object.const_get(@target)
       end
 
+      # reflection.rb's `active_record_primary_key`: the owner's key the
+      # association is joined from: the `:primary_key` option, else the
+      # owner's query constraints, else its primary key (a composite
+      # primary key shaped `[<tenant>, "id"]` infers "id").
+      def active_record_primary_key
+        @active_record_primary_key ||= begin
+          custom = options[:primary_key]
+          if custom
+            custom.is_a?(Array) ? custom.map { |key| -key.to_s }.freeze : -custom.to_s
+          elsif active_record.has_query_constraints? || options[:query_constraints]
+            active_record.query_constraints_list
+          elsif active_record.composite_primary_key?
+            key = _roundhouse_primary_key_of(active_record)
+            key.include?("id") ? "id" : key.freeze
+          else
+            _roundhouse_primary_key_of(active_record).freeze
+          end
+        end
+      end
+
       def autosave=(autosave)
         options[:autosave] = autosave
       end
@@ -468,6 +488,13 @@ module ActiveRecord
       private
         def _roundhouse_options_known?
           !@options.nil? && @unsupported.empty?
+        end
+
+        # reflection.rb's `primary_key(klass)`.
+        def _roundhouse_primary_key_of(klass)
+          key = klass.primary_key
+          raise UnknownPrimaryKey.new(klass) if key.nil?
+          key
         end
 
         def derive_class_name
@@ -586,6 +613,7 @@ module ActiveRecord
       def active_record = @delegate_reflection.active_record
       def class_name = @delegate_reflection.class_name
       def klass = @delegate_reflection.klass
+      def active_record_primary_key = @delegate_reflection.active_record_primary_key
       def collection? = @delegate_reflection.collection?
       def has_one? = @delegate_reflection.has_one?
       def belongs_to? = false
@@ -719,6 +747,17 @@ module ActiveRecord
     end
 
     class << self
+      # model_schema.rb's `quoted_table_name` and `quoted_primary_key`:
+      # the table and the primary key column as the connection quotes
+      # identifiers (a table name may be schema-qualified).
+      def quoted_table_name
+        connection.quote_table_name(table_name)
+      end
+
+      def quoted_primary_key
+        connection.quote_column_name(primary_key)
+      end
+
       # core.rb: `class_attribute :belongs_to_required_by_default,
       # instance_accessor: false`, true under `load_defaults` >= 5.0
       # (Core's 8.1). Reading walks to the nearest class that assigned
