@@ -274,6 +274,42 @@ module Rails
       Configuration.settings[:consider_all_requests_local] = value
     end
 
+    # Application::Configuration#session_store (railties 8.2.0.alpha
+    # application/configuration.rb:604-622, Shopify/rails 5eb8c4c45bee):
+    # with a name, records the store and its options; without, answers the
+    # store class (`:disabled` is nil, a Symbol resolves under
+    # ActionDispatch::Session as ActionDispatch::Session.resolve_store
+    # does, anything else as given). `session_store?` is the recorded name.
+    def session_store(new_session_store = nil, **options)
+      if new_session_store
+        Configuration.settings[:session_store] = new_session_store
+        Configuration.settings[:session_options] = options || {}
+      else
+        case (store = Configuration.settings[:session_store])
+        when :disabled
+          nil
+        when Symbol
+          resolve_session_store(store)
+        else
+          store
+        end
+      end
+    end
+
+    def session_store? # :nodoc:
+      Configuration.settings[:session_store]
+    end
+
+    # `config.session_options`, Application::Configuration's
+    # `attr_accessor :session_options` (configuration.rb:21).
+    def session_options
+      Configuration.settings[:session_options]
+    end
+
+    def session_options=(value)
+      Configuration.settings[:session_options] = value
+    end
+
     # The Application::Configuration accessors this class answers
     # itself (above), one store for the process like the native
     # singleton's instance variables.
@@ -453,6 +489,21 @@ module Rails
 
     def railtie_option?(name)
       defined?(::Rails::Railtie::Configuration) && ::Rails::Railtie::Configuration.new.respond_to?(name)
+    end
+
+    # ActionDispatch::Session.resolve_store (actionpack 8.2.0.alpha
+    # action_dispatch.rb:118), whose message it keeps.
+    def resolve_session_store(session_store)
+      ::ActionDispatch::Session.const_get(::ActiveSupport::Inflector.camelize(session_store.to_s))
+    rescue NameError
+      raise <<~ERROR
+        Unable to resolve session store #{session_store.inspect}.
+
+        #{session_store.inspect} resolves to ActionDispatch::Session::#{::ActiveSupport::Inflector.camelize(session_store.to_s)},
+        but that class is undefined.
+
+        Is #{session_store.inspect} spelled correctly, and are any necessary gems installed?
+      ERROR
     end
   end
 end
