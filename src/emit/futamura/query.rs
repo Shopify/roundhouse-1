@@ -104,10 +104,12 @@ pub struct Specializer<'a> {
     int_consts: HashMap<String, Option<i64>>,
     /// Models that may carry a `default_scope`.
     default_scoped: Vec<String>,
+    /// The dumps of the databases other than the primary.
+    schemas: super::schemas::DatabaseSchemas,
 }
 
 impl<'a> Specializer<'a> {
-    pub fn new(app: &'a App) -> Self {
+    pub fn new(app: &'a App, schemas: super::schemas::DatabaseSchemas) -> Self {
         let models = app.models.iter().map(|m| (m.name.0.as_str(), m)).collect();
         let mut int_consts: HashMap<String, Option<i64>> = HashMap::new();
         for (name, value) in app.library_classes.iter().flat_map(|lc| lc.constants.iter()) {
@@ -134,7 +136,7 @@ impl<'a> Specializer<'a> {
             })
             .map(|m| m.name.0.as_str().to_string())
             .collect();
-        Specializer { app, models, int_consts, default_scoped }
+        Specializer { app, models, int_consts, default_scoped, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -330,8 +332,10 @@ impl<'a> Specializer<'a> {
                     let ExprNode::Lit { value: Literal::Sym { value: column } } = &*k.node else {
                         return Err("where key is not a symbol".into());
                     };
-                    if !self.has_column(&chain.model, column) {
-                        return Err(format!("where on `{}`, not a column", column.as_str()));
+                    match self.has_column(&chain.model, column) {
+                        Ok(true) => {}
+                        Ok(false) => return Err(format!("where on `{}`, not a column", column.as_str())),
+                        Err(why) => return Err(format!("where on `{}`: {why}", column.as_str())),
                     }
                     if matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::Range { .. }) {
                         return Err("where value is a collection".into());
@@ -578,13 +582,11 @@ impl<'a> Specializer<'a> {
         }
     }
 
-    fn has_column(&self, model: &ClassId, column: &Symbol) -> bool {
+    /// Whether the model's table has `column`, looked up in the database the
+    /// model runs on (`schemas`).
+    fn has_column(&self, model: &ClassId, column: &Symbol) -> super::schemas::Lookup {
         let m = self.models[model.0.as_str()];
-        self.app
-            .schema
-            .tables
-            .get(&m.table.0)
-            .is_some_and(|t| t.columns.iter().any(|c| &c.name == column))
+        self.schemas.has_column(self.app, model, &m.table.0, column)
     }
 }
 

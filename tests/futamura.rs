@@ -325,3 +325,116 @@ fn unmodeled_structure_sql_statement_is_residue_not_a_refusal() {
     assert_eq!(fs::read(out.join("db/structure.sql")).unwrap(), structure);
     assert!(out.join("app/models/widget.rb").exists());
 }
+
+/// Rails' multiple-database model: each configuration has its own dump
+/// (`schema_dump:` or the `<name>_structure.sql` / `<name>_schema.rb`
+/// default), and a model is looked up in the database its abstract base
+/// class's `connects_to` names, not in the primary's.
+mod multiple_databases {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const PRIMARY: &str = "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\", null: false\n    t.integer \"owner_id\"\n  end\nend\n";
+    // `<name>_structure.sql`: the default name of a non-primary SQL dump.
+    const ANALYTICS: &str = "CREATE TABLE public.events (\n    id bigint NOT NULL,\n    kind character varying NOT NULL,\n    room_id bigint\n);\n";
+    // Named by the configuration's `schema_dump:` key, merged from an anchor.
+    const REPORTS: &str = "ActiveRecord::Schema.define do\n  create_table \"summaries\", force: :cascade do |t|\n    t.string \"period\", null: false\n  end\nend\n";
+    const DATABASE_YML: &str = "\
+reporting_defaults: &reporting_defaults
+  schema_dump: \"reports_schema.rb\"
+test:
+  primary:
+    adapter: postgresql
+  analytics:
+    adapter: postgresql
+  reporting:
+    adapter: postgresql
+    <<: *reporting_defaults
+";
+
+    fn files(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", PRIMARY),
+            ("db/analytics_structure.sql", ANALYTICS),
+            ("db/reports_schema.rb", REPORTS),
+            ("config/database.yml", DATABASE_YML),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/analytics_record.rb", "class AnalyticsRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :analytics, reading: :analytics }\nend\n"),
+            ("app/models/reporting_record.rb", "class ReportingRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :reporting }\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            ("app/models/event.rb", "class Event < AnalyticsRecord\nend\n"),
+            ("app/models/summary.rb", "class Summary < ReportingRecord\nend\n"),
+        ];
+        files.extend_from_slice(extra);
+        files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect()
+    }
+
+    fn specialized(files: &mut Vec<(String, String)>) -> roundhouse::emit::futamura::Report {
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        specialize(&app, files).unwrap()
+    }
+
+    #[test]
+    fn chains_on_every_database_specialize_against_that_databases_schema() {
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.all_of(room, period)\n    [Room.where(name: room).to_a, Event.where(kind: room).to_a, Summary.where(period: period).to_a]\n  end\nend\n",
+        )]);
+        let report = specialized(&mut files);
+        assert_eq!(report.specialized.len(), 3, "{:?}", report.residue);
+        let init = &files.iter().find(|(p, _)| p == INITIALIZER).expect("initializer").1;
+        for chain in ["Room.all.where(name: p.bind)", "Event.all.where(kind: p.bind)", "Summary.all.where(period: p.bind)"] {
+            assert!(init.contains(chain), "{chain}: {init}");
+        }
+    }
+
+    #[test]
+    fn a_column_of_another_database_is_not_a_column_of_the_models_own() {
+        // `events` has no `name` (the primary's `rooms` does) and `rooms` has
+        // no `kind`: each model is checked against its own database only.
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.mixed(x)\n    [Event.where(name: x).to_a, Room.where(kind: x).to_a]\n  end\nend\n",
+        )]);
+        let report = specialized(&mut files);
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(report.residue.iter().any(|r| r.contains("`name`, not a column")), "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("`kind`, not a column")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_database_without_a_dump_in_the_tree_leaves_its_models_to_rails_by_name() {
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.of(x)\n    Event.where(kind: x).to_a\n  end\nend\n",
+        )]);
+        files.retain(|(p, _)| p != "db/analytics_structure.sql");
+        let report = specialized(&mut files);
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(
+            report.residue.iter().any(|r| r.contains("database `analytics` has no schema dump") || r.contains("analytics_structure.sql")),
+            "{:?}",
+            report.residue
+        );
+    }
+
+    #[test]
+    fn a_table_the_primary_lacks_is_checked_against_the_dumps_that_hold_it() {
+        // No `connects_to`: the app routes this model at run time.
+        let mut files = files(&[
+            ("app/models/rollup.rb", "class Rollup < ApplicationRecord\n  self.table_name = \"summaries\"\n  def self.of(x)\n    where(period: x).to_a\n  end\nend\n"),
+            (
+                "app/models/report_card.rb",
+                "class ReportCard < ApplicationRecord\n  def self.of(x)\n    Rollup.where(period: x).to_a\n  end\nend\n",
+            ),
+        ]);
+        let report = specialized(&mut files);
+        assert!(report.specialized.iter().any(|s| s.contains("report_card.rb")), "{:?}", report.residue);
+    }
+}
