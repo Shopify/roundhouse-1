@@ -1928,7 +1928,7 @@ module ActiveRecord
     def valid?(context = nil)
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
-      @errors = []
+      @errors = _fresh_errors
       begin
         ActiveRecord::RuntimeValidations.run(self)
       ensure
@@ -2309,6 +2309,25 @@ module ActiveRecord
         @errors = errors
       end
       ActiveRecord::RuntimeValidations.accumulator(errors, self)
+    end
+
+    # Base#_fresh_errors, extended when the class's `errors` is not the
+    # one above: Rails' `errors` is `@errors ||= Errors.new(self)`, so a
+    # replacement written that way hands the Array back unwrapped, and
+    # `errors.full_messages` has to find the methods on it.
+    def _fresh_errors
+      list = [] #: untyped
+      return list unless self.class._errors_reader_replaced?
+      ActiveRecord::RuntimeValidations.accumulator(list, self)
+    end
+
+    def self._errors_reader_replaced?
+      replaced = @_errors_reader_replaced
+      if replaced.nil?
+        replaced = instance_method(:errors).owner != ActiveRecord::Base
+        @_errors_reader_replaced = replaced
+      end
+      replaced
     end
   end
 
@@ -2842,6 +2861,28 @@ module ActiveRecord
       def add(attribute, type = :invalid, **options)
         ActiveRecord::RuntimeValidations.add_error(self, attribute, type, options)
       end
+
+      # ActiveModel::Errors#full_messages: the accumulator already holds
+      # full messages, so this is a copy (Rails builds a new Array too).
+      # The compiler folds the `errors.full_messages` it can see; this
+      # answers the ones it cannot (an `errors` held in a local, passed as
+      # an argument, or read through a safe-navigation).
+      def full_messages
+        Array.new(self)
+      end
+
+      # The readers Array has no spelling for, over what each push
+      # recorded (runtime/spinel/active_model_errors.rb). `delete`,
+      # `include?` and `each` stay Array's own, as the compiled rules use
+      # them on the accumulator.
+      %i[to_hash messages details attribute_names objects].each do |reader|
+        define_method(reader) { |*args| ::ActiveModel::ErrorAttributes.public_send(reader, self, *args) }
+      end
+
+      %i[where key? of_kind? added? messages_for full_messages_for full_message merge! import].each do |reader|
+        define_method(reader) { |*args, **options, &block| ::ActiveModel::ErrorAttributes.public_send(reader, self, *args, **options, &block) }
+      end
+      alias_method :has_key?, :key?
     end
 
     # A validate callback (ActiveSupport::Callbacks::Callback) with its

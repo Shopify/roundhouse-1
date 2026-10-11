@@ -1290,8 +1290,9 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, value: &Expr, text
     // tree's parse memo is `@__t_<attr>`), so a check against it fired
     // unconditionally — lobsters' `validates :created_at, presence:
     // true` on Username rejected every record. Blank on the stored
-    // form is nil-or-empty text.
-    if matches!(attr_ty, Some(Ty::Time)) {
+    // form is nil-or-empty text. A nullable column types `Time | nil`,
+    // which stores the same way.
+    if matches!(peel_nilable(attr_ty).0, Some(Ty::Time)) {
         let raw_ivar = ivar(&Symbol::from(format!("{}_raw", attr.as_str())));
         let cond = bool_op(
             BoolOpKind::Or,
@@ -2703,6 +2704,22 @@ mod tests {
             !dbg.contains("\"Array\""),
             "Str-typed attr should drop is_a?(Array); tree: {dbg}",
         );
+    }
+
+    #[test]
+    fn presence_of_a_temporal_attr_reads_the_stored_text() {
+        // A temporal column keeps ISO-8601 text in `@<attr>_raw`; `@<attr>`
+        // is never assigned, so reading it made the check fire for every
+        // record. The nullable `Time | nil` column stores the same way.
+        let a = attr();
+        let nullable = Ty::Union { variants: vec![Ty::Time, Ty::Nil] };
+        for ty in [Ty::Time, nullable] {
+            let expr = inline_presence_check(&a, Some(&ty), &ivar(&a), &plain(&a));
+            let dbg = format!("{:?}", expr);
+            assert!(dbg.contains("title_raw"), "{ty:?} should read @title_raw; tree: {dbg}");
+            assert!(!dbg.contains("\"Array\""), "{ty:?} has no Array arm; tree: {dbg}");
+            assert_eq!(collect_error_messages(&expr), vec!["Title can't be blank"]);
+        }
     }
 
     #[test]

@@ -65,7 +65,7 @@ module ActiveRecord
     def valid?(context = nil)
       chain = self.class._validation_around_callbacks
       return super if chain.empty?
-      @errors = []
+      @errors = _fresh_errors
       ran = false
       result = false
       inner = lambda do

@@ -609,7 +609,7 @@ module ActiveRecord
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
       # Validations#valid? clears the errors before the chain runs.
-      @errors = []
+      @errors = _fresh_errors
       begin
         ok = _callback_chain_run(:validation) { valid?(context) }
       ensure

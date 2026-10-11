@@ -244,6 +244,8 @@ module ActiveRecord
     def self._reflect_on_association: (untyped association) -> untyped
     def marked_for_destruction?: () -> bool
     def errors: () -> Array[String]
+    def _fresh_errors: () -> Array[String]
+    def self._errors_reader_replaced?: () -> bool
   end
 
   # The validate chain for run-time registrations (connection.rb).
