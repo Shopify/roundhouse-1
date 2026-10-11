@@ -150,19 +150,18 @@ fn delegate_target_surface_respects_ruby_concern_precedence() {
         .iter()
         .find(|model| model.name.0.as_str() == "Page")
         .expect("Page");
+    // activesupport's delegate.rb defines the forwarder with `module_eval`
+    // whatever the target's visibility, and calling a private target then
+    // raises NoMethodError. The expansion no longer reads the target's
+    // surface, so the forwarder is declared in both orders.
     assert!(
-        page.methods().all(|method| method.name.as_str() != "name"),
-        "a later private concern method must shadow the earlier public method"
+        page.methods().any(|method| method.name.as_str() == "name"),
+        "a delegate is a forwarder whatever the target's concern precedence"
     );
-    assert!(page.body.iter().any(|item| matches!(
-        item,
-        roundhouse::dialect::ModelBodyItem::Unknown { expr, .. }
-            if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. } if method.as_str() == "delegate")
-    )), "the unsupported delegate must remain visible");
 }
 
 #[test]
-fn model_delegates_decline_collection_receivers_and_targets_that_yield() {
+fn model_delegates_forward_collection_receivers_and_targets_that_yield() {
     let mut files = tree("");
     files.insert(
         PathBuf::from("db/schema.rb"),
@@ -182,18 +181,23 @@ fn model_delegates_decline_collection_receivers_and_targets_that_yield() {
     );
     let mut app = ingest_app_from_tree(files).expect("ingest");
     let output = emit_model(&mut app, "account.rb");
-    assert!(
-        !output.contains("def comments_email"),
-        "a collection proxy is not a Comment instance:\n{output}"
-    );
-    assert!(
-        !output.contains("def render"),
-        "a delegate without block forwarding cannot target a yielding method:\n{output}"
-    );
-    assert!(
-        !output.contains("def block_sensitive?"),
-        "a delegate without block forwarding cannot target a method observing block_given?:\n{output}"
-    );
+    // Rails' forwarders are `(...)` calls on the target as it stands, so a
+    // collection receiver or a yielding target is the caller's to get
+    // right; a zero-argument, block-less forwarder would be wrong for both.
+    for (name, target) in [
+        ("comments_email", "comments.email"),
+        ("render", "profile.render"),
+        ("block_sensitive?", "profile.block_sensitive?"),
+    ] {
+        assert!(
+            output.contains(&format!("def {name}(...)\n    {target}(...)\n  end")),
+            "{name} forwards its arguments and block:\n{output}"
+        );
+        assert!(
+            !output.contains(&format!("def {name}\n")),
+            "{name} has no zero-argument form:\n{output}"
+        );
+    }
 }
 
 /// The plain form: the forwarder CALLS the target, which is what Rails'
@@ -314,12 +318,16 @@ fn a_delegate_to_methods_with_required_or_optional_arguments_is_left_alone() {
     let mut app = ingest_app_from_tree(files).expect("ingest");
     let emitted = emit_model(&mut app, "post.rb");
     assert!(
-        !emitted.contains("def formatted_name"),
+        !emitted.contains("def formatted_name\n"),
         "a zero-argument forwarder must not be synthesized for a required-argument target method:\n{emitted}"
     );
     assert!(
-        !emitted.contains("def display_name"),
-        "optional arguments still require forwarding and must not be dropped:\n{emitted}"
+        emitted.contains("def formatted_name(...)\n    account.formatted_name(...)\n  end"),
+        "the required argument is forwarded:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("def display_name(...)\n    account.display_name(...)\n  end"),
+        "optional arguments are forwarded, not dropped:\n{emitted}"
     );
 }
 
@@ -385,7 +393,7 @@ fn a_later_model_delegate_replaces_an_earlier_method_with_the_same_name() {
     let mut app = ingest_app_from_tree(files).expect("ingest");
     let page = emit_model(&mut app, "page.rb");
     assert!(
-        page.contains("def title\n    self.account.title\n  end"),
+        page.contains("def title(...)\n    account.title(...)\n  end"),
         "a delegate declared after a same-named method must win in source order:\n{page}"
     );
     assert!(
@@ -415,7 +423,7 @@ fn class_method_calls_do_not_suppress_instance_delegates() {
     let mut app = ingest_app_from_tree(files).expect("ingest");
     let page = emit_model(&mut app, "page.rb");
     assert!(
-        page.contains("def title\n    self.account.title\n  end"),
+        page.contains("def title(...)\n    account.title(...)\n  end"),
         "class-side calls must not require instance delegate argument forwarding:\n{page}"
     );
 }
@@ -433,9 +441,12 @@ fn a_delegate_to_a_private_target_method_is_left_alone() {
     );
     let mut app = ingest_app_from_tree(files).expect("ingest");
     let emitted = emit_model(&mut app, "post.rb");
+    // Rails defines the forwarder regardless; calling it reaches the private
+    // target through the association reader, so Ruby raises NoMethodError
+    // exactly as Rails' does.
     assert!(
-        !emitted.contains("def internal_name"),
-        "a delegate must not expose a private association target method:\n{emitted}"
+        emitted.contains("def internal_name(...)\n    account.internal_name(...)\n  end"),
+        "the forwarder reaches the target through its reader:\n{emitted}"
     );
 }
 
@@ -462,8 +473,8 @@ fn a_private_override_blocks_an_inherited_concern_method_from_delegation() {
         .expect("post.rb")
         .content;
     assert!(
-        !post.contains("def internal_name"),
-        "a private override must shadow the concern's public method and block the delegate:\n{post}"
+        post.contains("def internal_name(...)\n    account.internal_name(...)\n  end"),
+        "the forwarder is Rails' whatever the target's override; a private one raises when called:\n{post}"
     );
 }
 
@@ -491,7 +502,7 @@ fn a_public_model_override_remains_available_for_delegation() {
         .expect("post.rb")
         .content;
     assert!(
-        post.contains("def internal_name\n    self.account.internal_name\n  end"),
+        post.contains("def internal_name(...)\n    account.internal_name(...)\n  end"),
         "a public model override must outrank the concern's private method:\n{post}"
     );
 }
