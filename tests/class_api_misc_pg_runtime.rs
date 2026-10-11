@@ -50,6 +50,8 @@ end
 const SHOP: &str = r#"class Shop < ApplicationRecord
   has_many :groups
   has_one :first_group, class_name: "Group"
+  has_many :tags, as: :taggable, class_name: "Member"
+  has_one :badge, as: :holder, foreign_type: :holder_kind, class_name: "Member"
   has_many :members, through: :groups
 end
 "#;
@@ -75,6 +77,7 @@ const PROBE: &str = r##"class ClassApiProbe
     out << "quoted: #{Group.quoted_table_name} #{Group.quoted_primary_key}"
     out << "scope: #{Group.where("#{Group.quoted_table_name}.#{Group.quoted_primary_key} = ?", a.id).count}"
     out << "keys: #{Shop.reflect_on_association(:groups).active_record_primary_key.inspect} #{Shop.reflect_on_association(:first_group).active_record_primary_key.inspect} #{Group.reflect_on_association(:shop).active_record_primary_key.inspect} #{Shop.reflect_on_association(:members).active_record_primary_key.inspect}"
+    out << "type: #{Shop.reflect_on_association(:groups).type.inspect} #{Shop.reflect_on_association(:tags).type.inspect} #{Shop.reflect_on_association(:badge).type.inspect} #{Group.reflect_on_association(:shop).type.inspect}"
     out << "custom: #{Group.reflect_on_association(:members_by_number).active_record_primary_key.inspect}"
     out << "empty where: #{Group.where(id: []).count} #{Group.where(id: []).to_a.size}"
     out << "empty where.not: #{Group.where.not(id: []).count} #{Group.where(shop_id: shop.id).where.not(id: []).count}"
@@ -90,10 +93,11 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 12] = [
     r#"quoted: "groups" "id""#,
     "scope: 1",
     r#"keys: "id" "id" "id" "id""#,
+    r#"type: nil "taggable_type" "holder_kind" nil"#,
     r#"custom: "number""#,
     "empty where: 0 0",
     "empty where.not: 2 2",

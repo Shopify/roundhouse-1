@@ -450,6 +450,13 @@ module ActiveRecord
         end
       end
 
+      # reflection.rb's `type`: the polymorphic type column of an `as:`
+      # association (`foreign_type` option, else `"<as>_type"`), nil
+      # otherwise.
+      def type
+        @type ||= (-(options[:foreign_type]&.to_s || "#{options[:as]}_type") if options[:as])
+      end
+
       def autosave=(autosave)
         options[:autosave] = autosave
       end
@@ -614,6 +621,7 @@ module ActiveRecord
       def class_name = @delegate_reflection.class_name
       def klass = @delegate_reflection.klass
       def active_record_primary_key = @delegate_reflection.active_record_primary_key
+      def type = @delegate_reflection.type
       def collection? = @delegate_reflection.collection?
       def has_one? = @delegate_reflection.has_one?
       def belongs_to? = false
