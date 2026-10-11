@@ -1180,7 +1180,18 @@ fn every_runtime_method_body_concretely_typed() {
     // dynamic there: the validations DSL's option hashes, `validators_of`
     // / `add_error` payloads, the join-SQL reflection reads. A stem that
     // does not parse now fails this test instead of vanishing from it.
-    const CEILING: usize = 1565;
+    //
+    // 1565 -> 1595, MEASURED 1587 on 2026-10-11 at the test-debt2 fix: the
+    // fully-typed gate had 60 sub-expressions the body typer left as an
+    // unresolved inference variable (block parameters of RBS-declared
+    // methods, receiver-less sends into a delegated type, `Time.zone`, an
+    // empty-literal accumulator). A variable is not a Ty::Untyped site, so
+    // this gate never counted them; each is now a declared boundary
+    // (`#: untyped` on a value Rails itself leaves dynamic, or a concrete
+    // local type where one exists), which it counts: +62 over the 1525
+    // measured by the previous fix, all in active_record/connection.rb and
+    // relation.rb.
+    const CEILING: usize = 1595;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -197,6 +197,20 @@ module ActiveRecord
     end
   end
 
+  # attribute_registration.rb's `decorate_attributes` block, bound to the
+  # attribute it decorates: the `(name, cast_type)` block as the
+  # `call(cast_type)` a declared-type decoration answers.
+  class NamedAttributeDecoration
+    def initialize(name, decorator)
+      @name = name
+      @decorator = decorator
+    end
+
+    def call(cast_type)
+      @decorator.call(@name, cast_type)
+    end
+  end
+
   # Row set from `Connection#execute` / `#exec_query`: Rails 8.2's
   # `ActiveRecord::Result` (activerecord/lib/active_record/result.rb),
   # built the way Rails builds it, `new(columns, rows, column_types =
@@ -238,7 +252,7 @@ module ActiveRecord
       if block_given?
         hash_rows.each(&block)
       else
-        hash_rows.to_enum { @rows.size }
+        hash_rows.each
       end
     end
 
@@ -1291,14 +1305,15 @@ module ActiveRecord
       if names.nil?
         raise NotImplementedError, "#{self.name}.decorate_attributes without names: decorating every attribute is not ported"
       end
-      list = []
-      Array(names).each { |n| list << n.to_s }
+      list = [] #: Array[String]
+      given = Array(names) #: Array[untyped]
+      given.each { |n| list << n.to_s }
       list.each do |name|
         unless _retypable_attribute_names.include?(name)
           raise NotImplementedError, "#{self.name}.decorate_attributes([#{name.inspect}]): the compiled accessors for `#{name}` do not consult a declared type"
         end
       end
-      list.each { |name| _decorate_attribute(name, ->(cast_type) { decorator.call(name, cast_type) }) }
+      list.each { |name| _decorate_attribute(name, NamedAttributeDecoration.new(name, decorator)) }
       nil
     end
 
@@ -1418,7 +1433,11 @@ module ActiveRecord
         end
         types = inherited.merge(own)
         decorations = @__attribute_decorations || [] #: Array[[String, untyped]]
-        decorations.each { |n, decoration| types[n] = decoration.call(types[n] || _cast_type_for_spec(n, schema_column_types[n])) }
+        decorations.each do |entry|
+          n = entry[0]
+          decoration = entry[1] #: untyped
+          types[n] = decoration.call(types[n] || _cast_type_for_spec(n, schema_column_types[n]))
+        end
         types
       end
     end
@@ -1480,7 +1499,10 @@ module ActiveRecord
     # (Type::Time::Value) binds as quoting.rb's `quoted_time`, its clock
     # text, on any column.
     def self._bind_type_cast(name, value)
-      return _quoted_time(value.__getobj__) if defined?(ActiveRecord::Type::Time::Value) && ActiveRecord::Type::Time::Value === value
+      if defined?(ActiveRecord::Type::Time::Value)
+        time_value = ActiveRecord::Type::Time::Value #: untyped
+        return _quoted_time(value.__getobj__) if time_value === value
+      end
       text = case value
              when true then _bind_bool_text(true)
              when false then _bind_bool_text(false)
@@ -1542,7 +1564,8 @@ module ActiveRecord
         # enum.rb's `_enum`: the label => stored value HashWithIndifferentAccess,
         # frozen, over the column's type.
         mapping = ActiveSupport::HashWithIndifferentAccess.new
-        spec[1].each { |label, stored| mapping[label] = stored }
+        labels = spec[1] #: Hash[untyped, untyped]
+        labels.each { |label, stored| mapping[label] = stored }
         ActiveRecord::Enum::EnumType.new(name, mapping.freeze, _cast_type_for_spec(name, spec[2]))
       else
         raise NotImplementedError, "#{self.name}.type_for_attribute(#{name.inspect}): #{spec[1]} is not ported"
@@ -1567,7 +1590,7 @@ module ActiveRecord
     def update_columns(attributes)
       raise ActiveRecordError, "cannot update a new record" if new_record?
       raise ActiveRecordError, "cannot update a destroyed record" if destroyed?
-      writes = {}
+      writes = {} #: Hash[String, untyped]
       touch = nil
       attributes.each do |name, value|
         key = name.to_s
@@ -2218,7 +2241,8 @@ module ActiveRecord
     # EnumType#serialize answers, so it is taken as is.
     def attributes_for_database
       specs = self.class.schema_column_types
-      attributes.each_with_object({}) do |(name, value), result|
+      result = {} #: Hash[String, untyped]
+      attributes.each do |name, value|
         spec = specs[name]
         result[name] = if spec && spec[0] == :unported && spec[1] == "ActiveRecord::Enum::EnumType"
           value
@@ -2226,13 +2250,17 @@ module ActiveRecord
           self.class.type_for_attribute(name).serialize(value)
         end
       end
+      result
     end
 
     # core.rb's `slice(*methods)`: each named method's value, by name, in
     # a HashWithIndifferentAccess. Core's Markets::Region keys records
     # by `record.slice(keys)`.
     def slice(*methods)
-      methods.flatten.index_with { |method| public_send(method) }.with_indifferent_access
+      named = methods.flatten #: Array[untyped]
+      values = {} #: Hash[untyped, untyped]
+      named.each { |method| values[method] = public_send(method) }
+      values.with_indifferent_access
     end
 
     # core.rb's `values_at(*methods)`: the named methods' values.
@@ -2471,7 +2499,9 @@ module ActiveRecord
     def self._errors_reader_replaced?
       replaced = @_errors_reader_replaced
       if replaced.nil?
-        replaced = instance_method(:errors).owner != ActiveRecord::Base
+        klass = self #: untyped
+        reader = klass.instance_method(:errors)
+        replaced = reader.owner != ActiveRecord::Base
         @_errors_reader_replaced = replaced
       end
       replaced
@@ -3158,7 +3188,8 @@ module ActiveRecord
     module TimeZoneConversion
       class TimeZoneConverter < SimpleDelegator # :nodoc:
         def self.new(subtype)
-          self === subtype ? subtype : super
+          converter = self #: untyped
+          converter === subtype ? subtype : super
         end
 
         def subtype
@@ -3187,7 +3218,7 @@ module ActiveRecord
           elsif value.respond_to?(:infinite?) && value.infinite?
             value
           else
-            map(super) { |v| cast(v) }
+            map(super, &method(:cast))
           end
         end
 
@@ -3208,12 +3239,14 @@ module ActiveRecord
             elsif value.respond_to?(:infinite?) && value.infinite?
               value
             else
-              map(value) { |v| convert_time_to_time_zone(v) }
+              map(value, &method(:convert_time_to_time_zone))
             end
           end
 
           def set_time_zone_without_conversion(value)
-            ::Time.zone.local_to_utc(value)&.in_time_zone if value
+            return unless value
+            zone = ::Time.zone #: untyped
+            zone.local_to_utc(value)&.in_time_zone
           end
       end
     end

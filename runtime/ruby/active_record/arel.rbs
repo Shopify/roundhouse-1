@@ -55,6 +55,10 @@ module Arel
     end
 
     class Grouping < Unary
+      # Unary's reader, redeclared where the body typer sees no superclass.
+      %a{abstract}
+      def expr: () -> untyped
+
       def to_sql: () -> String
     end
 

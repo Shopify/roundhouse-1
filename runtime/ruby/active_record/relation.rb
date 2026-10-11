@@ -143,6 +143,7 @@ module ActiveRecord
       end
       previous = @model.current_scope(true)
       @model.current_scope = self
+      previous_global = nil #: untyped
       if all_queries
         previous_global = @model.global_current_scope(true)
         @model.global_current_scope = self
@@ -1023,13 +1024,9 @@ module ActiveRecord
       if table == own
         raise NotImplementedError, "roundhouse: #{name} on #{owner}: a self join needs a table alias, which is not resolved at runtime"
       end
-      if reflection.belongs_to?
-        theirs = join_key_list(reflection.association_primary_key)
-        ours = join_key_list(reflection.foreign_key)
-      else
-        theirs = join_key_list(reflection.foreign_key)
-        ours = join_key_list(reflection.active_record_primary_key)
-      end
+      belongs = reflection.belongs_to?
+      theirs = join_key_list(belongs ? reflection.association_primary_key : reflection.foreign_key)
+      ours = join_key_list(belongs ? reflection.foreign_key : reflection.active_record_primary_key)
       conditions = []
       index = 0
       while index < theirs.length
@@ -2221,7 +2218,9 @@ module ActiveRecord
       # A column with a declared type reads through it, as Rails' does; an
       # alias names its column.
       names = cols.map { |col| @model._attribute_name(col.to_s) }
-      @select_sql = names.each_with_index.map { |name, i| "#{@table}.#{name} AS v#{i}" }.join(", ")
+      projections = []
+      names.each_with_index { |name, i| projections << "#{@table}.#{name} AS v#{i}" }
+      @select_sql = projections.join(", ")
       rows = ActiveRecord.adapter.select_rows(to_sql)
       @select_sql = prior
       if names.length == 1
@@ -2229,7 +2228,9 @@ module ActiveRecord
         return rows.map { |row| @model._attribute_deserialize(name, row["v0"]) }
       end
       rows.map do |row|
-        names.each_with_index.map { |name, i| @model._attribute_deserialize(name, row["v#{i}"]) }
+        values = []
+        names.each_with_index { |name, i| values << @model._attribute_deserialize(name, row["v#{i}"]) }
+        values
       end
     end
 

@@ -80,6 +80,8 @@ module ActiveRecord
     def where_scope: (Hash[Symbol, untyped] condition) -> Relation
     def scope_attributes: () -> Hash[Symbol, untyped]
     def inherit_scope: (Relation scope) -> Relation
+    %a{abstract}
+    def singleton_class: () -> Class
     def model: () -> Base
     def default_scoped?: () -> bool
     def not: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation

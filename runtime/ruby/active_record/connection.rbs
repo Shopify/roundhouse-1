@@ -31,6 +31,14 @@ module ActiveRecord
       class TimeZoneConverter
         def self.new: (untyped subtype) -> untyped
         def subtype: () -> untyped
+        # The delegated Type::Value's own methods (SimpleDelegator's
+        # `__getobj__` and the wrapped type's `type` / `map`).
+        %a{abstract}
+        def __getobj__: () -> untyped
+        %a{abstract}
+        def type: () -> untyped
+        %a{abstract}
+        def map: (untyped value) { (untyped) -> untyped } -> untyped
         def deserialize: (untyped value) -> untyped
         def cast: (untyped value) -> untyped
         def ==: (untyped other) -> bool
@@ -38,6 +46,13 @@ module ActiveRecord
         def set_time_zone_without_conversion: (untyped value) -> untyped
       end
     end
+  end
+
+  class NamedAttributeDecoration
+    @name: String
+    @decorator: untyped
+    def initialize: (String name, untyped decorator) -> void
+    def call: (untyped cast_type) -> untyped
   end
 
   class IntegerKeyCast
@@ -181,7 +196,7 @@ module ActiveRecord
     def self._attribute_deserialize: (String name, untyped value) -> untyped
     def self._bind_type_cast: (String name, untyped value) -> untyped
     def self._bind_bool_text: (bool flag) -> String
-    def self._quoted_time: (Time time) -> String
+    def self._quoted_time: (::Time time) -> String
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
     def self._primary_key_from_database: (untyped value) -> untyped
@@ -229,6 +244,8 @@ module ActiveRecord
     def attributes_before_type_cast: () -> Hash[String, untyped]
     %a{abstract}
     def attributes: () -> Hash[String, untyped]
+    %a{abstract}
+    def readonly!: () -> untyped
     # default_scope (`lower::default_scope` emits the declaring model's).
     self.@_unscoped_depth: Integer?
     def self._default_scoped?: () -> bool
