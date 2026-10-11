@@ -628,3 +628,69 @@ mod association_keys {
         assert!(report.residue.iter().any(|r| r.contains("polymorphic belongs_to `subject`")), "{:?}", report.residue);
     }
 }
+
+/// Links and values a chain may carry beyond `where`/`order`/`limit`.
+mod more_links_and_values {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"clients\", force: :cascade do |t|\n    t.string \"key\"\n    t.integer \"kind\"\n  end\n  create_table \"tenants\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
+
+    fn run(finder: &str) -> (roundhouse::emit::futamura::Report, Vec<(String, String)>) {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/client.rb", "class Client < ApplicationRecord\n  KIND = 3\n  default_scope { where(kind: Current.kind) }\nend\n"),
+            ("app/models/tenant.rb", "class Tenant < ApplicationRecord\n  NAME = \"main\"\nend\n"),
+            ("app/services/finder.rb", finder),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        (report, tree_files)
+    }
+
+    fn init(files: &[(String, String)]) -> &str {
+        &files.iter().find(|(p, _)| p == INITIALIZER).expect("initializer").1
+    }
+
+    /// Scoping::Default::ClassMethods#unscoped is `relation` without the
+    /// default scopes, so the statement is rooted there and the model's
+    /// default scope no longer stands in the way.
+    #[test]
+    fn unscoped_directly_on_a_model_drops_the_default_scope_guard() {
+        let (report, files) = run("class Finder\n  def self.by_key(key)\n    Client.unscoped.where(key: key).first\n  end\n  def self.scoped(key)\n    Client.where(key: key).first\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(init(&files).contains("Client, one: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
+        assert!(report.residue.iter().any(|r| r.contains("Client may have a default_scope")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn unscoped_after_other_links_is_left_to_rails() {
+        let (report, _) = run("class Finder\n  def self.by_key(key)\n    Tenant.where(name: key).unscoped.first\n  end\nend\n");
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(report.residue.iter().any(|r| r.contains("unscoped other than directly on a model")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_constant_value_is_evaluated_at_the_call_site_but_a_call_on_one_is_not() {
+        let (report, files) = run("class Finder\n  def self.named\n    Tenant.find_by(name: Tenant::NAME)\n  end\n  def self.again(x)\n    Tenant.find_by(name: Tenant.fetch(x))\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.contains("Futamura.records(") && finder.contains("[Tenant::NAME]"), "{finder}");
+        assert!(report.residue.iter().any(|r| r.contains("value is Send")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn joins_select_and_lock_with_literal_arguments_are_links() {
+        let (report, files) = run("class Finder\n  def self.locked(n)\n    Tenant.joins(:clients).select(:id, :name).where(name: n).lock.to_a\n  end\n  def self.dynamic(n)\n    Tenant.select(n).to_a\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(init(&files).contains("Tenant.all.joins(:clients).select(:id, :name).where(name: p.bind).lock("), "{}", init(&files));
+        assert!(report.residue.iter().any(|r| r.contains("select with a non-literal argument")), "{:?}", report.residue);
+    }
+}

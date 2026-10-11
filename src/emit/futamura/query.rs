@@ -82,6 +82,8 @@ struct Chain {
     limit_binds: Vec<String>,
     ordered: bool,
     limited: bool,
+    /// Rooted at `Model.unscoped`, which drops the model's default scopes.
+    unscoped: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -182,7 +184,7 @@ impl<'a> Specializer<'a> {
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
-        if let Some(why) = self.default_scoped.get(chain.model.0.as_str()) {
+        if let Some(why) = self.default_scoped.get(chain.model.0.as_str()).filter(|_| !chain.unscoped) {
             return Err(format!("{} may have a default_scope ({why})", chain.model.0.as_str()));
         }
         let option = match terminal {
@@ -197,8 +199,9 @@ impl<'a> Specializer<'a> {
         // `Model.all` roots the block in a Relation: a link such as
         // `ordered_relation` is a Relation method, not a class method.
         let define = format!(
-            "Futamura.define(:{key}, {model}{option}) {{ |p| {model}.all{links} }}",
+            "Futamura.define(:{key}, {model}{option}) {{ |p| {model}.{root}{links} }}",
             model = chain.model.0.as_str(),
+            root = if chain.unscoped { "unscoped" } else { "all" },
             links = chain.links.concat(),
         );
         let owner = match &chain.owner {
@@ -384,6 +387,32 @@ impl<'a> Specializer<'a> {
                 chain.limited = true;
             }
             "all" if args.is_empty() => {}
+            // `Model.unscoped` (Scoping::Default::ClassMethods#unscoped, no
+            // block) is `relation` without the default scopes. On a relation it
+            // replaces the whole chain, so it is only the root here, and only
+            // where the model does not redefine it.
+            "unscoped" if args.is_empty() => {
+                let own = model.body.iter().any(|item| matches!(item, ModelBodyItem::Method { method: m, .. } if m.name == *method));
+                if !chain.links.is_empty() || chain.owner.is_some() || chain.unscoped || cx.self_chain.is_some() || own {
+                    return Err("unscoped other than directly on a model".into());
+                }
+                chain.unscoped = true;
+            }
+            // Links whose arguments are literals: Rails evaluates them when it
+            // builds the statement, as for `order`.
+            "joins" | "left_joins" | "left_outer_joins" | "select" | "group" | "reorder" | "lock" | "distinct"
+                if !args.is_empty() || matches!(method.as_str(), "lock" | "distinct") =>
+            {
+                let mut literal = Vec::new();
+                for a in args {
+                    literal.push(static_literal(a).ok_or_else(|| format!("{} with a non-literal argument", method.as_str()))?);
+                }
+                if method.as_str() == "select" && args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { .. })) {
+                    return Err("select with a hash".into());
+                }
+                chain.links.push(format!(".{}({})", method.as_str(), literal.join(", ")));
+                chain.ordered |= method.as_str() == "reorder";
+            }
             // Rails' FinderMethods, reproduced link for link. An unordered
             // chain takes Rails' implicit order (implicit_order_column, then
             // the primary key) from its own private `ordered_relation`, which
@@ -638,6 +667,7 @@ impl Chain {
             limit_binds: Vec::new(),
             ordered: false,
             limited: false,
+            unscoped: false,
         }
     }
 }
@@ -736,10 +766,15 @@ fn static_literal(e: &Expr) -> Option<String> {
 fn is_call_site_value(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef => true,
+        // A constant names the same object at the call site as in the
+        // fallback block (same lexical scope). Only as a value or argument:
+        // a call on a constant (`Enum.serialize(x)`) runs arbitrary class
+        // code, which would run twice.
+        ExprNode::Const { .. } => true,
         ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
         ExprNode::Send { recv: None, args, block: None, .. } => args.is_empty(),
         ExprNode::Send { recv: Some(r), args, block: None, .. } => {
-            is_call_site_value(r) && args.iter().all(is_call_site_value)
+            !matches!(&*r.node, ExprNode::Const { .. }) && is_call_site_value(r) && args.iter().all(is_call_site_value)
         }
         ExprNode::BoolOp { left, right, .. } => is_call_site_value(left) && is_call_site_value(right),
         _ => false,
