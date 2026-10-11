@@ -544,6 +544,16 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// `through: :assoc` — the row lives on what the sibling association
+        /// reaches (Rails `HasOneThroughAssociation`), found by joining the
+        /// through model; `foreign_key` then names the through model's key
+        /// back to the owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        through: Option<Symbol>,
+        /// `source:` — the association on the through model that supplies
+        /// the row (default: this association's own name).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
         /// See `HasMany::foreign_key_explicit`.
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,

@@ -4916,6 +4916,58 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
             m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, &assoc_scope);
         }
+        // `has_one :x, through: :y`: the same join answering the one row
+        // (activerecord has_one_through_association.rb), under the
+        // reader's own loaded guard and memoized like a plain has_one.
+        for assoc in model.associations() {
+            let Association::HasOne {
+                name, target, through: Some(thr_name), scope: assoc_scope, scope_owner, ..
+            } = assoc
+            else {
+                continue;
+            };
+            let mut hop_scopes = Vec::new();
+            let Some((joins, edge_table, edge_fk)) =
+                resolve_through_chain(&app.models, model, thr_name, target, 0, &mut hop_scopes)
+            else {
+                continue;
+            };
+            let Some(m) =
+                lc.methods.iter_mut().find(|m| {
+                    m.name == *name && m.receiver == crate::dialect::MethodReceiver::Instance
+                })
+            else {
+                continue;
+            };
+            let assoc_scope = assoc_scope
+                .as_ref()
+                .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
+            let relation = through_relation_chain(
+                target,
+                &joins.join(" "),
+                &format!("{edge_table}.{edge_fk} = ?"),
+                &hop_scopes,
+                &assoc_scope,
+            );
+            let first = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(relation),
+                    method: Symbol::from("first"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            // Keep the loaded guard `synth_has_one_reader` opened with.
+            match &mut *m.body.node {
+                ExprNode::Seq { exprs } if exprs.len() > 1 => {
+                    exprs.pop();
+                    exprs.push(first);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -5088,6 +5140,41 @@ fn through_reader_body(
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
+    let chain = through_relation_chain(target, join_sql, where_sql, hop_scopes, assoc_scope);
+    // Last in the chain, after any scope graft: the scope's conditions
+    // belong to the QUERY, and this hands the finished relation the
+    // records an eager load already fetched.
+    Expr::new(
+        span(),
+        ExprNode::Send {
+            recv: Some(chain),
+            method: Symbol::from("preloaded"),
+            args: vec![
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
+                ),
+                Expr::new(
+                    span(),
+                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
+                ),
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// The joined, scoped Relation a through reader reads (see
+/// `through_reader_body`).
+fn through_relation_chain(
+    target: &ClassId,
+    join_sql: &str,
+    where_sql: &str,
+    hop_scopes: &[Expr],
+    assoc_scope: &Option<Expr>,
+) -> Expr {
+    let span = Span::synthetic;
     let target_const = Expr::new(
         span(),
         ExprNode::Const {
@@ -5148,33 +5235,10 @@ fn through_reader_body(
     // reader filters the way Rails does (without it /upvoted served
     // every joined row).
     let chain = hop_scopes.iter().fold(chain, |chain, scope| graft_chain_root(scope, chain));
-    let chain = match assoc_scope {
+    match assoc_scope {
         Some(scope_body) => graft_chain_root(scope_body, chain),
         None => chain,
-    };
-
-    // Last in the chain, after any scope graft: the scope's conditions
-    // belong to the QUERY, and this hands the finished relation the
-    // records an eager load already fetched.
-    Expr::new(
-        span(),
-        ExprNode::Send {
-            recv: Some(chain),
-            method: Symbol::from("preloaded"),
-            args: vec![
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
-                ),
-                Expr::new(
-                    span(),
-                    ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
-                ),
-            ],
-            block: None,
-            parenthesized: true,
-        },
-    )
+    }
 }
 
 /// A through hop's scope that runs the same on the target's relation:
@@ -8812,6 +8876,16 @@ pub(crate) fn apply_constant_rooting(
         )
         .collect();
     let known = |n: &str| class_names.contains(n);
+    // A namespace-only module (`module Outer::Web::Plan` holding nested
+    // classes) has no entry of its own but still binds its name for
+    // lexical lookup, so every proper prefix of a known name counts.
+    let namespaces: crate::det::HashSet<String> = class_names
+        .iter()
+        .flat_map(|n| {
+            let segs: Vec<&str> = n.split("::").collect();
+            (1..segs.len()).map(move |i| segs[..i].join("::")).collect::<Vec<_>>()
+        })
+        .collect();
     for lc in lcs.iter_mut() {
         let name = if matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
             lc.name.0.as_str().rsplit_once("::").unwrap().0
@@ -8844,7 +8918,7 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
-        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes };
+        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes, namespaces: &namespaces };
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, &shadowing, &scope, &known);
         }
@@ -8866,6 +8940,8 @@ pub(crate) fn apply_constant_rooting(
 struct LexicalScope<'a> {
     own: String,
     prefixes: &'a [String],
+    /// Names that exist only as the namespace of a known class.
+    namespaces: &'a crate::det::HashSet<String>,
 }
 
 impl LexicalScope<'_> {
@@ -8927,9 +9003,17 @@ fn root_shadowed_constants(
     // … or an ENCLOSING namespace defines it and the full path under
     // that namespace does not exist, which is the nesting the emit
     // introduced. See the prefix note at the call site.
-    let by_enclosing = prefixes.iter().any(|p| {
-        known(&format!("{p}::{}", head.as_str())) && !known(&format!("{p}::{joined}"))
-    });
+    // Only the INNERMOST namespace defining the head binds it (Ruby's
+    // Module.nesting lookup); a farther one's same-named constant, with
+    // no such path under it, is never reached.
+    let by_enclosing = prefixes
+        .iter()
+        .rev()
+        .find(|p| {
+            let head_path = format!("{p}::{}", head.as_str());
+            known(&head_path) || scope.namespaces.contains(&head_path)
+        })
+        .is_some_and(|p| !known(&format!("{p}::{joined}")));
     if !by_own_segment && !by_enclosing {
         return;
     }
@@ -18546,7 +18630,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
             // batch can preserve those predicates.
             Association::HasOne {
                 name, target, foreign_key,
-                scope: None, as_interface: None, ..
+                through: None, scope: None, as_interface: None, ..
             } => {
                 if !model_exists(target) {
                     continue;

@@ -563,6 +563,15 @@ fn plan(
     else {
         return None;
     };
+    // A class body's own `COLLECTION.each { |name| define_method … }`: the
+    // loop is the statement the evaluator walks.
+    if matches!(method.as_str(), "each" | "each_pair")
+        && args.is_empty()
+        && recv.is_some()
+        && block.as_ref().is_some_and(|b| defines(b))
+    {
+        return Some((plan_eval(app, sources, constants, owner, call, true), Reach::Own));
+    }
     if recv
         .as_ref()
         .is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
@@ -574,7 +583,7 @@ fn plan(
         if !args.is_empty() || !defines(block) {
             return None;
         }
-        return Some((plan_eval(app, sources, constants, owner, call), Reach::Own));
+        return Some((plan_eval(app, sources, constants, owner, call, false), Reach::Own));
     }
     if block.is_some() {
         return None;
@@ -1106,6 +1115,7 @@ fn plan_eval(
     constants: &HashSet<String>,
     owner: Owner,
     call: &Expr,
+    is_loop: bool,
 ) -> Result<Expansion, String> {
     let method = match &*call.node {
         ExprNode::Send { method, .. } => method.clone(),
@@ -1123,7 +1133,7 @@ fn plan_eval(
         .block()
         .and_then(|b| b.as_block_node())
         .ok_or(format!("`{method}` takes no literal block"))?;
-    if block.parameters().is_some() {
+    if !is_loop && block.parameters().is_some() {
         return Err(format!("the `{method}` block takes parameters"));
     }
     let mut scope = Scope {
@@ -1144,10 +1154,14 @@ fn plan_eval(
             shadowed: Vec::new(),
         },
     };
-    let statements: Vec<ruby_prism::Node<'_>> = block
-        .body()
-        .map(super::util::flatten_statements)
-        .unwrap_or_default();
+    let statements: Vec<ruby_prism::Node<'_>> = if is_loop {
+        vec![node.as_node()]
+    } else {
+        block
+            .body()
+            .map(super::util::flatten_statements)
+            .unwrap_or_default()
+    };
     let mut env = Env::default();
     match scope.statements(&statements, &mut env, false)? {
         Flow::Normal => {}
@@ -1880,6 +1894,27 @@ impl<'a> Scope<'a> {
         if let Some(call) = node.as_call_node() {
             return self.call_value(&call, env);
         }
+        // `cond ? a : b`, or an `if` expression, whose condition and
+        // chosen single-expression branch are known statically.
+        if let Some(branch) = node.as_if_node() {
+            let taken = self.literal(&branch.predicate(), env)?.truthy()?;
+            let chosen: Vec<ruby_prism::Node<'_>> = if taken {
+                branch.statements().map(|s| s.body().iter().collect()).unwrap_or_default()
+            } else {
+                match branch.subsequent().and_then(|other| other.as_else_node()) {
+                    Some(other) => other
+                        .statements()
+                        .map(|s| s.body().iter().collect())
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
+            return match chosen.as_slice() {
+                [] => Ok(Val::Nil),
+                [one] => self.literal(one, env),
+                _ => Err(format!("`{}` has a multi-statement branch", text(self.source, node))),
+            };
+        }
         Err(format!(
             "`{}` is not known statically",
             text(self.source, node)
@@ -1945,6 +1980,11 @@ impl<'a> Scope<'a> {
                 other => Val::Array(vec![other]),
             });
         }
+        if args.is_empty()
+            && let Some(value) = self.class_method_literal(&recv, name)
+        {
+            return value;
+        }
         let value = self.literal(&recv, env)?;
         match (name, args.as_slice()) {
             ("freeze", []) => Ok(value),
@@ -1980,6 +2020,50 @@ impl<'a> Scope<'a> {
             }
             _ => Err(format!("`{name}` is not known statically")),
         }
+    }
+
+    /// `Const.name` where `Const` is an app class whose class method
+    /// `name` takes no arguments and answers one literal collection
+    /// (`def self.names; ["a", "b"]; end`): that collection, as the call
+    /// answers it every time. None when the receiver is no such class.
+    fn class_method_literal(
+        &self,
+        recv: &ruby_prism::Node<'_>,
+        name: &str,
+    ) -> Option<Result<Val, String>> {
+        let written = if let Some(read) = recv.as_constant_read_node() {
+            constant_id_str(&read.name()).to_string()
+        } else if recv.as_constant_path_node().is_some() {
+            text(self.source, recv)
+        } else {
+            return None;
+        };
+        let written = written.trim_start_matches("::");
+        let candidates: Vec<String> = (0..=self.nesting.len())
+            .rev()
+            .map(|n| match n {
+                0 => written.to_string(),
+                n => format!("{}::{written}", self.nesting[n - 1]),
+            })
+            .collect();
+        let class = candidates.iter().find_map(|candidate| {
+            self.app
+                .library_classes
+                .iter()
+                .find(|c| c.origin.is_none() && !c.is_module && c.name.0.as_str() == candidate)
+        })?;
+        let defs: Vec<&MethodDef> = class
+            .methods
+            .iter()
+            .filter(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
+            .collect();
+        let [def] = defs.as_slice() else { return None };
+        if !def.params.is_empty() {
+            return None;
+        }
+        Some(literal_value(&def.body).ok_or_else(|| {
+            format!("`{written}.{name}` does not answer a literal collection")
+        }))
     }
 
     /// `Array` (or `::Array`) where no app constant of that name is in
@@ -2112,6 +2196,31 @@ impl<'a> Scope<'a> {
 /// keyword and named keyword-rest parameters are allowed too: they are
 /// in the ingested block's `signature`, which `Scope::define`
 /// reads. A rest, post, block or nameless `**` parameter is refused.
+/// A literal an IR body evaluates to: scalars, and arrays and hashes
+/// of them, as the method answers it on every call.
+fn literal_value(expr: &Expr) -> Option<Val> {
+    let expr = match &*expr.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => expr,
+    };
+    match &*expr.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(Val::Str(value.clone())),
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(Val::Sym(value.clone())),
+        ExprNode::Lit { value: Literal::Int { value } } => Some(Val::Int(*value)),
+        ExprNode::Lit { value: Literal::Nil } => Some(Val::Nil),
+        ExprNode::Lit { value: Literal::Bool { value } } => Some(Val::Bool(*value)),
+        ExprNode::Array { elements, .. } => {
+            elements.iter().map(literal_value).collect::<Option<_>>().map(Val::Array)
+        }
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .map(|(k, v)| Some((literal_value(k)?, literal_value(v)?)))
+            .collect::<Option<_>>()
+            .map(Val::Hash),
+        _ => None,
+    }
+}
+
 fn define_method_block_params(block: &ruby_prism::BlockNode<'_>) -> Result<Vec<Symbol>, String> {
     let Some(list) = block
         .parameters()
@@ -2262,6 +2371,22 @@ fn substitute(
     own: &HashSet<Symbol>,
     depth: usize,
 ) -> Result<(), String> {
+    // `captured == other`: a String literal compares the same as the
+    // captured String (String#==), and an operand's identity is not
+    // observable there, so it is carried as a literal.
+    if let ExprNode::Send { method, recv, args, .. } = &mut *expr.node
+        && matches!(method.as_str(), "==" | "!=")
+    {
+        for operand in recv.iter_mut().chain(args.iter_mut()) {
+            if let ExprNode::Var { name, .. } = &*operand.node
+                && !own.contains(name)
+                && let Some(Val::Str(text)) = env.get(name.as_str())
+            {
+                let literal = ExprNode::Lit { value: Literal::Str { value: text.clone() } };
+                *operand = Expr::new(operand.span, literal);
+            }
+        }
+    }
     match &*expr.node {
         ExprNode::Var { name, .. } if !own.contains(name) => {
             let value = env

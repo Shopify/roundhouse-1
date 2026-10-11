@@ -3156,7 +3156,11 @@ pub(super) fn parse_association(
             name: name.clone(),
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
+                .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
+                .or_else(|| source.clone().map(|s| ClassId(Symbol::from(singularize_camelize(s.as_str())))))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
+            through: through.map(|s| Symbol::from(s.as_str())),
+            source: source.map(|s| Symbol::from(s.as_str())),
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| match &as_interface {

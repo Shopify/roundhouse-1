@@ -621,10 +621,11 @@ module ActiveRecord
     end
 
     # Persistence#save!: RecordInvalid for an invalid record,
-    # RecordNotSaved when the save chain did not write.
+    # RecordNotSaved when the save chain did not write. It
+    # answers `true`, as `create_or_update || raise` does.
     def save!(context: nil, validate: true)
       @_create_or_update_failed = false
-      return self if save(context: context, validate: validate)
+      return true if save(context: context, validate: validate)
       raise RecordNotSaved.new("Failed to save the record", self) if @_create_or_update_failed
       raise RecordInvalid, self
     end

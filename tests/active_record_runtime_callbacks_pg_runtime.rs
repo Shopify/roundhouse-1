@@ -300,6 +300,8 @@ const PROBE: &str = r##"class CallbackDslProbe
     other = Other.create!(name: "o")
     out << "other: #{other.note} #{other.trail.join(" | ")}"
     out << "other find: #{Other.find(other.id).trail.join(" | ")}"
+    # Persistence#save! answers `true` (create_or_update || raise), not the record.
+    out << "save!: #{Other.new(name: "o2").save!.inspect}"
     event = CallbackDslEvent.new(kind: "toolong")
     # `errors.to_a` (Errors#full_messages' alias): lower::errors_full_messages
     # folds a literal `errors.full_messages` for a record it does not see
@@ -320,7 +322,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 24] = [
+const EXPECTED: [&str; 25] = [
     r#"create: x guard before_validation | item before_validation | guard after_validation | guard prepend before_save | guard before_save | guard around_save in | guard mark | extra mark | item before_create note=x | guard after_create | guard around_save out | guard after_save new=false | extra after_save | item after_save | guard after_commit | guard commit on create"#,
     r#"seen after create: false"#,
     r#"first: true guard seen true a"#,
@@ -341,6 +343,7 @@ const EXPECTED: [&str; 24] = [
     r#"halt destroy!: ActiveRecord::RecordNotDestroyed Failed to destroy Item with id=4 true"#,
     r#"other: x guard before_validation | guard after_validation | guard prepend before_save | guard before_save | guard around_save in | guard mark | guard after_create | guard around_save out | guard after_save new=false | guard after_commit | guard commit on create"#,
     r#"other find: guard seen true o"#,
+    r#"save!: true"#,
     r#"event: false ["Kind is too long (maximum is 5 characters)"]"#,
     r#"event validators: ["ActiveModel::Validations::PresenceValidator", "ActiveRecord::Validations::LengthValidator"]"#,
     r#"event ok: true"#,

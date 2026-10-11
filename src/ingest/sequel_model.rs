@@ -263,6 +263,8 @@ fn parse_sequel_association(
         }
         "one_to_one" => Association::HasOne {
             name: name.clone(),
+            through: None,
+            source: None,
             foreign_key_explicit: key.is_some(),
             inverse_of: None,
             target: class_name
