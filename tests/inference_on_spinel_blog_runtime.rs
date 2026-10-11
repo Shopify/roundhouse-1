@@ -428,7 +428,9 @@ fn untyped_subexpressions_baseline() {
     // All nine are the nested branch's new `Db.exec` SAVEPOINT / RELEASE /
     // ROLLBACK TO calls (and the `if`/`unless` arms holding them) plus the
     // `depth` read in the savepoint name, unmodeled here like the others.
-    const CEILING: usize = 552;
+    // #818 AssociationReflection + `reflect_on_association`: +5 over the
+    // r13-merge ceiling (552 -> 557), as origin/main measured it.
+    const CEILING: usize = 557;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

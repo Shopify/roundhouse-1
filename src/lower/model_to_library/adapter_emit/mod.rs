@@ -37,7 +37,7 @@
 
 use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
-use crate::expr::{Expr, ExprNode, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef, VarId};
 use crate::lower::arel::{
     ArelOp, ArelVisitor, Assignment, ColRef, ColumnSpec, Delete, Direction, Insert, LimitSpec,
@@ -916,13 +916,17 @@ fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema, diale
 /// a "hydrate target = bare ivar / passed-in symbol" option is the
 /// right cleanup once a second use surfaces.
 fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> MethodDef {
-    let owner = &model.name;
     use crate::expr::{ExprNode, LValue, Literal};
     use crate::span::Span;
 
+    let owner = &model.name;
     let stmt = Symbol::from("stmt");
     let db = ClassId(Symbol::from("Db"));
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
+
+    // Rails' `reload` clears the association cache — owned by
+    // associations (same kinds as `assoc_cache_ivar_bindings`).
+    let clear_assoc = super::associations::clear_loaded_flag_assigns(model);
 
     // SQL: "SELECT <cols> FROM <table> WHERE id = " + Db.escape_int(@id) + " LIMIT 1"
     let cols_csv: String = table
@@ -1006,9 +1010,10 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
         },
     );
 
-    // stmt = prepare ; [bind_int(stmt, 1, @id)] ; if step? {…} ; finalize ; self
+    // clear assoc loaded ; stmt = prepare ; [bind_int(stmt, 1, @id)] ; if step? {…} ; finalize ; self
     let assemble = |sql: Expr, binds: Vec<Expr>| {
-        let mut body_exprs = vec![arel_assign(&stmt, arel_db_call(&db, "prepare", vec![sql]))];
+        let mut body_exprs = clear_assoc.clone();
+        body_exprs.push(arel_assign(&stmt, arel_db_call(&db, "prepare", vec![sql])));
         body_exprs.extend(binds);
         body_exprs.push(if_expr.clone());
         body_exprs.push(arel_db_call(&db, "finalize", vec![var_ref(&stmt)]));

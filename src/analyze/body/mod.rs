@@ -61,7 +61,7 @@ use const_resolution::ResolvedConstant;
 mod narrowing;
 mod send;
 pub(crate) use send::PARAM_VALUE;
-pub(crate) use send::string_answers;
+pub(crate) use send::{indexed_pluck, string_answers};
 
 /// Typed constants for generated expressions without Ruby source spans.
 /// The class's constants shadow the shared app registry. Source-backed
@@ -150,6 +150,8 @@ pub struct Ctx {
     /// it `String` instead of the generic `Untyped`. Off elsewhere, where a
     /// block's return type isn't tracked through the method signature.
     pub in_view: bool,
+    /// The template being typed (`articles/_form`), for a lazy `t(".key")`.
+    pub view_name: Option<Symbol>,
     /// Set while typing the body of a class-side method (`def self.x`,
     /// `class << self; def x`). `self` there is the class object, so an
     /// implicit-self `new` answers "an instance of whichever class
@@ -614,6 +616,8 @@ pub struct BodyTyper<'a> {
     load_hook_bases: Option<&'a std::collections::BTreeMap<String, ClassId>>,
     /// What the natively loaded gems' installed sources declare.
     gem_sources: Option<std::sync::Arc<crate::gem_boundary::GemSourceConstants>>,
+    /// The app's translations; Rails' English when absent.
+    i18n: Option<&'a crate::i18n::Catalog>,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -959,6 +963,7 @@ impl<'a> BodyTyper<'a> {
             inquirers: None,
             load_hook_bases: None,
             gem_sources: None,
+            i18n: None,
         }
     }
 
@@ -979,6 +984,12 @@ impl<'a> BodyTyper<'a> {
     /// Note every registry read in `deps`.
     pub(crate) fn with_deps(mut self, deps: &'a DepRecorder) -> Self {
         self.deps = Some(deps);
+        self
+    }
+
+    /// The app's locale catalog, for `human_attribute_name` and the like.
+    pub(crate) fn with_i18n(mut self, catalog: &'a crate::i18n::Catalog) -> Self {
+        self.i18n = Some(catalog);
         self
     }
 
@@ -1561,7 +1572,12 @@ impl<'a> BodyTyper<'a> {
                 // Never search by suffix or borrow another scope's
                 // same-named declaration: only the exact written class.
                 let exact_modeled_class = |path: &[Symbol]| {
-                    let id = written_class_id(path);
+                    let id = match path {
+                        [name] | [_, name] if name.as_str() == "HashWithIndifferentAccess" && (path.len() == 1 || path[0].as_str().is_empty()) => {
+                            crate::ident::ClassId(Symbol::from(crate::analyze::indifferent::CLASS))
+                        }
+                        _ => written_class_id(path),
+                    };
                     if let Some((name, owner)) = path.split_last() {
                         if !owner.is_empty() {
                             // Only external declarations carry `constants`:
@@ -1785,6 +1801,12 @@ impl<'a> BodyTyper<'a> {
                         }
                         _ => exact_modeled_class(path),
                     },
+                    // Rubydex records no constant references inside a singleton
+                    // class opened on an expression (`class << Rails.application`);
+                    // ingest marks them (`UNINDEXED_SCOPE_CONST_REF`).
+                    None if indexed_source && expr.decisions & crate::expr::UNINDEXED_SCOPE_CONST_REF != 0 => {
+                        exact_modeled_class(path)
+                    }
                     None if indexed_source && !unindexed_singleton => unknown(),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
@@ -1944,6 +1966,14 @@ impl<'a> BodyTyper<'a> {
                 } else {
                     ty
                 };
+                // Not a class the emitted program has: the indifferent hash is a plain Hash there, so only its `new` is supported.
+                if matches!(&ty, Ty::Class { id, args } if args.is_empty() && id.0.as_str() == crate::analyze::indifferent::CLASS) {
+                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None,
+                        construct: Symbol::from("constant"),
+                        detail: written_class_id(path).0.as_str().to_string(),
+                    });
+                }
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     // A stored class-body local is reported by the name the
                     // source wrote, not the hidden constant's.
@@ -2627,6 +2657,15 @@ impl<'a> BodyTyper<'a> {
                     Some(r) => Some(self.analyze_expr(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
+                if method.as_str() == "new"
+                    && block.is_none()
+                    && crate::analyze::indifferent::constructor_args(args)
+                    && let Some(r) = recv.as_mut()
+                    && matches!(&*r.node, ExprNode::Const { .. })
+                    && matches!(&r.ty, Some(Ty::Class { id, args }) if args.is_empty() && id.0.as_str() == crate::analyze::indifferent::CLASS)
+                {
+                    r.diagnostic = None;
+                }
                 // Not a value: Rails' `call` answers the loaders, which `preload_associations` does not.
                 if crate::lower::preloader::LOWERS_TO_MODEL_LOADER
                     && method.as_str() == "call" && args.is_empty() && block.is_none()
@@ -3003,6 +3042,12 @@ impl<'a> BodyTyper<'a> {
                     }
                     return self.dispatch(Some(&objects), method, block_ret.as_ref(), args);
                 }
+                if expr.decisions & crate::expr::REVERSE_MERGE != 0
+                    && let (Some(defaults), [hash]) = (recv_ty.as_ref(), args.as_slice())
+                    && let Some(ty) = hash.ty.as_ref().and_then(|h| crate::analyze::indifferent::reverse_merged(defaults, h))
+                {
+                    return ty;
+                }
                 let instance_receiver = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx))
                     && recv_ty.as_ref().is_some_and(instance_shaped);
                 let dispatched =
@@ -3102,6 +3147,56 @@ impl<'a> BodyTyper<'a> {
                     {
                         return block_ty;
                     }
+                }
+                let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
+                if let Some(resolved) = crate::lower::i18n_translate::resolves(
+                    catalog, recv.as_ref(), method.as_str(), args, block.as_ref(), ctx.in_view, ctx.view_name.as_ref().map(|v| v.as_str()),
+                ) {
+                    if let Err(reason) = resolved {
+                        if expr.diagnostic.is_none() {
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("I18n"),
+                                detail: format!("`{method}` cannot be resolved from the app's locale: {reason}"),
+                            });
+                        }
+                    }
+                    return Ty::Str;
+                }
+                if method.as_str() == "[]"
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && expr.diagnostic.is_none()
+                {
+                    let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
+                    if let Some(reason) = crate::i18n::errors_index_refusal(catalog.errors_format()) {
+                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                            target: None,
+                            construct: Symbol::from("ActiveModel::Errors"),
+                            detail: format!("`errors[:field]` cannot pick a field's messages: {reason}"),
+                        });
+                    }
+                }
+                if method.as_str() == "human_attribute_name"
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && crate::lower::human_attribute_name::literal_attribute(args).is_some()
+                    && match recv.as_ref() {
+                        Some(r) => crate::lower::human_attribute_name::receiver_model(r),
+                        None if ctx.class_side => match ctx.self_ty.as_ref() {
+                            Some(Ty::Class { id, .. }) => Some(id.clone()),
+                            _ => None,
+                        },
+                        None => None,
+                    }
+                    .is_some_and(|id| self.classes.get(&id).is_some_and(|c| c.table.is_some()))
+                {
+                    return Ty::Str;
+                }
+                if method.as_str() == "full_message"
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                    && crate::lower::errors_add::full_message_bakes(recv.as_ref(), args, block.as_ref())
+                {
+                    return Ty::Str;
                 }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
@@ -3331,6 +3426,15 @@ impl<'a> BodyTyper<'a> {
                         // Not refused again on a receiver the constant refusal already accounts for.
                         _ if matches!(recv_ty, None | Some(Ty::Var { .. } | Ty::Untyped))
                             && recv.as_ref().is_some_and(|r| rooted_in_refused_constant(r)) => None,
+                        // Grounded, so not a gap: `presence_in(<Array[String]>)` is
+                        // `ActiveSupport.presence_in` (lower::presence_in), and a
+                        // zero-arg `to_query` on a Hash, or on a receiver inference
+                        // could not type, is `ActiveSupport.to_query` (lower::symbolize_keys).
+                        // A list inference cannot prove is an Array[String], or a
+                        // `to_query(key)` (the Object/Array/nil form), still refuse.
+                        _ if method.as_str() == "presence_in" && args.len() == 1 && block.is_none() && is_string_array(args[0].ty.as_ref()) => None,
+                        _ if method.as_str() == "to_query" && args.is_empty() && block.is_none()
+                            && matches!(recv_ty, None | Some(Ty::Var { .. } | Ty::Untyped | Ty::Hash { .. })) => None,
                         _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
@@ -7786,4 +7890,9 @@ fn ivars_of_untyped_self(expr: &Expr, out: &mut Vec<crate::ident::Symbol>) {
         _ => {}
     }
     expr.node.for_each_child(&mut |child| ivars_of_untyped_self(child, out));
+}
+
+/// `Array[String]` — what `ActiveSupport.presence_in(value, list)` declares for its list.
+fn is_string_array(ty: Option<&Ty>) -> bool {
+    matches!(ty, Some(Ty::Array { elem }) if **elem == Ty::Str)
 }

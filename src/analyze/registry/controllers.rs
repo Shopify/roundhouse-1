@@ -303,7 +303,7 @@ pub(in crate::analyze) fn register(
         }
         for m in [
             "get?", "post?", "put?", "patch?", "delete?", "head?", "options?", "xhr?",
-            "xml_http_request?", "ssl?", "local?", "form_data?",
+            "xml_http_request?", "ssl?", "local?", "form_data?", "inertia?",
         ] {
             request.instance_methods.insert(Symbol::from(m), Ty::Bool);
         }
@@ -329,13 +329,30 @@ pub(in crate::analyze) fn register(
         request.instance_methods.insert(Symbol::from("request_method_symbol"), Ty::Sym);
         request.instance_methods.insert(Symbol::from("route_uri_pattern"), str_or_nil());
         request.instance_methods.insert(Symbol::from("content_length"), Ty::Int);
-        for m in ["headers", "env", "cookie_jar", "session", "params", "query_parameters",
-                  "request_parameters", "path_parameters", "format", "body", "variant",
+        for m in ["headers", "env", "cookie_jar", "session", "params",
+                  "path_parameters", "format", "body", "variant",
                   "flash", "subdomains", "accepts", "mime_type", "authorization",
                   // The app's key generator, and the controller CLASS the
                   // request routed to (`Request#controller_class`).
                   "key_generator", "controller_class"] {
             request.instance_methods.insert(Symbol::from(m), Ty::Untyped);
+        }
+        // The two readers the runtime backs with a parsed, bracket-nested
+        // `Hash[String, Roundhouse::ParamValue]` (`Request#query_parameters`
+        // / `#request_parameters`, runtime/ruby/action_dispatch/request.rbs):
+        // typed as that, not `Untyped`, so `deep_dup` / `except` / `delete`
+        // / `keys` / `to_query` resolve against a Hash.
+        for m in ["query_parameters", "request_parameters"] {
+            request.instance_methods.insert(
+                Symbol::from(m),
+                Ty::Hash {
+                    key: Box::new(Ty::Str),
+                    value: Box::new(Ty::Class {
+                        id: ClassId(Symbol::from("Roundhouse::ParamValue")),
+                        args: vec![],
+                    }),
+                },
+            );
         }
         // `ActionDispatch::TestRequest`, Rails' Request subclass a test
         // builds by hand (the CRuby overlay's runtime/
@@ -386,6 +403,7 @@ pub(in crate::analyze) fn register(
         }
         app_ctrl.class_methods.insert(Symbol::from("request"), request_ty);
     }
+    register_inertia(classes, &mut app_ctrl);
     // HTTP Basic and Token auth (runtime/spinel/http_authentication.rb):
     // each yields the credentials the client sent and answers what the
     // block decided; the `or_request` forms render the 401 challenge
@@ -604,4 +622,60 @@ pub(crate) fn param_value_ty(nilable: bool) -> Ty {
         variants.push(Ty::Nil);
     }
     Ty::Union { variants }
+}
+
+/// `prop` and `inertia_errors` are typed here and have no runtime method:
+/// the controller lowering replaces them with their `_json` variants. A
+/// runtime `prop(String, untyped)` was rejected because the strict targets
+/// cannot compile an untyped parameter.
+fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut ClassInfo) {
+    const RBS: &str = include_str!("../../../runtime/ruby/action_controller/inertia.rbs");
+    let parsed = crate::rbs::parse_app_signatures(RBS)
+        .expect("ActionController::InertiaPage RBS must parse");
+    let page_id = ClassId(Symbol::from("ActionController::InertiaPage"));
+    let page = classes.entry(page_id.clone()).or_default();
+    if let Some(methods) = parsed.get(&page_id) {
+        for (name, ty) in methods {
+            page.instance_methods.insert(name.clone(), ty.clone());
+        }
+    }
+    // Phantom until controller_to_library rewrites to `prop_json`.
+    page.instance_methods.insert(
+        Symbol::from("prop"),
+        Ty::Fn {
+            params: vec![
+                crate::ty::Param {
+                    name: Symbol::from("key"),
+                    ty: Ty::Str,
+                    kind: crate::ty::ParamKind::Required,
+                },
+                crate::ty::Param {
+                    name: Symbol::from("value"),
+                    ty: Ty::Untyped,
+                    kind: crate::ty::ParamKind::Required,
+                },
+            ],
+            block: None,
+            ret: Box::new(Ty::Nil),
+            effects: crate::effect::EffectSet::default(),
+        },
+    );
+    if let Some(methods) = parsed.get(&ClassId(Symbol::from("ActionController::Base"))) {
+        for (name, ty) in methods {
+            app_ctrl.class_methods.insert(name.clone(), ty.clone());
+        }
+    }
+    app_ctrl.class_methods.insert(
+        Symbol::from("inertia_errors"),
+        Ty::Fn {
+            params: vec![crate::ty::Param {
+                name: Symbol::from("errors"),
+                ty: Ty::Untyped,
+                kind: crate::ty::ParamKind::Required,
+            }],
+            block: None,
+            ret: Box::new(Ty::Nil),
+            effects: crate::effect::EffectSet::default(),
+        },
+    );
 }

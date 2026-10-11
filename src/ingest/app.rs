@@ -2622,6 +2622,7 @@ end
             app.initializer_files.push(path);
         }
     }
+    app.inertia = super::inertia::load_inertia_config(vfs, dir)?;
 
     // Every app source is registered by here. Rubydex resolves a
     // SNAPSHOT on another thread while the passes below run, and those
@@ -2709,6 +2710,34 @@ end
         }
     }
     app.stylesheets = stylesheets;
+
+    // `config/locales/**/*.yml`, Rails' default I18n load path for the app.
+    let locales_dir = dir.join("config/locales");
+    let mut files = Vec::new();
+    let mut stack = if vfs.is_dir(&locales_dir) { vec![locales_dir] } else { Vec::new() };
+    while let Some(current) = stack.pop() {
+        for entry in vfs.read_dir(&current)? {
+            if vfs.is_dir(&entry) {
+                stack.push(entry);
+            } else if entry.extension().and_then(|s| s.to_str()) == Some("yml") {
+                if let Some(source) = read_to_string_or_ledger(vfs, &entry)? {
+                    let rel = entry.strip_prefix(dir).unwrap_or(&entry).display().to_string();
+                    files.push((rel, source));
+                }
+            }
+        }
+    }
+    let gem_files = match &app.gem_lock {
+        Some(lock) => crate::i18n::gems::gem_locale_files(vfs, dir, lock, &path_gem_dirs(vfs, dir)),
+        None => Vec::new(),
+    };
+    let (catalog, problems) = crate::i18n::Catalog::load_with_gems(&default_locale(vfs, dir), &gem_files, &mut files);
+    for (file, problem) in problems {
+        survey::record(&IngestError::Unsupported { file, message: format!("locale file not loaded: {problem}") });
+    }
+    app.i18n = catalog;
+    app.i18n.missing = missing_policy(vfs, dir);
+    crate::i18n::stamp_models(&mut app);
 
     // `sig/**/*.rbs` — user-authored RBS sidecars for app code the
     // Rails conventions can't fully type on their own. Recursively
@@ -2974,6 +3003,7 @@ end
     super::rate_limit::lower_rate_limit(&mut app);
     super::invisible_captcha::lower_invisible_captcha(&mut app);
     super::impersonates::lower_impersonates(&mut app);
+    super::inertia::lower_inertia(&mut app);
     // The app's own `ActiveSupport.run_load_hooks` sites, and then every
     // initializer statement no reader consumed or refused, carried to
     // run at boot (`initializer_programs`). PostgreSQL trees only: their
@@ -6045,6 +6075,10 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
     // `ingest::allow_browser`'s module doc. A per-target decision, not
     // a coverage gap.
     "allow_browser",
+    // `ingest::inertia` records its own survey gap, with the reason, for
+    // an `inertia_share` it cannot lower; the generic gap would count it
+    // a second time without the reason.
+    "inertia_share",
     // Conditional GET: the runtime answers every request fresh, a
     // decision recorded in docs/pipeline/runtime.md ("Conditional GET
     // is ALWAYS FRESH"), so the importmap ETag macro has nothing to do.
@@ -11387,10 +11421,12 @@ fn default_package_scan<V: Vfs + ?Sized>(vfs: &V, dir: &Path, out: &mut Vec<Path
     scan(vfs, dir, 1, out);
 }
 
-/// Roots an app adds to `config.autoload_paths` / `config.eager_load_paths`
-/// in `config/application.rb`, as paths relative to the app root:
+/// Roots an app adds to `config.autoload_paths`, `config.eager_load_paths`
+/// or `config.autoload_once_paths` in `config/application.rb`, as paths
+/// relative to the app root:
 /// `config.eager_load_paths << Rails.root.join("extras")` → `extras`,
-/// `config.autoload_paths += %w[app/lib]` → `app/lib`.
+/// `config.autoload_paths += %w[app/lib]` → `app/lib`,
+/// `config.autoload_once_paths << "#{root}/lib/shared"` → `lib/shared`.
 ///
 /// Line-scanned rather than parsed, like the `autoload_lib` and
 /// `time_zone` readers next to it: the file is railtie soup ingest does
@@ -11404,7 +11440,7 @@ fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
         if t.starts_with('#') {
             continue;
         }
-        if !t.contains("config.autoload_paths") && !t.contains("config.eager_load_paths") {
+        if !AUTOLOAD_PATH_SETTINGS.iter().any(|setting| t.contains(setting)) {
             continue;
         }
         // `Rails.root.join("a", "b")` — the segments, joined.
@@ -11435,13 +11471,27 @@ fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
         }
         if let Some((_, rest)) = t.split_once('"') {
             if let Some((value, _)) = rest.split_once('"') {
-                if !value.is_empty() {
-                    roots.push(value.to_string());
+                if let Some(root) = app_relative_path(value) {
+                    roots.push(root.to_string());
                 }
             }
         }
     }
     roots
+}
+
+const AUTOLOAD_PATH_SETTINGS: &[&str] =
+    &["config.autoload_paths", "config.eager_load_paths", "config.autoload_once_paths"];
+
+fn app_relative_path(value: &str) -> Option<&str> {
+    let path = match value.strip_prefix("#{") {
+        Some(interpolated) => match interpolated.split_once('}')? {
+            ("root" | "Rails.root" | "config.root", path) => path.strip_prefix('/')?,
+            _ => return None,
+        },
+        None => value,
+    };
+    (!path.is_empty()).then_some(path)
 }
 
 /// `get "up" => "rails/health#show"` — every `rails new` app's health
@@ -12137,7 +12187,7 @@ fn layouts_link_all_stylesheets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, roots: &[P
 /// block, flattened into one list. One level of unwrapping is enough:
 /// nesting a second config block inside the first is not a shape
 /// Rails apps write, and guessing at it would be inventing a need.
-fn initializer_statements<'a>(program: &ruby_prism::ProgramNode<'a>) -> Vec<Node<'a>> {
+pub(super) fn initializer_statements<'a>(program: &ruby_prism::ProgramNode<'a>) -> Vec<Node<'a>> {
     let mut stmts: Vec<Node> = Vec::new();
     for stmt in program.statements().body().iter() {
         let mut unwrapped = false;
@@ -12235,7 +12285,7 @@ fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crate::app::Ini
 /// (`Foo`, `Turbo::StreamsChannel`), or None for anything else. Read as
 /// TEXT rather than resolved: the receiver may name a class this tree
 /// does not define, and reporting that gap needs the app's spelling.
-fn constant_text(node: &Node, src: &str) -> Option<String> {
+pub(super) fn constant_text(node: &Node, src: &str) -> Option<String> {
     if node.as_constant_read_node().is_none() && node.as_constant_path_node().is_none() {
         return None;
     }
@@ -14425,5 +14475,81 @@ fn inherit_enums(models: &mut [crate::dialect::Model]) {
             }
             current = grand.clone();
         }
+    }
+}
+
+/// `config.i18n.default_locale = :xx` in `config/application.rb`, else `en`.
+fn default_locale<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> String {
+    let path = dir.join("config/application.rb");
+    let source = vfs.read_to_string(&path).unwrap_or_default();
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix("config.i18n.default_locale").map(str::trim))
+        .and_then(|rest| rest.strip_prefix('='))
+        .and_then(|v| locale_literal(v.trim()))
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// `config.i18n.raise_on_missing_translations` from `config/application.rb`
+/// and each `config/environments/<env>.rb`.
+fn missing_policy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::i18n::MissingPolicy {
+    let setting = |path: &Path| -> Option<Result<bool, String>> {
+        let source = vfs.read_to_string(path).ok()?;
+        source.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(|l| {
+            let value = l.strip_prefix("config.i18n.raise_on_missing_translations")?.trim().strip_prefix('=')?;
+            let value = value.split('#').next().unwrap_or("").trim();
+            Some(match value {
+                "true" => Ok(true),
+                "false" | "nil" => Ok(false),
+                ":strict" => Err("`raise_on_missing_translations = :strict` also raises from ActiveModel, which is not modeled".to_string()),
+                _ => Err(format!("`raise_on_missing_translations = {value}` is computed at boot")),
+            })
+        })
+    };
+    let mut policy = crate::i18n::MissingPolicy::default();
+    match setting(&dir.join("config/application.rb")) {
+        Some(Ok(raises)) => policy.raises = raises,
+        Some(Err(why)) => policy.unknown = Some(why),
+        None => {}
+    }
+    let envs_dir = dir.join("config/environments");
+    let mut envs = if vfs.is_dir(&envs_dir) { vfs.read_dir(&envs_dir).unwrap_or_default() } else { Vec::new() };
+    envs.sort();
+    for path in envs {
+        let Some(env) = path.file_stem().and_then(|s| s.to_str()).filter(|_| path.extension().is_some_and(|e| e == "rb")) else { continue };
+        match setting(&path) {
+            Some(Ok(raises)) if raises != policy.raises => policy.flipped.push(env.to_string()),
+            Some(Err(why)) => policy.unknown = Some(why),
+            _ => {}
+        }
+    }
+    policy
+}
+
+/// `:fr`, `:"pt-BR"`, `"fr"` or `'fr'` at the start of `value`, ignoring what follows it.
+fn locale_literal(value: &str) -> Option<String> {
+    let bare = value.strip_prefix(':');
+    let value = bare.unwrap_or(value);
+    let name = match value.chars().next() {
+        Some(quote @ ('"' | '\'')) => value[1..].split(quote).next()?,
+        _ if bare.is_some() => value.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next()?,
+        _ => return None,
+    };
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::locale_literal;
+
+    #[test]
+    fn a_default_locale_literal_drops_a_trailing_comment_but_not_a_quoted_hash() {
+        assert_eq!(locale_literal(":fr # French").as_deref(), Some("fr"));
+        assert_eq!(locale_literal(":\"pt-BR\"").as_deref(), Some("pt-BR"));
+        assert_eq!(locale_literal("\"fr#CA\" # comment").as_deref(), Some("fr#CA"));
+        assert_eq!(locale_literal("'ja'").as_deref(), Some("ja"));
+        assert_eq!(locale_literal("ENV[\"LOCALE\"]"), None);
     }
 }

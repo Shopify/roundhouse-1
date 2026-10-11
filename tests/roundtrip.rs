@@ -80,6 +80,7 @@ fn tiny_blog_round_trips() {
         after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
+        i18n: Default::default(),
         span: Span::synthetic(),
         visibility_overrides: Vec::new(),
     };
@@ -153,6 +154,7 @@ fn tiny_blog_round_trips() {
         // the roundtrip fixture has nothing to say about it.
         binary_assets: Vec::new(),
         locale_files: vec!["config/locales/en.yml".to_string()],
+        i18n: Default::default(),
         inferred_method_params: Default::default(),
         models: vec![post_model],
         library_classes: vec![],
@@ -192,6 +194,7 @@ fn tiny_blog_round_trips() {
         fixtures: vec![],
         seeds: None,
         importmap: None,
+        inertia: None,
         stylesheets: vec![],
         rbs_signatures: roundhouse::det::HashMap::default(),
         rbs_singleton_methods: roundhouse::det::HashMap::default(),

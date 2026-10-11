@@ -95,14 +95,14 @@ module Base64
     acc = 0
     nbits = 0
     i = 0
-    n = s.length
+    n = s.bytesize
     while i < n
-      c = s[i]
+      b = s.getbyte(i)
       i = i + 1
-      if c == "="
+      if b == 61   # "="
         break
       end
-      val = char_value(c)
+      val = byte_value(b)
       if val < 0
         next   # stray byte
       end
@@ -136,16 +136,23 @@ module Base64
     out
   end
 
-  # Map one base64 alphabet character to its 6-bit value, or -1 for
-  # anything outside the alphabet (padding / separators).
+  # The 6-bit value of one base64 alphabet character, or -1 for anything
+  # outside the alphabet (padding / separators).
   def self.char_value(c)
-    idx = 0
-    while idx < 64
-      if ALPHABET[idx] == c
-        return idx
-      end
-      idx = idx + 1
-    end
+    byte_value(c.getbyte(0))
+  end
+
+  # The 6-bit value of one base64 alphabet byte, or -1 for anything
+  # outside the alphabet (padding / separators). Arithmetic on the byte,
+  # not a scan of ALPHABET: the scan made decoding 64 comparisons per
+  # character, and since the session cookie is signed every request
+  # decodes it — the lobsters ruby lane spent a third of its time here.
+  def self.byte_value(b)
+    return b - 65 if b >= 65 && b <= 90   # A-Z
+    return b - 71 if b >= 97 && b <= 122  # a-z
+    return b + 4 if b >= 48 && b <= 57    # 0-9
+    return 62 if b == 43                  # +
+    return 63 if b == 47                  # /
     -1
   end
 

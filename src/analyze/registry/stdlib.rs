@@ -37,7 +37,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     );
     // `Rails.version` (railties gem_version.rb): "8.2.0.alpha".
     rails_cls.class_methods.insert(Symbol::from("version"), Ty::Str);
+    let error_reporter = ClassId(Symbol::from("ActiveSupport::ErrorReporter"));
+    rails_cls.class_methods.insert(
+        Symbol::from("error"),
+        Ty::Class { id: error_reporter.clone(), args: vec![] },
+    );
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
+    register_stdlib_class(classes, error_reporter.0.as_str(), &[], &[("report", Ty::Nil)]);
 
     // `Rails.event` / `Rails.error` — ActiveSupport's EventReporter and
     // ErrorReporter, answered by runtime/ruby/active_support_reporters.rb
@@ -990,6 +996,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("default_value", Ty::Class { id: ClassId(Symbol::from("ActiveModel::Type::Value")), args: vec![] }),
     ], &[]);
     // `ActiveModel::Type::Boolean.new.cast(v)`: nil for a blank value, else the boolean.
+    // `ActiveSupport::TimeZone` is `runtime/ruby/active_support_ext.rb`'s port; `[]` is typed in dispatch, by its argument.
+    {
+        let zone = || Ty::Class { id: ClassId(Symbol::from("ActiveSupport::TimeZone")), args: vec![] };
+        register_stdlib_class(classes, "ActiveSupport::TimeZone", &[
+            ("all", Ty::Array { elem: Box::new(zone()) }),
+            ("lookup", Ty::Union { variants: vec![zone(), Ty::Nil] }),
+        ], &[
+            ("name", Ty::Str), ("utc_offset", Ty::Int), ("formatted_offset", Ty::Str),
+            ("to_s", Ty::Str), ("now", Ty::Time),
+        ]);
+    }
+    register_stdlib_class(classes, crate::analyze::indifferent::CLASS, &[], &[]);
     // Not answered here beyond `new`: the dispatch arm for `ActiveSupport::StringInquirer` types its predicates and String surface.
     register_stdlib_class(classes, "ActiveSupport::StringInquirer", &[("new", Ty::Str)], &[]);
     // `ActiveRecord::Type::Boolean` is a subclass with the same casting; `deserialize` casts the same way for a boolean.

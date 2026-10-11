@@ -33,6 +33,7 @@ use crate::app::{SqlFunction, SqlFunctionKind};
 use crate::dialect::{MethodDef, MethodReceiver, Param};
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
+use crate::span::Span;
 
 use super::expr::ingest_expr;
 use super::util::constant_id_str;

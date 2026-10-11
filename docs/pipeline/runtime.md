@@ -2421,9 +2421,27 @@ Three gaps remain, all on spinel's side:
 ### Smaller shapes campfire main reaches, each narrower than Rails
 
 - **`I18n.locale` / `default_locale` answer `:en`** (`runtime/ruby/i18n_locale.rb`),
-  Rails' default when nothing sets one. Setting a locale (`I18n.locale =`,
-  `with_locale`, `config.i18n.default_locale`) and translation (`I18n.t`)
-  are not modeled.
+  Rails' default when nothing sets one. Setting a locale at run time
+  (`I18n.locale =`, `with_locale`) is not modeled. Translation is answered
+  at compile time from the default locale (`src/i18n`): `t` / `I18n.t`
+  with a literal key, attribute names, validation messages and form
+  labels. A key the locale lacks answers as Rails does in the running
+  environment: `Translation missing: en.key`, a template's
+  `translation_missing` span, or `I18n::MissingTranslationData` where
+  `config.i18n.raise_on_missing_translations` is set (`:strict` and a
+  value computed at boot stay errors). A key with run-time text after a
+  literal prefix (`t("statuses.#{v}")`) folds every translation under
+  the prefix into a `case` on the normalized key, falling back to the
+  missing answer or `default:`. Where such a key names a subtree, Rails
+  answers a Hash; here it raises `NotImplementedError`. A key with no
+  literal prefix, or one reaching more than 400 translations, is an
+  error rather than a guess. A `Rails::Engine` gem's `config/locales`
+  load before the app's, read where Bundler installed the gem
+  (`BUNDLE_PATH`, `GEM_HOME`, `GEM_PATH`), so an uninstalled gem's keys
+  stay missing. Engines load in lockfile order, not Rails' railtie
+  order, which differs only when two gems define one key. A gem that is
+  not an engine adds its files from its own code; none is read unless
+  `src/i18n/gems.rs::NON_ENGINE_LOCALES` names its paths.
 - **`fragment_name_with_digest(name, digest_path)` adds no template
   digest**: templates carry none here (see
   `runtime/spinel/action_controller_fragment_caching.rb`), so an omitted
@@ -2448,6 +2466,39 @@ Three gaps remain, all on spinel's side:
   trigger-maintained `rooms.messages_count` correct when a message
   touches its room. A `save`/`update` of a record loaded before a
   trigger moved one of its columns still writes the stale value back.
+
+### `HashWithIndifferentAccess` is a String-keyed Hash; a call converts its keys at the site
+
+No target can subclass `Hash`, so the class exists only in the
+analyzer, as `HashWithIndifferentAccess[V]` (`analyze::indifferent`).
+`lower::indifferent_access` rewrites each call on a value of that type
+into the String-keyed Hash call. It converts keys and values the way
+Rails does: a Symbol key becomes its String, other keys stay as they
+are, and a written Hash or Array value converts all the way down, an
+Array in place under `[]=`. The value stays a `Hash`, so `is_a?(Hash)`,
+merging it into another hash, and JSON encoding answer as in Rails. A
+method outside the modeled surface is an error, as is any use of the
+constant other than `new`.
+
+Where it differs from Rails:
+
+- **A value whose type is not known.** A Symbol key read from one
+  converts only along a chain of `[]` / `fetch` / `dig` / `first` /
+  `last` reads rooted at an indifferent hash. Once the value is held in
+  a local or passed to a method, the indifferent type is gone and
+  `x[:key]` reads the plain hash, which answers `nil` where Rails
+  answers the value.
+- **An indifferent hash inside an untyped or Array value is copied.**
+  Rails keeps such a hash as it is, shared, when it is nested into
+  another. The runtime cannot tell it from a plain Hash, so it converts
+  it into a new hash.
+- **The constructor drops a source hash's `default` / `default_proc`.**
+- **A value that may not be a Hash takes a String key where Rails raises.**
+  This covers a read on that chain, or a value typed as an indifferent
+  hash OR something else. `h[:name][:x]` on a String value is a
+  `TypeError` in Rails. The converted call asks `"…"["x"]` instead and
+  answers a substring or `nil`. `include?`, `member?` and `delete` are
+  not converted there, since an Array answers them for a Symbol too.
 
 ## Related docs
 

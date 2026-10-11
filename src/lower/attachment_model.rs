@@ -123,6 +123,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
         after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
+        i18n: Default::default(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
         parent_span: Default::default(),

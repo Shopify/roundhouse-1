@@ -50,7 +50,7 @@ mod fixture_entries;
 mod body;
 mod class_configuration;
 mod data;
-pub(crate) use body::string_answers;
+pub(crate) use body::{indexed_pluck, string_answers};
 pub(crate) use body::ConstResolverTask;
 pub use body::PreparedConstResolver;
 pub mod async_color;
@@ -78,6 +78,7 @@ mod superclass_binding;
 mod typing_mode;
 mod inferred_types;
 pub mod inquiry;
+pub mod indifferent;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
 pub use forwarding::nameless_rest_refusals_off_ruby;
@@ -159,6 +160,8 @@ pub struct Analyzer {
     /// The base each load hook fires with: the `self` of an
     /// `ActiveSupport.on_load(:hook)` block (`ingest::initializer_programs`).
     load_hook_bases: std::collections::BTreeMap<String, ClassId>,
+    /// The app's translations, for `t` / `I18n.t` (see `crate::i18n`).
+    i18n: crate::i18n::Catalog,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
     ///
@@ -567,10 +570,6 @@ impl Analyzer {
                 cls.class_methods.insert(Symbol::from(name), ty);
             }
             cls.class_methods.insert(Symbol::from("table_name"), Ty::Str);
-            // `Model.human_attribute_name(:col)` — the ActiveModel
-            // translation entry point every form label and table header
-            // goes through. Returns the humanized/localized String.
-            cls.class_methods.insert(Symbol::from("human_attribute_name"), Ty::Str);
             cls.class_methods.insert(Symbol::from("primary_key"), Ty::Str);
             // Arel entry points: `Model.arel_table` is an `Arel::Table`
             // (`table[:col]` → attribute → predicate node); `Model.arel`
@@ -1496,6 +1495,7 @@ impl Analyzer {
                 .map(|(hook, base, _)| (hook.to_string(), ClassId(Symbol::from(*base))))
                 .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
                 .collect(),
+            i18n: app.i18n.clone(),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
             gem_sources: std::sync::Arc::new(app.gem_boundary.source_constants.clone()),
@@ -1525,6 +1525,7 @@ impl Analyzer {
         let typer = BodyTyper::new(&self.classes)
             .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
+            .with_i18n(&self.i18n)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories)
             .with_gem_sources(self.gem_sources.clone());
@@ -2300,7 +2301,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
-                in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             self.body_typer().analyze_expr(&mut helper.body, &ctx);
         }
@@ -2778,7 +2779,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: shared.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                        in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                     };
                     let deps = body::DepRecorder::default();
                     let mut value = match std::mem::replace(&mut cur[index], Cur::Source) {
@@ -3250,7 +3251,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             for item in model.body.iter_mut() {
                 if let ModelBodyItem::Unknown { expr, .. } = item {
@@ -3267,7 +3268,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // Pass A: type every method body with only `@attributes`
@@ -3336,7 +3337,7 @@ impl Analyzer {
                     local_bindings: HashMap::default(),
                     class_objects: Default::default(),
                     constants: class_constants.clone(),
-                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                    annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                 };
 
                 for scope in model.scopes_mut() {
@@ -3388,7 +3389,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             if retype {
                 for item in controller.body.iter_mut() {
@@ -3409,7 +3410,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // Snapshot this controller's own segment of the filter chain
@@ -3984,7 +3985,7 @@ impl Analyzer {
                             local_bindings: HashMap::default(),
                             class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
-                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                            annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                         };
                         // Seed helper-method params from the inferred-params
                         // table too, so `period(query)`'s body resolves on
@@ -4507,7 +4508,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                        in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                     };
                     let origin = app
                         .concern_spliced_actions
@@ -4758,7 +4759,7 @@ impl Analyzer {
                 ivar_bindings: HashMap::default(),
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
-                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, view_name: None, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // The initializers run in order on the class object, so one
@@ -4914,7 +4915,7 @@ impl Analyzer {
                     ivar_bindings: reseeded,
                     local_bindings: HashMap::default(),
                     class_objects: Default::default(),
-                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
+                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                 };
                 for method in &mut lc.methods {
                     let mut mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
@@ -4996,6 +4997,7 @@ impl Analyzer {
             });
             view_ctx.constants = global_constants.clone();
             view_ctx.ivar_bindings = ivars;
+            view_ctx.view_name = Some(name.clone());
             if let Some(row) = mailer_params_by_view.get(name) {
                 view_ctx.local_bindings.insert(Symbol::from("params"), row.clone());
             }
@@ -5227,6 +5229,7 @@ impl Analyzer {
             }
             let mut view_ctx = Ctx::default();
             view_ctx.in_view = true; // `yield` here renders to a String
+            view_ctx.view_name = Some(view.name.clone());
             // The view body types against the ActionView context, so
             // implicit-self helper calls (`form_with`, …) dispatch there.
             view_ctx.self_ty = Some(Ty::Class {

@@ -1191,7 +1191,12 @@ fn every_runtime_method_body_concretely_typed() {
     // local type where one exists), which it counts: +62 over the 1525
     // measured by the previous fix, all in active_record/connection.rb and
     // relation.rb.
-    const CEILING: usize = 1595;
+    //
+    // Merged with origin/main (futamura): origin's own growth since the
+    // last merge (+25: the indifferent hash's conversions, +23, and
+    // AssociationReflection `#klass` / `#macro` stubs, +2) is added to
+    // the ceiling; the measured value is recorded below when run.
+    const CEILING: usize = 1620;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

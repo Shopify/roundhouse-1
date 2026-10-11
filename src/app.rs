@@ -110,6 +110,8 @@ pub struct App {
     /// None when the app has no importmap.rb.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub importmap: Option<Importmap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inertia: Option<InertiaConfig>,
     /// Logical stylesheet names discovered in `app/assets/stylesheets/`
     /// + `app/assets/builds/` (file stems without `.css`). When the
     /// ERB uses `stylesheet_link_tag :app, ...`, Rails with Propshaft
@@ -209,6 +211,9 @@ pub struct App {
     /// would bake Rails' default text declines when it is non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locale_files: Vec<String>,
+    /// `config/locales` for the default locale (see `crate::i18n`).
+    #[serde(default, skip_serializing_if = "crate::i18n::Catalog::is_empty")]
+    pub i18n: crate::i18n::Catalog,
     /// App-helper method registry: maps each method name defined in an
     /// `app/helpers/*.rb` module to the helper module (`ClassId`) that
     /// defines it. Rails mixes all helper modules into every view, so a
@@ -1329,6 +1334,14 @@ impl MixinKind {
 /// pin, in declaration order (Rails preserves order for
 /// modulepreload link emission).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct InertiaConfig {
+    pub version: String,
+    pub encrypt_history: bool,
+    pub always_include_errors_hash: bool,
+    pub use_script_element_for_initial_page: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Importmap {
     pub pins: Vec<ImportmapPin>,
 }
@@ -1467,6 +1480,7 @@ impl App {
             database_yml: None,
             binary_assets: Vec::new(),
             locale_files: Vec::new(),
+            i18n: crate::i18n::Catalog::default(),
             models: Vec::new(),
             library_classes: Vec::new(),
             controllers: Vec::new(),
@@ -1476,6 +1490,7 @@ impl App {
             fixtures: Vec::new(),
             seeds: None,
             importmap: None,
+            inertia: None,
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
             rbs_includes: HashMap::default(),
