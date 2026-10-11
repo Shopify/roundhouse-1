@@ -28,7 +28,7 @@ pub use schema::col_storage_name;
 pub use schema::shakeable_synthesized_names;
 pub(crate) use schema::generated_attribute_method_names;
 pub(crate) mod validations;
-mod associations;
+pub(crate) mod associations;
 mod attribute_alias;
 mod composite_key;
 pub(crate) mod broadcasts;

@@ -134,6 +134,7 @@ pub(super) fn push_association_methods(
                 foreign_key,
                 as_interface,
                 scope,
+                scope_owner,
                 through,
                 extension,
                 ..
@@ -144,7 +145,7 @@ pub(super) fn push_association_methods(
                     target,
                     foreign_key,
                     as_interface.as_ref(),
-                    scope.as_ref(),
+                    scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
                     through.is_some(),
                 ));
                 crate::lower::default_scope::materialize_reader(methods.last_mut(), target, models, through.is_some());
@@ -379,6 +380,7 @@ pub(super) fn push_association_methods(
                 foreign_key,
                 as_interface,
                 scope,
+                scope_owner,
                 autosave,
                 ..
             } => {
@@ -388,7 +390,7 @@ pub(super) fn push_association_methods(
                     target,
                     foreign_key,
                     as_interface.as_ref(),
-                    scope.as_ref(),
+                    scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
                 ));
                 methods.push(synth_has_one_preload_setter(owner, name, target));
                 push_singular_loaded_reader(methods, model, owner, name);
@@ -831,6 +833,26 @@ fn extension_relation_method(name: &str) -> bool {
             | "first"
             | "last"
     )
+}
+
+/// Bind an owner-taking association scope's parameter to the record
+/// the reader runs on: every read of the lambda's `owner` local becomes
+/// `self` (Rails `instance_exec`s an arity-1 scope with the owner,
+/// association_scope.rb `eval_scope`). A parameterless scope is
+/// returned as written.
+pub(crate) fn bind_scope_owner(scope: &Expr, owner: Option<&Symbol>) -> Expr {
+    fn bind(e: &mut Expr, owner: &Symbol) {
+        if matches!(&*e.node, ExprNode::Var { name, .. } if name == owner) {
+            *e = Expr::new(e.span, ExprNode::SelfRef);
+            return;
+        }
+        e.node.for_each_child_mut(&mut |c| bind(c, owner));
+    }
+    let mut bound = scope.clone();
+    if let Some(owner) = owner {
+        bind(&mut bound, owner);
+    }
+    bound
 }
 
 /// Re-root an association-scope chain onto `base`: walk the scope's

@@ -510,6 +510,13 @@ pub enum Association {
         /// seed; None for the unscoped common case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<Expr>,
+        /// The owner parameter of an owner-taking scope (`has_many :x,
+        /// ->(owner) { where(shop_id: owner.shop_id) }`). Rails
+        /// `instance_exec`s an arity-1 scope with the record
+        /// (association_scope.rb `eval_scope`), so the body reads the
+        /// owner through this local; None for a parameterless scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_owner: Option<Symbol>,
         /// Association-extension block — `has_many :memberships do def
         /// grant_to(users) … end end`. Rails builds an anonymous module
         /// and mixes it into the CollectionProxy, so these methods live
@@ -551,6 +558,13 @@ pub enum Association {
         /// [`HasMany::scope`] (`has_one :x, -> { where(name: "body") }`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<Expr>,
+        /// The owner parameter of an owner-taking scope (`has_many :x,
+        /// ->(owner) { where(shop_id: owner.shop_id) }`). Rails
+        /// `instance_exec`s an arity-1 scope with the record
+        /// (association_scope.rb `eval_scope`), so the body reads the
+        /// owner through this local; None for a parameterless scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_owner: Option<Symbol>,
         /// `autosave: true` — persist a built/assigned child after the
         /// owner saves. Default false, matching Rails. When true, the
         /// shared lowerer stashes via the writer and folds an

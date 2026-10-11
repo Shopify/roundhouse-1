@@ -994,6 +994,7 @@ module ActiveRecord
     # through hop then its source hop off the through model, every hop
     # carrying `kind`.
     def reflection_join_sql(owner, reflection, kind)
+      reflection.check_eager_loadable! if reflection.respond_to?(:check_eager_loadable!)
       if reflection.through_reflection?
         through = reflection.through_reflection
         source = reflection.source_reflection
@@ -1146,8 +1147,28 @@ module ActiveRecord
     def eager_load(*names)
       own_lists
       @records = nil
+      names.each { |n| check_eager_loadable(@model, n) }
       names.each { |n| @includes << n }
       self
+    end
+
+    # An eager load joins each hop, which Rails refuses for a scope that
+    # takes the owner (reflection.rb `check_eager_loadable!`). Hops the
+    # model answers no reflection for are left to the preloader.
+    def check_eager_loadable(owner, spec)
+      case spec
+      when Symbol, String
+        reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(spec.to_sym) : nil
+        reflection.check_eager_loadable! if reflection.respond_to?(:check_eager_loadable!)
+        reflection
+      when Array
+        spec.each { |el| check_eager_loadable(owner, el) }
+      when Hash
+        spec.each do |name, nested|
+          reflection = check_eager_loadable(owner, name)
+          check_eager_loadable(reflection.klass, nested) if reflection.respond_to?(:klass)
+        end
+      end
     end
 
     # `references(:assoc)` — Rails' marker that a string condition

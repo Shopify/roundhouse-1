@@ -1492,6 +1492,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     through: None,
                     as_interface,
                     scope,
+                    scope_owner,
                     extension,
                     ..
                 } => {
@@ -1505,10 +1506,15 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                         reg.has_many_unseedable_names.insert(name.clone());
                     }
                     let t = reg.table_for(target);
-                    reg.join_tails.insert(
-                        (m.name.clone(), name.clone()),
-                        format!("{t} ON {t}.{foreign_key} = {own}.id"),
-                    );
+                    // A scope that takes the owner has no join (Rails'
+                    // `check_eager_loadable!`): the spec stays unexpanded
+                    // and the runtime reflection refuses it.
+                    if scope_owner.is_none() {
+                        reg.join_tails.insert(
+                            (m.name.clone(), name.clone()),
+                            format!("{t} ON {t}.{foreign_key} = {own}.id"),
+                        );
+                    }
                     reg.has_many_fk.insert(
                         (m.name.clone(), name.clone()),
                         (target.clone(), foreign_key.clone()),
@@ -1533,12 +1539,14 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                         })
                         .or_insert(Some(entry));
                 }
-                Association::HasOne { name, target, foreign_key, .. } => {
+                Association::HasOne { name, target, foreign_key, scope_owner, .. } => {
                     let t = reg.table_for(target);
-                    reg.join_tails.insert(
-                        (m.name.clone(), name.clone()),
-                        format!("{t} ON {t}.{foreign_key} = {own}.id"),
-                    );
+                    if scope_owner.is_none() {
+                        reg.join_tails.insert(
+                            (m.name.clone(), name.clone()),
+                            format!("{t} ON {t}.{foreign_key} = {own}.id"),
+                        );
+                    }
                     reg.assoc_table
                         .insert((m.name.clone(), name.clone()), Symbol::from(t.as_str()));
                     reg.assoc_target

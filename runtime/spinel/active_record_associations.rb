@@ -651,6 +651,27 @@ module ActiveRecord
           super
         end
 
+        # association.rb `build_record` + `initialize_attributes`: the
+        # record starts with the association scope's `where` equalities
+        # (`scope_for_create`, the owner already bound), except the keys
+        # the caller passed; the key and `as:` type are the owner's.
+        def build_record(attributes, &block)
+          record = klass.new(attributes, &block)
+          assign_scope_attributes(record, attributes)
+          initialize_attributes(record)
+          record
+        end
+
+        def assign_scope_attributes(record, given)
+          query = :"_#{@name}_association_scope"
+          return unless @owner.respond_to?(query)
+          skip = [@foreign_key.to_s, (@as_type.to_s if @as_type)]
+          skip.concat(given.keys.map(&:to_s)) if given.respond_to?(:keys)
+          @owner.public_send(query).scope_for_create.each do |column, value|
+            record.public_send(:"#{column}=", value) unless skip.include?(column.to_s)
+          end
+        end
+
         def initialize_attributes(record)
           set_owner_attributes(record)
           set_inverse_instance(record)

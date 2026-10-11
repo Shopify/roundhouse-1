@@ -2957,6 +2957,8 @@ pub(super) fn parse_association(
     let mut required: Option<bool> = None;
     let mut join_table: Option<String> = None;
     let mut scope: Option<crate::expr::Expr> = None;
+    // The lambda's single required parameter (the owner), when it has one.
+    let mut scope_owner: Option<Symbol> = None;
     let mut polymorphic: Option<bool> = None;
     let mut as_interface: Option<String> = None;
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
@@ -2969,18 +2971,39 @@ pub(super) fn parse_association(
         // Positional lambda between name and kwargs — the association
         // scope (`has_many :x, -> { where(...) }, through: :y`).
         // Recorded as its raw body Expr; the reader synthesis grafts it
-        // onto the relation seed. Param-taking lambdas (rare
-        // owner-dependent scopes) are skipped — they need the owner
-        // threaded and no exercised corpus does this yet.
+        // onto the relation seed. A lambda taking one parameter is an
+        // owner-dependent scope (Rails `instance_exec`s it with the
+        // record); the parameter name is kept so each consumer can bind
+        // it to the owner, or decline it.
         if let Some(lambda) = arg.as_lambda_node() {
             if scope.is_none() {
-                let param_free = lambda
+                let params = lambda
                     .parameters()
-                    .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
-                    .map(|pn| pn.requireds().iter().next().is_none())
-                    .unwrap_or(true);
-                if param_free {
+                    .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()));
+                let required: Vec<String> = params
+                    .as_ref()
+                    .map(|pn| {
+                        pn.requireds()
+                            .iter()
+                            .filter_map(|r| r.as_required_parameter_node())
+                            .map(|r| constant_id_str(&r.name()).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let only_required = params.as_ref().is_none_or(|pn| {
+                    pn.requireds().iter().count() == required.len()
+                        && pn.optionals().iter().next().is_none()
+                        && pn.rest().is_none()
+                        && pn.posts().iter().next().is_none()
+                        && pn.keywords().iter().next().is_none()
+                        && pn.keyword_rest().is_none()
+                        && pn.block().is_none()
+                });
+                if only_required && required.len() <= 1 {
                     scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
+                    if scope.is_some() {
+                        scope_owner = required.first().map(|n| Symbol::from(n.as_str()));
+                    }
                 }
             }
             continue;
@@ -3125,6 +3148,7 @@ pub(super) fn parse_association(
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
+            scope_owner,
             skip_validation: validate == Some(false),
             autosave: autosave == Some(true),
         }),
@@ -3144,6 +3168,7 @@ pub(super) fn parse_association(
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
+            scope_owner,
             autosave: autosave.unwrap_or(false),
         }),
         "belongs_to" => Some(Association::BelongsTo {

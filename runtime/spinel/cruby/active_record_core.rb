@@ -377,13 +377,23 @@ module ActiveRecord
     class AssociationReflection
       attr_reader :name, :active_record
 
-      def initialize(name, target, foreign_key, options, active_record, unsupported: [])
+      def initialize(name, target, foreign_key, options, active_record, unsupported: [], instance_dependent_scope: false)
         @name = name
         @target = target
         @foreign_key = foreign_key
         @options = options.nil? ? nil : normalize_options(options)
         @active_record = active_record
         @unsupported = unsupported
+        @instance_dependent_scope = instance_dependent_scope
+      end
+
+      # reflection.rb `check_eager_loadable!`: a scope that takes the
+      # owner (`->(owner) { where(...) }`) cannot be joined or eager
+      # loaded, as there is no owner to hand it.
+      def check_eager_loadable!
+        return unless @instance_dependent_scope
+        raise ArgumentError, "The association scope '#{@name}' is instance dependent (the scope " \
+          "block takes an argument). Eager loading instance dependent scopes is not supported."
       end
 
       def options
@@ -662,6 +672,7 @@ module ActiveRecord
       def polymorphic? = @delegate_reflection.polymorphic?
       def validate? = @delegate_reflection.validate?
       def through_reflection? = true
+      def check_eager_loadable! = @delegate_reflection.check_eager_loadable!
 
       def autosave=(autosave)
         @delegate_reflection.autosave = autosave

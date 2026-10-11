@@ -3795,6 +3795,7 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
     if !lcs.iter().any(|lc| lc.methods.iter().any(generated))
         && !app_calls_method(app, "reflect_on_association")
         && !app_joins_by_name(app)
+        && !(app_has_owner_scope(app) && app_calls_method(app, "eager_load"))
         && !app_calls_method(app, "accepts_nested_attributes_for")
     {
         return;
@@ -3822,12 +3823,16 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             {
                 unsupported.push("`extend:` (the declaration's block)".to_string());
             }
-            let unsupported = if unsupported.is_empty() {
+            let mut unsupported = if unsupported.is_empty() {
                 String::new()
             } else {
                 let names: Vec<String> = unsupported.iter().map(|u| ruby_single_quoted(u)).collect();
                 format!(", unsupported: [{}]", names.join(", "))
             };
+            // `->(owner) { ... }`: Rails refuses to join or eager load it.
+            if matches!(assoc, Association::HasMany { scope_owner: Some(_), .. } | Association::HasOne { scope_owner: Some(_), .. }) {
+                unsupported.push_str(", instance_dependent_scope: true");
+            }
             let class = |t: &ClassId| format!("{:?}", t.0.as_str().trim_start_matches("::"));
             let reflection = "::ActiveRecord::Reflection";
             let new = match assoc {
@@ -4018,6 +4023,14 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
 /// Some emit-bound body, view or test sends `method`.
 fn app_calls_method(app: &App, method: &str) -> bool {
     app_sends(app, &|m, _| m == method)
+}
+
+/// Some association's scope takes the owner (`->(owner) { ... }`).
+fn app_has_owner_scope(app: &App) -> bool {
+    use crate::dialect::Association;
+    app.models.iter().flat_map(|m| m.associations()).any(|a| {
+        matches!(a, Association::HasMany { scope_owner: Some(_), .. } | Association::HasOne { scope_owner: Some(_), .. })
+    })
 }
 
 /// Some emit-bound body, view or test joins by something other than SQL
@@ -4870,7 +4883,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
         for assoc in model.associations() {
             let Association::HasMany {
-                name, target, through: Some(thr_name), scope: assoc_scope, ..
+                name, target, through: Some(thr_name), scope: assoc_scope, scope_owner, ..
             } = assoc
             else {
                 continue;
@@ -4891,7 +4904,10 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, assoc_scope);
+            let assoc_scope = assoc_scope
+                .as_ref()
+                .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
+            m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, &assoc_scope);
         }
     }
 }
