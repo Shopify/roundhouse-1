@@ -465,7 +465,17 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     }
     let headers: Vec<&str> = lines[first..first + depth].to_vec();
     let body = unwrapped(&lines[first..], depth)?;
-    let above: Vec<String> = lines[..first].iter().filter(|l| !l.trim().is_empty()).map(|l| format!("{}{l}", pad(depth))).collect();
+    // A require of the declaration's own file (the reopen's render names
+    // its target like any sibling) would load that file inside itself:
+    // Ruby warns "loading in progress, circular require considered
+    // harmful" and the require does nothing, so it is left out.
+    let own_stem = crate::naming::underscore(target.rsplit("::").next()?);
+    let above: Vec<String> = lines[..first]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !split_require_relative(l).is_some_and(|(required, _)| required == own_stem))
+        .map(|l| format!("{}{l}", pad(depth)))
+        .collect();
     // The declaration's file: the same headers, then the declaration.
     let own: Vec<&str> = content.lines().collect();
     let start = own.iter().position(|l| *l == headers[0])?;
@@ -18725,5 +18735,24 @@ mod insert_rel_param_tests {
         };
         let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["tags", "__rel", "opts"]);
+    }
+}
+
+#[cfg(test)]
+mod spliced_namespace_tests {
+    use super::*;
+
+    // A namespace reopen written after a nested declaration lands inside
+    // that declaration's file; the reopen's render requires its sibling
+    // files and the declaration itself, and a file requiring itself is
+    // CRuby's "loading in progress, circular require considered harmful".
+    #[test]
+    fn a_reopen_spliced_into_a_declarations_file_does_not_require_that_file() {
+        let own = "module Outer\n  module Inner\n    module Leaf\n      def self.x = 1\n    end\n  end\nend\n";
+        let rendered = "require_relative \"sibling\"\nrequire_relative \"leaf\" unless defined?(::Outer::Inner::Leaf)\nmodule Outer\n  module Inner\n    Leaf.x\n  end\nend\n";
+        let spliced = spliced_into_namespace(own, "Outer::Inner", "Outer::Inner::Leaf", rendered, "# marker").expect("splices");
+        assert!(spliced.contains("require_relative \"sibling\""), "{spliced}");
+        assert!(!spliced.contains("require_relative \"leaf\""), "{spliced}");
+        assert!(spliced.contains("Leaf.x"), "{spliced}");
     }
 }
