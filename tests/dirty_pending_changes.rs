@@ -135,3 +135,16 @@ fn a_name_sent_by_a_concern_method_is_synthesized() {
     assert!(src.contains("def username_changed?"), "{src}");
     assert!(src.contains("def username_was"), "{src}");
 }
+
+/// A guard a concern's `included` block names is demand too: the
+/// concern's validations run on the including model's record
+/// (`included do validates :about, presence: true, if: :about_changed?`).
+#[test]
+fn a_guard_named_by_a_concerns_included_validation_is_synthesized() {
+    let src = emit_user_with_concern(
+        "class User < ApplicationRecord\n  include Trackable\nend\n",
+        "module Trackable\n  extend ActiveSupport::Concern\n\n  included do\n    validates :about, presence: true, if: :about_changed?\n  end\nend\n",
+    );
+    assert!(src.contains("def about_changed?"), "{src}");
+    assert!(src.contains(r#"attribute_changed?("about")"#), "{src}");
+}

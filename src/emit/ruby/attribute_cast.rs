@@ -355,11 +355,22 @@ fn guarded_cast(col: &Column, kind: Kind, name: &Symbol) -> Expr {
         )),
         Kind::Always => None,
     };
+    let mut cast = cast_call(col, var(name));
     let cond = match passes {
+        // Active Model's String type casts a String through `::String.new(value)`
+        // (type/string.rb `cast_value`): the attribute owns a mutable copy, so
+        // `record.name.downcase!` neither raises on a frozen literal nor warns
+        // on a chilled one, and never mutates the caller's string.
+        Some(p) if kind == Kind::Text => {
+            let mut copy = sp(ExprNode::If { cond: p, then_branch: send(var(name), "dup", vec![]), else_branch: cast });
+            copy.ty = Some(Ty::Untyped);
+            cast = copy;
+            nil_q
+        }
         Some(p) => or(nil_q, p),
         None => nil_q,
     };
-    let mut e = sp(ExprNode::If { cond, then_branch: var(name), else_branch: cast_call(col, var(name)) });
+    let mut e = sp(ExprNode::If { cond, then_branch: var(name), else_branch: cast });
     e.ty = Some(Ty::Untyped);
     e
 }
