@@ -35,7 +35,7 @@ module ActionController
     def self.nested_attribute?: (::Object key, ::Object value) -> bool
     def self.convert_key: (::Object key) -> String
     def self.convert_value: (::Object value) -> ::Object
-    def self.indifferent: (Hash[::Object, ::Object] hash) -> Hash[String, ::Object]
+    def self.indifferent: (Hash[String, ::Object] hash) -> Hash[String, ::Object]
     def self.permit_nested!: (::Object value) -> ::Object
     def self.checked: (Hash[untyped, untyped] parameters) -> Hash[untyped, untyped]
     def self.check_key: (::Object key) -> void

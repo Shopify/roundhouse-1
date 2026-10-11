@@ -13,7 +13,7 @@
 //! gets this `untyped` pin from roundhouse, but its EMITTED BODY is
 //! untouched, so Spinel's own inference still lands on a Hash for it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -24,7 +24,7 @@ const APPLICATION_RECORD: &str =
 
 /// The spinel tree for a small app: the base classes plus `files`.
 fn spinel(files: &[(&str, &str)]) -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("app/models/application_record.rb"), APPLICATION_RECORD.as_bytes().to_vec());
     for (path, content) in files {
         tree.insert(PathBuf::from(path), content.as_bytes().to_vec());

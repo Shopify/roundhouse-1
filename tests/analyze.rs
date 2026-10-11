@@ -2347,7 +2347,7 @@ fn time_zone_lookup_error_report_and_array_pluck_type_without_errors() {
     let app = app_from_files(&[
         (
             "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
         ),
         (
             "db/schema.rb",
@@ -2371,7 +2371,7 @@ fn array_pluck_with_a_computed_key_stays_an_error() {
     let app = app_from_files(&[
         (
             "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
         ),
         ("db/schema.rb", widget_schema()),
         (

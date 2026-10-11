@@ -128,7 +128,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("of_kind?", Ty::Bool),
         ("added?", Ty::Bool),
         ("full_messages_for", str_arr()),
-        ("full_message", Ty::Str),
+        // Not `full_message`: its text follows the app's I18n (`errors.format`,
+        // translated attribute names), which only `lower::errors_add` evaluates,
+        // for a literal field on a plain `errors` reader. The port's humanize
+        // alone would answer another call wrongly.
         ("delete", Ty::Union { variants: vec![str_arr(), Ty::Nil] }),
         ("import", Ty::Array { elem: Box::new(error_ty.clone()) }),
     ] {

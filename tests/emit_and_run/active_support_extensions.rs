@@ -58,10 +58,27 @@ puts "time zone lookup passed"
     assert!(run.stdout.contains("time zone lookup passed"));
 }
 
+// Rails' ErrorReporter delivers a report to its subscribers and writes
+// nothing itself (ActiveSupport 8.2 error_reporter.rb); the severity and
+// `handled` flag travel with the report.
 #[test]
-fn rails_error_report_logs_at_its_severity_in_emitted_ruby() {
+fn rails_error_report_reaches_subscribers_at_its_severity_in_emitted_ruby() {
     let run = app().run_ruby(
-        r#"raise "report returns nil" unless Article.report(RuntimeError.new("handled")).nil?
+        r#"class CollectingSubscriber
+  attr_reader :reports
+
+  def initialize
+    @reports = []
+  end
+
+  def report(error, handled:, severity:, context:, source:)
+    @reports << [error.message, handled, severity]
+  end
+end
+
+subscriber = CollectingSubscriber.new
+Rails.error.subscribe(subscriber)
+raise "report returns nil" unless Article.report(RuntimeError.new("handled")).nil?
 Article.report_unhandled(RuntimeError.new("unhandled"))
 Article.report_info(RuntimeError.new("info"))
 begin
@@ -70,13 +87,15 @@ begin
 rescue ArgumentError => e
   raise "message: #{e.message}" unless e.message == "severity must be one of :error, :warning, :info, got: :debug"
 end
+expected = [["handled", true, :warning], ["unhandled", false, :error], ["info", true, :info]]
+raise "delivered: #{subscriber.reports.inspect}" unless subscriber.reports == expected
 puts "error report passed"
 "#,
     );
     run.assert_passes();
     assert!(run.stdout.contains("error report passed"));
-    for line in ["WARN RuntimeError: handled", "ERROR RuntimeError: unhandled", "INFO RuntimeError: info"] {
-        assert!(run.stderr.contains(line), "{line}: {}", run.stderr);
+    for line in ["WARN", "ERROR", "INFO"] {
+        assert!(!run.stderr.contains(&format!("{line} RuntimeError")), "a report logged by default: {}", run.stderr);
     }
 }
 

@@ -297,7 +297,7 @@ const PROBE: &str = r##"class SerializationOptionsProbe
     out << "fields: #{s.as_json(fields: ["name", "customer_email"]).inspect}"
     out << "only empty: #{s.as_json(only: [], methods: [:label]).inspect}"
     h = s.serializable_hash(only: [:name], methods: [{ mail: :contact_email }])
-    out << "sh: #{h.class} #{h[:name].inspect} #{h["mail"].inspect} #{h.inspect}"
+    out << "sh: #{h.is_a?(Hash)} #{h[:name].inspect} #{h["mail"].inspect} #{h.inspect}"
     out << "include: #{s.as_json(only: [:name], methods: [], include: { products: { only: [:title] } }).inspect}"
     out << "include fields: #{s.as_json(only: [:name], methods: [], include: [:products], fields: ["name"]).inspect}"
     p = Product.first
@@ -317,7 +317,7 @@ const EXPECTED: [&str; 12] = [
     r##"settings: {"id" => 1, "label" => "shop a", "pre_launch_enabled" => true, "plan_inquiry" => "paid", "extra" => {"x" => 1}}"##,
     r##"fields: {"name" => "a", "customer_email" => "a@example.com"}"##,
     r##"only empty: {"label" => "shop a"}"##,
-    r##"sh: ActiveSupport::HashWithIndifferentAccess "a" "a@example.com" {"name" => "a", "mail" => "a@example.com"}"##,
+    r##"sh: true "a" "a@example.com" {"name" => "a", "mail" => "a@example.com"}"##,
     r##"include: {"name" => "a", "products" => [{"title" => "t"}]}"##,
     r##"include fields: {"name" => "a"}"##,
     r##"product: {"title" => "t", "shop_name" => 1}"##,
@@ -415,7 +415,9 @@ fn a_record_reaches_serialization_options_statically() {
     }
     let mut h = None;
     assigned(&lines.body, "h", &mut h);
-    // The module's `HashWithIndifferentAccess.new`, String-keyed.
+    // The module's `HashWithIndifferentAccess.new`: the analyzer's indifferent hash class
+    // (it runs as a String-keyed Hash, so the probe prints `is_a?(Hash)`, not `class`).
     let ty = h.expect("h assigned").ty.clone();
-    assert!(matches!(&ty, Some(Ty::Hash { key, .. }) if **key == Ty::Str), "s.serializable_hash(...): {ty:?}");
+    let is_indifferent = ty.as_ref().is_some_and(|t| roundhouse::analyze::indifferent::value_of(t).is_some());
+    assert!(is_indifferent, "s.serializable_hash(...): {ty:?}");
 }

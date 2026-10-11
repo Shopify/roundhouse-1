@@ -76,6 +76,10 @@ pub const STR_BORROW: u64 = 1 << 33;
 /// Rust-local: only Rust's move semantics need this.
 pub const CLONE_AT: u64 = 1 << 34;
 
+// Bits 36-47 are a second cross-target range: 0-31 filled up (lanes that
+// merge each took the next free bit), and the rust-local bits above sit
+// in 32-34. `expr::decision_bits_are_distinct` holds all of them apart.
+
 // Bit 35 was `OPTION_WRAP` (Stage 4 of #22). Retired once the
 // `lower::ty_coerce_insertion` lowerer gained cross-LC visibility +
 // Var-recv coverage (Const + SelfRef + implicit-self + Var(Class) +

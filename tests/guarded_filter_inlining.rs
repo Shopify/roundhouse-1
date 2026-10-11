@@ -13,7 +13,7 @@
 //! already turns `if:`/`unless:` into a runtime condition
 //! (`cond_from_guards`) around the dispatch call.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

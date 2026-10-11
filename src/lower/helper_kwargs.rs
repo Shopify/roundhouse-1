@@ -230,6 +230,16 @@ fn rewrite_class_calls_node(
 /// and so the slots it fills, are known only at run time, and the erased
 /// call binds the whole Hash to the first open slot. A callee with a
 /// flattened `**rest` is left to `kwrest_forward`, which owns that shape.
+/// The constructor-keyword refusals the CRuby and JRuby trees run as written
+/// (`CONSTRUCTOR_KEYWORDS_AS_WRITTEN`), as warnings: the call binds as Ruby
+/// does there, so only a target that keeps flattened keywords positional
+/// refuses it (that target's emit still stubs the site).
+pub fn demote_constructor_keywords_run_as_written(diagnostics: &mut [crate::diagnostic::Diagnostic]) {
+    for d in diagnostics.iter_mut().filter(|d| constructor::runs_as_written(d)) {
+        d.severity = crate::diagnostic::Severity::Warning;
+    }
+}
+
 pub(crate) fn refuse_flattened_keyword_splats(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut diagnostics = Vec::new();
     let class_params = library_class_call_params(app);
