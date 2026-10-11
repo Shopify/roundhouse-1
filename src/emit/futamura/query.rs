@@ -19,7 +19,8 @@
 //! - Root: a model constant, or a plain `has_many` reader on a typed owner
 //!   (no `through:`, `as:`, or scope lambda; a `primary_key:` option is
 //!   not in the IR yet, so it cannot be refused).
-//! - Links: `where(column: value)`, `order`/`preload`/`includes` with
+//! - Links: `where(column: value)` (or `where(belongs_to_name: record_or_id)`,
+//!   bound as the key Rails' AssociationQueryValue would take), `order`/`preload`/`includes` with
 //!   literal arguments, `limit`, and scopes. A scope whose body only
 //!   builds a relation from literals (or calls other such scopes, or the
 //!   `with_attached_*`/`with_rich_text_*` scopes Rails generates) is called
@@ -29,8 +30,10 @@
 //!
 //! Request-time values become binds evaluated at the call site. Anything
 //! else declines with a reason, and the site stays Rails'. A model that
-//! may have a `default_scope` is never specialized: ingest does not model
-//! it, so the generated root `where` could not be trusted to be complete.
+//! may have a `default_scope` (its own source, superclasses, or included
+//! modules, transitively; see `scoping`) is never specialized: ingest does
+//! not model it, so the generated root `where` could not be trusted to be
+//! complete.
 
 use std::collections::HashMap;
 
@@ -102,8 +105,8 @@ pub struct Specializer<'a> {
     /// Integer class constants by bare name; `None` when two classes give
     /// the same name different values.
     int_consts: HashMap<String, Option<i64>>,
-    /// Models that may carry a `default_scope`.
-    default_scoped: Vec<String>,
+    /// Models that may carry a `default_scope`, with why.
+    default_scoped: HashMap<String, String>,
     /// The dumps of the databases other than the primary.
     schemas: super::schemas::DatabaseSchemas,
 }
@@ -120,21 +123,11 @@ impl<'a> Specializer<'a> {
                 }
             }
         }
-        let concern_mentions = app
-            .sources
-            .iter()
-            .any(|s| s.path.contains("app/models/concerns/") && s.text.contains("default_scope"));
+        let scoping = super::scoping::DefaultScopes::new(app);
         let default_scoped = app
             .models
             .iter()
-            .filter(|m| {
-                concern_mentions
-                    || app
-                        .sources
-                        .get((m.span.file.0 as usize).wrapping_sub(1))
-                        .is_some_and(|s| s.text.contains("default_scope"))
-            })
-            .map(|m| m.name.0.as_str().to_string())
+            .filter_map(|m| scoping.why(m).map(|why| (m.name.0.as_str().to_string(), why)))
             .collect();
         Specializer { app, models, int_consts, default_scoped, schemas }
     }
@@ -189,8 +182,8 @@ impl<'a> Specializer<'a> {
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
-        if self.default_scoped.iter().any(|m| m == chain.model.0.as_str()) {
-            return Err(format!("{} may have a default_scope", chain.model.0.as_str()));
+        if let Some(why) = self.default_scoped.get(chain.model.0.as_str()) {
+            return Err(format!("{} may have a default_scope ({why})", chain.model.0.as_str()));
         }
         let option = match terminal {
             Terminal::Link => return Err("chain does not end in a terminal".into()),
@@ -335,10 +328,26 @@ impl<'a> Specializer<'a> {
                     let ExprNode::Lit { value: Literal::Sym { value: column } } = &*k.node else {
                         return Err("where key is not a symbol".into());
                     };
-                    match self.has_column(&chain.model, column) {
-                        Ok(true) => {}
-                        Ok(false) => return Err(format!("where on `{}`, not a column", column.as_str())),
-                        Err(why) => return Err(format!("where on `{}`: {why}", column.as_str())),
+                    // PredicateBuilder#expand_from_hash tests for an association
+                    // before it looks at columns, so a `belongs_to` name is a key
+                    // even when the table has a column of that name.
+                    let belongs_to = self.belongs_to(&chain.model, column);
+                    match &belongs_to {
+                        Some(Association::BelongsTo { polymorphic: true, .. }) => {
+                            return Err(format!("where on polymorphic belongs_to `{}`", column.as_str()));
+                        }
+                        // The foreign key must be a column of the model's table.
+                        Some(Association::BelongsTo { foreign_key, .. }) => match self.has_column(&chain.model, foreign_key) {
+                            Ok(true) => {}
+                            Ok(false) => return Err(format!("belongs_to `{}` foreign key is not a column", column.as_str())),
+                            Err(why) => return Err(format!("where on `{}`: {why}", column.as_str())),
+                        },
+                        Some(_) => return Err(format!("where on association `{}` that is not a belongs_to", column.as_str())),
+                        None => match self.has_column(&chain.model, column) {
+                            Ok(true) => {}
+                            Ok(false) => return Err(format!("where on `{}`, not a column", column.as_str())),
+                            Err(why) => return Err(format!("where on `{}`: {why}", column.as_str())),
+                        },
                     }
                     if matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::Range { .. }) {
                         return Err("where value is a collection".into());
@@ -346,7 +355,13 @@ impl<'a> Specializer<'a> {
                     let value = match self.value(v, cx)? {
                         Val::Static(src) => src,
                         Val::Bind(src) => {
-                            chain.where_binds.push(src);
+                            // AssociationQueryValue turns a record into its key;
+                            // a StatementCache cannot take a record, so the call
+                            // site converts it the way Rails would.
+                            chain.where_binds.push(match belongs_to {
+                                Some(_) => format!("Futamura.association_key(::{}, :{}, {src})", chain.model.0.as_str(), column.as_str()),
+                                None => src,
+                            });
                             "p.bind".into()
                         }
                     };
@@ -583,6 +598,14 @@ impl<'a> Specializer<'a> {
             },
             (None, false) => Ok(Val::Static(format!("{owner}::{}", name.as_str()))),
         }
+    }
+
+    /// The association the model declares under `name`, if any.
+    fn belongs_to(&self, model: &ClassId, name: &Symbol) -> Option<&Association> {
+        self.models[model.0.as_str()].body.iter().find_map(|item| match item {
+            ModelBodyItem::Association { assoc, .. } if assoc.name() == name => Some(assoc),
+            _ => None,
+        })
     }
 
     /// Whether the model's table has `column`, looked up in the database the

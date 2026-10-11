@@ -33,6 +33,23 @@ module Futamura
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one)
     end
 
+    # The key `where(association: value)` binds, as Rails'
+    # PredicateBuilder::AssociationQueryValue#convert_to_id reads it: the
+    # record's primary key column, or the value itself when it has none. A
+    # StatementCache takes no record, so the call site passes this instead.
+    # nil (which it refuses, so Rails' own chain runs) for an association
+    # whose condition is not one key column.
+    def association_key(model, name, value)
+      reflection = model._reflect_on_association(name)
+      return unless reflection&.belongs_to? && !reflection.polymorphic?
+
+      primary_key = reflection.join_primary_key
+      foreign_key = reflection.join_foreign_key
+      return if primary_key.is_a?(Array) || foreign_key.is_a?(Array)
+
+      value.respond_to?(primary_key) ? value.public_send(primary_key) : value
+    end
+
     def records(key, binds, owner: nil, association: nil, &fallback)
       return fallback.call if binds.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
@@ -70,6 +87,11 @@ module Futamura
     # nil, so compute_if_absent remembers it) when Rails would load it in a
     # way a StatementCache cannot reproduce.
     def compile(statement, connection)
+      # `Model.all` applies default scopes, and the block runs once: a scope
+      # a gem or a reopened class added, which Roundhouse's source walk did
+      # not see, may read request state. Rails' own path handles it.
+      return false if statement.model.default_scopes.any?
+
       relation = nil
       cache = ActiveRecord::StatementCache.create(connection) { |params| relation = statement.build.call(params) }
       return false if relation.eager_loading? || relation.readonly_value || relation.extending_values.any?

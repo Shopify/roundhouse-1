@@ -13,6 +13,7 @@
 
 pub mod query;
 pub mod schemas;
+mod scoping;
 
 use std::collections::BTreeMap;
 

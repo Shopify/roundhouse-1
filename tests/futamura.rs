@@ -515,3 +515,116 @@ mod dumps_with_unmodeled_statements {
         assert!(!roundhouse::ingest::survey::is_active());
     }
 }
+
+/// Rails inherits default scopes down the superclass chain and through
+/// included modules (activerecord/lib/active_record/scoping/default.rb), so
+/// only a model that reaches a `default_scope` is left to Rails.
+mod default_scope_reach {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"plain_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"scoped_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"nested_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"derived_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"dynamic_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"gem_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
+
+    fn run() -> roundhouse::emit::futamura::Report {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            // A concern that scopes whoever includes it.
+            ("app/models/concerns/tenanted.rb", "module Tenanted\n  extend ActiveSupport::Concern\n  included do\n    default_scope { where(name: Current.name) }\n  end\nend\n"),
+            // A concern that reaches the scoping one only through another.
+            ("app/models/concerns/wrapped.rb", "module Wrapped\n  extend ActiveSupport::Concern\n  included do\n    include Tenanted\n  end\nend\n"),
+            ("app/models/concerns/harmless.rb", "module Harmless\n  extend ActiveSupport::Concern\n  def hello = 1\nend\n"),
+            ("app/models/base_thing.rb", "class BaseThing < ApplicationRecord\n  self.abstract_class = true\n  default_scope { order(:id) }\nend\n"),
+            ("app/models/plain_thing.rb", "class PlainThing < ApplicationRecord\n  include Harmless\nend\n"),
+            ("app/models/scoped_thing.rb", "class ScopedThing < ApplicationRecord\n  include Tenanted\nend\n"),
+            ("app/models/nested_thing.rb", "class NestedThing < ApplicationRecord\n  include Wrapped\nend\n"),
+            ("app/models/derived_thing.rb", "class DerivedThing < BaseThing\nend\n"),
+            ("app/models/dynamic_thing.rb", "class DynamicThing < ApplicationRecord\n  include Module.new\nend\n"),
+            // A gem's module has no app source: Rails reports its scopes at run time.
+            ("app/models/gem_thing.rb", "class GemThing < ApplicationRecord\n  include Discard::Model\nend\n"),
+            (
+                "app/services/finder.rb",
+                "class Finder\n  def self.all_of(x)\n    [PlainThing.where(name: x).to_a, ScopedThing.where(name: x).to_a, NestedThing.where(name: x).to_a, DerivedThing.where(name: x).to_a, DynamicThing.where(name: x).to_a, GemThing.where(name: x).to_a]\n  end\nend\n",
+            ),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        specialize(&app, &mut tree_files).unwrap()
+    }
+
+    #[test]
+    fn only_models_that_reach_a_default_scope_stay_residue() {
+        let report = run();
+        let residue = report.residue.join("\n");
+        for stays in ["ScopedThing", "NestedThing", "DerivedThing", "DynamicThing"] {
+            assert!(residue.contains(&format!("{stays} may have a default_scope")), "{stays}: {residue}");
+        }
+        // The unrelated concern's default_scope no longer taints every model.
+        assert!(!residue.contains("PlainThing may have"), "{residue}");
+        assert!(!residue.contains("GemThing may have"), "{residue}");
+        assert_eq!(report.specialized.len(), 2, "{:?}\n{residue}", report.specialized);
+    }
+
+    #[test]
+    fn the_residue_names_where_the_default_scope_came_from() {
+        let report = run();
+        let residue = report.residue.join("\n");
+        assert!(residue.contains("tenanted.rb declares a default_scope"), "{residue}");
+        assert!(residue.contains("base_thing.rb declares a default_scope"), "{residue}");
+        assert!(residue.contains("dynamic_thing.rb includes a module the specializer cannot resolve"), "{residue}");
+    }
+}
+
+/// `where(author: record_or_id)`: PredicateBuilder#expand_from_hash expands
+/// a `belongs_to` name to its foreign key (and, for a polymorphic one, the
+/// type column too). Only the non-polymorphic case is statically one
+/// condition, so only that one specializes.
+mod association_keys {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"authors\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"notes\", force: :cascade do |t|\n    t.integer \"author_id\"\n    t.integer \"subject_id\"\n    t.string \"subject_type\"\n    t.string \"slug\"\n  end\nend\n";
+
+    fn run(finder: &str) -> (roundhouse::emit::futamura::Report, Vec<(String, String)>) {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/author.rb", "class Author < ApplicationRecord\nend\n"),
+            ("app/models/note.rb", "class Note < ApplicationRecord\n  belongs_to :author\n  belongs_to :subject, polymorphic: true\nend\n"),
+            ("app/services/finder.rb", finder),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        (report, tree_files)
+    }
+
+    #[test]
+    fn a_belongs_to_key_binds_the_key_rails_would_take_from_the_value() {
+        let (report, files) = run("class Finder\n  def self.of(author, slug)\n    Note.find_by(author: author, slug: slug)\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
+        // Rails expands the name itself when it builds the statement.
+        assert!(init.contains("Note.all.where(author: p.bind, slug: p.bind).limit(1)"), "{init}");
+        let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.contains("[Futamura.association_key(::Note, :author, author), slug]"), "{finder}");
+    }
+
+    #[test]
+    fn a_polymorphic_belongs_to_key_is_left_to_rails() {
+        let (report, _) = run("class Finder\n  def self.of(subject)\n    Note.where(subject: subject).to_a\n  end\nend\n");
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(report.residue.iter().any(|r| r.contains("polymorphic belongs_to `subject`")), "{:?}", report.residue);
+    }
+}
