@@ -482,6 +482,13 @@ fn spliced_into_namespace(content: &str, owner: &str, target: &str, rendered: &s
     if own.len() < start + depth + 1 || own[start..start + depth].iter().zip(&headers).any(|(l, h)| l != h) {
         return None;
     }
+    // The same require can sit in the body, above the statements the
+    // reopen's render writes first.
+    let body = body
+        .lines()
+        .filter(|l| !split_require_relative(l.trim_start()).is_some_and(|(required, rest)| required == own_stem && rest.trim().is_empty()))
+        .collect::<Vec<_>>()
+        .join("\n");
     let leaf = target.rsplit("::").next()?;
     let declaration = own[start + depth].strip_prefix(&pad(depth))?;
     if !(declaration == format!("module {leaf}") || declaration.starts_with(&format!("class {leaf} ")) || declaration == format!("class {leaf}")) {
@@ -17420,9 +17427,34 @@ fn waits_on_its_constant(self_anchor: &str, anchor: &str, owner: &str, app: &App
     if cycles.get(self_anchor).is_some_and(|c| cycles.get(anchor) == Some(c)) {
         return true;
     }
+    if runs_requires_below_its_class(owner, app) {
+        return true;
+    }
     app.class_load_hooks.iter().any(|hook| {
         let class = hook.class.trim_start_matches("::");
         owner == class || owner.strip_prefix(class).is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
+/// Whether a gem source of `owner`'s file writes a top-level require
+/// below its first class (`authored_requires`' trailing requires). That
+/// file runs the required files, subclass files that name the class,
+/// while it is still loading, so a require of it from one of them
+/// reaches a loading file: Ruby has no such require, the class is
+/// defined by then (rack-oauth2's `connect_object.rb` ends in `require
+/// 'openid_connect/request_object'`, a subclass of the class it follows).
+fn runs_requires_below_its_class(owner: &str, app: &App) -> bool {
+    if app.gem_source_dirs.is_empty() {
+        return false;
+    }
+    let by_owner = authored_require_sources(app);
+    let Some(sources) = by_owner.get(owner) else { return false };
+    sources.iter().any(|&i| {
+        let source = &app.sources[i];
+        let rel = relative_source_path(app, &source.path);
+        app.gem_source_dirs.iter().any(|dir| rel.trim_start_matches('/').starts_with(dir.as_str()))
+            && first_declaration_end(source)
+                .is_some_and(|end| top_level_requires(source).iter().any(|(_, _, offset)| *offset >= end))
     })
 }
 
@@ -17617,7 +17649,7 @@ pub(crate) fn strongly_connected(edges: &[Vec<usize>]) -> Vec<usize> {
 /// before any app file runs. An app file under one of them reopens them
 /// (or nests under them), so a defined constant there does not mean that
 /// file has loaded.
-const FRAMEWORK_ROOTS: &[&str] = &[
+pub(super) const FRAMEWORK_ROOTS: &[&str] = &[
     "ActiveSupport",
     "ActiveModel",
     "ActiveRecord",

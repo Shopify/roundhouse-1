@@ -74,7 +74,10 @@ pub(super) fn enter_lexical_scope(scopes: &[&str], paths: std::rc::Rc<crate::det
 /// Management`). The analysis writes a resolved reference in full; the
 /// leading `::` keeps it the constant it resolved to. A name the
 /// innermost shadowing scope declares in full is that scope's, and one
-/// the app does not declare is not ours: both stay as written.
+/// the app does not declare is not ours: both stay as written, unless
+/// it is a framework's (`Rails::Railtie` in `class Money` beside a
+/// sibling `Money::Rails`, which a load order that has defined the
+/// sibling binds first: `uninitialized constant Money::Rails::Railtie`).
 pub(super) fn rooted_if_shadowed(written: &str, scopes: &[&str], paths: &crate::det::HashSet<String>) -> String {
     if written.starts_with("::") || scopes.is_empty() {
         return written.to_string();
@@ -83,7 +86,7 @@ pub(super) fn rooted_if_shadowed(written: &str, scopes: &[&str], paths: &crate::
     let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
         return written.to_string();
     };
-    if paths.contains(&format!("{scope}::{written}")) || !paths.contains(written) {
+    if paths.contains(&format!("{scope}::{written}")) || !(paths.contains(written) || super::library::FRAMEWORK_ROOTS.contains(&first)) {
         return written.to_string();
     }
     format!("::{written}")

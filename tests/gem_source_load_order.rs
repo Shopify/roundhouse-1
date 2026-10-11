@@ -196,3 +196,37 @@ fn a_nested_namespace_a_later_file_opens_does_not_shadow_the_top_level_before_it
     );
     assert_eq!(lines(&run.stdout), expected, "emitted Tessera diverges from the gem");
 }
+
+/// The same shape under `ruby -w`, where a `require` of a file that is
+/// still loading prints "loading in progress, circular require considered
+/// harmful" (a StrictWarning-style boot raises on it). Natively the
+/// subclass file never requires its superclass's file back: the
+/// superclass is defined by the time the tail require runs. The emitted
+/// subclass file's own dependency require of the superclass file
+/// (`require_relative "node"`) must therefore not run while that file is
+/// still loading.
+#[test]
+fn a_require_written_below_a_gem_class_does_not_re_enter_the_loading_file() {
+    let files: &[(&str, &str)] = &[
+        ("lib/tessera.rb", "require 'tessera/node'\n"),
+        (
+            "lib/tessera/node.rb",
+            "module Tessera\n  class Node\n    include ActiveModel::Validations\n\n    validate :check\n\n    def check\n    end\n  end\nend\n\nrequire 'tessera/leaf'\nrequire 'tessera/twig'\n",
+        ),
+        ("lib/tessera/leaf.rb", "module Tessera\n  class Leaf < Node\n    def kind\n      :leaf\n    end\n  end\nend\n"),
+        ("lib/tessera/twig.rb", "module Tessera\n  class Twig < Node\n    def kind\n      :twig\n    end\n  end\nend\n"),
+    ];
+    let run = app_with(files, "require \"tessera\"\n")
+        .run_ruby_env("puts \"#{Tessera::Leaf.new.kind} #{Tessera::Twig.new.kind}\"\n", &[("RUBYOPT", "-w")]);
+    assert!(
+        run.success,
+        "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
+        run.emitted.display(),
+        run.stdout,
+        run.stderr,
+        run.errors
+    );
+    assert_eq!(lines(&run.stdout), ["leaf twig"]);
+    let circular: Vec<&str> = run.stderr.lines().filter(|l| l.contains("circular require")).collect();
+    assert!(circular.is_empty(), "a require re-entered a loading file: {circular:#?}");
+}
