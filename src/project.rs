@@ -9266,6 +9266,17 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let (namespace, name) = cpath.rsplit_once("::").unwrap_or(("Object", cpath.as_str()));
         if let Some(file) = namespaces.get(namespace).and_then(|c| c.get(name)).and_then(|c| c.file.as_ref()) {
             callback_files.push((as_loaded(file), cpath.clone()));
+            continue;
+        }
+        // A constant no file of its own autoloads, assigned in its
+        // namespace's declarations file (`module Ns; Name = Factory.new; end`
+        // in the file that is the namespace's autoload): Zeitwerk loads that
+        // file as the constant's, so the callback runs once it has loaded.
+        let (outer, inner) = namespace.rsplit_once("::").unwrap_or(("Object", namespace));
+        let Some(file) = namespaces.get(outer).and_then(|c| c.get(inner)).and_then(|c| c.file.as_ref()) else { continue };
+        let (emitted, assignment) = (format!("app/{}.rb", as_loaded(file)), format!("{name} = "));
+        if files.iter().any(|(p, content)| *p == emitted && content.lines().any(|l| l.trim_start().starts_with(&assignment))) {
+            callback_files.push((as_loaded(file), cpath.clone()));
         }
     }
     if !callback_files.is_empty() {
