@@ -10962,6 +10962,7 @@ fn late_includes<'a>(lc: &'a LibraryClass, app: &App, positioned: &[(usize, &Cla
         .iter()
         .filter(|c| !c.span.is_synthetic() && crate::lower::job_class_side::is_callbacks_port_call(c))
         .map(|c| c.span)
+        .chain(macro_hooked_include_floor(lc, app, positioned))
         .min_by_key(|span| (span.file.0, span.start));
     let Some(first) = first else { return Vec::new() };
     let Some(source) = (first.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
@@ -10989,6 +10990,90 @@ fn late_includes<'a>(lc: &'a LibraryClass, app: &App, positioned: &[(usize, &Cla
         }
     }
     late
+}
+
+/// Whether the app module `inc`'s `self.included(base)` hook sends `base`
+/// a class macro: a call that is no `Module` builtin (`extend`,
+/// `class_eval`, ...), so one a superclass or an extended module defines,
+/// which reads the state the including body's earlier macro calls set
+/// (Rails' `Module#included` runs where `include` stands).
+fn included_hook_sends_class_macro(inc: &ClassId, app: &App) -> bool {
+    const MODULE_BUILTINS: &[&str] = &[
+        "extend", "include", "prepend", "class_eval", "class_exec", "module_eval", "module_exec", "instance_eval",
+        "instance_exec", "send", "public_send", "__send__", "define_method", "define_singleton_method", "alias_method",
+        "attr_accessor", "attr_reader", "attr_writer", "const_set", "const_get", "const_defined?", "method_defined?",
+        "instance_methods", "instance_method", "name", "to_s", "is_a?", "kind_of?", "respond_to?", "ancestors",
+        "include?", "private", "public", "protected", "private_constant", "remove_method", "undef_method",
+        "instance_variable_get", "instance_variable_set", "class_variable_get", "class_variable_set", "singleton_class",
+        "module_function", "freeze", "tap", "then", "nil?", "equal?", "object_id", "instance_variable_defined?",
+    ];
+    let bare = inc.0.as_str().trim_start_matches("::");
+    let Some(module) = first_module_bare_named(bare, app) else { return false };
+    let Some(hook) = module
+        .methods
+        .iter()
+        .find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && m.params.len() == 1)
+    else {
+        return false;
+    };
+    let base = hook.params[0].name.clone();
+    fn walk(e: &Expr, base: &Symbol, hit: &mut bool) {
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name == base)
+            && !MODULE_BUILTINS.contains(&method.as_str())
+        {
+            *hit = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, base, hit));
+    }
+    let mut hit = false;
+    walk(&hook.body, &base, &mut hit);
+    hit
+}
+
+/// The first body statement the source writes above an include of `lc`
+/// whose `included` hook sends `base` a class macro
+/// (`included_hook_sends_class_macro`): from it on the includes are
+/// written where the body's statements reach them (`late_includes`), as
+/// Ruby runs the hook at the `include`. Core's `AppCatalog` calls
+/// `implements` and `pre_resolve_access`, then includes a module whose hook
+/// calls `base.post_resolve_access`, which raises when the class has no
+/// access declared yet; the include bucket wrote it first.
+fn macro_hooked_include_floor(lc: &LibraryClass, app: &App, positioned: &[(usize, &ClassId)]) -> Option<Span> {
+    let candidates: Vec<&ClassId> = lc
+        .includes
+        .iter()
+        .filter(|inc| !positioned.iter().any(|(_, p)| p == inc))
+        .filter(|inc| included_hook_sends_class_macro(inc, app))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let calls: Vec<Span> = lc.unknown_calls.iter().map(|c| c.span).filter(|s| !s.is_synthetic()).collect();
+    let file = calls.iter().map(|s| s.file).min_by_key(|f| f.0)?;
+    let source = (file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i))?;
+    let offsets = crate::lower::job_class_side::include_offsets(&source.text, lc.name.0.as_str());
+    let mut cursor = 0;
+    let mut floor: Option<Span> = None;
+    for inc in lc.includes.iter().filter(|inc| !positioned.iter().any(|(_, p)| p == inc)) {
+        let id = inc.0.as_str().trim_start_matches("::");
+        let Some(k) = offsets[cursor..].iter().position(|(written, _)| id == written || id.ends_with(&format!("::{written}")))
+        else {
+            continue;
+        };
+        cursor += k + 1;
+        if !candidates.contains(&inc) {
+            continue;
+        }
+        let at = offsets[cursor - 1].1;
+        let above = calls.iter().filter(|s| s.file == file && s.start < at).min_by_key(|s| s.start);
+        if let Some(above) = above
+            && floor.is_none_or(|f| above.start < f.start)
+        {
+            floor = Some(*above);
+        }
+    }
+    floor
 }
 
 /// The replayed `extend M`s of the app's own modules that the source
