@@ -2361,6 +2361,16 @@ end
         .filter_map(|root| root.strip_prefix(dir).ok())
         .map(|rel| format!("{}/", rel.display()))
         .collect();
+    // Rails' engines and application put `lib` on `$LOAD_PATH` in every
+    // environment (engine/configuration.rb `paths.add "lib", load_path: true`).
+    app.lib_load_roots = std::iter::once(dir.to_path_buf())
+        .chain(engine_dirs.iter().cloned())
+        .map(|root| root.join("lib"))
+        .filter(|root| vfs.is_dir(root))
+        .filter_map(|root| root.strip_prefix(dir).ok().map(|rel| format!("{}/", rel.display())))
+        .collect();
+    app.lib_load_roots.sort();
+    app.lib_load_roots.dedup();
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();

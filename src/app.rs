@@ -531,6 +531,14 @@ pub struct App {
     /// (`project::test_load_path_features`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_load_roots: Vec<String>,
+    /// The run-time `$LOAD_PATH` below the app root in every environment,
+    /// each ending in `/`: the application's and each engine's `lib`
+    /// (Rails::Engine's `paths.add("lib", load_path: true)`, railties
+    /// engine/configuration.rb; Rails::Application inherits it). A carried
+    /// file below one answers a `require` of its feature
+    /// (`project::lib_load_path_features`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lib_load_roots: Vec<String>,
     /// The carried file programs `test/test_helper.rb` requires, by
     /// source path, in the order it requires them: Core's
     /// `require "platform/testing/test_helper"` inside its load block,
@@ -1490,6 +1498,7 @@ impl App {
             bundler_gems: Vec::new(),
             gem_source_dirs: Vec::new(),
             test_load_roots: Vec::new(),
+            lib_load_roots: Vec::new(),
             test_helper_programs: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),

@@ -9288,6 +9288,16 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         writeln!(body, "    {feature:?} => {loads:?},").unwrap();
     }
     body.push_str("  }.freeze\n");
+    let lib_features = lib_load_path_features(app, &program_anchors, &declarations_by_source, &emitted_file);
+    body.push_str(
+        "  # feature on the application's or an engine's `lib` (carried there) => the files\n  \
+         # requiring it loads in every environment (`project::lib_load_path_features`)\n  \
+         LIB_LOAD_PATH_FEATURES = {\n",
+    );
+    for (feature, loads) in &lib_features {
+        writeln!(body, "    {feature:?} => {loads:?},").unwrap();
+    }
+    body.push_str("  }.freeze\n");
     let test_features = test_load_path_features(app, &program_anchors, &declarations_by_source, &emitted_file);
     body.push_str(
         "  # feature on the test load path (a test-support file) => the files\n  \
@@ -9374,7 +9384,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
     }
     body.push_str(IMPLICIT_NAMESPACE_REQUIRE);
-    if !compiled_features.is_empty() || !test_features.is_empty() {
+    if !compiled_features.is_empty() || !lib_features.is_empty() || !test_features.is_empty() {
         body.push_str(COMPILED_GEM_REQUIRE);
     }
     if boot_programs.is_empty() {
@@ -10173,8 +10183,32 @@ fn test_load_path_features(
     declarations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
     emitted_file: &dyn Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
+    load_root_features(&app.test_load_roots, program_anchors, declarations_by_source, emitted_file)
+}
+
+/// The run-time load path's features ([`App::lib_load_roots`]): as
+/// [`test_load_path_features`], for the application's and each engine's
+/// `lib`, which Rails puts on `$LOAD_PATH` in every environment
+/// (railties engine/configuration.rb `paths.add "lib", load_path: true`).
+/// A carried file below one answers a `require` of its feature at run
+/// time, where the emitted tree has no such directory.
+fn lib_load_path_features(
+    app: &App,
+    program_anchors: &std::collections::BTreeSet<String>,
+    declarations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: &dyn Fn(&str) -> bool,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    load_root_features(&app.lib_load_roots, program_anchors, declarations_by_source, emitted_file)
+}
+
+fn load_root_features(
+    roots: &[String],
+    program_anchors: &std::collections::BTreeSet<String>,
+    declarations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: &dyn Fn(&str) -> bool,
+) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut found: std::collections::BTreeMap<String, Vec<Vec<String>>> = std::collections::BTreeMap::new();
-    if app.test_load_roots.is_empty() {
+    if roots.is_empty() {
         return std::collections::BTreeMap::new();
     }
     let programs = program_anchors
@@ -10185,8 +10219,7 @@ fn test_load_path_features(
     for rel in &sources {
         // A file below two roots (`test/` and `test/support/`) is a
         // feature of each.
-        let features: Vec<&str> = app
-            .test_load_roots
+        let features: Vec<&str> = roots
             .iter()
             .filter_map(|root| rel.strip_prefix(root.as_str()))
             .filter_map(|rest| rest.strip_suffix(".rb"))
@@ -10224,6 +10257,8 @@ fn test_load_path_features(
 const COMPILED_GEM_REQUIRE: &str = r##"
 # A gem the tree compiles from source answers its own features for a
 # native gem that requires one (`project::compiled_gem_features`), and
+# a carried file below an engine's or the application's `lib` answers
+# its feature (`project::lib_load_path_features`), and
 # in the test environment a carried test-support file answers its
 # feature on the test load path (`project::test_load_path_features`).
 module Kernel
@@ -10235,6 +10270,7 @@ module Kernel
   private def require(feature)
     key = feature.is_a?(String) && feature.delete_suffix(".rb")
     files = key && (RoundhouseAutoload::COMPILED_GEM_FEATURES[key] ||
+      RoundhouseAutoload::LIB_LOAD_PATH_FEATURES[key] ||
       (RoundhouseAutoload::TEST_LOAD_PATH_FEATURES[key] if defined?(::Rails.env) && ::Rails.env.test?))
     return RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, feature) unless files
     files.map { |file| RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, RoundhouseAutoload.path(file)) }.any?
