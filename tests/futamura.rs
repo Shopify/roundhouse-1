@@ -571,6 +571,29 @@ mod default_scope_reach {
         assert_eq!(report.specialized.len(), 2, "{:?}\n{residue}", report.specialized);
     }
 
+    /// A constant is resolved through the namespaces around it, so a model
+    /// is not tainted by a same-named class in another namespace.
+    #[test]
+    fn a_same_named_class_in_another_namespace_does_not_taint_a_model() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"admin_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("app/models/concerns/tenanted.rb", "module Tenanted\n  extend ActiveSupport::Concern\n  included do\n    default_scope { where(name: Current.name) }\n  end\nend\n"),
+            ("app/models/thing.rb", "class Thing < ApplicationRecord\nend\n"),
+            ("app/models/admin/thing.rb", "module Admin\n  class Thing < ApplicationRecord\n    include Tenanted\n  end\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    [Thing.where(name: x).to_a, Admin::Thing.where(name: x).to_a]\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let residue = report.residue.join("\n");
+        assert!(residue.contains("Admin::Thing may have a default_scope"), "{residue}");
+        assert!(!residue.contains(": Thing may have"), "{residue}");
+        assert_eq!(report.specialized.len(), 1, "{residue}");
+    }
+
     #[test]
     fn the_residue_names_where_the_default_scope_came_from() {
         let report = run();
