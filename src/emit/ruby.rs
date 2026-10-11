@@ -470,7 +470,8 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     library::apply_hydration_nil_lowering(&mut lcs, app);
     // CRuby/JRuby: a nil written to a belongs_to stores nil (NULL), not
     // the strict targets' 0/"" sentinel.
-    library::apply_belongs_to_nil_writes(&mut lcs, app);
+    let no_views = crate::det::HashMap::default();
+    library::apply_belongs_to_nil_writes(&mut lcs, app, &no_views);
     // CRuby/JRuby: broadcasts_to renders for the record located again,
     // as Rails' later job does.
     library::apply_broadcast_located_record(&mut lcs, app);
@@ -482,7 +483,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // on a runtime Relation executes as batched IN-loads instead of
     // N+1 lazy reads. Runs last so nothing reprocesses the synthesized
     // bodies (no-op unless the app mentions includes).
-    library::apply_preload_lowering(&mut lcs, app);
+    library::apply_preload_lowering(&mut lcs, app, &no_views);
     // A belongs_to reader memoizes, and writing the foreign key
     // invalidates it (no-op for models with no belongs_to). AFTER the
     // preload pass, which is what puts the `return @<name>_cache if
@@ -492,12 +493,12 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     library::apply_belongs_to_memoization(&mut lcs, app);
     // …and a has_many/has_one reader keeps the records it loads where the
     // app reads `loaded?` (same guard, same reason to run after preload).
-    library::apply_collection_memoization(&mut lcs, app);
+    library::apply_collection_memoization(&mut lcs, app, &no_views);
     // `record.reload` drops the targets those caches hold, as Rails'.
-    library::apply_reload_resets_associations(&mut lcs, app);
+    library::apply_reload_resets_associations(&mut lcs, app, &no_views);
     // A has_many validates its new (or, in a custom context, loaded)
     // records with the owner, from the caches the memoization keeps.
-    collection_autosave::apply(&mut lcs, app);
+    collection_autosave::apply(&mut lcs, app, &no_views);
     // Every association reader waits on its record's pending preload
     // (`lower::deferred_preload`): a Relation's includes run when a record
     // first reads an association, not when the rows arrive. After the two
