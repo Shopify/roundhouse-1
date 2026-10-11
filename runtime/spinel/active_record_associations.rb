@@ -846,15 +846,23 @@ module ActiveRecord
         @proxy_owner.public_send(@proxy_name)
       end
 
+      # A method the proxy does not define goes to the association's scope,
+      # and from there to the target class's class methods run under that
+      # scope (`Event.log` through `shop.events.log`), as Rails'
+      # CollectionProxy delegates to its scope and Relation::Delegation
+      # delegates `klass.respond_to?(method)` through `scoping`.
       def method_missing(method, *args, **kwargs, &block)
         relation = scope
-        return super unless relation.respond_to?(method)
-        relation.public_send(method, *args, **kwargs, &block)
+        return relation.public_send(method, *args, **kwargs, &block) if relation.respond_to?(method)
+        model = relation.model
+        return super unless model.respond_to?(method)
+        relation.scoping { model.public_send(method, *args, **kwargs, &block) }
       end
 
       def respond_to_missing?(method, include_private = false)
         return false if method.to_s.start_with?("to_")
-        scope.respond_to?(method) || super
+        relation = scope
+        relation.respond_to?(method) || relation.model.respond_to?(method) || super
       rescue NotImplementedError
         super
       end
