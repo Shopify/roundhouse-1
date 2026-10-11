@@ -1953,7 +1953,24 @@ end
                 &mut methods,
             ));
         }
-        if !methods.is_empty() {
+        // The application body's `initializer` blocks, replayed in
+        // Rails' order by the PostgreSQL tree's railtie runtime
+        // (`application_initializers`). One that does not ingest is
+        // reported by name, not dropped.
+        let mut application_initializers: Vec<crate::expr::Expr> = Vec::new();
+        if postgresql {
+            let (carried, refused) = super::application_initializers::extract(&source, &file);
+            application_initializers = carried;
+            for (start, end, message) in refused {
+                let span = crate::span::Span { file: super::sources::file_id(&file), start: start as u32, end: end as u32 };
+                app.ingest_drops.push(crate::app::IngestDrop {
+                    span,
+                    message,
+                    construct: Some("initializer".to_string()),
+                });
+            }
+        }
+        if !methods.is_empty() || !application_initializers.is_empty() {
             app.rails_application = Some(crate::dialect::LibraryClass {
                 conditional_definitions: Vec::new(),
                 method_aliases: Vec::new(),
@@ -1967,7 +1984,7 @@ end
                 nullable_columns: Vec::new(),
                 origin: None,
                 constants,
-                unknown_calls: Vec::new(),
+                unknown_calls: application_initializers,
                 class_ivar_initializers: Vec::new(),
                 visibility_overrides: Vec::new(),
             });

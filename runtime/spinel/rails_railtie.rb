@@ -262,6 +262,11 @@ module Rails
     end
   end
 
+  # The application's class body registers initializers like any
+  # railtie's (`class Application < Rails::Application; initializer :x do
+  # |app| … end`); Rails::Engine.application_initializers runs them.
+  Application.extend Initializable::ClassMethods
+
   class Railtie
     include Initializable
 

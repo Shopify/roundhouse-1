@@ -10366,7 +10366,7 @@ fn emit_library_class_decl_inner(
     // record for check, not a statement. The include it names is written
     // above (`write_include`), where the source has it; replayed, the
     // record raised again at the end of a body whose include had run.
-    let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
+    let replayed: Vec<&Expr> = if railtie || is_application_reopen(lc) || replays_foreign_class_body(lc, app) {
         lc.unknown_calls
             .iter()
             .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
@@ -14987,6 +14987,13 @@ fn inline_declarations(classes: &[LibraryClass], app: &App, out_path: &Path) -> 
 /// is replayed statement by statement under `run_body_statement`.
 fn carried_railtie(lc: &LibraryClass, app: &App) -> bool {
     !lc.is_module && app.railties.iter().any(|r| r.name == lc.name)
+}
+
+/// The `Rails::Application` reopen `App::rails_application` carries: its
+/// class body is the application's `initializer` registrations
+/// (`ingest::application_initializers`), replayed as written.
+fn is_application_reopen(lc: &LibraryClass) -> bool {
+    !lc.is_module && lc.name.0.as_str() == "Rails::Application"
 }
 
 /// The locals a class-body statement writes in the body's own scope:
