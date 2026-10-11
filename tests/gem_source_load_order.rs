@@ -157,3 +157,42 @@ fn a_require_written_below_a_gem_class_runs_after_the_class_is_defined() {
     );
     assert_eq!(lines(&run.stdout), ["leaf Tessera::Node Tessera::Leaf"]);
 }
+
+/// A gem file that opens a namespace nested (`module Tessera; module
+/// Logger`) defines it when that file loads, as shopify-money 4.1.1's
+/// `money/rails/job_argument_serializer.rb` (`class Money; module Rails`)
+/// does. Until then a lexical `Logger` inside `module Tessera` is the top
+/// level's, as `Rails::Railtie` inside `class Money` is natively; the
+/// emitted tree must not define the nested namespace ahead of its file.
+#[test]
+fn a_nested_namespace_a_later_file_opens_does_not_shadow_the_top_level_before_it_loads() {
+    const NESTED: &[(&str, &str)] = &[
+        (
+            "lib/tessera.rb",
+            "require 'logger'\n\nmodule Tessera\n  class Formatter < Logger::Formatter\n  end\nend\n\nrequire 'tessera/logger/sink'\n",
+        ),
+        (
+            "lib/tessera/logger/sink.rb",
+            "module Tessera\n  module Logger\n    class Sink\n      def self.tag\n        :sink\n      end\n    end\n  end\nend\n",
+        ),
+    ];
+    const SEE: &str = "puts Tessera::Formatter.superclass.name\nputs Tessera::Logger::Sink.tag.inspect\n";
+    let gem = std::env::temp_dir().join(format!("rh_tessera_nested_native_{}", std::process::id()));
+    write_gem(&gem, NESTED);
+    let native = emit_and_run::ruby().arg("-I").arg(gem.join("lib")).args(["-rtessera", "-e", SEE]).output().expect("CRuby control");
+    assert!(native.status.success(), "native tessera: {}", String::from_utf8_lossy(&native.stderr));
+    let expected = lines(&String::from_utf8_lossy(&native.stdout));
+    std::fs::remove_dir_all(&gem).unwrap();
+    assert_eq!(expected, ["Logger::Formatter", ":sink"], "native control");
+
+    let run = app_with(NESTED, "require \"tessera\"\n").run_ruby(SEE);
+    assert!(
+        run.success,
+        "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
+        run.emitted.display(),
+        run.stdout,
+        run.stderr,
+        run.errors
+    );
+    assert_eq!(lines(&run.stdout), expected, "emitted Tessera diverges from the gem");
+}

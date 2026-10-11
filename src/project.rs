@@ -8294,6 +8294,23 @@ fn constant_assignment(text: &str) -> Option<&str> {
 /// aggregator, so every load-time error still surfaces. Nothing is
 /// dropped: a file is only loaded later, never omitted. The spinel tree
 /// keeps the eager aggregator (AOT resolves the whole require graph).
+/// The path of a file's first `module`/`class` header when it is compact
+/// (`module A::B::C`), else None.
+fn compact_header_path(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("module ")
+                .or_else(|| l.strip_prefix("class "))
+                .map(|r| r.split(|c: char| c.is_whitespace() || c == '<').next().unwrap_or(""))
+        })
+        .filter(|p| p.contains("::"))
+}
+
+fn opens_compact_header(content: &str) -> bool {
+    compact_header_path(content).is_some()
+}
+
 fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     use std::collections::BTreeMap;
     use std::fmt::Write;
@@ -8983,15 +9000,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let Some(chain) = autoload_primary(anchor, content) else {
             if !gem_file {
                 boot_files.push(anchor);
-            } else if let Some(path) = content
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("module ")
-                        .or_else(|| l.strip_prefix("class "))
-                        .map(|r| r.split(|c: char| c.is_whitespace() || c == '<').next().unwrap_or(""))
-                })
-                .filter(|p| p.contains("::"))
-            {
+            } else if let Some(path) = compact_header_path(content) {
                 // The compact path of the declaration: its leading segments
                 // are namespaces, modules where a source opens them so.
                 let chain: Vec<(String, bool)> = path.split("::").map(|seg| (seg.to_string(), true)).collect();
@@ -9001,7 +9010,15 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         };
         let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
         if gem_file && !gem_autoloads(&full) && !in_autoloaded_file(anchor, &full) {
-            implicit_parents(&chain, &mut namespaces);
+            // Only a compact header (`module A::B::C`) needs its parents
+            // defined first. A nested declaration opens its own namespaces
+            // when its file loads; an implicit module registered for one
+            // ahead of that would answer lexical lookups Ruby sends to the
+            // top level (shopify-money's `class Money; module Rails` would
+            // turn `Rails::Railtie` inside `class Money` into `Money::Rails`).
+            if opens_compact_header(content) {
+                implicit_parents(&chain, &mut namespaces);
+            }
             continue;
         }
         // Two files that both define the same constant cannot both be its
