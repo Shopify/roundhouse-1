@@ -4036,10 +4036,11 @@ fn ruby_family_files(
              # commonmark-java Markly shim — from the same list, minus that\n\
              # one name.)\n\
              require_relative \"module_delegate\"\n\
-             require_relative \"open_telemetry_facade\"\n\
+             {}\
              require_relative \"rails_configuration\"\n\
              require_relative \"rails_autoloaders\"\n\
              {}{}{}",
+            open_telemetry_require(app.gem_lock.as_ref()),
             // Before the Bundler.require list: a gem source's own
             // dependencies load where Bundler requires the gem, and Core's
             // Gemfile requires panama_client "before anything else that may
@@ -4074,9 +4075,10 @@ fn ruby_family_files(
                  require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
              require_relative \"rails_autoloaders\"\n\
-                 require_relative \"open_telemetry_facade\"\n\
+                 {}\
                  {}{}",
                 markly_require,
+                open_telemetry_require(app.gem_lock.as_ref()),
                 gem_require_block(&jruby_excluded, app.gem_lock.as_ref()),
                 WEB_PUSH_STUB_REOPEN
             )
@@ -14079,6 +14081,19 @@ const LOCK_GATED_DEPENDENCIES: [&str; 127] = [
     "sorbet-runtime", "ssrf_filter", "statsd-instrument", "strscan", "timeout", "ttfunk", "twirp",
     "typhoeus", "tzinfo", "uri", "zeitwerk", "zlib",
 ];
+
+/// How a Ruby-family tree gets `OpenTelemetry::Trace`: where the app's
+/// lock pins `opentelemetry-api` the real gem answers (its
+/// `Trace.current_span(context = nil)` and the SDK's recording spans
+/// included), and the non-recording facade is only the fallback when the
+/// gem is not installed. A tree with no such gem takes the facade as is.
+fn open_telemetry_require(lock: Option<&crate::gems::Lockfile>) -> &'static str {
+    if lock.is_some_and(|lock| lock.has("opentelemetry-api")) {
+        "begin\n  require \"opentelemetry\"\nrescue LoadError\n  require_relative \"open_telemetry_facade\"\nend\n"
+    } else {
+        "require_relative \"open_telemetry_facade\"\n"
+    }
+}
 
 /// The test framework the CRuby test process runs on: real Minitest
 /// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the

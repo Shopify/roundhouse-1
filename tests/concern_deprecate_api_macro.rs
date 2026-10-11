@@ -632,7 +632,7 @@ const OTEL_APPLICATION_CONTROLLER: &str = "class ApplicationController < ActionC
 
 const OTEL_WIDGETS_CONTROLLER: &str = r#"class WidgetsController < ApplicationController
   before_action do
-    span = OpenTelemetry::Trace.current_span
+    span = OpenTelemetry::Trace.current_span(nil)
     response.headers['X-Recording'] = span.recording?.to_s
     span.set_attribute('probe', true)
   end
