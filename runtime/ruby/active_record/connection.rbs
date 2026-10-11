@@ -85,9 +85,9 @@ module ActiveRecord
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
-    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer
+    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped) -> Integer
     def self._conflict_predicate: (String columns) -> String
-    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer
+    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped) -> Integer
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
     def self.abstract_class: () -> bool?

@@ -4666,6 +4666,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let callbacks = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_callbacks.rb")
         .map_err(|e| format!("read Active Record callbacks runtime: {e}"))?;
     files.push(("runtime/active_record_callbacks.rb".into(), callbacks));
+    // `accepts_nested_attributes_for` and the autosave pieces it uses
+    // (activerecord nested_attributes.rb, autosave_association.rb), over
+    // the reflections and the association objects, reopening Base.
+    let nested_attributes = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_nested_attributes.rb")
+        .map_err(|e| format!("read Active Record nested attributes runtime: {e}"))?;
+    files.push(("runtime/active_record_nested_attributes.rb".into(), nested_attributes));
     // ActiveRecord::FixtureSet, its File and RenderContext, and
     // ActiveRecord::Fixture (activerecord 8.2.0.alpha fixtures.rb,
     // fixture_set/file.rb), which Active Record autoloads: an app's own
@@ -4901,6 +4907,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                         .chain(carries_api.then_some("active_model_api"))
                         .chain([
                             "active_record_callbacks",
+                            "active_record_nested_attributes",
                             "active_record_fixture_set",
                             "active_support_string_inquirer",
                         ])

@@ -180,6 +180,7 @@ fn runtime_registers_at_class_body(name: &str) -> bool {
             | "validates_with"
             | "validates_each"
             | "validates_associated"
+            | "accepts_nested_attributes_for"
             | "before_validation"
             | "after_validation"
             | "after_find"
@@ -655,6 +656,22 @@ impl<'a> ClassSide<'a> {
             return Some(verdict);
         }
         let ExprNode::Send { recv, method, args, block, .. } = &*call.node else { return None };
+        // The PostgreSQL CRuby tree's base answers `accepts_nested_attributes_for`
+        // at class-body time (runtime/spinel/cruby/active_record_nested_attributes.rb),
+        // over the association reflections the compiled class carries.
+        if method.as_str() == "accepts_nested_attributes_for"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && self.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+        {
+            // The call's own arguments run in the class body.
+            let mut walk = Walk::new(self, method.as_str());
+            let mut aliases = Vec::new();
+            let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
+            return Some(match result {
+                Ok(()) => MacroVerdict::Replay,
+                Err(reason) => MacroVerdict::Refuse(reason),
+            });
+        }
         if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) || is_model_dsl(method.as_str()) {
             return None;
         }

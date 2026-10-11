@@ -840,8 +840,8 @@ module ActiveRecord
     # `Model.upsert(attrs, …)` — INSERT that folds into an UPDATE when it
     # collides, in one statement. Rails routes the single-row form
     # through `upsert_all`; so does this.
-    def self.upsert(attrs, unique_by: nil, on_duplicate: nil, returning: nil)
-      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, returning: returning)
+    def self.upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
+      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
     end
 
     # The predicate of the unique index on `columns` (sorted, joined with
@@ -866,13 +866,15 @@ module ActiveRecord
     # fragment (`Arel.sql("value = value + 1")` — Arel.sql is the
     # identity here, so it arrives as a String). Otherwise every
     # non-conflict column is assigned from `excluded`, matching Rails.
+    # `update_only:` (a column or list of columns, insert_all.rb) narrows
+    # that default to the named columns; the rest keep their stored value.
     #
     # NOT Rails-complete, deliberately: no RETURNING (asking for it
     # raises rather than quietly handing back nothing) and no
     # `record_timestamps` stamping — no corpus model upserts a table
     # that has timestamps. Returns the affected-row count, the same
     # currency `update_counters` deals in.
-    def self.upsert_all(rows, unique_by: nil, on_duplicate: nil, returning: nil)
+    def self.upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
       return 0 if rows.length == 0
       if returning
         raise NotImplementedError, "#{name}.upsert_all: RETURNING is not supported"
@@ -889,6 +891,10 @@ module ActiveRecord
       assigns = on_duplicate
       if assigns.nil?
         updatable = cols.reject { |c| target_names.include?(c.to_s) }
+        unless update_only.nil?
+          only = (update_only.is_a?(Array) ? update_only : [update_only]).map { |c| c.to_s }
+          updatable = updatable.select { |c| only.include?(c.to_s) }
+        end
         # Every column IS the conflict target: there is nothing left to
         # assign, and `DO UPDATE SET` with an empty list is a syntax
         # error. Rails degrades to a no-op insert here too.
