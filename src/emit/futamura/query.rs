@@ -29,11 +29,13 @@
 //! - Terminal: `first(n)` / `last(n)` on an ordered chain, or `to_a`.
 //!
 //! Request-time values become binds evaluated at the call site. Anything
-//! else declines with a reason, and the site stays Rails'. A model that
-//! may have a `default_scope` (its own source, superclasses, or included
-//! modules, transitively; see `scoping`) is never specialized: ingest does
-//! not model it, so the generated root `where` could not be trusted to be
-//! complete.
+//! else declines with a reason, and the site stays Rails'. A model's
+//! `default_scope` is Ruby that runs when `Model.all` is evaluated, so it
+//! is not decided here: the runtime has Rails evaluate it at each call and
+//! builds the statement over the equality conditions it found there, as
+//! binds (`Futamura.default_binds`), or runs Rails' chain when it is
+//! anything else. A chain rooted at `Model.unscoped` has no default scopes
+//! and says so (`unscoped: true`).
 
 use std::collections::HashMap;
 
@@ -111,8 +113,6 @@ pub struct Specializer<'a> {
     /// Integer class constants by bare name; `None` when two classes give
     /// the same name different values.
     int_consts: HashMap<String, Option<i64>>,
-    /// Models that may carry a `default_scope`, with why.
-    default_scoped: HashMap<String, String>,
     /// The dumps of the databases other than the primary.
     schemas: super::schemas::DatabaseSchemas,
 }
@@ -129,13 +129,7 @@ impl<'a> Specializer<'a> {
                 }
             }
         }
-        let scoping = super::scoping::DefaultScopes::new(app);
-        let default_scoped = app
-            .models
-            .iter()
-            .filter_map(|m| scoping.why(m).map(|why| (m.name.0.as_str().to_string(), why)))
-            .collect();
-        Specializer { app, models, int_consts, default_scoped, schemas }
+        Specializer { app, models, int_consts, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -196,15 +190,13 @@ impl<'a> Specializer<'a> {
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
-        if let Some(why) = self.default_scoped.get(chain.model.0.as_str()).filter(|_| !chain.unscoped) {
-            return Err(format!("{} may have a default_scope ({why})", chain.model.0.as_str()));
-        }
         let option = match terminal {
             Terminal::Link => return Err("chain does not end in a terminal".into()),
             Terminal::Records { reverse: false } => "",
             Terminal::Records { reverse: true } => ", reverse: true",
             Terminal::One => ", one: true",
         };
+        let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
         let key = self.key(e.span);
         let mut binds = chain.where_binds.clone();
         binds.extend(chain.limit_binds.iter().cloned());
