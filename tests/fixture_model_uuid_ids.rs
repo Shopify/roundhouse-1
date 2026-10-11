@@ -220,3 +220,56 @@ puts "sub #{Sub.ancestors.take(3).inspect}"
     assert!(stdout.contains("case [Case, Helper, ActiveRecord::TestFixtures] true helper"), "{stdout}");
     assert!(stdout.contains("sub [Sub, Case, Helper]"), "{stdout}");
 }
+
+/// FasterFixtures builds each file row with `Fixture.new(row, model_class,
+/// association_map)`, whose `initialize` an app may use to rewrite the row
+/// before a column is cast: the runtime runs the app's own `initialize` on
+/// the row, for the set's model, and nothing when the app has none.
+#[test]
+fn runtime_fixture_row_hook_runs_the_apps_fixture_initializer() {
+    let dir = emit().join("runtime");
+    let script = r##"
+require_relative "active_record_test_fixtures"
+# activerecord/lib/active_record/fixtures.rb's Fixture#initialize.
+class ActiveRecord::Fixture
+  def initialize(fixture, model_class)
+    @fixture = fixture
+    @model_class = model_class
+  end
+end
+TF = ActiveRecord::TestFixtures
+row = { "body" => "text" }
+TF.fixture_row_hook(row, "Doc")
+puts "no app class #{row.inspect}"
+module FasterFixtures
+  class Fixture < ActiveRecord::Fixture
+    def initialize(fixture, model_class, association_map)
+      fixture["body"] = fixture["body"].upcase if model_class == "Doc" && fixture.key?("body")
+      super(fixture, model_class)
+    end
+    private :initialize
+  end
+end
+doc = { "body" => "text" }
+other = { "body" => "text" }
+bare = { "title" => "t" }
+TF.fixture_row_hook(doc, "Doc")
+TF.fixture_row_hook(other, "Other")
+TF.fixture_row_hook(bare, "Doc")
+puts "doc #{doc.inspect}"
+puts "other #{other.inspect}"
+puts "bare #{bare.inspect}"
+"##;
+    std::fs::write(dir.join("row_hook_probe.rb"), script).unwrap();
+    let result = std::process::Command::new("ruby").arg(dir.join("row_hook_probe.rb")).output().expect("ruby");
+    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+    assert!(result.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&result.stderr));
+    for line in [
+        r#"no app class {"body" => "text"}"#,
+        r#"doc {"body" => "TEXT"}"#,
+        r#"other {"body" => "text"}"#,
+        r#"bare {"title" => "t"}"#,
+    ] {
+        assert!(stdout.lines().any(|l| l == line), "no {line} in:\n{stdout}");
+    }
+}

@@ -52,22 +52,29 @@ impl Reader<'_> {
         }
         let (value, anchor) = match self.next()? {
             Event::Scalar(text, style, anchor, tag) => {
-                let binary = tag
+                let is_binary = tag
                     .as_ref()
-                    .filter(|t| t.handle == "tag:yaml.org,2002:" && t.suffix == "binary")
+                    .is_some_and(|t| matches!(t.handle.as_str(), "tag:yaml.org,2002:" | "!") && t.suffix == "binary");
+                let binary = Some(())
+                    .filter(|_| is_binary)
                     .and_then(|_| base64_decode(&text))
                     .and_then(|bytes| String::from_utf8(bytes).ok());
                 let value = if let Some(decoded) = binary {
-                    // `!!binary` (yaml.org/type/binary) is base64 for bytes,
-                    // which Psych decodes before the row is typed. UTF-8 bytes
-                    // ride as the string they spell; a string-valued row has
-                    // no spelling for others, which keep their base64 text.
+                    // `!!binary` / `!binary` (yaml.org/type/binary) is base64
+                    // for bytes, which Psych decodes before the row is typed.
+                    // UTF-8 bytes ride as the string they spell; others stay
+                    // a tagged scalar of their base64 text, which the fixture
+                    // ingest turns into a runtime decode.
                     Value::String(decoded)
                 } else if let Some(tag) = tag {
                     // Let the existing scalar resolver retain its tag and number
                     // semantics; JSON string escaping is also valid YAML quoting.
                     let quoted = serde_json::to_string(&text).map_err(|e| e.to_string())?;
-                    serde_yaml_ng::from_str(&format!("!<{}{}> {quoted}", tag.handle, tag.suffix))
+                    // serde_yaml_ng drops a verbatim `tag:yaml.org,2002:` tag
+                    // as its own core type; `!binary` keeps its tag, which
+                    // the fixture ingest reads to decode the text at load.
+                    let (handle, suffix) = if is_binary { ("!", "binary") } else { (tag.handle.as_str(), tag.suffix.as_str()) };
+                    serde_yaml_ng::from_str(&format!("!<{handle}{suffix}> {quoted}"))
                         .map_err(|e| e.to_string())?
                 } else if style == TScalarStyle::Plain {
                     plain_scalar(text)

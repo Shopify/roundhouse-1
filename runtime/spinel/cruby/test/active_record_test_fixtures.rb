@@ -249,6 +249,18 @@ module ActiveRecord
         hooks.send(:normalize_fixture_value, value, FixtureColumn.new(column.to_s, :uuid), fixture_model_class(class_name))
       end
 
+      # FasterFixtures' `Fixture.new(row, model_class, association_map)`,
+      # which the app's class may use to rewrite the row it is given (the
+      # file's row, as it is read and before any column is cast); `model`
+      # is the set's model class name. Only an `initialize` the app's
+      # FasterFixtures::Fixture defines itself runs, on the row in place.
+      def fixture_row_hook(row, model)
+        return row unless defined?(::FasterFixtures::Fixture) && ::FasterFixtures::Fixture.is_a?(Class)
+        return row unless ::FasterFixtures::Fixture.instance_method(:initialize).owner == ::FasterFixtures::Fixture
+        ::FasterFixtures::Fixture.new(row, model, {})
+        row
+      end
+
       # One set's rows, as Rails' insert_fixtures_set writes them
       # (build_fixture_sql): every row's timestamps the loader fills with
       # `now` when it omits them, a FixtureError for a key the table has no
@@ -274,6 +286,7 @@ module ActiveRecord
         live = nil
         rows = rows.map do |row|
           row = row.dup
+          fixture_row_hook(row, model) if faster_fixtures && model
           timestamps.each { |column| row[column] = now unless row.key?(column) }
           unknown = row.keys - columns.keys
           unless unknown.empty?
