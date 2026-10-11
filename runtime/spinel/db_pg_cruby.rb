@@ -1392,7 +1392,12 @@ module Db
     value.nil? ? "NULL" : escape_bool(value)
   end
 
+  # IN-list for eager-load keys. Integer keys render bare; String keys
+  # (uuid / string primary or foreign keys) render as quoted literals, which
+  # PostgreSQL coerces to the column's type like a bound parameter would.
   def self.escape_int_list(values)
-    values.empty? ? "NULL" : values.map { |value| Integer(value).to_s }.join(", ")
+    return "NULL" if values.empty?
+
+    values.map { |value| value.is_a?(String) ? escape_string(value) : Integer(value).to_s }.join(", ")
   end
 end

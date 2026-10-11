@@ -863,6 +863,12 @@ module ActiveRecord
       {}
     end
 
+    # ActiveModel::Dirty#previous_changes (`mutations_before_last_save
+    # .changes`): the changes of the last save, which is `saved_changes`.
+    def previous_changes
+      saved_changes
+    end
+
     # ONE leading underscore, like `_adapter_*` beside it: this is
     # called ACROSS the class boundary (a model's `from_row` reaching
     # Base's method), and Python mangles a `__`-prefixed name per class

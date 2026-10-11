@@ -1958,6 +1958,9 @@ module ActiveRecord
         prev = previous.nil? ? nil : previous[key]
         changes[key] = [prev, value] if prev != value
       end
+      # A create writes the id too (Rails' `_create_record`: saved_changes
+      # has "id" => [nil, id]); the attribute snapshot leaves it out.
+      changes["id"] = [nil, id] if was_new && !id.nil?
       @__last_saved_attributes = current
       @saved_changes = changes
       @id_previously_changed = was_new
@@ -1966,6 +1969,13 @@ module ActiveRecord
 
     def saved_changes
       @saved_changes || {}
+    end
+
+    # ActiveModel::Dirty#previous_changes is `mutations_before_last_save
+    # .changes`, the same diff `saved_changes` reads: what the last save
+    # changed, still readable in `after_commit`.
+    def previous_changes
+      saved_changes
     end
 
     # The Dirty baseline for a record that came from the DB. Without
