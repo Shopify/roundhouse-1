@@ -36,7 +36,7 @@ module MochaBridge
 
   # A bare parameter matcher (`has_entry(...)`, `anything`) from
   # `Mocha::ParameterMatchers`, by name.
-  def self.matcher(name, arg = nil)
+  def self.matcher(name, *args)
     raise NotImplementedError, "mocha: the #{name} parameter matcher is not served on this target"
   end
 end

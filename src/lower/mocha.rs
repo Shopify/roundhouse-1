@@ -1474,7 +1474,8 @@ fn bridge() -> Expr {
 /// replay side resolves it in every argument position (`with`, `returns`,
 /// matcher arguments) and a real String argument that happens to spell a
 /// constant name stays a String. A bare matcher call becomes
-/// `MochaBridge.matcher(:name, arg)`.
+/// `MochaBridge.matcher(:name, *args)`, whatever its arity (`has_entry(:k, v)`,
+/// `all_of(a, b)`), its arguments marked the same way.
 fn bridge_arg(arg: Expr) -> Expr {
     let span = arg.span;
     match &*arg.node {
@@ -1483,7 +1484,7 @@ fn bridge_arg(arg: Expr) -> Expr {
             call(span, bridge(), "konst", vec![str_lit(span, &name)])
         }
         ExprNode::Send { recv: None, method, args, block: None, .. }
-            if MATCHERS.contains(&method.as_str()) && args.len() <= 1 =>
+            if MATCHERS.contains(&method.as_str()) =>
         {
             let mut margs = vec![sym_lit(span, method.as_str())];
             margs.extend(args.iter().cloned().map(bridge_arg));
@@ -1944,6 +1945,52 @@ fn a_keyword_only_block_still_gets_the_host_placeholder() {
             let ExprNode::Array { elements: a, .. } = &*link[1].node else { panic!() };
             assert_eq!(matches!(&*a[0].node, ExprNode::Send { method, .. } if method.as_str() == "kwargs"), marked);
         }
+    }
+
+    #[test]
+    fn a_matcher_of_any_arity_travels_with_each_argument_marked() {
+        // Q.expects(:coerce).with(has_entry(:k, Some::V), all_of(includes(1), instance_of(Some::K)))
+        let has_entry = send(None, "has_entry", vec![sym("k"), konst(&["Some", "V"])]);
+        let all_of = send(
+            None,
+            "all_of",
+            vec![send(None, "includes", vec![int_lit(sp(), 1)]), send(None, "instance_of", vec![konst(&["Some", "K"])])],
+        );
+        let head = send(Some(konst(&["Q"])), "expects", vec![sym("coerce")]);
+        let mut e = send(Some(head), "with", vec![has_entry, all_of]);
+        e = send(Some(e), "raises", vec![konst(&["Net", "OpenTimeout"])]);
+        rewrite(&mut e, &mut AppMethods::empty());
+        let (_, _, args, _) = as_send(&e);
+        let ExprNode::Array { elements: elems, .. } = &*args[3].node else { panic!() };
+        let ExprNode::Array { elements: link, .. } = &*elems[0].node else { panic!() };
+        let ExprNode::Array { elements: a, .. } = &*link[1].node else { panic!() };
+        let (_, m, margs, _) = as_send(&a[0]);
+        assert_eq!(m, "matcher");
+        assert_eq!(margs.len(), 3, "name plus both arguments: {margs:?}");
+        assert_eq!(as_send(&margs[2]).1, "konst");
+        let (_, m, margs, _) = as_send(&a[1]);
+        assert_eq!(m, "matcher");
+        assert_eq!(margs.len(), 3);
+        assert_eq!(as_send(&margs[1]).1, "matcher", "a nested matcher is bridged too");
+        assert_eq!(as_send(&margs[2]).1, "matcher");
+    }
+
+    #[test]
+    fn only_the_trailing_keyword_hash_after_positionals_is_marked() {
+        // Q.expects(:subscribe).with(shop, "uuid", contract_id: 123).raises(...)
+        let kw = Expr::new(sp(), ExprNode::Hash { entries: vec![(sym("contract_id"), int_lit(sp(), 123))], kwargs: true });
+        let head = send(Some(konst(&["Q"])), "expects", vec![sym("subscribe")]);
+        let mut e = send(Some(head), "with", vec![sym("shop"), str_lit(sp(), "uuid"), kw]);
+        e = send(Some(e), "raises", vec![konst(&["Net", "OpenTimeout"])]);
+        rewrite(&mut e, &mut AppMethods::empty());
+        let (_, _, args, _) = as_send(&e);
+        let ExprNode::Array { elements: elems, .. } = &*args[3].node else { panic!() };
+        let ExprNode::Array { elements: link, .. } = &*elems[0].node else { panic!() };
+        let ExprNode::Array { elements: a, .. } = &*link[1].node else { panic!() };
+        assert_eq!(a.len(), 3);
+        assert!(matches!(&*a[0].node, ExprNode::Lit { .. }));
+        assert!(matches!(&*a[1].node, ExprNode::Lit { .. }));
+        assert_eq!(as_send(&a[2]).1, "kwargs");
     }
 
     /// An app with one model, `User`, carrying `reset_remote_connections`,
