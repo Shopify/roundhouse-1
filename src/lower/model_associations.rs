@@ -297,6 +297,7 @@ mod tests {
             dependent: Dependent::None,
             as_interface: None,
             scope: None,
+            scope_owner: None,
             extension: Vec::new(),
             skip_validation: false,
             autosave: false,

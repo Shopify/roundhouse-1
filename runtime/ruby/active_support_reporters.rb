@@ -17,9 +17,10 @@
 # - `rescue *error_classes => e` is written as `rescue Exception => e`
 #   plus a class test that re-raises anything not listed; the set of
 #   errors handled is the same.
-# - ExecutionContext has no `after_change` callbacks and no
-#   `current_attributes_instances`: nothing here defines
-#   CurrentAttributes, which is what registers them.
+# - ExecutionContext has no `current_attributes_instances`: nothing here
+#   defines CurrentAttributes, which is what registers them. Its
+#   `after_change` callbacks (execution_context.rb) run after every change
+#   to the context, which is how QueryLogs clears its cached comment.
 #
 # `ActiveSupport.filter_parameters` starts empty, as in Rails before the
 # railtie copies `config.filter_parameters` into it.
@@ -153,6 +154,18 @@ module ActiveSupport
       @nestable || false
     end
 
+    def self.after_change(&block)
+      after_change_callbacks << block
+    end
+
+    def self.after_change_callbacks
+      @after_change_callbacks ||= []
+    end
+
+    def self.changed
+      after_change_callbacks.each(&:call)
+    end
+
     def self.set(**options)
       store = record.store
       previous = {}
@@ -160,16 +173,19 @@ module ActiveSupport
         previous[key.to_sym] = store[key.to_sym]
       end
       options.each { |key, value| store[key.to_sym] = value }
+      changed
       return nil unless block_given?
       begin
         yield
       ensure
         store.merge!(previous)
+        changed
       end
     end
 
     def self.[]=(key, value)
       record.store[key.to_sym] = value
+      changed
     end
 
     def self.to_h
@@ -178,20 +194,26 @@ module ActiveSupport
 
     def self.push
       nestable ? record.push : clear
+      changed
       self
     end
 
     def self.pop
       nestable ? record.pop : clear
+      changed
       self
     end
 
     def self.clear
       Thread.current[:active_support_execution_context] = nil
+      changed
+      nil
     end
 
     def self.flush
-      record.flush
+      result = record.flush
+      changed
+      result
     end
 
     def self.record

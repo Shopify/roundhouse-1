@@ -20,9 +20,9 @@
 #   `ActiveRecord.disable_prepared_statements` there; every statement a
 #   transformer rewrites is sent unprepared (`Db.execute_handle`), which is
 #   what that setting is for.
-# * ActiveSupport::ExecutionContext.after_change (execution_context.rb),
-#   which the runtime's reporter port (active_support_reporters.rb) lacks:
-#   QueryLogs clears its cached comment when the context changes.
+# * ActiveSupport::ExecutionContext.after_change (execution_context.rb,
+#   ported in active_support_reporters.rb): QueryLogs clears its cached
+#   comment when the context changes.
 #
 # CRuby-only (the PostgreSQL tree, `project::apply_postgres_bootstrap`),
 # after runtime/active_support_backtrace_cleaner.rb and
@@ -31,25 +31,6 @@
 require "erb"
 require_relative "active_support_lazy_load_hooks"
 require_relative "active_support_attribute_accessors_per_thread"
-
-module ActiveSupport
-  module ExecutionContext
-    module AfterChange # :nodoc:
-      def after_change(&block)
-        (@after_change_callbacks ||= []) << block
-      end
-
-      %i[set []= clear flush push pop].each do |name|
-        define_method(name) do |*args, **options, &block|
-          result = options.empty? ? super(*args, &block) : super(*args, **options, &block)
-          (@after_change_callbacks || []).each(&:call)
-          result
-        end
-      end
-    end
-    singleton_class.prepend(AfterChange)
-  end
-end
 
 module ActiveRecord
   singleton_class.attr_accessor :query_transformers
