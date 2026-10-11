@@ -491,6 +491,12 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
         through: Option<Symbol>,
+        /// `inverse_of: :name` as written. A `has_many`/`has_one` with no
+        /// `foreign_key:` or `as:` takes its key from that inverse
+        /// `belongs_to` (reflection.rb `derive_foreign_key`), resolved by
+        /// app assembly once the target model is known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
         dependent: Dependent,
         /// `has_many :notifications, as: :notifiable` — this side is
         /// one implementor of the named polymorphic interface; rows
@@ -534,6 +540,9 @@ pub enum Association {
         /// See `HasMany::foreign_key_explicit`.
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
         dependent: Dependent,
         /// See `HasMany::as_interface`.
         #[serde(default, skip_serializing_if = "Option::is_none")]

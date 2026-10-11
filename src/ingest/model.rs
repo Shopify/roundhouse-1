@@ -2962,6 +2962,7 @@ pub(super) fn parse_association(
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
+    let mut inverse_of: Option<String> = None;
     let mut validate: Option<bool> = None;
 
     for arg in iter {
@@ -3028,6 +3029,7 @@ pub(super) fn parse_association(
                 "as" => as_interface = super::util::symbol_or_string_value(&value),
                 "autosave" => autosave = bool_value(&value),
                 "validate" => validate = bool_value(&value),
+                "inverse_of" => inverse_of = symbol_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not
                 // the lambda. Rails calls it with `instance_exec`, so
                 // the body is already written against the record; a
@@ -3118,6 +3120,7 @@ pub(super) fn parse_association(
                     None => Symbol::from(format!("{owner_snake}_id")),
                 }),
             foreign_key_explicit,
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
             through: through.map(|s| Symbol::from(s.as_str())),
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
@@ -3137,6 +3140,7 @@ pub(super) fn parse_association(
                     None => Symbol::from(format!("{owner_snake}_id")),
                 }),
             foreign_key_explicit,
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,

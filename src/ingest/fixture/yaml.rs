@@ -52,7 +52,18 @@ impl Reader<'_> {
         }
         let (value, anchor) = match self.next()? {
             Event::Scalar(text, style, anchor, tag) => {
-                let value = if let Some(tag) = tag {
+                let binary = tag
+                    .as_ref()
+                    .filter(|t| t.handle == "tag:yaml.org,2002:" && t.suffix == "binary")
+                    .and_then(|_| base64_decode(&text))
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                let value = if let Some(decoded) = binary {
+                    // `!!binary` (yaml.org/type/binary) is base64 for bytes,
+                    // which Psych decodes before the row is typed. UTF-8 bytes
+                    // ride as the string they spell; a string-valued row has
+                    // no spelling for others, which keep their base64 text.
+                    Value::String(decoded)
+                } else if let Some(tag) = tag {
                     // Let the existing scalar resolver retain its tag and number
                     // semantics; JSON string escaping is also valid YAML quoting.
                     let quoted = serde_json::to_string(&text).map_err(|e| e.to_string())?;
@@ -126,4 +137,29 @@ fn tagged(value: Value, tag: Option<Tag>) -> Value {
             value,
         })),
     }
+}
+
+/// Standard-alphabet base64 as `!!binary` writes it (whitespace between
+/// groups allowed, `=` padding optional). `None` for anything else.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.chars().filter(|c| !c.is_whitespace()).take_while(|c| *c != '=') {
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }

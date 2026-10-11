@@ -2938,6 +2938,9 @@ end
     // After the splice too: the inverse `has_many …, as: :owner` may be
     // declared in a concern's `included do`.
     resolve_polymorphic_targets(&mut app);
+    // After the splice and target qualification: the inverse `belongs_to`
+    // may come from a concern and its model from a namespace.
+    resolve_inverse_foreign_keys(&mut app);
     // `allow_browser` becomes a filter plus the method it runs, on the
     // concern (before the splice carries both to the includer) or on
     // the controller that called it directly.
@@ -8857,6 +8860,53 @@ pub(super) fn qualify_target(
         .find(|candidate| models.contains(candidate));
     if let Some(qualified) = found {
         *target = crate::ident::ClassId(crate::ident::Symbol::from(qualified));
+    }
+}
+
+/// A `has_many`/`has_one` with `inverse_of:` and neither `foreign_key:`
+/// nor `as:` takes its key from the inverse `belongs_to` rather than the
+/// owner's name (activerecord reflection.rb `derive_foreign_key`:
+/// `inverse_of.foreign_key(infer_from_inverse_of: false)`). A `through:`
+/// reflection reads its keys from the through and source reflections.
+fn resolve_inverse_foreign_keys(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+
+    let mut keys: HashMap<(crate::ident::ClassId, crate::ident::Symbol), crate::ident::Symbol> =
+        HashMap::default();
+    for model in &app.models {
+        for assoc in model.associations() {
+            if let Association::BelongsTo { name, foreign_key, polymorphic: false, .. } = assoc {
+                keys.insert((model.name.clone(), name.clone()), foreign_key.clone());
+            }
+        }
+    }
+    for model in &mut app.models {
+        for item in &mut model.body {
+            let ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (target, foreign_key, inverse_of) = match assoc {
+                Association::HasMany {
+                    target,
+                    foreign_key,
+                    foreign_key_explicit: false,
+                    inverse_of: Some(inverse_of),
+                    through: None,
+                    as_interface: None,
+                    ..
+                }
+                | Association::HasOne {
+                    target,
+                    foreign_key,
+                    foreign_key_explicit: false,
+                    inverse_of: Some(inverse_of),
+                    as_interface: None,
+                    ..
+                } => (target, foreign_key, inverse_of),
+                _ => continue,
+            };
+            if let Some(key) = keys.get(&(target.clone(), inverse_of.clone())) {
+                *foreign_key = key.clone();
+            }
+        }
     }
 }
 
