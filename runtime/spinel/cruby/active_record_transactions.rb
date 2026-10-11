@@ -50,6 +50,47 @@ module ActiveRecord
     self.default_transaction_isolation_level = nil
   end
 
+  # active_record.rb `after_all_transactions_commit` / `all_open_transactions`
+  # (Rails 7.2+): run the block now when no joinable transaction is open on
+  # any pool's active connection, else once every such transaction has
+  # committed (dropped when one rolls back). A non-joinable transaction (the
+  # one a transactional test wraps its example in) does not count.
+  unless respond_to?(:after_all_transactions_commit)
+    def self.after_all_transactions_commit(&block)
+      open_transactions = all_open_transactions
+
+      if open_transactions.empty?
+        yield
+      elsif open_transactions.size == 1
+        open_transactions.first.after_commit(&block)
+      else
+        count = open_transactions.size
+        callback = -> do
+          count -= 1
+          block.call if count.zero?
+        end
+        open_transactions.each do |t|
+          t.after_commit(&callback)
+        end
+        open_transactions = nil # avoid holding it in the closure
+      end
+    end
+
+    def self.all_open_transactions # :nodoc:
+      open_transactions = []
+      Base.connection_handler.each_connection_pool do |pool|
+        if (active_connection = pool.active_connection)
+          current_transaction = active_connection.current_transaction
+
+          if current_transaction.open? && current_transaction.joinable?
+            open_transactions << current_transaction
+          end
+        end
+      end
+      open_transactions
+    end
+  end
+
   # transaction.rb: the transaction a block of `transaction` is given.
   class Transaction
     def initialize(internal_transaction) # :nodoc:
