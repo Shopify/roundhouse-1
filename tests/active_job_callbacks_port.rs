@@ -935,3 +935,85 @@ fn job_serialization_runs_like_activejob() {
     assert!(native.contains("\"stamp\" => 7") && native.contains("PointSerializer"), "{native}");
     assert_eq!(stdout, native, "emitted on the port vs native activejob");
 }
+
+/// activejob's `set` (core.rb) answering a ConfiguredJob
+/// (configured_job.rb) on the port: the options reach the job's queue
+/// name, priority and schedule through `perform_later` and `perform_now`,
+/// from the class body (`set(...)` with the implicit receiver, as a job's
+/// own class-side entry calls it) and from outside.
+const CONFIGURED_JOB: &str = r#"class ConfiguredJob < ApplicationJob
+  queue_as :plain
+  before_enqueue do |job|
+    at = job.scheduled_at ? (job.scheduled_at.to_f > Time.now.to_f + 30) : nil
+    job.trail << "enqueue #{job.queue_name} #{job.priority.inspect} #{at.inspect} #{job.arguments.inspect}"
+  end
+
+  class << self
+    def debounce(id)
+      set(wait: 60, queue: :slow).perform_later(id, flag: true)
+    end
+  end
+
+  def perform(*args)
+    trail << "perform #{queue_name} #{priority.inspect} #{args.inspect}"
+    args
+  end
+end
+"#;
+
+const CONFIGURED_OBSERVE: &str = r#"hold_jobs
+def run(label)
+  ApplicationJob::TRAIL.clear
+  result = begin
+    yield
+  rescue Exception => e
+    [:raised, e.class.name, e.message]
+  end
+  run_held
+  result = result.class.name if result.is_a?(ActiveJob::Base)
+  p [label, result, ApplicationJob::TRAIL.dup]
+end
+run(:plain) { ConfiguredJob.perform_later(1) }
+run(:class_body) { ConfiguredJob.debounce(2) }
+run(:queue) { ConfiguredJob.set(queue: :other).perform_later(3) }
+run(:priority) { ConfiguredJob.set(priority: "7").perform_later(4) }
+run(:wait_until) { ConfiguredJob.set(wait_until: Time.now + 3600).perform_later(5) }
+run(:now) { ConfiguredJob.set(queue: :now_queue, priority: 2).perform_now(6) }
+run(:none) { ConfiguredJob.set.perform_later }
+p ConfiguredJob.set(wait: 1).class.name
+"#;
+
+const CONFIGURED_FILES: &[(&str, &str, &str)] = &[
+    ("app/jobs/application_job.rb", "app/models/application_job.rb", APPLICATION_JOB),
+    ("app/jobs/configured_job.rb", "app/models/configured_job.rb", CONFIGURED_JOB),
+];
+
+#[test]
+fn set_answers_a_configured_job_like_activejob() {
+    let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+    for (path, _, text) in CONFIGURED_FILES {
+        app = app.write(path, text);
+    }
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let requires: String = CONFIGURED_FILES
+        .iter()
+        .map(|(_, emitted, _)| format!("require_relative {:?}\n", emitted.trim_end_matches(".rb")))
+        .collect();
+    let script = format!("require File.expand_path('main', Dir.pwd)\n{requires}{EMITTED_ADAPTER}{CONFIGURED_OBSERVE}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args(["-W0", "-e", &script])
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<(&str, &str)> =
+        CONFIGURED_FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    let native = native_of(&files, &format!("{requires}{NATIVE_ADAPTER}{CONFIGURED_OBSERVE}"));
+    assert!(native.contains("enqueue slow nil true [2, {flag: true}]"), "{native}");
+    assert!(native.contains("perform plain 7 [4]"), "{native}");
+    assert!(native.contains("ActiveJob::ConfiguredJob"), "{native}");
+    assert_eq!(stdout, native, "emitted on the port vs native activejob");
+}
