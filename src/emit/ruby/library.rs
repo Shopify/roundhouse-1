@@ -44,6 +44,13 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             crate::lower::model_to_library::push_subclass_model_methods(&mut lc.methods, view, &lineage, &app.models);
         }
     }
+    // `reflect_on_association` and `association(name)` for the
+    // associations a subclass declares (what `accepts_nested_attributes_for`
+    // and friends read).
+    if !subclass_views.is_empty() {
+        apply_belongs_to_memoization(&mut lcs, app);
+        apply_association_reader(&mut lcs, app);
+    }
     // An STI subclass's relations carry its type condition at runtime.
     crate::lower::sti_scope::push_type_condition_methods(&mut lcs, app);
     apply_scope_lowering(&mut lcs, app);
@@ -2845,8 +2852,11 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
     // load) and their own key writers.
     let native = super::expr::native_keywords();
     let stale_state = native && app_calls_association(app);
+    let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
         if native {
             synth_open_polymorphic_accessors(lc, model);
         }
@@ -2874,7 +2884,7 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
             if seen.contains(&p) {
                 break;
             }
-            let Some(pm) = app.models.iter().find(|m| m.name == p) else { break };
+            let Some(pm) = app.models.iter().find(|m| m.name == p).or_else(|| subclass_views.get(&p)) else { break };
             keys.extend(belongs_to(pm));
             seen.push(p);
             parent = pm.parent.clone();
@@ -3431,8 +3441,11 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
         return;
     }
     let mut declarations = DeclarationOptions::default();
+    let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
         if lc.methods.iter().any(|m| m.name.as_str() == "association" && m.receiver == MethodReceiver::Instance) {
             continue; // the model's own wins
         }
@@ -3511,7 +3524,10 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
         }
         // A subclass of another model (STI) hands the names it does not
         // declare to its parent's dispatch; a root model raises.
-        let inherits = model.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p));
+        let inherits = model
+            .parent
+            .as_ref()
+            .is_some_and(|p| subclass_views.contains_key(p) || app.models.iter().any(|m| &m.name == p));
         let otherwise = if inherits {
             "super(name)"
         } else {
@@ -3808,12 +3824,20 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
         return;
     }
     let mut declarations = DeclarationOptions::default();
+    // A subclass of a model declares its associations on itself
+    // (`lower::subclass_macros`); its view carries only those.
+    let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
         if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && !generated(m)) {
             continue; // the model's own wins
         }
-        let inherits = model.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p));
+        let inherits = model
+            .parent
+            .as_ref()
+            .is_some_and(|p| subclass_views.contains_key(p) || app.models.iter().any(|m| &m.name == p));
         let owner = format!("::{}", model.name.0.as_str().trim_start_matches("::"));
         let macro_declared = crate::lower::model_to_library::macro_associations::declaring_calls(model);
         let mut entries: Vec<(String, String)> = Vec::new();
@@ -14401,10 +14425,26 @@ fn names_own_method(lc: &LibraryClass, call: &Expr) -> bool {
 /// `def generate_unique_cityhash` and then `statsd_measure
 /// :generate_unique_cityhash, ...` (statsd-instrument raises "could not
 /// find method" for a method not defined yet).
+///
+/// Also `accepts_nested_attributes_for :x`, which reads the class's own
+/// `reflect_on_association` (activerecord nested_attributes.rb raises
+/// "No association found for name" on nil) as the body runs: the
+/// compiler defines that class method for the associations the class
+/// declares (`apply_association_reflections`), so the macro follows it.
 fn names_own_method_above(lc: &LibraryClass, call: &Expr) -> bool {
-    let ExprNode::Send { args, .. } = &*call.node else { return false };
+    let ExprNode::Send { recv, method, args, .. } = &*call.node else { return false };
     if call.span.is_synthetic() {
         return false;
+    }
+    if method.as_str() == "accepts_nested_attributes_for"
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && lc.methods.iter().any(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Class
+                && m.name.as_str() == "reflect_on_association"
+                && m.name_span.is_synthetic()
+        })
+    {
+        return true;
     }
     let names_def_above = |arg: &Expr| {
         matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }

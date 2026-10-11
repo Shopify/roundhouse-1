@@ -293,8 +293,31 @@ module ActiveRecord
       end
 
       def klass
-        @klass_name && Object.const_get(@klass_name)
+        @klass_name && _compute_type(@klass_name)
       end
+
+      # reflection.rb `compute_type`: a class name without a leading `::`
+      # binds relative to the owner's namespace, innermost first; a
+      # candidate counts only when it is that very constant, not one the
+      # lookup inherited from Object.
+      def _compute_type(type_name)
+        type_name = type_name.to_s
+        return Object.const_get(type_name.delete_prefix("::")) if type_name.start_with?("::")
+        candidates = []
+        @owner.class.name.to_s.scan(/::|$/) { candidates.unshift "#{$`}::#{type_name}" } unless @owner.class.name.to_s.empty?
+        candidates << type_name
+        candidates.each do |candidate|
+          constant = begin
+            Object.const_get(candidate)
+          rescue NameError => e
+            raise unless e.name.to_s == candidate.split("::").last
+            next
+          end
+          return constant if candidate == constant.to_s
+        end
+        raise NameError.new("uninitialized constant #{candidates.first}", candidates.first)
+      end
+      private :_compute_type
 
       # Rails' `association_scope`: the target class's relation narrowed
       # to the owner's records. A has_many or has_one the model compiled

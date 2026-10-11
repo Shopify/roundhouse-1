@@ -359,6 +359,30 @@ module ActiveRecord
   end
 
   module Reflection
+    # reflection.rb `compute_type`: a class name written without a
+    # leading `::` binds relative to the owner's namespace, innermost
+    # first (`class_name: "Address"` on Shipping::Label is
+    # Shipping::Label::Address, Shipping::Address, then ::Address); a
+    # candidate counts only when it is that very constant, not one the
+    # lookup inherited from Object.
+    def self.compute_type(owner, type_name)
+      type_name = type_name.to_s
+      return Object.const_get(type_name.delete_prefix("::")) if type_name.start_with?("::")
+      candidates = []
+      owner.to_s.scan(/::|$/) { candidates.unshift "#{$`}::#{type_name}" } unless owner.to_s.empty?
+      candidates << type_name
+      candidates.each do |candidate|
+        constant = begin
+          Object.const_get(candidate)
+        rescue NameError => e
+          raise unless e.name.to_s == candidate.split("::").last
+          next
+        end
+        return constant if candidate == constant.to_s
+      end
+      raise NameError.new("uninitialized constant #{candidates.first}", candidates.first)
+    end
+
     # The reflection `reflect_on_association` answers for an association
     # the model compiled (reflection.rb's AssociationReflection and its
     # macro subclasses). The generated `reflect_on_association` builds one
@@ -448,7 +472,7 @@ module ActiveRecord
       end
 
       def klass
-        @klass ||= Object.const_get(@target)
+        @klass ||= Reflection.compute_type(@active_record&.name, @target)
       end
 
       # reflection.rb's `active_record_primary_key`: the owner's key the
