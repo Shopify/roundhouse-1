@@ -320,6 +320,9 @@ module ActiveRecord
     # Reloads the record from the database.
     def reload
       _adapter_reload
+      # ActiveRecord::AttributeMethods::Dirty#reload: the row just read is
+      # the baseline, and the last save's changes are forgotten.
+      clear_changes_information
       self
     end
 
