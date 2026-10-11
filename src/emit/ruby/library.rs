@@ -14182,8 +14182,29 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || validations.iter().any(|e| std::ptr::eq(*e, *c))
                 || claimed(c)
                 || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
+                || ruby2_keywords_call(lc, c)
         })
         .collect()
+}
+
+/// `ruby2_keywords :a, :b` naming instance methods the class defines
+/// (Module#ruby2_keywords): a `*args` forwarder marked so the keywords it
+/// received as a trailing hash reach `target(*args)` as keywords again.
+/// Replayed whatever the base, as every Module answers it; dropped, a
+/// caller's `save_it!(validate: false)` reaches `save!(*args)` as a
+/// positional hash.
+fn ruby2_keywords_call(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+    method.as_str() == "ruby2_keywords"
+        && !args.is_empty()
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && args.iter().all(|a| match &*a.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => lc
+                .methods
+                .iter()
+                .any(|m| m.receiver == MethodReceiver::Instance && m.name == *value),
+            _ => false,
+        })
 }
 
 /// The class-body validation calls (`validates`, `validate`,
