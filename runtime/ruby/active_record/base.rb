@@ -196,6 +196,15 @@ module ActiveRecord
       @errors
     end
 
+    # A fresh, empty accumulator for `@errors`. A model whose class
+    # replaces `errors` (a concern answering `@errors ||= Errors.new(self)`
+    # reads the ivar straight back) never reaches the wrapper that
+    # extends the Array, so the PostgreSQL tree builds it extended here
+    # (connection.rb).
+    def _fresh_errors
+      []
+    end
+
     # The one frozen empty Hash a model's `initialize(attrs = …)` defaults
     # to on the ruby family (`lower::lazy_model_state`). A record built
     # bare — which is every hydration path: `from_row` is `new` then the
@@ -249,7 +258,7 @@ module ActiveRecord
       # The sentinel is written by the MODEL's own `initialize`
       # (`self.id = (attrs[:id] || 0)` — `|| ""` for a string key), not
       # here: see the class comment on why the base holds no `@id`.
-      @errors = []
+      @errors = _fresh_errors
       @id_previously_changed = false
       @persisted = false
       @destroyed = false
@@ -1220,7 +1229,7 @@ module ActiveRecord
     end
 
     def valid?
-      @errors = []
+      @errors = _fresh_errors
       validate
       @errors.empty?
     end
