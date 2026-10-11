@@ -528,6 +528,7 @@ pub fn parse_library_with_rbs(
             .get(&class_name)
             .cloned()
             .unwrap_or_default();
+        let mut taken_sigs: crate::det::HashMap<Symbol, (MethodReceiver, Ty)> = Default::default();
 
         for m in &mut lc.methods {
             if m.params.iter().any(|p| p.forwarding) {
@@ -537,7 +538,7 @@ pub fn parse_library_with_rbs(
             for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
                 project_runtime_keywords(default);
             }
-            let sig = class_sigs.remove(&m.name).ok_or_else(|| {
+            let sig = take_signature(&mut class_sigs, &mut taken_sigs, &m.name, m.receiver).ok_or_else(|| {
                 format!(
                     "class `{}` method `{}` has no matching RBS signature",
                     class_name, m.name
@@ -838,6 +839,28 @@ fn typing_classes_with_local_block_contracts(
     typing_classes
 }
 
+/// The signature for a method `name` on `receiver`. An RBS class keeps
+/// one signature per name, so the class-side method and the instance
+/// method of one name (activerecord's `ScopeRegistry.current_scope`
+/// delegating to the instance's `current_scope`) share it: the second
+/// definition, on the other receiver, is answered from `taken`. Any
+/// further definition of the name has none, as a duplicate always had.
+fn take_signature(
+    sigs: &mut crate::det::HashMap<Symbol, Ty>,
+    taken: &mut crate::det::HashMap<Symbol, (MethodReceiver, Ty)>,
+    name: &Symbol,
+    receiver: MethodReceiver,
+) -> Option<Ty> {
+    if let Some(ty) = sigs.remove(name) {
+        taken.insert(name.clone(), (receiver, ty.clone()));
+        return Some(ty);
+    }
+    match taken.get(name) {
+        Some((first, _)) if *first != receiver => taken.remove(name).map(|(_, ty)| ty),
+        _ => None,
+    }
+}
+
 /// Same as `parse_methods_with_rbs` but takes a pre-built class
 /// registry — so cross-class method dispatch during body-typing can
 /// resolve. Used by the runtime-sweep test, which builds a unified
@@ -897,6 +920,8 @@ pub fn parse_methods_with_rbs_in_ctx(
     // the RBS sigs still live inside a `module M`.
     let mut flat_matched_names: crate::det::HashSet<Symbol> =
         crate::det::HashSet::default();
+    let mut taken_sigs: crate::det::HashMap<String, crate::det::HashMap<Symbol, (MethodReceiver, Ty)>> =
+        crate::det::HashMap::default();
 
     for m in &mut methods {
         let ty = if let Some(enclosing) = &m.enclosing_class {
@@ -907,7 +932,8 @@ pub fn parse_methods_with_rbs_in_ctx(
                     class_key, m.name
                 )
             })?;
-            class_sigs.remove(&m.name).ok_or_else(|| {
+            let taken = taken_sigs.entry(class_key.to_string()).or_default();
+            take_signature(class_sigs, taken, &m.name, m.receiver).ok_or_else(|| {
                 format!(
                     "class `{}` method `{}` has no matching RBS signature",
                     class_key, m.name

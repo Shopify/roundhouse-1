@@ -14258,8 +14258,12 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
     // runs it.
     // The same holds for one a lazy-load hook includes into another base
     // (`App::load_hook_includes`: `ActiveSupport::TestCase`).
-    let base_included_concern =
-        lc.is_module && (app.framework_base_includes.contains(&lc.name) || app.load_hook_includes.contains(&lc.name));
+    // Only the PostgreSQL tree carries that port (`apply_postgres_bootstrap`);
+    // another tree's module has had the concern spliced into its includers
+    // at ingest, and an `extend` of a constant it lacks fails at load.
+    let base_included_concern = lc.is_module
+        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+        && (app.framework_base_includes.contains(&lc.name) || app.load_hook_includes.contains(&lc.name));
     lc.unknown_calls
         .iter()
         .filter(|call| {

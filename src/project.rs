@@ -11742,7 +11742,7 @@ fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(St
     }
     let runtime: crate::det::HashSet<String> = files.iter()
         .filter(|(p, _)| p.starts_with("runtime/") && p.ends_with(".rb"))
-        .flat_map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .flat_map(|(_, text)| crate::analyze::test_constants::defined_namespaces(text))
         .collect();
     // A port's value (`Rails::VERSION::STRING`) is there only where the
     // tree loads the file that assigns it, not merely carries it.

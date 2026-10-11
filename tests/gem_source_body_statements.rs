@@ -129,17 +129,21 @@ fn a_gem_source_body_runs_in_source_order_like_the_gem() {
     assert_eq!(lines(&run.stdout), expected, "emitted Orbis diverges from the gem");
 }
 
-/// The same statements in an app's own module are not replayed: the
-/// replay is a gem source's, whose body is the gem's Ruby. An app class
-/// body keeps the modelled DSL (and reports what it drops).
+/// The same statements in an app's own module are carried too
+/// (e05b798bd, `carries_body_statement`): Ruby runs a module body's
+/// statements in source order whoever wrote the module, so `ROWS.sort!`
+/// sorts the constant it follows.
 #[test]
-fn an_app_module_does_not_take_the_gem_source_replay() {
-    let (emitted, _) = emit_and_run::empty_app()
+fn an_app_modules_body_statements_run_in_source_order() {
+    let run = emit_and_run::empty_app()
         .write("app/models/table.rb", "module Table\n  ROWS = [3, 1, 2]\n  ROWS.sort!\nend\n")
-        .emit(roundhouse::project::BuildTarget::Ruby);
-    let table = std::fs::read_to_string(emitted.join("app/models/table.rb")).expect("emitted table.rb");
-    assert!(table.contains("ROWS = [3, 1, 2]"), "{table}");
-    assert!(!table.contains("ROWS.sort!"), "an app module took the gem-source replay:\n{table}");
+        .run_ruby("puts Table::ROWS.inspect\n");
+    let table = std::fs::read_to_string(run.emitted.join("app/models/table.rb")).expect("emitted table.rb");
+    let rows = table.find("ROWS = [3, 1, 2]").expect("ROWS emitted");
+    let sort = table.find("ROWS.sort!").expect("the body statement is carried");
+    assert!(rows < sort, "source order lost:\n{table}");
+    assert!(run.success, "the emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout.trim(), "[1, 2, 3]", "the statement did not run:\n{table}");
 }
 
 fn core_gem_home() -> std::path::PathBuf {

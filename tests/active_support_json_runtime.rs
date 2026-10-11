@@ -197,9 +197,13 @@ fn the_postgresql_ruby_tree_carries_the_json_port() {
     assert!(refused.is_empty(), "{refused:?}");
     let source = |path: &str| files.iter().find(|(p, _)| p == path).map(|(_, text)| text.as_str())
         .unwrap_or_else(|| panic!("tree lacks {path}: {:?}", files.iter().map(|(p, _)| p).collect::<Vec<_>>()));
-    // Verbatim, after the stdlib requires the tree adds for what it names.
+    // Verbatim, but for the stdlib require the tree adds for what it names:
+    // written below the leading magic comments (4c3b8b3d9), because Ruby
+    // reads `# frozen_string_literal: true` only before the first token.
     let port = source("runtime/active_support_json.rb");
-    assert!(port.ends_with(&std::fs::read_to_string(root().join("runtime/spinel/active_support_json.rb")).unwrap()), "{port}");
+    let original = std::fs::read_to_string(root().join("runtime/spinel/active_support_json.rb")).unwrap();
+    assert!(original.starts_with("# frozen_string_literal: true\n"), "the port's magic comment moved");
+    assert_eq!(port.replacen("require \"uri\"\n", "", 1), original, "{port}");
     let ext = source("runtime/active_support_ext.rb");
     assert_eq!(ext.matches("require_relative \"active_support_json\"").count(), 1, "{ext}");
     let snapshot = source("app/models/snapshot.rb");

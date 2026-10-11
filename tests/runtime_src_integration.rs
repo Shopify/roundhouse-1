@@ -776,8 +776,23 @@ fn every_runtime_method_body_is_fully_typed() {
             continue;
         }
 
-        let rbs = fs::read_to_string(&rbs_path)
+        let mut rbs = fs::read_to_string(&rbs_path)
             .unwrap_or_else(|_| panic!("read {rbs_path:?}"));
+
+        // A `<name>_mixin.rbs` uses the type aliases `<name>.rbs`
+        // declares (one module, one declaration each: RBS refuses a
+        // duplicate when both load). An alias is scoped to the module
+        // declaration that holds it, so this per-file read declares the
+        // base file's aliases ahead of the mixin's first method.
+        if let Some(base) = stem.strip_suffix("_mixin") {
+            if let Ok(base_rbs) = fs::read_to_string(Path::new("runtime/ruby").join(format!("{base}.rbs"))) {
+                let aliases: Vec<&str> = base_rbs.lines().filter(|l| l.trim_start().starts_with("type ")).collect();
+                let first_def = rbs.lines().position(|l| l.trim_start().starts_with("def ")).unwrap_or(0);
+                let mut lines: Vec<&str> = rbs.lines().collect();
+                lines.splice(first_def..first_def, aliases);
+                rbs = lines.join("\n");
+            }
+        }
 
         let methods = match parse_methods_with_rbs_in_ctx(&ruby, &rbs, &class_registry) {
             Ok(m) => m,
@@ -909,8 +924,16 @@ fn every_runtime_method_body_concretely_typed() {
         if !rbs_path.exists() { continue; }
         let ruby = fs::read_to_string(&ruby_path).unwrap();
         let rbs = fs::read_to_string(&rbs_path).unwrap();
-        let Ok(methods) = parse_methods_with_rbs_in_ctx(&ruby, &rbs, &class_registry)
-            else { continue };
+        // A stem that does not parse is no stem with no sites: it hid
+        // connection.rb, relation.rb and active_support_reporters.rb
+        // (1195 sites) from this ceiling while their RBS lacked signatures.
+        // A `_mixin` stem's aliases live in its base's RBS (the typed sweep
+        // splices them in), so it alone may not parse standalone.
+        let methods = match parse_methods_with_rbs_in_ctx(&ruby, &rbs, &class_registry) {
+            Ok(methods) => methods,
+            Err(_) if stem.ends_with("_mixin") => continue,
+            Err(e) => panic!("{stem}.rb does not parse against its RBS: {e}"),
+        };
         for m in &methods {
             let n = count_gradual(&m.body);
             if n > 0 {
@@ -1146,7 +1169,18 @@ fn every_runtime_method_body_concretely_typed() {
     // origin/main a40ec2b98 (ceiling 466 from 428): the merged tree
     // measures 515 = 477 + origin's 38; the ceiling keeps r13-merge's
     // headroom, 527 + 38.
-    const CEILING: usize = 565;
+    //
+    // 565 -> 1565, MEASURED 1525 on 2026-10-11 at the test-debt fix: no new
+    // untyped code, but three stems this gate had stopped reading. Their
+    // RBS lacked signatures for methods the Ruby had gained, so
+    // `parse_methods_with_rbs_in_ctx` failed and the old `else { continue }`
+    // counted them as zero (active_record/connection.rb 785,
+    // active_record/relation.rb 220, active_support_reporters.rb 190; the
+    // other 28 files stay 330). The sites are what Rails itself leaves
+    // dynamic there: the validations DSL's option hashes, `validators_of`
+    // / `add_error` payloads, the join-SQL reflection reads. A stem that
+    // does not parse now fails this test instead of vanishing from it.
+    const CEILING: usize = 1565;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

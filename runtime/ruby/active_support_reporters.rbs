@@ -36,6 +36,9 @@ module ActiveSupport
 
     def self.nestable: () -> bool
     def self.nestable=: (bool value) -> bool
+    def self.after_change: () { () -> untyped } -> Array[untyped]
+    def self.after_change_callbacks: () -> Array[untyped]
+    def self.changed: () -> Array[untyped]
     def self.set: (**untyped options) ?{ () -> untyped } -> untyped
     def self.[]=: (untyped key, untyped value) -> untyped
     def self.to_h: () -> Hash[Symbol, untyped]
