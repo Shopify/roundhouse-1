@@ -87,14 +87,14 @@ struct Read {
 /// of `iter().find` by name, so a step is a lookup rather than a scan of
 /// every library class (per class, per declaring subclass: 600 s of
 /// `sti_subclass_callbacks` on Shopify Core).
-struct Lineage<'a> {
+pub(crate) struct Lineage<'a> {
     app: &'a App,
     models: crate::det::HashMap<&'a str, &'a Model>,
     classes: crate::det::HashMap<&'a str, &'a LibraryClass>,
 }
 
 impl<'a> Lineage<'a> {
-    fn new(app: &'a App) -> Self {
+    pub(crate) fn new(app: &'a App) -> Self {
         let mut models: crate::det::HashMap<&str, &Model> = crate::det::HashMap::default();
         for model in &app.models {
             models.entry(model.name.0.as_str()).or_insert(model);
@@ -137,7 +137,7 @@ impl<'a> Lineage<'a> {
 
 /// The nearest model ancestor of `lc` and the classes from `lc` up to
 /// it (`lc` first, the model last), through intermediate library classes.
-fn model_ancestry<'a>(lc: &LibraryClass, lineage: &Lineage<'a>) -> Option<(&'a Model, Vec<ClassId>)> {
+pub(crate) fn model_ancestry<'a>(lc: &LibraryClass, lineage: &Lineage<'a>) -> Option<(&'a Model, Vec<ClassId>)> {
     let mut chain = vec![lc.name.clone()];
     let mut cursor = lc.parent.clone();
     for _ in 0..8 {
@@ -453,7 +453,7 @@ fn define_acceptance_attributes(app: &mut App) {
     }
 }
 
-fn instance_method(owner: &ClassId, name: &str, params: Vec<crate::dialect::Param>, body: Expr) -> crate::dialect::MethodDef {
+pub(crate) fn instance_method(owner: &ClassId, name: &str, params: Vec<crate::dialect::Param>, body: Expr) -> crate::dialect::MethodDef {
     crate::dialect::MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -473,7 +473,7 @@ fn instance_method(owner: &ClassId, name: &str, params: Vec<crate::dialect::Para
     }
 }
 
-fn param(name: &str, default: Option<Expr>) -> crate::dialect::Param {
+pub(crate) fn param(name: &str, default: Option<Expr>) -> crate::dialect::Param {
     crate::dialect::Param {
         name: Symbol::from(name),
         default,

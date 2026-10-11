@@ -2903,6 +2903,7 @@ end
     )?;
     app.carried_included_blocks =
         super::concern_accessors::carried_included_blocks(&app, &concern_class_method_spans);
+    super::anonymous_class_concerns::expand(&mut app);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     super::define_method_loops::expand(&mut app, &sources);
     super::trusted_id_attribute::expand(&mut app);

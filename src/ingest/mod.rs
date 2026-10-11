@@ -26,6 +26,7 @@ pub(crate) mod concern_class_attribute;
 pub mod allow_browser;
 pub mod app;
 mod concern_accessors;
+mod anonymous_class_concerns;
 pub mod database_manifest;
 pub(crate) mod database_ownership;
 pub mod database_yml;

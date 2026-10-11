@@ -118,6 +118,7 @@ pub mod job_test_only;
 pub mod test_cookie_jar;
 pub mod sti_scope;
 pub mod subclass_macros;
+pub(crate) mod sti_subclass_attributes;
 mod sti_subclass_callbacks;
 pub(crate) mod sti_subclass_validations;
 pub mod sum_symbol;
@@ -890,6 +891,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("defined_ivar_memo");
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
     sti_subclass_validations::apply_sti_subclass_validations(app);
+    sti_subclass_attributes::apply_sti_subclass_attributes(app);
     model_to_library::include_callbacks_in_sti_subclasses(app);
     ran!("sti_subclass_callbacks");
     model_to_library::replay_model_macros(app);

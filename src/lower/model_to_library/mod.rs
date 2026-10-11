@@ -1573,6 +1573,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
                 || crate::analyze::is_include_refusal(call)
                 || crate::lower::sti_subclass_callbacks::folds(call)
                 || crate::lower::default_scope::claims(call)
+                || crate::lower::sti_subclass_attributes::claims(app, lc, call)
                 || crate::lower::subclass_macros::lowers(app, &lc.name, call)
                 || app.models.iter().any(|m| lc.parent.as_ref() == Some(&m.name) && m.claimed_body_calls.contains(&call.span))
             {
