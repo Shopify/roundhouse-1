@@ -17670,6 +17670,8 @@ mod tests {
             ("::Semian::SyscallError", "runtime/semian.rb"),
             ("Semian::ActiveRecordPostgreSQLAdapter", "runtime/semian_activerecord_postgresql_adapter.rb"),
             ("ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::CircuitOpenError", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            ("ActiveRecord::ConnectionAdapters::TrilogyAdapter::ResourceBusyError", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            ("ActiveRecord::ConnectionAdapters::TrilogyAdapter::CircuitOpenError", "runtime/semian_activerecord_postgresql_adapter.rb"),
             ("Semian::NetHTTP", "runtime/semian_net_http.rb"),
             ("Semian::Adapter", "runtime/semian_adapter.rb"),
         ] {
