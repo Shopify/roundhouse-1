@@ -65,6 +65,8 @@ module ActiveRecord
       @model = model
       @table = model._table_sql
       @wheres = []
+      @where_parts = {}
+      @lock = nil
       @joins = []
       @orders = []
       @groups = []
@@ -393,15 +395,23 @@ module ActiveRecord
       own_lists
       @records = nil
       return false if condition.nil?
+      parts = nil
       sql = if condition.is_a?(Hash)
-        hash_conditions(condition, note)
+        built = hash_conditions(condition, note)
+        parts = @hash_parts
+        built
       elsif condition.is_a?(Array)
         substitute_binds(condition[0].to_s, condition.drop(1) + args)
       else
         substitute_binds(condition.to_s, args)
       end
       return false if sql == ""
-      @wheres << (negate ? "NOT (#{sql})" : "(#{sql})")
+      clause = negate ? "NOT (#{sql})" : "(#{sql})"
+      @wheres << clause
+      # A Hash's equalities are separate predicates in Rails, which
+      # `unscope(where:)` removes one by one. Reassigned, not written
+      # into: a spawned relation shares the Hash.
+      @where_parts = @where_parts.merge({ clause => parts }) unless parts.nil?
       true
     end
 
@@ -471,6 +481,115 @@ module ActiveRecord
       @orders = []
       order(*parts)
     end
+
+    # `lock` / `lock(false)` / `lock("FOR SHARE")` — the row-locking
+    # clause closing the SELECT (query_methods.rb `lock!`: a String is
+    # the clause as written, true or nil is `FOR UPDATE`, anything else
+    # removes it; arel's visitor writes it after LIMIT and OFFSET).
+    def lock(locks = true)
+      @records = nil
+      @lock = if locks.is_a?(String)
+        locks
+      elsif locks == true || locks.nil?
+        "FOR UPDATE"
+      end
+      self
+    end
+
+    # What `unscope(:name)` may name (query_methods.rb
+    # VALID_UNSCOPING_VALUES).
+    UNSCOPING_VALUES = [
+      :where, :select, :group, :order, :lock, :limit, :offset, :joins, :left_outer_joins,
+      :annotate, :includes, :eager_load, :preload, :from, :readonly, :having, :optimizer_hints, :with
+    ].freeze
+    private_constant :UNSCOPING_VALUES
+
+    # `unscope(:order, where: :col, …)` — drop a clause of the query
+    # (query_methods.rb `unscope!`). A Symbol names the clause to reset;
+    # `where:` takes the columns whose conditions go, whatever their
+    # predicate (equality, IN, NOT …).
+    def unscope(*args)
+      own_lists
+      @records = nil
+      args.flatten.each do |scope|
+        if scope.is_a?(Symbol)
+          scope = :left_outer_joins if scope == :left_joins
+          unless UNSCOPING_VALUES.include?(scope)
+            raise ArgumentError, "Called unscope() with invalid unscoping argument ':#{scope}'. Valid arguments are :#{UNSCOPING_VALUES.join(", :")}."
+          end
+          unscope_clause(scope)
+        elsif scope.is_a?(Hash)
+          scope.each do |key, target|
+            raise ArgumentError, "Hash arguments in .unscope(*args) must have :where as the key." if key != :where
+            unscope_where_columns(target.is_a?(Array) ? target : [target])
+          end
+        else
+          raise ArgumentError, "Unrecognized scoping: #{args.inspect}. Use .unscope(where: :attribute_name) or .unscope(:order), for example."
+        end
+      end
+      self
+    end
+
+    def unscope_clause(scope)
+      case scope
+      when :where
+        @wheres = []
+        @where_parts = {}
+        @scope_attributes = {}
+      when :select then @select_sql = nil
+      when :group then @groups = []
+      when :order then @orders = []
+      when :lock then @lock = nil
+      when :limit then @limit = nil
+      when :offset then @offset = nil
+      when :joins, :left_outer_joins then @joins = []
+      when :includes, :eager_load, :preload then @includes = []
+      when :from then @from = nil
+      when :readonly then @readonly = false
+      when :having then @havings = []
+      when :with then @ctes = []
+      end
+      nil
+    end
+    private :unscope_clause
+
+    # `where_clause.except(*columns)`: a hash condition's predicate goes
+    # when it is on one of `columns` (bare, or qualified with this
+    # relation's table); a negated one only when every predicate in it is.
+    def unscope_where_columns(columns)
+      names = columns.map { |c| unscope_column_name(c.to_s) }
+      kept = []
+      parts_left = {}
+      @wheres.each do |clause|
+        parts = @where_parts[clause]
+        if parts.nil?
+          kept << clause
+          next
+        end
+        remaining = parts.reject { |part| names.include?(unscope_column_name(part[0])) }
+        if remaining.length == parts.length || (clause.start_with?("NOT (") && remaining.length > 0)
+          kept << clause
+          parts_left[clause] = parts
+        elsif remaining.length > 0
+          rebuilt = "(#{remaining.map { |part| part[1] }.join(" AND ")})"
+          kept << rebuilt
+          parts_left[rebuilt] = remaining
+        end
+      end
+      @wheres = kept
+      @where_parts = parts_left
+      @scope_attributes = @scope_attributes.reject { |col, _| names.include?(col.to_s) }
+      nil
+    end
+    private :unscope_where_columns
+
+    # A column as `unscope` compares it: this relation's own table's
+    # prefix dropped, another table's kept.
+    def unscope_column_name(name)
+      prefix = "#{@model.table_name}."
+      name.start_with?(prefix) ? name[prefix.length, name.length - prefix.length].to_s : name
+    end
+    private :unscope_column_name
 
     # Rails' mutating spellings. This Relation's chain methods already
     # mutate in place and return self, so the bang forms are the same
@@ -2294,6 +2413,7 @@ module ActiveRecord
         sql = "#{sql} LIMIT -1"
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?
+      sql = "#{sql} #{@lock}" unless @lock.nil?
       sql
     end
 
@@ -2397,16 +2517,23 @@ module ActiveRecord
     # `IS NULL`, nested Hash -> qualified `table.col = ...`.
     def hash_conditions(hash, note = false)
       parts = []
+      named = []
       hash.each do |key, val|
         if val.is_a?(Hash)
           val.each do |col, v|
-            parts << column_predicate("#{key}.#{col}", v)
+            predicate = column_predicate("#{key}.#{col}", v)
+            parts << predicate
+            named << ["#{key}.#{col}", predicate]
           end
         else
           # An alias names its column (`where(subdomain:)`).
-          parts << column_predicate(@model._attribute_name(key.to_s), val, note)
+          column = @model._attribute_name(key.to_s)
+          predicate = column_predicate(column, val, note)
+          parts << predicate
+          named << [column, predicate]
         end
       end
+      @hash_parts = named
       parts.join(" AND ")
     end
 

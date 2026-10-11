@@ -197,6 +197,9 @@ p [ReportJob.stamp, HaltedJob.stamp, ReportJob.new.stamp, ApplicationJob.respond
 p [ReportJob._perform_callbacks.map(&:kind), HaltedJob._perform_callbacks.count, ReportJob._enqueue_callbacks.map(&:kind).last(4)]
 p ReportJob.rescue_handlers.map(&:first)
 p PlainJob.perform_now(5)
+# `ActiveJob.perform_all_later`: no enqueue callbacks (the halting one is skipped), jobs flattened.
+run(:all_later) { jobs = [ReportJob.new(:ok, 1), ReportJob.new(:refuse)]; [ActiveJob.perform_all_later(jobs), jobs.map(&:successfully_enqueued?)] }
+run(:all_later_splat) { job = ReportJob.new(:ok, 2); [ActiveJob.perform_all_later(job, [HaltedJob.new(:ok)]), job.successfully_enqueued?] }
 hold_jobs
 run(:held) { ReportJob.perform_later(:ok, 3) }
 run(:held_refused) { ReportJob.perform_later(:refuse) }
