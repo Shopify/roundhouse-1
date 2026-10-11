@@ -2732,13 +2732,13 @@ module MochaBridge
   # Extended lazily: this file is required from the helper's preamble,
   # ahead of the gem in some trees, and the matchers are only needed
   # once a test reaches one.
-  def self.matcher(name, arg = nil)
+  def self.matcher(name, *args)
     # mocha 3 keeps the matcher methods in `Mocha::ParameterMatchers::Methods`;
     # mocha 2 (Core pins 2.5) defines them on `Mocha::ParameterMatchers`
     # itself. `Mocha::API` includes whichever into a test class.
     matchers = Mocha::ParameterMatchers.const_defined?(:Methods, false) ? Mocha::ParameterMatchers::Methods : Mocha::ParameterMatchers
     extend matchers unless singleton_class.include?(matchers)
-    arg.nil? ? public_send(name) : public_send(name, resolve(arg))
+    public_send(name, *args.map { |a| resolve(a) })
   end
 end
 "##;
@@ -19074,6 +19074,28 @@ mod tests {
         );
         let out = std::process::Command::new("ruby").arg("-e").arg(&script).output().expect("ruby");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "[5, :kw]", "stderr={}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The replay half under STRICT keyword matching (the setting that
+    /// tells `with(a: 1)` from `with({a: 1})`): an `expects(:new)` head,
+    /// positionals followed by a trailing keyword hash, a two-argument
+    /// matcher with a marked constant, and a nested `all_of`.
+    #[test]
+    fn mocha_bridge_replay_serves_new_heads_trailing_keywords_and_multi_arg_matchers() {
+        let script = format!(
+            "require 'mocha/api'\ninclude Mocha::API\nMocha.configure {{ |c| c.strict_keyword_argument_matching = true }}\nmocha_setup\n\
+             class Svc; LIMIT = 5; def initialize(**) = nil; def self.subscribe(*a, **k) = :real; def self.pick(*a) = :real; end\n\
+             {MOCHA_BRIDGE_REPLAY}\n\
+             K = MochaBridge\n\
+             K.chain('Svc', :expects, :new, [[:with, [K.kwargs({{ id: 7 }})]], [:returns, [:made]]])\n\
+             K.chain('Svc', :expects, :subscribe, [[:with, ['s', 'u', K.kwargs({{ contract_id: 123 }})]], [:returns, [:ok]]])\n\
+             K.chain('Svc', :expects, :pick, [[:with, [K.matcher(:has_entry, :k, K.konst('Svc::LIMIT')), K.matcher(:all_of, K.matcher(:instance_of, K.konst('Integer')), K.matcher(:kind_of, K.konst('Numeric')))]], [:returns, [:picked]]])\n\
+             print [Svc.new(id: 7), Svc.subscribe('s', 'u', contract_id: 123), Svc.pick({{ k: 5 }}, 3)].inspect\n\
+             begin\n  Svc.subscribe('s', 'u', {{ contract_id: 123 }})\nrescue Exception => e\n  print ' ', e.class\nend\n"
+        );
+        let out = std::process::Command::new("ruby").arg("-e").arg(&script).output().expect("ruby");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("[:made, :ok, :picked]"), "stdout={stdout} stderr={}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// The spinel tree names the app source each emitted line came from
