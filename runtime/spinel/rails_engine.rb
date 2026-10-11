@@ -47,6 +47,25 @@
 require "pathname"
 require_relative "rails_railtie"
 
+require "set"
+
+module ActiveSupport
+  # activesupport/lib/active_support/dependencies.rb: the directory lists
+  # Rails::Engine's `set_autoload_paths` / `set_eager_load_paths` fill and
+  # an application initializer prunes. Loading is the emitted tree's own
+  # (app/models.rb's autoload), so nothing here loads from them.
+  module Dependencies # :nodoc:
+    singleton_class.attr_accessor :autoload_paths
+    self.autoload_paths = []
+
+    singleton_class.attr_accessor :autoload_once_paths
+    self.autoload_once_paths = []
+
+    singleton_class.attr_accessor :_eager_load_paths
+    self._eager_load_paths = Set.new
+  end unless const_defined?(:Dependencies, false)
+end
+
 module Rails
   # railties/lib/rails/paths.rb.
   module Paths
@@ -277,6 +296,12 @@ module Rails
         super
       end
 
+      # The application's root: the tree's (app/models.rb's
+      # RoundhouseAutoload sits in app/), as Rails' is the app's.
+      def application_root # :nodoc:
+        defined?(::RoundhouseAutoload::ROOT) ? File.expand_path("..", ::RoundhouseAutoload::ROOT) : File.expand_path(Rails.root.to_s)
+      end
+
       # The application's own Engine initializers, run after every
       # engine's: Rails::Application is an engine, the last in
       # Engine::Railties order (Application#ordered_railties), with the
@@ -288,7 +313,7 @@ module Rails
       def application_initializers(app) # :nodoc:
         return [] unless app.is_a?(::Rails::Application)
 
-        root = defined?(::RoundhouseAutoload::ROOT) ? File.expand_path("..", ::RoundhouseAutoload::ROOT) : File.expand_path(Rails.root.to_s)
+        root = application_root
         locales = Engine::Configuration.new(Pathname.new(root)).paths["config/locales"]
         add_locales = Initializable::Initializer.new(:add_locales, app, before: nil, after: nil) do
           # `config` is runtime/rails_configuration.rb's, which the tree
@@ -463,12 +488,19 @@ module Rails
 
     # app/models.rb's autoload, generated from every carried file, is
     # this tree's ActiveSupport::Dependencies.
+    # The directories it registers are where Rails' `set_autoload_paths`
+    # puts them, ActiveSupport::Dependencies' lists (engine.rb:596-604),
+    # for an app initializer that prunes them.
     initializer :set_autoload_paths, before: :bootstrap_hook do
+      ActiveSupport::Dependencies.autoload_paths.unshift(*_all_autoload_paths)
+      ActiveSupport::Dependencies.autoload_once_paths.unshift(*_all_autoload_once_paths)
+
       config.autoload_paths.freeze
       config.autoload_once_paths.freeze
     end
 
     initializer :set_eager_load_paths, before: :bootstrap_hook do
+      ActiveSupport::Dependencies._eager_load_paths.merge(config.all_eager_load_paths)
       config.eager_load_paths.freeze
     end
 
@@ -651,6 +683,29 @@ module Rails
 
       def all_eager_load_paths # :nodoc:
         eager_load_paths + paths.eager_load
+      end
+    end
+  end
+
+  # railties/lib/rails/application/configuration.rb: the engine
+  # configuration of the application, with the paths only an application
+  # has. runtime/rails_configuration.rb answers `Rails.application.config`'s
+  # `paths`, `root` and the autoload / eager-load path lists from it.
+  class Application
+    class Configuration < ::Rails::Engine::Configuration # :nodoc:
+      def paths
+        @paths ||= begin
+          paths = super
+          paths.add "config/database",    with: "config/database.yml"
+          paths.add "config/environment", with: "config/environment.rb"
+          paths.add "lib/templates"
+          paths.add "log",                with: "log/#{Rails.env}.log"
+          paths.add "public"
+          paths.add "public/javascripts"
+          paths.add "public/stylesheets"
+          paths.add "tmp"
+          paths
+        end
       end
     end
   end

@@ -1963,6 +1963,7 @@ end
         // reported by name, not dropped.
         let mut application_initializers: Vec<crate::expr::Expr> = Vec::new();
         if postgresql {
+            app.application_namespace = extract_app_namespace(&source);
             let (carried, refused) = super::application_initializers::extract(&source, &file);
             application_initializers = carried;
             for (start, end, message) in refused {

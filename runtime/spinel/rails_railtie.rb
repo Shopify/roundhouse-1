@@ -398,6 +398,7 @@ module Rails
           build_middleware_stack: -> { Configuration.refuse_app_middleware! },
           run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
           eager_load!: -> { eager_load_step(app) },
+          set_routes_reloader_hook: -> { refuse_undrawn_application_routes(app) },
           finisher_hook: -> { ActiveSupport.run_load_hooks(:after_initialize, app) },
         }
         collection = Initializable::Collection.new
@@ -441,6 +442,24 @@ module Rails
         store = config.cache_store
         return if store.nil? || store.is_a?(Symbol) || store.is_a?(Array)
         ::Rails.instance_variable_set(:@cache_store, ::ActiveSupport::Cache.lookup_store(store))
+      end
+
+      # Finisher's `:set_routes_reloader_hook` loads the routes, which
+      # draws the blocks an initializer gave `app.routes.append` /
+      # `prepend`. This tree's routes are compiled from config/routes.rb
+      # and drawing a block is not ported, so each is named
+      # (error[route_set_not_drawn]) instead of dropped.
+      def refuse_undrawn_application_routes(app) # :nodoc:
+        return unless app.respond_to?(:routes)
+        routes = app.routes
+        return unless routes.respond_to?(:appended_blocks)
+
+        (routes.prepended_blocks + routes.appended_blocks).each do |block|
+          site = block.source_location&.first(2)&.join(":")
+          not_run_unless_it_runs("the application's routes block at #{site}") do
+            raise NotImplementedError, "error[route_set_not_drawn]: the routes block at #{site} is not drawn: this tree's routes are compiled from config/routes.rb, and drawing a route set at run time (ActionDispatch::Routing::Mapper) is not ported"
+          end
+        end
       end
 
       # Finisher's `:eager_load!` (railties application/finisher.rb):

@@ -57,6 +57,29 @@ module Rails
         UrlHelpers
       end
 
+      # ActionDispatch::Routing::RouteSet#append / #prepend (actionpack
+      # 8.2.0.alpha route_set.rb:464-470): the blocks an initializer adds
+      # (`app.routes.append { … }`), which Rails draws when it loads the
+      # routes. They are kept; this tree's routes are compiled from
+      # config/routes.rb and drawing a block is not ported, so the railtie
+      # runtime names each at the routes-reloader step
+      # (Railtie.refuse_undrawn_application_routes).
+      def self.append(&block)
+        appended_blocks << block
+      end
+
+      def self.prepend(&block)
+        prepended_blocks << block
+      end
+
+      def self.appended_blocks # :nodoc:
+        @appended_blocks ||= []
+      end
+
+      def self.prepended_blocks # :nodoc:
+        @prepended_blocks ||= []
+      end
+
       # Rails' `recognize_path` for one path. The result has Symbol
       # keys and String values: `:controller`, `:action`, each dynamic
       # segment, and `:format` last. `:controller` is the Rails path of

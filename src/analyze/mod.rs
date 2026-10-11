@@ -1301,6 +1301,17 @@ impl Analyzer {
                 info.app_declared = true;
             }
         }
+        // `class Sample::Application < Rails::Application`: ingest folds its
+        // body onto the `Rails::Application` reopen, and the emitted
+        // tree binds `Sample::Application` to that class
+        // (`emit::ruby::application_namespace_alias`), so a read of the
+        // app's own constant is the application class.
+        if let Some(namespace) = &app.application_namespace {
+            classes
+                .entry(ClassId(Symbol::from(format!("{namespace}::Application").as_str())))
+                .or_default()
+                .app_declared = true;
+        }
         let const_resolver = app.const_resolver.for_app(app);
         // Before signatures resolve: `#: -> IdentityAccountFields` inside
         // `IdentityAccount` names the Struct constant's class.
