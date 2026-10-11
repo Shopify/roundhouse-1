@@ -125,10 +125,14 @@ module ActiveRecord
     def prev_page: () -> Integer?
     def group: (*(String | Symbol) parts) -> Relation
     def having: (String condition, *untyped args) -> Relation
-    def joins: (String | Symbol spec) -> Relation
-    def join_fragment: (String | Symbol spec) -> String
-    def left_outer_joins: (String | Symbol spec) -> Relation
-    def left_joins: (String | Symbol spec) -> Relation
+    def joins: (untyped spec) -> Relation
+    def join_fragment: (untyped spec, ?String kind) -> String
+    def reflected_join_sql: (untyped owner, untyped spec, String kind) -> String
+    def reflect_join_hop: (untyped owner, untyped name) -> untyped
+    def reflection_join_sql: (untyped owner, untyped reflection, String kind) -> String
+    def join_key_list: (untyped key) -> Array[String]
+    def left_outer_joins: (untyped spec) -> Relation
+    def left_joins: (untyped spec) -> Relation
     # Two methods sharing a name: field args PROJECT columns and keep
     # the Relation; a block is Enumerable's filter over the loaded
     # records and answers an Array (zero args means the block form —

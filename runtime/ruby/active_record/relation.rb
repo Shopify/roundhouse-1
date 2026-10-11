@@ -942,18 +942,107 @@ module ActiveRecord
     def left_outer_joins(spec)
       own_lists
       @records = nil
-      frag = join_fragment(spec)
+      frag = join_fragment(spec, "LEFT OUTER JOIN")
       @joins << frag unless @joins.include?(frag)
       self
     end
 
-    def join_fragment(spec)
+    # The SQL of a `joins` / `left_outer_joins` argument. A String is
+    # the author's SQL. An association spec the lowering did not expand
+    # (the receiver's model is only known here, as in `base.left_joins(
+    # :payment_credentials)` on a relation built from a variable) is
+    # resolved against the model's reflections, as JoinDependency does:
+    # a Symbol is one hop, a Hash (`joins(user: :memberships)`) joins the
+    # nested hops off the hop's target, an Array is several.
+    #
+    # A hop the reflections cannot express raises naming it: a scoped or
+    # polymorphic association, a habtm, an STI target, a self join
+    # (Rails aliases its table) and a model answering no reflections.
+    # Appending a guess would answer the wrong rows.
+    def join_fragment(spec, kind = "INNER JOIN")
       return spec if spec.is_a?(String)
-      raise("joins(#{spec}): an association join is resolved at transpile " \
-            "time and this one was not — the receiver's class has no entry " \
-            "in the association registry (an STI subclass, a habtm, or an " \
-            "unresolvable `through`). Appending the name raw would answer " \
-            "the wrong rows rather than fail.")
+      reflected_join_sql(@model, spec, kind)
+    end
+
+    def reflected_join_sql(owner, spec, kind)
+      case spec
+      when String
+        spec
+      when Symbol
+        reflection_join_sql(owner, reflect_join_hop(owner, spec), kind)
+      when Array
+        spec.map { |el| reflected_join_sql(owner, el, kind) }.join(" ")
+      when Hash
+        spec.map do |name, nested|
+          reflection = reflect_join_hop(owner, name)
+          head = reflection_join_sql(owner, reflection, kind)
+          "#{head} #{reflected_join_sql(reflection.klass, nested, kind)}"
+        end.join(" ")
+      else
+        raise ArgumentError, "joins(#{spec.inspect}): not an association name, hash, array or SQL string"
+      end
+    end
+
+    def reflect_join_hop(owner, name)
+      reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(name.to_sym) : nil
+      return reflection unless reflection.nil?
+      raise ArgumentError, "joins(:#{name}): #{owner} has no association #{name} to join, or answers no reflections " \
+        "(reflect_on_association is emitted where the app calls it)"
+    end
+
+    # JoinDependency's join for one reflection: a `through` is its
+    # through hop then its source hop off the through model, every hop
+    # carrying `kind`.
+    def reflection_join_sql(owner, reflection, kind)
+      if reflection.through_reflection?
+        through = reflection.through_reflection
+        source = reflection.source_reflection
+        if through.nil? || source.nil?
+          raise ArgumentError, "joins(:#{reflection.name}): the through association of #{owner} has no through or source reflection"
+        end
+        first = reflection_join_sql(owner, through, kind)
+        return "#{first} #{reflection_join_sql(through.klass, source, kind)}"
+      end
+      name = "joins(:#{reflection.name})"
+      if reflection.macro == :has_and_belongs_to_many
+        raise NotImplementedError, "roundhouse: #{name} on #{owner}: a has_and_belongs_to_many join through its implicit join table is not resolved at runtime"
+      end
+      if reflection.polymorphic?
+        raise ArgumentError, "#{name} on #{owner}: a polymorphic belongs_to cannot be joined (Rails raises EagerLoadPolymorphicError)"
+      end
+      reflection.options # raises by name for a scope or option the compiler did not carry
+      target = reflection.klass
+      if target._type_conditioned?
+        raise NotImplementedError, "roundhouse: #{name} on #{owner}: the target #{target} is an STI subclass; its type condition is not resolved at runtime"
+      end
+      table = target._table_sql
+      own = owner._table_sql
+      if table == own
+        raise NotImplementedError, "roundhouse: #{name} on #{owner}: a self join needs a table alias, which is not resolved at runtime"
+      end
+      if reflection.belongs_to?
+        theirs = join_key_list(reflection.association_primary_key)
+        ours = join_key_list(reflection.foreign_key)
+      else
+        theirs = join_key_list(reflection.foreign_key)
+        ours = join_key_list(reflection.active_record_primary_key)
+      end
+      conditions = []
+      index = 0
+      while index < theirs.length
+        conditions << "#{table}.#{theirs[index]} = #{own}.#{ours[index]}"
+        index += 1
+      end
+      type = reflection.type
+      unless type.nil?
+        conditions << "#{table}.#{type} = '#{owner.polymorphic_name.to_s.gsub("'", "''")}'"
+      end
+      "#{kind} #{table} ON #{conditions.join(" AND ")}#{target._join_scope_sql}"
+    end
+
+    # A reflection's key is one column or an Array of them (composite).
+    def join_key_list(key)
+      key.is_a?(Array) ? key.map { |k| k.to_s } : [key.to_s]
     end
 
     # `left_joins` — Rails alias for `left_outer_joins`.

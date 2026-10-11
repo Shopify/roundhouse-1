@@ -3780,7 +3780,10 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
     let generated = |m: &MethodDef| {
         m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && m.name_span.file.0 == 0
     };
-    if !lcs.iter().any(|lc| lc.methods.iter().any(generated)) && !app_calls_method(app, "reflect_on_association") {
+    if !lcs.iter().any(|lc| lc.methods.iter().any(generated))
+        && !app_calls_method(app, "reflect_on_association")
+        && !app_joins_by_name(app)
+    {
         return;
     }
     let mut declarations = DeclarationOptions::default();
@@ -4001,24 +4004,44 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
 
 /// Some emit-bound body, view or test sends `method`.
 fn app_calls_method(app: &App, method: &str) -> bool {
-    fn walk(e: &Expr, method: &str, found: &mut bool) {
+    app_sends(app, &|m, _| m == method)
+}
+
+/// Some emit-bound body, view or test joins by something other than SQL
+/// text (`base.left_joins(:name)`, `model.joins(spec)`). Where the
+/// receiver's model is known `lower::scope_chain` expands the spec to
+/// SQL; where it is only known at runtime (a parameter, a `Class#new`
+/// result) `Relation#join_fragment` resolves it from the model's
+/// reflections. Which of the two a call becomes is not known at this
+/// stage, so any such call carries the reflections.
+fn app_joins_by_name(app: &App) -> bool {
+    app_sends(app, &|m, args| {
+        matches!(m, "joins" | "left_joins" | "left_outer_joins")
+            && args.first().is_some_and(|a| {
+                !matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })
+            })
+    })
+}
+
+fn app_sends(app: &App, wanted: &dyn Fn(&str, &[Expr]) -> bool) -> bool {
+    fn walk(e: &Expr, wanted: &dyn Fn(&str, &[Expr]) -> bool, found: &mut bool) {
         if *found {
             return;
         }
-        if let ExprNode::Send { method: m, .. } = &*e.node {
-            if m.as_str() == method {
+        if let ExprNode::Send { method: m, args, .. } = &*e.node {
+            if wanted(m.as_str(), args) {
                 *found = true;
                 return;
             }
         }
-        e.node.for_each_child(&mut |c| walk(c, method, found));
+        e.node.for_each_child(&mut |c| walk(c, wanted, found));
     }
     let mut found = false;
-    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, method, &mut found));
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, wanted, &mut found));
     for view in &app.views {
-        walk(&view.body, method, &mut found);
+        walk(&view.body, wanted, &mut found);
     }
-    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, method, &mut found));
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, wanted, &mut found));
     found
 }
 
