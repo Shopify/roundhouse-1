@@ -460,21 +460,21 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
 }
 
 /// The features the tree does not port fail by name, never loading the
-/// gem home's activesupport. active_support/all and core_ext/hash, which
-/// it ports in part, load (their unported methods refuse by name:
+/// gem home's activesupport. active_support/all, core_ext and core_ext/hash,
+/// which it ports in part, load (their unported methods refuse by name:
 /// tests/active_support_all_feature.rs).
 #[test]
 fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     let (tree, _) = probe().emit(BuildTarget::Ruby);
     let out = run("refusals", &tree, None);
-    for feature in ["active_support/all", "active_support/core_ext/hash"] {
+    for feature in ["active_support/all", "active_support/core_ext", "active_support/core_ext/hash"] {
         let line = format!("{feature}: loaded\n");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
     // Every other Rails feature with no port (Integer#months, the whole
     // core_ext set): by name, not as a plain
     // `cannot load such file`, which is left to everything else.
-    for feature in ["active_support/core_ext/string/filters", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
+    for feature in ["active_support/core_ext/string/filters", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
         let line = format!(
             "{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded\n"
         );
@@ -489,7 +489,7 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     ] {
         assert!(out.contains(line), "missing {line:?}:\n{out}");
     }
-    assert_eq!(out.matches("framework_feature_not_ported").count(), 4, "{out}");
+    assert_eq!(out.matches("framework_feature_not_ported").count(), 3, "{out}");
     assert!(out.contains("routes: NotImplementedError: error[route_set_not_drawn]: the routes block at "), "{out}");
     for method in ["url_helpers", "recognize_path"] {
         let line = format!("routes: NotImplementedError: error[route_set_not_drawn]: ActionDispatch::Routing::RouteSet#{method} needs a drawn route set");

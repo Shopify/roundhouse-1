@@ -5520,6 +5520,8 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
     ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
     ("active_support/descendants_tracker", &["active_support_descendants_tracker"]),
+    // json-jwt's json/jose.rb requires it for `secure_compare`.
+    ("active_support/security_utils", &["security_utils"]),
     ("active_support/core_ext/numeric", &["active_support_numeric"]),
     ("active_support/core_ext/numeric/bytes", &["active_support_numeric_bytes"]),
     ("active_support/core_ext/numeric/time", &["active_support_numeric_time"]),
@@ -5809,6 +5811,14 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
         files.push(("runtime/features/active_support/all.rb".into(), text));
         refusals = true;
     }
+    // `require "active_support/core_ext"` (core_ext.rb: every core_ext/*.rb
+    // of Rails' active_support, json-jwt's json/jwt.rb) is the core_ext part
+    // of all.rb, answered the same way.
+    if !exists(files, "active_support/core_ext") {
+        let text = active_support_core_ext_feature(files);
+        files.push(("runtime/features/active_support/core_ext.rb".into(), text));
+        refusals = true;
+    }
     if refusals && !carried(files, "active_support_not_ported") {
         files.push(("runtime/active_support_not_ported.rb".into(), active_support_not_ported_file()));
     }
@@ -5869,6 +5879,29 @@ fn active_support_all_feature(files: &[(String, String)]) -> String {
         };
         if feature.starts_with("core_ext/") {
             text.push_str(&format!("require_relative {feature:?}\n"));
+        }
+    }
+    text.push_str("require_relative \"../../active_support_not_ported\"\n");
+    text.push_str("RoundhouseActiveSupportNotPorted.refuse(\"Array#to_xml\", \"active_support/core_ext/array/conversions\")\n");
+    text.push_str("RoundhouseActiveSupportNotPorted.name_missing_methods\n");
+    text
+}
+
+/// runtime/features/active_support/core_ext.rb: Rails' `active_support/core_ext`
+/// loads each active_support/core_ext/*.rb, as [`active_support_all_feature`]
+/// does for the part of all.rb that requires it, with what the tree does
+/// not port refused the same way.
+fn active_support_core_ext_feature(files: &[(String, String)]) -> String {
+    const DIR: &str = "runtime/features/active_support/core_ext/";
+    let mut text = String::from(
+        "# `require \"active_support/core_ext\"` on this tree, from a gem's own code:\n\
+         # the tree's file for each Active Support core extension it ports, and what\n\
+         # they do not port refused by name (project.rs::active_support_core_ext_feature).\n\
+         # runtime/gem_facades.rb puts this directory first on the load path.\n",
+    );
+    for (path, _) in files {
+        if let Some(feature) = path.strip_prefix(DIR).and_then(|p| p.strip_suffix(".rb")) {
+            text.push_str(&format!("require_relative \"core_ext/{feature}\"\n"));
         }
     }
     text.push_str("require_relative \"../../active_support_not_ported\"\n");
