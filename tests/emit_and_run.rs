@@ -12684,3 +12684,110 @@ raise "the cached copy is the caller's object" if again.equal?(body)
 "##)
         .assert_passes();
 }
+
+/// `X = Struct.new(…) do … end` followed by `class X … end` reopens the
+/// class the factory built (Ruby: the constant is bound, so `class X` is
+/// a reopening). The reopening's methods, constants and includes join the
+/// factory class, in the same file, in a later file, for `Data.define`,
+/// and nested in a module. Expected values are Ruby's own.
+#[test]
+fn a_factory_class_reopened_by_a_class_body_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/point.rb",
+            r##"Point = Struct.new(:x, :y) do
+  def sum
+    x + y
+  end
+end
+"##,
+        )
+        .write(
+            "app/services/doubler.rb",
+            r##"module Doubler
+  def doubled
+    sum * 2
+  end
+end
+"##,
+        )
+        .write(
+            "app/services/reopened_point.rb",
+            r##"require_relative "point"
+require_relative "doubler"
+
+class Point
+  include Doubler
+  ORIGIN = [0, 0].freeze
+
+  def self.origin
+    new(*ORIGIN)
+  end
+
+  def label
+    "(#{x}, #{y})"
+  end
+end
+"##,
+        )
+        .write(
+            "app/services/mixed.rb",
+            r##"Mixed = Struct.new(:a) do
+  def one
+    a
+  end
+end
+
+class Mixed
+  def two
+    a * 2
+  end
+end
+
+module Ns
+  Inner = Data.define(:v) do
+    def plus
+      v + 1
+    end
+  end
+
+  class Inner
+    def minus
+      v - 1
+    end
+  end
+
+  Tagged = Struct.new(:t, keyword_init: true) do
+    def raw
+      t
+    end
+  end
+
+  class Tagged
+    TAG = "t"
+
+    def tag
+      "#{TAG}:#{raw}"
+    end
+  end
+end
+"##,
+        )
+        .run_ruby(
+            r#"
+p1 = Point.new(1, 2)
+raise "factory method" unless p1.sum == 3
+raise "included module" unless p1.doubled == 6
+raise "reopened method" unless p1.label == "(1, 2)"
+raise "reopened constant" unless Point::ORIGIN == [0, 0]
+raise "reopened singleton" unless Point.origin.to_a == [0, 0]
+raise "struct equality" unless Point.new(1, 2) == p1
+raise "one class" unless Point.ancestors.include?(Struct) && Point.name == "Point"
+m = Mixed.new(4)
+raise "same-file factory" unless m.one == 4 && m.two == 8
+raise "data reopen" unless Ns::Inner.new(v: 5).plus == 6 && Ns::Inner.new(v: 5).minus == 4
+raise "nested struct reopen" unless Ns::Tagged.new(t: "z").tag == "t:z"
+"#,
+        )
+        .assert_passes();
+}

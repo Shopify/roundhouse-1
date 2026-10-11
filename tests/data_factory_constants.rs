@@ -658,9 +658,10 @@ fn custom_factory_blocks_are_not_silently_discarded() {
     }
 }
 
-/// Keep error diagnostics for dynamic/invalid members, shadowed Data, and
-/// or reopened factories even when their method bodies can be lifted. A
-/// subclass of a factory class is supported (`factory_class_blocks`).
+/// Keep error diagnostics for dynamic/invalid members and shadowed Data even
+/// when their method bodies can be lifted. A subclass of a factory class is
+/// supported (`factory_class_blocks`), and so is a `class` body reopening one
+/// (`a_factory_class_reopened_by_a_class_body_ingests`).
 #[test]
 fn custom_factories_outside_the_literal_subset_report_errors() {
     use roundhouse::diagnostic::{DiagnosticKind, Severity};
@@ -671,7 +672,6 @@ fn custom_factories_outside_the_literal_subset_report_errors() {
         "class Owner; State = Data.define(:name=) do; def label; 1; end; end; end",
         "class Owner; class Data; def self.define(name); name; end; end; State = Data.define(:name) do; def label; name; end; end; end",
         "class Data; end; class Owner; State = ::Data.define(:name) do; def label; name; end; end; end",
-        "class Owner; State = Data.define(:name) do; def label; name; end; end; class State; def extra; 1; end; end; end",
     ] {
         let mut app = ingest(source, "nil");
         roundhouse::session::analyze_and_lower(&mut app);
@@ -816,5 +816,27 @@ fn ruby_and_spinel_emit_declared_factory_types_without_data_errors() {
             1,
             "{sidecar}"
         );
+    }
+}
+
+/// `X = Struct.new(...) do … end` followed by `class X … end` reopens the
+/// class the factory built (Ruby: a constant already bound to a class makes
+/// `class X` a reopening). Both ingest, in the same file or nested in a
+/// module, and both reach the emitted Ruby, the factory first.
+#[test]
+fn a_factory_class_reopened_by_a_class_body_ingests() {
+    for source in [
+        "class Owner; State = Struct.new(:name) do; def label; name; end; end; class State; def extra; 1; end; end; end",
+        "module Ns; Pair = Data.define(:a) do; def one; a; end; end; class Pair; def two; 2; end; end; end",
+        "Pair = Struct.new(:a) do; def one; a; end; end\nclass Pair; def two; 2; end; end",
+    ] {
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let factory = classes
+            .iter()
+            .filter(|class| matches!(class.origin, Some(roundhouse::dialect::LibraryClassOrigin::FactoryClass { .. })))
+            .count();
+        assert_eq!(factory, 1, "{source}");
+        assert!(classes.len() >= 2, "{source}: the reopening is kept: {classes:?}");
     }
 }

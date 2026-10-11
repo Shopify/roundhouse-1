@@ -191,36 +191,22 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
 
 /// A factory whose generator the file itself declares (`class Data`,
 /// `Struct = …`, in any scope) builds whatever that declaration says, not
-/// the core class the factory model assumes; and a `class`/`module` body
-/// reopening a factory class would be emitted ahead of the constant that
-/// defines it. Both refused by name rather than guessed at.
+/// the core class the factory model assumes; refused by name rather than
+/// guessed at. A `class` body reopening a factory class is not refused:
+/// the emitter orders the factory ahead of its reopenings.
 fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &str) -> IngestResult<()> {
     #[derive(Default)]
     struct Declares {
-        scope: Vec<String>,
         names: Vec<String>,
-        qualified: Vec<String>,
-    }
-    impl Declares {
-        fn declare(&mut self, path: Option<Vec<String>>) -> usize {
-            let path = path.unwrap_or_default();
-            self.names.extend(path.last().cloned());
-            let depth = self.scope.len();
-            self.scope.extend(path);
-            self.qualified.push(self.scope.join("::"));
-            depth
-        }
     }
     impl<'pr> ruby_prism::Visit<'pr> for Declares {
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            let depth = self.declare(class_name_path(node));
+            self.names.extend(class_name_path(node).and_then(|path| path.last().cloned()));
             ruby_prism::visit_class_node(self, node);
-            self.scope.truncate(depth);
         }
         fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            let depth = self.declare(module_name_path(node));
+            self.names.extend(module_name_path(node).and_then(|path| path.last().cloned()));
             ruby_prism::visit_module_node(self, node);
-            self.scope.truncate(depth);
         }
         fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
             self.names.push(constant_id_str(&node.name()).to_string());
@@ -244,12 +230,6 @@ fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &
                     &format!("{generator} factory in a file that declares its own `{generator}`"),
                 ));
             }
-        }
-        if declares.qualified.iter().any(|q| q == class.name.0.as_str()) {
-            return Err(unsupported(
-                file,
-                &format!("`{}` is a factory class and also reopened by a class body", class.name.0),
-            ));
         }
     }
     Ok(())
