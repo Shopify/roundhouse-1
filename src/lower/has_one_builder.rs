@@ -186,8 +186,16 @@ fn rewrite(expr: &mut Expr, table: &Builders, self_owner: Option<&ClassId>) {
     }
 
     let span = expr.span;
+    let synthesized = entries.len() - args.first().map_or(0, |a| match &*a.node {
+        ExprNode::Hash { entries, .. } => entries.len(),
+        _ => 0,
+    });
+    let method = method.clone();
     let mut attrs = Expr::new(span, ExprNode::Hash { entries, kwargs: true });
     attrs.ty = Some(Ty::Untyped);
+    // On the hash, which later rewrites of the constructor call keep
+    // where they rebuild the call itself.
+    attrs.hint = Some(crate::expr::IrHint::SingularBuilder { method, synthesized });
     *expr = Expr::new(
         span,
         ExprNode::Send {

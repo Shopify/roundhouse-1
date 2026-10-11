@@ -3532,6 +3532,159 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
+/// Ruby-family pre-emit pass: the singular association's builders.
+///
+/// Rails defines, per `has_one` and monomorphic `belongs_to`,
+/// `build_<name>(attributes = {})`, `create_<name>`, `create_<name>!`,
+/// `reload_<name>` and `reset_<name>` (associations/builder/
+/// singular_association.rb `define_constructors`, `define_accessors`).
+/// The call-site rewrite (`lower::has_one_builder`) covers a literal
+/// keyword-hash call on a typed receiver; any other shape (a hash held in
+/// a variable, `attrs.merge(...)`, a call from a method of another class,
+/// a `belongs_to`) reaches the record itself, where the method was
+/// missing. Each method runs the association object
+/// (runtime/spinel/active_record_associations.rb), so a built record
+/// replaces the target, carries the owner's key and inverse, and a
+/// `create` saves it.
+///
+/// Only for the names the app calls, so a model's unused associations
+/// carry no extra methods; a model's own definition wins. CRuby and
+/// JRuby only: the object reads the record's ivars by computed name.
+pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app: &App) {
+    use crate::dialect::{Association, Dependent};
+
+    if !super::expr::native_keywords() {
+        return;
+    }
+    let mut called: BTreeSet<String> = BTreeSet::new();
+    fn walk(e: &Expr, called: &mut BTreeSet<String>) {
+        // `lower::has_one_builder` made a constructor of the call; the
+        // emit writes the authored call back (`IrHint::SingularBuilder`).
+        if let Some(crate::expr::IrHint::SingularBuilder { method, .. }) = &e.hint {
+            called.insert(method.as_str().to_string());
+        }
+        if let ExprNode::Send { method, .. } = &*e.node {
+            let m = method.as_str();
+            if ["build_", "create_", "reload_", "reset_"].iter().any(|p| m.starts_with(p)) {
+                called.insert(m.to_string());
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, called));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut called));
+    for view in &app.views {
+        walk(&view.body, &mut called);
+    }
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &mut called));
+    if called.is_empty() {
+        return;
+    }
+    let mut declarations = DeclarationOptions::default();
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let mut src = String::new();
+        for (span, assoc) in model.spanned_associations() {
+            let name = assoc.name().as_str();
+            let key = |k: &Symbol| format!(":{}", k.as_str());
+            let object = match assoc {
+                Association::BelongsTo { target, foreign_key, polymorphic: false, primary_key, .. } => {
+                    format!(
+                        "ActiveRecord::Associations::BelongsToAssociation.new(self, :{name}, {:?}, {}, true, {}, {})",
+                        target.0.as_str(),
+                        key(foreign_key),
+                        primary_key.as_ref().map_or_else(|| ":id".to_string(), key),
+                        belongs_to_inverse(app, model, assoc, &declarations.of(app, span).0)
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
+                    )
+                }
+                Association::HasOne { target, foreign_key, as_interface, scope, dependent, .. } => {
+                    format!(
+                        "ActiveRecord::Associations::HasOneAssociation.new(self, :{name}, {:?}, {}, {}, {}, {}, {})",
+                        target.0.as_str(),
+                        key(foreign_key),
+                        as_interface.is_none() && scope.is_none(),
+                        as_interface
+                            .as_ref()
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}_type", i.as_str())),
+                        match dependent {
+                            Dependent::None => "nil",
+                            Dependent::Destroy => ":destroy",
+                            Dependent::DestroyAsync => ":destroy_async",
+                            Dependent::Delete => ":delete",
+                            Dependent::DeleteAll => ":delete_all",
+                            Dependent::Nullify => ":nullify",
+                            Dependent::Restrict => ":restrict",
+                        },
+                        has_one_inverse(app, model, assoc, &declarations.of(app, span).0)
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
+                    )
+                }
+                _ => continue,
+            };
+            let defined = |n: &str| {
+                lc.methods.iter().any(|m| m.name.as_str() == n && m.receiver == MethodReceiver::Instance)
+                    || crate::lower::model_to_library::model_defines_instance_method(model, &Symbol::from(n))
+            };
+            let mut def = |method: String, body: String| {
+                if called.contains(&method) && !defined(&method) && !src.contains(&format!("def {method}(")) && !src.contains(&format!("def {method}\n")) {
+                    src.push_str(&body);
+                }
+            };
+            for (method, call) in [(format!("build_{name}"), "build"), (format!("create_{name}"), "create"), (format!("create_{name}!"), "create!")] {
+                def(method.clone(), format!("def {method}(attributes = {{}}, &block)\n  {object}.{call}(attributes, &block)\nend\n"));
+            }
+            def(
+                format!("reload_{name}"),
+                format!("def reload_{name}\n  association = {object}\n  association.reload\n  association.target\nend\n"),
+            );
+            def(format!("reset_{name}"), format!("def reset_{name}\n  {object}.reset\nend\n"));
+        }
+        if src.is_empty() {
+            continue;
+        }
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("apply_singular_association_builders: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            lc.methods.push(m);
+        }
+    }
+}
+
+/// The belongs_to on a has_one's target that points back at it, which
+/// Rails' `set_inverse_instance` sets: the declaration's literal
+/// `inverse_of:`, else the automatic one (reflection.rb
+/// `automatic_inverse_of`): the target's belongs_to named for the owner's
+/// class, on the same foreign key, when the has_one has no
+/// `foreign_key:`, scope or `as:` of its own.
+fn has_one_inverse(app: &App, owner: &crate::dialect::Model, assoc: &crate::dialect::Association, options: &str) -> Option<Symbol> {
+    use crate::dialect::Association;
+    let Association::HasOne { target, foreign_key, foreign_key_explicit, as_interface, scope, .. } = assoc else {
+        return None;
+    };
+    let target = app.models.iter().find(|m| &m.name == target)?;
+    if let Some(at) = options.find("inverse_of: ") {
+        let value: String =
+            options[at + "inverse_of: ".len()..].chars().take_while(|c| c.is_alphanumeric() || matches!(c, '_' | ':')).collect();
+        return match value.strip_prefix(':') {
+            Some(inverse) => target.associations().find(|a| a.name().as_str() == inverse).map(|a| a.name().clone()),
+            None => None,
+        };
+    }
+    if *foreign_key_explicit || as_interface.is_some() || scope.is_some() {
+        return None;
+    }
+    let candidate = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    target.associations().find_map(|a| match a {
+        Association::BelongsTo { name, target: t, foreign_key: fk, polymorphic: false, .. }
+            if name.as_str() == candidate && *t == owner.name && fk == foreign_key =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    })
+}
+
 /// The association on a belongs_to's target that points back at it,
 /// which Rails' `set_inverse_instance` sets: the declaration's literal
 /// `inverse_of:` (`inverse_of: false` names none), else the automatic
@@ -4678,8 +4831,9 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
+            let mut hop_scopes = Vec::new();
             let Some((joins, edge_table, edge_fk)) =
-                resolve_through_chain(&app.models, model, thr_name, target, 0)
+                resolve_through_chain(&app.models, model, thr_name, target, 0, &mut hop_scopes)
             else {
                 continue;
             };
@@ -4693,7 +4847,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, assoc_scope);
+            m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, assoc_scope);
         }
     }
 }
@@ -4713,31 +4867,46 @@ fn resolve_through_chain(
     thr_name: &Symbol,
     target: &ClassId,
     depth: usize,
+    hop_scopes: &mut Vec<Expr>,
 ) -> Option<(Vec<String>, String, Symbol)> {
     use crate::dialect::Association;
-    use crate::naming::pluralize_snake;
 
     if depth > 4 {
         return None;
     }
-    // The through association on the owner (`:votes`, `:taggings`, `:tags`).
-    let (thr_target, thr_fk, thr_through, as_interface) = model.associations().find_map(|a| match a {
-        Association::HasMany { name, target, foreign_key, through, as_interface, .. }
+    // The through association on the owner (`:votes`, `:taggings`,
+    // `:tags`): a has_many, or a has_one (`has_many :x, through:
+    // :primary_entity`), whose rows tie back to the owner by the same
+    // foreign key. Its scope narrows the join rows, as Rails' through
+    // scope chain merges every reflection's scope.
+    let (thr_target, thr_fk, thr_through, as_interface, thr_scope) = model.associations().find_map(|a| match a {
+        Association::HasMany { name, target, foreign_key, through, as_interface, scope, .. }
             if name == thr_name =>
         {
-            Some((target, foreign_key, through, as_interface))
+            Some((target, foreign_key, through.as_ref(), as_interface, scope))
+        }
+        Association::HasOne { name, target, foreign_key, as_interface, scope, .. } if name == thr_name => {
+            Some((target, foreign_key, None, as_interface, scope))
         }
         _ => None,
     })?;
+    if let Some(scope) = thr_scope {
+        // Only a SQL-string condition is portable onto the target's
+        // relation: a hash `where(primary: true)` would be qualified by
+        // the target table, where Rails qualifies it by the through's.
+        if through_scope_graftable(scope) {
+            hop_scopes.push(scope.clone());
+        }
+    }
     // How the join model's rows tie back to the owner: directly by the
     // sibling's fk, or through the sibling's own chain.
     let (back_joins, edge_table, edge_fk) = match thr_through {
-        None => (Vec::new(), pluralize_snake(thr_target.0.as_str()), thr_fk.clone()),
-        Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1)?,
+        None => (Vec::new(), model_table_name(models, thr_target), thr_fk.clone()),
+        Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1, hop_scopes)?,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
-    let thr_table = pluralize_snake(thr_target.0.as_str());
-    let target_table = pluralize_snake(target.0.as_str());
+    let thr_table = model_table_name(models, thr_target);
+    let target_table = model_table_name(models, target);
     let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
     // The source belongs_to on the join model (`Vote.belongs_to :story`)
     // — matched by target class, so `source:` renames resolve without a
@@ -4758,12 +4927,19 @@ fn resolve_through_chain(
     // source: :messages` — Room#messages, `messages.room_id`). The
     // belongs_to branch above cannot serve this: there is no column on
     // the join table naming the target.
-    if let Some(src_fk) = thr_model.associations().find_map(|a| match a {
-        Association::HasMany { target: t, foreign_key, through: None, .. } if t == target => {
-            Some(foreign_key)
+    if let Some((src_fk, src_scope)) = thr_model.associations().find_map(|a| match a {
+        Association::HasMany { target: t, foreign_key, through: None, scope, .. } if t == target => {
+            Some((foreign_key, scope))
         }
         _ => None,
     }) {
+        // The source association's own scope (`has_many :gateways, ->
+        // { merge(Gateway.enabled) }`) is part of the through query.
+        if let Some(scope) = src_scope {
+            if !reads_local(scope) {
+                hop_scopes.push(scope.clone());
+            }
+        }
         let mut joins = vec![format!(
             "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{owner_type}"
         )];
@@ -4778,13 +4954,23 @@ fn resolve_through_chain(
         _ => None,
     })?;
     let (src_joins, src_edge_table, src_edge_fk) =
-        resolve_through_chain(models, thr_model, src_through, target, depth + 1)?;
+        resolve_through_chain(models, thr_model, src_through, target, depth + 1, hop_scopes)?;
     let mut joins = src_joins;
     joins.push(format!(
         "INNER JOIN {thr_table} ON {thr_table}.id = {src_edge_table}.{src_edge_fk}{owner_type}"
     ));
     joins.extend(back_joins);
     Some((joins, edge_table, edge_fk))
+}
+
+/// The table a model reads: its own (`self.table_name`, a namespace's
+/// `table_name_prefix`), else Rails' default from the demodulized class
+/// name (`compute_table_name`).
+fn model_table_name(models: &[crate::dialect::Model], class: &ClassId) -> String {
+    match models.iter().find(|m| &m.name == class) {
+        Some(m) => m.table.0.as_str().to_string(),
+        None => crate::naming::rails_table_name(class.0.as_str()),
+    }
 }
 
 /// Keep the same polymorphic owner restriction on lazy and batched through joins.
@@ -4831,6 +5017,7 @@ fn through_reader_body(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    hop_scopes: &[Expr],
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
@@ -4893,6 +5080,7 @@ fn through_reader_body(
     // graft its receiver-less chain onto the seeded relation so the
     // reader filters the way Rails does (without it /upvoted served
     // every joined row).
+    let chain = hop_scopes.iter().fold(chain, |chain, scope| graft_chain_root(scope, chain));
     let chain = match assoc_scope {
         Some(scope_body) => graft_chain_root(scope_body, chain),
         None => chain,
@@ -4920,6 +5108,22 @@ fn through_reader_body(
             parenthesized: true,
         },
     )
+}
+
+/// A through hop's scope that runs the same on the target's relation:
+/// a chain of calls whose arguments hold no hash (a hash condition is
+/// qualified by the table the scope was declared on) and no local.
+fn through_scope_graftable(scope: &Expr) -> bool {
+    fn chain_ok(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv, args, block: None, .. } => {
+                args.iter().all(|a| !matches!(&*a.node, ExprNode::Hash { .. }))
+                    && recv.as_ref().is_none_or(|r| chain_ok(r))
+            }
+            _ => false,
+        }
+    }
+    chain_ok(scope) && !reads_local(scope)
 }
 
 /// Replace the receiver-less root of a `where(...).order(...)` chain
@@ -18110,7 +18314,7 @@ enum PreloadKind {
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
-    Through { target: String, join: String, group_col: String, order: Option<String> },
+    Through { target: String, table: String, join: String, group_col: String, order: Option<String> },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
     /// `ActiveStorage::Attached` on each record (`attr`, owner class).
@@ -18135,7 +18339,6 @@ enum PreloadKind {
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
     use crate::dialect::Association;
-    use crate::naming::pluralize_snake;
 
     let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
     let mut out = Vec::new();
@@ -18226,13 +18429,14 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 else {
                     continue;
                 };
-                let thr_table = pluralize_snake(thr_target.0.as_str());
-                let target_table = pluralize_snake(target.0.as_str());
+                let thr_table = model_table_name(&app.models, thr_target);
+                let target_table = model_table_name(&app.models, target);
                 let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::Through {
                         target: target.0.as_str().to_string(),
+                        table: target_table.clone(),
                         join: format!(
                             "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
                         ),
@@ -18402,8 +18606,7 @@ end
 "#
                 );
             }
-            PreloadKind::Through { target, join, group_col, order } => {
-                let table = crate::naming::pluralize_snake(target.as_str());
+            PreloadKind::Through { target, table, join, group_col, order } => {
                 let order_sql = match order {
                     Some(o) => format!(" ORDER BY {o}"),
                     None => String::new(),

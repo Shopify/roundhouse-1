@@ -397,6 +397,43 @@ module ActiveRecord
         end
         target
       end
+
+      # `owner.build_<name>(attributes)` / `create_<name>` /
+      # `create_<name>!` (singular_association.rb `build`, `create`,
+      # `create!`, `_create_record`): a new target record, which
+      # replaces the association's target. `create` saves the record
+      # first, then replaces, as Rails' does; the bang raises on an
+      # invalid one.
+      def build(attributes = {}, &block)
+        record = build_record(attributes, &block)
+        replace(record, false)
+        record
+      end
+
+      def create(attributes = {}, &block)
+        _create_record(attributes, false, &block)
+      end
+
+      def create!(attributes = {}, &block)
+        _create_record(attributes, true, &block)
+      end
+
+      private
+        # Rails' `build_record`: the target class's constructor, then the
+        # attributes the association's scope stamps (`initialize_attributes`).
+        def build_record(attributes, &block)
+          record = klass.new(attributes, &block)
+          initialize_attributes(record)
+          record
+        end
+
+        def _create_record(attributes, raise_error, &block)
+          record = build_record(attributes, &block)
+          saved = record.save
+          replace(record, true)
+          raise ActiveRecord::RecordInvalid, record if !saved && raise_error
+          record
+        end
     end
 
     class CollectionAssociation < Association
@@ -511,7 +548,19 @@ module ActiveRecord
         super
       end
 
+      # belongs_to_association.rb `replace(record)`: the record is the
+      # target and its key the owner's foreign key.
+      def replace(record, _save = true)
+        set_inverse_instance(record) if record
+        replace_keys(record)
+        self.target = record
+      end
+
       private
+        def initialize_attributes(record)
+          set_inverse_instance(record)
+        end
+
         # Rails' `replace_keys(record)`: the owner's foreign key is the
         # record's key (nil for no record).
         def replace_keys(record)
@@ -558,6 +607,90 @@ module ActiveRecord
     end
 
     class HasOneAssociation < SingularAssociation
+      # as_type: the polymorphic `as:` interface's type column, which
+      # holds the owner's class name; dependent: the declaration's
+      # `dependent:`; inverse: the target's belongs_to that points back
+      # at the owner (Rails' `reflection.inverse_of`), nil for none.
+      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, as_type = nil, dependent = nil, inverse = nil)
+        super(owner, name, klass_name, foreign_key, scopable)
+        @as_type = as_type
+        @dependent = dependent
+        @inverse = inverse
+      end
+
+      # Rails' has_one_association.rb `replace(record, save = true)`: a
+      # different target than the held one removes the held one, as the
+      # declaration's `dependent:` says, then the record joins the owner
+      # (its key, type and inverse set) and is saved where the owner is.
+      def replace(record, save = true)
+        previous = @owner.persisted? ? load_target : target
+        return previous if previous.nil? && record.nil?
+        assigning_another_record = !previous.equal?(record)
+        if assigning_another_record || record.has_changes_to_save?
+          save &&= @owner.persisted?
+          remove_target!(previous) if previous && !previous.destroyed? && assigning_another_record
+          if record
+            set_owner_attributes(record)
+            set_inverse_instance(record)
+            if save && !record.save
+              nullify_owner_attributes(record)
+              set_owner_attributes(previous) if previous
+              raise ActiveRecord::RecordNotSaved.new("Failed to save the new associated #{@name}.", record)
+            end
+          end
+        end
+        self.target = record
+      end
+
+      private
+        # has_one_association.rb `_create_record`: the owner must be saved.
+        def _create_record(attributes, raise_error, &block)
+          unless @owner.persisted?
+            raise ActiveRecord::RecordNotSaved.new("You cannot call create unless the parent is saved", @owner)
+          end
+          super
+        end
+
+        def initialize_attributes(record)
+          set_owner_attributes(record)
+          set_inverse_instance(record)
+        end
+
+        def set_owner_attributes(record)
+          record.public_send(:"#{@foreign_key}=", @owner.new_record? ? nil : @owner.id)
+          record.public_send(:"#{@as_type}=", @owner.class.name) if @as_type
+        end
+
+        def nullify_owner_attributes(record)
+          record.public_send(:"#{@foreign_key}=", nil)
+          record.public_send(:"#{@as_type}=", nil) if @as_type
+        end
+
+        # The record holds the owner through its inverse belongs_to
+        # (Rails' `set_inverse_instance`), in the ivars the emitted
+        # belongs_to reader keeps.
+        def set_inverse_instance(record)
+          return record if @inverse.nil? || record.nil?
+          record.instance_variable_set(:"@#{@inverse}_cache", @owner)
+          record.instance_variable_set(:"@#{@inverse}_loaded", true)
+          record
+        end
+
+        # has_one_association.rb `remove_target!`.
+        def remove_target!(previous)
+          case @dependent
+          when :delete
+            previous.delete
+          when :destroy, :destroy_async
+            previous.destroy if previous.persisted?
+          else
+            nullify_owner_attributes(previous)
+            if previous.persisted? && @owner.persisted? && !previous.save
+              set_owner_attributes(previous)
+              raise ActiveRecord::RecordNotSaved.new("Failed to remove the existing associated #{@name}. The record failed to save after its foreign key was set to nil.", previous)
+            end
+          end
+        end
     end
 
     class HasManyAssociation < CollectionAssociation
