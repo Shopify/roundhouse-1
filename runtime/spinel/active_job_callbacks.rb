@@ -130,6 +130,7 @@ module ActiveJob
       self.scheduled_at = Time.now + options[:wait].to_f if options[:wait]
       self.scheduled_at = options[:wait_until] if options[:wait_until]
       self.queue_name   = self.class.queue_name_from_part(options[:queue]) if options[:queue]
+      self.priority     = options[:priority].to_i if options[:priority]
       self
     end
 
@@ -169,6 +170,14 @@ module ActiveJob
     end
 
     module ClassMethods
+      # Returns a ConfiguredJob (configured_job.rb) that holds the options
+      # until it is performed or enqueued:
+      #
+      #   MyJob.set(wait: 5.minutes, queue: :low).perform_later(post)
+      def set(options = {})
+        ConfiguredJob.new(self, options)
+      end
+
       # Creates a new job instance from a hash created with +serialize+.
       def deserialize(job_data)
         job_class = begin
@@ -650,6 +659,23 @@ module ActiveJob
       BigDecimalSerializer.instance
   end
 
+  # ActiveJob::ConfiguredJob (configured_job.rb): the job class with
+  # `set`'s options, answered by the class-side `set`.
+  class ConfiguredJob # :nodoc:
+    def initialize(job_class, options = {})
+      @options = options
+      @job_class = job_class
+    end
+
+    def perform_now(...)
+      @job_class.new(...).set(@options).perform_now
+    end
+
+    def perform_later(...)
+      @job_class.new(...).enqueue @options
+    end
+  end
+
   # ActiveJob::Enqueuing.
   module Enqueuing
     module ClassMethods
@@ -708,13 +734,14 @@ module ActiveJob
       def _raw_enqueue
         job_class = self.class
         name = job_class.name
-        enqueued = [arguments, job_id, executions, queue_name]
+        enqueued = [arguments, job_id, executions, queue_name, @priority]
         work = -> do
-          arguments, job_id, executions, queue_name = enqueued
+          arguments, job_id, executions, queue_name, priority = enqueued
           job = job_class.new(*arguments)
           job.job_id = job_id
           job.executions = executions
           job.queue_name = queue_name
+          job.priority = priority
           job.perform_now
           nil
         end
