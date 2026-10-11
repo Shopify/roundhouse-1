@@ -462,3 +462,36 @@ mod rooted_constants {
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
     }
 }
+
+mod dumps_with_unmodeled_statements {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    /// A pg_dump of a second database holds statements the SQL ingest does
+    /// not model; the tables it does model still answer column lookups even
+    /// when the caller did not switch survey mode on.
+    #[test]
+    fn a_second_databases_dump_with_a_prepare_statement_still_gives_its_columns() {
+        let events = "CREATE TABLE public.events (\n    id bigint NOT NULL,\n    kind character varying NOT NULL\n);\n\nPREPARE stmt AS SELECT 1;\n\nALTER TABLE ONLY public.events\n    ADD CONSTRAINT events_pkey PRIMARY KEY (id);\n";
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("db/events_structure.sql", events),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/events_record.rb", "class EventsRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :events }\nend\n"),
+            ("app/models/event.rb", "class Event < EventsRecord\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    Event.where(kind: x).to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        assert!(!roundhouse::ingest::survey::is_active());
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(!roundhouse::ingest::survey::is_active());
+    }
+}

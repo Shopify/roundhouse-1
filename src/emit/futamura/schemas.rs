@@ -104,6 +104,13 @@ impl DatabaseSchemas {
             }
         }
 
+        // A dump may hold statements the ingest does not model (`PREPARE`,
+        // `ALTER TABLE`): Rails loads the file itself, so they are gaps, not
+        // refusals. Survey mode records them and keeps the tables it models.
+        let own_survey = !crate::ingest::survey::is_active();
+        if own_survey {
+            crate::ingest::survey::activate();
+        }
         let mut out = DatabaseSchemas::default();
         let mut by_path: HashMap<String, usize> = HashMap::new();
         let mut read = |path: &str, out: &mut DatabaseSchemas| -> usize {
@@ -140,6 +147,9 @@ impl DatabaseSchemas {
             let Some(path) = candidates.iter().find(|p| file(p).is_some()) else { continue };
             let i = read(path, &mut out);
             out.by_name.entry(name).or_insert(i);
+        }
+        if own_survey {
+            crate::ingest::survey::drain();
         }
         out
     }
