@@ -271,6 +271,12 @@ pub const FROM_PARAMS_EXPECT: u64 = 1 << 28;
 /// refusal stub.
 pub const CONSTRUCTOR_KEYWORDS_AS_WRITTEN: u64 = 1 << 29;
 
+/// A statement hoisted out of a Concern's `class_methods do … end` block into
+/// the module's captured body statements. Its `self` is the class-side
+/// module the block builds, not the module body it is written back into, so
+/// a refused `define_method` loop here cannot run as written.
+pub const CLASS_METHODS_BLOCK_STATEMENT: u64 = 1 << 30;
+
 /// A statement whose value the enclosing sequence discards (not its tail).
 pub const DISCARDED_VALUE: u64 = 1 << 9;
 
@@ -2030,7 +2036,7 @@ mod tests {
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
-            FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN,
+            FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN, CLASS_METHODS_BLOCK_STATEMENT,
         ];
         let mut seen = 0u64;
         for bit in bits {

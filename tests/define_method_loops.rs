@@ -506,3 +506,159 @@ fn a_loop_over_a_class_method_answering_a_literal_array_matches_native() {
     let actual: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
 }
+
+// ---- Refused statements run natively on the Ruby emit -----------------------
+
+/// Shapes the expansion refuses: a computed name
+/// and a rest + keywords parameter list.
+const REFUSED_SHAPES: &str = r##"module Cs
+  class Forwarder
+    def self.names
+      %i[alpha beta].map { |n| :"#{n}_value" }
+    end
+
+    #: (Integer) -> untyped
+    def deliver(value)
+      value
+    end
+
+    def deliver_all(*args, **kwargs)
+      [args, kwargs]
+    end
+
+    names.each do |name|
+      define_method(name) { name.to_s }
+    end
+
+    %i[deliver deliver_all].each do |method_name|
+      define_method(:"#{method_name}!") do |*args, **kwargs|
+        send(method_name, *args, **kwargs)
+      end
+    end
+  end
+end
+"##;
+
+const REFUSED_SHAPES_SCRIPT: &str = r##"f = Cs::Forwarder.new
+p f.alpha_value
+p f.beta_value
+p f.deliver!(7)
+p f.deliver_all!(1, 2, k: 3)
+p Cs::Forwarder.public_method_defined?(:deliver!)
+"##;
+
+/// Ruby runs `define_method` itself: a statement the static expansion
+/// refuses stays as written on the Ruby emit (never a raising stub that
+/// runs when the class loads), and the strict targets still report it.
+#[test]
+fn a_refused_define_method_loop_runs_natively_on_the_ruby_emit() {
+    let expected = native("refused_shapes", &format!("{NATIVE_PRELUDE}{REFUSED_SHAPES}{REFUSED_SHAPES_SCRIPT}"));
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected, ["\"alpha_value\"", "\"beta_value\"", "7", "[[1, 2], {k: 3}]", "true"], "native control");
+    let run = emit_and_run::real_blog().write("app/lib/cs/forwarder.rb", REFUSED_SHAPES).run_ruby(REFUSED_SHAPES_SCRIPT);
+    assert!(run.success, "emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(
+        !refusals(&run.errors).is_empty(),
+        "the refusal is still reported:\n{}",
+        run.errors.join("\n")
+    );
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
+}
+
+/// A class macro that prepends a `Module.new` whose block defines the
+/// wrapper with `define_method` and `super` (the expansion refuses `super`
+/// without a method of its own): the macro call stays as written on the
+/// Ruby emit and wraps the method natively.
+const WRAPPING_MACRO: &str = r##"module Cs
+  module Wrapping
+    def self.included(base)
+      base.extend(ClassMethods)
+    end
+
+    module ClassMethods
+      #: (untyped) -> untyped
+      def wrap_calls(names)
+        wrapper = Module.new do
+          names.each do |name|
+            define_method(name) do |*args|
+              "wrapped(#{super(*args)})"
+            end
+          end
+        end
+        prepend(wrapper)
+      end
+    end
+  end
+
+  class Worker
+    include Cs::Wrapping
+
+    #: (untyped) -> untyped
+    def run(value)
+      "run:#{value}"
+    end
+
+    wrap_calls [:run]
+  end
+end
+"##;
+
+const WRAPPING_SCRIPT: &str = "p Cs::Worker.new.run(3)\n";
+
+#[test]
+fn a_refused_wrapping_macro_call_runs_natively_on_the_ruby_emit() {
+    let expected = native("wrapping_macro", &format!("{NATIVE_PRELUDE}{WRAPPING_MACRO}{WRAPPING_SCRIPT}"));
+    assert_eq!(expected.lines().collect::<Vec<_>>(), ["\"wrapped(run:3)\""], "native control");
+    let run = emit_and_run::real_blog().write("app/lib/cs/wrapping.rb", WRAPPING_MACRO).run_ruby(WRAPPING_SCRIPT);
+    assert!(run.success, "emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+}
+
+/// A concern's `class_methods do … end` whose loop wraps inherited class
+/// methods with `define_method` and a bare `super`
+/// (`ActiveSupport::Concern#class_methods`). The refused statement is
+/// hoisted out of the block into the concern's body, where `self` is the
+/// wrong object, so it is not written back as is: the emit keeps the named
+/// refusal instead of defining instance methods on the concern.
+const CLASS_METHODS_CONCERN: &str = r##"module Cs
+  module Noisy
+    extend ActiveSupport::Concern
+
+    WRAPPED = %i[first_name last_name].freeze
+
+    class_methods do
+      WRAPPED.each do |method_name|
+        define_method(method_name) do |*args, **kwargs, &block|
+          "noisy(#{super(*args, **kwargs, &block)})"
+        end
+      end
+    end
+  end
+
+  class Base
+    def self.first_name
+      "ada"
+    end
+
+    def self.last_name
+      "lovelace"
+    end
+  end
+
+  class Person < Base
+    include Cs::Noisy
+  end
+end
+"##;
+
+const CLASS_METHODS_SCRIPT: &str = "p Cs::Person.first_name\np Cs::Person.last_name\n";
+
+#[test]
+fn a_refused_class_methods_loop_stays_a_named_refusal_on_the_ruby_emit() {
+    let expected = native("class_methods", &format!("{NATIVE_PRELUDE}{CLASS_METHODS_CONCERN}{CLASS_METHODS_SCRIPT}"));
+    assert_eq!(expected.lines().collect::<Vec<_>>(), ["\"noisy(ada)\"", "\"noisy(lovelace)\""], "native control");
+    let run = emit_and_run::real_blog().write("app/lib/cs/noisy.rb", CLASS_METHODS_CONCERN).run_ruby(CLASS_METHODS_SCRIPT);
+    assert!(!run.success, "the hoisted loop must not run as written:\n{}", run.stdout);
+    assert!(run.stderr.contains("define_method_expansion not supported"), "{}", run.stderr);
+}

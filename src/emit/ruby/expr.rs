@@ -229,8 +229,18 @@ fn diagnostic_stub(e: &Expr) -> Option<String> {
     let constructor_as_written = e.decisions & crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN != 0
         && native_keywords()
         && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
-    if let Some(kind @ DiagnosticKind::Unsupported { .. }) =
-        &e.diagnostic.as_ref().filter(|_| !runtime_declared_type && !constructor_as_written)
+    // A `define_method` statement the static expansion refused
+    // (`ingest::define_method_loops`): the refusal is about expanding it
+    // into `def`s for tools that cannot run it. CRuby runs `define_method`
+    // itself, so this tree keeps the statement as written; `check` and the
+    // strict targets still report the diagnostic.
+    let define_method_as_written = native_keywords()
+        && e.decisions & crate::expr::CLASS_METHODS_BLOCK_STATEMENT == 0
+        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL);
+    if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e
+        .diagnostic
+        .as_ref()
+        .filter(|_| !runtime_declared_type && !constructor_as_written && !define_method_as_written)
     {
         // This is an expression, including in a rescue list or a binary
         // operand. A bare command-style `raise` is not valid there.

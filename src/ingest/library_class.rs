@@ -4472,7 +4472,11 @@ fn walk_decl_body_in<'pr>(
                 // registry's concern fold copies them onto includers.
                 if kw == "class_methods" {
                     if let Some(block) = call.block().and_then(|blk| blk.as_block_node()) {
-                        out.extend(walk_decl_body_with_visibility(block.body(), owner, file, true, visibility)?);
+                        let mut inner = walk_decl_body_with_visibility(block.body(), owner, file, true, visibility)?;
+                        for call in &mut inner.unknown_calls {
+                            call.decisions |= crate::expr::CLASS_METHODS_BLOCK_STATEMENT;
+                        }
+                        out.extend(inner);
                         continue;
                     }
                 }

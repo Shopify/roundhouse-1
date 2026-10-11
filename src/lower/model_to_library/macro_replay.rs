@@ -327,6 +327,7 @@ fn emitted_raise(e: &Expr) -> Option<String> {
                 && matches!(construct.as_str(), "declared type" | "constant"))
                 || (e.decisions & crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN != 0
                     && construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
+            let as_written = as_written || expansion_refused(e);
             (!as_written).then(|| if detail.is_empty() { construct.to_string() } else { format!("{construct}: {detail}") })
         }
         Some(DiagnosticKind::IngestRefused { detail }) => Some(format!("ingest_unsupported: {detail}")),

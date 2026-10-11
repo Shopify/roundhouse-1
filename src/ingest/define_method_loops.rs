@@ -71,6 +71,14 @@
 //! macro of an `extend`ed module (the emit runs those natively) keeps
 //! the statement as before, unreported.
 //!
+//! On the Ruby (CRuby) emit a refused statement is written back as
+//! source, since Ruby runs `define_method` itself: the diagnostic stays
+//! for `check` and the strict targets, and the class body never holds a
+//! raising placeholder that would fire when the class loads. The one
+//! exception is a statement hoisted out of a Concern's `class_methods`
+//! block (`expr::CLASS_METHODS_BLOCK_STATEMENT`), whose `self` is not the
+//! module body it would be written into; it keeps the named refusal.
+//!
 //! INHERITED MACROS. A library class's call to a class macro its app
 //! superclass defines (Core's `Sales::OrderEditing::StagedChanges::Base`
 //! has `class << self; def data_accessor(*keys)`, and each subclass
