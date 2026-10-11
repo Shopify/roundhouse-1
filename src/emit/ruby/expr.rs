@@ -1730,7 +1730,7 @@ pub(super) fn emit_send_base(
         // spelling.
         && !IN_CORE_CLASS_REOPEN.with(Cell::get)
     {
-        if parenthesized {
+        if parenthesized || first_arg_opens_block(m, &args_s) {
             return format!("{method}({})", args_s.join(", "));
         }
         return format!("{method} {}", args_s.join(", "));
@@ -1783,7 +1783,7 @@ pub(super) fn emit_send_base(
         (None, _) => {
             if args_s.is_empty() {
                 method.to_string()
-            } else if parenthesized || first_arg_opens_block(&args_s) {
+            } else if parenthesized || first_arg_opens_block(m, &args_s) {
                 format!("{method}({})", args_s.join(", "))
             } else {
                 format!("{method} {}", args_s.join(", "))
@@ -1794,7 +1794,7 @@ pub(super) fn emit_send_base(
             let recv_s = if recv_needs_parens(r) { format!("({recv_s})") } else { recv_s };
             if args_s.is_empty() {
                 format!("{recv_s}.{method}")
-            } else if parenthesized || first_arg_opens_block(&args_s) {
+            } else if parenthesized || first_arg_opens_block(m, &args_s) {
                 format!("{recv_s}.{method}({})", args_s.join(", "))
             } else {
                 format!("{recv_s}.{method} {}", args_s.join(", "))
@@ -1805,9 +1805,19 @@ pub(super) fn emit_send_base(
 
 /// A leading `if`/`case`/… argument must be parenthesized: paren-less,
 /// `j if c … end` reads `if` as a statement modifier of the call.
-fn first_arg_opens_block(args_s: &[String]) -> bool {
+///
+/// An argument that starts with a character Ruby also reads as a binary
+/// operator or prefix (`/` regexp, `*` splat, `&` block-pass, unary
+/// `-`/`+`, `::`, `[`, `(`) is parenthesized too: written after a space,
+/// `ruby -w` warns "ambiguous first argument; put parentheses or a space
+/// even after `/` operator" (parse.y `warn_balanced`), which raises under
+/// a warnings-as-errors harness where the `%r{…}` / parenthesized source
+/// did not.
+fn first_arg_opens_block(method: &str, args_s: &[String]) -> bool {
     args_s.first().is_some_and(|a| {
         ["if ", "unless ", "case ", "while ", "until ", "begin"].iter().any(|k| a.starts_with(k))
+            // `!` is a prefix operator: nothing after it is an argument.
+            || (method != "!" && ["/", "*", "&", "-", "+", "::", "[", "("].iter().any(|k| a.starts_with(k)))
     })
 }
 
@@ -2412,6 +2422,26 @@ mod tests {
             },
         );
         assert!(emit_expr(&call).starts_with("j(if "), "got {}", emit_expr(&call));
+    }
+
+    // parse.y `warn_balanced`: `f /x/`, `f -1`, `f *a`, `f &b`, `f ::C`,
+    // `f [1]` and `f (1)` warn "ambiguous first argument" under `ruby -w`.
+    #[test]
+    fn a_command_call_whose_first_argument_starts_like_an_operator_is_parenthesized() {
+        let regex = |p: &str| Expr::new(Span::default(), ExprNode::Lit { value: Literal::Regex { pattern: p.to_string(), flags: String::new() } });
+        let command = |recv: Option<Expr>, arg: Expr| {
+            Expr::new(
+                Span::default(),
+                ExprNode::Send { recv, method: Symbol::from("add_filter"), args: vec![arg], block: None, parenthesized: false },
+            )
+        };
+        assert_eq!(emit_expr(&command(None, regex("^a/b$"))), "add_filter(/^a\\/b$/)");
+        let neg = Expr::new(Span::default(), ExprNode::Lit { value: Literal::Int { value: -1 } });
+        assert_eq!(emit_expr(&command(None, neg.clone())), "add_filter(-1)");
+        assert_eq!(emit_expr(&command(Some(self_ref()), regex("x"))), "add_filter(/x/)");
+        assert_eq!(emit_expr(&command(Some(send(None, "cfg", vec![])), regex("x"))), "cfg.add_filter(/x/)");
+        // An ordinary first argument keeps the paren-less spelling.
+        assert_eq!(emit_expr(&command(None, lit_sym("a"))), "add_filter :a");
     }
 
     fn self_ref() -> Expr {

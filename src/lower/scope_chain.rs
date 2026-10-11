@@ -2830,9 +2830,16 @@ fn resolve_assoc_read(
 /// appending writes a duplicate literal key, and Ruby warns "key … is
 /// duplicated and overwritten" at parse time (strict_warnings turns that
 /// into an offense). The owner's value wins either way, so a caller
-/// entry whose value is a plain read is replaced in place. An effectful
+/// entry whose value is a plain read (or a `&&`/`||` of plain reads, which
+/// is how a safe-navigation read `a&.b` ingests) is replaced in place. An effectful
 /// caller value keeps the duplicate form, which still evaluates it.
 fn merge_fk_entry(entries: &mut Vec<(Expr, Expr)>, fk_entry: (Expr, Expr)) {
+    fn pure_value(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::BoolOp { left, right, .. } => pure_value(left) && pure_value(right),
+            _ => super::case_lambda::is_pure_read(e),
+        }
+    }
     let ExprNode::Lit { value: Literal::Sym { value: fk } } = &*fk_entry.0.node else {
         entries.push(fk_entry);
         return;
@@ -2841,7 +2848,7 @@ fn merge_fk_entry(entries: &mut Vec<(Expr, Expr)>, fk_entry: (Expr, Expr)) {
         ExprNode::Lit { value: Literal::Sym { value } } if value == fk);
     if let Some(slot) = entries
         .iter_mut()
-        .find(|(k, v)| same_key(k) && super::case_lambda::is_pure_read(v))
+        .find(|(k, v)| same_key(k) && pure_value(v))
     {
         slot.1 = fk_entry.1;
         return;
@@ -5034,6 +5041,34 @@ mod tests {
     }
     fn is_rel(e: &Expr) -> bool {
         matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == "__rel")
+    }
+
+    // Ruby warns "key :k is duplicated and overwritten" for a literal
+    // that repeats a key; the owner's key replaces a caller entry that
+    // is a plain read or a `&&` of plain reads (`a&.fk` ingests as one).
+    #[test]
+    fn a_foreign_key_replaces_a_caller_entry_that_reads_without_effects() {
+        let var = |n: &str| Expr::new(span(), ExprNode::Var { id: VarId(0), name: Symbol::from(n) });
+        let sym = |n: &str| Expr::new(span(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n) } });
+        let read = |n: &str| Expr::new(span(), ExprNode::Send { recv: Some(var("a")), method: Symbol::from(n), args: vec![], block: None, parenthesized: false });
+        let guarded = Expr::new(
+            span(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::And,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: var("a"),
+                right: read("fk"),
+            },
+        );
+        let mut entries = vec![(sym("fk"), guarded)];
+        merge_fk_entry(&mut entries, (sym("fk"), read("id")));
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&*entries[0].1.node, ExprNode::Send { method, .. } if method.as_str() == "id"));
+        // A caller value with an effect keeps the duplicate, which evaluates it.
+        let effect = Expr::new(span(), ExprNode::Send { recv: Some(var("a")), method: Symbol::from("next_id"), args: vec![int_lit(1)], block: None, parenthesized: true });
+        let mut entries = vec![(sym("fk"), effect)];
+        merge_fk_entry(&mut entries, (sym("fk"), read("id")));
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
