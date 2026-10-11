@@ -162,33 +162,41 @@ fn walk_block(b: &Expr, at: Nesting, inner: Nesting, out: &mut Jumps) {
 /// A block's `break`/`return`/`redo` are left as they are: callers
 /// refuse those first ([`Jumps::unliftable`]).
 pub(crate) fn to_method_body(body: &mut Expr, form: Form) {
+    to_method_body_with(body, form, &|value, span| {
+        value.unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }))
+    });
+}
+
+/// [`to_method_body`], with `returned` building each `return`'s value
+/// from the jump's own (`None` for a bare `next`).
+pub(crate) fn to_method_body_with(body: &mut Expr, form: Form, returned: &dyn Fn(Option<Expr>, crate::span::Span) -> Expr) {
     let span = body.span;
     match &mut *body.node {
         ExprNode::Next { value } => {
-            let value = value.take();
-            *body = return_of(value, span);
+            let value = returned(value.take(), span);
+            *body = Expr::new(span, ExprNode::Return { value });
         }
         ExprNode::Break { value } if form == Form::Lambda => {
-            let value = value.take();
-            *body = return_of(value, span);
+            let value = returned(value.take(), span);
+            *body = Expr::new(span, ExprNode::Return { value });
         }
-        ExprNode::While { cond, .. } => to_method_body(cond, form),
+        ExprNode::While { cond, .. } => to_method_body_with(cond, form, returned),
         ExprNode::Lambda { .. } | ExprNode::MethodDefExpr { .. } => {}
         ExprNode::Send { recv, args, block, .. } => {
             if let Some(r) = recv {
-                to_method_body(r, form);
+                to_method_body_with(r, form, returned);
             }
             for a in args {
-                to_method_body(a, form);
+                to_method_body_with(a, form, returned);
             }
             if let Some(b) = block {
                 // `&blk` is an operand; a literal block keeps its jumps.
                 if !matches!(&*b.node, ExprNode::Lambda { .. }) {
-                    to_method_body(b, form);
+                    to_method_body_with(b, form, returned);
                 }
             }
         }
-        _ => body.node.for_each_child_mut(&mut |c| to_method_body(c, form)),
+        _ => body.node.for_each_child_mut(&mut |c| to_method_body_with(c, form, returned)),
     }
 }
 
@@ -293,11 +301,6 @@ fn guard(stmt: &Expr) -> Option<(Expr, bool, Option<Expr>)> {
         (None, Some(value)) if is_empty(then_branch) => Some((cond.clone(), false, value)),
         _ => None,
     }
-}
-
-fn return_of(value: Option<Expr>, span: crate::span::Span) -> Expr {
-    let value = value.unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-    Expr::new(span, ExprNode::Return { value })
 }
 
 #[cfg(test)]
