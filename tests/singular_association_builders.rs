@@ -110,6 +110,10 @@ module BuildersProbe
       Note.where(order_id: order.id).update_all(body: "changed")
       [o.note.body, o.reload_note.body]
     end
+    show("relation delegates to its model") do
+      relation = Order.where(number: "A1")
+      [relation.primary_key, relation.table_name, relation.arel_table.name]
+    end
     show("reset") do
       o = Order.find(order.id)
       o.note

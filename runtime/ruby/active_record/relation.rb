@@ -1154,6 +1154,21 @@ module ActiveRecord
       @model
     end
 
+    # Rails delegates these to the model class (relation/delegation.rb:
+    # `delegate :table_name, :quoted_table_name, :primary_key,
+    # :connection, :columns_hash, to: :klass`; `arel_table` likewise).
+    def primary_key
+      @model.primary_key
+    end
+
+    def table_name
+      @model.table_name
+    end
+
+    def arel_table
+      @model.arel_table
+    end
+
     # ---- terminals --------------------------------------------------
 
     # Loads once, then serves the memoized records (see the class

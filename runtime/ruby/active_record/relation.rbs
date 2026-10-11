@@ -162,6 +162,9 @@ module ActiveRecord
     # array. Same over-claim as `map`/`collect` below.
     def preloaded: (untyped records, bool loaded) -> Relation
     def klass: () -> Class
+    def primary_key: () -> untyped
+    def table_name: () -> String
+    def arel_table: () -> untyped
 
     def to_a: () -> Array[Base]
     def load_records: () -> Array[Base]
