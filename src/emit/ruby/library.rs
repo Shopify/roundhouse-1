@@ -10034,6 +10034,7 @@ fn emit_library_class_decl_inner(
         segments = vec![name];
     }
     let segments = segments;
+    let _lexical_scope = super::expr::enter_lexical_scope(&segments, app_constant_paths(app));
     let depth = segments.len();
     let body_pad = "  ".repeat(depth);
 
@@ -16716,15 +16717,7 @@ fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
     if written.starts_with("::") || scopes.is_empty() {
         return written.to_string();
     }
-    let paths = app_constant_paths(app);
-    let first = written.split("::").next().unwrap_or(written);
-    let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
-        return written.to_string();
-    };
-    if paths.contains(&format!("{scope}::{written}")) || !paths.contains(written) {
-        return written.to_string();
-    }
-    format!("::{written}")
+    super::expr::rooted_if_shadowed(written, scopes, &app_constant_paths(app))
 }
 
 /// The helper class of the test file declaring `lc` that is named
