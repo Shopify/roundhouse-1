@@ -1655,6 +1655,16 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).unscope(*args)
     end
 
+    # `Model.and(other)` / `Model.or(other)`: querying.rb delegates both
+    # to `all`.
+    def self.and(other)
+      ActiveRecord::Relation.new(self).and(other)
+    end
+
+    def self.or(other)
+      ActiveRecord::Relation.new(self).or(other)
+    end
+
     # Model Hash finders use the relation's NULL / IN predicates too.
     # `.to_h` matches `where` above: Hash is a no-op (nil / Array values
     # survive); non-Hash inputs raise rather than reach Relation's SQL path.

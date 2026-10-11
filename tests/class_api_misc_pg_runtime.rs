@@ -80,6 +80,8 @@ const PROBE: &str = r##"class ClassApiProbe
     out << "empty where.not: #{Group.where.not(id: []).count} #{Group.where(shop_id: shop.id).where.not(id: []).count}"
     out << "empty and: #{Group.where(shop_id: shop.id).where(id: []).count} #{Group.where(shop_id: shop.id).where(id: [a.id]).count}"
     out << "empty named bind: #{Group.where("id IN (:ids)", ids: []).count}"
+    out << "and: #{Group.and(Group.where(name: "a")).count} #{Group.where(shop_id: shop.id).and(Group.where(number: 2)).pluck(:name).inspect} #{Group.where(name: "a").and(Group.where(name: "b")).count}"
+    out << "or: #{Group.or(Group.where(name: "a")).count} #{Group.where(name: "a").or(Group.where(name: "b")).count}"
     out << "empty bind: #{Group.where("id IN (?)", []).count}"
     out
   end
@@ -88,7 +90,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 9] = [
+const EXPECTED: [&str; 11] = [
     r#"quoted: "groups" "id""#,
     "scope: 1",
     r#"keys: "id" "id" "id" "id""#,
@@ -97,6 +99,8 @@ const EXPECTED: [&str; 9] = [
     "empty where.not: 2 2",
     "empty and: 0 1",
     "empty named bind: 0",
+    "and: 1 [\"b\"] 0",
+    "or: 2 2",
     "empty bind: 0",
 ];
 

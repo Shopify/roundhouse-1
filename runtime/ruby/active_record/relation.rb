@@ -383,6 +383,17 @@ module ActiveRecord
       self
     end
 
+    # `and(other)` — the receiver's conditions AND the other relation's
+    # (relation/query_methods.rb's `and!`: `where_clause.and`). Rails
+    # requires structurally compatible relations; as for `or`, the
+    # receiver's structural clauses are kept.
+    def and(other)
+      own_lists
+      @records = nil
+      other.where_clauses.each { |w| @wheres << w }
+      self
+    end
+
     # Answers whether it actually PUSHED a clause — a nil or empty
     # condition pushes none. `find_by` is the caller that needs the
     # answer: it borrows a predicate and gives it back, so it has to
