@@ -12,6 +12,7 @@
 //! the runtime helper and one `Futamura.define` per specialized site.
 
 pub mod query;
+pub mod schemas;
 
 use std::collections::BTreeMap;
 
@@ -30,7 +31,7 @@ pub struct Report {
 
 /// Splice every specialization into `files` (the identity tree).
 pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report, String> {
-    let spec = query::Specializer::new(app);
+    let spec = query::Specializer::new(app, schemas::DatabaseSchemas::load(app, files));
     let mut sites = Vec::new();
     let mut residue = Vec::new();
     for c in &app.controllers {

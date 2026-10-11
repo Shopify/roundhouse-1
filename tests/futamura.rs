@@ -345,3 +345,173 @@ fn unmodeled_structure_sql_statement_is_residue_not_a_refusal() {
     assert_eq!(fs::read(out.join("db/structure.sql")).unwrap(), structure);
     assert!(out.join("app/models/widget.rb").exists());
 }
+
+/// Rails' multiple-database model: each configuration has its own dump
+/// (`schema_dump:` or the `<name>_structure.sql` / `<name>_schema.rb`
+/// default), and a model is looked up in the database its abstract base
+/// class's `connects_to` names, not in the primary's.
+mod multiple_databases {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const PRIMARY: &str = "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\", null: false\n    t.integer \"owner_id\"\n  end\nend\n";
+    // `<name>_structure.sql`: the default name of a non-primary SQL dump.
+    const ANALYTICS: &str = "CREATE TABLE public.events (\n    id bigint NOT NULL,\n    kind character varying NOT NULL,\n    room_id bigint\n);\n";
+    // Named by the configuration's `schema_dump:` key, merged from an anchor.
+    const REPORTS: &str = "ActiveRecord::Schema.define do\n  create_table \"summaries\", force: :cascade do |t|\n    t.string \"period\", null: false\n  end\nend\n";
+    const DATABASE_YML: &str = "\
+reporting_defaults: &reporting_defaults
+  schema_dump: \"reports_schema.rb\"
+test:
+  primary:
+    adapter: postgresql
+  analytics:
+    adapter: postgresql
+  reporting:
+    adapter: postgresql
+    <<: *reporting_defaults
+";
+
+    fn files(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", PRIMARY),
+            ("db/analytics_structure.sql", ANALYTICS),
+            ("db/reports_schema.rb", REPORTS),
+            ("config/database.yml", DATABASE_YML),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/analytics_record.rb", "class AnalyticsRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :analytics, reading: :analytics }\nend\n"),
+            ("app/models/reporting_record.rb", "class ReportingRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :reporting }\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            ("app/models/event.rb", "class Event < AnalyticsRecord\nend\n"),
+            ("app/models/summary.rb", "class Summary < ReportingRecord\nend\n"),
+        ];
+        files.extend_from_slice(extra);
+        files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect()
+    }
+
+    fn specialized(files: &mut Vec<(String, String)>) -> roundhouse::emit::futamura::Report {
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        specialize(&app, files).unwrap()
+    }
+
+    #[test]
+    fn chains_on_every_database_specialize_against_that_databases_schema() {
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.all_of(room, period)\n    [Room.where(name: room).to_a, Event.where(kind: room).to_a, Summary.where(period: period).to_a]\n  end\nend\n",
+        )]);
+        let report = specialized(&mut files);
+        assert_eq!(report.specialized.len(), 3, "{:?}", report.residue);
+        let init = &files.iter().find(|(p, _)| p == INITIALIZER).expect("initializer").1;
+        for chain in ["Room.all.where(name: p.bind)", "Event.all.where(kind: p.bind)", "Summary.all.where(period: p.bind)"] {
+            assert!(init.contains(chain), "{chain}: {init}");
+        }
+    }
+
+    #[test]
+    fn a_column_of_another_database_is_not_a_column_of_the_models_own() {
+        // `events` has no `name` (the primary's `rooms` does) and `rooms` has
+        // no `kind`: each model is checked against its own database only.
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.mixed(x)\n    [Event.where(name: x).to_a, Room.where(kind: x).to_a]\n  end\nend\n",
+        )]);
+        let report = specialized(&mut files);
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(report.residue.iter().any(|r| r.contains("`name`, not a column")), "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("`kind`, not a column")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_database_without_a_dump_in_the_tree_leaves_its_models_to_rails_by_name() {
+        let mut files = files(&[(
+            "app/models/report_card.rb",
+            "class ReportCard < ApplicationRecord\n  def self.of(x)\n    Event.where(kind: x).to_a\n  end\nend\n",
+        )]);
+        files.retain(|(p, _)| p != "db/analytics_structure.sql");
+        let report = specialized(&mut files);
+        assert!(report.specialized.is_empty(), "{:?}", report.specialized);
+        assert!(
+            report.residue.iter().any(|r| r.contains("database `analytics` has no schema dump") || r.contains("analytics_structure.sql")),
+            "{:?}",
+            report.residue
+        );
+    }
+
+    #[test]
+    fn a_table_the_primary_lacks_is_checked_against_the_dumps_that_hold_it() {
+        // No `connects_to`: the app routes this model at run time.
+        let mut files = files(&[
+            ("app/models/rollup.rb", "class Rollup < ApplicationRecord\n  self.table_name = \"summaries\"\n  def self.of(x)\n    where(period: x).to_a\n  end\nend\n"),
+            (
+                "app/models/report_card.rb",
+                "class ReportCard < ApplicationRecord\n  def self.of(x)\n    Rollup.where(period: x).to_a\n  end\nend\n",
+            ),
+        ]);
+        let report = specialized(&mut files);
+        assert!(report.specialized.iter().any(|s| s.contains("report_card.rb")), "{:?}", report.residue);
+    }
+}
+
+mod rooted_constants {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_rooted_model_constant_roots_a_chain_like_the_bare_one() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\", null: false\n  end\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            ("app/services/lookup/finder.rb", "module Lookup\n  class Finder\n    def self.named(x)\n      ::Room.where(name: x).to_a\n    end\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+    }
+}
+
+mod dumps_with_unmodeled_statements {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    /// A pg_dump of a second database holds statements the SQL ingest does
+    /// not model; the tables it does model still answer column lookups even
+    /// when the caller did not switch survey mode on.
+    #[test]
+    fn a_second_databases_dump_with_a_prepare_statement_still_gives_its_columns() {
+        let events = "CREATE TABLE public.events (\n    id bigint NOT NULL,\n    kind character varying NOT NULL\n);\n\nPREPARE stmt AS SELECT 1;\n\nALTER TABLE ONLY public.events\n    ADD CONSTRAINT events_pkey PRIMARY KEY (id);\n";
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("db/events_structure.sql", events),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/events_record.rb", "class EventsRecord < ApplicationRecord\n  self.abstract_class = true\n  connects_to database: { writing: :events }\nend\n"),
+            ("app/models/event.rb", "class Event < EventsRecord\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    Event.where(kind: x).to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        assert!(!roundhouse::ingest::survey::is_active());
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(!roundhouse::ingest::survey::is_active());
+    }
+}
