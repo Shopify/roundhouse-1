@@ -241,6 +241,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("backtrace_cleaner", as_cleaner.clone()), ("backtrace_cleaner=", as_cleaner.clone()),
         ("backtrace_cleaner?", Ty::Bool),
     ]);
+    // activerecord query_logs.rb, the tags API an app configures from an
+    // initializer (runtime/spinel/active_record_query_logs.rb, PostgreSQL
+    // tree only).
+    register_stdlib_class(classes, "ActiveRecord::QueryLogs", &[
+        ("tags", Ty::Untyped), ("tags=", Ty::Untyped),
+        ("taggings", Ty::Untyped), ("taggings=", Ty::Untyped),
+        ("tags_formatter", Ty::Untyped), ("tags_formatter=", Ty::Untyped),
+        ("prepend_comment", Ty::Untyped), ("prepend_comment=", Ty::Untyped),
+        ("cache_query_log_tags", Ty::Untyped), ("cache_query_log_tags=", Ty::Untyped),
+        ("call", Ty::Str), ("clear_cache", Ty::Untyped), ("query_source_location", Ty::Untyped),
+    ], &[]);
     register_stdlib_class(classes, "ActiveSupport::ExecutionContext", &[
         ("set", Ty::Untyped), ("[]=", Ty::Untyped), ("to_h", sym_hash()),
         ("clear", Ty::Nil), ("push", Ty::Untyped), ("pop", Ty::Untyped), ("flush", Ty::Untyped),

@@ -102,6 +102,22 @@ module DatabaseConfigurations
       configuration_hash[:database]
     end
 
+    # hash_config.rb: the `query_log_tags` entry of the configuration, and
+    # the per-pool format and comment position it may carry (QueryLogs).
+    def query_log_tags_config
+      configuration_hash[:query_log_tags]
+    end
+
+    def query_log_tags_format
+      tags = query_log_tags_config
+      tags["format"]&.to_sym if tags.is_a?(Hash)
+    end
+
+    def query_log_tags_prepend_comment
+      tags = query_log_tags_config
+      tags["prepend_comment"] if tags.is_a?(Hash)
+    end
+
     def for_current_env?
       env_name == DatabaseConfiguration.default_env
     end
