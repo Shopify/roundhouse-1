@@ -330,14 +330,17 @@ fn postgresql_tree() -> bool {
 /// A load hook's block whose statements are all `prepend Mod` calls with
 /// literal module paths, on the hooked class (receiverless) or on a
 /// literal class path (`ActiveRecord::Reflection::AssociationReflection
-/// .prepend(Mod)`, which the block runs the same wherever it is).
+/// .prepend(Mod)`, which the block runs the same wherever it is), or on
+/// the hooked class's metaclass (`singleton_class.prepend(Mod)`, which
+/// `base.class_eval` resolves to the base's own singleton class: how a
+/// patch adds class-level accessors).
 fn prepends_only(block: &ruby_prism::BlockNode<'_>) -> bool {
     let Some(body) = block.body() else { return false };
     let stmts = flatten_statements(body);
     !stmts.is_empty()
         && stmts.iter().all(|stmt| {
             stmt.as_call_node().is_some_and(|call| {
-                call.receiver().is_none_or(|recv| constant_path_of(&recv).is_some())
+                call.receiver().is_none_or(|recv| constant_path_of(&recv).is_some() || is_bare_singleton_class(&recv))
                     && constant_id_str(&call.name()) == "prepend"
                     && call.block().is_none()
                     && call.arguments().is_some_and(|args| {
@@ -346,6 +349,13 @@ fn prepends_only(block: &ruby_prism::BlockNode<'_>) -> bool {
                     })
             })
         })
+}
+
+/// A receiverless, argumentless `singleton_class` call.
+fn is_bare_singleton_class(node: &Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|call| {
+        call.receiver().is_none() && constant_id_str(&call.name()) == "singleton_class" && call.arguments().is_none()
+    })
 }
 
 /// The framework class a load hook hands its block, for the hooks whose

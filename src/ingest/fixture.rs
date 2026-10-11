@@ -82,11 +82,15 @@ fn split_erb(source: &str) -> SplitErb {
         };
         let raw = &source[open + 2..close];
         let body = raw.trim_start_matches('-').trim_end_matches('-').trim();
-        if let Some(rest) = body.strip_prefix('#') {
-            let _ = rest; // comment tag: contributes nothing
-        } else if let Some(expr) = body.strip_prefix('=') {
+        // `<%#` and `<%=` are tags only when the marker follows `<%`
+        // directly: a statement tag whose first line is a comment
+        // (`<%\n# note\ndef helper … end\n%>`) is a statement.
+        let marked = raw.trim_start_matches('-');
+        if marked.starts_with('#') {
+            // comment tag: contributes nothing
+        } else if let Some(expr) = marked.strip_prefix('=') {
             out.yaml.push_str(&erb_slot(out.values.len()));
-            out.values.push(expr.trim().to_string());
+            out.values.push(expr.trim_end_matches('-').trim().to_string());
         } else if !body.is_empty() {
             out.statements.push(body.to_string());
         }
