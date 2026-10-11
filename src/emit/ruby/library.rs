@@ -8869,6 +8869,16 @@ pub(crate) fn apply_constant_rooting(
         )
         .collect();
     let known = |n: &str| class_names.contains(n);
+    // A namespace-only module (`module Outer::Web::Plan` holding nested
+    // classes) has no entry of its own but still binds its name for
+    // lexical lookup, so every proper prefix of a known name counts.
+    let namespaces: crate::det::HashSet<String> = class_names
+        .iter()
+        .flat_map(|n| {
+            let segs: Vec<&str> = n.split("::").collect();
+            (1..segs.len()).map(move |i| segs[..i].join("::")).collect::<Vec<_>>()
+        })
+        .collect();
     for lc in lcs.iter_mut() {
         let name = if matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
             lc.name.0.as_str().rsplit_once("::").unwrap().0
@@ -8901,7 +8911,7 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
-        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes };
+        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes, namespaces: &namespaces };
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, &shadowing, &scope, &known);
         }
@@ -8923,6 +8933,8 @@ pub(crate) fn apply_constant_rooting(
 struct LexicalScope<'a> {
     own: String,
     prefixes: &'a [String],
+    /// Names that exist only as the namespace of a known class.
+    namespaces: &'a crate::det::HashSet<String>,
 }
 
 impl LexicalScope<'_> {
@@ -8984,9 +8996,17 @@ fn root_shadowed_constants(
     // … or an ENCLOSING namespace defines it and the full path under
     // that namespace does not exist, which is the nesting the emit
     // introduced. See the prefix note at the call site.
-    let by_enclosing = prefixes.iter().any(|p| {
-        known(&format!("{p}::{}", head.as_str())) && !known(&format!("{p}::{joined}"))
-    });
+    // Only the INNERMOST namespace defining the head binds it (Ruby's
+    // Module.nesting lookup); a farther one's same-named constant, with
+    // no such path under it, is never reached.
+    let by_enclosing = prefixes
+        .iter()
+        .rev()
+        .find(|p| {
+            let head_path = format!("{p}::{}", head.as_str());
+            known(&head_path) || scope.namespaces.contains(&head_path)
+        })
+        .is_some_and(|p| !known(&format!("{p}::{joined}")));
     if !by_own_segment && !by_enclosing {
         return;
     }
