@@ -245,7 +245,18 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
                     file: file.clone(),
                     message: format!("fixture field {label}.{k} is not a scalar"),
                 })?;
+            // `!!binary` (or `!binary`) over ERB, or over bytes that are not
+            // UTF-8 (which the YAML reader leaves as base64): Rails renders
+            // the tags first and Psych then decodes the base64
+            // (yaml.org/type/binary), so the row holds the bytes
+            // (`unpack1("m")`), not the spelling.
+            let binary = is_binary_tagged(&v);
             let value = match resolve_slot(&s, &values) {
+                SlotMatch::Whole(_) | SlotMatch::Embedded | SlotMatch::None if binary => {
+                    let src = format!("{}.unpack1(\"m\")", interpolated_source(&s, &split.values));
+                    let tag_file = format!("{file} ({label}.{k} with ERB)");
+                    FixtureValue::Ruby(super::expr::ingest_ruby_program(&src, &tag_file)?)
+                }
                 SlotMatch::None => FixtureValue::Scalar(s),
                 SlotMatch::Whole(expr) => FixtureValue::Ruby(expr),
                 // `body: "hi <%= name %>"` — the tag is one part of a
@@ -441,6 +452,17 @@ fn yaml_kind(v: &serde_yaml_ng::Value) -> &'static str {
         serde_yaml_ng::Value::Mapping(_) => "a mapping",
         serde_yaml_ng::Value::Tagged(_) => "a tagged value",
         _ => "a scalar",
+    }
+}
+
+/// A scalar tagged `!!binary` (`tag:yaml.org,2002:binary`) or `!binary`.
+fn is_binary_tagged(v: &serde_yaml_ng::Value) -> bool {
+    match v {
+        serde_yaml_ng::Value::Tagged(t) => {
+            let tag = t.tag.to_string();
+            matches!(tag.trim_start_matches('!').trim_matches(|c| c == '<' || c == '>'), "tag:yaml.org,2002:binary" | "binary")
+        }
+        _ => false,
     }
 }
 

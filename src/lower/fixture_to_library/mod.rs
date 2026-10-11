@@ -1124,10 +1124,19 @@ fn raw_value_expr(v: &crate::lower::fixtures::RawFixtureValue) -> Expr {
 /// from ingest as an interpolated string whose literal parts YAML has
 /// already read, and stays as is.
 fn erb_scalar(expr: &Expr) -> Expr {
-    if matches!(&*expr.node, ExprNode::StringInterp { .. }) {
+    if matches!(&*expr.node, ExprNode::StringInterp { .. }) || is_binary_decode(expr) {
         return expr.clone();
     }
     send(Some(test_fixtures_const()), "erb_scalar", vec![expr.clone()], Ty::Untyped)
+}
+
+/// A `!!binary` field ingest decoded: `"<base64 text>".unpack1("m")`. The
+/// bytes are the value Psych yields, not text for YAML to read again.
+fn is_binary_decode(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else { return false };
+    method.as_str() == "unpack1"
+        && matches!(&*recv.node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } })
+        && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Str { value } } if value == "m"))
 }
 
 fn yaml_value_expr(v: &serde_yaml_ng::Value) -> Expr {
