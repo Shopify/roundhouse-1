@@ -186,3 +186,13 @@ show("1.duplicable?") { 1.duplicable? }
 show("nil.deep_dup") { nil.deep_dup }
 show("Holder.new.instance_values") { Holder.new.instance_values }
 show("Holder.new.instance_variable_names") { Holder.new.instance_variable_names }
+
+class WithProbe
+  attr_accessor :a, :b
+  def initialize; @a = 1; @b = 2; end
+end
+show("Object#with sets and restores") { x = WithProbe.new; seen = x.with(a: 10, b: 20) { |o| [o.equal?(x), o.a, o.b] }; [seen, x.a, x.b] }
+show("Object#with restores on raise") { x = WithProbe.new; begin; x.with(a: 5) { raise "boom" }; rescue => e; [e.message, x.a]; end }
+show("Object#with no attributes") { x = WithProbe.new; x.with { |o| o.a } }
+show("Object#with unknown writer") { x = WithProbe.new; begin; x.with(zz: 1) { }; rescue NoMethodError => e; e.class; end }
+show("1.respond_to?(:with)") { [1.respond_to?(:with), nil.respond_to?(:with), :a.respond_to?(:with), "".respond_to?(:with)] }

@@ -1089,6 +1089,20 @@ module ActiveRecord
     String = ActiveModel::Type::String
     Value = ActiveModel::Type::Value
 
+    # activerecord/lib/active_record/type/decimal_without_scale.rb: the
+    # type PostgreSQL's `numeric(p)` / `numeric(p,0)` column gets
+    # (postgresql_adapter.rb initialize_type_map), an integer that
+    # reports itself a decimal.
+    class DecimalWithoutScale < ActiveModel::Type::BigInteger # :nodoc:
+      def type
+        :decimal
+      end
+
+      def type_cast_for_schema(value)
+        value.to_s.inspect
+      end
+    end
+
     class DateTime < ActiveModel::Type::DateTime
       include Internal::Timezone
     end
@@ -1462,6 +1476,64 @@ module ActiveRecord
       else
         coder
       end
+    end
+  end
+end
+
+module ActiveRecord
+  # activerecord/lib/active_record/enum.rb: the type `enum` decorates an
+  # attribute's type with (`decorate_attributes([name])`), which maps a
+  # label to the stored value on the way to the database and back. Only
+  # EnumType is ported; the `enum` macro itself is lowered by the compiler.
+  module Enum
+    class EnumType < ActiveRecord::Type::Value # :nodoc:
+      include ActiveRecord::Type::QueryPredicates::Decorator
+
+      def initialize(name, mapping, subtype, raise_on_invalid_values: true)
+        @name = name
+        @mapping = mapping
+        @subtype = subtype
+        @_raise_on_invalid_values = raise_on_invalid_values
+      end
+
+      def type
+        subtype.type
+      end
+
+      def cast(value)
+        if mapping.has_key?(value)
+          value.to_s
+        elsif mapping.has_value?(value)
+          mapping.key(value)
+        else
+          ActiveModel::Type.const_get(:Blank).presence(value)
+        end
+      end
+
+      def deserialize(value)
+        mapping.key(subtype.deserialize(value))
+      end
+
+      def serialize(value)
+        subtype.serialize(mapping.fetch(value, value))
+      end
+
+      def serializable?(value, &block)
+        subtype.serializable?(mapping.fetch(value, value), &block)
+      end
+
+      def assert_valid_value(value)
+        return unless @_raise_on_invalid_values
+
+        unless ActiveModel::Type.const_get(:Blank).blank?(value) || mapping.has_key?(value) || mapping.has_value?(value)
+          raise ArgumentError, "'#{value}' is not a valid #{name}. Valid values are: #{mapping.keys.map(&:inspect).join(", ")}"
+        end
+      end
+
+      attr_reader :subtype
+
+      private
+        attr_reader :name, :mapping
     end
   end
 end

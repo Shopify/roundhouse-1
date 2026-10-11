@@ -1,6 +1,6 @@
 //! The activesupport core_ext methods Shopify Core sends to builtins
 //! (`exclude?`, `in?`, `index_with`, `squish`, `deep_dup`, `in_groups_of`,
-//! `except!`, ...) on the CRuby overlay against the Rails native Core
+//! `except!`, `with`, ...) on the CRuby overlay against the Rails native Core
 //! runs: tests/core_ext_surface_runtime.rb prints the same observations
 //! natively and on runtime/spinel/scaffold/ruby_overlay/runtime/
 //! active_support_core_ext.rb and requires them equal. The emitted Core

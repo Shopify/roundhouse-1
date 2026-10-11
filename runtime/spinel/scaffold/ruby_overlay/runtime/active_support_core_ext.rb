@@ -1335,3 +1335,28 @@ class Object
     instance_variables.map(&:name)
   end
 end
+
+# core_ext/object/with.rb: set the named attributes through their
+# writers for the block, then restore each one's earlier value.
+class Object
+  def with(**attributes)
+    old_values = {}
+    begin
+      attributes.each do |key, value|
+        old_values[key] = public_send(key)
+        public_send("#{key}=", value)
+      end
+      yield self
+    ensure
+      old_values.each do |key, old_value|
+        public_send("#{key}=", old_value)
+      end
+    end
+  end
+end
+
+# `with` is undefined on the immediates Rails names (an `with` on them is
+# a NoMethodError, as natively).
+[NilClass, TrueClass, FalseClass, Integer, Float, Symbol].each do |klass|
+  klass.undef_method(:with)
+end
