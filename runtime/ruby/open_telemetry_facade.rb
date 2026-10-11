@@ -13,6 +13,13 @@
 # endpoint serving 200s instead of 500ing the moment its `before_action`
 # reaches the OTel tail.
 #
+# On the Ruby/JRuby trees a lock that pins opentelemetry-api loads the
+# real gem instead (project.rs `open_telemetry_require`): this file is
+# then only the LoadError fallback, and `current_span` takes the same
+# optional context argument as the real API so a caller passing one
+# (opentelemetry-api's own `Tracer#start_span` does) never hits an
+# ArgumentError.
+#
 # Own file, own commit: a tree that later wires a real
 # opentelemetry-api/-sdk pair drops this file and the one
 # `require_relative` below, same whole-file grain the other façades
@@ -36,7 +43,7 @@ module OpenTelemetry
 
     NON_RECORDING_SPAN = Span.new
 
-    def self.current_span
+    def self.current_span(_context = nil)
       NON_RECORDING_SPAN
     end
   end

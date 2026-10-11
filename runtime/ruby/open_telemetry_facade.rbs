@@ -11,6 +11,6 @@ module OpenTelemetry
 
     NON_RECORDING_SPAN: Span
 
-    def self.current_span: () -> Span
+    def self.current_span: (?untyped _context) -> Span
   end
 end

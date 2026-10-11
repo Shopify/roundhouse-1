@@ -330,6 +330,28 @@ fn the_emitted_ruby_tree_declares_and_loads_the_platform_gems() {
     assert!(!facades.contains("\"prism\""), "prism is required by the app, not Bundler: {facades}");
 }
 
+/// A tree whose lock pins the OpenTelemetry API loads the real gem, so its
+/// `Trace.current_span(context = nil)` is not shadowed by the non-recording
+/// stand-in; the stand-in stays only as the LoadError fallback.
+#[test]
+fn the_emitted_ruby_tree_prefers_the_real_telemetry_api_over_the_stand_in() {
+    let (dir, errors) = platform_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    let guarded = "begin\n  require \"opentelemetry\"\nrescue LoadError\n  require_relative \"open_telemetry_facade\"\nend\n";
+    assert!(facades.contains(guarded), "{facades}");
+    assert_eq!(facades.matches("require_relative \"open_telemetry_facade\"").count(), 1, "{facades}");
+}
+
+#[test]
+fn a_ruby_tree_without_the_telemetry_api_in_its_lock_requires_the_stand_in_directly() {
+    let (dir, errors) = emit_and_run::empty_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(facades.contains("require_relative \"open_telemetry_facade\"\n"), "{facades}");
+    assert!(!facades.contains("require \"opentelemetry\"\nrescue"), "{facades}");
+}
+
 #[test]
 fn the_platform_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
     let (_, errors) = platform_app().emit(BuildTarget::Rust);
