@@ -1921,8 +1921,18 @@ pub fn target_files(
     // yet, so none of the trimming or refusals below apply — every construct is
     // residue, and the residue runs on Rails.
     if target == BuildTarget::Futamura {
-        let mut files = futamura_files(fixture)?;
+        let tree = futamura_tree(fixture)?;
+        let (carried_opaque, excluded) = (tree.opaque.len(), tree.excluded);
+        let mut files = tree.text;
         let report = emit::futamura::specialize(app, &mut files)?;
+        // No silent drops: the stage-0 contract is every file source
+        // control holds, so each deliberately excluded class is named.
+        let excluded: Vec<String> = excluded.iter().map(|(class, n)| format!("{n} {class}")).collect();
+        eprintln!(
+            "roundhouse: futamura: carried {} text and {carried_opaque} non-UTF-8 file(s) verbatim; left out: {}",
+            files.len(),
+            if excluded.is_empty() { "nothing".to_string() } else { excluded.join("; ") },
+        );
         eprintln!(
             "roundhouse: futamura: specialized {} query site(s); {} left to Rails{}",
             report.specialized.len(),
@@ -2728,17 +2738,42 @@ fn blog_files(fixture: &Path) -> Result<Vec<(String, String)>, String> {
 /// [`blog_files`] it keeps dotfiles (`.ruby-version` decides which Ruby
 /// runs the residue) and the `.keep` files that hold Rails' empty
 /// directories open. What it leaves out is run-time state, named by
-/// the paths a generated Rails app's `.gitignore` excludes. Binary
-/// files travel separately, as `App::binary_assets`.
-fn futamura_files(app_root: &Path) -> Result<Vec<(String, String)>, String> {
+/// the paths a generated Rails app's `.gitignore` excludes, and secret
+/// material (`config/master.key`, `*.pem`, `*.enc`, ...); each excluded
+/// class is counted in [`FutamuraTree::excluded`] so the caller can say
+/// so. Every other file is carried whatever its extension or encoding:
+/// UTF-8 files as text, the rest ([`FutamuraTree::opaque`]) byte for
+/// byte through [`write_futamura_opaque`].
+#[derive(Default)]
+struct FutamuraTree {
+    text: Vec<(String, String)>,
+    opaque: Vec<(String, PathBuf)>,
+    excluded: std::collections::BTreeMap<&'static str, usize>,
+}
+
+/// Key and encrypted-credential files by name (`config/master.key`,
+/// `*.pem`, `*.ejson`, `credentials.yml.enc`). Narrower than
+/// [`named_for_secrets`], whose word heuristics would also catch tracked
+/// source such as a `tokens.yml` fixture; stage 0 must not drop those.
+fn is_key_material(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    [".key", ".pem", ".ejson", ".enc", ".p12", ".pfx"].iter().any(|ext| lower.ends_with(ext))
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].contains(&lower.as_str())
+}
+
+fn futamura_tree(app_root: &Path) -> Result<FutamuraTree, String> {
     const UNWALKED: [&str; 2] = [".git", "node_modules"];
     const STATE: [&str; 5] = ["log/", "tmp/", "storage/", "app/assets/builds/", "public/assets/"];
-    let generated_state = |rel: &str| {
-        (STATE.iter().any(|dir| rel.starts_with(dir)) && !rel.ends_with("/.keep"))
-            || rel.starts_with(".bundle")
-            || rel == "config/master.key"
+    let exclusion = |rel: &str| -> Option<&'static str> {
+        if (STATE.iter().any(|dir| rel.starts_with(dir)) && !rel.ends_with("/.keep")) || rel.starts_with(".bundle") {
+            Some("run-time state (log/ tmp/ storage/ built assets .bundle)")
+        } else if is_key_material(rel.rsplit('/').next().unwrap_or(rel)) {
+            Some("secrets (keys, credentials)")
+        } else {
+            None
+        }
     };
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, unwalked: &mut usize) -> Result<(), String> {
         for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
             let entry = entry.map_err(|e| format!("read entry: {e}"))?;
             let path = entry.path();
@@ -2748,8 +2783,10 @@ fn futamura_files(app_root: &Path) -> Result<Vec<(String, String)>, String> {
                 .to_string_lossy()
                 .replace('\\', "/");
             if entry.file_type().map_err(|e| format!("stat: {e}"))?.is_dir() {
-                if !UNWALKED.contains(&rel.as_str()) {
-                    walk(root, &path, out)?;
+                if entry.file_name().to_str().is_some_and(|n| UNWALKED.contains(&n)) {
+                    *unwalked += 1;
+                } else {
+                    walk(root, &path, out, unwalked)?;
                 }
             } else {
                 out.push((rel, path));
@@ -2758,14 +2795,48 @@ fn futamura_files(app_root: &Path) -> Result<Vec<(String, String)>, String> {
         Ok(())
     }
     let mut paths = Vec::new();
-    walk(app_root, app_root, &mut paths)?;
-    let mut files: Vec<(String, String)> = paths
-        .into_iter()
-        .filter(|(rel, _)| !generated_state(rel))
-        .filter_map(|(rel, path)| fs::read_to_string(&path).ok().map(|content| (rel, content)))
-        .collect();
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
+    let mut unwalked = 0;
+    walk(app_root, app_root, &mut paths, &mut unwalked)?;
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut tree = FutamuraTree::default();
+    if unwalked > 0 {
+        tree.excluded.insert("dir(s) not walked (.git, node_modules at any depth)", unwalked);
+    }
+    for (rel, path) in paths {
+        if let Some(class) = exclusion(&rel) {
+            *tree.excluded.entry(class).or_default() += 1;
+            continue;
+        }
+        match fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(content) => tree.text.push((rel, content)),
+                Err(_) => tree.opaque.push((rel, path)),
+            },
+            // A dangling symlink or a file the walker cannot open.
+            Err(_) => *tree.excluded.entry("unreadable (dangling symlink, no permission)").or_default() += 1,
+        }
+    }
+    Ok(tree)
+}
+
+fn futamura_files(app_root: &Path) -> Result<Vec<(String, String)>, String> {
+    Ok(futamura_tree(app_root)?.text)
+}
+
+/// Write the stage-0 files that are not UTF-8 text (test fixtures,
+/// images, archives, wherever they live) into `dest` byte for byte,
+/// with their executable bits. The text files go through
+/// [`write_to_dir`] and [`copy_exec_bits`]. Returns how many were
+/// written.
+pub fn write_futamura_opaque(app_root: &Path, dest: &Path) -> Result<usize, String> {
+    let tree = futamura_tree(app_root)?;
+    for (rel, path) in &tree.opaque {
+        let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        write_if_changed(&dest.join(rel), &bytes)?;
+    }
+    let rels: Vec<(String, String)> = tree.opaque.iter().map(|(rel, _)| (rel.clone(), String::new())).collect();
+    copy_exec_bits(app_root, &rels, dest)?;
+    Ok(tree.opaque.len())
 }
 
 /// "ruby" archive: emitted CRuby-runnable tree. Starts from the

@@ -46,10 +46,18 @@ fn app_tree(root: &Path) {
     write(root, "storage/.keep", b"");
     write(root, "storage/test.sqlite3", b"SQLite format 3\0");
     write(root, "config/master.key", b"secret\n");
+    // Not UTF-8, and nowhere an asset root: a test fixture, a doc image.
+    write(root, "test/files/latin1.txt", b"caf\xe9 \xff\xfe\n");
+    write(root, "docs/diagram.bin", b"\x00\x01\xc3\x28\xff");
+    write(root, "docs/screenshots/shot.png", PNG);
+    write(root, "bin/setup-data", b"\x7fELF\xff\xfe");
+    write(root, "engines/x/node_modules/pkg/bin/tool", b"\x7fELF\xff\xfe");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(root.join("bin/rails"), fs::Permissions::from_mode(0o755)).unwrap();
+        for exec in ["bin/rails", "bin/setup-data"] {
+            fs::set_permissions(root.join(exec), fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 }
 
@@ -79,21 +87,33 @@ fn identity_carries_source_and_drops_run_time_state() {
         "app/models/widget.rb",
         "app/assets/images/logo.png",
         "bin/rails",
+        "test/files/latin1.txt",
+        "docs/diagram.bin",
+        "docs/screenshots/shot.png",
+        "bin/setup-data",
         "log/.keep",
         "tmp/.keep",
         "storage/.keep",
     ] {
         assert_eq!(fs::read(out.join(rel)).ok(), fs::read(src.join(rel)).ok(), "{rel}");
     }
-    for rel in ["log/test.log", "tmp/cache/x", "storage/test.sqlite3", "config/master.key"] {
+    for rel in ["engines/x/node_modules/pkg/bin/tool", "log/test.log", "tmp/cache/x", "storage/test.sqlite3", "config/master.key"] {
         assert!(!out.join(rel).exists(), "{rel} is run-time state, not source");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(out.join("bin/rails")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "bin/rails must stay executable");
+        for rel in ["bin/rails", "bin/setup-data"] {
+            let mode = fs::metadata(out.join(rel)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "{rel} must stay executable");
+        }
     }
+    // Nothing is dropped silently: the exclusions are named once.
+    let summary = stderr.lines().find(|l| l.contains("futamura: carried")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(summary.contains("5 non-UTF-8 file(s)"), "{summary}");
+    assert!(summary.contains("3 run-time state"), "{summary}");
+    assert!(summary.contains("1 secrets"), "{summary}");
+    assert!(summary.contains("1 dir(s) not walked"), "{summary}");
     // The source app ships no README, so the target supplies one.
     assert!(fs::read_to_string(out.join("README.md")).unwrap().contains("bin/rails test"));
 

@@ -501,6 +501,7 @@ fn run_transpile(
     let assets = project::write_binary_assets(&app.binary_assets, &files, out)?;
     if target == BuildTarget::Futamura {
         project::copy_exec_bits(input, &files, out)?;
+        project::write_futamura_opaque(input, out)?;
     }
     eprintln!(
         "roundhouse: emitted {} files to {} ({})",
