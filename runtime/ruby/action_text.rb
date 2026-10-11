@@ -854,7 +854,7 @@ module ActionText
       finish = at + length
       i = revision
       while i < @changes.length
-        change = @changes[i]
+        change = @changes[i] #: Change
         change_at = change.at
         change_finish = change_at + change.length
         if change_finish <= at

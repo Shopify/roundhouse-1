@@ -100,9 +100,9 @@ fn emit() -> PathBuf {
     out
 }
 
-/// The uuid key, the `owner: alice` reference and the accessor's find key
-/// are the set's `fixture_identifier` of the label; the explicit Integer
-/// stays for the loader's `normalize_fixture_value`, which `model:` names.
+/// The uuid key and the `owner: alice` reference are the set's
+/// `fixture_identifier` of the label; the explicit Integer stays for the
+/// loader's `normalize_fixture_value`, which `model:` names.
 #[test]
 fn uuid_column_ids_are_the_sets_fixture_identifier() {
     let out = emit();
@@ -112,7 +112,9 @@ fn uuid_column_ids_are_the_sets_fixture_identifier() {
         r#""owner_id" => ActiveRecord::TestFixtures.fixture_identifier("Token", "owner_id", "alice")"#,
         r#""holder_id" => 7"#,
         r#"faster_fixtures: true, model: "Token")"#,
-        r#"@__fx_red = Token.find(ActiveRecord::TestFixtures.fixture_identifier("Token", "id", "red")) if @__fx_red.nil?"#,
+        // The accessor finds the inserted row (Rails' Fixture#find, a48a4f88b),
+        // whose id is the identifier above.
+        r#"@__fx_red = ActiveRecord::TestFixtures.fixture_find(Token, @__fixture_rows, 0) if @__fx_red.nil?"#,
     ] {
         assert!(tokens.contains(needle), "no {needle} in:\n{tokens}");
     }

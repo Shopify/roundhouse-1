@@ -107,9 +107,11 @@ module ActiveRecord
       @scope_attributes = scope.scope_attributes
       @default_scoped = scope.default_scoped?
       extensions = []
-      scope.singleton_class.ancestors.each do |mod|
+      meta = scope.singleton_class #: Class
+      chain = meta.ancestors #: Array[Module]
+      chain.each do |mod|
         break if mod.equal?(scope.class)
-        extensions.unshift(mod) unless mod.equal?(scope.singleton_class)
+        extensions.unshift(mod) unless mod.equal?(meta)
       end
       extensions.each { |mod| extend(mod) }
       self
