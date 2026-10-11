@@ -128,9 +128,18 @@ const BADGES: &str = r#"gold:
   name: Gold
 "#;
 
-const SLOTS: &str = r#"ab:
+/// A `def` in a statement tag (after a comment line) is a helper the value
+/// tags call: Rails' ERB runs the file in one binding.
+const SLOTS: &str = r#"<%
+# Joins the two halves of a name.
+def joined(first, second)
+  first + second
+end
+%>
+
+ab:
   shop_id: <%= 6 * 7 %>
-  name: <%= "a" + "b" %>
+  name: <%= joined("a", "b") %>
 "#;
 
 const PROBE_TEST: &str = r#"require "test_helper"
@@ -352,6 +361,17 @@ fn a_model_whose_writer_raises_still_loads() {
 /// The runtime half on a real PostgreSQL: the emitted program's loader
 /// inserts each row through the column casts, the authored test reads them
 /// back, and the table holds exactly the cast rows afterwards.
+/// A `def` in a statement tag defines the helper on the set's module
+/// singleton (the loader runs in a singleton method, and the value tags
+/// call `joined(…)` there), as the model-building loader does.
+#[test]
+fn a_def_in_a_statement_tag_is_callable_from_raw_row_value_tags() {
+    let out = emit("def-helper");
+    let slots = read(&out, "test/fixtures/slots.rb");
+    assert!(slots.contains("def self.joined(first, second)"), "{slots}");
+    assert!(slots.contains("joined(\"a\", \"b\")"), "{slots}");
+}
+
 /// `ROUNDHOUSE_PG_TEST_URL` is an admin conninfo for a disposable server;
 /// the run creates and drops its own database.
 #[test]
