@@ -889,3 +889,19 @@ fn postgres_project_puts_an_extension_gems_lib_on_the_load_path_without_activati
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// An eager-load key list holds the key column's own values: integers
+/// bare, uuid / string keys as quoted literals.
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn postgres_driver_escapes_string_keys_in_eager_load_lists() {
+    assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
+    let result = std::process::Command::new("ruby")
+        .args(["tests/db_pg_runtime.rb", "--name", "/test_escape_int_list_/"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(result.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&result.stderr));
+    assert!(stdout.lines().any(|line| line.starts_with("1 runs, ")), "stdout={stdout}");
+}

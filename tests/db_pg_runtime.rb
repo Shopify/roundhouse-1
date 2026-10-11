@@ -69,6 +69,18 @@ class PostgreSQLRuntimeTest < Minitest::Test
     Db.finalize(statement)
   end
 
+  # Eager-load IN-lists carry whatever the key column holds: integers bare,
+  # uuid / string keys as quoted literals (Rails binds them as typed params).
+  def test_escape_int_list_accepts_string_keys
+    assert_equal "NULL", Db.escape_int_list([])
+    assert_equal "1, 2, 3", Db.escape_int_list([1, 2, 3])
+    uuid = "2d547a90-a652-45ad-bac3-630b9a63a7a3"
+    assert_equal "'#{uuid}', 'o''k'", Db.escape_int_list([uuid, "o'k"])
+    Db.exec("CREATE TABLE keyed (id uuid PRIMARY KEY, label text)")
+    Db.exec("INSERT INTO keyed VALUES (#{Db.escape_string(uuid)}, 'x')")
+    assert_equal "x", scalar("SELECT label FROM keyed WHERE id IN (#{Db.escape_int_list([uuid])})")
+  end
+
   def test_trigger_sequence_cannot_replace_returned_identity
     Db.exec("CREATE TABLE audit (id bigserial PRIMARY KEY)")
     Db.exec("SELECT setval('audit_id_seq',900)")
