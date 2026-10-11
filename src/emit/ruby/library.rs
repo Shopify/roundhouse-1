@@ -16635,6 +16635,27 @@ fn require_path_for_body_const(
         }
         return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
     }
+    // The enclosing namespaces are scopes too: `Change::ADD` inside
+    // `module Sales; module Query; module Changes` is `Sales::Change::ADD`
+    // when `Sales::Change` is a class, as Ruby's lexical lookup finds it
+    // (the innermost scope that has the head segment wins). The file of
+    // the longest class prefix of the path under that scope.
+    let scopes: Vec<&str> = self_name.match_indices("::").map(|(i, _)| &self_name[..i]).chain(Some(self_name)).collect();
+    for scope in scopes.into_iter().rev().filter(|scope| !scope.is_empty()) {
+        if !is_model_or_library_class(&format!("{scope}::{first}"), app) {
+            continue;
+        }
+        for n in (1..=path.len()).rev() {
+            let prefix = format!("{scope}::{}", path[..n].join("::"));
+            if is_model_or_library_class(&prefix, app) {
+                let owner = file_owner(&prefix, app);
+                if owner == self_name {
+                    return None;
+                }
+                return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+            }
+        }
+    }
     // A qualified constant (`SecureHeaders::ClearSiteData::CACHE`,
     // `SecureHeaders::PolicyManagement::ALL_DIRECTIVES`) is defined by
     // the file of its longest class prefix: this file when that is this
