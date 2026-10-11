@@ -8840,6 +8840,27 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    // A gem file loaded by `require`, not an autoload, is nested in
+    // namespaces its source opens as modules but no file of the tree
+    // declares (rack-oauth2 2.2.1's urn.rb: `module URN` holding only
+    // `TokenType`, `GrantType`, ...). Its compact `module
+    // Rack::OAuth2::URN::TokenType` names URN, which nothing defined, so
+    // the namespace is an implicit module, defined on first reference as
+    // the gem's own file defines it. `chain`: the declaration's path.
+    let implicit_parents = |chain: &[(String, bool)], namespaces: &mut BTreeMap<String, BTreeMap<String, Child>>| {
+        for i in 1..chain.len().saturating_sub(1) {
+            let (name, is_module) = &chain[i];
+            let parent: Vec<&str> = chain[..i].iter().map(|(s, _)| s.as_str()).collect();
+            if !*is_module || !required_files.iter().any(|source| opens_module_within(&source.text, &parent, name)) {
+                continue;
+            }
+            let child = namespaces.entry(parent.join("::")).or_default().entry(name.clone()).or_default();
+            if !child.seen {
+                child.all_module = true;
+                child.seen = true;
+            }
+        }
+    };
     for (anchor, content) in &models {
         // A declaration only a file program holds loads in place, with no
         // autoload, unless the gem's own glob registers its constant
@@ -8867,11 +8888,25 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let Some(chain) = autoload_primary(anchor, content) else {
             if !gem_file {
                 boot_files.push(anchor);
+            } else if let Some(path) = content
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("module ")
+                        .or_else(|| l.strip_prefix("class "))
+                        .map(|r| r.split(|c: char| c.is_whitespace() || c == '<').next().unwrap_or(""))
+                })
+                .filter(|p| p.contains("::"))
+            {
+                // The compact path of the declaration: its leading segments
+                // are namespaces, modules where a source opens them so.
+                let chain: Vec<(String, bool)> = path.split("::").map(|seg| (seg.to_string(), true)).collect();
+                implicit_parents(&chain, &mut namespaces);
             }
             continue;
         };
         let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
         if gem_file && !gem_autoloads(&full) && !in_autoloaded_file(anchor, &full) {
+            implicit_parents(&chain, &mut namespaces);
             continue;
         }
         // Two files that both define the same constant cannot both be its
@@ -17014,6 +17049,7 @@ fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, Stri
         }
         found.sort();
         let lib = format!("{dir}lib/");
+        let mut carried = false;
         for (rel, content) in found {
             if rel.ends_with(".rb") && rel.starts_with(lib.as_str()) {
                 continue;
@@ -17022,7 +17058,32 @@ fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, Stri
                 eprintln!("roundhouse: note: {rel} is named for secrets and is not carried into the tree");
                 continue;
             }
+            carried |= !rel.starts_with(lib.as_str());
             out.push((rel, content));
+        }
+        // A gem reads a root file beside its code by a path that goes up
+        // from the directory of its file (`File.join(File.dirname(__FILE__),
+        // "../VERSION")`, rack-oauth2, swd, webfinger, openid_connect;
+        // `"../../VERSION"` from json/jwt.rb in json-jwt). The code under
+        // lib/ is compiled, so the tree has no lib/ directories for the
+        // kernel to resolve `..` through, and the read raises Errno::ENOENT.
+        // Keep the directories the source has.
+        if carried {
+            let mut stack = vec![format!("{lib}")];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = fs::read_dir(root.join(&d)) else { continue };
+                let mut subdirs: Vec<String> = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect();
+                subdirs.sort();
+                stack.extend(subdirs.into_iter().map(|n| format!("{d}{n}/")));
+                if !out.iter().any(|(rel, _)| rel.starts_with(d.as_str())) {
+                    out.push((format!("{d}.keep"), String::new()));
+                }
+            }
         }
     }
     Ok(())

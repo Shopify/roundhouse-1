@@ -9949,7 +9949,7 @@ fn emit_library_class_decl_inner(
     // The source's own top-level requires first, as Ruby runs them
     // before the body (`authored_requires`). A load-time need that one
     // of them already loads is not repeated.
-    let (authored, after) = authored_requires(lc, app, &out_dir, &self_anchor);
+    let (authored, after, trailing) = authored_requires(lc, app, &out_dir, &self_anchor);
     for line in &authored {
         writeln!(s, "{line}").unwrap();
     }
@@ -10790,7 +10790,7 @@ fn emit_library_class_decl_inner(
     // `class_attribute` writer, a carried `included do` statement calling
     // one) needs the defs above it, as the source had them: it and every
     // effect after it run after the methods, keeping their order.
-    let tail_effects: Vec<&Expr> = if railtie {
+    let mut tail_effects: Vec<&Expr> = if railtie {
         Vec::new()
     } else {
         let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
@@ -10831,6 +10831,29 @@ fn emit_library_class_decl_inner(
             .unwrap_or(body_effects.len());
         body_effects.split_off(at)
     };
+    // A body statement written among the defs, or after the last, is
+    // written before the tail effects. One with a tail effect above it
+    // in the source (`self.logger = Logger.new` through the body's own
+    // `def self.logger=`, above `self.logger.progname = "x"`) would run
+    // ahead of the effect it reads, so it joins the tail, which keeps
+    // the source's order.
+    let tail_statements: Vec<&Expr> = positioned_statements
+        .iter()
+        .filter(|(at, call)| {
+            *at >= lc.methods.len()
+                || tail_effects.iter().any(|t| {
+                    !t.span.is_synthetic() && t.span.file == call.span.file && t.span.start < call.span.start
+                })
+        })
+        .map(|(_, call)| *call)
+        .collect();
+    if !tail_effects.is_empty() && !tail_statements.is_empty() {
+        positioned_statements.retain(|(_, call)| !tail_statements.iter().any(|t| std::ptr::eq(*t, *call)));
+        tail_effects.extend(tail_statements);
+        if tail_effects.iter().all(|e| !e.span.is_synthetic() && e.span.file == tail_effects[0].span.file) {
+            tail_effects.sort_by_key(|e| e.span.start);
+        }
+    }
     // A carried railtie's body: its locals first (a statement's block
     // closes over a local an earlier statement writes), then each
     // statement under `run_body_statement`, which names one that fails
@@ -11137,6 +11160,12 @@ fn emit_library_class_decl_inner(
 
     for i in (0..depth).rev() {
         writeln!(s, "{}end", "  ".repeat(i)).unwrap();
+    }
+    if !trailing.is_empty() {
+        writeln!(s).unwrap();
+        for line in &trailing {
+            writeln!(s, "{line}").unwrap();
+        }
     }
 
     EmittedFile { path: out_path, content: s }
@@ -15511,7 +15540,11 @@ pub(super) fn emit_file_program(
                                 Some(declared) => {
                                     let mut anchors: Vec<String> =
                                         declared.iter().filter(|a| emitted.contains(*a)).cloned().collect();
-                                    if anchors.is_empty() {
+                                    // Every class it declares was dropped (a Rails
+                                    // generator class the runtime does not port, a
+                                    // `lower_residue` warning) and no file of it is
+                                    // written: Ruby's require has nothing to load here.
+                                    if anchors.is_empty() && emitted.contains(&anchor) {
                                         anchors.push(anchor);
                                     }
                                     anchors
@@ -17606,6 +17639,19 @@ fn guards_on_owner(owner: &str, anchor: &str, declared_by_programs: &BTreeSet<St
     })
 }
 
+/// Where a source's first top-level `class`/`module` ends.
+fn first_declaration_end(source: &crate::span::SourceFile) -> Option<u32> {
+    let result = ruby_prism::parse(source.text.as_bytes());
+    let root = result.node();
+    let program = root.as_program_node()?;
+    program
+        .statements()
+        .body()
+        .iter()
+        .find(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
+        .map(|stmt| stmt.location().end_offset() as u32)
+}
+
 /// A source's top-level `require "f"` and `require_relative "f"`
 /// statements (one string literal argument), in source order, as
 /// `(feature, relative, offset)`.
@@ -17733,21 +17779,30 @@ fn authored_require_sources(app: &App) -> std::rc::Rc<HashMap<String, Vec<usize>
 /// not carry gets a named error. A file that declares nothing beyond
 /// the modules it opens has those modules opened. A feature outside the
 /// app (a gem's, the stdlib's) is not handled here.
-fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: &str) -> (Vec<String>, Vec<String>) {
+fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     if !super::expr::native_keywords() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let by_owner = authored_require_sources(app);
-    let Some(sources) = by_owner.get(lc.name.0.as_str()) else { return (Vec::new(), Vec::new()) };
+    let Some(sources) = by_owner.get(lc.name.0.as_str()) else { return (Vec::new(), Vec::new(), Vec::new()) };
     let table = carried_sources(app);
     let files = require_guard_owners(app);
     let mut requires: Vec<String> = Vec::new();
     let mut after: Vec<String> = Vec::new();
+    let mut trailing: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for &i in sources {
         let source = &app.sources[i];
         let rel = relative_source_path(app, &source.path);
+        // A gem file's requires written below its class run after the
+        // class is defined (rack-oauth2's `connect_object.rb`: `require
+        // 'openid_connect/request_object'` after `class ConnectObject`,
+        // a subclass file that reopens the class it requires back).
+        let gem_file = app.gem_source_dirs.iter().any(|dir| rel.trim_start_matches('/').starts_with(dir.as_str()));
+        let declaration_end = if gem_file { first_declaration_end(source) } else { None };
         for (feature, relative, offset) in top_level_requires(source) {
+            let after_declaration = declaration_end.is_some_and(|end| offset >= end);
+            let requires = if after_declaration { &mut trailing } else { &mut requires };
             let site = format!("{rel}:{}", source.line_col(offset).0);
             let written = format!("require{} {feature:?}", if relative { "_relative" } else { "" });
             match program_require_source(rel, &feature, relative, &table) {
@@ -17797,7 +17852,7 @@ fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: 
             }
         }
     }
-    (requires, after)
+    (requires, after, trailing)
 }
 
 /// The constant references of code that runs as its file loads (a
