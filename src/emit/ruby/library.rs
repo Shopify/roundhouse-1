@@ -3569,6 +3569,17 @@ pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app:
                 called.insert(m.to_string());
             }
         }
+        // `accepts_nested_attributes_for :x` builds a new target through
+        // `build_x` (nested_attributes.rb, one-to-one assignment).
+        if let ExprNode::Send { method, args, .. } = &*e.node
+            && method.as_str() == "accepts_nested_attributes_for"
+        {
+            for arg in args {
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
+                    called.insert(format!("build_{}", value.as_str()));
+                }
+            }
+        }
         e.node.for_each_child(&mut |c| walk(c, called));
     }
     crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut called));
@@ -3770,7 +3781,8 @@ fn belongs_to_inverse(app: &App, owner: &crate::dialect::Model, assoc: &crate::d
 ///
 /// CRuby/JRuby with the PostgreSQL runtime only, where the reflection
 /// classes are carried, and only where some body calls
-/// `reflect_on_association` or a class macro declares an association.
+/// `reflect_on_association` (or `accepts_nested_attributes_for`, which
+/// reads it) or a class macro declares an association.
 pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::{Association, ModelBodyItem};
 
@@ -3780,7 +3792,10 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
     let generated = |m: &MethodDef| {
         m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && m.name_span.file.0 == 0
     };
-    if !lcs.iter().any(|lc| lc.methods.iter().any(generated)) && !app_calls_method(app, "reflect_on_association") {
+    if !lcs.iter().any(|lc| lc.methods.iter().any(generated))
+        && !app_calls_method(app, "reflect_on_association")
+        && !app_calls_method(app, "accepts_nested_attributes_for")
+    {
         return;
     }
     let mut declarations = DeclarationOptions::default();
@@ -4061,6 +4076,14 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
         }
         if let ExprNode::Send { method, args, .. } = &*e.node {
             if matches!(method.as_str(), "association" | "association_cached?") && args.len() == 1 {
+                *found = true;
+                return;
+            }
+        }
+        // `accepts_nested_attributes_for`'s writers read and build through
+        // the association object (runtime/spinel/cruby/active_record_nested_attributes.rb).
+        if let ExprNode::Send { method, .. } = &*e.node {
+            if method.as_str() == "accepts_nested_attributes_for" {
                 *found = true;
                 return;
             }

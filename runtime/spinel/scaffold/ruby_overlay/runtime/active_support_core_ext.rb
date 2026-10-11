@@ -228,6 +228,18 @@ class Array
     end
   end
 
+  # AS core_ext/object/json.rb: `map { |v| options ? v.as_json(options.dup) : v.as_json }`.
+  # The element table (core values, a record's own `as_json`) is the
+  # JSON port's `Encoding.as_json`; without the port the elements answer
+  # for themselves.
+  def as_json(options = nil)
+    if defined?(::ActiveSupport::JSON::Encoding) && ::ActiveSupport::JSON::Encoding.respond_to?(:as_json)
+      ::ActiveSupport::JSON::Encoding.as_json(self, options)
+    else
+      map { |v| options ? v.as_json(options.dup) : v.as_json }
+    end
+  end
+
   # AS `to_sentence` with its three connector options, :en defaults:
   # "a", "a and b", "a, b, and c".
   def to_sentence(words_connector: ", ", two_words_connector: " and ", last_word_connector: ", and ")

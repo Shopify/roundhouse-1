@@ -62,7 +62,13 @@ else
   require File.join(root, "runtime/ruby/active_support_ext")
   require File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime/active_support_duration")
   require File.join(root, "runtime/spinel/active_support_json")
-  def ask_as_json(value, *options) = ActiveSupport::JSON::Encoding.as_json(value, *options)
+  require File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime/active_support_core_ext")
+  # An Array answers its own `as_json` (the overlay's `Array#as_json`); the
+  # rest are asked of the table the analyzer's residue calls.
+  def ask_as_json(value, *options)
+    return value.as_json(*options) if value.instance_of?(Array)
+    ActiveSupport::JSON::Encoding.as_json(value, *options)
+  end
 end
 
 def shown(value)

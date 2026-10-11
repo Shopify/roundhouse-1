@@ -600,7 +600,12 @@ module ActiveRecord
 
     # runtime/active_record/connection.rb's `save`, with the validation
     # chain around `valid?` in the validation context `valid?` will use.
-    def save(context: nil)
+    #
+    # `validate: false` (validations.rb `perform_validations`) skips the
+    # validation chain, and so its callbacks, and saves.
+    def save(context: nil, validate: true)
+      return save_after_validation if validate == false
+
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
       # Validations#valid? clears the errors before the chain runs.
@@ -617,9 +622,9 @@ module ActiveRecord
 
     # Persistence#save!: RecordInvalid for an invalid record,
     # RecordNotSaved when the save chain did not write.
-    def save!(context: nil)
+    def save!(context: nil, validate: true)
       @_create_or_update_failed = false
-      return self if save(context: context)
+      return self if save(context: context, validate: validate)
       raise RecordNotSaved.new("Failed to save the record", self) if @_create_or_update_failed
       raise RecordInvalid, self
     end
