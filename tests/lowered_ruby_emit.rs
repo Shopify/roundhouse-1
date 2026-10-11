@@ -2662,3 +2662,32 @@ fn has_many_cache_is_made_on_first_read_and_the_attrs_default_is_shared() {
     let in_getter = getter_body.split("\n  end").next().unwrap().matches("@comments_cache").count();
     assert_eq!(raw_reads - in_getter, 2, "init + preload writer only:\n{src}");
 }
+
+#[test]
+fn a_class_in_a_helper_file_is_not_a_helper_module() {
+    // `all_helpers_from_path` mixes in modules only; a `class XHelper`
+    // under app/helpers is a plain object. It must stay an instantiable
+    // class (instance methods, `initialize`), not be flattened into module
+    // functions (`def self.initialize`) by registry membership.
+    let app = ingest_tree(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
+        (
+            "app/helpers/money_bag_helper.rb",
+            "class MoneyBagHelper\n  attr_reader :currency\n\n  def initialize(currency:)\n    @currency = currency\n  end\n\n  def label\n    currency.to_s\n  end\nend\n",
+        ),
+    ]);
+    assert!(
+        app.helper_method_index.is_empty(),
+        "a helper-named class must add no registry entries: {:?}",
+        app.helper_method_index,
+    );
+    let files = ruby::emit_library(&app);
+    let src = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("money_bag_helper.rb"))
+        .map(|f| f.content.clone())
+        .expect("emitted money_bag_helper.rb");
+    assert!(src.contains("def initialize(currency:)"), "{src}");
+    assert!(!src.contains("def self.initialize"), "{src}");
+    assert!(!src.contains("def self.label"), "{src}");
+}

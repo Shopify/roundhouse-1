@@ -1197,7 +1197,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             .then(|| super::helper_surface::SingletonOrigins::of(&source));
                         let mut included_origins =
                             super::helper_surface::RegisteredOrigins::default();
-                        for lc in classes.iter().filter(|_| is_helper_module) {
+                        // Only a MODULE is mixed in (`include` of a Class is a
+                        // TypeError); a `class FooHelper` is app code that
+                        // lives under app/helpers, and indexing it flattens
+                        // the class into module functions.
+                        for lc in classes.iter().filter(|lc| is_helper_module && lc.is_module) {
                             // A nested `module ClassMethods` is the
                             // helper's class side, extended onto
                             // includers; none of it is view-visible.
