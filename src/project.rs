@@ -8780,6 +8780,29 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         })
     };
     let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
+    // Each level of `chain` is a namespace child; the last is `anchor`'s.
+    fn register_chain(
+        namespaces: &mut BTreeMap<String, BTreeMap<String, Child>>,
+        chain: &[(String, bool)],
+        anchor: &str,
+        path_named: bool,
+    ) {
+        let mut parent = String::from("Object");
+        let last = chain.len() - 1;
+        for (i, (segment, is_module)) in chain.iter().enumerate() {
+            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
+            if !child.seen {
+                child.all_module = true;
+                child.seen = true;
+            }
+            child.all_module &= *is_module;
+            if i == last {
+                child.file = Some(anchor.to_string());
+                child.path_named = path_named;
+            }
+            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
+        }
+    }
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, content) in &models {
@@ -8825,21 +8848,23 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             continue;
         }
         claimed.insert(full, anchor.clone());
-        let mut parent = String::from("Object");
-        let last = chain.len() - 1;
-        for (i, (segment, is_module)) in chain.iter().enumerate() {
-            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
-            if !child.seen {
-                child.all_module = true;
-                child.seen = true;
-            }
-            child.all_module &= *is_module;
-            if i == last {
-                child.file = Some(anchor.clone());
-                child.path_named = path_named(anchor);
-            }
-            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
+        register_chain(&mut namespaces, &chain, anchor, path_named(anchor));
+    }
+    // A controller is Zeitwerk's too (`app/controllers` is an autoload
+    // path): a model or test names it before the route that dispatches
+    // to it has required its file. Its file is the constant's autoload
+    // and loads on the first reference, as Zeitwerk loads it; it is not
+    // loaded at boot, so ALL_FILES and the loaders keep to the models.
+    for (path, content) in files.iter() {
+        let Some(stem) = path.strip_prefix("app/controllers/").and_then(|p| p.strip_suffix(".rb")) else { continue };
+        let Some(chain) = autoload_primary(&format!("models/{stem}"), content) else { continue };
+        let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        if claimed.contains_key(&full) {
+            continue;
         }
+        let anchor = format!("controllers/{stem}");
+        claimed.insert(full, anchor.clone());
+        register_chain(&mut namespaces, &chain, &anchor, true);
     }
     // A gem's autoloaded file that declares nothing of its own, only
     // requires its children: hedwig 1.68.0's status/track.rb (three
