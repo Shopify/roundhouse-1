@@ -42,3 +42,23 @@ fn class_body_constants_from_anonymous_modules_and_classes_resolve() {
     let src = std::fs::read_to_string(run.emitted.join("app/models/anon_probe/parser.rb")).expect("emitted");
     assert!(!src.contains("constant not supported"), "unresolved constant:\n{src}");
 }
+
+/// A module of constants an initializer defines, read through its full
+/// path from the body of an `app/` module (Rails loads initializers
+/// before the app's code): the emitted program defines it where the
+/// initializer stands, so the read is a real reference.
+#[test]
+fn an_initializer_defined_module_is_read_from_a_module_body() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "config/initializers/zz_pods.rb",
+            "module PodsProbe\n  module Settings\n    module Enum\n      LEADER = \"0\"\n      OTHER = \"1\"\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/models/pods_config.rb",
+            "module PodsConfig\n  TARGETS = [\n    PodsProbe::Settings::Enum::LEADER,\n    PodsProbe::Settings::Enum::OTHER,\n  ].freeze\nend\n",
+        )
+        .run_ruby("p PodsConfig::TARGETS\n");
+    run.assert_passes();
+    assert_eq!(run.stdout.trim_end(), r#"["0", "1"]"#);
+}

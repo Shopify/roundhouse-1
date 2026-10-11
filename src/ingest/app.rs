@@ -364,8 +364,19 @@ fn keep_initializer_defined(
         // level or nested under a namespace.
         let initializer_local = own_namespace
             && super::initializers::referenced_by_initializers(sources, initializers, &name, &file, &ranges);
+        // A nested module the app's own code reads through its full path
+        // (`ElasticSearch::Shopify::Enum::LEADER_POD` in an `app/` file):
+        // the initializer that defines it ran before any of that code,
+        // so the read finds it there.
+        let app_named = own_namespace
+            && lc.is_module
+            && sources.iter().any(|f| {
+                let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
+                let in_app = ["app/", "lib/"].iter().any(|dir| rel.starts_with(dir) || rel.contains(&format!("/{dir}")));
+                in_app && rel.ends_with(".rb") && super::initializers::names_constant(&f.text, &name, &[])
+            });
         if name.contains("::") {
-            if !initializer_local {
+            if !initializer_local && !app_named {
                 continue;
             }
         } else if !referenced(&name) && !own_mixin && !initializer_local {
