@@ -159,10 +159,13 @@ class String
   # plural form. Every corpus call site passes a count; the inflection
   # applies to the string's tail, matching AS ("#{n} story".pluralize(n)
   # → "2 stories"). A trailing "s" is treated as already-plural
-  # (idempotent, like AS's /s$/ → "s" rule).
+  # (idempotent, like AS's /s$/ → "s" rule), except AS's earlier
+  # /(alias|status)$/ → "\1es" rule ("status" → "statuses").
   def pluralize(count = nil)
     return self if count == 1
-    if match?(/([^aeiouy]|qu)y\z/i)
+    if match?(/(alias|status)\z/i)
+      "#{self}es"
+    elsif match?(/([^aeiouy]|qu)y\z/i)
       sub(/y\z/i, "ies")
     elsif end_with?("s")
       self
@@ -174,7 +177,9 @@ class String
   end
 
   def singularize
-    if match?(/([^aeiouy]|qu)ies\z/i)
+    if match?(/(alias|status)es\z/i)
+      sub(/es\z/i, "")
+    elsif match?(/([^aeiouy]|qu)ies\z/i)
       sub(/ies\z/i, "y")
     elsif match?(/(s|x|z|ch|sh)es\z/i)
       sub(/es\z/i, "")
