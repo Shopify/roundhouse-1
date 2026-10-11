@@ -141,12 +141,16 @@ struct Collection {
     inverse: Option<Symbol>,
 }
 
-pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
+pub(crate) fn apply(
+    lcs: &mut [LibraryClass],
+    app: &App,
+    subclass_views: &crate::det::HashMap<crate::ident::ClassId, crate::dialect::Model>,
+) {
     if !super::expr::native_keywords() {
         return;
     }
     for lc in lcs.iter_mut() {
-        accept_held_required_targets(lc, app);
+        accept_held_required_targets(lc, app, subclass_views);
     }
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
@@ -693,8 +697,14 @@ end
 /// before it has a key. The check is the `validate` statement carrying
 /// the `belongs_to`'s span; it becomes
 /// `if @order_loaded != true || @order_cache.nil?; <check>; end`.
-fn accept_held_required_targets(lc: &mut LibraryClass, app: &App) {
-    let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { return };
+fn accept_held_required_targets(
+    lc: &mut LibraryClass,
+    app: &App,
+    subclass_views: &crate::det::HashMap<crate::ident::ClassId, crate::dialect::Model>,
+) {
+    let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+        return;
+    };
     let required: Vec<(Span, Symbol)> = model
         .spanned_associations()
         .filter_map(|(span, a)| match a {

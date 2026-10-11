@@ -50,6 +50,19 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     if !subclass_views.is_empty() {
         apply_belongs_to_memoization(&mut lcs, app);
         apply_association_reader(&mut lcs, app);
+        // The model-keyed association passes, over the subclasses'
+        // views now that their readers and checks exist.
+        let mut views: Vec<LibraryClass> = lcs.iter().filter(|lc| subclass_views.contains_key(&lc.name)).cloned().collect();
+        apply_belongs_to_nil_writes(&mut views, app, &subclass_views);
+        apply_preload_lowering(&mut views, app, &subclass_views);
+        apply_collection_memoization(&mut views, app, &subclass_views);
+        apply_reload_resets_associations(&mut views, app, &subclass_views);
+        super::collection_autosave::apply(&mut views, app, &subclass_views);
+        for view in views {
+            if let Some(slot) = lcs.iter_mut().find(|lc| lc.name == view.name) {
+                *slot = view;
+            }
+        }
     }
     // An STI subclass's relations carry its type condition at runtime.
     crate::lower::sti_scope::push_type_condition_methods(&mut lcs, app);
@@ -2958,11 +2971,13 @@ fn ensure_cache_guard(lc: &mut LibraryClass, name: &Symbol) {
 /// for the reloaded keys. The associations are the model's and its
 /// model ancestors' (an abstract base's or an STI parent's), whose
 /// readers it inherits.
-pub(crate) fn apply_reload_resets_associations(lcs: &mut [LibraryClass], app: &App) {
+pub(crate) fn apply_reload_resets_associations(lcs: &mut [LibraryClass], app: &App, subclass_views: &crate::det::HashMap<ClassId, crate::dialect::Model>) {
     // The belongs_to stale record `invalidate_on_fk_write` keeps.
     let stale_state = super::expr::native_keywords() && app_calls_association(app);
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
         let mut names: Vec<Symbol> = Vec::new();
         let mut stale: Vec<Symbol> = Vec::new();
         let mut seen: Vec<ClassId> = Vec::new();
@@ -2980,7 +2995,27 @@ pub(crate) fn apply_reload_resets_associations(lcs: &mut [LibraryClass], app: &A
                     }
                 }
             }
-            cursor = m.parent.as_ref().and_then(|p| app.models.iter().find(|pm| &pm.name == p));
+            cursor = m
+                .parent
+                .as_ref()
+                .and_then(|p| app.models.iter().find(|pm| &pm.name == p).or_else(|| subclass_views.get(p)));
+        }
+        // A subclass answers the reload through its parent's and then
+        // drops what it declares itself.
+        if subclass_views.contains_key(&lc.name)
+            && !names.is_empty()
+            && !lc.methods.iter().any(|m| m.name.as_str() == "_adapter_reload" && m.receiver == MethodReceiver::Instance)
+        {
+            let mut ms = crate::runtime_src::parse_methods("def _adapter_reload
+  super
+  nil
+end
+")
+                .expect("generated reload parses");
+            if let Some(mut m) = ms.pop() {
+                m.enclosing_class = Some(lc.name.0.clone());
+                lc.methods.push(m);
+            }
         }
         let Some(reload) = lc
             .methods
@@ -3094,14 +3129,16 @@ fn load_on_assign(lc: &mut LibraryClass, name: &Symbol, stale_state: bool) {
 /// loaded until `reload` / `reset`, so a record's in-memory changes
 /// (what `validates_associated` and autosave read) survive the next
 /// read.
-pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App) {
+pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App, subclass_views: &crate::det::HashMap<ClassId, crate::dialect::Model>) {
     use crate::dialect::Association;
 
     if !super::expr::native_keywords() {
         return;
     }
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
         // (name, :through or HABTM, singular, the unscoped has_many's
         // relation source)
         let names: Vec<(Symbol, bool, bool, Option<String>)> = model
@@ -8515,11 +8552,11 @@ fn locate_broadcast_records(expr: &mut Expr, declarations: &[Span]) {
 /// trees keep it. Every `@fk == <sentinel>` guard of a key that
 /// `apply_hydration_nil_lowering` does not already widen (a NOT NULL
 /// column, which a nil write now reaches too) is widened the same way.
-pub(crate) fn apply_belongs_to_nil_writes(lcs: &mut [LibraryClass], app: &App) {
+pub(crate) fn apply_belongs_to_nil_writes(lcs: &mut [LibraryClass], app: &App, subclass_views: &crate::det::HashMap<ClassId, crate::dialect::Model>) {
     if !super::expr::native_keywords() {
         return;
     }
-    for model in &app.models {
+    for model in app.models.iter().chain(subclass_views.values()) {
         let mut writers: BTreeSet<Symbol> = BTreeSet::new();
         let mut keys: BTreeSet<Symbol> = BTreeSet::new();
         for assoc in model.associations() {
@@ -18495,7 +18532,7 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // benchmark's build-then-render flows are unaffected).
 /// Synthesize runtime batch loaders when includes hints occur, leaving
 /// associations whose restrictions cannot be preserved to their lazy readers.
-pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App) {
+pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App, subclass_views: &crate::det::HashMap<ClassId, crate::dialect::Model>) {
     use crate::dialect::Association;
 
     // A dynamic query can reach Relation without any named scope (for
@@ -18506,7 +18543,10 @@ pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App) {
     }
 
     for lc in lcs.iter_mut() {
-        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let view = subclass_views.contains_key(&lc.name);
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
+            continue;
+        };
 
         // belongs_to readers gain the cache guard the has_many readers
         // already carry: `return @user_cache if @user_loaded`.
@@ -18527,7 +18567,7 @@ pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App) {
             );
         }
 
-        let src = preload_methods_source(model, app);
+        let src = preload_methods_source(model, app, view);
         let methods = crate::runtime_src::parse_methods(&src).unwrap_or_else(|e| {
             panic!("apply_preload_lowering: generated source failed to parse: {e}\n{src}")
         });
@@ -18833,7 +18873,7 @@ fn order_literal(scope_body: &Expr) -> Option<&str> {
 /// through `runtime_src::parse_methods`). Templates stay boring on
 /// purpose: statement-level assigns and explicit nil-guards round-trip
 /// through every walker; no `||=`-on-index, no ternaries.
-fn preload_methods_source(model: &crate::dialect::Model, app: &App) -> String {
+fn preload_methods_source(model: &crate::dialect::Model, app: &App, subclass_view: bool) -> String {
     let targets = preload_targets(model, app);
     let mut src = String::new();
 
@@ -19089,6 +19129,10 @@ end
     // through silently (lazy readers stay correct — mirrors what Rails
     // does for anything `includes` didn't name).
     src.push_str("\ndef self._preload_dispatch(records, name, nested)\n");
+    if targets.is_empty() && subclass_view {
+        src.push_str("  super\nend\n");
+        return src;
+    }
     if targets.is_empty() {
         src.push_str("  nil\nend\n");
     } else {
@@ -19118,7 +19162,12 @@ end
                 }
             }
         }
-        src.push_str("  end\n  nil\nend\n");
+        // A subclass's own arms, then the inherited ones.
+        src.push_str(if subclass_view { "  else\n    super\n  end\n  nil\nend\n" } else { "  end\n  nil\nend\n" });
+    }
+    // The spec walker is inherited.
+    if subclass_view {
+        return src;
     }
 
     // Spec walker — the entry point `Relation#to_a` calls. Specs are
