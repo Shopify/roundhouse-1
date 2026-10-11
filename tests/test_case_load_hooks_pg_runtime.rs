@@ -187,6 +187,12 @@ class ControllerHookTest < ActionController::TestCase
     assert_equal 3, widget_patch_answer
     assert_equal CONTROLLER_LINES, HookLog.lines
   end
+
+  test "session reads the request session" do
+    session[:user_id] = 7
+    assert_equal 7, session["user_id"]
+    assert_same request.session, session
+  end
 end
 "#;
 
@@ -374,9 +380,10 @@ exit(ok ? 0 : 1)
 
 /// What native Rails answers (Shopify/rails 5813559f, checked on the task
 /// PostgreSQL), so two identical wrong answers still fail.
-const EXPECTED: [(&str, &str, u64); 8] = [
+const EXPECTED: [(&str, &str, u64); 9] = [
     ("BehaviorHookTest#test_including_the_view_case_behavior_runs_its_hooks_on_the_includer", "pass", 1),
     ("ControllerHookTest#test_controller_hook_helpers_reach_the_test_in_registration_order", "pass", 4),
+    ("ControllerHookTest#test_session_reads_the_request_session", "pass", 2),
     ("HookOrderTest#test_a_module_the_hook_block_defines_is_a_top_level_module", "pass", 3),
     ("HookOrderTest#test_hook_helper_reaches_the_test", "pass", 1),
     ("HookOrderTest#test_only_the_active_support_hooks_ran", "pass", 3),

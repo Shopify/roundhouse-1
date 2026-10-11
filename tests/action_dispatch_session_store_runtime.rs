@@ -51,6 +51,7 @@ fn session_stores_answer_like_rails() {
 /// Core's MultiSessionStore and SessionUnavailableMiddleware, in a probe app.
 const MODEL: &str = r##"class ProbeSessionStore < ActionDispatch::Session::AbstractStore
   class CookieDomainMismatch < StandardError; end
+  DEFAULT_OPTIONS = ActionDispatch::Session::AbstractStore::DEFAULT_OPTIONS.merge(expire_after: 3600)
 
   def instance(env)
     store = self.class.new(nil, key: "_probe_session_id", secure: true)
@@ -161,6 +162,7 @@ fn the_postgresql_ruby_tree_carries_the_session_stores() {
     }
     let store = source("app/models/probe_session_store.rb");
     assert!(store.contains("ProbeSessionStore < ActionDispatch::Session::AbstractStore") && !store.contains("not supported"), "{store}");
+    assert!(store.contains("ActionDispatch::Session::AbstractStore::DEFAULT_OPTIONS.merge"), "{store}");
     let middleware = source("app/models/probe_session_middleware.rb");
     assert!(middleware.contains("ProbeSessionMiddleware < ActionDispatch::ShowExceptions") && !middleware.contains("not supported"), "{middleware}");
     std::fs::remove_dir_all(dir).unwrap();

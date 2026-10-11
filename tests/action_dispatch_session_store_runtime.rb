@@ -109,6 +109,8 @@ end
 app = ->(env) { [200, { "Content-Type" => "text/plain" }, ["ok"]] }
 options = {}
 store = ProbeStore.new(app, options)
+show("abstract store DEFAULT_OPTIONS", ActionDispatch::Session::AbstractStore::DEFAULT_OPTIONS)
+show("abstract store DEFAULT_OPTIONS is rack's", ActionDispatch::Session::AbstractStore::DEFAULT_OPTIONS == Rack::Session::Abstract::Persisted::DEFAULT_OPTIONS)
 show("store key", store.key)
 show("store default_options", store.default_options)
 show("store same_site", store.instance_variable_get(:@same_site))
@@ -132,10 +134,40 @@ show("extract_session_id", outcome { store.send(:extract_session_id, request) })
 show("extract_session_id without cookie", outcome { store.send(:extract_session_id, Rack::Request.new(Rack::MockRequest.env_for("/"))) })
 show("extract_session_id from params when not cookie only", outcome { ProbeStore.new(app, cookie_only: false).send(:extract_session_id, Rack::Request.new(Rack::MockRequest.env_for("/?_session_id=p1"))) })
 show("session_exists?", outcome { store.send(:session_exists?, request) })
-# SessionObject's `prepare_session`, `loaded_session?` and
-# `commit_session` read ActionDispatch::Http::Session, which the tree
-# does not carry (runtime/spinel/action_dispatch_session_store.rb); they
-# are request-time, and not observed here.
+# ActionDispatch::Http::Session over a store: `create` merges the request's
+# previous session, loads lazily through the store and writes through to
+# the request's env.
+class MemoryStore < ActionDispatch::Session::AbstractStore
+  def find_session(_req, sid)
+    sid ||= generate_sid
+    [sid, { "stored" => "yes" }]
+  end
+
+  def session_exists?(_req) = true
+end
+memory = MemoryStore.new(app, key: "_probe", secure: true)
+session_request = Rack::Request.new(Rack::MockRequest.env_for("/"))
+previous = ActionDispatch::Http::Session.create(memory, session_request, { id: "previous-id", secure: true })
+previous[:before] = 1
+previous[:sym] = 2
+created = ActionDispatch::Http::Session.create(memory, session_request, { id: "fixed-id", secure: true })
+show("Http::Session.create class", created.class.name)
+show("Http::Session.create loaded by the merge", [created.loaded?, created.exists?, created.id_was])
+show("Http::Session.find", ActionDispatch::Http::Session.find(session_request).equal?(created))
+show("Http::Session.create options", session_request.get_header(Rack::RACK_SESSION_OPTIONS).to_hash)
+show("Http::Session []", [created["stored"], created[:before], created["sym"]])
+show("Http::Session after write", [created.loaded?, created.to_h, created.keys.sort])
+created[:added] = [1]
+show("Http::Session write", [created["added"], created.key?(:added), created.fetch(:nope, :dflt), created.dig(:added, 0)])
+show("Http::Session delete", [created.delete(:added), created.to_hash.key?("added")])
+show("Http::Session id", created.id)
+show("Http::Session enabled", created.enabled?)
+disabled = ActionDispatch::Http::Session.disabled(Rack::Request.new(Rack::MockRequest.env_for("/")))
+show("Http::Session.disabled write", outcome { disabled[:x] = 1 })
+show("Http::Session.disabled read", [disabled.enabled?, disabled.exists?, disabled[:x]])
+show("Http::Session.delete", ActionDispatch::Http::Session.delete(session_request).equal?(created))
+# SessionObject's `commit_session` reaches request forgery protection's
+# `commit_csrf_token`, which this tree does not carry; not observed.
 show("initialize_sid", outcome { store.send(:initialize_sid) })
 
 show("stale check passes", outcome { store.stale_session_check! { :value } })

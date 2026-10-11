@@ -158,3 +158,30 @@ fn a_cattr_seed_runs_in_source_order_as_native() {
     assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
+
+/// A class-body call after the declaration may send the writer to the
+/// class (`registry.register(owner: self, accessor: :store)` runs
+/// `owner.send("store=", client)` at load): ActiveSupport defines the
+/// accessors where the declaration stands, so the writer exists by then.
+const BINDS_AT_LOAD: &str = r##"class Registry
+  def self.register(owner:, accessor:, value:)
+    owner.send("#{accessor}=", value)
+  end
+end
+
+class Bound
+  cattr_accessor :store
+
+  Registry.register(owner: self, accessor: :store, value: :client)
+end
+"##;
+
+#[test]
+fn a_class_body_call_after_cattr_accessor_finds_the_writer_as_native() {
+    let script = "p [Bound.store, Bound.new.store]\n";
+    let expected = native(&format!("{PRELUDE}{BINDS_AT_LOAD}{script}"));
+    assert_eq!(expected, "[:client, :client]\n", "native control");
+    let run = emit_and_run::empty_app().write("lib/bound.rb", BINDS_AT_LOAD).run_ruby(script);
+    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+}

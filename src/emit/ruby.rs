@@ -2716,6 +2716,13 @@ module ActionController
 
       attr_reader :response, :request
 
+      # ActionDispatch::TestProcess#session (actionpack action_dispatch/
+      # testing/test_process.rb), which Behavior includes in Rails: the
+      # request's session, as the helpers and tests read it.
+      def session
+        @request.session
+      end
+
       def self.included(base)
         base.extend(ClassMethods)
         base.setup :setup_controller_request_and_response
