@@ -277,3 +277,22 @@ pub(crate) fn generated(method: &MethodDef) -> bool {
             _ => false,
         }
 }
+
+/// The attribute a class-body statement is the seed of (`@@name = value`,
+/// `@@name = nil unless defined?(@@name)`), as [`Declaration::seeds`] writes it.
+pub(crate) fn seeded_storage(expr: &Expr) -> Option<&str> {
+    fn class_var(e: &Expr) -> Option<&str> {
+        match &*e.node {
+            ExprNode::Var { name, .. } => name.as_str().strip_prefix("@@"),
+            _ => None,
+        }
+    }
+    match &*expr.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } => name.as_str().strip_prefix("@@"),
+        ExprNode::If { cond, .. } => match &*cond.node {
+            ExprNode::Defined { operand } => class_var(operand),
+            _ => None,
+        },
+        _ => None,
+    }
+}

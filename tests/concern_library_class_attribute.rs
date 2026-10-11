@@ -238,24 +238,25 @@ fn an_unmodeled_included_statement_is_an_error_not_a_drop() {
             "class Tally\n  include Counted\nend\n",
         ),
     ]);
-    assert_eq!(gaps.len(), 2, "{gaps:#?}");
+    // `cattr_accessor` is modeled on a plain includer (its accessors and
+    // seed are carried); only `validates` is still refused.
+    assert_eq!(gaps.len(), 1, "{gaps:#?}");
     assert!(
-        gaps[0].contains("`cattr_accessor` in `included do` of Counted")
+        gaps[0].contains("`validates` in `included do` of Counted")
             && gaps[0].contains("Counter, Tally would run without it"),
         "{}",
         gaps[0]
     );
-    assert!(
-        gaps[1].contains("`validates` in `included do` of Counted"),
-        "{}",
-        gaps[1]
-    );
     assert_eq!(
         methods(&app, "Counter"),
         [
+            "count",
+            "count=",
             "limit",
             "limit=",
             "limit?",
+            "self.count",
+            "self.count=",
             "self.limit",
             "self.limit=",
             "self.limit?"
