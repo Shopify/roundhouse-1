@@ -337,16 +337,13 @@ fn literal_loops_unroll_and_other_declarations_are_named_gaps() {
     assert_eq!(native["UnrollTest#test_fails_for_2"], "fail");
     assert_eq!(native["UnrollTest#test_no_implementation"], "fail");
 
-    // Strict ingest names the first statement it does not model.
-    let err = roundhouse::ingest::ingest_test_files(PARTIAL.as_bytes(), "partial_test.rb").unwrap_err().to_string();
-    assert!(
-        err.contains("tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run (`PartialTest` line 8, first test at line 9: `PartialTest::COMPUTED`: `COMPUTED = %w[x y].map(&:upcase)`"),
-        "{err}"
-    );
+    // A declaration the compiler cannot list runs as the class loads: strict
+    // ingest accepts it, and no statement is named.
+    let tms = roundhouse::ingest::ingest_test_files(PARTIAL.as_bytes(), "partial_test.rb").expect("strict partial");
+    assert!(tms[0].tests_at_load);
     // A literal-only class ingests strictly.
     roundhouse::ingest::ingest_test_files(UNROLL.as_bytes(), "unroll_test.rb").expect("strict unroll");
 
-    // Survey mode records each such statement and emits the rest.
     roundhouse::ingest::survey::activate();
     let (emitted, errors) = emit_and_run::empty_app()
         .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
@@ -357,18 +354,10 @@ fn literal_loops_unroll_and_other_declarations_are_named_gaps() {
         .emit(BuildTarget::Ruby);
     let gaps: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "{errors:#?}");
-    let named = [
-        "tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run (`PartialTest` line 8, first test at line 9: `PartialTest::COMPUTED`: `COMPUTED = %w[x y].map(&:upcase)`",
-        "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`EdgeTest` line 49, first test at line 50",
-        "tests declared by a conditional are not modeled; they will not run (`PartialTest` line 14",
-        "tests declared by a loop whose test names are not known before it runs are not modeled; they will not run (`PartialTest` line 18, first test at line 19",
-    ];
-    for gap in named {
-        assert_eq!(gaps.iter().filter(|g| g.contains(gap)).count(), 1, "{gap}\n{gaps:#?}");
-    }
-    assert_eq!(gaps.iter().filter(|g| g.contains("tests declared by")).count(), named.len(), "{gaps:#?}");
+    assert_eq!(gaps.iter().filter(|g| g.contains("tests declared by")).count(), 0, "{gaps:#?}");
 
-    // The index lists exactly the native tests the gaps do not name.
+    // The index lists the native tests the compiler can name; the others
+    // are declared as their class loads.
     let want: BTreeMap<String, String> =
         native.iter().filter(|(id, _)| !NOT_MODELED.contains(&id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
     let classes = index(&emitted);
@@ -396,7 +385,7 @@ fn literal_loops_unroll_and_other_declarations_are_named_gaps() {
             assert!(ran.insert(id.clone(), status).is_none(), "{id} ran twice\n{log}");
         }
     }
-    assert_eq!(ran, want, "emitted results vs native");
+    assert_eq!(ran, native, "emitted results vs native");
 }
 
 #[test]

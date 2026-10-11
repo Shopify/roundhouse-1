@@ -1326,6 +1326,15 @@ module RoundhouseTestRunner
     ActiveRecord::TestFixtures.fixture_sets_not_loaded.keys.sort
   end
 
+  # The tests a class lists (`listed`: the ones compiled into the emitted
+  # class) and those its body declared as it loaded (a loop over a computed
+  # collection, a call of a class method that declares tests): the
+  # `test_` methods the loaded class has, as Minitest lists them
+  # (`methods_matching(/^test_/)`), after the listed ones.
+  def self.loaded_tests(klass, listed)
+    listed + (klass.public_instance_methods(true).map(&:to_s).grep(/\Atest_/).sort - listed)
+  end
+
   def self.run(klass, methods, &reset)
     results = methods.map do |name|
       result = run_one(klass, name, &reset)

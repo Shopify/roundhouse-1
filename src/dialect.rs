@@ -2733,6 +2733,15 @@ pub struct TestModule {
     /// preamble (`emit::ruby`), one that cannot load named where it runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_requires: Vec<TestFileRequire>,
+    /// The class body declares tests ingest cannot list before it runs:
+    /// a loop over a computed collection, a call of a class method that
+    /// declares tests, a conditional `test`, a module whose `included`
+    /// hook declares them. Ruby runs those statements as the class
+    /// loads (`body_statements` carries them), so the emitted driver
+    /// lists the test methods the loaded class has
+    /// (`RoundhouseTestRunner.loaded_tests`) beside the ones named here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tests_at_load: bool,
 }
 
 /// A test file's top-level load (`TestModule::file_requires`).

@@ -595,6 +595,10 @@ pub(super) fn ingest_test_class(
     let mut after_definitions = false;
     let mut after_setup_blocks = false;
     let mut after_teardown_blocks = false;
+    // A statement declares tests ingest cannot list: they are the loaded
+    // class's (`TestModule::tests_at_load`).
+    let mut tests_at_load = false;
+    let mut covered_singletons: Vec<Node<'_>> = Vec::new();
     if let Some(class_body) = class.body() {
         let stmts = flatten_statements(class_body);
         let consts = TagConstants::of(&stmts);
@@ -700,18 +704,10 @@ pub(super) fn ingest_test_class(
             // setup` and `def test_*` already short-circuited above.
             if let Some(def) = stmt.as_def_node() {
                 // A `def self.m` test macro used other than by a class-body
-                // call statement (`send(:m, …)`): those tests are named.
-                if let Some(other) = macros.def_other_use(&def) {
-                    super::survey::continue_or_fail(IngestError::Unsupported {
-                        file: file.into(),
-                        message: format!(
-                            "tests declared by the class method `{}` where it is used other than called from the class body \
-                             are not modeled; they will not run (`{}`{}: {other})",
-                            constant_id_str(&def.name()),
-                            name.0,
-                            line_suffix(file, &stmt.location())
-                        ),
-                    })?;
+                // call statement (`send(:m, …)`) declares tests as that
+                // statement, carried, runs.
+                if macros.def_other_use(&def).is_some() {
+                    tests_at_load = true;
                 }
                 let m = ingest_library_method(&def, &name, file)?;
                 helpers.push(m);
@@ -772,6 +768,10 @@ pub(super) fn ingest_test_class(
                 {
                     // Tests its modules' `included` hooks declare.
                     macros.mixin_gaps(&stmt)?;
+                    // A hook of a module it mixes in declares tests as it runs.
+                    if macros.take_gap().is_some() {
+                        tests_at_load = true;
+                    }
                     if let Some(args) = call.arguments() {
                         for arg in args.arguments().iter() {
                             if let Some(path) = constant_path_of(&arg) {
@@ -802,11 +802,21 @@ pub(super) fn ingest_test_class(
                 // `CASES = [...].each do |c| test … end`: the loop's tests,
                 // and the constant its receiver (`each` returns it).
                 if let Some(offset) = hidden_test_declaration(&cw.value()) {
-                    if let (Some(const_name), Some(receiver)) = (const_name, test_unroll::loop_receiver(&cw.value())) {
-                        constants.push((const_name, ingest_expr(&receiver, file)?));
-                    }
-                    for test in test_unroll::declare_hidden(&cw.value(), offset, class, &name, file, &test_tags, &consts)? {
-                        declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                    match test_unroll::declare_hidden(&cw.value(), offset, class, &name, file, &test_tags, &consts)? {
+                        test_unroll::Hidden::Tests(declared) => {
+                            if let (Some(const_name), Some(receiver)) = (const_name, test_unroll::loop_receiver(&cw.value())) {
+                                constants.push((const_name, ingest_expr(&receiver, file)?));
+                            }
+                            for test in declared {
+                                declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                            }
+                        }
+                        // The constant is written, and its tests declared,
+                        // as the class loads.
+                        test_unroll::Hidden::AtLoad(gap) => {
+                            let at = BodyAt { after_definitions, after_setup_blocks, after_teardown_blocks };
+                            carry_at_load(&stmt, gap, &name, file, &test_tags, at, &mut body_statements, &mut tests_at_load)?;
+                        }
                     }
                     continue;
                 }
@@ -826,9 +836,26 @@ pub(super) fn ingest_test_class(
             // A call of a test macro is expanded (`test_macros`); the
             // `class << self` defining macros the body only calls that way
             // declares nothing itself.
-            if let Some(declared) = macros.expand(&stmt, &test_tags, &consts)? {
+            let expanded = macros.expand(&stmt, &test_tags, &consts)?;
+            let gap = macros.take_gap();
+            // A call not expanded declares its tests as it runs: carried. A
+            // hook of a module the statement mixes in does too (the mixin
+            // replays); a statement that also declares tests itself is left
+            // to `declare_hidden` below, which carries it.
+            if let Some(test_macros::Gap::Mixin) = gap {
+                tests_at_load = true;
+            }
+            if let Some(declared) = expanded {
                 for test in declared {
                     declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                }
+                match gap {
+                    Some(test_macros::Gap::Call(gap)) => {
+                        let at = BodyAt { after_definitions, after_setup_blocks, after_teardown_blocks };
+                        carry_at_load(&stmt, gap, &name, file, &test_tags, at, &mut body_statements, &mut tests_at_load)?;
+                    }
+                    Some(test_macros::Gap::Named(gap)) => super::survey::continue_or_fail(gap)?,
+                    _ => {}
                 }
                 after_definitions = true;
                 continue;
@@ -841,11 +868,22 @@ pub(super) fn ingest_test_class(
                     helpers.push(m);
                 }
                 after_definitions = true;
+                // Its macros are not emitted (every call is expanded), unless
+                // a call declares its tests as the class loads.
+                covered_singletons.push(stmt);
                 continue;
             }
             if let Some(offset) = hidden_test_declaration(&stmt) {
-                for test in test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &consts)? {
-                    declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                match test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &consts)? {
+                    test_unroll::Hidden::Tests(declared) => {
+                        for test in declared {
+                            declare_test(&mut tests, &mut defined_tests, test, false, &name, file, &stmt.location())?;
+                        }
+                    }
+                    test_unroll::Hidden::AtLoad(gap) => {
+                        let at = BodyAt { after_definitions, after_setup_blocks, after_teardown_blocks };
+                        carry_at_load(&stmt, gap, &name, file, &test_tags, at, &mut body_statements, &mut tests_at_load)?;
+                    }
                 }
                 after_definitions = true;
                 continue;
@@ -870,6 +908,24 @@ pub(super) fn ingest_test_class(
                 });
             }
         }
+    }
+
+    // A macro the class body expands is not defined in the emitted class,
+    // but a call that declares its tests as the class loads runs it: the
+    // `class << self` it is in is carried too, above the calls.
+    if tests_at_load {
+        for stmt in &covered_singletons {
+            if let Some(expr) = carried_body_statement(stmt, &name, file)? {
+                body_statements.push(crate::dialect::TestBodyStatement {
+                    expr,
+                    line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+                    after_definitions: false,
+                    after_setup_blocks: false,
+                    after_teardown_blocks: false,
+                });
+            }
+        }
+        body_statements.sort_by_key(|carried| carried.line);
     }
 
     // TestTags' persistent hook (`_process_persistent_tags`, run before
@@ -979,6 +1035,7 @@ pub(super) fn ingest_test_class(
         defined_tests,
         body_statements,
         file_requires: Vec::new(),
+        tests_at_load,
     })
 }
 
@@ -988,6 +1045,51 @@ fn singleton_methods<'pr>(stmt: &Node<'pr>) -> Option<Vec<ruby_prism::DefNode<'p
     singleton.expression().as_self_node()?;
     let items = singleton.body().map(flatten_statements).unwrap_or_default();
     items.iter().map(|item| item.as_def_node()).collect()
+}
+
+/// Where a carried class-body statement stands among the body's
+/// definitions and callback blocks (`TestBodyStatement`).
+#[derive(Clone, Copy)]
+struct BodyAt {
+    after_definitions: bool,
+    after_setup_blocks: bool,
+    after_teardown_blocks: bool,
+}
+
+/// `stmt` declares tests that cannot be listed before it runs (`gap` is
+/// the refusal that would name them): a loop over a collection computed
+/// as the class loads, a call of a class method that declares tests, a
+/// conditional `test`. Ruby runs the statement as the body loads, and
+/// ActiveSupport's `test` (or a macro's) defines each method then, so
+/// the emitted class carries it as written (`carried_body_statement`)
+/// and the driver lists the methods the loaded class has
+/// (`TestModule::tests_at_load`). A statement under TestTags' `tag` is
+/// named instead: the tags are applied by ingest here, and the carried
+/// statement would declare the tests untagged, under other names.
+fn carry_at_load(
+    stmt: &Node<'_>,
+    gap: IngestError,
+    class: &ClassId,
+    file: &str,
+    tags: &TestTags,
+    at: BodyAt,
+    body_statements: &mut Vec<crate::dialect::TestBodyStatement>,
+    tests_at_load: &mut bool,
+) -> IngestResult<()> {
+    if !tags.tags.is_empty() || tags.persistent {
+        return super::survey::continue_or_fail(gap);
+    }
+    if let Some(expr) = carried_body_statement(stmt, class, file)? {
+        body_statements.push(crate::dialect::TestBodyStatement {
+            expr,
+            line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+            after_definitions: at.after_definitions,
+            after_setup_blocks: at.after_setup_blocks,
+            after_teardown_blocks: at.after_teardown_blocks,
+        });
+        *tests_at_load = true;
+    }
+    Ok(())
 }
 
 /// A test class-body statement no case above models, which Ruby runs in
@@ -1001,7 +1103,7 @@ fn singleton_methods<'pr>(stmt: &Node<'pr>) -> Option<Vec<ruby_prism::DefNode<'p
 /// A bare `private`/`protected`/`public`/`module_function` is not one:
 /// it sets the visibility of the `def`s below it in the source, which
 /// the emitted class defines elsewhere.
-fn carried_body_statement(stmt: &Node<'_>, class: &ClassId, file: &str) -> IngestResult<Option<Expr>> {
+pub(super) fn carried_body_statement(stmt: &Node<'_>, class: &ClassId, file: &str) -> IngestResult<Option<Expr>> {
     if let Some(call) = stmt.as_call_node() {
         if call.receiver().is_none()
             && call.arguments().is_none()
@@ -1580,6 +1682,11 @@ pub(super) fn statement_tests<'pr>(
     let declare = |target: &Node<'pr>| match hidden_test_declaration(target) {
         Some(offset) => super::survey::without_recording(|| {
             test_unroll::declare_hidden(target, offset, class_node, class, file, tags, consts)
+        })
+        .map(|hidden| match hidden {
+            test_unroll::Hidden::Tests(tests) => tests,
+            // Declared as the class loads (`carry_at_load`), not listed.
+            test_unroll::Hidden::AtLoad(_) => Vec::new(),
         }),
         None => Ok(Vec::new()),
     };
@@ -2527,17 +2634,13 @@ end
             }
             other => panic!("{other:?}"),
         }
-        // `test "x", &blk` is that statement's gap: strict ingest fails,
-        // the survey records it and keeps the class's other tests.
+        // `test "x", &blk` declares its test as the class loads: the
+        // statement is carried as written, the class lists the others.
         let src = "class NamesTest < ActiveSupport::TestCase\n  test \"from a proc\", &BODY\n  test \"kept\" do\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
-        assert!(err.contains("tests declared by a `test` whose block is passed with `&` are not modeled"), "{err}");
-        crate::ingest::survey::activate();
-        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("survey");
-        let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
         assert_eq!(tms[0].tests.iter().map(|t| t.method_name.as_str()).collect::<Vec<_>>(), ["test_kept"]);
-        assert_eq!(gaps.len(), 1, "{gaps:#?}");
-        assert!(gaps[0].contains("(`NamesTest` line 2: test \"from a proc\""), "{}", gaps[0]);
+        assert!(tms[0].tests_at_load);
+        assert_eq!(tms[0].body_statements.len(), 1);
     }
 
     // TestGenerator's `generate_test` in the class body is a named gap; in
@@ -2546,8 +2649,9 @@ end
     #[test]
     fn a_generate_test_is_a_named_gap_unless_a_macro_call_expands() {
         let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  generate_test(\"made\") do\n    assert true\n  end\n  test \"kept\" do\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "gen_test.rb").unwrap_err().to_string();
-        assert!(err.contains("tests declared by TestGenerator's `generate_test` are not modeled"), "{err}");
+        let tms = ingest_test_files(src.as_bytes(), "gen_test.rb").expect("ingest");
+        assert!(tms[0].tests_at_load, "generate_test declares its test as the class loads");
+        assert_eq!(tms[0].tests.iter().map(|t| t.method_name.as_str()).collect::<Vec<_>>(), ["test_kept"]);
         let src = "class NamesTest < ActiveSupport::TestCase\n  extend TestGenerator\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
         let names: Vec<String> = method_names(src).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["test_checks_a", "test_kept"]);
@@ -2556,16 +2660,16 @@ end
         // (And each class its own name: a class declared in two sources
         // may be given methods by the other.)
         let src = "class GenPlainTest < ActiveSupport::TestCase\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "gen_plain_test.rb").unwrap_err().to_string();
-        assert!(
-            err.contains("tests declared by a call of the class method `checks` are not modeled; they will not run (`GenPlainTest` line 8: `generate_test` is not TestGenerator's"),
-            "{err}"
-        );
+        // The call is carried: it runs as the class loads, as Ruby does.
+        let tms = ingest_test_files(src.as_bytes(), "gen_plain_test.rb").expect("ingest");
+        assert!(tms[0].tests_at_load);
+        assert_eq!(tms[0].tests.iter().map(|t| t.method_name.as_str()).collect::<Vec<_>>(), ["test_kept"]);
         // A call before the macro is defined runs no macro (native
-        // raises NoMethodError): nothing is expanded, the macro is named.
+        // raises NoMethodError): nothing is expanded, the call is carried
+        // and raises as the class loads, as native does.
         let src = "class GenLateTest < ActiveSupport::TestCase\n  extend TestGenerator\n  checks :a\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "gen_late_test.rb").unwrap_err().to_string();
-        assert!(err.contains("a `class << self` method that declares tests when called") && err.contains("`checks`"), "{err}");
+        let tms = ingest_test_files(src.as_bytes(), "gen_late_test.rb").expect("ingest");
+        assert!(tms[0].tests_at_load && tms[0].tests.is_empty());
     }
 
     // TestTags' persistent rename aliases `test_x` onto the name the
@@ -2614,9 +2718,8 @@ end
         let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
         assert!(err.contains("a test `tag` with 0 arguments is not modeled"), "{err}");
         let src = "class NamesTest < ActiveSupport::TestCase\n  test \"b\", owner_tags do\n  end\nend\n";
-        let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
-        assert!(err.contains("tests declared by a `test` whose tags are not literal are not modeled"), "{err}");
-        assert!(err.contains("tags `owner_tags`: neither a literal Hash nor a constant"), "{err}");
+        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
+        assert!(tms[0].tests_at_load && tms[0].tests.is_empty());
     }
 
     // A subclass whose tests are all inside `tag … do` blocks is a test
@@ -2737,8 +2840,9 @@ end
     fn a_tag_whose_name_text_is_unknown_is_refused() {
         for args in ["slow: SLOW", "**more", "slow: \"#{x}\""] {
             let src = format!("class NamesTest < ActiveSupport::TestCase\n  test \"a\", {args} do\n  end\nend\n");
-            let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
-            assert!(err.contains("is not a literal"), "{args}: {err}");
+            // Carried: `test` runs as the class loads and names the test.
+            let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
+            assert!(tms[0].tests_at_load && tms[0].tests.is_empty(), "{args}");
         }
         let src = "class NamesTest < ActiveSupport::TestCase\n  tag(owner: OWNER) do\n    test \"a\" do\n    end\n  end\nend\n";
         let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();

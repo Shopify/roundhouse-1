@@ -772,6 +772,27 @@ pub(super) struct Macros<'pr> {
     /// Where the class body's statements look constants up (the class
     /// body's own constants included).
     cx: Option<consts::ConstCx>,
+    /// The tests a statement declares that are not expanded, which `expand`
+    /// or `mixin_gaps` found (`take_gap`): Ruby declares them as the
+    /// statement runs.
+    gap: std::cell::RefCell<Option<Gap>>,
+}
+
+/// A statement of a test class body that declares tests `Macros` does not
+/// expand (`Macros::take_gap`).
+pub(super) enum Gap {
+    /// A module the statement mixes in declares them in a hook it runs
+    /// (`included do gen(:a) end`): the `include` replays as written.
+    Mixin,
+    /// A call of a class method that declares them, in a form not
+    /// expanded, with the refusal that would name it: the statement
+    /// runs as the class loads.
+    Call(IngestError),
+    /// The same, but running it as written would give other results than
+    /// Ruby: a block in `class << self` looks constants up through the
+    /// singleton class, which the emitted class method (`def self.m`) does
+    /// not. Named, not run.
+    Named(IngestError),
 }
 
 /// The receiverless (or `self.`) `include`/`extend`/`prepend` statement
@@ -1078,6 +1099,7 @@ impl<'pr> Macros<'pr> {
             runs,
             calls,
             cx: consts::ConstCx::of_class(class_node, body, file, 0),
+            gap: std::cell::RefCell::new(None),
         }
     }
 
@@ -1108,10 +1130,17 @@ impl<'pr> Macros<'pr> {
         let found = self.runs.iter().find(|(start, _, name)| {
             *start == at && !matches!(name.as_str(), "test" | "generate_test" | "setup" | "teardown") && self.matters(name)
         });
-        if let Some((_, module, name)) = found {
-            self.record_gap(name, stmt, format!("a hook of `{module}` calls it as `{}` runs, which is not expanded", first_line(stmt)))?;
+        if found.is_some() {
+            EXPANDED.with(|e| e.borrow_mut().push((self.file.clone(), sources::with_text(&self.file, fingerprint).unwrap_or_default(), at)));
+            *self.gap.borrow_mut() = Some(Gap::Mixin);
         }
         Ok(())
+    }
+
+    /// What `expand` or `mixin_gaps` found not expanded in the last
+    /// statement, as it runs.
+    pub(super) fn take_gap(&self) -> Option<Gap> {
+        self.gap.borrow_mut().take()
     }
 
     fn line(&self, at: usize) -> String {
@@ -1476,13 +1505,15 @@ impl<'pr> Macros<'pr> {
     fn record_gap(&self, name: &str, stmt: &Node<'pr>, why: String) -> IngestResult<()> {
         let at = stmt.location().start_offset();
         let line = sources::line_at(&self.file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
-        super::super::survey::continue_or_fail(IngestError::Unsupported {
+        let named = why.contains("in `class << self`, names");
+        let error = IngestError::Unsupported {
             file: self.file.clone(),
             message: format!(
                 "tests declared by a call of the class method `{name}` are not modeled; they will not run (`{}` line {line}: {why})",
                 self.class.0
             ),
-        })?;
+        };
+        *self.gap.borrow_mut() = Some(if named { Gap::Named(error) } else { Gap::Call(error) });
         let print = sources::with_text(&self.file, fingerprint).unwrap_or_default();
         EXPANDED.with(|e| e.borrow_mut().push((self.file.clone(), print, at)));
         Ok(())

@@ -183,15 +183,11 @@ fn a_test_class_ingest_cannot_reach_is_refused_by_name() {
     );
 
     // A loop over a collection ingest cannot see declares tests whose
-    // names are not known before the code runs: strict ingest names the
-    // statement (survey mode records it and keeps the class's other tests;
-    // see tests/cruby_test_unroll.rs).
+    // names are not known before the code runs: the class runs the loop as
+    // it loads (see tests/cruby_test_unroll.rs).
     let src = "class LoopTest < ActiveSupport::TestCase\n  Item::ALL.each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";
-    let err = roundhouse::ingest::ingest_test_files(src.as_bytes(), "loop_test.rb").unwrap_err().to_string();
-    assert!(
-        err.contains("tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`LoopTest` line 2, first test at line 3"),
-        "{err}"
-    );
+    let modules = roundhouse::ingest::ingest_test_files(src.as_bytes(), "loop_test.rb").expect("carried");
+    assert!(modules[0].tests_at_load && modules[0].tests.is_empty());
 
     // Over a literal, the loop's tests are each declared by name.
     let src = "class LoopTest < ActiveSupport::TestCase\n  %w[a b].each do |x|\n    test \"#{x}\" do\n      assert true\n    end\n  end\nend\n";

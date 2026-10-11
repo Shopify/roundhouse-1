@@ -1697,13 +1697,23 @@ fn def_declares_tests(def: &ruby_prism::DefNode<'_>) -> bool {
     def.body().is_some_and(|body| super::hidden_test_declaration(&body).is_some())
 }
 
+/// What a class-body statement that declares tests gives the test class.
+pub(super) enum Hidden {
+    /// The tests of a static loop, in the order it declares them.
+    Tests(Vec<Test>),
+    /// Tests that cannot be listed before the statement runs, with the
+    /// refusal ingest would name for them: Ruby declares them as the
+    /// class loads, so the caller carries the statement to run there
+    /// (`TestModule::tests_at_load`), and names this when it cannot.
+    AtLoad(IngestError),
+}
+
 /// `stmt`, a class-body statement that declares tests (`offset` is the
 /// first one) and that ingest did not take as one literal test: the
 /// tests of a static loop, in the order it declares them (the caller
-/// adds each, `super::declare_test`), or none, with just this
-/// statement refused by kind and line. Under `--survey` the refusal is
-/// recorded and the class's other tests still run; strict ingest fails
-/// with it.
+/// adds each, `super::declare_test`), or the refusal by kind and line
+/// for the statement alone (`Hidden::AtLoad`), which the caller names
+/// when it cannot carry the statement to run as the class loads.
 pub(super) fn declare_hidden<'pr>(
     stmt: &Node<'pr>,
     offset: usize,
@@ -1712,7 +1722,7 @@ pub(super) fn declare_hidden<'pr>(
     file: &str,
     tags: &TestTags,
     consts: &TagConstants<'pr>,
-) -> IngestResult<Vec<Test>> {
+) -> IngestResult<Hidden> {
     let class_body: Vec<Node<'pr>> = class_node.body().map(flatten_statements).unwrap_or_default();
     let cx = consts::ConstCx::of_class(class_node, &class_body, file, stmt.location().start_offset()).map(Rc::new);
     let unroll = Unroll { class_body: &class_body, file, tags, consts, cx };
@@ -1749,7 +1759,7 @@ pub(super) fn declare_hidden<'pr>(
         if direct {
             Err(not_modeled("a `class << self` body", first_line(stmt)))
         } else if macros.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Hidden::Tests(Vec::new()));
         } else {
             Err(not_modeled("a `class << self` method that declares tests when called", macros.join(", ")))
         }
@@ -1759,20 +1769,19 @@ pub(super) fn declare_hidden<'pr>(
         Err(not_modeled("a class-body statement ingest does not model", first_line(stmt)))
     };
     match outcome {
-        Ok(declared) => Ok(declared),
+        Ok(declared) => Ok(Hidden::Tests(declared)),
         Err(why) => {
             let line = |at: usize| super::super::sources::line_at(file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
             let stmt_line = line(stmt.location().start_offset());
             let test_line = line(offset);
             let at = if stmt_line == test_line { format!("line {stmt_line}") } else { format!("line {stmt_line}, first test at line {test_line}") };
-            super::super::survey::continue_or_fail(IngestError::Unsupported {
+            Ok(Hidden::AtLoad(IngestError::Unsupported {
                 file: file.into(),
                 message: format!(
                     "tests declared by {} are not modeled; they will not run (`{}` {at}: {})",
                     why.kind, class.0, why.detail
                 ),
-            })?;
-            Ok(Vec::new())
+            }))
         }
     }
 }

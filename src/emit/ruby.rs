@@ -1457,6 +1457,19 @@ pub fn emit_with_assertions(
             }
             names
         };
+        // A class declares tests as it loads (`TestModule::tests_at_load`),
+        // or inherits from one that does: Minitest runs those too.
+        let loads_tests = |tm: &crate::dialect::TestModule| -> bool {
+            let mut current = Some(tm);
+            for _ in 0..32 {
+                let Some(m) = current.take() else { break };
+                if m.tests_at_load {
+                    return true;
+                }
+                current = m.parent.as_ref().and_then(|parent| app.test_modules.iter().find(|o| o.name == *parent && o.name != m.name));
+            }
+            false
+        };
         let mut index: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
         let test_parents: crate::det::HashSet<&str> = test_lowered
             .iter()
@@ -1662,9 +1675,10 @@ pub fn emit_with_assertions(
             // A base with no tests of its own is loaded by its subclasses'
             // files; a driver there would report on it once per require.
             let test_names = test_names_of(lc);
-            let is_bare_base = test_parents.contains(class_name) && test_names.is_empty();
+            let at_load = loads_tests(module);
+            let is_bare_base = test_parents.contains(class_name) && test_names.is_empty() && !at_load;
             if !is_bare_base && minitest {
-                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &test_names));
+                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &test_names, at_load));
             } else if !is_bare_base {
                 emitted.content.push_str(&render_autorun_shim(&lc_for_emit, &test_names, &reset_lines));
             }
@@ -1672,6 +1686,10 @@ pub fn emit_with_assertions(
                 "class": class_name,
                 "file": emitted.path.display().to_string(),
                 "tests": if is_bare_base { Vec::new() } else { test_names.clone() },
+                // Tests the class declares as it loads are not listed:
+                // a runner maps an id of the class's to its method by
+                // name, and the loaded class has it or not.
+                "tests_at_load": at_load && !is_bare_base,
             }));
             let rbs_path = emitted.path.clone();
             files.push(emitted);
@@ -1813,12 +1831,19 @@ fn rbs_only_from_funcs(
 /// reset here ran every truncate and fixture load a second time per test
 /// (on Core, 1,421 model truncates, each naming and so autoloading its
 /// model).
-fn render_minitest_shim(lc: &LibraryClass, test_names: &[String]) -> String {
+///
+/// A class that declares tests as it loads (`at_load`) adds the ones its
+/// loaded body defined (`RoundhouseTestRunner.loaded_tests`).
+fn render_minitest_shim(lc: &LibraryClass, test_names: &[String], at_load: bool) -> String {
     // A native name is any text (`test_#call_ok?`, `test_x_#@y`): a
     // literal that does not interpolate.
     let methods: Vec<String> = test_names.iter().map(|name| expr::ruby_str_literal(name)).collect();
     let mut s = String::from("\nif RoundhouseTestRunner.drive?(__FILE__)\n");
-    writeln!(s, "  RoundhouseTestRunner.run({}, [{}])", lc.name.0, methods.join(", ")).unwrap();
+    if at_load {
+        writeln!(s, "  RoundhouseTestRunner.run({0}, RoundhouseTestRunner.loaded_tests({0}, [{1}]))", lc.name.0, methods.join(", ")).unwrap();
+    } else {
+        writeln!(s, "  RoundhouseTestRunner.run({}, [{}])", lc.name.0, methods.join(", ")).unwrap();
+    }
     s.push_str("end\n");
     s
 }
@@ -2653,8 +2678,28 @@ module RoundhouseEarlyTestCallbacks
     nil
   end
 end
+# ActiveSupport::Testing::Declarative#test (activesupport 8.x), which Rails
+# puts on `ActiveSupport::TestCase` itself: `test \"name\" do … end` in a
+# class body, run as the body loads (a loop over a collection, a class
+# method that declares tests), defines `test_<name, whitespace as _>`.
+module RoundhouseTestDeclarative
+  def test(name, &block)
+    test_name = \"test_#{name.gsub(/\\s+/, '_')}\".to_sym
+    defined = method_defined?(test_name)
+    raise \"#{test_name} is already defined in #{self}\" if defined
+
+    if block
+      define_method(test_name, &block)
+    else
+      define_method(test_name) do
+        flunk \"No implementation provided for #{name}\"
+      end
+    end
+  end
+end
 class TestBase
   extend RoundhouseEarlyTestCallbacks
+  extend RoundhouseTestDeclarative
 end
 module ActiveSupport
   TestCase = ::TestBase
