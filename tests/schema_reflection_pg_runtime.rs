@@ -131,6 +131,8 @@ const PROBE: &str = r##"class SchemaReflectionProbe
     out << "shop belongs_to: #{Shop.reflect_on_all_associations(:belongs_to).map(&:name).inspect}"
     out << "product belongs_to: #{Product.reflect_on_all_associations(:belongs_to).map(&:name).inspect}"
     out << "vehicle associations: #{Vehicle.reflect_on_all_associations.inspect}"
+    out << "reflections: #{[Shop.reflections.keys, Product.reflections.keys, Vehicle.reflections.keys, Product.reflections.keys.include?("shop"), Product.reflections["shop"].macro].inspect}"
+    out << "normalized_reflections: #{[Shop.normalized_reflections.keys, Product.normalized_reflections.keys].inspect}"
     out << "schema cache: #{[Shop.connection_pool.schema_cache.columns_hash?("shops"), Shop.connection.schema_cache.columns_hash?("vehicles")].inspect}"
     out
   end
@@ -180,6 +182,8 @@ const EXPECTED: &[&str] = &[
     "shop belongs_to: []",
     "product belongs_to: [:shop]",
     "vehicle associations: []",
+    r#"reflections: [["products"], ["shop"], [], true, :belongs_to]"#,
+    "normalized_reflections: [[:products], [:shop]]",
     "schema cache: [true, true]",
 ];
 

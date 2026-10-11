@@ -3788,6 +3788,15 @@ fn app_class_method_call(
         return false;
     }
     let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    // A call on a constant this very body assigned (`REGISTRY = Registry.new`
+    // then `REGISTRY.register(:a) { … }`): the object is the body's own, so
+    // the statement runs as Ruby runs it, once the constant is written.
+    if let [only] = written.as_slice()
+        && !rooted
+        && lc.constants.iter().any(|(name, _)| name.as_str() == *only)
+    {
+        return true;
+    }
     let scope: Vec<&str> = lc.name.0.as_str().trim_start_matches("::").split("::").collect();
     let depths: Vec<usize> = if rooted { vec![0] } else { (0..=scope.len()).rev().collect() };
     for depth in depths {

@@ -207,3 +207,24 @@ fn a_tag_calling_the_apps_own_model_emits_as_that_call() {
         "expected the model call in:\n{out}",
     );
 }
+
+/// A `def` in a statement tag (`<% def helper(x) … end %>`) is Rails'
+/// `ERB#result` of the file in the render context's binding, where the
+/// `def` defines a method on the context class and the value tags call it
+/// as `helper(…)`. The loader's body is a singleton method, so a `def`
+/// written there defines an instance method nothing calls: the emitted
+/// loader must define the helper on the module's singleton.
+#[test]
+fn a_def_in_a_statement_tag_is_callable_from_the_value_tags() {
+    let app = app_with_fixture(
+        "<%\ndef tagged(name, primary)\n  prefix = primary ? \"1\" : \"0\"\n  \"#{prefix}-#{name}\"\nend\n%>\n\n\
+         david:\n  name: <%= tagged(:david, true) %>\n",
+    );
+    let emitted = emitted_fixture(&app);
+    let load = emitted.split("def self._fixtures_load!").nth(1).expect("loader");
+    assert!(
+        load.contains("def self.tagged(name, primary)"),
+        "a bare nested `def` defines an instance method of the module, which the singleton loader cannot call:\n{emitted}"
+    );
+    assert!(load.contains("instance.name = tagged(:david, true)"), "{emitted}");
+}

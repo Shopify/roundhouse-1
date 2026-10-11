@@ -385,6 +385,26 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
     )
 }
 
+/// A statement tag's `def` (`<% def helper(x) … end %>`): Rails renders
+/// the file in the fixture render context, where the `def` defines a
+/// method on the context the value tags call. The loader body here is a
+/// singleton method of the fixtures module, where a nested `def` would
+/// define an instance method of the module nothing calls, so each is
+/// written as a singleton method of the module the loader runs on.
+fn preamble_defs_on_singleton(statement: &Expr) -> Expr {
+    use crate::dialect::MethodReceiver;
+    let mut statement = statement.clone();
+    fn rewrite(e: &mut Expr) {
+        match &mut *e.node {
+            ExprNode::MethodDefExpr { def } => def.receiver = MethodReceiver::Class,
+            ExprNode::Seq { exprs } => exprs.iter_mut().for_each(rewrite),
+            _ => {}
+        }
+    }
+    rewrite(&mut statement);
+    statement
+}
+
 /// Body of `_fixtures_load!`: a Seq of per-record blocks. Each
 /// record lowers to
 ///   instance = <Class>.new
@@ -415,7 +435,7 @@ fn build_load_method_body(
     // ERB statement tags first, in source order — they bind the locals
     // the value tags read (`password_digest`), so they have to run in
     // this body and ahead of every insert.
-    exprs.extend(preamble.iter().cloned());
+    exprs.extend(preamble.iter().map(preamble_defs_on_singleton));
 
     for (idx, r) in records.iter().enumerate() {
         let id = (idx + 1) as i64;
@@ -941,7 +961,7 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
             )
         })
         .collect();
-    exprs.extend(set.preamble.iter().cloned());
+    exprs.extend(set.preamble.iter().map(preamble_defs_on_singleton));
     match (&set.columns, set.errors.first()) {
         (Some(columns), None) => {
             let columns_hash = hash_lit(

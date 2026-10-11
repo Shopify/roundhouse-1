@@ -1262,6 +1262,28 @@ module ActiveRecord
       # rather than answered empty. (CRuby only: the registry is read
       # through `singleton_methods` and `instance_variable_get`.)
       def reflect_on_all_associations(macro = nil)
+        list = __roundhouse_association_reflections.values
+        macro ? list.select { |reflection| reflection.macro == macro } : list
+      end
+
+      # reflection.rb's `reflections`: the association reflections by
+      # String name (`normalized_reflections.stringify_keys`), a fresh hash
+      # each call. Callers test membership by name, as state_machines'
+      # audit_trail backend does (`object.class.reflections.keys.include?
+      # (context.to_s)`).
+      def reflections
+        normalized_reflections.transform_keys(&:to_s)
+      end
+
+      # reflection.rb's `normalized_reflections`: the reflections by Symbol
+      # name. The compiled registry holds no parent (habtm) reflections.
+      def normalized_reflections
+        __roundhouse_association_reflections.dup.freeze
+      end
+
+      # Every association reflection of the class by Symbol name, a
+      # superclass's before its own (see `reflect_on_all_associations`).
+      def __roundhouse_association_reflections
         chain = [] #: Array[untyped]
         klass = self #: untyped
         until klass.nil? || klass.equal?(ActiveRecord::Base)
@@ -1292,8 +1314,7 @@ module ActiveRecord
           raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: #{name}.reflect_on_all_associations: " \
             "this tree emits no association registry (reflect_on_association) for #{name}"
         end
-        list = reflections.values
-        macro ? list.select { |reflection| reflection.macro == macro } : list
+        reflections
       end
 
       def shard_keys

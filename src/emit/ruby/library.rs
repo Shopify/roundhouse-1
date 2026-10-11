@@ -12407,10 +12407,23 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
             })
     };
     let gem_source = declared_in_gem_source(lc, app);
+    // A constant whose value calls a class method the body defines
+    // nowhere itself (`VALID = statuses`, which a class-body macro
+    // above it defined on the singleton) waits for the replayed class-body
+    // calls the source has above it: those are written after the
+    // eager constants.
+    let reads_macro_defined = |value: &Expr| {
+        !value.span.is_synthetic()
+            && calls_unowned_class_method(value, &own)
+            && lc.unknown_calls.iter().any(|c| {
+                !c.span.is_synthetic() && c.span.file == value.span.file && c.span.end <= value.span.start
+            })
+    };
     let mut deferred_names: crate::det::HashSet<String> = crate::det::HashSet::default();
     let (mut eager, mut deferred) = (Vec::new(), Vec::new());
     for (i, (name, value)) in lc.constants.iter().enumerate() {
         if calls_self(value, &own, &deferred_names, lc.name.0.as_str())
+            || reads_macro_defined(value)
             || (gem_source && below_own_def(value) && runs_app_code(value, app))
             || names_subclass(value, lc.name.0.as_str().trim_start_matches("::"), app)
         {
@@ -12426,6 +12439,39 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
         .iter()
         .any(|init| calls_self(init, &own, &deferred_names, lc.name.0.as_str()));
     (eager, deferred, initializers_call_self)
+}
+
+/// Whether `value` calls, on the class itself (no receiver, or `self`), a
+/// method that is neither one of the class's own defs nor one any class
+/// answers ([`ANY_CLASS_SELF_CALLS`]): a class method an earlier class-body
+/// macro defined (`symbol_enum :status, [...]` gives the class `statuses`).
+/// A stored closure's body runs later and does not count.
+fn calls_unowned_class_method(value: &Expr, own: &crate::det::HashSet<&str>) -> bool {
+    match &*value.node {
+        ExprNode::Lambda { .. } => false,
+        ExprNode::Send { recv, method, args, block, .. } => {
+            let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+            if on_self
+                && !own.contains(method.as_str())
+                && !ANY_CLASS_SELF_CALLS.contains(&method.as_str())
+                && !matches!(method.as_str(), "new" | "require" | "require_relative" | "binding" | "block_given?")
+            {
+                return true;
+            }
+            let stores_block = matches!(method.as_str(), "proc" | "lambda");
+            recv.iter().chain(args.iter()).any(|e| calls_unowned_class_method(e, own))
+                || (!stores_block && block.as_ref().is_some_and(|b| calls_unowned_class_method(b, own)))
+        }
+        _ => {
+            let mut found = false;
+            value.node.for_each_child(&mut |child| {
+                if !found && calls_unowned_class_method(child, own) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
 }
 
 /// One statement of a body written in source order (`ordered_class_state`):
