@@ -93,3 +93,32 @@ fn a_module_whose_constant_reads_its_including_models_loads_without_a_cycle() {
         assert_eq!(run.stdout, expected, "{script}\n{}", run.stderr);
     }
 }
+
+/// A model's constant reads a class whose body asks the model what it
+/// answers to (`Order.instance_methods`), as a `record_field`-style
+/// macro does. Natively the `delegate` above the constant has defined its
+/// forwarders when that constant autoloads the class (Module#delegate
+/// defines where it is written; Module#instance_methods sees them).
+/// The load-time require for the constant ran above the forwarders, so the
+/// class saw a model without them and raised.
+#[test]
+fn a_constant_loading_a_class_that_asks_the_model_for_its_methods_sees_the_delegates() {
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "require_relative \"boot\"\n")
+        .write("lib/strict.rb", STRICT)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :orders do |t|\n    t.string :name\n  end\nend\n")
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n")
+        .write(
+            "app/models/order.rb",
+            "class Order < ApplicationRecord\n  delegate :title, to: :helper\n  delegate :title=, to: :helper\n\n  RESPONSES = { \"a\" => Order::Response }.freeze\n\n  def helper\n    @helper ||= Struct.new(:title).new(\"t\")\n  end\nend\n",
+        )
+        .write(
+            "app/models/order/response.rb",
+            "class Order\n  class Response\n    MISSING = [:title, :title=] - Order.instance_methods\n    raise ArgumentError, \"Methods #{MISSING.inspect} don't exist on Order.\" unless MISSING.empty?\n  end\nend\n",
+        )
+        .run_ruby("p Order::RESPONSES.keys\np Order.new.title\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "[\"a\"]\n\"t\"\n", "{}", run.stderr);
+}

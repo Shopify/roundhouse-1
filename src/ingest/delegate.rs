@@ -138,6 +138,7 @@ pub fn lower_delegates(app: &mut crate::App) {
         if had_definer {
             drop_spent_forwardable_extend(lc);
         }
+        record_forwarder_sites(&mut app.delegate_forwarder_sites, &lc.name, &methods);
         if !methods.is_empty() {
             generated.push((i, methods));
         }
@@ -153,7 +154,7 @@ pub fn lower_delegates(app: &mut crate::App) {
     }
     let none = crate::det::HashSet::default();
     for model in &mut app.models {
-        lower_model_delegates(model, &nameless_rest, &none, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
+        lower_model_delegates(model, &nameless_rest, &none, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders, &mut app.delegate_forwarder_sites);
     }
 }
 
@@ -193,7 +194,7 @@ pub(super) fn pending_model_delegates(app: &crate::App) -> crate::det::HashSet<c
 pub(super) fn lower_spliced_model_delegates(app: &mut crate::App, before: &crate::det::HashSet<crate::span::Span>) {
     let nameless_rest = nameless_rest_names(app);
     for model in &mut app.models {
-        lower_model_delegates(model, &nameless_rest, before, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
+        lower_model_delegates(model, &nameless_rest, before, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders, &mut app.delegate_forwarder_sites);
     }
 }
 
@@ -209,6 +210,7 @@ fn lower_model_delegates(
     skip: &crate::det::HashSet<crate::span::Span>,
     full_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
     declined_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
+    sites: &mut crate::det::HashMap<crate::ident::ClassId, Vec<(crate::ident::Symbol, crate::span::Span)>>,
 ) {
     use crate::dialect::ModelBodyItem;
     let is_delegate = |e: &Expr| {
@@ -254,6 +256,7 @@ fn lower_model_delegates(
         visibility_overrides: Vec::new(),
     };
     let (methods, full, declined) = expand_delegates_declining(&mut lc, decline);
+    record_forwarder_sites(sites, &model.name, &methods);
     // The declarations the expansion consumed: those it left are declined.
     // A skipped declaration stays as written.
     let left: Vec<crate::span::Span> = lc.unknown_calls.iter().map(|e| e.span).chain(skip.iter().copied()).collect();
@@ -298,6 +301,19 @@ fn lower_model_delegates(
     }
     if !declined.is_empty() {
         declined_forwarders.entry(model.name.clone()).or_default().extend(declined);
+    }
+}
+
+/// Note where each instance forwarder of `class` sits (`App::delegate_forwarder_sites`).
+fn record_forwarder_sites(
+    sites: &mut crate::det::HashMap<crate::ident::ClassId, Vec<(crate::ident::Symbol, crate::span::Span)>>,
+    class: &crate::ident::ClassId,
+    methods: &[MethodDef],
+) {
+    let found: Vec<_> =
+        methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| (m.name.clone(), m.name_span)).collect();
+    if !found.is_empty() {
+        sites.entry(class.clone()).or_default().extend(found);
     }
 }
 

@@ -687,6 +687,12 @@ pub struct App {
     /// placed at the call.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ruby_declined_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
+    /// Where each instance forwarder `ingest::delegate` expanded sits
+    /// (its name and the declaration's span), by class: the Ruby emit
+    /// writes one where `Module#delegate` would have defined it, ahead of
+    /// a load-time require that may ask the class for its methods.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub delegate_forwarder_sites: HashMap<ClassId, Vec<(crate::ident::Symbol, crate::span::Span)>>,
     /// The instance methods `ingest::class_eval_macro` added to a library
     /// class for a class-body call to a macro that writes them with a
     /// `class_eval` heredoc (Core's ComplexStruct `attribute :value,
@@ -1523,6 +1529,7 @@ impl App {
             class_methods_blocks: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
             ruby_declined_delegate_forwarders: HashMap::default(),
+            delegate_forwarder_sites: HashMap::default(),
             class_eval_macro_expansions: HashMap::default(),
             concern_model_items: HashMap::default(),
             concern_prepended_items: HashMap::default(),

@@ -10434,6 +10434,18 @@ fn emit_library_class_decl_inner(
     // hooks as it loads, so a hook the source defines above its body
     // statements exists before the requires, as in Ruby, where a `def`
     // runs where it stands (Module#included, Class#inherited).
+    //
+    // So does a `delegate` forwarder: the macro defines its method where
+    // it is written, and what that require loads may ask the class what
+    // it answers to at load (`instance_methods`, `method_defined?`,
+    // ActiveModel::AttributeMethods' `instance_method_already_implemented?`
+    // style checks). A forwarder runs nothing when it is defined.
+    let forwarder_sites = app.delegate_forwarder_sites.get(&lc.name);
+    let is_delegate_forwarder = |m: &MethodDef| {
+        m.receiver == MethodReceiver::Instance
+            && (forwarder_sites.into_iter().flatten().any(|(name, at)| *name == m.name && *at == m.name_span)
+                || declined.into_iter().flatten().any(|f| f.name == m.name && f.name_span == m.name_span))
+    };
     let hoisted_hooks: Vec<usize> = if in_body_after_includes.is_empty() {
         Vec::new()
     } else {
@@ -10441,8 +10453,9 @@ fn emit_library_class_decl_inner(
             .iter()
             .enumerate()
             .filter(|(i, m)| {
-                m.receiver == MethodReceiver::Class
-                    && matches!(m.name.as_str(), "included" | "extended" | "prepended" | "inherited")
+                (is_delegate_forwarder(m)
+                    || (m.receiver == MethodReceiver::Class
+                        && matches!(m.name.as_str(), "included" | "extended" | "prepended" | "inherited")))
                     && !carried_method(m)
                     && !written_in_state.contains(i)
                     && !instance_form.get(*i).copied().unwrap_or(false)
