@@ -53,7 +53,10 @@ fn unresolved_declared_classes_are_errors() {
 
 #[test]
 fn new_errors_api_requires_runtime_support() {
-    for body in ["errors.added?(:title, :blank)", "errors.details", "errors.where(:title)", "errors.merge!(errors)", "errors.first.options", "errors.delete(:title); errors.size"] {
+    // `added?`, `details`, `where`, `merge!`, `Error#options` and `delete`
+    // have a runtime port now (runtime/spinel/active_model_errors.rb); the
+    // rest of activemodel's errors.rb still has none and is refused by name.
+    for body in ["errors.slice!(:title)", "errors.group_by_attribute", "errors.copy!(errors)", "errors.generate_message(:title, :blank)"] {
         refuses(body, "ActiveModel::Errors");
     }
 }
@@ -201,14 +204,24 @@ fn uncheckable_sorbet_types_are_refused_by_name() {
 }
 
 #[test]
-fn for_scope_is_not_a_block_scope() {
+fn for_scope_is_the_enclosing_scope() {
+    // `for` is lowered as `each` over the enclosing scope's locals
+    // (tests/for_loop_cruby.rs runs it against CRuby), so the loop
+    // variables and body locals read after the loop are admitted.
     for body in [
         "x = 10; for x in [1, 2]; end; x",
         "for x in []; end; [defined?(x), x]",
         "for x in [1, 2]; y = x * 10; end; y",
         "for p, q in [[1, 2], [3, 4]]; end; [p, q]",
         "for x in []; y = 1; end; [defined?(y), y]",
-    ] { refuses(body, "for"); }
+    ] {
+        let root = probe_app(body);
+        let (ok, text) = run(&root, &["check"]);
+        assert!(ok, "check refused {body}: {text}");
+        let (ok, text) = run(&root, &["--target", "ruby"]);
+        assert!(ok, "ruby refused {body}: {text}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

@@ -776,8 +776,23 @@ fn every_runtime_method_body_is_fully_typed() {
             continue;
         }
 
-        let rbs = fs::read_to_string(&rbs_path)
+        let mut rbs = fs::read_to_string(&rbs_path)
             .unwrap_or_else(|_| panic!("read {rbs_path:?}"));
+
+        // A `<name>_mixin.rbs` uses the type aliases `<name>.rbs`
+        // declares (one module, one declaration each: RBS refuses a
+        // duplicate when both load). An alias is scoped to the module
+        // declaration that holds it, so this per-file read declares the
+        // base file's aliases ahead of the mixin's first method.
+        if let Some(base) = stem.strip_suffix("_mixin") {
+            if let Ok(base_rbs) = fs::read_to_string(Path::new("runtime/ruby").join(format!("{base}.rbs"))) {
+                let aliases: Vec<&str> = base_rbs.lines().filter(|l| l.trim_start().starts_with("type ")).collect();
+                let first_def = rbs.lines().position(|l| l.trim_start().starts_with("def ")).unwrap_or(0);
+                let mut lines: Vec<&str> = rbs.lines().collect();
+                lines.splice(first_def..first_def, aliases);
+                rbs = lines.join("\n");
+            }
+        }
 
         let methods = match parse_methods_with_rbs_in_ctx(&ruby, &rbs, &class_registry) {
             Ok(m) => m,

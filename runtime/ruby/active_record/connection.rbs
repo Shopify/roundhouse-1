@@ -2,6 +2,44 @@
 # Hash[String, untyped] by design — raw SQL's row shape (aliased
 # aggregates, computed columns) is genuinely dynamic; see connection.rb.
 module ActiveRecord
+  module Scoping
+    # The current and global scopes per model name. A scope is whatever
+    # `scoping` was handed (a Relation), so it stays untyped.
+    class ScopeRegistry
+      @current_scope: Hash[String, untyped]
+      @global_current_scope: Hash[String, untyped]
+
+      def self.instance: () -> ScopeRegistry
+      def self.current_scope: (untyped model, ?bool skip_inherited_scope) -> untyped
+      def self.set_current_scope: (untyped model, untyped value) -> untyped
+      def self.global_current_scope: (untyped model, ?bool skip_inherited_scope) -> untyped
+      def self.set_global_current_scope: (untyped model, untyped value) -> untyped
+      def initialize: () -> void
+      def current_scope: (untyped model, ?bool skip_inherited_scope) -> untyped
+      def set_current_scope: (untyped model, untyped value) -> untyped
+      def global_current_scope: (untyped model, ?bool skip_inherited_scope) -> untyped
+      def set_global_current_scope: (untyped model, untyped value) -> untyped
+      def value_for: (Hash[String, untyped] scope_type, untyped model, bool skip_inherited_scope) -> untyped
+    end
+  end
+
+  module AttributeMethods
+    module TimeZoneConversion
+      # time_zone_conversion.rb's TimeZoneConverter over a SimpleDelegator:
+      # the subtype's value is what every method here wraps, so each
+      # answer is the delegated type's own (untyped).
+      class TimeZoneConverter
+        def self.new: (untyped subtype) -> untyped
+        def subtype: () -> untyped
+        def deserialize: (untyped value) -> untyped
+        def cast: (untyped value) -> untyped
+        def ==: (untyped other) -> bool
+        def convert_time_to_time_zone: (untyped value) -> untyped
+        def set_time_zone_without_conversion: (untyped value) -> untyped
+      end
+    end
+  end
+
   class IntegerKeyCast
     @valid: bool
     @value: Integer
@@ -35,8 +73,9 @@ module ActiveRecord
     def to_ary: () -> Array[Hash[String, untyped]]
     def to_a: () -> Array[Hash[String, untyped]]
     def []: (Integer idx) -> Hash[String, untyped]?
-    def first: () -> Hash[String, untyped]?
-    def last: () -> Hash[String, untyped]?
+    def first: (?Integer? n) -> (Hash[String, untyped] | Array[Hash[String, untyped]])?
+    def last: (?Integer? n) -> (Hash[String, untyped] | Array[Hash[String, untyped]])?
+    def hash_rows: () -> Array[Hash[String, untyped]]
     def column_types: () -> Hash[String | Integer, untyped]
     def result: () -> Result
   end
@@ -162,6 +201,34 @@ module ActiveRecord
     def self.find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.sole: () -> Base
     def self.all: () -> Relation
+    def self._hook_attribute_type: (untyped name, untyped cast_type) -> untyped
+    def self._create_time_zone_conversion_attribute?: (untyped name, untyped cast_type) -> bool
+    def self._scoped_reads?: () -> bool
+    def self.lock: (?(String | bool)? locks) -> Relation
+    def self.unscope: (*untyped args) -> Relation
+    def self.and: (Relation other) -> Relation
+    def self.or: (Relation other) -> Relation
+    def self.current_scope: (?bool skip_inherited_scope) -> untyped
+    def self.current_scope=: (untyped scope) -> untyped
+    def self.global_current_scope: (?bool skip_inherited_scope) -> untyped
+    def self.global_current_scope=: (untyped scope) -> untyped
+    def self.scope_registry: () -> ::ActiveRecord::Scoping::ScopeRegistry
+    # Declared by the emitted model or a class-level macro, not by a `def`
+    # here: the contract the bodies in connection.rb are typed against.
+    %a{abstract}
+    def self.columns_hash: () -> Hash[String, untyped]
+    %a{abstract}
+    def self.inheritance_column: () -> String
+    %a{abstract}
+    def self.time_zone_aware_attributes: () -> bool
+    %a{abstract}
+    def self.skip_time_zone_conversion_for_attributes: () -> Array[untyped]
+    %a{abstract}
+    def self.time_zone_aware_types: () -> Array[Symbol]
+    %a{abstract}
+    def attributes_before_type_cast: () -> Hash[String, untyped]
+    %a{abstract}
+    def attributes: () -> Hash[String, untyped]
     # default_scope (`lower::default_scope` emits the declaring model's).
     self.@_unscoped_depth: Integer?
     def self._default_scoped?: () -> bool
@@ -193,8 +260,11 @@ module ActiveRecord
     def values_at: (*untyped methods) -> Array[untyped]
     def self.has_attribute?: (String | Symbol attr_name) -> bool
     def self._has_attribute?: (untyped attr_name) -> bool
+    %a{abstract}
     def self.reflect_on_all_associations: (?Symbol? macro) -> Array[untyped]
+    %a{abstract}
     def self.reflections: () -> Hash[String, untyped]
+    %a{abstract}
     def self.normalized_reflections: () -> Hash[Symbol, untyped]
     def attribute_previously_was: (String | Symbol name) -> untyped
     def self.first: () -> Base?
@@ -313,6 +383,7 @@ module ActiveRecord
 
     module Errors
       def add: (untyped attribute, ?untyped type, **untyped options) -> untyped
+      def full_messages: () -> Array[String]
     end
 
     class Entry

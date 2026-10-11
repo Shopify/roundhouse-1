@@ -30,12 +30,37 @@ use crate::App;
 /// The namespaced class and module paths a Ruby source declares
 /// (`ActiveSupport::Cache::MemoryStore`); top-level ones are left out.
 pub(crate) fn declared_namespaces(text: &str) -> HashSet<String> {
-    struct Declared(Vec<String>, HashSet<String>);
+    declared_namespaces_in(text, false)
+}
+
+/// `declared_namespaces` without the namespaces a source opens only to
+/// nest other declarations (`class Configuration; class Generators; ...;
+/// end; end`): reopening a class to hold a nested class defines nothing
+/// of the class itself, so it does not make a read of the class resolve.
+pub(crate) fn defined_namespaces(text: &str) -> HashSet<String> {
+    declared_namespaces_in(text, true)
+}
+
+fn declared_namespaces_in(text: &str, skip_containers: bool) -> HashSet<String> {
+    struct Declared(Vec<String>, HashSet<String>, bool);
+    /// A body made of nothing but nested classes and modules.
+    fn only_nests(body: &ruby_prism::Node<'_>) -> bool {
+        let Some(statements) = body.as_statements_node() else { return false };
+        let mut any = false;
+        for statement in statements.body().iter() {
+            if statement.as_class_node().is_none() && statement.as_module_node().is_none() {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
     impl Declared {
         fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
             self.0.push(String::from_utf8_lossy(path).into_owned());
             let full = self.0.join("::");
-            if full.contains("::") {
+            let container = self.2 && body.as_ref().is_some_and(only_nests);
+            if full.contains("::") && !container {
                 self.1.insert(full);
             }
             if let Some(body) = body {
@@ -52,7 +77,7 @@ pub(crate) fn declared_namespaces(text: &str) -> HashSet<String> {
             self.enter(node.constant_path().location().as_slice(), node.body());
         }
     }
-    let mut declared = Declared(Vec::new(), HashSet::default());
+    let mut declared = Declared(Vec::new(), HashSet::default(), skip_containers);
     let parsed = ruby_prism::parse(text.as_bytes());
     if parsed.errors().next().is_none() {
         ruby_prism::Visit::visit(&mut declared, &parsed.node());
@@ -191,4 +216,21 @@ fn walk(app: &App) -> Found {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_namespace_opened_only_to_nest_defines_nothing() {
+        let text = "module Outer\n  class Holder\n    class Inner\n      def x; end\n    end\n  end\n  class Own\n    def y; end\n  end\n  class Empty; end\nend\n";
+        let declared = declared_namespaces(text);
+        assert!(declared.contains("Outer::Holder"));
+        let defined = defined_namespaces(text);
+        assert!(!defined.contains("Outer::Holder"));
+        for name in ["Outer::Holder::Inner", "Outer::Own", "Outer::Empty"] {
+            assert!(defined.contains(name), "{name} is defined");
+        }
+    }
 }

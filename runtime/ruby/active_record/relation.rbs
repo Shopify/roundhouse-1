@@ -77,10 +77,14 @@ module ActiveRecord
     @scope_attributes: Hash[Symbol, untyped]
     def where_scope: (Hash[Symbol, untyped] condition) -> Relation
     def scope_attributes: () -> Hash[Symbol, untyped]
+    def inherit_scope: (Relation scope) -> Relation
+    def model: () -> Base
+    def default_scoped?: () -> bool
     def not: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
     def excluding: (*untyped records) -> Relation
     def without: (*untyped records) -> Relation
     def or: (Relation other) -> Relation
+    def and: (Relation other) -> Relation
     def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate, ?bool note) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
     def order_sql: (String fragment) -> Relation
@@ -151,6 +155,23 @@ module ActiveRecord
     def references: (*Symbol names) -> Relation
     def merge: (Relation other) -> Relation
     def where_clauses: () -> Array[String]
+    def join_clauses: () -> Array[String]
+    def order_clauses: () -> Array[String]
+    def cast_schema_date: (untyped value) -> untyped
+    def cast_schema_value: (untyped value, Symbol column) -> untyped
+    def check_eager_loadable: (untyped owner, untyped spec) -> untyped
+    def extreme: (untyped expr, String function) -> untyped
+    def grouped_extreme: (String column, String function) -> untyped
+    def lock: (?(String | bool)? locks) -> Relation
+    def readonly: (?bool value) -> Relation
+    def schema_group_column: (String group) -> untyped
+    def scope_for_create: () -> Hash[String, untyped]
+    def unscope: (*untyped args) -> Relation
+    def unscope_clause: (untyped scope) -> untyped
+    def unscope_column_name: (String name) -> String
+    def unscope_where_columns: (Array[untyped] columns) -> untyped
+    def where_values_hash: () -> Hash[String, untyped]
+    def scoping: (?all_queries: bool?) { () -> untyped } -> untyped
     def arel: () -> Arel::SelectManager
     def none: () -> Relation
     def reload: () -> Relation
