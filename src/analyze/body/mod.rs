@@ -1620,6 +1620,17 @@ impl<'a> BodyTyper<'a> {
                             expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
                             qualify_resolved_path(path, &id);
                             Ty::Class { id, args: vec![] }
+                        } else if let Some(value) = self
+                            .typed_constant(&declaration_id_from_lookup_name(id.0.as_str()))
+                            .filter(|ty| !*stdlib && matches!(ty, Ty::Untyped))
+                        {
+                            // The source index reads `X = Module.new { .. }`
+                            // as a module declaration, though no class is
+                            // modeled for it: its value is the module Ruby
+                            // creates when the body runs
+                            // (`anonymous_module_ty`), read by its name.
+                            qualify_resolved_path(path, &id);
+                            value.clone()
                         } else {
                             unknown()
                         }
@@ -2941,6 +2952,9 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) =
                     self.column_attribute_access_ty(recv_ty.as_ref(), method, args)
                 {
+                    return t;
+                }
+                if let Some(t) = recv.as_ref().and_then(|r| anonymous_module_ty(r, recv_ty.as_ref(), method, block.is_some())) {
                     return t;
                 }
                 if let Some(t) = recv.as_ref().and_then(|r| time_parse_ty(r, method, args)) {
@@ -7430,6 +7444,27 @@ fn never_falsy(ty: &Ty) -> bool {
         Ty::Union { variants } => variants.iter().all(never_falsy),
         _ => false,
     }
+}
+
+/// `Module.new { .. }` / `Class.new(Parent) { .. }` where no registry models
+/// the receiver: a module or class Ruby creates when the call runs
+/// (`Module#initialize`, `Class#initialize`). Its value is gradual, so a
+/// constant assigned it (`FILTERS = Module.new do .. end`) still registers
+/// and its readers resolve instead of reporting an untyped value. A
+/// blockless `Class.new(parent)` stays as it was: it declares a class
+/// (`ingest::library_class::class_new_declaration`) or, for a computed
+/// parent, is refused.
+fn anonymous_module_ty(recv: &Expr, recv_ty: Option<&Ty>, method: &Symbol, has_block: bool) -> Option<Ty> {
+    let ExprNode::Const { path } = &*recv.node else { return None };
+    let [only] = path.as_slice() else { return None };
+    (method.as_str() == "new"
+        && (only.as_str() == "Module" || (only.as_str() == "Class" && has_block))
+        && match recv_ty {
+            None | Some(Ty::Var { .. }) => true,
+            Some(Ty::Class { id, args }) => args.is_empty() && id.0 == *only,
+            _ => false,
+        })
+    .then_some(Ty::Untyped)
 }
 
 // Not the `(str, now)` form: only one argument is grounded to `ActiveSupport.parse_time` / `zone_parse`.
