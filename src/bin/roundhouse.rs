@@ -294,6 +294,11 @@ fn run_transpile(
     // The /ide/ page has always done this (its wasm entry calls
     // `survey::activate()`), so before this flag the BROWSER could
     // transpile an app the command line could not.
+    // Futamura is always a survey: what ingest cannot model (a pg_dump
+    // statement in db/structure.sql, a construct the parser has no node
+    // for) is residue that Rails runs from the app's own files, which
+    // are carried byte for byte, not a reason to refuse the app.
+    let survey = survey || target == BuildTarget::Futamura;
     if survey {
         roundhouse::ingest::survey::activate();
     }

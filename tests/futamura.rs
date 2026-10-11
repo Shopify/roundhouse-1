@@ -303,3 +303,25 @@ mod preload_scopes {
         assert!(!init.contains("User#seen_posts"), "{init}");
     }
 }
+
+/// A pg_dump statement the structure.sql ingest does not model is
+/// residue under futamura, not a refusal: Rails loads the dump itself,
+/// so the file must still be carried byte for byte.
+#[test]
+fn unmodeled_structure_sql_statement_is_residue_not_a_refusal() {
+    let src = scratch("structure-src");
+    let out = scratch("structure-out");
+    app_tree(&src);
+    write(&src, "config/application.rb", b"module App\n  class Application < Rails::Application\n    config.active_record.schema_format = :sql\n  end\nend\n");
+    let structure = b"CREATE TABLE public.widgets (\n    id bigint NOT NULL\n);\n\nPREPARE stmt AS SELECT 1;\n\nALTER TABLE ONLY public.widgets\n    ADD CONSTRAINT widgets_pkey PRIMARY KEY (id);\n";
+    write(&src, "db/structure.sql", structure);
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(fs::read(out.join("db/structure.sql")).unwrap(), structure);
+    assert!(out.join("app/models/widget.rb").exists());
+}
