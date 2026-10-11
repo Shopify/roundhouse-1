@@ -1072,9 +1072,41 @@ pub(crate) fn erase_generic_applications(app: &mut crate::App) {
         }
         false
     };
-    let generic: crate::det::HashSet<String> = known.iter().filter(|name| applies_self(name)).cloned().collect();
+    let mut generic: crate::det::HashSet<String> = known.iter().filter(|name| applies_self(name)).cloned().collect();
     if generic.is_empty() {
         return;
+    }
+    // A constant naming a generic (`Optional = ::Adt::Optional`, or one
+    // naming such a constant) is that module: `Optional[X]` through it is
+    // `T::Generic#[]` on the module, and erased the same way. Settled to
+    // a fixed point so a chain of constants resolves.
+    let aliases: Vec<(String, Vec<Symbol>, String)> = app
+        .library_classes
+        .iter()
+        .flat_map(|lc| {
+            let owner = lc.name.0.as_str().to_string();
+            lc.constants.iter().filter_map(move |(name, value)| match &*value.node {
+                ExprNode::Const { path } => Some((format!("{owner}::{}", name.as_str()), path.clone(), owner.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut known = known;
+    loop {
+        let mut grew = false;
+        for (name, path, scope) in &aliases {
+            if generic.contains(name) {
+                continue;
+            }
+            if resolve_written(path, scope, &generic).is_some() {
+                known.insert(name.clone());
+                generic.insert(name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
     }
     let mut rewrite = |owner: Option<&crate::ident::ClassId>, body: &mut Expr| {
         let scope = owner.map(|o| o.0.as_str()).unwrap_or("");

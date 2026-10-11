@@ -48,6 +48,20 @@ use crate::ident::ClassId;
 const BASE: &str = "ActiveRecord::Base";
 
 pub(super) fn collect(app: &mut App) {
+    app.framework_base_includes = gather(app, Hooks::ActiveRecord);
+    app.load_hook_includes = gather(app, Hooks::Others);
+}
+
+/// Which lazy-load hooks' `include`s a pass reads: `:active_record`'s,
+/// with the explicit `ActiveRecord::Base.include` shapes, or every other
+/// hook's (self is the hooked base, which has no constant to name).
+#[derive(Clone, Copy, PartialEq)]
+enum Hooks {
+    ActiveRecord,
+    Others,
+}
+
+fn gather(app: &App, hooks: Hooks) -> Vec<ClassId> {
     let mut found: Vec<ClassId> = Vec::new();
     let mut record = |app: &App, scope: &str, written: &str| {
         if let Some(id) = resolve(app, scope, written) {
@@ -61,7 +75,7 @@ pub(super) fn collect(app: &mut App) {
         let Some(lc) = app.library_classes.iter().find(|c| c.name == railtie.name) else { continue };
         let scope = lc.name.0.as_str().to_string();
         for expr in lc.unknown_calls.iter().chain(lc.class_ivar_initializers.iter()) {
-            for written in base_includes_in(expr, false) {
+            for written in base_includes_in(expr, false, hooks) {
                 record(app, &scope, &written);
             }
         }
@@ -70,25 +84,27 @@ pub(super) fn collect(app: &mut App) {
         let mut statements = Vec::new();
         program_statements(&program.items, &mut statements);
         for expr in statements {
-            for written in base_includes_in(expr, false) {
+            for written in base_includes_in(expr, false, hooks) {
                 record(app, "", &written);
             }
         }
     }
-    for lc in app.library_classes.iter().filter(|c| c.name.0.as_str().trim_start_matches("::") == BASE) {
-        for include in &lc.includes {
-            record(app, "", include.0.as_str());
+    if hooks == Hooks::ActiveRecord {
+        for lc in app.library_classes.iter().filter(|c| c.name.0.as_str().trim_start_matches("::") == BASE) {
+            for include in &lc.includes {
+                record(app, "", include.0.as_str());
+            }
         }
     }
     for program in &app.initializer_programs {
         let Some(holder) = app.library_classes.iter().find(|c| c.name == program.holder) else { continue };
         for method in &holder.methods {
-            for written in base_includes_in(&method.body, false) {
+            for written in base_includes_in(&method.body, false, hooks) {
                 record(app, "", &written);
             }
         }
     }
-    app.framework_base_includes = found;
+    found
 }
 
 fn program_statements<'a>(items: &'a [ProgramItem], out: &mut Vec<&'a Expr>) {
@@ -133,16 +149,16 @@ fn include_args(args: &[Expr], method: &str) -> Option<Vec<String>> {
 
 /// The modules `expr` includes into the base, as written. `in_hook`:
 /// `self` is the base (an `on_load(:active_record)` block's body).
-fn base_includes_in(expr: &Expr, in_hook: bool) -> Vec<String> {
+fn base_includes_in(expr: &Expr, in_hook: bool, hooks: Hooks) -> Vec<String> {
     let mut out = Vec::new();
-    walk(expr, in_hook, &mut out);
+    walk(expr, in_hook, hooks, &mut out);
     out
 }
 
-fn walk(expr: &Expr, in_hook: bool, out: &mut Vec<String>) {
+fn walk(expr: &Expr, in_hook: bool, hooks: Hooks, out: &mut Vec<String>) {
     if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
         let on_base = match recv {
-            Some(r) => is_base(r) || (in_hook && matches!(&*r.node, ExprNode::SelfRef)),
+            Some(r) => (hooks == Hooks::ActiveRecord && is_base(r)) || (in_hook && matches!(&*r.node, ExprNode::SelfRef)),
             None => in_hook,
         };
         if on_base {
@@ -153,31 +169,32 @@ fn walk(expr: &Expr, in_hook: bool, out: &mut Vec<String>) {
         }
         let hook = method.as_str() == "on_load"
             && recv.as_ref().and_then(const_name).is_some_and(|n| n.trim_start_matches("::") == "ActiveSupport")
-            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { value } }) if value.as_str() == "active_record");
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { value } })
+                if (value.as_str() == "active_record") == (hooks == Hooks::ActiveRecord));
         if hook {
             if let Some(ExprNode::Lambda { body, .. }) = block.as_ref().map(|b| &*b.node) {
-                walk(body, true, out);
+                walk(body, true, hooks, out);
             }
             return;
         }
         // Another block runs with its own `self` or later: only an
         // explicit `ActiveRecord::Base.include` inside it counts.
         if let Some(r) = recv {
-            walk(r, in_hook, out);
+            walk(r, in_hook, hooks, out);
         }
         for arg in args {
-            walk(arg, in_hook, out);
+            walk(arg, in_hook, hooks, out);
         }
         if let Some(ExprNode::Lambda { body, .. }) = block.as_ref().map(|b| &*b.node) {
-            walk(body, false, out);
+            walk(body, false, hooks, out);
         }
         return;
     }
     if matches!(&*expr.node, ExprNode::Lambda { .. }) {
-        expr.node.for_each_child(&mut |child| walk(child, false, out));
+        expr.node.for_each_child(&mut |child| walk(child, false, hooks, out));
         return;
     }
-    expr.node.for_each_child(&mut |child| walk(child, in_hook, out));
+    expr.node.for_each_child(&mut |child| walk(child, in_hook, hooks, out));
 }
 
 /// The carried module `written` names, read from `scope` outwards.

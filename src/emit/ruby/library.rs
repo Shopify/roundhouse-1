@@ -14146,7 +14146,10 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
     // `ClassMethods` (measured 3.2.1's `Measured::Rails::ActiveRecord::
     // Weight`). The tree's Concern port (runtime/active_support_concern.rb)
     // runs it.
-    let base_included_concern = lc.is_module && app.framework_base_includes.contains(&lc.name);
+    // The same holds for one a lazy-load hook includes into another base
+    // (`App::load_hook_includes`: `ActiveSupport::TestCase`).
+    let base_included_concern =
+        lc.is_module && (app.framework_base_includes.contains(&lc.name) || app.load_hook_includes.contains(&lc.name));
     lc.unknown_calls
         .iter()
         .filter(|call| {
