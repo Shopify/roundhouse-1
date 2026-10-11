@@ -246,7 +246,10 @@ impl Overlay {
         }
 
         let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
-        let lower_diags = roundhouse::session::analyze_and_lower(&mut app);
+        let mut lower_diags = roundhouse::session::analyze_and_lower(&mut app);
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+            roundhouse::lower::helper_kwargs::demote_constructor_keywords_run_as_written(&mut lower_diags);
+        }
         let mut errors: Vec<_> = diagnose(&app)
             .into_iter()
             .chain(lower_diags)

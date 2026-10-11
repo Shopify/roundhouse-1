@@ -1231,6 +1231,19 @@ pub(super) fn library_class_from_node(
 /// application object is a singleton, making instance-vs-singleton
 /// definition indistinguishable to callers). Empty when the file has
 /// no such block.
+/// `class << Rails.application`, the statement the function below reads.
+/// `boot_requires` leaves it out of the boot program for the same reason:
+/// its methods are carried as `Rails::Application` methods.
+pub(super) fn is_rails_application_singleton(stmt: &ruby_prism::Node<'_>) -> bool {
+    let Some(sc) = stmt.as_singleton_class_node() else { return false };
+    let Some(call) = sc.expression().as_call_node() else { return false };
+    if constant_id_str(&call.name()) != "application" || call.arguments().is_some() {
+        return false;
+    }
+    let Some(recv) = call.receiver() else { return false };
+    constant_path_of(&recv).is_some_and(|path| path.join("::") == "Rails")
+}
+
 pub fn ingest_rails_application_singleton_methods(
     source: &[u8],
     file: &str,
@@ -1243,16 +1256,10 @@ pub fn ingest_rails_application_singleton_methods(
         return Ok(out);
     };
     for stmt in prog.statements().body().iter() {
+        if !is_rails_application_singleton(&stmt) {
+            continue;
+        }
         let Some(sc) = stmt.as_singleton_class_node() else { continue };
-        let Some(call) = sc.expression().as_call_node() else { continue };
-        if constant_id_str(&call.name()) != "application" || call.arguments().is_some() {
-            continue;
-        }
-        let Some(recv) = call.receiver() else { continue };
-        let Some(path) = constant_path_of(&recv) else { continue };
-        if path.join("::") != "Rails" {
-            continue;
-        }
         let body = walk_decl_body(sc.body(), &owner, file, false)?;
         if !body.conditional_definitions.is_empty() {
             return Err(IngestError::Unsupported {

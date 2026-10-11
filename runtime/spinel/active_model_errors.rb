@@ -244,15 +244,6 @@ module ActiveModel
       where(errors, attribute, type).map(&:full_message).freeze
     end
 
-    # Rails' `full_message(attribute, message)`: the bare message on
-    # :base, else `"%{attribute} %{message}"` with the attribute
-    # humanized as the pushes humanize it (`add_humanized`).
-    def self.full_message(errors, attribute, message)
-      return errors.full_message(attribute, message) unless errors.is_a?(Array)
-      return message if attribute == :base
-      "#{ActiveSupport.humanize(attribute.to_s.tr(".", "_"))} #{message}"
-    end
-
     # Rails' `delete(attribute, type = nil, **options)`: removes the
     # matching errors, answering their short messages, or nil for none.
     def self.delete(errors, attribute, type = nil, **options)

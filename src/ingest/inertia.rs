@@ -101,37 +101,39 @@ fn extract_inertia_config(source: &[u8], file: &str, config: &mut InertiaConfig)
                 .and_then(|p| p.as_required_parameter_node())?;
             Some((block, param))
         });
+        let (start, end) = (stmt.location().start_offset(), stmt.location().end_offset());
         let Some((block, param)) = named else {
-            survey::record(&IngestError::Unsupported {
-                file: file.to_string(),
-                message: "InertiaRails.configure: a configuration without a block that names its parameter (`do |config|`) is not read; its options are not applied".to_string(),
-            });
+            let message = "InertiaRails.configure: a configuration without a block that names its parameter (`do |config|`) is not read; its options are not applied";
+            super::initializers::refuse(file, start, end, message);
+            survey::record(&IngestError::Unsupported { file: file.to_string(), message: message.to_string() });
             found = true;
             continue;
         };
         let param = super::util::constant_id_str(&param.name());
         found = true;
-        let Some(body) = block.body() else { continue };
+        let Some(body) = block.body() else {
+            super::initializers::consume(file, start, end);
+            continue;
+        };
         // Not read even partially: the main statements' assignments hold
         // only if nothing raises, and the rescue clauses' only if something
         // does, so neither is the configuration on its own.
         let Some(body) = body.as_statements_node() else {
-            survey::record(&IngestError::Unsupported {
-                file: file.to_string(),
-                message: "InertiaRails.configure: a block with `rescue` or `ensure` is not read; its options are not applied".to_string(),
-            });
+            let message = "InertiaRails.configure: a block with `rescue` or `ensure` is not read; its options are not applied";
+            super::initializers::refuse(file, start, end, message);
+            survey::record(&IngestError::Unsupported { file: file.to_string(), message: message.to_string() });
             continue;
         };
+        let mut first_gap: Option<String> = None;
         for inner in body.body().iter() {
             let loc = inner.location();
             let text = &src[loc.start_offset()..loc.end_offset()];
-            let gap = |why: &str| {
-                survey::record(&IngestError::Unsupported {
-                    file: file.to_string(),
-                    message: format!(
-                        "InertiaRails.configure: {why} (`{text}`); the emitted app uses the gem's default"
-                    ),
-                });
+            let mut gap = |why: &str| {
+                let message = format!(
+                    "InertiaRails.configure: {why} (`{text}`); the emitted app uses the gem's default"
+                );
+                first_gap.get_or_insert_with(|| message.clone());
+                survey::record(&IngestError::Unsupported { file: file.to_string(), message });
             };
             let Some(assign) = inner.as_call_node() else {
                 gap("not an option assignment");
@@ -177,6 +179,12 @@ fn extract_inertia_config(source: &[u8], file: &str, config: &mut InertiaConfig)
                 }
                 _ => gap("option not modeled"),
             }
+        }
+        // A block whose every option is applied is consumed; one with a gap
+        // is refused with that gap's reason, which the coverage error names.
+        match first_gap {
+            Some(reason) => super::initializers::refuse(file, start, end, reason),
+            None => super::initializers::consume(file, start, end),
         }
     }
     found

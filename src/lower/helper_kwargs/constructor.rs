@@ -599,6 +599,17 @@ fn constructor_refusal_reason(
     None
 }
 
+/// What a refusal says when only ingest's flattening caused it ([`runs_as_written`]).
+pub(crate) const AS_WRITTEN_NOTE: &str = "the CRuby tree, which writes flattened keywords back, runs the call as written";
+
+/// Whether `d` is a constructor-keyword refusal the CRuby and JRuby trees
+/// run as written ([`refuse_constructor`]'s `CONSTRUCTOR_KEYWORDS_AS_WRITTEN`):
+/// an error only for the targets that keep the flattened keywords positional.
+pub(crate) fn runs_as_written(d: &crate::diagnostic::Diagnostic) -> bool {
+    matches!(&d.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, detail, .. }
+        if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS && detail.ends_with(AS_WRITTEN_NOTE))
+}
+
 /// The refusal holds on every target that keeps ingest's flattened
 /// keywords positional. Where its only cause is that flattening, and the
 /// Ruby family writes every flattened constructor keyword back, the call
@@ -615,7 +626,7 @@ fn refuse_constructor(
     let as_written = params.ruby_family_positional_constructor.is_none() && !refinement;
     let detail = match &params.ruby_family_positional_constructor {
         _ if as_written => format!(
-            "{detail}; the CRuby tree, which writes flattened keywords back, runs the call as written"
+            "{detail}; {AS_WRITTEN_NOTE}"
         ),
         Some(positional) if !refinement => format!(
             "{detail}; refused on the CRuby tree too: `{positional}` keeps flattened keywords positional there"

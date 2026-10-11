@@ -8,7 +8,7 @@
 //! controller ivar came out unresolved. The model's (or its included
 //! concern's) declaration stays the only fact source.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

@@ -86,7 +86,7 @@ pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 /// models' `Array[String]` accumulator cannot answer by itself
 /// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `details`,
 /// `merge!`, the queries by attribute (`where`, `include?`, `of_kind?`,
-/// `added?`, `messages_for`, `full_messages_for`, `full_message`),
+/// `added?`, `messages_for`, `full_messages_for`),
 /// `delete`, `import`, and Enumerable over the Errors,
 /// [`errors_enumerable`]):
 /// the messages by attribute, or another collection's errors. The CRuby
@@ -107,7 +107,6 @@ pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
         // Rails' queries by attribute, and `delete` / `import`.
         "include?" | "key?" | "has_key?" | "exclude?" => args == 1 && !block,
         "of_kind?" | "messages_for" | "full_messages_for" | "import" => (1..=2).contains(&args) && !block,
-        "full_message" => args == 2 && !block,
         "where" | "added?" | "delete" => (1..=3).contains(&args) && !block,
         _ => errors_enumerable(method, args, block),
     }
@@ -271,27 +270,32 @@ pub const FROM_PARAMS_EXPECT: u64 = 1 << 28;
 /// refusal stub.
 pub const CONSTRUCTOR_KEYWORDS_AS_WRITTEN: u64 = 1 << 29;
 
+// Upstream numbered the next four 9-12; this lane already owns those
+// (SELF_BINDING .. ERASED_KEYWORD_SPLAT), so they take the last free
+// cross-target bits (30, 31) and the overflow range above the
+// rust-local bits (36+, see `emit::rust::decide::bits`).
+
 /// A statement hoisted out of a Concern's `class_methods do … end` block into
 /// the module's captured body statements. Its `self` is the class-side
 /// module the block builds, not the module body it is written back into, so
 /// a refused `define_method` loop here cannot run as written.
-pub const CLASS_METHODS_BLOCK_STATEMENT: u64 = 1 << 30;
+pub const CLASS_METHODS_BLOCK_STATEMENT: u64 = 1 << 38;
 
 /// A statement whose value the enclosing sequence discards (not its tail).
-pub const DISCARDED_VALUE: u64 = 1 << 9;
+pub const DISCARDED_VALUE: u64 = 1 << 30;
 
 /// A `Preloader.new(records:, associations:).call` the analyzer admitted:
 /// discarded, over one model's records. Only this one lowers.
-pub const ADMITTED_PRELOADER_CALL: u64 = 1 << 10;
+pub const ADMITTED_PRELOADER_CALL: u64 = 1 << 31;
 
 /// A written constant inside a body Rubydex does not index (the
 /// `class << Rails.application` settings block): the file is in the
 /// snapshot, but no reference was recorded at this span, so the absence
 /// is not evidence of an indexing defect.
-pub const UNINDEXED_SCOPE_CONST_REF: u64 = 1 << 11;
+pub const UNINDEXED_SCOPE_CONST_REF: u64 = 1 << 36;
 
 /// The `defaults.merge(hash)` ingest wrote for `hash.reverse_merge(defaults)`.
-pub const REVERSE_MERGE: u64 = 1 << 12;
+pub const REVERSE_MERGE: u64 = 1 << 37;
 
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
@@ -2036,13 +2040,16 @@ mod tests {
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
-            FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN, CLASS_METHODS_BLOCK_STATEMENT,
+            FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN,
+            DISCARDED_VALUE, ADMITTED_PRELOADER_CALL, UNINDEXED_SCOPE_CONST_REF, REVERSE_MERGE, CLASS_METHODS_BLOCK_STATEMENT,
+            crate::emit::rust::decide::bits::STR_TO_OWNED, crate::emit::rust::decide::bits::STR_BORROW,
+            crate::emit::rust::decide::bits::CLONE_AT,
         ];
         let mut seen = 0u64;
         for bit in bits {
             assert_eq!(bit.count_ones(), 1);
             assert_eq!(seen & bit, 0, "bit {} is taken twice", bit.trailing_zeros());
-            assert!(bit > 0b11 && bit < 1 << 32);
+            assert!(bit > 0b11 && bit < 1 << 48);
             seen |= bit;
         }
     }

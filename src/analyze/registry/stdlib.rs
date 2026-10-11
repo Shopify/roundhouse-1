@@ -466,15 +466,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActiveSupport::SecurityUtils", &[
         ("secure_compare", Ty::Bool), ("fixed_length_secure_compare", Ty::Bool),
     ], &[]);
-    // `ActiveSupport::HashWithIndifferentAccess.new(params)` (and the
-    // top-level alias): a Hash subclass storing its keys as Strings,
-    // the value `with_indifferent_access` already types as (the Ruby
-    // family's port is ruby_overlay active_support_core_ext.rb).
-    // `crate::rbs` and `sorbet_sig::named_ty` read the name the same way.
-    let indifferent = || Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) };
-    for name in ["ActiveSupport::HashWithIndifferentAccess", "HashWithIndifferentAccess"] {
-        register_stdlib_class(classes, name, &[("new", indifferent()), ("[]", indifferent())], &[]);
-    }
     register_stdlib_class(classes, "File", &[
         ("read", Ty::Str), ("binread", Ty::Str), ("write", Ty::Int),
         ("exist?", Ty::Bool), ("exists?", Ty::Bool), ("file?", Ty::Bool),

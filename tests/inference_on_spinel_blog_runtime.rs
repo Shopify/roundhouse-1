@@ -430,7 +430,16 @@ fn untyped_subexpressions_baseline() {
     // `depth` read in the savepoint name, unmodeled here like the others.
     // #818 AssociationReflection + `reflect_on_association`: +5 over the
     // r13-merge ceiling (552 -> 557), as origin/main measured it.
-    const CEILING: usize = 557;
+    // Merge of origin/main 007406d92 into ruby-lane-final 9352caa8a,
+    // RE-MEASURED: 552 -> 786. The lane's ruby-family runtime (Base,
+    // Relation, TokenFor, ScopeRegistry, ...) already read 774 sites at
+    // 9352caa8a against the unmeasured 552 ceiling; the merge adds 12 of upstream's #818
+    // (`reflect_on_association`, AssociationReflection#initialize,
+    // `Relation#reflection_join_sql`), unannotated parameters read here
+    // without their RBS like every other site above. Not fixed by
+    // annotating: this probe is the no-RBS reading, the RBS-aware
+    // `every_runtime_method_body_is_fully_typed` gate is green.
+    const CEILING: usize = 786;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

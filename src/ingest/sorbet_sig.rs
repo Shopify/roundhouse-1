@@ -909,9 +909,8 @@ pub(crate) fn named_ty(name: &str) -> Ty {
         "Float" => Ty::Float,
         "String" => Ty::Str,
         "Hash" => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
-        // String-keyed, as `with_indifferent_access` types it.
         "ActiveSupport::HashWithIndifferentAccess" | "HashWithIndifferentAccess" => {
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) }
+            crate::analyze::indifferent::of(Ty::Untyped)
         }
         "Array" => Ty::Array { elem: Box::new(Ty::Untyped) },
         "Symbol" => Ty::Sym,

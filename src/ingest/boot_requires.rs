@@ -328,6 +328,11 @@ impl<V: Vfs + ?Sized> BootProgram<'_, '_, V> {
             if writes_bundle_gemfile(stmt) {
                 continue;
             }
+            // `class << Rails.application` in config/application.rb: its defs are
+            // `Rails::Application` methods (`ingest::app`), not a boot statement.
+            if self.path.ends_with("config/application.rb") && super::library_class::is_rails_application_singleton(stmt) {
+                continue;
+            }
             out.push(self.statement(stmt));
         }
     }
