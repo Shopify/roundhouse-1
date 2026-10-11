@@ -1,6 +1,9 @@
 # Instance-method facade of ActionView::Helpers::NumberHelper, separated
 # from its module-function implementation for runtime source typing.
-require_relative "action_view_number_helper"
+# action_view_number_helper.rb requires this file from its tail, after it has opened
+# ActionView::Helpers::NumberHelper; requiring it back while it is still loading is a circular
+# require.
+require_relative "action_view_number_helper" unless defined?(ActionView::Helpers::NumberHelper)
 
 module ActionView
   module Helpers

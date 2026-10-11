@@ -37,3 +37,33 @@ end
         .run_test("test/models/api_test.rb");
     run.assert_passes();
 }
+
+#[test]
+fn a_framework_superclass_is_rooted_when_a_sibling_namespace_shadows_its_head() {
+    // The sibling `Ledger::ActiveSupport` is loaded before the file that
+    // writes `ActiveSupport::HashWithIndifferentAccess` in a class header
+    // (Ruby binds the superclass at that point: natively the sibling's
+    // file loads later; the emitted tree's boot loads every model file).
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write(
+            "lib/ledger/active_support/serializer.rb",
+            "class Ledger\n  module ActiveSupport\n    class Serializer\n      def self.kind = :serializer\n    end\n  end\nend\n",
+        )
+        .write(
+            "lib/ledger/table.rb",
+            "class Ledger\n  class Table < ActiveSupport::HashWithIndifferentAccess\n    def self.kind = :table\n  end\nend\n",
+        )
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/table_test.rb", r#"require "test_helper"
+require "ledger/active_support/serializer"
+require "ledger/table"
+class TableTest < ActiveSupport::TestCase
+  test "a framework superclass written under a shadowing sibling namespace binds the top-level constant" do
+    assert_equal [:table, ::ActiveSupport::HashWithIndifferentAccess], [Ledger::Table.kind, Ledger::Table.superclass]
+  end
+end
+"#)
+        .run_test("test/models/table_test.rb");
+    run.assert_passes();
+}

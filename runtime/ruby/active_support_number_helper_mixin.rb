@@ -1,7 +1,10 @@
 # Instance-method form of ActiveSupport::NumberHelper. Kept separate from
 # the module-function stem because the runtime source checker matches methods
 # by their short class name and cannot distinguish the two forms in one file.
-require_relative "active_support_number_helper"
+# active_support_number_helper.rb requires this file from its tail, after it has opened
+# ActiveSupport::NumberHelper; requiring it back while it is still loading is a circular
+# require.
+require_relative "active_support_number_helper" unless defined?(ActiveSupport::NumberHelper)
 
 module ActiveSupport
   module NumberHelper
