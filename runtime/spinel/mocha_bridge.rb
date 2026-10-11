@@ -23,6 +23,17 @@ module MochaBridge
           "mocha: #{konst}.#{kind}(:#{meth}) with #{ops.length} chained link(s) is not a stub shape this target serves"
   end
 
+  # A constant or brace-less keyword-hash argument, marked for the replay
+  # side; here the chain that carries it raises, so the marker is never
+  # resolved.
+  def self.konst(name)
+    name
+  end
+
+  def self.kwargs(hash)
+    hash
+  end
+
   # A bare parameter matcher (`has_entry(...)`, `anything`) from
   # `Mocha::ParameterMatchers`, by name.
   def self.matcher(name, arg = nil)
