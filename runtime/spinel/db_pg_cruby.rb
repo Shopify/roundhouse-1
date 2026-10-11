@@ -913,11 +913,22 @@ module Db
     nil
   end
 
+  # Rails' QueryIntent#preprocess_query (connection_adapters/query_intent.rb):
+  # each of `ActiveRecord.query_transformers` rewrites the statement the
+  # adapter sends, in order (QueryLogs appends its comment).
+  def self.transform_query(sql, adapter)
+    transformers = ActiveRecord.query_transformers if defined?(ActiveRecord.query_transformers)
+    return sql if transformers.nil? || transformers.empty?
+    transformers.each { |transformer| sql = transformer.call(sql, adapter) }
+    sql
+  end
+
   # `name` is the `sql.active_record` event's (Rails' `execute(sql, name)`).
   def self.exec(sql, name = "SQL")
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
+    sql = transform_query(sql, adapter)
     result = adapter.raw_execute(sql, name) { |conn| adapter.perform_query(conn, sql) }
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     nil
@@ -931,6 +942,7 @@ module Db
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
+    sql = transform_query(sql, adapter)
     result = adapter.raw_execute(sql) { |conn| adapter.perform_query(conn, sql) }
     raise "INSERT RETURNING must produce one key" unless result.ntuples == 1 && result.nfields == 1
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
@@ -1097,10 +1109,17 @@ module Db
       return
     end
     record_query(sql)
+    # A statement a transformer rewrites is sent unprepared, as Rails'
+    # query_log_tags_config sets ActiveRecord.disable_prepared_statements:
+    # a comment that varies per request would otherwise churn the
+    # connection's prepared statement cache.
+    sent = transform_query(sql, adapter)
+    transformed = !sent.equal?(sql) && sent != sql
+    sql = sent
     result = adapter.raw_execute(sql, "SQL", binds) do |conn|
       if binds.empty?
         adapter.perform_query(conn, sql)
-      elsif handle[:uncached]
+      elsif handle[:uncached] || transformed
         adapter.perform_query(conn, sql, binds)
       else
         cache = conn.instance_variable_get(:@rh_pg_cache)

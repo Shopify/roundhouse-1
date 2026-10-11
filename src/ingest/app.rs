@@ -12214,6 +12214,11 @@ pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
         "active_record.maintain_test_schema",
         "runtime/database_configuration.rb DatabaseConfiguration.maintain_test_schema gates the boot schema load",
     ),
+    ("active_record.query_log_tags_enabled", QUERY_LOG_TAGS_APPLIED_BY),
+    ("active_record.query_log_tags", QUERY_LOG_TAGS_APPLIED_BY),
+    ("active_record.query_log_tags_format", QUERY_LOG_TAGS_APPLIED_BY),
+    ("active_record.cache_query_log_tags", QUERY_LOG_TAGS_APPLIED_BY),
+    ("active_record.query_log_tags_prepend_comment", QUERY_LOG_TAGS_APPLIED_BY),
     ("active_support.deprecation", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
     ("active_support.disallowed_deprecation", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
     (
@@ -12229,6 +12234,12 @@ pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
     ("i18n.locale", I18N_APPLIED_BY),
     ("i18n.raise_on_missing_translations", I18N_APPLIED_BY),
 ];
+
+/// `active_record.query_log_tags_*` (`project::QUERY_LOG_TAGS_KEYS`):
+/// activerecord 8.2.0.alpha railtie.rb:405-437 puts QueryLogs among the
+/// query transformers once the app has initialized, and applies the app's
+/// tags, format, caching and comment position to it.
+const QUERY_LOG_TAGS_APPLIED_BY: &str = "runtime/active_record_query_logs.rb ActiveRecord::QueryLogs.apply_railtie_config";
 
 /// `i18n.*` (`project::I18N_CONFIG_KEYS`): activesupport 8.2.0.alpha
 /// i18n_railtie.rb's `initialize_i18n` applies `config.i18n` to I18n once

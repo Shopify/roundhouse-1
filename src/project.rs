@@ -4560,6 +4560,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read deprecation runtime: {e}"))?;
     files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
     let deprecation_behavior = deprecation_behavior_block(app);
+    let query_log_tags = query_log_tags_block(app);
     // Active Job's error classes (8.2.0.alpha enqueuing.rb, core.rb,
     // arguments.rb), which `require "active_job"` defines before app code.
     let job_errors = crate::runtime_files::read_to_string("runtime/spinel/active_job_errors.rb")
@@ -4834,6 +4835,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let ar_log_subscriber = crate::runtime_files::read_to_string("runtime/spinel/active_record_log_subscriber.rb")
         .map_err(|e| format!("read Active Record log subscriber runtime: {e}"))?;
     files.push(("runtime/active_record_log_subscriber.rb".into(), ar_log_subscriber));
+    // ActiveRecord::QueryLogs, ActiveRecord.query_transformers and the
+    // railtie's `active_record.query_log_tags_config` (8.2.0.alpha).
+    let ar_query_logs = crate::runtime_files::read_to_string("runtime/spinel/active_record_query_logs.rb")
+        .map_err(|e| format!("read Active Record query logs runtime: {e}"))?;
+    files.push(("runtime/active_record_query_logs.rb".into(), ar_query_logs));
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
@@ -5030,7 +5036,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # Active Record's railtie: LogSubscriber.backtrace_cleaner and its\n\
                  # `active_record.backtrace_cleaner` load hook, registered ahead of\n\
                  # every config/initializers file.\n\
-                 require_relative \"runtime/active_record_log_subscriber\"\n",
+                 require_relative \"runtime/active_record_log_subscriber\"\n\
+                 # Active Record's query transformers and QueryLogs, the tags API\n\
+                 # an initializer configures (railtie.rb `active_record.query_log_tags_config`).\n\
+                 require_relative \"runtime/active_record_query_logs\"\n",
             );
             // The app's `inflect.*` declarations (config/initializers), which
             // Rails runs after the gems load and before the app's code, in
@@ -5080,6 +5089,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = at + environment.len();
             content.insert_str(at, &deprecation_behavior);
             let at = at + deprecation_behavior.len();
+            content.insert_str(at, &query_log_tags);
+            let at = at + query_log_tags.len();
             content.insert_str(at, &i18n_config);
             let at = at + i18n_config.len();
             content.insert_str(
@@ -6591,6 +6602,47 @@ fn deprecation_behavior_block(app: &App) -> String {
          # (railtie.rb:92): the app's config.active_support deprecation keys\n\
          # configure every registered deprecator (runtime/active_support_deprecation.rb).\n\
          Rails::Application.apply_deprecation_behavior({})\n",
+        args.join(", ")
+    )
+}
+
+/// The `config.active_record` keys activerecord's
+/// `active_record.query_log_tags_config` initializer reads, by the keyword
+/// `ActiveRecord::QueryLogs.apply_railtie_config` takes
+/// (runtime/active_record_query_logs.rb).
+const QUERY_LOG_TAGS_KEYS: &[(&str, &str)] = &[
+    ("query_log_tags_enabled", "enabled"),
+    ("query_log_tags", "tags"),
+    ("query_log_tags_format", "format"),
+    ("cache_query_log_tags", "cache"),
+    ("query_log_tags_prepend_comment", "prepend_comment"),
+];
+
+/// activerecord 8.2.0.alpha railtie.rb:405-437
+/// (`active_record.query_log_tags_config`): ahead of the app's
+/// config/initializers, register the after-initialize step that turns the
+/// app's `config.active_record.query_log_tags_*` into query transformers.
+/// A key the app writes is read through the reader ingest lifts onto the
+/// Application reopen (`ingest::app::APPLIED_FRAMEWORK_CONFIG_KEYS`); one
+/// it never writes is nil, as Rails' OrderedOptions answers.
+fn query_log_tags_block(app: &App) -> String {
+    let lifted = |reader: &str| {
+        app.rails_application.as_ref().is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == reader))
+    };
+    let args: Vec<String> = QUERY_LOG_TAGS_KEYS
+        .iter()
+        .map(|(key, keyword)| {
+            let reader = crate::ingest::app::applied_framework_config_reader(&format!("active_record.{key}"));
+            let value = if lifted(&reader) { format!("Rails.application.{reader}") } else { "nil".to_string() };
+            format!("{keyword}: {value}")
+        })
+        .collect();
+    format!(
+        "# activerecord's `active_record.query_log_tags_config` initializer\n\
+         # (railtie.rb:405): the app's config.active_record.query_log_tags_* keys\n\
+         # configure QueryLogs once the app has initialized\n\
+         # (runtime/active_record_query_logs.rb).\n\
+         ActiveRecord::QueryLogs.apply_railtie_config({})\n",
         args.join(", ")
     )
 }
@@ -12901,7 +12953,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/rails_framework_locales.rb"
         && p != "runtime/action_dispatch_session_store.rb"
         && p != "runtime/action_dispatch_show_exceptions.rb"
-        && p != "runtime/active_record_log_subscriber.rb");
+        && p != "runtime/active_record_log_subscriber.rb"
+        && p != "runtime/active_record_query_logs.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance
