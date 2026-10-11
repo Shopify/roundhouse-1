@@ -8924,6 +8924,20 @@ pub(crate) fn mixin_path_id(path: &[Symbol]) -> ClassId {
     ClassId(Symbol::from(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
 }
 
+/// Whether the model's own instance `initialize` calls `super`.
+fn initialize_calls_super(model: &crate::dialect::Model) -> bool {
+    fn calls_super(expr: &Expr) -> bool {
+        let mut found = matches!(&*expr.node, ExprNode::Super { .. });
+        expr.node.for_each_child(&mut |child| found = found || calls_super(child));
+        found
+    }
+    model.methods().any(|m| {
+        m.name.as_str() == "initialize"
+            && m.receiver == crate::dialect::MethodReceiver::Instance
+            && calls_super(&m.body)
+    })
+}
+
 pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     let mut out = Vec::new();
     for item in &model.body {
@@ -8943,8 +8957,20 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
                 // supplies each family instead; the library-class twin
                 // calls the same predicate from ingest's decl walk.
                 let segs: Vec<&str> = id.0.as_str().split("::").collect();
-                if crate::ingest::util::is_active_model_marker_include(&segs)
-                    || crate::ingest::util::is_view_helper_marker_include(&segs)
+                //
+                // `ActiveModel::Model` is the exception when the class's
+                // own `initialize` calls `super`: the lowering would
+                // have synthesized the attribute-hash constructor into
+                // `initialize` itself
+                // (`model_to_library::validations::push_active_model_constructor`),
+                // which the class's own definition replaces, leaving
+                // that `super` to reach Object#initialize. The include
+                // stays so the runtime port supplies it
+                // (activemodel/lib/active_model/api.rb `initialize`).
+                let keeps_constructor = id.0.as_str() == "ActiveModel::Model" && initialize_calls_super(model);
+                if !keeps_constructor
+                    && (crate::ingest::util::is_active_model_marker_include(&segs)
+                        || crate::ingest::util::is_view_helper_marker_include(&segs))
                 {
                     continue;
                 }
