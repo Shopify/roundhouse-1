@@ -301,7 +301,26 @@ module Rails
             end
           end
         end
-        [add_locales]
+        [add_locales, *class_body_initializers(app)]
+      end
+
+      # The `initializer` blocks the application's class body registered
+      # (config/application.rb, compiled onto the `Rails::Application`
+      # reopen), bound to the application as Rails' Initializer#bind does,
+      # in registration order. Rails stops the boot when one raises; this
+      # tree names the one that did (error[gem_railtie_not_run]) and goes
+      # on, as it does for a railtie's, because a body can need Rails this
+      # tree does not port.
+      def class_body_initializers(app) # :nodoc:
+        ::Rails::Application.initializers.map do |initializer|
+          name, body = initializer.name, initializer.block
+          Initializable::Initializer.new(
+            name, app, before: initializer.before, after: initializer.after,
+            group: initializer.instance_variable_get(:@group)
+          ) do |*args|
+            Railtie.not_run_unless_it_runs("#{self.class.name} initializer #{name.inspect}") { instance_exec(*args, &body) }
+          end
+        end
       end
 
       def find_root(from)

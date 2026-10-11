@@ -33,6 +33,7 @@ pub mod database_yml;
 mod database_yml_adapters;
 pub mod controller;
 pub mod environments;
+mod application_initializers;
 mod engine_config;
 mod error_site;
 mod data_factory;
