@@ -471,21 +471,21 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         ErrorShort::After(prefix) => format!(
             "ActiveModel::ErrorAttributes.add({}, {attribute}, {}, {}{})",
             emit_expr(recv),
-            emit_expr(msg),
+            emit_arg(msg),
             emit_node(&ExprNode::Lit { value: crate::expr::Literal::Str { value: prefix.clone() } }),
             detail_args(detail)
         ),
         ErrorShort::AfterHumanized => format!(
             "ActiveModel::ErrorAttributes.add_humanized({}, {attribute}, {}{})",
             emit_expr(recv),
-            emit_expr(msg),
+            emit_arg(msg),
             detail_args(detail)
         ),
         ErrorShort::Unknown => match detail_args(detail) {
             extra if extra.is_empty() => {
-                format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {})", emit_expr(recv), emit_expr(msg))
+                format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {})", emit_expr(recv), emit_arg(msg))
             }
-            extra => format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {}, nil{extra})", emit_expr(recv), emit_expr(msg)),
+            extra => format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {}, nil{extra})", emit_expr(recv), emit_arg(msg)),
         },
     };
     // The analyzer types `attribute_names` on ActiveModel::Errors; a
@@ -496,7 +496,7 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
     let errors_reader = matches!(&*recv.node, ExprNode::Send { method, args, .. } if method.as_str() == "errors" && args.is_empty());
     let read = |name: &str| {
         let mut written = vec![emit_expr(recv)];
-        written.extend(args.iter().map(emit_expr));
+        written.extend(args.iter().map(emit_arg));
         format!("ActiveModel::ErrorAttributes.{name}({})", written.join(", "))
     };
     match (e.hint.as_ref(), method.as_str(), args.as_slice()) {
@@ -830,6 +830,9 @@ fn emit_node(n: &ExprNode) -> String {
                     indent_lines(&emit_expr(else_branch), 1),
                 )
             }
+        }
+        ExprNode::Case { scrutinee, arms } if !arms.iter().any(is_when_arm) => {
+            emit_expr(&case_without_whens(scrutinee, arms))
         }
         ExprNode::Case { scrutinee, arms } => {
             let mut s = format!("case {}\n", emit_expr(scrutinee));
@@ -1593,7 +1596,42 @@ fn renders_as_trailing_modifier(e: &Expr) -> bool {
 /// newlines end the enclosing call; wrapped in parens Ruby reads
 /// `(a\nb)` as one grouped expression answering `b`.
 fn is_multi_seq(e: &Expr) -> bool {
-    matches!(&*e.node, ExprNode::Seq { exprs } if exprs.len() > 1)
+    match &*e.node {
+        ExprNode::Seq { exprs } => exprs.len() > 1,
+        ExprNode::Case { scrutinee, arms } if !arms.iter().any(is_when_arm) => {
+            is_multi_seq(&case_without_whens(scrutinee, arms))
+        }
+        _ => false,
+    }
+}
+
+/// An arm that prints as a `when` clause, as opposed to the `else` one
+/// (`emit_arm`'s guard-free Wildcard).
+fn is_when_arm(arm: &Arm) -> bool {
+    !(matches!(arm.pattern, Pattern::Wildcard) && arm.guard.is_none())
+}
+
+/// parse.y `case_body`/`k_case expr_value opt_terms case_body`: a `case`
+/// needs at least one `when` (prism: "expected a `when` or `in` clause
+/// after `case`"), so one whose clauses were all folded away, leaving
+/// only the `else`, is its scrutinee evaluated for effect and then the
+/// `else` body (`nil` without one), as a sequence. A plain read as
+/// scrutinee has no effect to keep.
+fn case_without_whens(scrutinee: &Expr, arms: &[Arm]) -> Expr {
+    let span = scrutinee.span;
+    let mut exprs = Vec::new();
+    if !matches!(&*scrutinee.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. } | ExprNode::Const { .. }) {
+        exprs.push(scrutinee.clone());
+    }
+    exprs.push(match arms.last() {
+        Some(arm) => arm.body.clone(),
+        None => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+    });
+    if exprs.len() == 1 {
+        exprs.remove(0)
+    } else {
+        Expr::new(span, ExprNode::Seq { exprs })
+    }
 }
 
 fn recv_needs_parens(r: &Expr) -> bool {
@@ -2959,6 +2997,120 @@ mod tests {
             assert_eq!(emitted, want, "source: {src}");
             assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
         }
+    }
+
+    /// Whether `ruby -c` (prism) accepts `src`.
+    fn parses(src: &str) -> bool {
+        use std::io::Write;
+        let mut check = std::process::Command::new("ruby")
+            .args(["-c", "-W0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("ruby on PATH");
+        check.stdin.take().unwrap().write_all(src.as_bytes()).unwrap();
+        check.wait().unwrap().success()
+    }
+
+    fn var(name: &str) -> Expr {
+        Expr::new(Span::default(), ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) })
+    }
+
+    fn assign(name: &str, value: Expr) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name) },
+                value,
+            },
+        )
+    }
+
+    fn seq(exprs: Vec<Expr>) -> Expr {
+        Expr::new(Span::default(), ExprNode::Seq { exprs })
+    }
+
+    fn else_only_case(scrutinee: Expr, body: Expr) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::Case {
+                scrutinee,
+                arms: vec![Arm { pattern: Pattern::Wildcard, guard: None, body }],
+            },
+        )
+    }
+
+    // parse.y `case_body`: `case x` + `else` with no `when` is a syntax
+    // error ("expected a `when` or `in` clause after `case`").
+    #[test]
+    fn a_case_with_only_an_else_prints_as_the_else_body() {
+        let case = else_only_case(var("k"), lit_str("fallback"));
+        let emitted = emit_expr(&case);
+        assert_eq!(emitted, "\"fallback\"");
+        assert!(parses(&emitted), "got {emitted}");
+    }
+
+    #[test]
+    fn a_case_with_only_an_else_still_evaluates_a_call_scrutinee() {
+        let case = else_only_case(send(None, "key", vec![]), lit_str("fallback"));
+        let emitted = emit_expr(&case);
+        assert_eq!(emitted, "key\n\"fallback\"");
+        assert!(parses(&emitted), "got {emitted}");
+        // As an argument or a right-hand side it is one grouped value.
+        let call = send(None, "f", vec![lit_sym("a"), case.clone()]);
+        let emitted = emit_expr(&call);
+        assert_eq!(emitted, "f(:a, (key\n\"fallback\"))");
+        assert!(parses(&emitted), "got {emitted}");
+        let emitted = emit_expr(&assign("x", case));
+        assert!(emitted.starts_with("x = (key"), "got {emitted}");
+        assert!(parses(&emitted), "got {emitted}");
+    }
+
+    #[test]
+    fn a_case_with_no_clauses_prints_nil() {
+        let case = Expr::new(Span::default(), ExprNode::Case { scrutinee: var("k"), arms: vec![] });
+        let emitted = emit_expr(&case);
+        assert_eq!(emitted, "nil");
+        assert!(parses(&emitted), "got {emitted}");
+    }
+
+    #[test]
+    fn a_case_with_a_when_keeps_its_clauses() {
+        let case = Expr::new(
+            Span::default(),
+            ExprNode::Case {
+                scrutinee: var("k"),
+                arms: vec![
+                    Arm { pattern: Pattern::Lit { value: Literal::Str { value: "a".into() } }, guard: None, body: lit_str("A") },
+                    Arm { pattern: Pattern::Wildcard, guard: None, body: lit_str("B") },
+                ],
+            },
+        );
+        let emitted = emit_expr(&send(None, "f", vec![case]));
+        assert_eq!(emitted, "f(case k\nwhen \"a\"\n  \"A\"\nelse\n  \"B\"\nend)");
+        assert!(parses(&emitted), "got {emitted}");
+    }
+
+    // A call argument is one expression: a statement sequence (the hoisted
+    // temporaries of a folded message) is grouped, not spliced bare, which
+    // ends the call at the first newline.
+    #[test]
+    fn a_recorded_error_message_that_is_a_statement_sequence_is_grouped() {
+        use crate::expr::{ErrorDetail, ErrorShort, ErrorTag, IrHint};
+        let message = seq(vec![assign("tmp", send(None, "compute", vec![])), lit_str("text")]);
+        let mut push = send(Some(var("errors")), "<<", vec![message]);
+        push.hint = Some(IrHint::ErrorAttribute(ErrorTag {
+            attribute: Symbol::from("base"),
+            short: ErrorShort::After(String::new()),
+            detail: ErrorDetail::Message,
+        }));
+        let emitted = with_error_attributes(true, || emit_expr(&push));
+        assert!(
+            emitted.starts_with("ActiveModel::ErrorAttributes.add(errors, :base, (tmp = compute\n\"text\"), \"\""),
+            "got {emitted}"
+        );
+        assert!(parses(&emitted), "got {emitted}");
     }
 }
 
