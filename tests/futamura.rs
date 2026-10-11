@@ -183,7 +183,7 @@ end
             ("app/models/message.rb", MESSAGE),
             ("app/controllers/messages_controller.rb", CONTROLLER),
         ];
-        let tree: HashMap<PathBuf, Vec<u8>> =
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
             files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         Analyzer::new(&app).analyze(&mut app);
@@ -255,7 +255,7 @@ mod single_record_terminals {
             ("app/models/story.rb", "class Story < ApplicationRecord\nend\n"),
             ("app/controllers/stories_controller.rb", controller),
         ];
-        let tree: HashMap<PathBuf, Vec<u8>> =
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
             files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         Analyzer::new(&app).analyze(&mut app);
@@ -292,7 +292,7 @@ mod preload_scopes {
             ("app/models/post.rb", "class Post < ApplicationRecord\n  belongs_to :user\nend\n"),
             ("app/controllers/users_controller.rb", controller),
         ];
-        let tree: HashMap<PathBuf, Vec<u8>> =
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
             files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         Analyzer::new(&app).analyze(&mut app);

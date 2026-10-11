@@ -10,7 +10,6 @@ module Rails
   def self.cache=: (Cache store) -> Cache
   def self.logger: () -> Rails::Logger
   def self.log_line: (String line) -> void
-  def self.error: () -> ActiveSupport::ErrorReporter
   def self.application: () -> Application
   def self.error: () -> ActiveSupport::ErrorReporter
   def self.event: () -> ActiveSupport::EventReporter

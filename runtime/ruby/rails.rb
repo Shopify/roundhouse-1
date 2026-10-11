@@ -153,10 +153,6 @@ module Rails
     warn(line)
   end
 
-  def self.error
-    ActiveSupport::ErrorReporter.new
-  end
-
   def self.application
     Application.new
   end

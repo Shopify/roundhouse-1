@@ -5434,7 +5434,7 @@ end
 ];
 
 fn inertia_check(files: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = files
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
         .collect();
@@ -5527,7 +5527,7 @@ fn inertia_configure_blocks_add_to_one_configuration() {
         "config/initializers/inertia_b.rb",
         "InertiaRails.configure do |config|\n  config.encrypt_history = true\nend\n",
     ));
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = files
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
         .collect();
