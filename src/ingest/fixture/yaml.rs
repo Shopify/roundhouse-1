@@ -7,7 +7,24 @@ use serde_yaml_ng::{Mapping, Value};
 use yaml_rust2::parser::{Event, Parser, Tag};
 use yaml_rust2::scanner::TScalarStyle;
 
+/// A document yaml-rust2 rejects for indentation inside a flow collection or
+/// a multi-line quoted scalar is read again with those continuation lines
+/// indented (`relax_continuation_indentation`): Psych, which parses Rails
+/// fixtures, takes the text as written.
 pub(super) fn parse(source: &str) -> Result<Value, String> {
+    match parse_strict(source) {
+        Err(error) if error.contains("invalid indentation") => {
+            let relaxed = relax_continuation_indentation(source);
+            if relaxed == source {
+                return Err(error);
+            }
+            parse_strict(&relaxed).map_err(|_| error)
+        }
+        other => other,
+    }
+}
+
+fn parse_strict(source: &str) -> Result<Value, String> {
     let mut reader = Reader {
         parser: Parser::new_from_str(source),
         anchors: HashMap::default(),
@@ -169,4 +186,165 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Indentation means nothing on the continuation lines of a flow collection
+/// or a quoted scalar (line folding trims it, and libyaml ignores it inside
+/// flow context), but yaml-rust2 requires it to exceed the enclosing block
+/// key's. Each such line that does not is pushed two columns past that key.
+/// Block scalars, comments and plain text are left alone.
+fn relax_continuation_indentation(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut base = 0usize;
+    let mut block_threshold: Option<usize> = None;
+    for raw in source.split_inclusive('\n') {
+        let (text, newline) = match raw.strip_suffix('\n') {
+            Some(text) => (text, "\n"),
+            None => (raw, ""),
+        };
+        let blank = text.trim().is_empty();
+        let indent = text.chars().take_while(|c| *c == ' ').count();
+        if let Some(threshold) = block_threshold {
+            if blank || indent > threshold {
+                out.push_str(raw);
+                continue;
+            }
+            block_threshold = None;
+        }
+        let inside = depth > 0 || quote.is_some();
+        let mut chars: Vec<char> = text.chars().collect();
+        if inside && !blank && indent <= base {
+            let mut widened = vec![' '; base + 2];
+            widened.extend_from_slice(&chars[indent..]);
+            chars = widened;
+        }
+        // The key column of a block line: past its leading `- ` entries.
+        let lead = chars.iter().take_while(|c| **c == ' ').count();
+        let mut key_col = lead;
+        let mut last_dash = None;
+        while chars.get(key_col) == Some(&'-') && chars.get(key_col + 1).is_none_or(|c| *c == ' ') {
+            last_dash = Some(key_col);
+            key_col += 1;
+            while chars.get(key_col) == Some(&' ') {
+                key_col += 1;
+            }
+        }
+        let mut i = if inside { 0 } else { lead };
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(open) = quote {
+                if open == '"' && c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == open {
+                    if open == '\'' && chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+                break;
+            }
+            let node_start = {
+                let mut j = i;
+                while j > 0 && chars[j - 1] == ' ' {
+                    j -= 1;
+                }
+                match j.checked_sub(1).map(|k| chars[k]) {
+                    None => true,
+                    Some(':' | '?' | ',' | '[' | '{') if j < i || depth > 0 => true,
+                    Some('-') if j < i && (j == 1 || chars[j - 2] == ' ') => true,
+                    Some(_) => {
+                        let mut k = j;
+                        while k > 0 && chars[k - 1] != ' ' {
+                            k -= 1;
+                        }
+                        matches!(chars.get(k), Some('&' | '!'))
+                    }
+                }
+            };
+            match c {
+                '"' | '\'' if node_start => {
+                    if depth == 0 {
+                        base = key_col;
+                    }
+                    quote = Some(c);
+                }
+                '[' | '{' if depth > 0 || node_start => {
+                    if depth == 0 {
+                        base = key_col;
+                    }
+                    depth += 1;
+                }
+                ']' | '}' if depth > 0 => depth -= 1,
+                '|' | '>' if depth == 0 && node_start => {
+                    let mut rest = chars[i + 1..].iter().skip_while(|c| matches!(c, '0'..='9' | '+' | '-'));
+                    let header = rest.clone().all(|c| c.is_whitespace())
+                        || rest.find(|c| !c.is_whitespace()) == Some(&'#');
+                    if header {
+                        block_threshold = Some(if i == key_col { last_dash.unwrap_or(lead) } else { key_col });
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.extend(chars);
+        out.push_str(newline);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    /// Psych (libyaml) ignores indentation inside a flow collection, so a
+    /// closing `}` or `]` back at the enclosing key's column is accepted.
+    #[test]
+    fn flow_collection_may_close_at_the_enclosing_key_column() {
+        let source = "first:\n  metadata: {\n    \"a\": {\n      \"b\": \"c\"\n    }\n  }\n\nsecond:\n  amount: 1\n";
+        let value = parse(source).expect("flow mapping closing at the key's indentation parses");
+        let first = value.get("first").and_then(|f| f.get("metadata")).and_then(|m| m.get("a")).and_then(|a| a.get("b"));
+        assert_eq!(first.and_then(|b| b.as_str()), Some("c"));
+        assert!(value.get("second").is_some());
+    }
+
+    #[test]
+    fn flow_sequence_may_close_at_the_enclosing_key_column() {
+        let source = "first:\n  tags: [\n    \"a\",\n    \"b\"\n  ]\nsecond:\n  amount: 1\n";
+        let value = parse(source).expect("flow sequence closing at the key's indentation parses");
+        assert_eq!(value.get("first").and_then(|f| f.get("tags")).and_then(|t| t.as_sequence()).map(|s| s.len()), Some(2));
+    }
+
+    #[test]
+    fn multi_line_quoted_scalar_may_continue_at_the_key_column() {
+        let source = "first:\n  body: \"Confirm\n\n  Click below.\"\n  name: x\nsecond:\n  definition: &definition '{\n    \"status\": \"published\"\n}'\n  name: y\n";
+        let value = parse(source).expect("quoted scalars continuing at the key column parse");
+        let body = value.get("first").and_then(|f| f.get("body")).and_then(|b| b.as_str()).unwrap_or_default();
+        assert!(body.starts_with("Confirm") && body.ends_with("Click below."), "{body:?}");
+        assert_eq!(value.get("first").and_then(|f| f.get("name")).and_then(|n| n.as_str()), Some("x"));
+        assert_eq!(value.get("second").and_then(|s| s.get("name")).and_then(|n| n.as_str()), Some("y"));
+    }
+
+    #[test]
+    fn block_scalar_text_is_not_read_as_flow_or_quotes() {
+        let source = "first:\n  note: |\n    {\n    it's \"odd\n  flag: true\nsecond:\n  tags: [\n    a\n  ]\n";
+        let value = parse(source).expect("a block scalar holding brackets and quotes does not confuse the relaxation");
+        assert_eq!(value.get("first").and_then(|f| f.get("flag")).and_then(|n| n.as_bool()), Some(true));
+        assert_eq!(value.get("second").and_then(|s| s.get("tags")).and_then(|t| t.as_sequence()).map(|s| s.len()), Some(1));
+    }
+
+    #[test]
+    fn misaligned_block_keys_stay_rejected() {
+        assert!(parse("a:\n    b: 1\n  c: 2\n").is_err());
+    }
 }

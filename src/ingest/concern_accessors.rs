@@ -1530,6 +1530,10 @@ pub(super) fn carried_included_blocks(
             .flat_map(|t| t.inner_classes.iter())
             .map(|lc| (lc.includes.clone(), false)),
     );
+    hosts.extend(app.test_modules.iter().map(|t| {
+        let carried = t.includes.iter().all(|id| app.test_carried_included_blocks.contains(&top(id)) || !concerns.contains(&top(id)));
+        (t.includes.clone(), carried)
+    }));
     let mut covered: HashMap<ClassId, bool> = HashMap::default();
     for (includes, carries) in hosts {
         let mut stack: Vec<ClassId> = includes.iter().map(top).collect();
@@ -1761,7 +1765,7 @@ fn seed_span(items: &[ModelBodyItem], name: &Symbol) -> Span {
 
 /// The modules a carried `include M, …` names, each resolved in the
 /// Concern's lexical scope (the block's), innermost first.
-fn included_modules(item: &ModelBodyItem, concern: &ClassId, defined: &HashSet<String>) -> Vec<ClassId> {
+pub(super) fn included_modules(item: &ModelBodyItem, concern: &ClassId, defined: &HashSet<String>) -> Vec<ClassId> {
     written_modules(item, "include", concern, defined)
 }
 

@@ -718,6 +718,59 @@ pub fn rewrite_fixture_calls(body: &Expr, fixture_names: &[Symbol]) -> Expr {
     })
 }
 
+/// The instance method names a test class answers before Rails' generated
+/// fixture accessors do: its own and its parent test classes' helpers, and
+/// those of the modules it includes (with theirs), which a later `include`
+/// puts ahead of the accessor module `fixtures` adds
+/// (`ActiveRecord::TestFixtures.setup_fixture_accessors` defines the readers
+/// on `fixture_accessor_module`). A call these name is the class's method,
+/// not the fixture set's reader.
+pub fn shadowed_fixture_accessors(
+    test_modules: &[crate::dialect::TestModule],
+    library_classes: &[LibraryClass],
+) -> HashMap<ClassId, HashSet<Symbol>> {
+    let top = |id: &ClassId| ClassId(Symbol::from(id.0.as_str().trim_start_matches("::")));
+    let modules: HashMap<ClassId, &LibraryClass> =
+        library_classes.iter().filter(|lc| lc.is_module).map(|lc| (lc.name.clone(), lc)).collect();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
+    for (index, tm) in test_modules.iter().enumerate() {
+        let mut names: HashSet<Symbol> = HashSet::default();
+        let mut chain = vec![index];
+        let mut at = tm.parent.as_ref();
+        while let Some(parent) = at.take() {
+            let Some(i) = test_modules.iter().position(|other| other.name == *parent) else { break };
+            if chain.contains(&i) {
+                break;
+            }
+            chain.push(i);
+            at = test_modules[i].parent.as_ref();
+        }
+        let mut stack: Vec<ClassId> = Vec::new();
+        for i in chain {
+            let class = &test_modules[i];
+            names.extend(
+                class.helpers.iter().filter(|h| h.receiver == MethodReceiver::Instance).map(|h| h.name.clone()),
+            );
+            stack.extend(class.includes.iter().map(top));
+        }
+        let mut seen: HashSet<ClassId> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(module) = modules.get(&id) else { continue };
+            names.extend(
+                module.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name.clone()),
+            );
+            stack.extend(module.includes.iter().map(top));
+        }
+        if !names.is_empty() {
+            out.entry(tm.name.clone()).or_default().extend(names);
+        }
+    }
+    out
+}
+
 fn rewrite_fixture_call(e: &Expr, fixture_names: &[Symbol]) -> Option<Expr> {
     let ExprNode::Send {
         recv: None,

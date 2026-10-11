@@ -2825,6 +2825,11 @@ pub struct TestBodyStatement {
     /// the runner calls before the chain).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub after_teardown_blocks: bool,
+    /// The file the statement is written in, when it is not the test
+    /// class's own (a Concern's `included do` block run on the class,
+    /// `ingest::test_class_concerns`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl TestModule {

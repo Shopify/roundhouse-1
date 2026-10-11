@@ -905,6 +905,7 @@ pub(super) fn ingest_test_class(
                     after_definitions,
                     after_setup_blocks,
                     after_teardown_blocks,
+                    source: None,
                 });
             }
         }
@@ -922,6 +923,7 @@ pub(super) fn ingest_test_class(
                     after_definitions: false,
                     after_setup_blocks: false,
                     after_teardown_blocks: false,
+                    source: None,
                 });
             }
         }
@@ -1086,6 +1088,7 @@ fn carry_at_load(
             after_definitions: at.after_definitions,
             after_setup_blocks: at.after_setup_blocks,
             after_teardown_blocks: at.after_teardown_blocks,
+            source: None,
         });
         *tests_at_load = true;
     }

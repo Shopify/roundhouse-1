@@ -733,6 +733,10 @@ pub struct App {
     /// (`concern_accessors::carried_included_blocks`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_included_blocks: Vec<ClassId>,
+    /// Concerns every test class that includes one got whole, as class-body
+    /// statements (`ingest::test_class_concerns`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_carried_included_blocks: Vec<ClassId>,
     /// The library classes and modules the source declared inside a
     /// `class << self` (Core's `ElasticSearch::TaxCodeIndexing`'s
     /// `TaxCodeSourceBuilder`, which its class methods read bare). Ruby
@@ -1535,6 +1539,7 @@ impl App {
             concern_prepended_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             carried_included_blocks: Vec::new(),
+            test_carried_included_blocks: Vec::new(),
             singleton_scoped_classes: Vec::new(),
             library_class_declarations: Vec::new(),
             included_block_statements: HashMap::default(),

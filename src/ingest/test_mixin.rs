@@ -1680,6 +1680,7 @@ impl ClassWalk<'_> {
                                 after_definitions: true,
                                 after_setup_blocks: false,
                                 after_teardown_blocks: false,
+                                source: None,
                             });
                             continue;
                         }
