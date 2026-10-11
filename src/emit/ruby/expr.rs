@@ -1808,7 +1808,7 @@ pub(super) fn emit_send_base(
 ///
 /// An argument that starts with a character Ruby also reads as a binary
 /// operator or prefix (`/` regexp, `*` splat, `&` block-pass, unary
-/// `-`/`+`, `::`, `[`, `(`) is parenthesized too: written after a space,
+/// `-`/`+`) is parenthesized too: written after a space,
 /// `ruby -w` warns "ambiguous first argument; put parentheses or a space
 /// even after `/` operator" (parse.y `warn_balanced`), which raises under
 /// a warnings-as-errors harness where the `%r{…}` / parenthesized source
@@ -1817,7 +1817,7 @@ fn first_arg_opens_block(method: &str, args_s: &[String]) -> bool {
     args_s.first().is_some_and(|a| {
         ["if ", "unless ", "case ", "while ", "until ", "begin"].iter().any(|k| a.starts_with(k))
             // `!` is a prefix operator: nothing after it is an argument.
-            || (method != "!" && ["/", "*", "&", "-", "+", "::", "[", "("].iter().any(|k| a.starts_with(k)))
+            || (method != "!" && ["/", "*", "&", "-", "+"].iter().any(|k| a.starts_with(k)))
     })
 }
 
