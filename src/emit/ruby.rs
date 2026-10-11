@@ -507,6 +507,9 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // settle (no-op unless the app calls `association`). Before
     // `lazy_model_state`, which renames the cache reads it finds.
     library::apply_association_reader(&mut lcs, app);
+    // `build_<name>` / `create_<name>` / `reload_<name>` / `reset_<name>` of
+    // the singular associations the app calls, run on the association object.
+    library::apply_singular_association_builders(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated

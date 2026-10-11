@@ -228,6 +228,9 @@ pub fn emit_expr(e: &Expr) -> String {
     if let Some(target) = association_target(e) {
         return target;
     }
+    if let Some(call) = singular_builder(e) {
+        return call;
+    }
     if native_keywords() {
         if let Some(call) = crate::lower::assoc_loaded::association_proxy_call(e) {
             return emit_expr(&call);
@@ -492,6 +495,39 @@ fn association_target(e: &Expr) -> Option<String> {
         args: vec![],
         block: None,
         parenthesized: false,
+    }))
+}
+
+/// `owner.build_x(...)` / `create_x(...)` / `create_x!(...)`, which
+/// `lower::has_one_builder` made a constructor call with the key preset
+/// (`IrHint::SingularBuilder`), written back as authored on the CRuby and
+/// JRuby trees: the model's `build_x` (`library::
+/// apply_singular_association_builders`) runs the association object, so
+/// the built record replaces the target, as Rails'.
+fn singular_builder(e: &Expr) -> Option<String> {
+    if !native_keywords() {
+        return None;
+    }
+    let ExprNode::Send { args, .. } = &*e.node else { return None };
+    let [attrs] = args.as_slice() else { return None };
+    let Some(crate::expr::IrHint::SingularBuilder { method, synthesized }) = &attrs.hint else { return None };
+    let ExprNode::Hash { entries, .. } = &*attrs.node else { return None };
+    let owner = match &entries.first()?.1.node.as_ref() {
+        ExprNode::Send { recv: Some(r), method: id, .. } if id.as_str() == "id" => Some(r.clone()),
+        _ => None,
+    };
+    let given: Vec<_> = entries.iter().skip(*synthesized).cloned().collect();
+    let args = if given.is_empty() {
+        vec![]
+    } else {
+        vec![Expr::new(e.span, ExprNode::Hash { entries: given, kwargs: true })]
+    };
+    Some(emit_node(&ExprNode::Send {
+        recv: owner,
+        method: method.clone(),
+        args,
+        block: None,
+        parenthesized: true,
     }))
 }
 

@@ -789,7 +789,7 @@ fn try_string_builder_stmt(e: &Expr, declared: &mut HashSet<Symbol>) -> Option<V
     match e.hint.as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
-        IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach => None, // CRuby/JRuby-only hints, the plain node elsewhere
+        IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 let escaped = escape_reserved_word(name.as_str());

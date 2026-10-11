@@ -359,6 +359,15 @@ pub enum IrHint {
     /// the association object, write the read back as written; the
     /// others keep the reader.
     AssociationTarget,
+    /// On the `Target.new` / `create` / `create!` that `lower::
+    /// has_one_builder` made of `owner.build_x(...)` / `create_x(...)`:
+    /// the association's name (the call's method) and how many leading
+    /// entries of the hash are the synthesized key and `as:` type. The
+    /// CRuby and JRuby trees write the authored call back, since the
+    /// model's own `build_x` replaces the association's target, sets its
+    /// inverse and honors `dependent:`, which the constructor does not;
+    /// the others keep the constructor.
+    SingularBuilder { method: Symbol, synthesized: usize },
     /// On `record.<has_many>.reload` / `.reset`, which `lower::
     /// assoc_loaded` resolved to a collection reader. Rails' reader is
     /// the CollectionProxy, which reloads or resets its association; the

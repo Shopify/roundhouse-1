@@ -3532,6 +3532,159 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
+/// Ruby-family pre-emit pass: the singular association's builders.
+///
+/// Rails defines, per `has_one` and monomorphic `belongs_to`,
+/// `build_<name>(attributes = {})`, `create_<name>`, `create_<name>!`,
+/// `reload_<name>` and `reset_<name>` (associations/builder/
+/// singular_association.rb `define_constructors`, `define_accessors`).
+/// The call-site rewrite (`lower::has_one_builder`) covers a literal
+/// keyword-hash call on a typed receiver; any other shape (a hash held in
+/// a variable, `attrs.merge(...)`, a call from a method of another class,
+/// a `belongs_to`) reaches the record itself, where the method was
+/// missing. Each method runs the association object
+/// (runtime/spinel/active_record_associations.rb), so a built record
+/// replaces the target, carries the owner's key and inverse, and a
+/// `create` saves it.
+///
+/// Only for the names the app calls, so a model's unused associations
+/// carry no extra methods; a model's own definition wins. CRuby and
+/// JRuby only: the object reads the record's ivars by computed name.
+pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app: &App) {
+    use crate::dialect::{Association, Dependent};
+
+    if !super::expr::native_keywords() {
+        return;
+    }
+    let mut called: BTreeSet<String> = BTreeSet::new();
+    fn walk(e: &Expr, called: &mut BTreeSet<String>) {
+        // `lower::has_one_builder` made a constructor of the call; the
+        // emit writes the authored call back (`IrHint::SingularBuilder`).
+        if let Some(crate::expr::IrHint::SingularBuilder { method, .. }) = &e.hint {
+            called.insert(method.as_str().to_string());
+        }
+        if let ExprNode::Send { method, .. } = &*e.node {
+            let m = method.as_str();
+            if ["build_", "create_", "reload_", "reset_"].iter().any(|p| m.starts_with(p)) {
+                called.insert(m.to_string());
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, called));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut called));
+    for view in &app.views {
+        walk(&view.body, &mut called);
+    }
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &mut called));
+    if called.is_empty() {
+        return;
+    }
+    let mut declarations = DeclarationOptions::default();
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let mut src = String::new();
+        for (span, assoc) in model.spanned_associations() {
+            let name = assoc.name().as_str();
+            let key = |k: &Symbol| format!(":{}", k.as_str());
+            let object = match assoc {
+                Association::BelongsTo { target, foreign_key, polymorphic: false, primary_key, .. } => {
+                    format!(
+                        "ActiveRecord::Associations::BelongsToAssociation.new(self, :{name}, {:?}, {}, true, {}, {})",
+                        target.0.as_str(),
+                        key(foreign_key),
+                        primary_key.as_ref().map_or_else(|| ":id".to_string(), key),
+                        belongs_to_inverse(app, model, assoc, &declarations.of(app, span).0)
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
+                    )
+                }
+                Association::HasOne { target, foreign_key, as_interface, scope, dependent, .. } => {
+                    format!(
+                        "ActiveRecord::Associations::HasOneAssociation.new(self, :{name}, {:?}, {}, {}, {}, {}, {})",
+                        target.0.as_str(),
+                        key(foreign_key),
+                        as_interface.is_none() && scope.is_none(),
+                        as_interface
+                            .as_ref()
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}_type", i.as_str())),
+                        match dependent {
+                            Dependent::None => "nil",
+                            Dependent::Destroy => ":destroy",
+                            Dependent::DestroyAsync => ":destroy_async",
+                            Dependent::Delete => ":delete",
+                            Dependent::DeleteAll => ":delete_all",
+                            Dependent::Nullify => ":nullify",
+                            Dependent::Restrict => ":restrict",
+                        },
+                        has_one_inverse(app, model, assoc, &declarations.of(app, span).0)
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
+                    )
+                }
+                _ => continue,
+            };
+            let defined = |n: &str| {
+                lc.methods.iter().any(|m| m.name.as_str() == n && m.receiver == MethodReceiver::Instance)
+                    || crate::lower::model_to_library::model_defines_instance_method(model, &Symbol::from(n))
+            };
+            let mut def = |method: String, body: String| {
+                if called.contains(&method) && !defined(&method) && !src.contains(&format!("def {method}(")) && !src.contains(&format!("def {method}\n")) {
+                    src.push_str(&body);
+                }
+            };
+            for (method, call) in [(format!("build_{name}"), "build"), (format!("create_{name}"), "create"), (format!("create_{name}!"), "create!")] {
+                def(method.clone(), format!("def {method}(attributes = {{}}, &block)\n  {object}.{call}(attributes, &block)\nend\n"));
+            }
+            def(
+                format!("reload_{name}"),
+                format!("def reload_{name}\n  association = {object}\n  association.reload\n  association.target\nend\n"),
+            );
+            def(format!("reset_{name}"), format!("def reset_{name}\n  {object}.reset\nend\n"));
+        }
+        if src.is_empty() {
+            continue;
+        }
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("apply_singular_association_builders: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            lc.methods.push(m);
+        }
+    }
+}
+
+/// The belongs_to on a has_one's target that points back at it, which
+/// Rails' `set_inverse_instance` sets: the declaration's literal
+/// `inverse_of:`, else the automatic one (reflection.rb
+/// `automatic_inverse_of`): the target's belongs_to named for the owner's
+/// class, on the same foreign key, when the has_one has no
+/// `foreign_key:`, scope or `as:` of its own.
+fn has_one_inverse(app: &App, owner: &crate::dialect::Model, assoc: &crate::dialect::Association, options: &str) -> Option<Symbol> {
+    use crate::dialect::Association;
+    let Association::HasOne { target, foreign_key, foreign_key_explicit, as_interface, scope, .. } = assoc else {
+        return None;
+    };
+    let target = app.models.iter().find(|m| &m.name == target)?;
+    if let Some(at) = options.find("inverse_of: ") {
+        let value: String =
+            options[at + "inverse_of: ".len()..].chars().take_while(|c| c.is_alphanumeric() || matches!(c, '_' | ':')).collect();
+        return match value.strip_prefix(':') {
+            Some(inverse) => target.associations().find(|a| a.name().as_str() == inverse).map(|a| a.name().clone()),
+            None => None,
+        };
+    }
+    if *foreign_key_explicit || as_interface.is_some() || scope.is_some() {
+        return None;
+    }
+    let candidate = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    target.associations().find_map(|a| match a {
+        Association::BelongsTo { name, target: t, foreign_key: fk, polymorphic: false, .. }
+            if name.as_str() == candidate && *t == owner.name && fk == foreign_key =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    })
+}
+
 /// The association on a belongs_to's target that points back at it,
 /// which Rails' `set_inverse_instance` sets: the declaration's literal
 /// `inverse_of:` (`inverse_of: false` names none), else the automatic
