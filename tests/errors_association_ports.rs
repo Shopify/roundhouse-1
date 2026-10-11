@@ -693,7 +693,7 @@ fn check_refuses_what_the_association_cannot_answer() {
     post = Post.first
     post.association(:nope)
     post.association(:image_attachment)
-    Author.first.association(:post_comments).scope
+    Author.first.association(:post_comments).stale_target?
     Star.first.association(:subject).stale_target?
     post.comments.reset.size
   end
@@ -706,7 +706,7 @@ end
     for expected in [
         "`association(:nope)` on Post",
         "`association(:image_attachment)` on Post",
-        "`association(:post_comments).scope` on Author: not ported for a :through association",
+        "`association(:post_comments).stale_target?` on Author: not ported for a :through association",
         "`association(:subject).stale_target?` on Star: not ported for a polymorphic belongs_to",
         "`comments.reset.size`",
     ] {

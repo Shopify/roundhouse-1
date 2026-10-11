@@ -40,13 +40,18 @@
 # - The object is built per call, not memoized: its state is the
 #   record's, so two calls answer the same, but they are not `equal?`.
 # - No reflection object: `reflection`, `options` and the strict-
-#   loading/inverse hooks are not ported. `scope` is ported for a
-#   belongs_to (a polymorphic one with its type set) and an unscoped,
-#   non-`as:`, non-`:through` has_many or has_one; `stale_target?` for
-#   all but a polymorphic belongs_to and a `:through` association. The
-#   rest raise NotImplementedError, and the analyzer refuses a static
-#   call to them (`analyze::association_surface`), as it does a literal
-#   name the model does not have.
+#   loading hooks are not ported. `scope` is ported for a belongs_to
+#   (a polymorphic one with its type set), for a has_many or has_one
+#   whose compiled query is nameable (`_<name>_association_scope`: its
+#   key, `as:` type and scope lambda) and for a `:through` association
+#   whose reader answers its Relation; `stale_target?` for all but a
+#   polymorphic belongs_to and a `:through` association. The rest raise
+#   NotImplementedError, and the analyzer refuses a static call to them
+#   (`analyze::association_surface`), as it does a literal name the
+#   model does not have. `set_inverse_instance` is ported for a
+#   non-polymorphic belongs_to with a literal `inverse_of:` or an
+#   automatic inverse; a has_many or has_one's own is the model's
+#   `_set_inverse_instance`.
 # - `loaded?`, `target` and `stale_target?` answer as Rails'.
 module ActiveRecord
   module Associations
@@ -292,8 +297,14 @@ module ActiveRecord
       end
 
       # Rails' `association_scope`: the target class's relation narrowed
-      # to the owner's records.
+      # to the owner's records. A has_many or has_one the model compiled
+      # a query for (`_<name>_association_scope`, emitted beside the
+      # reader: its key, an `as:` type and its scope lambda's chain) is
+      # that query; a belongs_to or an unscoped one is built from the
+      # key alone.
       def scope
+        query = :"_#{@name}_association_scope"
+        return @owner.public_send(query) if @owner.respond_to?(query)
         unless @scopable
           raise NotImplementedError, "roundhouse: #{@owner.class.name}#association(:#{@name}).scope is not ported for a scoped, polymorphic or :through association"
         end
@@ -346,6 +357,12 @@ module ActiveRecord
         loaded!
       end
 
+      # Rails' `inversed_from(record)`: the record this association's
+      # inverse holds becomes its target.
+      def inversed_from(record)
+        self.target = record
+      end
+
       private
         # A Relation's `includes` runs when a record first reads an
         # association (`lower::deferred_preload`); Rails has run it by
@@ -383,6 +400,14 @@ module ActiveRecord
     end
 
     class CollectionAssociation < Association
+      # Rails' CollectionAssociation#scope: an owner that is not saved
+      # has no records (`null_scope?`).
+      def scope
+        relation = super
+        relation = relation.none if @owner.new_record?
+        relation
+      end
+
       # Rails' collection reader is the CollectionProxy, which loads
       # when enumerated; the model's reader is the runtime's answer for
       # it, loaded or not.
@@ -417,9 +442,12 @@ module ActiveRecord
     end
 
     class BelongsToAssociation < SingularAssociation
-      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, primary_key = :id)
+      # inverse: the name of the association on the target that points
+      # back at the owner (Rails' `reflection.inverse_of`), nil for none.
+      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, primary_key = :id, inverse = nil)
         super(owner, name, klass_name, foreign_key, scopable)
         @primary_key = primary_key
+        @inverse = inverse
         @stale_loaded_ivar = :"@#{name}_stale_loaded"
         @stale_state_ivar = :"@#{name}_stale_state"
       end
@@ -443,6 +471,34 @@ module ActiveRecord
         stale_loaded? && @owner.instance_variable_get(@stale_state_ivar) != stale_state
       end
 
+      # Rails' `set_inverse_instance(record)`: the target record's
+      # inverse association holds the owner, where the belongs_to has an
+      # inverse (belongs_to_association.rb `invertible_for?`: a has_one,
+      # or a has_many under `has_many_inversing`, which Core's
+      # load_defaults enables). A has_many inverse that is not loaded
+      # holds nothing to add the owner to: the emitted reader loads its
+      # own records, which include the owner when it is saved.
+      def set_inverse_instance(record)
+        return record if @inverse.nil? || record.nil?
+        inverse = record.association(@inverse)
+        if inverse.is_a?(CollectionAssociation)
+          if inverse.loaded?
+            records = inverse.target
+            records << @owner unless records.any? { |r| r.equal?(@owner) }
+          end
+        else
+          inverse.inversed_from(@owner)
+        end
+        record
+      end
+
+      # Rails' belongs_to `inversed_from(record)`: the owner's key
+      # follows the record, then it is the target.
+      def inversed_from(record)
+        replace_keys(record)
+        super
+      end
+
       # Rails' ends on `@updated = false`.
       def reset
         super
@@ -456,6 +512,12 @@ module ActiveRecord
       end
 
       private
+        # Rails' `replace_keys(record)`: the owner's foreign key is the
+        # record's key (nil for no record).
+        def replace_keys(record)
+          @owner.public_send(:"#{@foreign_key}=", record.nil? ? nil : record.public_send(@primary_key))
+        end
+
         def super_loaded?
           await_preload
           @owner.instance_variable_get(@loaded_ivar) == true
@@ -502,6 +564,18 @@ module ActiveRecord
     end
 
     class HasManyThroughAssociation < HasManyAssociation
+      # The reader answers the association's own Relation (the through
+      # joins and the source's scope), as Rails' ThroughAssociation
+      # builds its scope.
+      def scope
+        relation = @owner.public_send(@name)
+        unless relation.is_a?(ActiveRecord::Relation)
+          raise NotImplementedError, "roundhouse: #{@owner.class.name}#association(:#{@name}).scope is not ported for a :through association whose reader answers records"
+        end
+        relation = relation.none if @owner.new_record?
+        relation
+      end
+
       # Rails' through stale state reads the through record's key when
       # the through association is a belongs_to.
       def stale_target?

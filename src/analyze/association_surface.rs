@@ -14,9 +14,10 @@
 //! association `x` is refused here.
 //!
 //! The same for the parts of the object that are ported only for some
-//! kinds (runtime/spinel/active_record_associations.rb): `scope` on a
-//! scoped, `as:` or `:through` association, `stale_target?` on a
-//! polymorphic belongs_to or a `:through` association. And for
+//! kinds (runtime/spinel/active_record_associations.rb): `stale_target?`
+//! on a polymorphic belongs_to or a `:through` association. (`scope` is
+//! ported for a scoped, `as:` or `:through` association; the runtime
+//! names the one whose query it cannot build.) And for
 //! `record.<has_many>.reset` continuing into another call: Rails resets
 //! the CollectionProxy and answers it, the emitted call answers the
 //! association object.
@@ -332,16 +333,9 @@ impl Surface<'_> {
 /// Why `call` on `assoc` is not ported, if it is not.
 fn unported(assoc: &Association, call: &str) -> Option<&'static str> {
     match (assoc, call) {
-        (Association::HasMany { through: Some(_), .. } | Association::HasAndBelongsToMany { .. }, _) => {
+        (Association::HasMany { through: Some(_), .. } | Association::HasAndBelongsToMany { .. }, "stale_target?") => {
             Some("a :through association")
         }
-        (Association::HasMany { scope: Some(_), .. } | Association::HasOne { scope: Some(_), .. }, "scope") => {
-            Some("an association with a scope")
-        }
-        (
-            Association::HasMany { as_interface: Some(_), .. } | Association::HasOne { as_interface: Some(_), .. },
-            "scope",
-        ) => Some("an `as:` association"),
         (Association::BelongsTo { polymorphic: true, .. }, "stale_target?") => Some("a polymorphic belongs_to"),
         _ => None,
     }

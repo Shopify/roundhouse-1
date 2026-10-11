@@ -3240,23 +3240,32 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
     // it answers. A query that is a relation loaded with `to_a` and
     // reads no local of the reader is it; an unscoped has_many's
     // compiled query is its key (and `as:` type) on the target.
-    let scope = (!singular)
-        .then(|| match &*query.node {
-            ExprNode::Send { recv: Some(rel), method, args, block: None, .. }
-                if method.as_str() == "to_a" && args.is_empty() && !reads_local(rel) =>
-            {
-                Some(rel.clone())
-            }
-            _ => plain.map(|src| {
-                let src = format!("def __scope\n  {src}\nend\n");
-                crate::runtime_src::parse_methods(&src)
-                    .unwrap_or_else(|e| panic!("memoize_query_reader: generated source failed to parse: {e}\n{src}"))
-                    .pop()
-                    .expect("one method")
-                    .body
-            }),
-        })
-        .flatten();
+    // A has_one's is the same without its `.first`, and a scoped
+    // association's is its query (a chain of relation methods that
+    // reads no local of the reader), as Rails' `association.scope`
+    // answers the relation before it loads.
+    let scope = match &*query.node {
+        ExprNode::Send { recv: Some(rel), method, args, block: None, .. }
+            if args.is_empty()
+                && method.as_str() == if singular { "first" } else { "to_a" }
+                && !reads_local(rel) =>
+        {
+            Some(rel.clone())
+        }
+        _ if !singular && is_relation_chain(&query) && !reads_local(&query) => Some(query.clone()),
+        _ => (!singular)
+            .then(|| {
+                plain.map(|src| {
+                    let src = format!("def __scope\n  {src}\nend\n");
+                    crate::runtime_src::parse_methods(&src)
+                        .unwrap_or_else(|e| panic!("memoize_query_reader: generated source failed to parse: {e}\n{src}"))
+                        .pop()
+                        .expect("one method")
+                        .body
+                })
+            })
+            .flatten(),
+    };
     let value = syn(ExprNode::If { cond: new_record, then_branch: none, else_branch: query });
     exprs.push(syn(ExprNode::Assign { target: LValue::Ivar { name: cache.clone() }, value }));
     exprs.push(syn(ExprNode::Assign {
@@ -3265,6 +3274,9 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
     }));
     if singular {
         exprs.push(syn(ExprNode::Ivar { name: cache }));
+        if let Some(rel) = scope {
+            push_association_scope(lc, name, rel);
+        }
         return;
     }
     // A collection reader answers Rails' CollectionProxy over its
@@ -3302,19 +3314,47 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
     }
     exprs.push(wrap(syn(ExprNode::Ivar { name: cache })));
     if let Some(rel) = scope {
-        let scope_name = Symbol::from(format!("_{}_association_scope", name.as_str()));
-        if !lc.methods.iter().any(|m| m.name == scope_name && m.receiver == MethodReceiver::Instance) {
-            let mut scope_method = lc
-                .methods
-                .iter()
-                .find(|m| &m.name == name && m.receiver == MethodReceiver::Instance)
-                .expect("the reader")
-                .clone();
-            scope_method.name = scope_name;
-            scope_method.signature = None;
-            scope_method.body = rel;
-            lc.methods.push(scope_method);
+        push_association_scope(lc, name, rel);
+    }
+}
+
+/// `_<name>_association_scope`, beside the reader: the association's
+/// query before it loads, for the collection proxy and
+/// `association(:<name>).scope`.
+fn push_association_scope(lc: &mut LibraryClass, name: &Symbol, rel: Expr) {
+    let scope_name = Symbol::from(format!("_{}_association_scope", name.as_str()));
+    if !lc.methods.iter().any(|m| m.name == scope_name && m.receiver == MethodReceiver::Instance) {
+        let mut scope_method = lc
+            .methods
+            .iter()
+            .find(|m| &m.name == name && m.receiver == MethodReceiver::Instance)
+            .expect("the reader")
+            .clone();
+        scope_method.name = scope_name;
+        scope_method.signature = None;
+        scope_method.body = rel;
+        lc.methods.push(scope_method);
+    }
+}
+
+/// A chain of relation-building calls on a constant (`Model.where(…)
+/// .order(…)`, `ActiveRecord::Relation.new(Model).where(…)`): it
+/// answers a relation, not records.
+fn is_relation_chain(e: &Expr) -> bool {
+    const BUILDERS: [&str; 20] = [
+        "where", "order", "reorder", "joins", "left_joins", "left_outer_joins", "includes", "preload",
+        "eager_load", "limit", "offset", "group", "having", "distinct", "unscope", "merge", "references",
+        "readonly", "rewhere", "extending",
+    ];
+    match &*e.node {
+        ExprNode::Send { recv: Some(inner), method, .. } if BUILDERS.contains(&method.as_str()) => {
+            is_relation_chain(inner)
         }
+        ExprNode::Send { recv: Some(inner), method, .. } if method.as_str() == "new" => {
+            matches!(&*inner.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "Relation"))
+        }
+        ExprNode::Const { .. } => true,
+        _ => false,
     }
 }
 
@@ -3373,13 +3413,14 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
     if !super::expr::native_keywords() || !app_calls_association(app) {
         return;
     }
+    let mut declarations = DeclarationOptions::default();
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
         if lc.methods.iter().any(|m| m.name.as_str() == "association" && m.receiver == MethodReceiver::Instance) {
             continue; // the model's own wins
         }
         let mut arms = String::new();
-        for assoc in model.associations() {
+        for (span, assoc) in model.spanned_associations() {
             let name = assoc.name();
             // The object runs the model's reader for its query; an
             // association whose reader the model does not carry is
@@ -3402,11 +3443,13 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
                 Association::BelongsTo {
                     target, foreign_key, polymorphic: false, primary_key, ..
                 } => format!(
-                    "BelongsToAssociation.new(self, :{}, {:?}, {}, true, {})",
+                    "BelongsToAssociation.new(self, :{}, {:?}, {}, true, {}, {})",
                     name.as_str(),
                     target.0.as_str(),
                     key(foreign_key),
-                    primary_key.as_ref().map_or_else(|| ":id".to_string(), key)
+                    primary_key.as_ref().map_or_else(|| ":id".to_string(), key),
+                    belongs_to_inverse(app, model, assoc, &declarations.of(app, span).0)
+                        .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
                 ),
                 Association::BelongsTo {
                     foreign_key, polymorphic: true, foreign_type, primary_key, ..
@@ -3477,6 +3520,47 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
             lc.methods.push(m);
         }
     }
+}
+
+/// The association on a belongs_to's target that points back at it,
+/// which Rails' `set_inverse_instance` sets: the declaration's literal
+/// `inverse_of:` (`inverse_of: false` names none), else the automatic
+/// one (reflection.rb `automatic_inverse_of`): the target's has_one or
+/// has_many named for the owner's class, on the same foreign key, with
+/// no scope, `as:` or `through:`, when the belongs_to has no
+/// `foreign_key:` or scope of its own. `options` is the declaration's
+/// hash literal (`DeclarationOptions::of`).
+fn belongs_to_inverse(app: &App, owner: &crate::dialect::Model, assoc: &crate::dialect::Association, options: &str) -> Option<Symbol> {
+    use crate::dialect::Association;
+    let Association::BelongsTo { name, target, foreign_key, .. } = assoc else { return None };
+    let target = app.models.iter().find(|m| &m.name == target)?;
+    if let Some(at) = options.find("inverse_of: ") {
+        let value: String =
+            options[at + "inverse_of: ".len()..].chars().take_while(|c| c.is_alphanumeric() || matches!(c, '_' | ':')).collect();
+        return match value.strip_prefix(':') {
+            Some(inverse) => target.associations().find(|a| a.name().as_str() == inverse).map(|a| a.name().clone()),
+            None => None,
+        };
+    }
+    if foreign_key.as_str() != format!("{}_id", name.as_str()) {
+        return None;
+    }
+    // The plural name is tried only under
+    // `automatically_invert_plural_associations`, which is off by default.
+    let candidate = crate::naming::underscore(crate::naming::demodulize(owner.name.0.as_str()));
+    target.associations().find_map(|a| match a {
+        Association::HasOne { name, foreign_key: fk, foreign_key_explicit: false, as_interface: None, scope: None, .. }
+        | Association::HasMany {
+            name,
+            foreign_key: fk,
+            foreign_key_explicit: false,
+            as_interface: None,
+            scope: None,
+            through: None,
+            ..
+        } if name.as_str() == candidate && fk == foreign_key => Some(name.clone()),
+        _ => None,
+    })
 }
 
 /// `Model.reflect_on_association(name)` on the PostgreSQL CRuby tree: a
