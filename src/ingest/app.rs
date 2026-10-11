@@ -3013,7 +3013,7 @@ end
     }
     // Before the drain: the subclass declarations are re-read from the
     // registered sources.
-    collect_subclass_declarations(&mut app);
+    let subclass_declarations = collect_subclass_declarations(&app);
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so
@@ -3091,6 +3091,9 @@ end
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     super::test::resolve_test_parents(&mut app)?;
     super::library_class::resolve_library_parents(&mut app);
+    // After the parents resolve: `class ReturnLabel < Label` inside
+    // `module Shipping` is a subclass of `Shipping::Label`.
+    attach_subclass_declarations(&mut app, subclass_declarations);
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.
@@ -3563,7 +3566,10 @@ fn singleton_scoped_classes(app: &App) -> Vec<crate::ident::ClassId> {
 /// source as the model body walk reads it (`ingest_model_body_item`)
 /// and stored on the nearest model ancestor
 /// (`Model::subclass_declarations`), for `lower::subclass_macros`.
-fn collect_subclass_declarations(app: &mut App) {
+/// Read from the sources while they are registered
+/// ([`collect_subclass_declarations`]), then attached once the library
+/// classes' parents are resolved ([`attach_subclass_declarations`]).
+fn collect_subclass_declarations(app: &App) -> Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)> {
     const DECLARATIONS: &[&str] = &[
         "belongs_to",
         "has_many",
@@ -3589,12 +3595,7 @@ fn collect_subclass_declarations(app: &mut App) {
         "after_initialize",
     ];
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
-    let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
-        HashMap::default();
-    let mut lc_parent: HashMap<&crate::ident::ClassId, &Option<crate::ident::ClassId>> = HashMap::default();
-    for other in &app.library_classes {
-        lc_parent.entry(&other.name).or_insert(&other.parent);
-    }
+    let mut declared = Vec::new();
     for lc in &app.library_classes {
         if models.contains(&lc.name) {
             continue;
@@ -3610,17 +3611,6 @@ fn collect_subclass_declarations(app: &mut App) {
         if calls.is_empty() {
             continue;
         }
-        let mut cursor = lc.parent.clone();
-        let mut base = None;
-        for _ in 0..8 {
-            let Some(parent) = cursor else { break };
-            if models.contains(&parent) {
-                base = Some(parent);
-                break;
-            }
-            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
-        }
-        let Some(base) = base else { continue };
         let mut items = Vec::new();
         for call in calls {
             let Some(path) = super::sources::path_of(call.span.file) else { continue };
@@ -3656,8 +3646,37 @@ fn collect_subclass_declarations(app: &mut App) {
             }
         }
         if !items.is_empty() {
-            declared.entry(base).or_default().push((lc.name.clone(), items));
+            declared.push((lc.name.clone(), items));
         }
+    }
+    declared
+}
+
+/// Stores each subclass's declarations on its nearest model ancestor.
+fn attach_subclass_declarations(
+    app: &mut App,
+    declarations: Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>,
+) {
+    let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    let mut lc_parent: HashMap<&crate::ident::ClassId, &Option<crate::ident::ClassId>> = HashMap::default();
+    for other in &app.library_classes {
+        lc_parent.entry(&other.name).or_insert(&other.parent);
+    }
+    let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
+        HashMap::default();
+    for (sub, items) in declarations {
+        let mut cursor = lc_parent.get(&sub).and_then(|p| (*p).clone());
+        let mut base = None;
+        for _ in 0..8 {
+            let Some(parent) = cursor else { break };
+            if models.contains(&parent) {
+                base = Some(parent);
+                break;
+            }
+            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
+        }
+        let Some(base) = base else { continue };
+        declared.entry(base).or_default().push((sub, items));
     }
     for model in &mut app.models {
         model.subclass_declarations = declared.remove(&model.name).unwrap_or_default();
