@@ -10615,6 +10615,22 @@ fn emit_library_class_decl_inner(
             && (forwarder_sites.into_iter().flatten().any(|(name, at)| *name == m.name && *at == m.name_span)
                 || declined.into_iter().flatten().any(|f| f.name == m.name && f.name_span == m.name_span))
     };
+    //
+    // So does any instance `def` the source writes above a constant: the
+    // constant's value is what loads the file, and a `def` runs nothing
+    // when it is defined (Ruby's class body defines it where it stands).
+    let last_constant = lc
+        .constants
+        .iter()
+        .map(|(_, value)| value.span)
+        .filter(|span| !span.is_synthetic())
+        .max_by_key(|span| span.start);
+    let above_a_constant = |m: &MethodDef| {
+        !railtie
+            && m.receiver == MethodReceiver::Instance
+            && !m.name_span.is_synthetic()
+            && last_constant.is_some_and(|c| c.file == m.name_span.file && m.name_span.start < c.start)
+    };
     let hoisted_hooks: Vec<usize> = if in_body_after_includes.is_empty() {
         Vec::new()
     } else {
@@ -10623,6 +10639,7 @@ fn emit_library_class_decl_inner(
             .enumerate()
             .filter(|(i, m)| {
                 (is_delegate_forwarder(m)
+                    || above_a_constant(m)
                     || (m.receiver == MethodReceiver::Class
                         && matches!(m.name.as_str(), "included" | "extended" | "prepended" | "inherited")))
                     && !carried_method(m)
@@ -14566,6 +14583,19 @@ fn app_prepend_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<(&'a Expr, Vec<
         .collect()
 }
 
+/// Whether `path`, as Ruby resolves the constant from `lc`'s namespace
+/// outwards, names a class or module the app defines (a library class or
+/// a model).
+fn names_app_class(lc: &LibraryClass, path: &[Symbol], app: &App) -> bool {
+    let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    let written = path.iter().skip(usize::from(rooted)).map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let scope: Vec<&str> = if rooted { Vec::new() } else { lc.name.0.as_str().split("::").collect() };
+    (0..=scope.len()).rev().any(|n| {
+        let name = if n == 0 { written.clone() } else { format!("{}::{written}", scope[..n].join("::")) };
+        is_model_named(&name, app) || library_classes_named(&name, app).into_iter().any(|c| c.origin.is_none())
+    })
+}
+
 /// The `app_extension_calls` of a plain module or class.
 fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let own_class_side = |name: &str| {
@@ -14575,6 +14605,8 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let mut extended: Vec<&LibraryClass> = Vec::new();
     // The Concerns whose `class_methods do` module is extended.
     let mut extended_blocks: Vec<&LibraryClass> = Vec::new();
+    // The app modules the body extends other app classes with.
+    let mut receiver_extended: Vec<&LibraryClass> = Vec::new();
     let mut out = Vec::new();
     for call in &lc.unknown_calls {
         // `self.x = v` through the body's own class-side writer, or after
@@ -14586,6 +14618,35 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
             && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::SelfRef));
         if self_write && (own_class_side(method.as_str()) || !extended.is_empty()) {
             out.push(call);
+            continue;
+        }
+        // `Receiver.extend(M)` and `Receiver.name = v` on a class or module
+        // the app defines, named by a constant: Ruby runs them on that
+        // class at load, and the emitted class answers them when `M`, an
+        // app module, defines the writer (`Base.extend(Accessor)` then
+        // `Leaf.kind = :text`). No runtime base is involved.
+        if let Some(ExprNode::Const { path: receiver }) = recv.as_ref().map(|r| &*r.node) {
+            if !names_app_class(lc, receiver, app) {
+                continue;
+            }
+            if method.as_str() == "extend" {
+                let modules: Option<Vec<&LibraryClass>> = args
+                    .iter()
+                    .map(|a| match &*a.node {
+                        ExprNode::Const { path } => app_module(path),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(modules) = modules.filter(|m| !m.is_empty()) {
+                    receiver_extended.extend(modules);
+                    out.push(call);
+                }
+            } else if method.as_str().ends_with('=')
+                && args.len() == 1
+                && receiver_extended.iter().any(|m| module_defines(m, method.as_str(), app, &mut Vec::new()))
+            {
+                out.push(call);
+            }
             continue;
         }
         if recv.is_some() {

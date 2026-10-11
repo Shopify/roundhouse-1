@@ -6296,6 +6296,22 @@ pub fn ingest_concern_class_method_spans(
                 if def.receiver().is_none() {
                     out.push(super::util::def_name_span(&def, file));
                 }
+                continue;
+            }
+            // `alias_method :to, :from` / `alias to from` defines `to` in
+            // the same module as the defs around it; the walk copies the
+            // method under the statement's own span (`name_span`).
+            let loc = if let Some(call) = stmt.as_call_node() {
+                (call.receiver().is_none() && constant_id_str(&call.name()) == "alias_method").then(|| call.location())
+            } else {
+                stmt.as_alias_method_node().map(|alias| alias.location())
+            };
+            if let Some(loc) = loc {
+                out.push(Span {
+                    file: super::sources::file_id(file),
+                    start: loc.start_offset() as u32,
+                    end: loc.end_offset() as u32,
+                });
             }
         }
     }

@@ -319,6 +319,26 @@ pub(crate) fn private_constructors(app: &App) -> crate::det::HashSet<String> {
     for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
         classes.insert(lc.name.0.as_str(), (lc.parent.as_ref().map(|p| p.0.as_str()), &lc.visibility_overrides));
     }
+    // A class that defines `self.new` itself and then makes it private
+    // (`def self.new(v) … super … end; private_class_method :new`) has no
+    // visibility override: the change landed on its own method.
+    let mut local_new: HashMap<&str, MethodVisibility> = HashMap::default();
+    for m in &app.models {
+        for item in &m.body {
+            if let ModelBodyItem::Method { method, .. } = item {
+                if method.receiver == MethodReceiver::Class && method.name.as_str() == "new" {
+                    local_new.insert(m.name.0.as_str(), method.visibility);
+                }
+            }
+        }
+    }
+    for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
+        if let Some(m) =
+            lc.methods.iter().rev().find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "new")
+        {
+            local_new.insert(lc.name.0.as_str(), m.visibility);
+        }
+    }
     let resolve = |child: &str, parent: &str| -> Option<String> {
         let parent = parent.trim_start_matches("::");
         let mut scope: Vec<&str> = child.split("::").collect();
@@ -338,6 +358,12 @@ pub(crate) fn private_constructors(app: &App) -> crate::det::HashSet<String> {
         let mut seen = crate::det::HashSet::default();
         while seen.insert(current.clone()) {
             let (parent, overrides) = classes[current.as_str()];
+            if let Some(visibility) = local_new.get(current.as_str()) {
+                if *visibility != MethodVisibility::Public {
+                    out.insert(name.to_string());
+                }
+                break;
+            }
             if let Some(o) = overrides
                 .iter()
                 .rev()
