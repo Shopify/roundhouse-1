@@ -860,3 +860,42 @@ end
 "#, &["test_success_fails", "test_symbol_code_fails", "test_redirect_on_redirect_fails", "test_redirected_to_fails",
       "test_redirected_to_not_a_redirect_fails"]);
 }
+
+/// An authored `capture_queries(*args, **kwargs)` on the test case (a
+/// helper's own capture API) is not the runtime assertions' capture: Rails'
+/// `assert_queries_count` subscribes its own `SQLCounter` and never calls it.
+/// Emitted side only: every test passes and counts its assertion.
+#[test]
+fn query_assertions_do_not_route_through_an_authored_capture_queries() {
+    let source = r#"
+module CaptureQueriesHelper
+  def capture_queries(*args, **kwargs)
+    yield
+    []
+  end
+end
+
+class AssertionCountTest < ActiveSupport::TestCase
+  include CaptureQueriesHelper
+
+  def test_no_queries
+    probe = Probe.new(name: "q")
+    assert_no_queries { probe.name }
+  end
+
+  def test_queries_count
+    assert_queries_count(1) { Probe.count }
+  end
+
+  def test_queries_match
+    assert_queries_match(/COUNT/) { Probe.count }
+  end
+end
+"#;
+    let (rows, log) = emitted_rows(app(source), "test/models/assertion_count_test.rb");
+    assert_eq!(rows.len(), 3, "{log}");
+    for row in &rows {
+        assert_eq!(row["status"], "pass", "{row}\n{log}");
+        assert!(row["assertions"].as_i64() >= Some(1), "{row}\n{log}");
+    }
+}

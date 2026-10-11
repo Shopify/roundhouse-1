@@ -420,7 +420,7 @@ module RoundhouseRailsTestHelpers
   # ActiveRecord::Assertions::QueryAssertions
   # (activerecord/lib/active_record/testing/query_assertions.rb).
   def assert_queries_count(count = nil, include_schema: false, &block)
-    result, queries = capture_queries(include_schema) { _assert_nothing_raised_or_warn("assert_queries_count", &block) }
+    result, queries = _capture_queries(include_schema) { _assert_nothing_raised_or_warn("assert_queries_count", &block) }
     if count
       assert_equal count, queries.size, "#{queries.size} instead of #{count} queries were executed#{queries.empty? ? '' : ". Queries:\n\n#{queries.join("\n\n")}"}"
     else
@@ -434,7 +434,7 @@ module RoundhouseRailsTestHelpers
   end
 
   def assert_queries_match(match, count: nil, include_schema: false, &block)
-    result, queries = capture_queries(include_schema) { _assert_nothing_raised_or_warn("assert_queries_match", &block) }
+    result, queries = _capture_queries(include_schema) { _assert_nothing_raised_or_warn("assert_queries_match", &block) }
     matched_queries = queries.select { |query| match === query }
     if count
       assert_equal count, matched_queries.size, "#{matched_queries.size} instead of #{count} matching queries were executed#{queries.empty? ? '' : ". Queries:\n\n#{queries.join("\n\n")}"}"

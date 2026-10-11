@@ -984,7 +984,7 @@ module ActiveRecord
     module QueryAssertions
       # Statements the block issued. Schema introspection is left out,
       # as Rails leaves out SCHEMA-named queries, unless asked for.
-      def capture_queries(include_schema, &block)
+      def _capture_queries(include_schema, &block)
         result = nil
         statements = Db.capture_sql { result = block.call }
         unless include_schema
@@ -994,7 +994,7 @@ module ActiveRecord
       end
 
       def assert_queries_count(count = nil, include_schema: false, &block)
-        result, statements = capture_queries(include_schema, &block)
+        result, statements = _capture_queries(include_schema, &block)
         if count.nil?
           raise "expected at least one query, got none" if statements.empty?
         elsif statements.length != count
@@ -1008,7 +1008,7 @@ module ActiveRecord
       end
 
       def assert_queries_match(match, count: nil, include_schema: false, &block)
-        result, statements = capture_queries(include_schema, &block)
+        result, statements = _capture_queries(include_schema, &block)
         matched = statements.select { |sql| match === sql }
         if count.nil?
           raise "expected a query matching #{match.inspect}, got:\n#{statements.join("\n")}" if matched.empty?
@@ -1019,7 +1019,7 @@ module ActiveRecord
       end
 
       def assert_no_queries_match(match, include_schema: false, &block)
-        result, statements = capture_queries(include_schema, &block)
+        result, statements = _capture_queries(include_schema, &block)
         matched = statements.select { |sql| match === sql }
         raise "expected no query matching #{match.inspect}, got:\n#{matched.join("\n")}" unless matched.empty?
         result
