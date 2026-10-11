@@ -40,6 +40,53 @@ thread_local! {
     /// Set while a class is rendered for splicing into another file
     /// (`with_spliced_into`): the inner per-file emit keeps that file.
     static EMITTED_FILE_PINNED: Cell<bool> = const { Cell::new(false) };
+    /// The lexical namespaces (outermost first) of the class being
+    /// rendered, with the app's constant paths: a fully qualified
+    /// `A::B::C` a sibling `A` nested in one of them shadows is rooted
+    /// (`rooted_if_shadowed`). `None` outside a class emit.
+    static LEXICAL_SCOPE: std::cell::RefCell<Option<(Vec<String>, std::rc::Rc<crate::det::HashSet<String>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous lexical scope on drop (`enter_lexical_scope`).
+pub(super) struct LexicalScopeGuard(Option<(Vec<String>, std::rc::Rc<crate::det::HashSet<String>>)>);
+
+impl Drop for LexicalScopeGuard {
+    fn drop(&mut self) {
+        LEXICAL_SCOPE.with(|c| *c.borrow_mut() = self.0.take());
+    }
+}
+
+/// Render constant paths for a class nested in `scopes` (outermost
+/// first) until the guard drops. `paths` is every constant path the app
+/// declares (`app_constant_paths`).
+pub(super) fn enter_lexical_scope(scopes: &[&str], paths: std::rc::Rc<crate::det::HashSet<String>>) -> LexicalScopeGuard {
+    let scopes = scopes.iter().map(|s| s.to_string()).collect();
+    LexicalScopeGuard(LEXICAL_SCOPE.with(|c| c.replace(Some((scopes, paths)))))
+}
+
+/// An app constant `written` as a reference inside `scopes` (innermost
+/// last) must spell it. Ruby looks up the first segment through the
+/// lexical scopes before `Object` (Module.nesting), so inside `module
+/// Apps; module Management` a written `Apps::Management::Api` finds the
+/// sibling `Apps::Management::Apps` first, then fails on its
+/// `::Management` (`uninitialized constant Apps::Management::Apps::
+/// Management`). The analysis writes a resolved reference in full; the
+/// leading `::` keeps it the constant it resolved to. A name the
+/// innermost shadowing scope declares in full is that scope's, and one
+/// the app does not declare is not ours: both stay as written.
+pub(super) fn rooted_if_shadowed(written: &str, scopes: &[&str], paths: &crate::det::HashSet<String>) -> String {
+    if written.starts_with("::") || scopes.is_empty() {
+        return written.to_string();
+    }
+    let first = written.split("::").next().unwrap_or(written);
+    let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
+        return written.to_string();
+    };
+    if paths.contains(&format!("{scope}::{written}")) || !paths.contains(written) {
+        return written.to_string();
+    }
+    format!("::{written}")
 }
 
 /// Whether the tree being emitted binds keywords natively (ruby family).
@@ -2186,6 +2233,18 @@ fn without_keyword_fills(args: &[Expr]) -> std::borrow::Cow<'_, [Expr]> {
 /// `::File` is stored with an empty first segment. Joining that as
 /// `::File` keeps the rooted spelling; a relative path stays `A::B`.
 fn emit_const_path(path: &[crate::Symbol]) -> String {
+    if path.len() > 1 && path.first().is_some_and(|s| !s.as_str().is_empty()) {
+        let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        let rooted = LEXICAL_SCOPE.with(|c| {
+            c.borrow().as_ref().map(|(scopes, paths)| {
+                let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+                rooted_if_shadowed(&written, &scopes, paths)
+            })
+        });
+        if let Some(rooted) = rooted.filter(|r| r.starts_with("::")) {
+            return if native_keywords() { singleton_scoped_path(&rooted) } else { rooted };
+        }
+    }
     if path.len() > 1 && native_keywords() && SINGLETON_SCOPED.with(|c| !c.borrow().is_empty()) {
         let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         return singleton_scoped_path(&written);
