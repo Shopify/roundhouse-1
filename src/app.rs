@@ -594,6 +594,13 @@ pub struct App {
     /// its class defines no methods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rails_application: Option<LibraryClass>,
+    /// The module path wrapping `class Application < Rails::Application`
+    /// in `config/application.rb` (`Sample` of `Sample::Application`), when
+    /// the app runs on PostgreSQL. App code reads the class by that name
+    /// (`Sample::Application.config`), so the emitted reopen of
+    /// `Rails::Application` is also bound to it. None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_namespace: Option<String>,
     /// Filters declared inside a concern module's `included do` block
     /// (`AccountOwnedConcern` → its `before_action :set_account, …`
     /// lines), keyed by the module. Rails runs these as if written in
@@ -1520,6 +1527,7 @@ impl App {
             zeitwerk_loaders: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
+            application_namespace: None,
             concern_filters: HashMap::default(),
             graphql_types: Vec::new(),
             graphql_signatures: Vec::new(),

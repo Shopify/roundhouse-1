@@ -215,6 +215,7 @@ fn tiny_blog_round_trips() {
         generated_helper_methods: std::collections::BTreeMap::new(),
         module_mixins: Vec::new(),
         rails_application: None,
+        application_namespace: None,
         concern_filters: roundhouse::det::HashMap::default(),
         graphql_types: Vec::new(),
         graphql_signatures: Vec::new(),

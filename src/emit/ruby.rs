@@ -290,8 +290,35 @@ pub fn emit_rails_application(app: &App) -> Option<EmittedFile> {
         for m in &mut lc.methods {
             library::rewrite_url_helpers_absolute(&mut m.body);
         }
-        library::emit_library_class_decl(&lc, app, PathBuf::from("config/application.rb"))
+        let mut file = library::emit_library_class_decl(&lc, app, PathBuf::from("config/application.rb"));
+        file.content.push_str(&application_namespace_alias(app.application_namespace.as_deref()));
+        file
     })
+}
+
+/// `module Sample; Application = ::Rails::Application; end`: the reopen
+/// above is the app's `class Sample::Application < Rails::Application`
+/// (its body is replayed on `Rails::Application`), so the constant app
+/// code reads (`Sample::Application.config`) names it. Empty without a
+/// namespace, or one that is not a constant path.
+fn application_namespace_alias(namespace: Option<&str>) -> String {
+    let Some(namespace) = namespace else { return String::new() };
+    let segments: Vec<&str> = namespace.split("::").collect();
+    let constant_path = segments.iter().all(|s| {
+        s.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    if !constant_path {
+        return String::new();
+    }
+    let mut out = String::from("\n");
+    for (depth, segment) in segments.iter().enumerate() {
+        out.push_str(&format!("{}module {segment}\n", "  ".repeat(depth)));
+    }
+    out.push_str(&format!("{}Application = ::Rails::Application\n", "  ".repeat(segments.len())));
+    for depth in (0..segments.len()).rev() {
+        out.push_str(&format!("{}end\n", "  ".repeat(depth)));
+    }
+    out
 }
 
 /// Lower each `app.models` entry through `model_to_library` and emit

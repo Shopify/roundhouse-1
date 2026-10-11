@@ -48,6 +48,15 @@ module Rails
     @configuration ||= Configuration.new(application)
   end
 
+  # `delegate :config, to: :instance` (railties application.rb,
+  # `class << self`): `MyApp::Application.config`, the same configuration
+  # as `Rails.application.config`.
+  class << Application
+    def config(...)
+      Rails.configuration
+    end
+  end
+
   Application.class_eval do
     def config
       Rails.configuration
@@ -225,7 +234,34 @@ module Rails
     end
 
     def respond_to_missing?(name, include_private = false)
-      lifted?(name) || railtie_option?(name) || super
+      lifted?(name) || engine_option?(name) || railtie_option?(name) || framework_namespace?(name) || super
+    end
+
+    # The names Application::Configuration inherits from
+    # Engine::Configuration (railties 8.2.0.alpha engine/configuration.rb),
+    # the path lists and tables an application initializer reads and
+    # prunes (`config.autoload_paths -= unwanted`, `config.paths["app/views"]
+    # .expanded`). One Rails::Application::Configuration for the process,
+    # rooted at the tree's root; where the tree carries no Engine port,
+    # none of them.
+    ENGINE_OPTIONS = %i[
+      paths root autoload_paths autoload_once_paths eager_load_paths
+      all_autoload_paths all_autoload_once_paths all_eager_load_paths
+      route_set_class default_scope javascript_path
+    ].freeze
+
+    # The `config.<framework>` option namespaces each framework's railtie
+    # body sets (`config.action_controller = ActiveSupport::
+    # OrderedOptions.new`, actionpack's action_controller/railtie.rb and
+    # the like), where an assignment is the definition and an unset
+    # option reads as nil.
+    FRAMEWORK_NAMESPACES = %w[
+      action_controller action_dispatch action_view action_mailer action_mailbox action_cable
+      action_text active_job active_model active_record active_storage active_support
+    ].freeze
+
+    def engine_config # :nodoc:
+      @engine_config ||= ::Rails::Application::Configuration.new(Pathname.new(::Rails::Engine.application_root))
     end
 
     # A lifted key answers from the application reopen. Any other key is
@@ -240,8 +276,14 @@ module Rails
     def method_missing(name, *args, &block)
       if lifted?(name)
         @application.public_send(name, *args, &block)
+      elsif engine_option?(name)
+        engine_config.public_send(name, *args, &block)
       elsif defined?(::Rails::Railtie::Configuration)
-        ::Rails::Railtie::Configuration.new.public_send(name, *args, &block)
+        if framework_namespace?(name) && !railtie_option?(name)
+          framework_namespace(name)
+        else
+          ::Rails::Railtie::Configuration.new.public_send(name, *args, &block)
+        end
       else
         super
       end
@@ -323,9 +365,13 @@ module Rails
     # name is Rails' own store: a write sets it, a read of an unset name
     # creates and keeps an empty ActiveSupport::OrderedOptions.
     class Custom
-      def initialize(application, prefix)
+      # `reads_nil`: the options a framework railtie's namespace holds
+      # (`config.action_controller.asset_host`), where an unset name
+      # reads as nil, not as a namespace of its own.
+      def initialize(application, prefix, reads_nil: false)
         @application = application
         @prefix = prefix
+        @reads_nil = reads_nil
       end
 
       def method_missing(method, *args)
@@ -340,6 +386,7 @@ module Rails
           return @application.public_send(key) if lifted?(key)
           return Custom.store[key] if Custom.store.key?(key)
           return Custom.nested[key] ||= Custom.new(@application, key) if lifted_below?(key)
+          return nil if @reads_nil
 
           Custom.store[key] = Custom.empty_options
         end
@@ -489,6 +536,18 @@ module Rails
 
     def railtie_option?(name)
       defined?(::Rails::Railtie::Configuration) && ::Rails::Railtie::Configuration.new.respond_to?(name)
+    end
+
+    def engine_option?(name)
+      defined?(::Rails::Application::Configuration) && ENGINE_OPTIONS.include?(name.to_s.delete_suffix("=").to_sym)
+    end
+
+    def framework_namespace?(name)
+      defined?(::Rails::Railtie::Configuration) && FRAMEWORK_NAMESPACES.include?(name.to_s)
+    end
+
+    def framework_namespace(name)
+      Custom.nested[name.to_s] ||= Custom.new(@application, name.to_s, reads_nil: true)
     end
 
     # ActionDispatch::Session.resolve_store (actionpack 8.2.0.alpha

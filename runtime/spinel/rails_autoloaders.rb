@@ -28,6 +28,7 @@
 # nothing will ever call it. Unloading and reloading (`on_unload`,
 # `reload`) are not modeled: the emitted tree loads each file once, as
 # Zeitwerk does with reloading disabled (Core's test environment).
+require "set"
 require_relative "rails"
 
 module Rails
@@ -110,6 +111,27 @@ module Rails
                        "runs it at the end of its body"
         end
         nil
+      end
+
+      # Zeitwerk::Loader#do_not_eager_load (zeitwerk 2.8.2
+      # loader/eager_load.rb): the directories (or files) `eager_load`
+      # skips, kept as expanded paths. The emitted tree's eager load is
+      # the compiled list of app/models.rb (`RoundhouseAutoload.eager_load!`),
+      # which does not consult them, so under an eager-loading
+      # environment the exclusion is named, once per loader.
+      def do_not_eager_load(*paths)
+        paths = paths.flatten
+        paths.each { |path| eager_load_exclusions << File.expand_path(path.to_s) }
+        if !@exclusions_named && defined?(RoundhouseAutoload) && RoundhouseAutoload.eager_load?
+          @exclusions_named = true
+          $stderr.puts "roundhouse: error[autoload_exclusion_not_applied]: #{@tag}.do_not_eager_load(#{paths.first.inspect}, ...) " \
+                       "is not applied: this tree's eager load is the compiled list of app/models.rb"
+        end
+        nil
+      end
+
+      def eager_load_exclusions # :nodoc:
+        @eager_load_exclusions ||= Set.new
       end
 
       # loader/callbacks.rb:88 with reloading disabled: the constant's
