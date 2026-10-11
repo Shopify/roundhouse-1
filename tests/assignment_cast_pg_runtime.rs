@@ -111,6 +111,20 @@ const PROBE: &str = r##"class AssignmentCastProbe
     out
   end
 
+  # A String column keeps its own mutable copy of what is assigned
+  # (type/string.rb `::String.new(value)`): mutating it in place neither
+  # raises on a frozen string nor reaches the caller's.
+  def self.own_copy
+    mixed = String.new("Mixed")
+    g = Gadget.new(name: mixed, body: "Body".freeze)
+    g.name.downcase!
+    g.body.upcase!
+    g[:legacy] = "7"
+    g.name = "Fro".freeze
+    g[:body] = "zen".freeze
+    "own copy: #{g.name} #{g.body} #{mixed} #{g.name.frozen?} #{g.body.frozen?}"
+  end
+
   def self.lines
     out = precision
     g = Gadget.new(count: "7", total: "12", active: "0", ratio: "1.5", price: "9.99", day: "2026-10-08",
@@ -171,6 +185,7 @@ const PROBE: &str = r##"class AssignmentCastProbe
     g[:owner_id] = nil
     fk << g.owner_id.inspect
     out << "fk: #{fk.join(" ")}"
+    out << own_copy
     out
   end
 end
@@ -178,7 +193,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 18] = [
+const EXPECTED: [&str; 19] = [
     "precision new: ratio=0.30000000000000004 true measure=12345678901234567.123456789 true taken_at=2026-10-08T12:34:56.123456Z usec=123456",
     "precision saved: ratio=0.30000000000000004 true measure=12345678901234567.123456789 true taken_at=2026-10-08T12:34:56.123456Z usec=123456",
     "precision update: ratio=3.3333333333333334e-08 true measure=0.1000000000000000055511151231257827 true taken_at=2026-10-08T12:34:56.999999Z usec=999999 | ratio=3.3333333333333334e-08 true measure=0.1000000000000000055511151231257827 true taken_at=2026-10-08T12:34:56.999999Z usec=999999",
@@ -197,6 +212,7 @@ const EXPECTED: [&str; 18] = [
     r#"attributes: ["id", "count", "total", "active", "ratio", "price", "day", "happened_at", "name", "body", "uid", "legacy", "owner_id"] 1 11 false 0.124e1 Date(2026-03-04) Time(2026-02-03T04:05:06.000000Z) "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" nil true"#,
     r#"nil: count=nil total=-3 active=nil ratio=nil price=nil day=Date(2026-03-04) happened_at=Time(2026-02-03T04:05:06.000000Z) name="" body="1.5" uid="a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" legacy=nil | count=nil total=-3 active=nil ratio=nil price=nil day=Date(2026-03-04) happened_at=Time(2026-02-03T04:05:06.000000Z) name="" body="1.5" uid="a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" legacy=nil"#,
     r#"fk: true true nil nil"#,
+    r#"own copy: Fro zen Mixed false false"#,
 ];
 
 /// What native Rails requires, in order.
