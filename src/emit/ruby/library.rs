@@ -14506,6 +14506,71 @@ impl CarriedSources {
     fn loads_nothing(&self, source: &str) -> bool {
         self.app_files.contains(source) && !self.left_out.contains(source) && !self.anchors.contains_key(source)
     }
+
+    /// The emitted files that requiring `source` (an app file the tree
+    /// carries nothing of: `loads_nothing`) loads through its own
+    /// top-level requires, as Ruby runs the file: each carried file it
+    /// requires, and those an uncarried file it requires requires in turn
+    /// (a test mixin ingest splices into its includers declares no module
+    /// of its own, but its `require` of the support module it includes
+    /// still loads that module). `emitted` filters a carried file's
+    /// declared anchors, as a program's `require` does.
+    fn requires_of_uncarried(&self, app: &App, source: &str, emitted: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::from([source.to_string()]);
+        self.collect_uncarried_requires(app, source, emitted, &mut seen, &mut out);
+        out
+    }
+
+    fn collect_uncarried_requires(
+        &self,
+        app: &App,
+        source: &str,
+        emitted: &dyn Fn(&str) -> bool,
+        seen: &mut BTreeSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        let Some(file) = app.sources.iter().find(|f| relative_source_path(app, &f.path) == source) else { return };
+        for (feature, relative, _) in top_level_requires(file) {
+            let mut resolved = program_require_source(source, &feature, relative, self);
+            if resolved.is_none() && !relative {
+                // A feature on the test load path (`require "support/helpers/x"`
+                // for test/support/helpers/x.rb).
+                let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                let mut hits = app.test_load_roots.iter().map(|root| format!("{root}{rb}")).filter(|p| self.app_files.contains(p));
+                if let (Some(path), None) = (hits.next(), hits.next()) {
+                    resolved = Some(match self.anchors.get(&path) {
+                        Some(anchor) => Ok((path, anchor.clone())),
+                        None => Err(path),
+                    });
+                }
+            }
+            match resolved {
+                Some(Ok((required, anchor))) => {
+                    let anchors: Vec<String> = match self.declarations.get(&required) {
+                        Some(declared) if declared.is_empty() => Vec::new(),
+                        Some(declared) => {
+                            let mut anchors: Vec<String> = declared.iter().filter(|a| emitted(a)).cloned().collect();
+                            if anchors.is_empty() {
+                                anchors.push(anchor);
+                            }
+                            anchors
+                        }
+                        None => vec![anchor],
+                    };
+                    for anchor in anchors {
+                        if !out.contains(&anchor) {
+                            out.push(anchor);
+                        }
+                    }
+                }
+                Some(Err(required)) if self.loads_nothing(&required) && seen.insert(required.clone()) => {
+                    self.collect_uncarried_requires(app, &required, emitted, seen, out);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Each app source with no file program => the emitted files of the
@@ -15045,6 +15110,12 @@ pub(super) fn emit_file_program(
                             for path in opened {
                                 let open: Vec<String> = path.iter().map(|segment| format!("module {segment}")).collect();
                                 writeln!(s, "{pad}{}; {}", open.join("; "), vec!["end"; path.len()].join("; ")).unwrap();
+                            }
+                            // Its own requires still run.
+                            for anchor in table.requires_of_uncarried(app, &source, &|a| emitted.contains(a)) {
+                                if loaded.insert(anchor.clone()) {
+                                    require_anchor(s, &anchor);
+                                }
                             }
                         }
                         Some(Err(_)) => {
@@ -17253,6 +17324,13 @@ fn authored_requires(lc: &LibraryClass, app: &App, out_dir: &Path, self_anchor: 
                     for path in opened {
                         let open: Vec<String> = path.iter().map(|segment| format!("module {segment}")).collect();
                         after.push(format!("{}; {}", open.join("; "), vec!["end"; path.len()].join("; ")));
+                    }
+                    // Its own requires still run.
+                    for anchor in table.requires_of_uncarried(app, &required, &|a| files.contains_key(&format!("app/{a}"))) {
+                        let target = format!("app/{anchor}");
+                        if target != self_anchor && seen.insert(target.clone()) {
+                            requires.push(format!("require_relative {:?}", relpath(out_dir, &target)));
+                        }
                     }
                 }
                 Some(Err(_)) => {

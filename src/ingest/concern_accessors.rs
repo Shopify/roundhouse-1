@@ -1230,10 +1230,48 @@ pub(super) fn splice_into_library_includers(
                 };
                 let Some(attribute) = attribute else {
                     // A `cattr_*`'s accessors are reported with its seed,
-                    // by the declaration itself.
+                    // by the declaration itself. On a plain includer
+                    // (`Module#cattr_accessor` is on every class) the
+                    // accessors and the `@@x` seed run as written, and a
+                    // later `self.x = ...` of the block writes through them.
+                    let plain = !job && !lc.is_module && hook.is_none() && !sti;
                     if let ModelBodyItem::Method { method, .. } = item
                         && super::cattr::generated(method)
                     {
+                        if plain
+                            && !lc.methods.iter().any(|own| own.receiver == method.receiver && own.name == method.name)
+                        {
+                            gained.insert(method.name.as_str().to_string());
+                            let class_attributes: &[Symbol] = &declared;
+                            if let ModelBodyItem::Method { method, .. } =
+                                super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                            {
+                                plan.methods.retain(|m| !(m.name == method.name && m.receiver == method.receiver));
+                                let key = (method.receiver, method.name.clone());
+                                for g in &mut plan.class_attributes {
+                                    g.methods.retain(|k| *k != key);
+                                }
+                                let group = attribute_group(&mut plan, top(&lc.includes[*root]));
+                                plan.class_attributes[group].methods.push(key);
+                                plan.methods.push(method);
+                            }
+                        }
+                        continue;
+                    }
+                    if plain
+                        && let ModelBodyItem::ClassBody { expr, .. } = item
+                        && super::cattr::seeded_storage(expr).is_some()
+                    {
+                        let class_attributes: &[Symbol] = &declared;
+                        if let ModelBodyItem::ClassBody { expr, .. } =
+                            super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                        {
+                            if !expr.span.is_synthetic() {
+                                let group = attribute_group(&mut plan, top(&lc.includes[*root]));
+                                plan.class_attributes[group].seeds.push(expr.span);
+                            }
+                            plan.initializers.push(expr);
+                        }
                         continue;
                     }
                     if sti && let Some(expr) = sti_subclass_statement(item, concern, &lc.name, &declared, &defined, sources) {
@@ -1277,18 +1315,7 @@ pub(super) fn splice_into_library_includers(
                 let class_attributes: &[Symbol] = &declared;
                 // Grouped under the include it runs after, where the
                 // emitted body writes it (`App::included_class_attributes`).
-                let after = top(&lc.includes[*root]);
-                let group = match plan.class_attributes.iter().position(|g| g.after == after) {
-                    Some(group) => group,
-                    None => {
-                        plan.class_attributes.push(crate::app::IncludedClassAttributes {
-                            after,
-                            methods: Vec::new(),
-                            seeds: Vec::new(),
-                        });
-                        plan.class_attributes.len() - 1
-                    }
-                };
+                let group = attribute_group(&mut plan, top(&lc.includes[*root]));
                 match super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined) {
                     ModelBodyItem::Method { method, .. } => {
                         plan.methods.retain(|m: &crate::dialect::MethodDef| {
@@ -1650,6 +1677,22 @@ struct Plan {
     /// An STI subclass's model DSL statements, in block order, ahead of
     /// its own body calls ([`sti_subclass_statement`]).
     carried: Vec<Expr>,
+}
+
+/// The group of `plan.class_attributes` that runs after the include of
+/// `after`, made on first use.
+fn attribute_group(plan: &mut Plan, after: ClassId) -> usize {
+    match plan.class_attributes.iter().position(|g| g.after == after) {
+        Some(group) => group,
+        None => {
+            plan.class_attributes.push(crate::app::IncludedClassAttributes {
+                after,
+                methods: Vec::new(),
+                seeds: Vec::new(),
+            });
+            plan.class_attributes.len() - 1
+        }
+    }
 }
 
 /// An `included do` statement as a body call of the STI subclass
