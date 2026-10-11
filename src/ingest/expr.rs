@@ -954,6 +954,30 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_constant_path_node().is_some() => {
             let p = n.as_constant_path_node().unwrap();
+            // `JobIteration.enumerator_builder::Wrapper`: the scope is a
+            // value, not a constant path, so the read is the receiver's
+            // own `const_get` (Ruby's `rb_public_const_get_from`; unlike
+            // the bare form, `const_get` also consults Object for a
+            // module receiver, which only matters where the source
+            // would have raised NameError).
+            if let Some((scope, names)) = super::util::dynamic_constant_scope(&p) {
+                let recv = ingest_expr(&scope, file)?;
+                let name = if names.len() == 1 {
+                    Literal::Sym { value: names[0].as_str().into() }
+                } else {
+                    Literal::Str { value: names.join("::") }
+                };
+                return Ok(Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(recv),
+                        method: Symbol::from("const_get"),
+                        args: vec![Expr::new(span, ExprNode::Lit { value: name })],
+                        block: None,
+                        parenthesized: true,
+                    },
+                ));
+            }
             // `::StatsD` names the top-level constant from anywhere; an empty
             // first segment keeps that through passes that qualify a bare
             // name into its enclosing namespace (`qualify_lexical_consts`

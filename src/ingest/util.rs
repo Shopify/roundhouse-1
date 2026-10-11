@@ -977,6 +977,27 @@ pub(super) fn constant_path_segments(p: &ruby_prism::ConstantPathNode<'_>) -> Ve
         .collect()
 }
 
+/// The value a constant path is scoped by, with the names read from it:
+/// `expr::A::B` is `(expr, ["A", "B"])` where `expr` is not itself a
+/// constant (a method call, a local, `self`). `None` for a path made of
+/// constants alone, rooted or not.
+pub(super) fn dynamic_constant_scope<'pr>(p: &ruby_prism::ConstantPathNode<'pr>) -> Option<(Node<'pr>, Vec<String>)> {
+    let mut names = Vec::new();
+    let mut cur = p.as_node().as_constant_path_node()?;
+    loop {
+        names.push(constant_id_str(&cur.name()?).to_string());
+        let parent = cur.parent()?;
+        if let Some(next) = parent.as_constant_path_node() {
+            cur = next;
+        } else if parent.as_constant_read_node().is_some() {
+            return None;
+        } else {
+            names.reverse();
+            return Some((parent, names));
+        }
+    }
+}
+
 /// The leading `::` belongs to the innermost path node in `::A::B`.
 pub(super) fn constant_path_is_rooted(p: &ruby_prism::ConstantPathNode<'_>) -> bool {
     match p.parent() {

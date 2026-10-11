@@ -171,6 +171,23 @@ module ActiveRecord
       ResourceBusyError = Class.new(SemianError)
       CircuitOpenError = Class.new(SemianError)
     end
+
+    # lib/semian/activerecord_trilogy_adapter.rb declares the same error
+    # classes on the Trilogy adapter, which an app names in rescue lists
+    # and class-body error arrays whatever its adapter is. This tree has
+    # no MySQL adapter, so TrilogyAdapter here is only the class that
+    # holds them: no connection is ever one, and nothing is prepended.
+    class TrilogyAdapter < AbstractAdapter
+      class SemianError < ConnectionNotEstablished
+        def initialize(semian_identifier, *args)
+          super(*args)
+          @semian_identifier = semian_identifier
+        end
+      end
+
+      ResourceBusyError = Class.new(SemianError)
+      CircuitOpenError = Class.new(SemianError)
+    end
   end
 end
 
