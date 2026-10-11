@@ -4681,7 +4681,17 @@ fn walk_decl_body_in<'pr>(
                             class_attributes.extend(declaration.names.iter().cloned());
                             let span = super::util::node_span(&statement, file);
                             out.class_attr_seeds.extend(declaration.seeds(span));
-                            for method in declaration.methods(owner) {
+                            // The accessors sit where the declaration does, so a
+                            // later class-body call (`register(owner: self,
+                            // accessor: :x)`, which sends `x=` to the class)
+                            // finds them defined, as in ActiveSupport.
+                            let at = Span {
+                                file: super::sources::file_id(file),
+                                start: call.location().start_offset() as u32,
+                                end: call.location().end_offset() as u32,
+                            };
+                            for mut method in declaration.methods(owner) {
+                                method.name_span = at;
                                 if !out.methods.iter().any(|e| e.name == method.name && e.receiver == method.receiver) {
                                     out.methods.push(method);
                                 }

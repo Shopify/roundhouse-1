@@ -12201,7 +12201,28 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment
         .as_program_node()
         .map(|p| p.statements().body().iter().collect::<Vec<_>>())
         .unwrap_or_default();
+    // Literal-valued locals the configuration body assigned so far
+    // (`version = 32`), by name: the lifted value is evaluated in a method
+    // of its own, where such a local no longer exists.
+    let mut literal_locals: Vec<(String, String)> = Vec::new();
     walk_config_statements(stmts, None, &mut |stmt, app_param| {
+        if let Some(w) = stmt.as_local_variable_write_node() {
+            let value = w.value();
+            if value.as_integer_node().is_some()
+                || value.as_float_node().is_some()
+                || value.as_string_node().is_some()
+                || value.as_symbol_node().is_some()
+                || value.as_true_node().is_some()
+                || value.as_false_node().is_some()
+                || value.as_nil_node().is_some()
+            {
+                let name = super::util::constant_id_str(&w.name()).to_string();
+                let loc = stmt.location();
+                literal_locals.retain(|(n, _)| *n != name);
+                literal_locals.push((name, src[loc.start_offset()..loc.end_offset()].to_string()));
+            }
+            return;
+        }
         // An inert framework write is applied by being inert:
         // `config.assets.version = …`, `config.assets.precompile +=
         // …`, `config.assets.precompile << …`.
@@ -12279,9 +12300,30 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment
         let loc = value.location();
         let mut path = prefix;
         path.push(base.to_string());
+        let mut value_src = src[loc.start_offset()..loc.end_offset()].to_string();
+        if !literal_locals.is_empty() {
+            use ruby_prism::Visit;
+            struct LocalReads(Vec<String>);
+            impl<'pr> Visit<'pr> for LocalReads {
+                fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                    self.0.push(super::util::constant_id_str(&node.name()).to_string());
+                }
+            }
+            let mut reads = LocalReads(Vec::new());
+            reads.visit(&value);
+            // Re-assigned inside the lifted method, ahead of the value.
+            let captured: Vec<&str> = literal_locals
+                .iter()
+                .filter(|(n, _)| reads.0.contains(n))
+                .map(|(_, text)| text.as_str())
+                .collect();
+            if !captured.is_empty() {
+                value_src = format!("{}\n  {value_src}", captured.join("\n  "));
+            }
+        }
         out.push(ConfigAssignment {
             path,
-            value: src[loc.start_offset()..loc.end_offset()].to_string(),
+            value: value_src,
             start: stmt.location().start_offset(),
             end: stmt.location().end_offset(),
         });

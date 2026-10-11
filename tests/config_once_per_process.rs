@@ -147,3 +147,38 @@ fn the_app_wide_setup_is_spliced_ahead_of_the_modules_own_and_its_tap_write_beco
     sends(&tm.tests[0].body, &mut body_calls);
     assert!(body_calls.contains(&"x_pool/0".to_string()), "{body_calls:?}");
 }
+
+/// `session_prefix_version = 32` in the Application body and
+/// `config.session_key_prefix = "#{session_prefix_version}:sessions"`
+/// beneath it: the lifted `__build` runs in a method of its own, so the
+/// literal local it reads is assigned again at the top of that method
+/// (class bodies keep their locals; a method does not).
+#[test]
+fn a_literal_local_the_value_reads_is_assigned_in_the_lifted_build() {
+    let tree = vec![
+        ("db/schema.rb", SCHEMA),
+        ("config/routes.rb", "Rails.application.routes.draw do\n  resources :users\nend\n"),
+        (
+            "config/application.rb",
+            "module Sample\n  class Application < Rails::Application\n    \
+               version = 32\n    unused = 1\n    \
+               config.key_prefix = \"#{version}:sessions\"\n  end\nend\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest tree");
+    let lc = app.rails_application.as_ref().expect("reopen");
+    let build = lc.methods.iter().find(|m| m.name.as_str() == "key_prefix__build").expect("build");
+    let ExprNode::Seq { exprs } = &*build.body.node else { panic!("{:?}", build.body.node) };
+    assert_eq!(exprs.len(), 2, "{exprs:?}");
+    assert!(
+        matches!(&*exprs[0].node, ExprNode::Assign { target, .. } if format!("{target:?}").contains("version")),
+        "the local is assigned first: {:?}",
+        exprs[0].node
+    );
+    assert!(format!("{:?}", exprs[0].node).contains("32"), "{:?}", exprs[0].node);
+    let text = format!("{:?}", exprs);
+    assert!(!text.contains("unused"), "only the locals the value reads are carried: {text}");
+}
