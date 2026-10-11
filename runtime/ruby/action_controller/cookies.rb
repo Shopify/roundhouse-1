@@ -369,6 +369,13 @@ module ActionDispatch
       def self.build(request, cookies)
         ActionController::CookieJar.new(cookies)
       end
+
+      # `CookieJar.new(request)` (actionpack's cookies.rb `initialize(request)`):
+      # an empty jar for the request, as a test builds one to hand a
+      # service. The request is ignored here, as in `build`.
+      def self.new(request = nil, inbound = {})
+        ActionController::CookieJar.new(inbound)
+      end
     end
   end
 end

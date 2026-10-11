@@ -210,4 +210,11 @@ class ActionControllerCookiesTest < Minitest::Test
     assert_instance_of ActionController::CookieJar, jar
     assert_equal "1", jar["a"]
   end
+
+  def test_action_dispatch_cookie_jar_new_takes_the_request
+    jar = ActionDispatch::Cookies::CookieJar.new(nil)
+    assert_instance_of ActionController::CookieJar, jar
+    jar["a"] = "1"
+    assert_equal "1", jar["a"]
+  end
 end
