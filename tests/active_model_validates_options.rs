@@ -227,8 +227,8 @@ fn app(files: &[(&str, &str)]) -> emit_and_run::Overlay {
 /// `script`.
 fn native(files: &[(&str, &str)], script: &str) -> String {
     let gem_home = std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
-    let rails = std::path::Path::new(&gem_home).join("bundler/gems/rails-5813559f4aed");
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+    let rails = std::path::Path::new(&gem_home).join("bundler/gems/rails-5eb8c4c45bee");
     assert!(rails.is_dir(), "Core's Rails checkout {} is missing (set CORE_GEM_HOME)", rails.display());
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -25,7 +25,7 @@ fn root() -> &'static Path {
 
 fn core_gem_home() -> String {
     std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn gem_path() -> String {
     format!("{}:{}", core_gem_home(), String::from_utf8_lossy(&ruby_path.stdout))
 }
 
-/// api_versioning 4.6.0's `FrozenApplicationRecord` and its backend,
+/// api_versioning 4.6.1's `FrozenApplicationRecord` and its backend,
 /// verbatim from Core's gem home with the gem's data dir, carried as a
 /// probe gem (`fa_probe`) beside frozen_record: the record class whose
 /// subclasses Core's ApiVersionRecord and ApiChangeRecord are, without
@@ -302,7 +302,7 @@ fn frozen_application_record_loads_api_versioning_data_like_native() {
     }
     let home = Path::new(&core_gem_home()).join("gems");
     copy_tree(&home.join("frozen_record-0.27.4"), &dir.join("vendor/gems/frozen_record-0.27.4"));
-    let api_versioning = home.join("api_versioning-4.6.0");
+    let api_versioning = home.join("api_versioning-4.6.1");
     copy_tree(&api_versioning.join("data"), &dir.join("vendor/gems/fa_probe-0.1.0/data"));
     for file in ["frozen_application_record.rb", "frozen_application_record_backend.rb"] {
         let to = dir.join("vendor/gems/fa_probe-0.1.0/lib/api_versioning").join(file);

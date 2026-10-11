@@ -29,22 +29,16 @@ require "fileutils"
 # (8.2.0.alpha) from Core's bundle, run with Core's gem home
 # (CORE_GEM_HOME, default the one bin/check-target uses) so its
 # dependencies are Core's too.
-CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
-RAILS_CHECKOUT = File.join(CORE_GEM_HOME, "bundler/gems/rails-5813559f4aed")
+require_relative "support/rails_oracle"
+
+CORE_GEM_HOME = RailsOracle::CORE_GEM_HOME
+RAILS_CHECKOUT = RailsOracle::PINNED
 RAILS_LIBS = %w[activesupport activemodel activerecord].map { |lib| File.join(RAILS_CHECKOUT, lib, "lib") }
 
 def ruby_command(mode)
   return [{}, RbConfig.ruby] unless mode == "native"
   abort "native: Core's Rails checkout #{RAILS_CHECKOUT} is missing (set CORE_GEM_HOME)" unless File.directory?(RAILS_CHECKOUT)
-  env = { "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }
-  # The gem home's native extensions (json's parser.so) are built against
-  # a jemalloc Ruby and fail to load without it (tests/support/rails_oracle.rb).
-  jemalloc = ENV.fetch("RH_JEMALLOC", "/nix/store/c04j2i0fkin1bw5fab35gx896558knsd-jemalloc-5.3.0-unstable-2025-09-12/lib/libjemalloc.so.2")
-  preload = ENV["LD_PRELOAD"].to_s
-  if File.exist?(jemalloc) && !preload.include?("jemalloc")
-    env["LD_PRELOAD"] = [jemalloc, *preload.split(/[: ]/).reject(&:empty?)].join(":")
-  end
-  [env, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
+  [RailsOracle.env, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
 end
 
 # Loaded from the checkout, not from some other installed Rails.

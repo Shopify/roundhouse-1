@@ -92,7 +92,7 @@ fn app() -> emit_and_run::Overlay {
 
 fn native(script: &str) -> String {
     let gems = std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
     let dir = std::env::temp_dir().join(format!("rh_non_nil_native_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("counter.rb"), LIB).unwrap();

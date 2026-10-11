@@ -14,7 +14,7 @@ require "json"
 require "socket"
 require_relative "support/rails_oracle"
 
-CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
+CORE_GEM_HOME = RailsOracle::CORE_GEM_HOME
 
 def memcached_binary
   candidates = [ENV["MEMCACHED"]]

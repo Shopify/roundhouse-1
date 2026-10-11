@@ -160,7 +160,7 @@ fn hook_stays_a_gap_when_the_app_is_not_compiled_for_postgresql() {
 
 fn core_gem_home() -> String {
     std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into())
 }
 
 fn gem_path() -> String {

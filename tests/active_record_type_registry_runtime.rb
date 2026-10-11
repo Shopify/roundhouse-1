@@ -10,14 +10,16 @@
 # its default reads `ActiveRecord::Base.connection_db_config`, which needs a
 # configured database.
 
-CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
-RAILS_CHECKOUT = File.join(CORE_GEM_HOME, "bundler/gems/rails-5813559f4aed")
+require_relative "support/rails_oracle"
+
+CORE_GEM_HOME = RailsOracle::CORE_GEM_HOME
+RAILS_CHECKOUT = RailsOracle::PINNED
 RAILS_LIBS = %w[activesupport activemodel activerecord].map { |lib| File.join(RAILS_CHECKOUT, lib, "lib") }
 
 def ruby_command(mode)
   return [{}, RbConfig.ruby] unless mode == "native"
   abort "native: Core's Rails checkout #{RAILS_CHECKOUT} is missing (set CORE_GEM_HOME)" unless File.directory?(RAILS_CHECKOUT)
-  [{ "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
+  [RailsOracle.env, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
 end
 
 if ARGV.first == "compare"

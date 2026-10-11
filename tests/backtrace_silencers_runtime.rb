@@ -103,7 +103,7 @@ FRAMES = [
   "#{ESSENTIALS}/lib/development_support/query_error_log_subscriber.rb:24:in 'QueryErrorLogSubscriber#sql'",
   "#{GEM_HOME}/gems/activesupport-8.1.4/lib/active_support/log_subscriber.rb:120:in 'ActiveSupport::LogSubscriber#call'",
   "/nix/store/0a1b2c3d-activesupport-8.1.4/lib/ruby/gems/4.0.0/gems/activesupport-8.1.4/lib/active_support/notifications/fanout.rb:110:in 'block in finish'",
-  "#{GEM_HOME}/bundler/gems/rails-5813559f4aed/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb:1150:in 'ActiveRecord::ConnectionAdapters::AbstractAdapter#log'",
+  "#{GEM_HOME}/bundler/gems/rails-5eb8c4c45bee/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb:1150:in 'ActiveRecord::ConnectionAdapters::AbstractAdapter#log'",
   "/nix/store/4e5f6a7b-pg-1.6.2/lib/ruby/gems/4.0.0/gems/pg-1.6.2/lib/pg/connection.rb:200:in 'PG::Connection#exec_params'",
   "#{ESSENTIALS}/lib/patches/active_record/retry.rb:31:in 'Patches::ActiveRecord::Retry#execute'",
   "#{ESSENTIALS}/lib/patches/active_record/deadline.rb:18:in 'Patches::ActiveRecord::Deadline#raw_execute'",
