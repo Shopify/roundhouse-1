@@ -185,3 +185,31 @@ fn a_class_body_call_after_cattr_accessor_finds_the_writer_as_native() {
     assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
+
+/// A class on a base the compiler does not model replays its class-body
+/// calls verbatim. A call that names a declared accessor by keyword
+/// (`registry.register(owner: self, accessor: :store)` sends `store=` to the
+/// class as it runs) is a tail effect: it stands below the accessors, as in
+/// ActiveSupport, where the declaration defines them where it stands.
+const BINDS_ON_FOREIGN_BASE: &str = r##"class Bound < ActionDispatch::Session::AbstractStore
+  cattr_accessor :store
+
+  Registry.register(owner: self, accessor: :store) do
+    :built
+  end
+
+  def find(id) = store
+end
+"##;
+
+#[test]
+fn a_replayed_call_naming_a_declared_accessor_by_keyword_is_written_below_the_accessors() {
+    let run = emit_and_run::empty_app()
+        .write("lib/registry.rb", "class Registry\n  def self.register(owner:, accessor:)\n    owner.send(\"#{accessor}=\", yield)\n  end\nend\n")
+        .write("app/utils/bound.rb", BINDS_ON_FOREIGN_BASE)
+        .run_ruby("p 1\n");
+    let text = std::fs::read_to_string(run.emitted.join("app/models/bound.rb")).expect("the class is emitted");
+    let call = text.find("Registry.register").unwrap_or_else(|| panic!("the call is replayed:\n{text}"));
+    let writer = text.find("def self.store=").unwrap_or_else(|| panic!("the writer is emitted:\n{text}"));
+    assert!(writer < call, "the call runs before the writer it sends:\n{text}");
+}

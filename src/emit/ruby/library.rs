@@ -14294,12 +14294,18 @@ fn names_own_method_above(lc: &LibraryClass, call: &Expr) -> bool {
     if call.span.is_synthetic() {
         return false;
     }
-    args.iter().any(|arg| {
+    let names_def_above = |arg: &Expr| {
         matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
             if lc.methods.iter().any(|m| m.name == *value
                 && !m.name_span.is_synthetic()
                 && m.name_span.file == call.span.file
                 && m.name_span.start < call.span.start))
+    };
+    // Also by a keyword value (`registry.register(owner: self, accessor:
+    // :store)`, which sends `store=` to the class as it runs).
+    args.iter().any(|arg| match &*arg.node {
+        ExprNode::Hash { entries, kwargs: true } => entries.iter().any(|(_, value)| names_def_above(value)),
+        _ => names_def_above(arg),
     })
 }
 
