@@ -197,7 +197,8 @@ fn a_nested_namespace_a_later_file_opens_does_not_shadow_the_top_level_before_it
     assert_eq!(lines(&run.stdout), expected, "emitted Tessera diverges from the gem");
 }
 
-/// The same shape under `ruby -w`, where a `require` of a file that is
+/// The `a_require_written_below_a_gem_class_runs_after_the_class_is_defined`
+/// shape under `ruby -w`, where a `require` of a file that is
 /// still loading prints "loading in progress, circular require considered
 /// harmful" (a StrictWarning-style boot raises on it). Natively the
 /// subclass file never requires its superclass's file back: the
