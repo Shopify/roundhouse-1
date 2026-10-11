@@ -15,7 +15,7 @@ use roundhouse::project::BuildTarget;
 
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-const ERRORS: &str = "module AdapterErrorProbe\n  TRANSIENT = [\n    ActiveRecord::ConnectionAdapters::TrilogyAdapter::ResourceBusyError,\n    ActiveRecord::ConnectionAdapters::TrilogyAdapter::CircuitOpenError,\n  ].freeze\nend\n";
+const ERRORS: &str = "module AdapterErrorProbe\n  TRANSIENT = [\n    ActiveRecord::ConnectionAdapters::TrilogyAdapter::ResourceBusyError,\n    ActiveRecord::ConnectionAdapters::TrilogyAdapter::CircuitOpenError,\n    ::ActiveRecord::ConnectionAdapters::TrilogyAdapter::ResourceBusyError,\n  ].freeze\n  def self.trilogy?(connection)\n    defined?(ActiveRecord::ConnectionAdapters::TrilogyAdapter) && connection.is_a?(ActiveRecord::ConnectionAdapters::TrilogyAdapter)\n  end\nend\n";
 
 struct TempDir(PathBuf);
 
