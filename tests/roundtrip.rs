@@ -176,6 +176,7 @@ fn tiny_blog_round_trips() {
         load_hook_bases: std::collections::BTreeMap::new(),
         load_hooks: Vec::new(),
         load_hook_includes: Vec::new(),
+        delegate_forwarder_sites: Default::default(),
         test_load_roots: Vec::new(),
         lib_load_roots: Vec::new(),
         ingest_drops: Vec::new(),
