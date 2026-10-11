@@ -154,10 +154,18 @@ module ActiveRecord # :nodoc:
     # activerecord/lib/active_record/attribute_methods/write.rb: a gem's
     # unit-name writer (`write_attribute(unit_field_name, name)`) reaches the
     # column through the model's generated `[]=`, which casts as the
-    # attribute writers do. (Not `read_attribute`: the validations ports
-    # test `respond_to?(:read_attribute)` to pick another read path.)
+    # attribute writers do.
     def write_attribute(attr_name, value)
       self[attr_name] = value
+    end
+
+    # attribute_methods/read.rb: the column's value through the model's
+    # generated `[]`, past any reader the class overrides, as an app
+    # module calls it on a record it holds (a validation's condition
+    # reading a foreign key column). The validations ports ask
+    # `respond_to?(:read_attribute)` and read the same value.
+    def read_attribute(attr_name)
+      self[attr_name]
     end
   end
 end

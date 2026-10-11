@@ -3940,7 +3940,15 @@ fn ruby_family_files(
     // it (`emit::ruby::library::apply_association_reader`, which runs only
     // where the app calls `association`). gem_facades.rb requires it after
     // the ActiveRecord runtime, whose Base it reopens.
-    let carries_associations = carries_named(&files, &["ActiveRecord::Associations"]);
+    // Also where app code asks a reflection for its `association_class`,
+    // which names one of its classes.
+    let carries_associations = carries_named(&files, &["ActiveRecord::Associations"])
+        || files.iter().any(|(path, content)| {
+            path.ends_with(".rb")
+                && !path.starts_with("runtime/")
+                && !path.starts_with("test/")
+                && content.contains(".association_class")
+        });
     // `errors.attribute_names` (see the file's header): carried where the
     // emitted code, its tests included, records or reads an error's
     // attribute (`emit::ruby::expr::error_attribute_push`).

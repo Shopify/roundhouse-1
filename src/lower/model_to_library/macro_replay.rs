@@ -239,10 +239,14 @@ const CLASS_SIDE_BUILTINS: &[&str] = &[
 /// `class_attribute`s, runtime/ruby/active_record/connection.rb), which
 /// the runtime reads at call time, so a write from a replayed class-body
 /// call takes effect as in Rails: Core's `StiLookupTable.extended` sets
-/// `store_full_sti_class = false`.
+/// `store_full_sti_class = false`. A class macro that declares its
+/// association through `belongs_to` reads `belongs_to_required_by_default`
+/// (core.rb's class_attribute; the runtime base answers it, the writes the
+/// lowered model applies statically).
 const RUNTIME_CLASS_SETTINGS: &[&str] = &[
     "store_full_sti_class", "store_full_sti_class=", "store_full_sti_class?", "store_full_class_name",
     "store_full_class_name=", "store_full_class_name?",
+    "belongs_to_required_by_default", "belongs_to_required_by_default?",
 ];
 
 /// The class-side DSL of a gem the Ruby-family runtime ports onto the

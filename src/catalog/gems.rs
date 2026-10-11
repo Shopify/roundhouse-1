@@ -183,10 +183,11 @@ pub const GEM_CATALOG: &[GemClass] = &[
         class_methods: &[],
         instance_methods: &[("value", GemTy::Untyped), ("pending?", GemTy::Bool)],
     },
-    // Thin surface for `Model.reflect_on_association(:name)` — enough
-    // for ActionText / attachment helpers that compare `.klass` or
-    // ask presence. Full reflection stays unmodeled (Untyped on the
-    // deeper readers).
+    // Surface for `Model.reflect_on_association(:name)`: the readers of
+    // activerecord reflection.rb's AssociationReflection that app code
+    // asks (`options`, the keys, the class names, the kind predicates).
+    // The deeper readers are Untyped; the Ruby-family runtime answers
+    // these (runtime/spinel/cruby/active_record_core.rb).
     GemClass {
         name: "ActiveRecord::Reflection::AssociationReflection",
         class_methods: &[],
@@ -194,6 +195,22 @@ pub const GEM_CATALOG: &[GemClass] = &[
             ("klass", GemTy::Untyped),
             ("name", GemTy::Sym),
             ("macro", GemTy::Sym),
+            ("options", GemTy::Untyped),
+            ("foreign_key", GemTy::Untyped),
+            ("foreign_type", GemTy::Untyped),
+            ("class_name", GemTy::Str),
+            ("active_record", GemTy::Untyped),
+            ("association_primary_key", GemTy::Untyped),
+            ("active_record_primary_key", GemTy::Untyped),
+            ("polymorphic?", GemTy::Untyped),
+            ("collection?", GemTy::Bool),
+            ("belongs_to?", GemTy::Bool),
+            ("has_one?", GemTy::Bool),
+            ("through_reflection?", GemTy::Bool),
+            ("through_reflection", GemTy::Untyped),
+            ("validate?", GemTy::Bool),
+            ("type", GemTy::Untyped),
+            ("association_class", GemTy::Untyped),
         ],
     },
     // Arel — ActiveRecord's low-level SQL AST builder. `sql` wraps a

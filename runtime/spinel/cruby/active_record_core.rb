@@ -418,7 +418,15 @@ module ActiveRecord
         end
       end
 
+      # reflection.rb's `foreign_key`: the `:foreign_key` option as the
+      # declaration gave it once it is known (a class macro's association
+      # may pass an Array of columns, Rails' composite foreign key,
+      # while the compiled association reads one column), else the
+      # column the compiler resolved.
       def foreign_key
+        if _roundhouse_options_known? && (declared = @options[:foreign_key])
+          return _roundhouse_key_names(declared)
+        end
         if @foreign_key.nil?
           raise NotImplementedError, "roundhouse: #{@active_record}.reflect_on_association(:#{@name}).foreign_key: " \
             "the compiled #{macro} association has no foreign key"
@@ -497,6 +505,12 @@ module ActiveRecord
           !@options.nil? && @unsupported.empty?
         end
 
+        # A `:foreign_key` / `:primary_key` option as reflection.rb
+        # normalizes it: a frozen String, or an Array of them.
+        def _roundhouse_key_names(key)
+          key.is_a?(Array) ? key.map { |name| -name.to_s }.freeze : -key.to_s
+        end
+
         # reflection.rb's `primary_key(klass)`.
         def _roundhouse_primary_key_of(klass)
           key = klass.primary_key
@@ -536,6 +550,10 @@ module ActiveRecord
         :has_many
       end
 
+      def association_class
+        ActiveRecord::Associations::HasManyAssociation
+      end
+
       def collection?
         true
       end
@@ -544,6 +562,10 @@ module ActiveRecord
     class HasOneReflection < AssociationReflection
       def macro
         :has_one
+      end
+
+      def association_class
+        ActiveRecord::Associations::HasOneAssociation
       end
 
       def has_one?
@@ -578,6 +600,11 @@ module ActiveRecord
         :belongs_to
       end
 
+      # reflection.rb's `association_class`.
+      def association_class
+        polymorphic? ? ActiveRecord::Associations::BelongsToPolymorphicAssociation : ActiveRecord::Associations::BelongsToAssociation
+      end
+
       def belongs_to?
         true
       end
@@ -592,7 +619,14 @@ module ActiveRecord
         super
       end
 
+      # reflection.rb's `association_primary_key`: the `:primary_key`
+      # option once the declaration's options are known (an Array for a
+      # composite key), else the key the compiler resolved, else the
+      # target's primary key.
       def association_primary_key
+        if _roundhouse_options_known? && (declared = @options[:primary_key])
+          return _roundhouse_key_names(declared)
+        end
         @primary_key || klass.primary_key.to_s
       end
 

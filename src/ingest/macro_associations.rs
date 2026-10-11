@@ -146,10 +146,18 @@ fn forwarded_to_association(
     def: &MethodDef,
     depth: usize,
 ) -> Option<Forward> {
-    let [record, second, options] = def.params.as_slice() else { return None };
+    let [record, second, middle @ .., options] = def.params.as_slice() else { return None };
     if record.rest || record.keyword || record.default.is_some() {
         return None;
     }
+    // Keyword parameters between the scope and `**options` (Core's
+    // `belongs_to_with_query_constraints(name, scope = nil,
+    // query_constraints:, foreign_key:, primary_key:, **options)`) take
+    // their values from the call, which the association is parsed from.
+    if !middle.iter().all(|p| (p.keyword || p.from_keyword) && !p.rest) {
+        return None;
+    }
+    let bound: Vec<Symbol> = middle.iter().map(|p| p.name.clone()).collect();
     let optional_nil = matches!(second.default.as_ref().map(|d| &*d.node), Some(ExprNode::Lit { value: Literal::Nil }));
     if second.keyword || !(second.rest || optional_nil) {
         return None;
@@ -203,7 +211,7 @@ fn forwarded_to_association(
                 if !on_self || !is_var(a_record, &record.name) || !passes_second || !passes_block {
                     continue;
                 }
-                let Some(mut merged) = passed_options(a_options, &options.name) else { continue };
+                let Some(mut merged) = passed_options_with(a_options, &options.name, &bound) else { continue };
                 if let kind @ ("belongs_to" | "has_one" | "has_many") = method.as_str() {
                     let kind = match kind {
                         "belongs_to" => "belongs_to",
@@ -582,6 +590,35 @@ fn is_self(expr: &Expr) -> bool {
 
 fn is_var(expr: &Expr, name: &Symbol) -> bool {
     matches!(&*expr.node, ExprNode::Var { name: n, .. } if n == name)
+}
+
+/// [`passed_options`], or `**{ key: literal, own_kw: own_kw, ... }.merge(name)`
+/// (what `belongs_to(name, scope, foreign_key: query_constraints,
+/// optional: true, **options)` parses to): the literal pairs. A pair
+/// valued by the macro's own keyword parameter `bound` is the call's own
+/// keyword, which the association is parsed from. The literals are
+/// taken to win over the call's `**name`, which holds only what the macro
+/// has not consumed (Core's `options.delete(:optional)`).
+fn passed_options_with(arg: &Expr, name: &Symbol, bound: &[Symbol]) -> Option<Vec<(Symbol, Expr)>> {
+    let ExprNode::KeywordSplat { value } = &*arg.node else { return passed_options(arg, name) };
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
+        return passed_options(arg, name);
+    };
+    let (ExprNode::Hash { entries, .. }, [passed]) = (&*recv.node, args.as_slice()) else { return passed_options(arg, name) };
+    if method.as_str() != "merge" || !is_var(passed, name) {
+        return passed_options(arg, name);
+    }
+    entries
+        .iter()
+        .filter_map(|(k, v)| {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return Some(None) };
+            match &*v.node {
+                ExprNode::Lit { .. } => Some(Some((key.clone(), v.clone()))),
+                ExprNode::Var { name: n, .. } if bound.contains(n) => None,
+                _ => Some(None),
+            }
+        })
+        .collect()
 }
 
 /// `**name` or `**name.merge(key: literal, ...)`: the merged pairs.
