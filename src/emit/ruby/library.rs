@@ -12505,11 +12505,12 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
     // nowhere itself (`VALID = statuses`, which a class-body macro
     // above it defined on the singleton) waits for the replayed class-body
     // calls the source has above it: those are written after the
-    // eager constants.
+    // eager constants. A model's replayed calls are its class-ivar
+    // initializers (`collect_class_attr_initializers`).
     let reads_macro_defined = |value: &Expr| {
         !value.span.is_synthetic()
             && calls_unowned_class_method(value, &own)
-            && lc.unknown_calls.iter().any(|c| {
+            && lc.unknown_calls.iter().chain(&lc.class_ivar_initializers).any(|c| {
                 !c.span.is_synthetic() && c.span.file == value.span.file && c.span.end <= value.span.start
             })
     };
@@ -16633,6 +16634,27 @@ fn require_path_for_body_const(
             return None;
         }
         return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+    }
+    // The enclosing namespaces are scopes too: `Change::ADD` inside
+    // `module Sales; module Query; module Changes` is `Sales::Change::ADD`
+    // when `Sales::Change` is a class, as Ruby's lexical lookup finds it
+    // (the innermost scope that has the head segment wins). The file of
+    // the longest class prefix of the path under that scope.
+    let scopes: Vec<&str> = self_name.match_indices("::").map(|(i, _)| &self_name[..i]).chain(Some(self_name)).collect();
+    for scope in scopes.into_iter().rev().filter(|scope| !scope.is_empty()) {
+        if !is_model_or_library_class(&format!("{scope}::{first}"), app) {
+            continue;
+        }
+        for n in (1..=path.len()).rev() {
+            let prefix = format!("{scope}::{}", path[..n].join("::"));
+            if is_model_or_library_class(&prefix, app) {
+                let owner = file_owner(&prefix, app);
+                if owner == self_name {
+                    return None;
+                }
+                return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+            }
+        }
     }
     // A qualified constant (`SecureHeaders::ClearSiteData::CACHE`,
     // `SecureHeaders::PolicyManagement::ALL_DIRECTIVES`) is defined by
