@@ -304,6 +304,14 @@ pub struct App {
     /// modules count: the tree carries their source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub framework_base_includes: Vec<ClassId>,
+    /// Modules a lazy-load hook other than `:active_record` includes at
+    /// run time into the hooked base (`ingest::base_includes`): a carried
+    /// railtie's or boot program's `ActiveSupport.on_load(:active_support_test_case)
+    /// { include M }`. The base is no class the app writes, so there is
+    /// no includer to splice a Concern's `ClassMethods` into; the module
+    /// keeps its `extend ActiveSupport::Concern` instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_includes: Vec<ClassId>,
     /// Partial → local name → type, harvested by the analyzer from the
     /// RENDER SITES that pass each local (`render partial: "form",
     /// locals: { new_message: @new_message }` with `@new_message` typed
@@ -1471,6 +1479,7 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             framework_base_includes: Vec::new(),
+            load_hook_includes: Vec::new(),
             partial_local_types: HashMap::default(),
             view_ivar_types: HashMap::default(),
             html_safe_methods: BTreeSet::new(),
