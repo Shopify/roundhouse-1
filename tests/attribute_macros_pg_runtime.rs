@@ -97,9 +97,10 @@ fn real_errors(errors: &[String]) -> Vec<&String> {
 // ---- 1. a macro that computes the attribute name and installs its type
 
 const WRAPPED_TYPE: &str = r##"class WrappedType < ActiveModel::Type::String
-  def initialize(key)
+  def initialize(key, owner)
     super()
     @key = key
+    @owner = owner
   end
 
   def serialize(value)
@@ -113,12 +114,14 @@ end
 "##;
 
 const WRAPPING: &str = r##"module Wrapping
-  def wrap_attribute(*names, key: "k")
+  def wrap_attribute(*names, key: "k", legacy: false)
+    raise ArgumentError, "legacy is not supported" if legacy
+
     target = wrapped_methods
 
     names.each do |name|
       column = "#{name}_wrapped".to_sym
-      type = WrappedType.new(key)
+      type = WrappedType.new(key, self.class.name)
 
       attribute(column, type)
 
@@ -145,7 +148,8 @@ end
 const ACCOUNT: &str = r##"class Account < ApplicationRecord
   extend Wrapping
 
-  wrap_attribute(:token, :note, key: "v1")
+  KEYS = ["v1"].freeze
+  wrap_attribute(:token, :note, key: KEYS.first)
 end
 "##;
 

@@ -538,7 +538,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
     let side = ClassSide::of(model, app);
     let body: Vec<&Expr> = body_statements(model).collect();
     for (call, names) in calls_reaching(&side, body.iter().copied(), "attribute", false) {
-        if literal_call(call)
+        if (literal_call(call) || computes_names(&side, call))
             && !names.is_empty()
             && names.iter().all(|n| model.retypable_attributes.iter().any(|c| c.as_str() == n))
         {
@@ -573,6 +573,20 @@ fn keyed_calls<'a>(model: &Model, side: &ClassSide<'a>, body: Vec<&'a Expr>) -> 
         })
         .map(|(call, _)| call.span)
         .collect()
+}
+
+/// A call of an app macro whose own `attribute` calls declare the names
+/// it computes from its literal positional arguments
+/// ([`computed_attribute_names`]). Its options (`db_encryption_secret:
+/// [SECRET]`) do not name a column, so they need not be literal.
+fn computes_names(side: &ClassSide<'_>, call: &Expr) -> bool {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+    let positional = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { kwargs: true, .. }) => rest,
+        _ => args.as_slice(),
+    };
+    positional.iter().all(literal_only)
+        && side.class_method(method.as_str()).is_some_and(|def| computed_attribute_names(def, args).is_some())
 }
 
 /// Every positional argument a literal ([`literal_only`]), and keyword
@@ -617,17 +631,22 @@ fn calls_reaching<'a>(
         if !on_self(recv) {
             continue;
         }
+        let mut computed = None;
         let reaches = if method.as_str() == target {
             direct
         } else {
             let Some(def) = side.class_method(method.as_str()) else { continue };
             let mut seen = vec![method.as_str().to_string()];
+            if target == "attribute" {
+                computed = computed_attribute_names(def, args);
+            }
             side.reaches(&def.body, target, &self_aliases(&def.body), &mut seen)
         };
         if reaches {
             let mut names = Vec::new();
-            for arg in args {
-                literal_names(arg, &mut names);
+            match computed {
+                Some(declared) => names = declared,
+                None => args.iter().for_each(|arg| literal_names(arg, &mut names)),
             }
             out.push((call, names));
         }
@@ -680,6 +699,142 @@ fn body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
         ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => Some(expr),
         _ => None,
     })
+}
+
+
+/// The names a macro's own `attribute(name, ...)` calls declare when it
+/// is called with `args` (a macro that computes them: Core's
+/// `attr_encrypted(*attributes)` declares
+/// `"#{attr_name}_encrypted".to_sym` for each), or `None` when the
+/// macro body has no direct `attribute` call or one of them names a
+/// column this cannot evaluate. The parameters bind to the literal
+/// positional arguments (a rest parameter takes the rest); the
+/// evaluator follows locals assigned a name, `each` over a list of names
+/// (`attributes.each do |attr_name|`), string interpolation and
+/// `to_sym` / `to_s`. Block bodies that run later (`LATER_BLOCKS`) are not
+/// entered.
+fn computed_attribute_names(def: &MethodDef, args: &[Expr]) -> Option<Vec<String>> {
+    let positional: Vec<&Expr> = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { kwargs: true, .. }) => rest.iter().collect(),
+        _ => args.iter().collect(),
+    };
+    let mut env: Vec<(Symbol, Vec<String>)> = Vec::new();
+    let mut at = 0;
+    for param in def.params.iter().filter(|p| !p.keyword && !p.name.as_str().is_empty()) {
+        let take = if param.rest { positional.len().saturating_sub(at) } else { 1.min(positional.len().saturating_sub(at)) };
+        let mut names = Vec::new();
+        for arg in &positional[at..at + take] {
+            literal_names(arg, &mut names);
+        }
+        at += take;
+        env.push((param.name.clone(), names));
+    }
+    let aliases = self_aliases(&def.body);
+    let mut out = Vec::new();
+    declared_names(&def.body, &aliases, &mut env, &mut out)?;
+    (!out.is_empty()).then_some(out)
+}
+
+/// One name per evaluated value: a bound local's list, a literal, an
+/// interpolation of single names, an Array or splat of those.
+fn evaluate_names(expr: &Expr, env: &[(Symbol, Vec<String>)]) -> Option<Vec<String>> {
+    match &*expr.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(vec![value.as_str().to_string()]),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(vec![value.clone()]),
+        ExprNode::Var { name, .. } => env.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone()),
+        ExprNode::Array { elements, .. } => {
+            let mut out = Vec::new();
+            for e in elements {
+                out.extend(evaluate_names(e, env)?);
+            }
+            Some(out)
+        }
+        ExprNode::Splat { value } => evaluate_names(value, env),
+        ExprNode::StringInterp { parts } => {
+            let mut s = String::new();
+            for part in parts {
+                match part {
+                    crate::expr::InterpPart::Text { value } => s.push_str(value),
+                    crate::expr::InterpPart::Expr { expr } => match evaluate_names(expr, env)?.as_slice() {
+                        [one] => s.push_str(one),
+                        _ => return None,
+                    },
+                }
+            }
+            Some(vec![s])
+        }
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if args.is_empty() && matches!(method.as_str(), "to_sym" | "to_s" | "freeze" | "dup") =>
+        {
+            evaluate_names(recv, env)
+        }
+        _ => None,
+    }
+}
+
+/// Collect into `out` the names of the `attribute` calls `expr` makes on
+/// the class, `None` when one is not evaluable.
+fn declared_names(expr: &Expr, aliases: &[Symbol], env: &mut Vec<(Symbol, Vec<String>)>, out: &mut Vec<String>) -> Option<()> {
+    match &*expr.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+            declared_names(value, aliases, env, out)?;
+            if let Some(names) = evaluate_names(value, env) {
+                env.push((name.clone(), names));
+            }
+            Some(())
+        }
+        ExprNode::Send { recv, method, args, block, .. } => {
+            if on_class(recv, aliases) && method.as_str() == "attribute" {
+                out.extend(evaluate_names(args.first()?, env)?);
+                return Some(());
+            }
+            if let Some(recv) = recv {
+                declared_names(recv, aliases, env, out)?;
+            }
+            for arg in args {
+                declared_names(arg, aliases, env, out)?;
+            }
+            if let Some(block) = block {
+                if LATER_BLOCKS.contains(&method.as_str())
+                    || (method.as_str() == "send"
+                        && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { value } }) if LATER_BLOCKS.contains(&value.as_str())))
+                {
+                    return Some(());
+                }
+                let ExprNode::Lambda { params, body, .. } = &*block.node else { return declared_names(block, aliases, env, out) };
+                let bound = env.len();
+                match (method.as_str(), recv.as_ref().and_then(|r| evaluate_names(r, env)), params.as_slice()) {
+                    ("each", Some(list), [param]) => {
+                        // Every iteration binds the parameter to one name; the
+                        // names an iteration declares are the same shape for each.
+                        for item in list {
+                            env.truncate(bound);
+                            env.push((param.clone(), vec![item]));
+                            declared_names(body, aliases, env, out)?;
+                        }
+                    }
+                    _ => {
+                        for p in params {
+                            env.push((p.clone(), Vec::new()));
+                        }
+                        declared_names(body, aliases, env, out)?;
+                    }
+                }
+                env.truncate(bound);
+            }
+            Some(())
+        }
+        ExprNode::Lambda { .. } => Some(()),
+        _ => {
+            let mut result = Some(());
+            expr.node.for_each_child(&mut |child| {
+                if result.is_some() {
+                    result = declared_names(child, aliases, env, out);
+                }
+            });
+            result
+        }
+    }
 }
 
 fn literal_names(arg: &Expr, out: &mut Vec<String>) {
