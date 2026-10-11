@@ -299,6 +299,9 @@ pub(crate) struct ClassSide<'a> {
     /// module with the class methods that module mixes in
     /// ([`ClassSide::gem_mixin_macro`]).
     gem_includes: Vec<(&'a Expr, std::collections::BTreeSet<crate::ident::Symbol>)>,
+    /// The body locals bound to `self` (`unsafe_self = self #: as
+    /// untyped`), by name: a mixin call on one is a mixin call on the class.
+    self_aliases: Vec<String>,
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -358,6 +361,17 @@ fn first_emitted_raise(e: &Expr) -> Option<String> {
 fn expansion_refused(call: &Expr) -> bool {
     matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
         if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL)
+}
+
+/// `self`, a local bound to it (`aliases`), or either under an inline
+/// cast (`self #: as untyped`).
+fn is_self_like(expr: &Expr, aliases: &[String]) -> bool {
+    match &*expr.node {
+        ExprNode::SelfRef => true,
+        ExprNode::Cast { value, .. } => is_self_like(value, aliases),
+        ExprNode::Var { name, .. } => aliases.iter().any(|a| a == name.as_str()),
+        _ => false,
+    }
 }
 
 /// `extend M, ...` (bare or `self.`): its argument expressions.
@@ -509,7 +523,17 @@ impl<'a> ClassSide<'a> {
             base: std::cell::OnceCell::new(),
             schema,
             gem_includes: Vec::new(),
+            self_aliases: Vec::new(),
         };
+        for call in &body {
+            if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*call.node {
+                if is_self_like(value, &side.self_aliases) {
+                    side.self_aliases.push(name.as_str().to_string());
+                } else {
+                    side.self_aliases.retain(|a| a != name.as_str());
+                }
+            }
+        }
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
         for call in body.into_iter().chain(ancestor_bodies) {
@@ -656,6 +680,9 @@ impl<'a> ClassSide<'a> {
             return Some(verdict);
         }
         let ExprNode::Send { recv, method, args, block, .. } = &*call.node else { return None };
+        if let Some(verdict) = self.self_mixin_verdict(recv.as_ref(), method.as_str(), args, block.is_some()) {
+            return Some(verdict);
+        }
         // The PostgreSQL CRuby tree's base answers `accepts_nested_attributes_for`
         // at class-body time (runtime/spinel/cruby/active_record_nested_attributes.rb),
         // over the association reflections the compiled class carries.
@@ -703,6 +730,42 @@ impl<'a> ClassSide<'a> {
             walk.expr(&def.body, &mut Vec::new())
         })();
         Some(match result {
+            Ok(()) => MacroVerdict::Replay,
+            Err(reason) => MacroVerdict::Refuse(reason),
+        })
+    }
+
+    /// `include`/`prepend` of a module an expression builds, called on the
+    /// class bare, on `self`, or on a local bound to it, often under a
+    /// cast (`unsafe_self.include(Mod.build)`; Ruby's `Module#include` has
+    /// been public since 2.1). The mixin runs as written, so the module is
+    /// built when the class body runs; the arguments' own class-body
+    /// effects are walked. Constant arguments on a bare or `self.`
+    /// receiver stay on the paths that already handle them. `extend`
+    /// through a local is the Module protocol's (`object_extend`), not
+    /// replayed here.
+    fn self_mixin_verdict(
+        &self,
+        recv: Option<&Expr>,
+        method: &str,
+        args: &[Expr],
+        has_block: bool,
+    ) -> Option<MacroVerdict> {
+        if !matches!(method, "include" | "prepend") || args.is_empty() || has_block {
+            return None;
+        }
+        if recv.is_some_and(|r| !is_self_like(r, &self.self_aliases)) {
+            return None;
+        }
+        // A bare or `self.` mixin of constants is the analyzer's (the
+        // concern splice, `model_includes`, a constant `prepend`).
+        let plain = recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+        if plain && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. })) {
+            return None;
+        }
+        let mut walk = Walk::new(self, method);
+        let mut aliases = self.self_aliases.clone();
+        Some(match args.iter().try_for_each(|arg| walk.expr(arg, &mut aliases)) {
             Ok(()) => MacroVerdict::Replay,
             Err(reason) => MacroVerdict::Refuse(reason),
         })
