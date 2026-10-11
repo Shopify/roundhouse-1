@@ -177,6 +177,7 @@ fn tiny_blog_round_trips() {
         load_hooks: Vec::new(),
         load_hook_includes: Vec::new(),
         delegate_forwarder_sites: Default::default(),
+        test_carried_included_blocks: Vec::new(),
         test_load_roots: Vec::new(),
         lib_load_roots: Vec::new(),
         ingest_drops: Vec::new(),
