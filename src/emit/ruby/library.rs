@@ -4831,8 +4831,9 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
+            let mut hop_scopes = Vec::new();
             let Some((joins, edge_table, edge_fk)) =
-                resolve_through_chain(&app.models, model, thr_name, target, 0)
+                resolve_through_chain(&app.models, model, thr_name, target, 0, &mut hop_scopes)
             else {
                 continue;
             };
@@ -4846,7 +4847,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             else {
                 continue;
             };
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, assoc_scope);
+            m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, assoc_scope);
         }
     }
 }
@@ -4866,26 +4867,42 @@ fn resolve_through_chain(
     thr_name: &Symbol,
     target: &ClassId,
     depth: usize,
+    hop_scopes: &mut Vec<Expr>,
 ) -> Option<(Vec<String>, String, Symbol)> {
     use crate::dialect::Association;
 
     if depth > 4 {
         return None;
     }
-    // The through association on the owner (`:votes`, `:taggings`, `:tags`).
-    let (thr_target, thr_fk, thr_through, as_interface) = model.associations().find_map(|a| match a {
-        Association::HasMany { name, target, foreign_key, through, as_interface, .. }
+    // The through association on the owner (`:votes`, `:taggings`,
+    // `:tags`): a has_many, or a has_one (`has_many :x, through:
+    // :primary_entity`), whose rows tie back to the owner by the same
+    // foreign key. Its scope narrows the join rows, as Rails' through
+    // scope chain merges every reflection's scope.
+    let (thr_target, thr_fk, thr_through, as_interface, thr_scope) = model.associations().find_map(|a| match a {
+        Association::HasMany { name, target, foreign_key, through, as_interface, scope, .. }
             if name == thr_name =>
         {
-            Some((target, foreign_key, through, as_interface))
+            Some((target, foreign_key, through.as_ref(), as_interface, scope))
+        }
+        Association::HasOne { name, target, foreign_key, as_interface, scope, .. } if name == thr_name => {
+            Some((target, foreign_key, None, as_interface, scope))
         }
         _ => None,
     })?;
+    if let Some(scope) = thr_scope {
+        // Only a SQL-string condition is portable onto the target's
+        // relation: a hash `where(primary: true)` would be qualified by
+        // the target table, where Rails qualifies it by the through's.
+        if through_scope_graftable(scope) {
+            hop_scopes.push(scope.clone());
+        }
+    }
     // How the join model's rows tie back to the owner: directly by the
     // sibling's fk, or through the sibling's own chain.
     let (back_joins, edge_table, edge_fk) = match thr_through {
         None => (Vec::new(), model_table_name(models, thr_target), thr_fk.clone()),
-        Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1)?,
+        Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1, hop_scopes)?,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
     let thr_table = model_table_name(models, thr_target);
@@ -4910,12 +4927,19 @@ fn resolve_through_chain(
     // source: :messages` — Room#messages, `messages.room_id`). The
     // belongs_to branch above cannot serve this: there is no column on
     // the join table naming the target.
-    if let Some(src_fk) = thr_model.associations().find_map(|a| match a {
-        Association::HasMany { target: t, foreign_key, through: None, .. } if t == target => {
-            Some(foreign_key)
+    if let Some((src_fk, src_scope)) = thr_model.associations().find_map(|a| match a {
+        Association::HasMany { target: t, foreign_key, through: None, scope, .. } if t == target => {
+            Some((foreign_key, scope))
         }
         _ => None,
     }) {
+        // The source association's own scope (`has_many :gateways, ->
+        // { merge(Gateway.enabled) }`) is part of the through query.
+        if let Some(scope) = src_scope {
+            if !reads_local(scope) {
+                hop_scopes.push(scope.clone());
+            }
+        }
         let mut joins = vec![format!(
             "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{owner_type}"
         )];
@@ -4930,7 +4954,7 @@ fn resolve_through_chain(
         _ => None,
     })?;
     let (src_joins, src_edge_table, src_edge_fk) =
-        resolve_through_chain(models, thr_model, src_through, target, depth + 1)?;
+        resolve_through_chain(models, thr_model, src_through, target, depth + 1, hop_scopes)?;
     let mut joins = src_joins;
     joins.push(format!(
         "INNER JOIN {thr_table} ON {thr_table}.id = {src_edge_table}.{src_edge_fk}{owner_type}"
@@ -4993,6 +5017,7 @@ fn through_reader_body(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    hop_scopes: &[Expr],
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
@@ -5055,6 +5080,7 @@ fn through_reader_body(
     // graft its receiver-less chain onto the seeded relation so the
     // reader filters the way Rails does (without it /upvoted served
     // every joined row).
+    let chain = hop_scopes.iter().fold(chain, |chain, scope| graft_chain_root(scope, chain));
     let chain = match assoc_scope {
         Some(scope_body) => graft_chain_root(scope_body, chain),
         None => chain,
@@ -5082,6 +5108,22 @@ fn through_reader_body(
             parenthesized: true,
         },
     )
+}
+
+/// A through hop's scope that runs the same on the target's relation:
+/// a chain of calls whose arguments hold no hash (a hash condition is
+/// qualified by the table the scope was declared on) and no local.
+fn through_scope_graftable(scope: &Expr) -> bool {
+    fn chain_ok(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { recv, args, block: None, .. } => {
+                args.iter().all(|a| !matches!(&*a.node, ExprNode::Hash { .. }))
+                    && recv.as_ref().is_none_or(|r| chain_ok(r))
+            }
+            _ => false,
+        }
+    }
+    chain_ok(scope) && !reads_local(scope)
 }
 
 /// Replace the receiver-less root of a `where(...).order(...)` chain

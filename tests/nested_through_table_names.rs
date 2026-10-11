@@ -20,11 +20,28 @@ const SCHEMA: &str = r#"ActiveRecord::Schema[8.0].define(version: 1) do
   create_table "slots_collections", force: :cascade do |t|
     t.integer "slot_id"
     t.integer "collection_id"
+    t.string "type"
+  end
+  create_table "accounts", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "account_id"
+    t.boolean "main", default: false
+  end
+  create_table "badges", force: :cascade do |t|
+    t.integer "profile_id"
+    t.string "label"
+    t.boolean "active", default: true
   end
 end
 "#;
 
 const MODELS: &[(&str, &str)] = &[
+    (
+        "concerns/slotted",
+        "module Slotted\n  extend ActiveSupport::Concern\n  included do\n    with_options foreign_key: :collection_id, inverse_of: false do\n      has_many :sti_live_slots, -> { merge(Shelving::Slots::SlotsCollection.live) }, class_name: \"Shelving::Slots::PinnedSlotsCollection\"\n      has_many :live_slots, -> { merge(Shelving::Slots::SlotsCollection.live) }, class_name: \"Shelving::Slots::SlotsCollection\"\n    end\n  end\nend\n",
+    ),
     ("application_record", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
     (
         "shelving/slots/slot",
@@ -32,11 +49,21 @@ const MODELS: &[(&str, &str)] = &[
     ),
     (
         "shelving/slots/slots_collection",
-        "module Shelving\n  module Slots\n    class SlotsCollection < ApplicationRecord\n      belongs_to :slot, class_name: \"Shelving::Slots::Slot\"\n      belongs_to :collection\n    end\n  end\nend\n",
+        "module Shelving\n  module Slots\n    class SlotsCollection < ApplicationRecord\n      belongs_to :slot, class_name: \"Shelving::Slots::Slot\"\n      belongs_to :collection\n      scope :live, -> { where.not(slot_id: nil) }\n    end\n  end\nend\n",
     ),
     (
+        "shelving/slots/pinned_slots_collection",
+        "module Shelving\n  module Slots\n    class PinnedSlotsCollection < SlotsCollection\n    end\n  end\nend\n",
+    ),
+    (
+        "account",
+        "class Account < ApplicationRecord\n  has_one :primary_profile, -> { where(\"profiles.main = 1\") }, class_name: \"Profile\"\n  has_many :badges, through: :primary_profile\nend\n",
+    ),
+    ("profile", "class Profile < ApplicationRecord\n  belongs_to :account\n  has_many :badges, -> { merge(Badge.live) }\nend\n"),
+    ("badge", "class Badge < ApplicationRecord\n  belongs_to :profile\n  scope :live, -> { where(active: true) }\nend\n"),
+    (
         "collection",
-        "class Collection < ApplicationRecord\n  has_many :slots_collections, class_name: \"Shelving::Slots::SlotsCollection\"\n  has_many :slots, class_name: \"Shelving::Slots::Slot\", through: :slots_collections\nend\n",
+        "class Collection < ApplicationRecord\n  include Slotted\n  has_many :slots_collections, class_name: \"Shelving::Slots::SlotsCollection\"\n  has_many :slots, class_name: \"Shelving::Slots::Slot\", through: :slots_collections\nend\n",
     ),
 ];
 
@@ -58,6 +85,19 @@ const PROBE: &str = r##"module ThroughProbe
     show("through from the other side") { slot.collections.map(&:title) }
     show("through where") { collection.slots.where(label: "s").count }
     show("preload") { Collection.includes(:slots).find(collection.id).slots.map(&:label) }
+    show("scoped association scope") { collection.association(:live_slots).scope.count }
+    show("scoped association reader") { collection.live_slots.size }
+    show("sti scoped association scope") { collection.association(:sti_live_slots).scope.count }
+    show("sti scoped association reader") { collection.sti_live_slots.size }
+    show("through a has_one with scopes") do
+      account = Account.create!(name: "a")
+      main = Profile.create!(account: account, main: true)
+      other = Profile.create!(account: account, main: false)
+      Badge.create!(profile: main, label: "m1")
+      Badge.create!(profile: main, label: "gone", active: false)
+      Badge.create!(profile: other, label: "o1")
+      [Account.find(account.id).badges.map(&:label).sort, account.association(:badges).scope.count]
+    end
     show("joins through") { Collection.joins(:slots).where(title: "c").count }
   end
 end
@@ -90,7 +130,7 @@ fn native() -> String {
     }
     let program = format!(
         "require {oracle:?}\nRailsOracle.activate(\"activerecord\", \"activemodel\", \"activesupport\")\n\
-         require \"active_record\"\n\
+         require \"active_record\"\nrequire \"active_support/core_ext/object/with_options\"\n\
          abort \"native: activerecord is not Core's\" unless Gem.loaded_specs[\"activerecord\"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)\n\
          ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
          ActiveRecord::Migration.verbose = false\n\
