@@ -74,7 +74,7 @@ module ActiveRecord # :nodoc:
       nil
     end
 
-    def reload
+    def reload(*)
       @__unloaded_columns = nil
       super
     end

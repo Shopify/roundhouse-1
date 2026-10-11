@@ -27,8 +27,8 @@
 #   for them where Rails' `instantiate` skips it;
 #   lower::model_to_library::macro_replay refuses a Base include's
 #   override of it (`PARTIAL_BASE_HOOKS`).
-# - `reload` takes no options (Rails' `lock:`); it re-reads the row
-#   through the runtime's `_adapter_reload`.
+# - `reload` reads `lock:` only (a locking SELECT of the key, then the
+#   re-read through the runtime's `_adapter_reload`).
 # - Multiparameter keys (`"written_on(1i)"`) raise NotImplementedError.
 #
 # Also Core#readonly! / #readonly? and the ReadOnlyRecord that
@@ -317,8 +317,14 @@ module ActiveRecord
   end
 
   module Persistence
-    # Reloads the record from the database.
-    def reload
+    # Reloads the record from the database (persistence.rb `reload(options = nil)`).
+    # `lock:` first takes the row lock a `lock(value).find(id)` takes, as
+    # `lock!` and Core's `reload(lock: true)` ask for; no other option is read.
+    def reload(options = nil)
+      lock = options && options[:lock]
+      if lock && persisted?
+        self.class.unscoped.lock(lock).where(self.class.primary_key => id).ids
+      end
       _adapter_reload
       # ActiveRecord::AttributeMethods::Dirty#reload: the row just read is
       # the baseline, and the last save's changes are forgotten.
