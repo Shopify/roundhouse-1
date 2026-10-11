@@ -1532,6 +1532,12 @@ module ActiveRecord
       when :bytea then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Bytea.new
       when :immutable_string then ActiveRecord::Type::ImmutableString.new
       when :value then ActiveRecord::Type::Value.new
+      when :enum
+        # enum.rb's `_enum`: the label => stored value HashWithIndifferentAccess,
+        # frozen, over the column's type.
+        mapping = ActiveSupport::HashWithIndifferentAccess.new
+        spec[1].each { |label, stored| mapping[label] = stored }
+        ActiveRecord::Enum::EnumType.new(name, mapping.freeze, _cast_type_for_spec(name, spec[2]))
       else
         raise NotImplementedError, "#{self.name}.type_for_attribute(#{name.inspect}): #{spec[1]} is not ported"
       end
@@ -2034,10 +2040,10 @@ module ActiveRecord
 
     # attribute_methods.rb's attributes_for_database: each attribute's
     # value_for_database (its type's `serialize` of the value), by name.
-    # Paquito's ActiveRecordCoder dumps a record with it. An enum column's
+    # Paquito's ActiveRecordCoder dumps a record with it. An enum column
+    # whose mapping is only known at run time has no EnumType here; its
     # compiled slot already holds the stored value, which is what
-    # EnumType#serialize answers, so it is taken as is (the EnumType is
-    # not ported as a cast type).
+    # EnumType#serialize answers, so it is taken as is.
     def attributes_for_database
       specs = self.class.schema_column_types
       attributes.each_with_object({}) do |(name, value), result|

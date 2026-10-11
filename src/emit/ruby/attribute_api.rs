@@ -145,7 +145,7 @@ fn schema_column_types(model: &Model, table: &Table, adapter: Option<&DatabaseAd
         // attribute API decorates the schema type map by name).
         let spec = match declared.iter().position(|(n, _)| *n == col.name) {
             Some(at) => declared_spec(&declared.remove(at).1),
-            None if model.enums.contains_key(&col.name) => unported("ActiveRecord::Enum::EnumType"),
+            None if model.enums.contains_key(&col.name) => enum_spec(&model.enums[&col.name], column_spec(col, adapter)),
             None => column_spec(col, adapter),
         };
         entries.push((str_lit(col.name.as_str()), spec));
@@ -196,6 +196,38 @@ fn decimal_spec(precision: Option<u8>, scale: Option<u8>) -> Expr {
         None => typed(ExprNode::Lit { value: Literal::Nil }, Ty::Nil),
     };
     sp(ExprNode::Array { elements: vec![sym("decimal"), int(precision), int(scale)], style: ArrayStyle::Brackets })
+}
+
+/// `[:enum, [[label, stored], …], <column spec>]`: ActiveRecord::Enum::EnumType
+/// over the column's type, with the label → stored value mapping the `enum`
+/// macro declared. A mapping whose stored values are not all integers, all
+/// strings or all symbols is a value only known at run time and stays unported.
+fn enum_spec(mapping: &[(String, Literal)], subtype: Expr) -> Expr {
+    let ty = match mapping.first().map(|(_, v)| v) {
+        Some(Literal::Int { .. }) => Ty::Int,
+        Some(Literal::Str { .. }) => Ty::Str,
+        Some(Literal::Sym { .. }) => Ty::Sym,
+        _ => return unported("ActiveRecord::Enum::EnumType"),
+    };
+    let same_kind = |v: &Literal| {
+        matches!((v, &ty), (Literal::Int { .. }, Ty::Int) | (Literal::Str { .. }, Ty::Str) | (Literal::Sym { .. }, Ty::Sym))
+    };
+    if !mapping.iter().all(|(_, v)| same_kind(v)) {
+        return unported("ActiveRecord::Enum::EnumType");
+    }
+    let pairs = mapping
+        .iter()
+        .map(|(label, stored)| {
+            sp(ExprNode::Array {
+                elements: vec![str_lit(label), typed(ExprNode::Lit { value: stored.clone() }, ty.clone())],
+                style: ArrayStyle::Brackets,
+            })
+        })
+        .collect();
+    sp(ExprNode::Array {
+        elements: vec![sym("enum"), sp(ExprNode::Array { elements: pairs, style: ArrayStyle::Brackets }), subtype],
+        style: ArrayStyle::Brackets,
+    })
 }
 
 fn unported(class: &str) -> Expr {

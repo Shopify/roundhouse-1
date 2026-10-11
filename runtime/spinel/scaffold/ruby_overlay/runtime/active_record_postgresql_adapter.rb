@@ -493,7 +493,7 @@ module ActiveRecord
             scale = extract_scale(sql_type)
             # places after decimal = fmod - 4 & 0xffff
             if fmod && (fmod - 4 & 0xffff).zero?
-              pg_unported_cast(:decimal, "Type::DecimalWithoutScale", precision: precision)
+              PgCast.new(:decimal, nil, precision, nil, "Type::DecimalWithoutScale", { precision: precision }, nil)
             else
               PgCast.new(:decimal, nil, precision, scale, "OID::Decimal", { precision: precision, scale: scale }, nil)
             end
@@ -527,6 +527,7 @@ module ActiveRecord
           when "OID::Bytea" then oid::Bytea.new
           when "OID::Uuid" then oid::Uuid.new
           when "OID::Decimal" then oid::Decimal.new(**args)
+          when "Type::DecimalWithoutScale" then ::ActiveRecord::Type::DecimalWithoutScale.new(**args)
           when "OID::Timestamp" then oid::Timestamp.new(**args)
           when "Type::Time" then ::ActiveRecord::Type::Time.new(**args)
           when "Type::Json" then ::ActiveRecord::Type::Json.new
@@ -607,6 +608,33 @@ module ActiveRecord
         sql = "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace " \
               "WHERE #{scope} AND c.relkind IN ('r','v','m','p','f') AND c.relname = #{quote(table)}"
         !query_value(sql, "SCHEMA").nil?
+      end
+
+      # postgresql/schema_statements.rb's primary_keys over
+      # fetch_primary_keys: the table's primary key columns in key order
+      # (one table name answers its list, an Array of names a Hash of
+      # lists), from its primary key constraint.
+      def primary_keys(table_name) # :nodoc:
+        names = Array(table_name).map(&:to_s)
+        result = names.to_h do |name|
+          rows = query_rows(<<~SQL, "SCHEMA")
+            SELECT a.attname
+              FROM pg_constraint c
+              JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+             WHERE c.contype = 'p' AND c.conrelid = #{quote(quote_table_name(name))}::regclass
+             ORDER BY array_position(c.conkey, a.attnum)
+          SQL
+          [name, rows.map(&:first)]
+        end
+        table_name.is_a?(Array) ? result : result[table_name.to_s]
+      end
+
+      # abstract/schema_statements.rb's primary_key: the sole key column,
+      # or the list of a composite key.
+      def primary_key(table_name)
+        pk = primary_keys(table_name)
+        pk = pk.first unless pk.size > 1
+        pk
       end
 
       def supports_identity_columns? # :nodoc:

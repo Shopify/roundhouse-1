@@ -425,9 +425,9 @@ module ActiveRecord
     # (the adapter's `columns`, a "SCHEMA" query) per table name: the
     # columns, by name, of each table a model or the app asks about.
     # Loading or dumping a cache file (`_load_from`, `dump_to`,
-    # `init_with` / `encode_with`), primary keys, the data source list and
-    # indexes are not ported and refuse by name; `data_source_exists?` is
-    # asked of the catalog per name.
+    # `init_with` / `encode_with`), the data source list and indexes are
+    # not ported and refuse by name; `data_source_exists?` and
+    # `primary_keys` are asked of the catalog per name.
     class SchemaCache
       def initialize # :nodoc:
         @columns = {}
@@ -483,7 +483,21 @@ module ActiveRecord
         @data_sources[name.dup.freeze] = pool.with_connection { |connection| connection.data_source_exists?(name) }
       end
 
-      %i[primary_keys add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
+      # schema_cache.rb: a table's primary key columns, asked of the
+      # catalog once per name (nil for a name that is no data source).
+      def primary_keys(pool, table_name)
+        @primary_keys.fetch(table_name) do
+          pool.with_connection do |connection|
+            if data_source_exists?(pool, table_name)
+              pk = connection.primary_key(table_name)
+              # deep_deduplicate: each name frozen, a composite key's list not.
+              @primary_keys[-table_name] = pk.is_a?(Array) ? pk.map { |name| -name } : (pk && -pk)
+            end
+          end
+        end
+      end
+
+      %i[add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
         define_method(name) do |*|
           raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: ActiveRecord::ConnectionAdapters::SchemaCache##{name}: " \
             "this runtime's schema cache holds only the columns it reads from the catalog"
