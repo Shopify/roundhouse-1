@@ -2683,7 +2683,18 @@ rescue LoadError
 end
 
 module MochaBridge
-  CONST_NAME = /\A[A-Z]\w*(::[A-Z]\w*)*\z/
+  # A constant argument, carried by name (`lower::mocha::bridge_arg`); a
+  # plain String argument is never one.
+  ConstRef = Struct.new(:name)
+  # A brace-less keyword hash, `with(a: 1)`, as opposed to `with({a: 1})`.
+  KwArgs = Struct.new(:hash)
+
+  def self.konst(name) = ConstRef.new(name)
+  def self.kwargs(hash) = KwArgs.new(hash)
+
+  def self.resolve(arg)
+    arg.is_a?(ConstRef) ? Object.const_get(arg.name) : arg
+  end
 
   def self.chain(konst, kind, meth, ops, &blk)
     # A head spelled `Const.reader` (`ActionCable.server`) is the object
@@ -2704,10 +2715,13 @@ module MochaBridge
       else raise ArgumentError, "mocha bridge: unknown kind #{kind}"
       end
     ops.each do |op, args|
-      args = args.map { |a| a.is_a?(String) && a.match?(CONST_NAME) && Object.const_defined?(a) ? Object.const_get(a) : a } if op == :raises
+      kw = args.last.is_a?(KwArgs) ? args.pop.hash : nil
+      args = args.map { |a| resolve(a) }
       expectation =
         if op == :with && blk
           expectation.with(&blk)
+        elsif kw
+          expectation.public_send(op, *args, **kw)
         else
           expectation.public_send(op, *args)
         end
@@ -2724,7 +2738,7 @@ module MochaBridge
     # itself. `Mocha::API` includes whichever into a test class.
     matchers = Mocha::ParameterMatchers.const_defined?(:Methods, false) ? Mocha::ParameterMatchers::Methods : Mocha::ParameterMatchers
     extend matchers unless singleton_class.include?(matchers)
-    arg.nil? ? public_send(name) : public_send(name, arg)
+    arg.nil? ? public_send(name) : public_send(name, resolve(arg))
   end
 end
 "##;
@@ -18974,6 +18988,25 @@ mod tests {
             let out = std::process::Command::new("ruby").arg("--disable-gems").arg("-e").arg(&script).output().expect("ruby");
             assert_eq!(String::from_utf8_lossy(&out.stdout), want, "stderr={}", String::from_utf8_lossy(&out.stderr));
         }
+    }
+
+    /// The replay half, run against the real mocha gem: a marked constant
+    /// is resolved in a matcher argument and in `returns`, a String that
+    /// spells a constant name stays a String, and a brace-less keyword
+    /// hash in `with` matches a keyword call.
+    #[test]
+    fn mocha_bridge_replay_resolves_marked_constants_and_keywords() {
+        let script = format!(
+            "require 'mocha/api'\ninclude Mocha::API\nmocha_setup\n\
+             module Svc; LIMIT = 5; def self.call(*a, **k) = :real; end\n\
+             {MOCHA_BRIDGE_REPLAY}\n\
+             K = MochaBridge\n\
+             K.chain('Svc', :expects, :call, [[:with, [K.matcher(:instance_of, K.konst('Integer')), 'Svc::LIMIT']], [:returns, [K.konst('Svc::LIMIT')]]])\n\
+             K.chain('Svc', :expects, :call, [[:with, [K.kwargs({{ shop_id: 1 }})]], [:returns, [:kw]]])\n\
+             print [Svc.call(3, 'Svc::LIMIT'), Svc.call(shop_id: 1)].inspect\n"
+        );
+        let out = std::process::Command::new("ruby").arg("-e").arg(&script).output().expect("ruby");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "[5, :kw]", "stderr={}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// The spinel tree names the app source each emitted line came from

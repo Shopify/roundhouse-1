@@ -1469,12 +1469,19 @@ fn bridge() -> Expr {
 
 /// One argument of a chain link, as the bridge wants it. A constant
 /// travels by NAME (`raises(Net::OpenTimeout)`): a class as a value is
-/// not a shape every target carries, and the replay side resolves the
-/// name. A bare matcher call becomes `MochaBridge.matcher(:name, arg)`.
+/// not a shape every target carries. It is marked as a constant
+/// (`MochaBridge.konst("Net::OpenTimeout")`), never a bare String, so the
+/// replay side resolves it in every argument position (`with`, `returns`,
+/// matcher arguments) and a real String argument that happens to spell a
+/// constant name stays a String. A bare matcher call becomes
+/// `MochaBridge.matcher(:name, arg)`.
 fn bridge_arg(arg: Expr) -> Expr {
     let span = arg.span;
     match &*arg.node {
-        ExprNode::Const { path } => str_lit(span, &path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
+        ExprNode::Const { path } => {
+            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            call(span, bridge(), "konst", vec![str_lit(span, &name)])
+        }
         ExprNode::Send { recv: None, method, args, block: None, .. }
             if MATCHERS.contains(&method.as_str()) && args.len() <= 1 =>
         {
@@ -1491,7 +1498,20 @@ fn bridge_chain(span: crate::span::Span, chain: Chain) -> Expr {
     let mut block: Option<Expr> = None;
     let mut links: Vec<Expr> = Vec::new();
     for op in chain.ops {
-        let args: Vec<Expr> = op.args.into_iter().map(bridge_arg).collect();
+        let mut args: Vec<Expr> = op.args.into_iter().map(bridge_arg).collect();
+        // `with(a: 1)` is keywords, `with({a: 1})` a positional Hash, and a
+        // strict-keyword mocha (`Mocha.configure { strict_keyword_argument_matching }`)
+        // tells them apart; an array of args loses the difference, so the
+        // brace-less hash is marked (`MochaBridge.kwargs`) and the replay
+        // splats it.
+        if op.name.as_str() == "with" {
+            if let Some(last) = args.last_mut() {
+                if matches!(&*last.node, ExprNode::Hash { kwargs: true, .. }) {
+                    let span = last.span;
+                    *last = call(span, bridge(), "kwargs", vec![last.clone()]);
+                }
+            }
+        }
         if op.block.is_some() {
             block = op.block;
         }
@@ -1877,7 +1897,53 @@ fn a_keyword_only_block_still_gets_the_host_placeholder() {
         assert!(matches!(&*margs[0].node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "has_entry"));
         let ExprNode::Array { elements: raises_link, .. } = &*elems[1].node else { panic!() };
         let ExprNode::Array { elements: raises_args, .. } = &*raises_link[1].node else { panic!() };
-        assert!(matches!(&*raises_args[0].node, ExprNode::Lit { value: Literal::Str { value } } if value == "Net::OpenTimeout"));
+        let (recv, mm, kargs, _) = as_send(&raises_args[0]);
+        assert_eq!(const_path(recv), "MochaBridge");
+        assert_eq!(mm, "konst");
+        assert!(matches!(&*kargs[0].node, ExprNode::Lit { value: Literal::Str { value } } if value == "Net::OpenTimeout"));
+    }
+
+    #[test]
+    fn a_constant_in_with_and_in_a_matcher_is_marked_and_a_string_is_not() {
+        // Q.expects(:coerce).with(includes(Some::LIST), "Some::LIST").returns(Some::LIST)
+        let matcher = send(None, "includes", vec![konst(&["Some", "LIST"])]);
+        let head = send(Some(konst(&["Q"])), "expects", vec![sym("coerce")]);
+        let with = send(Some(head), "with", vec![matcher, str_lit(sp(), "Some::LIST")]);
+        let mut e = send(Some(with), "returns", vec![konst(&["Some", "LIST"])]);
+        rewrite(&mut e, &mut AppMethods::empty());
+        let (_, _, args, _) = as_send(&e);
+        let ExprNode::Array { elements: elems, .. } = &*args[3].node else { panic!() };
+        let arg_lists: Vec<&Vec<Expr>> = elems
+            .iter()
+            .map(|l| {
+                let ExprNode::Array { elements: link, .. } = &*l.node else { panic!() };
+                let ExprNode::Array { elements: a, .. } = &*link[1].node else { panic!() };
+                a
+            })
+            .collect();
+        let (_, mm, margs, _) = as_send(&arg_lists[0][0]);
+        assert_eq!(mm, "matcher");
+        assert_eq!(as_send(&margs[1]).1, "konst");
+        assert!(matches!(&*arg_lists[0][1].node, ExprNode::Lit { value: Literal::Str { .. } }));
+        assert_eq!(as_send(&arg_lists[1][0]).1, "konst");
+    }
+
+    #[test]
+    fn a_keyword_hash_in_with_is_marked_and_a_braced_hash_is_not() {
+        // Q.expects(:call).with(shop_id: 1)   /   Q.expects(:call).with({ shop_id: 1 })
+        let hash = |kwargs| Expr::new(sp(), ExprNode::Hash { entries: vec![(sym("shop_id"), str_lit(sp(), "1"))], kwargs });
+        for (kwargs, marked) in [(true, true), (false, false)] {
+            let head = send(Some(konst(&["Q"])), "expects", vec![sym("call")]);
+            let mut e = send(Some(head), "with", vec![hash(kwargs)]);
+            // a trailing `.raises` keeps the chain on the bridge
+            e = send(Some(e), "raises", vec![konst(&["Net", "OpenTimeout"])]);
+            rewrite(&mut e, &mut AppMethods::empty());
+            let (_, _, args, _) = as_send(&e);
+            let ExprNode::Array { elements: elems, .. } = &*args[3].node else { panic!() };
+            let ExprNode::Array { elements: link, .. } = &*elems[0].node else { panic!() };
+            let ExprNode::Array { elements: a, .. } = &*link[1].node else { panic!() };
+            assert_eq!(matches!(&*a[0].node, ExprNode::Send { method, .. } if method.as_str() == "kwargs"), marked);
+        }
     }
 
     /// An app with one model, `User`, carrying `reset_remote_connections`,
