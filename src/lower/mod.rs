@@ -54,6 +54,7 @@ pub mod active_model_model;
 pub mod enumerable_ext;
 mod fused;
 pub mod time_calendar;
+pub mod indifferent_access;
 pub mod boolean_cast;
 pub mod where_range_split;
 pub mod params_merge;
@@ -89,6 +90,8 @@ pub mod dead_default;
 pub mod default_scope;
 pub mod errors_add;
 pub mod errors_full_messages;
+pub mod human_attribute_name;
+pub mod i18n_translate;
 pub mod assoc_attr_key;
 pub mod attachable;
 pub mod attachables_grep;
@@ -314,13 +317,18 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // ledger residue for (or rewrite inside) code that cannot run.
     ("bool_fold", &[]),
     ("association_new", &["bool_fold"]),
+    // Refuses `**h` into flattened optional keywords while the splat is
+    // still a `KeywordSplat`; `forwarding_keywords` erases it to `h`.
+    ("flattened_keyword_splats", &["bool_fold"]),
     // Preserve native full destinations; ordinary keyword producers
     // rejoin the legacy projection before any argument-rewriting pass.
-    ("forwarding_keywords", &["bool_fold"]),
+    ("forwarding_keywords", &["bool_fold", "flattened_keyword_splats"]),
     // Reads the analyzer's nested request-params types before any pass rewrites the controller bodies that carry them.
     ("params_residue", &["bool_fold"]),
     // After the ledger, which reads the calls this rewrites; before the controller lowering turns `params` into `@params`.
     ("params_permit", &["params_residue"]),
+    // Before the fused rewrites, which key on the plain Hash type this pass leaves on an indifferent hash.
+    ("indifferent_access", &[]),
     // Independent send rewrites: one fused tree walk in
     // `fused::apply_fused_independent_rewrites`. Grouped here so the
     // executed-pass assert stays a straight list match.
@@ -606,6 +614,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // the same body has already baked its humanized prefix — the
     // projection this pass emits reads that text.
     ("errors_index", &["errors_add"]),
+    ("human_attribute_name", &[]),
+    ("i18n_translate", &[]),
     ("create_block", &["secure_password_super"]),
     // `<params>.merge(k: v)` written a method away from the permit
     // chain → `Model.from_params(p)` + per-key setters, hoisted above
@@ -814,12 +824,18 @@ pub fn apply_post_analyze_lowerings(
     ran!("bool_fold");
     association_new::apply_association_new_lowering(app);
     ran!("association_new");
+    // Before the first `forwarding::apply` erases `**h` into a
+    // positional `h`, after which `f(x, **h)` and `f(x, h)` are one tree.
+    diags.extend(helper_kwargs::refuse_flattened_keyword_splats(app));
+    ran!("flattened_keyword_splats");
     diags.extend(forwarding::apply(app));
     ran!("forwarding_keywords");
     diags.extend(params_residue::apply_params_residue_ledger(app));
     ran!("params_residue");
     params_permit::apply_params_permit_lowering(app);
     ran!("params_permit");
+    indifferent_access::apply_indifferent_access_lowering(app);
+    ran!("indifferent_access");
     crate::timings::phase("post-analyze: fused send rewrites", || {
         diags.extend(fused::apply_fused_independent_rewrites(app));
     });
@@ -990,6 +1006,10 @@ pub fn apply_post_analyze_lowerings(
     ran!("errors_add");
     diags.extend(errors_index::apply_errors_index_lowering(app));
     ran!("errors_index");
+    human_attribute_name::apply_human_attribute_name_lowering(app);
+    ran!("human_attribute_name");
+    i18n_translate::apply_i18n_translate_lowering(app);
+    ran!("i18n_translate");
     diags.extend(create_block::apply_create_block_inline(app));
     ran!("create_block");
     diags.extend(params_merge::apply_params_merge_lowering(app));

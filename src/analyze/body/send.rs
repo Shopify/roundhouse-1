@@ -477,6 +477,10 @@ impl<'a> BodyTyper<'a> {
             let array = Ty::Array { elem: Box::new(Ty::Int) };
             return self.block_ctx_for(outer, Some(&array), method, args, class_object_receiver, block);
         }
+        if let Some(value) = recv_ty.and_then(crate::analyze::indifferent::value_of) {
+            let hash = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(value.clone()) };
+            return self.block_ctx_for(outer, Some(&hash), method, args, class_object_receiver, block);
+        }
         let mut new_ctx = outer.clone();
         let ExprNode::Lambda { params, block_param, .. } = &*block.node else {
             return new_ctx;
@@ -1593,6 +1597,32 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "BigDecimal" {
                     return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
                 }
+                if id.0.as_str() == crate::analyze::indifferent::CLASS {
+                    // Not `instance_receiver`: the bare `HashWithIndifferentAccess` alias is not marked a resolved class reference.
+                    let answer = if let Some(value) = args.first().cloned() {
+                        crate::analyze::indifferent::method_ty(&value, method.as_str(), call_args, block_ret, block_ret.is_some(), |m| {
+                            hash_method(&Symbol::from(m), &Ty::Str, &value, block_ret, call_args)
+                        })
+                    } else {
+                        match (method.as_str(), call_args) {
+                            ("new", []) => Some(crate::analyze::indifferent::of(Ty::Untyped)),
+                            ("new", [hash]) if block_ret.is_none() && crate::analyze::indifferent::constructor_args(call_args) => hash.ty.as_ref().and_then(crate::analyze::indifferent::from),
+                            _ => None,
+                        }
+                    };
+                    return answer.unwrap_or_else(unknown);
+                }
+                // Not Rails' numeric or TZInfo lookups: only a zone NAME reaches the runtime port's `lookup`.
+                if id.0.as_str() == "ActiveSupport::TimeZone" && method.as_str() == "[]" {
+                    return match call_args {
+                        [name] if matches!(name.ty.as_ref(), Some(Ty::Str | Ty::Var { .. }))
+                            || matches!(name.ty.as_ref(), Some(Ty::Union { variants }) if variants.iter().all(|t| matches!(t, Ty::Str | Ty::Nil))) =>
+                        {
+                            Ty::Union { variants: vec![Ty::Class { id: id.clone(), args: vec![] }, Ty::Nil] }
+                        }
+                        _ => unknown(),
+                    };
+                }
                 if id.0.as_str() == "Jbuilder" {
                     return match method.as_str() {
                         "array!" => Ty::Array { elem: Box::new(Ty::Untyped) },
@@ -2140,6 +2170,11 @@ impl<'a> BodyTyper<'a> {
                         _ => Ty::Untyped,
                     };
                 }
+                if block_ret.is_none() {
+                    if let Some(t) = indexed_pluck(method, elem, args) {
+                        return t;
+                    }
+                }
                 array_method(method, elem, block_ret)
             }
             // Relation-typed receiver — a chain started from a scope
@@ -2304,6 +2339,10 @@ impl<'a> BodyTyper<'a> {
             // inference gap) rather than the parent-chain walk — `Time`
             // has no user-defined ancestors in this corpus.
             Some(Ty::Time) if matches!(method.as_str(), "+" | "-") => time_arithmetic(method, args),
+            // Not Rails' `formatted_offset(colon, alternate_utc_string)`: only the bare form lowers.
+            Some(Ty::Time) if method.as_str() == "formatted_offset" => {
+                if args.is_empty() { Ty::Str } else { unknown() }
+            }
             Some(Ty::Time) => time_method(method).unwrap_or_else(unknown),
             Some(Ty::Date) => date_method(method, args).unwrap_or_else(unknown),
             // `Integer#in_time_zone` lowers only for ≤1 arg (invariant 6).
@@ -2636,7 +2675,7 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
         // Integer components / epoch seconds / spaceship.
         "to_i" | "tv_sec" | "tv_usec" | "tv_nsec" | "year" | "month" | "mon"
         | "day" | "mday" | "hour" | "min" | "sec" | "usec" | "nsec"
-        | "wday" | "yday" | "<=>" => Ty::Int,
+        | "wday" | "yday" | "<=>" | "utc_offset" | "gmt_offset" | "gmtoff" => Ty::Int,
         "to_f" => Ty::Float,
         // Predicates / comparisons that read as method calls.
         // `==`/`!=` are handled by `universal_method` (checked before
@@ -2897,6 +2936,26 @@ fn counted_first_last(method: &Symbol, args: &[crate::expr::Expr]) -> bool {
 fn array_find(method: &Symbol, args: &[crate::expr::Expr], block_ret: Option<&Ty>) -> bool {
     method.as_str() == "find" && block_ret.is_none() && args.len() == 1
         && matches!(args[0].ty, Some(Ty::Array { .. }))
+}
+
+/// Must match `lower::enumerable_ext::ground_indexed_pluck` — typing a
+/// `pluck` the lowerer leaves alone is invariant 6 (silent NoMethodError).
+pub(crate) fn indexed_pluck(method: &Symbol, elem: &Ty, args: &[crate::expr::Expr]) -> Option<Ty> {
+    // Not any key expression: the lowerer copies the key into the `map`
+    // block, so a computed key would run once per element.
+    let [key] = args else { return None };
+    if method.as_str() != "pluck"
+        || !matches!(&*key.node, ExprNode::Lit { .. } | ExprNode::Var { .. })
+    {
+        return None;
+    }
+    let value = match elem {
+        Ty::Hash { value, .. } if **value == Ty::Untyped => Ty::Untyped,
+        Ty::Hash { value, .. } => super::union_of((**value).clone(), Ty::Nil),
+        Ty::Untyped | Ty::Var { .. } => Ty::Untyped,
+        _ => return None,
+    };
+    Some(Ty::Array { elem: Box::new(value) })
 }
 
 /// Is this array element type a model relation's element — a single
@@ -3362,8 +3421,13 @@ pub(super) fn hash_method(
             key: Box::new(Ty::Sym),
             value: Box::new(value.clone()),
         },
+        "with_indifferent_access" if args.is_empty() => crate::analyze::indifferent::from(&Ty::Hash {
+            key: Box::new(key.clone()),
+            value: Box::new(value.clone()),
+        })
+        .unwrap_or_else(unknown),
         "stringify_keys" | "deep_stringify_keys" | "stringify_keys!"
-        | "deep_stringify_keys!" | "with_indifferent_access" => Ty::Hash {
+        | "deep_stringify_keys!" => Ty::Hash {
             key: Box::new(Ty::Str),
             value: Box::new(value.clone()),
         },

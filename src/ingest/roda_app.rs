@@ -147,6 +147,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
         visibility_overrides: Vec::new(),
+        i18n: Default::default(),
     });
     let models_dir = dir.join("models");
     if vfs.is_dir(&models_dir) {

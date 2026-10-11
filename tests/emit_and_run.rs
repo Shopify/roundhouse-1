@@ -9,6 +9,10 @@
 mod emit_and_run;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/array_excluding.rs"]
+mod array_excluding;
+#[path = "emit_and_run/array_excluding.rs"]
+mod array_excluding_runs;
 #[path = "emit_and_run/integer_query_find_by.rs"]
 mod integer_query_find_by;
 #[path = "support/lambda_signatures.rs"]
@@ -46,6 +50,8 @@ mod helper_anonymous_rest;
 mod controller_response_body;
 #[path = "emit_and_run/render_to_string_partial_ivar.rs"]
 mod render_to_string_partial_ivar;
+#[path = "emit_and_run/active_support_extensions.rs"]
+mod active_support_extensions;
 #[path = "emit_and_run/request_optional_port.rs"]
 mod request_optional_port;
 #[path = "emit_and_run/controller_url_helpers.rs"]
@@ -56,6 +62,8 @@ mod controller_super_ivars;
 mod assoc_pluck_typed;
 #[path = "emit_and_run/action_controller_head.rs"]
 mod action_controller_head;
+#[path = "emit_and_run/inline_filter_guard.rs"]
+mod inline_filter_guard;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
 #[path = "support/campfire_caches.rs"]
@@ -66,6 +74,8 @@ mod campfire_caches;
 mod action_text_markdown;
 #[path = "emit_and_run/ordinalize.rs"]
 mod ordinalize;
+#[path = "emit_and_run/autoload_once_paths.rs"]
+mod autoload_once_paths;
 
 /// A generated text column on the real-blog Article model exercises the
 /// schema-to-runtime path together with Rails-style symbol callbacks. The
@@ -571,6 +581,479 @@ fn rescued_socket_and_uri_errors_bring_their_requires() {
 #[ignore = "requires the Spinel toolchain"]
 fn uri_and_socket_errors_are_rescued_on_spinel() {
     uri_and_socket_errors_app().run_spinel(URI_AND_SOCKET_ASSERTIONS).assert_passes();
+}
+
+/// `errors.full_message(:field, msg)` answers Rails' text without adding
+/// to the record: the humanized field before the message, the bare message
+/// for `:base`.
+fn full_message_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().edit(
+        "app/models/article.rb",
+        "  validates :title, presence: true\n",
+        "  validates :title, presence: true
+
+  def self.taken_title_message
+    article = Article.new
+    article.errors.full_message(:title, \"is taken\")
+  end
+
+  def self.base_message(text)
+    article = Article.new
+    article.errors.full_message(:base, text)
+  end
+
+  def body_message(count)
+    errors.full_message(:body, \"needs #{count} words\")
+  end
+",
+    )
+}
+
+const FULL_MESSAGE_ASSERTIONS: &str = r#"raise "taken: #{Article.taken_title_message}" unless Article.taken_title_message == "Title is taken"
+raise "base: #{Article.base_message("Whole")}" unless Article.base_message("Whole") == "Whole"
+article = Article.new(title: "x", body: "y")
+raise "body: #{article.body_message(3)}" unless article.body_message(3) == "Body needs 3 words"
+raise "added" unless article.errors.empty?
+puts "full_message passed"
+"#;
+
+#[test]
+fn errors_full_message_answers_the_humanized_text() {
+    full_message_app().run_ruby(FULL_MESSAGE_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn errors_full_message_answers_the_humanized_text_on_spinel() {
+    full_message_app().run_spinel(FULL_MESSAGE_ASSERTIONS).assert_passes();
+}
+
+/// The app's locale names attributes and formats full messages, as
+/// Rails' I18n does: `activerecord.attributes.article.title` and
+/// `errors.format` reach validation messages, `errors.add`,
+/// `full_message` and `errors[:field]` alike.
+fn localized_messages_app() -> emit_and_run::Overlay {
+    full_message_app()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  errors:\n    format: \"%{attribute}: %{message}\"\n  activerecord:\n    attributes:\n      article:\n        title: \"Headline\"\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  def self.taken_title_message\n",
+            "  def flag_title\n    errors.add(:title, \"is flagged\")\n  end\n\n  def listed_errors\n    errors.full_messages\n  end\n\n  def title_errors\n    errors[:title]\n  end\n\n  def self.taken_title_message\n",
+        )
+}
+
+const LOCALIZED_MESSAGES_ASSERTIONS: &str = r#"article = Article.new(title: "", body: "short")
+raise "valid" if article.valid?
+raise "full: #{article.listed_errors.inspect}" unless article.listed_errors == ["Headline: can't be blank", "Body: is too short (minimum is 10 characters)"]
+raise "taken: #{Article.taken_title_message}" unless Article.taken_title_message == "Headline: is taken"
+raise "body: #{article.body_message(3)}" unless article.body_message(3) == "Body: needs 3 words"
+raise "base: #{Article.base_message("Whole")}" unless Article.base_message("Whole") == "Whole"
+flagged = Article.new(title: "t", body: "long enough body")
+flagged.flag_title
+raise "add: #{flagged.listed_errors.inspect}" unless flagged.listed_errors == ["Headline: is flagged"]
+puts "localized messages passed"
+"#;
+
+#[test]
+fn localized_attribute_names_and_format_reach_error_messages() {
+    let index = r#"raise "index: #{Article.new(title: "", body: "long enough body").tap(&:valid?).title_errors.inspect}" unless Article.new(title: "", body: "long enough body").tap(&:valid?).title_errors == ["can't be blank"]
+"#;
+    localized_messages_app().run_ruby(&format!("{index}{LOCALIZED_MESSAGES_ASSERTIONS}")).assert_passes();
+}
+
+// Not `title_errors` here: `errors[:field]` does not compile on Spinel, with or without a locale.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn localized_attribute_names_and_format_reach_error_messages_on_spinel() {
+    localized_messages_app().run_spinel(LOCALIZED_MESSAGES_ASSERTIONS).assert_passes();
+}
+
+/// Validation and `errors.add` messages come from the locale as Rails
+/// looks them up: a model's attribute override, the plural form for the
+/// count, `%{model}` and `%{value}` interpolated.
+fn localized_error_kinds_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  activerecord:\n    models:\n      article:\n        one: \"Story\"\n        other: \"Stories\"\n    errors:\n      models:\n        article:\n          attributes:\n            title:\n              blank: \"is required for %{model}\"\n      messages:\n        too_short:\n          one: \"needs at least one character, got %{value}\"\n          other: \"needs %{count} characters, got %{value}\"\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def listed_errors
+    errors.full_messages
+  end
+
+  def flag
+    errors.add(:title, :blank)
+    errors.add(:body)
+  end
+",
+        )
+}
+
+const LOCALIZED_ERROR_KINDS_ASSERTIONS: &str = r#"article = Article.new(title: "", body: "short")
+raise "valid" if article.valid?
+raise "validated: #{article.listed_errors.inspect}" unless article.listed_errors == ["Title is required for Story", "Body needs 10 characters, got short"]
+flagged = Article.new(title: "t", body: "long enough body")
+flagged.flag
+raise "added: #{flagged.listed_errors.inspect}" unless flagged.listed_errors == ["Title is required for Story", "Body is invalid"]
+puts "localized error kinds passed"
+"#;
+
+#[test]
+fn localized_error_kinds_reach_validations_and_errors_add() {
+    localized_error_kinds_app().run_ruby(LOCALIZED_ERROR_KINDS_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn localized_error_kinds_reach_validations_and_errors_add_on_spinel() {
+    localized_error_kinds_app().run_spinel(LOCALIZED_ERROR_KINDS_ASSERTIONS).assert_passes();
+}
+
+/// A plain ActiveModel class reads its attribute names under
+/// `activemodel`, not `activerecord`, as Rails' i18n_scope says.
+fn active_model_scope_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  activemodel:\n    attributes:\n      search:\n        query: \"Keywords\"\n  activerecord:\n    attributes:\n      search:\n        query: \"Wrong scope\"\n",
+        )
+        .write(
+            "app/models/search.rb",
+            "class Search\n  include ActiveModel::Model\n\n  attr_accessor :query\n\n  validates :query, presence: true\nend\n",
+        )
+}
+
+const ACTIVE_MODEL_SCOPE_ASSERTIONS: &str = r#"search = Search.new(query: "")
+raise "valid" if search.valid?
+raise "messages: #{search.errors.inspect}" unless search.errors == ["Keywords can't be blank"]
+puts "active model scope passed"
+"#;
+
+#[test]
+fn an_active_model_class_reads_the_activemodel_scope() {
+    active_model_scope_app().run_ruby(ACTIVE_MODEL_SCOPE_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_class_reads_the_activemodel_scope_on_spinel() {
+    active_model_scope_app().run_spinel(ACTIVE_MODEL_SCOPE_ASSERTIONS).assert_passes();
+}
+
+/// `human_attribute_name` answers the locale's name, from a model method,
+/// a view and `record.class`; a dynamic attribute stays an error.
+fn human_attribute_name_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  activerecord:\n    attributes:\n      article:\n        title: \"Headline\"\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.title_label
+    human_attribute_name(:title)
+  end
+
+  def self.body_label
+    Article.human_attribute_name(\"body\")
+  end
+
+  def own_created_at_label
+    self.class.human_attribute_name(:created_at)
+  end
+",
+        )
+}
+
+const HUMAN_ATTRIBUTE_NAME_ASSERTIONS: &str = r#"raise "title: #{Article.title_label}" unless Article.title_label == "Headline"
+raise "body: #{Article.body_label}" unless Article.body_label == "Body"
+raise "created: #{Article.new.own_created_at_label}" unless Article.new.own_created_at_label == "Created at"
+puts "human_attribute_name passed"
+"#;
+
+#[test]
+fn human_attribute_name_answers_the_locale() {
+    human_attribute_name_app().run_ruby(HUMAN_ATTRIBUTE_NAME_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn human_attribute_name_answers_the_locale_on_spinel() {
+    human_attribute_name_app().run_spinel(HUMAN_ATTRIBUTE_NAME_ASSERTIONS).assert_passes();
+}
+
+#[test]
+fn human_attribute_name_on_a_dynamic_attribute_stays_an_error() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def self.label_for(field)\n    Article.human_attribute_name(field)\n  end\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("human_attribute_name")), "{errors:?}");
+}
+
+/// Form labels and submit text come from the locale as Action View finds
+/// them: `helpers.label`, then the model's attribute name, then the
+/// humanized method; `helpers.submit` over the model's human name.
+fn localized_form_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  helpers:\n    label:\n      article:\n        title: \"Your headline\"\n    submit:\n      create: \"Publish %{model}\"\n  activerecord:\n    attributes:\n      article:\n        body: \"Content\"\n",
+        )
+        .write(
+            "test/controllers/localized_forms_controller_test.rb",
+            "require \"test_helper\"\n\nclass LocalizedFormsControllerTest < ActionDispatch::IntegrationTest\n  test \"labels and submit read the locale\" do\n    get new_article_url\n    assert_includes response.body, \">Your headline</label>\"\n    assert_includes response.body, \">Content</label>\"\n    assert_includes response.body, \"value=\\\"Publish Article\\\"\"\n    get edit_article_url(articles(:one))\n    assert_includes response.body, \"value=\\\"Update Article\\\"\"\n  end\nend\n",
+        )
+}
+
+#[test]
+fn localized_form_labels_and_submit_text() {
+    localized_form_app().run_test("test/controllers/localized_forms_controller_test.rb").assert_passes();
+}
+
+/// `I18n.t` and a template's `t` answer the locale at compile time:
+/// interpolation, plural forms chosen by a run-time count, `scope:`,
+/// `default:` and a view's lazy `.key`.
+fn translate_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .write(
+            "config/locales/en.yml",
+            "en:\n  hello: \"Hello world\"\n  greet: \"Hi %{name}\"\n  inbox:\n    zero: \"No messages\"\n    one: \"1 message\"\n    other: \"%{count} messages\"\n  shop:\n    title: \"Store\"\n  intro_html: \"<b>Hi</b> %{name}\"\n  pct: \"100%% sure %%{x} %{name}\"\n  mood:\n    happy: \"Glad\"\n    sad: \"Down %{name}\"\n  visibility:\n    public: \"Everyone\"\n    private: \"Only me\"\n    notice_html: \"<b>Note</b> %{name}\"\n  box:\n    inbox:\n      one: \"1 letter\"\n      other: \"%{count} letters\"\n  tally_html:\n    one: \"<b>one</b>\"\n    other: \"<b>%{count}</b> items\"\n  articles:\n    index:\n      heading: \"All the articles\"\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.greeting(name)
+    I18n.t(\"greet\", name: name)
+  end
+
+  def self.inbox(count)
+    I18n.t(\"inbox\", count: count)
+  end
+
+  def self.scoped_title
+    I18n.t(:title, scope: :shop)
+  end
+
+  def self.fallbacks
+    [I18n.t(:nope, default: :greet, name: \"Bo\"), I18n.t(:nope, default: \"Plain\")]
+  end
+
+  def self.intro
+    I18n.t(\"intro_html\", name: \"<i>\")
+  end
+
+  def self.counted_inbox(calls)
+    I18n.t(\"inbox\", count: (calls << 1).size)
+  end
+
+  def self.percents
+    [I18n.t(\"pct\", name: \"N\", x: \"X\"), I18n.t(\"greet\")]
+  end
+
+  def self.moods(flag)
+    [I18n.t(\"mood.#{flag ? 'happy' : 'sad'}\", name: \"Al\"), I18n.t(flag ? :hello : \"shop.title\")]
+  end
+
+  def self.visibility(v)
+    I18n.t(\"visibility.#{v}\")
+  end
+
+  def self.visibility_or(v)
+    I18n.t(\"visibility.#{v}\", default: \"Unknown\")
+  end
+
+  def self.letters(box, n)
+    I18n.t(\"box.#{box}\", count: n)
+  end
+
+  def self.missing_text(flag)
+    [I18n.t(\"no.such.key\", name: \"x\"), I18n.t(\"shop.#{flag ? 'title' : 'nope'}\")]
+  end
+
+  def self.unread_option(calls)
+    I18n.t(\"hello\", unused: (calls << 1).size)
+  end
+
+  def self.read_before_write
+    name = \"before\"
+    I18n.t(\"greet\", name: name, unused: (name = \"after\"))
+  end
+
+  def self.ordered_options(calls)
+    I18n.t(\"greet\", other: (calls << \"a\").size, name: (calls << \"b\").join)
+  end
+",
+        )
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<h1",
+            "<p id=\"lazy\"><%= t(\".heading\") %></p><p id=\"inbox\"><%= t(\"inbox\", count: @articles.size) %></p><p id=\"intro\"><%= t(\"intro_html\", name: \"<i>\") %></p><p id=\"tally\"><%= t(\"tally_html\", count: \"<s>\") %></p><p id=\"missing\"><%= t(\"no.such_key\", name: \"<b>\", count: 2) %></p><p id=\"lazy-missing\"><%= t(\".missing_heading\") %></p><% [\"notice_html\", \"public\", \"nope\"].each do |k| %><p class=\"vis\"><%= t(\"visibility.#{k}\", name: \"<i>\") %></p><% end %>\n<h1",
+        )
+        .write(
+            "test/controllers/translations_controller_test.rb",
+            "require \"test_helper\"\n\nclass TranslationsControllerTest < ActionDispatch::IntegrationTest\n  test \"templates translate\" do\n    get articles_url\n    assert_includes response.body, \"<p id=\\\"lazy\\\">All the articles</p>\"\n    assert_includes response.body, \" messages</p>\"\n    assert_includes response.body, \"<p id=\\\"intro\\\"><b>Hi</b> &lt;i&gt;</p>\"\n    assert_includes response.body, \"<p id=\\\"tally\\\"><b>&lt;s&gt;</b> items</p>\"\n    assert_includes response.body, \"<p id=\\\"missing\\\"><span class=\\\"translation_missing\\\" title=\\\"translation missing: en.no.such_key, name: &amp;lt;b&amp;gt;, count: 2\\\">Such Key</span></p>\"\n    assert_includes response.body, \"<p class=\\\"vis\\\"><b>Note</b> &lt;i&gt;</p><p class=\\\"vis\\\">Everyone</p><p class=\\\"vis\\\"><span class=\\\"translation_missing\\\" title=\\\"translation missing: en.visibility.nope, name: &amp;lt;i&amp;gt;\\\">Nope</span></p>\"\n    assert_includes response.body, \"<p id=\\\"lazy-missing\\\"><span class=\\\"translation_missing\\\" title=\\\"translation missing: en.articles.index.missing_heading\\\">Missing Heading</span></p>\"\n  end\nend\n",
+        )
+}
+
+const TRANSLATE_ASSERTIONS: &str = r#"raise "greet: #{Article.greeting("Ann")}" unless Article.greeting("Ann") == "Hi Ann"
+raise "zero: #{Article.inbox(0)}" unless Article.inbox(0) == "No messages"
+raise "one: #{Article.inbox(1)}" unless Article.inbox(1) == "1 message"
+raise "other: #{Article.inbox(3)}" unless Article.inbox(3) == "3 messages"
+raise "scope: #{Article.scoped_title}" unless Article.scoped_title == "Store"
+raise "fallbacks: #{Article.fallbacks.inspect}" unless Article.fallbacks == ["Hi Bo", "Plain"]
+raise "intro: #{Article.intro}" unless Article.intro == "<b>Hi</b> <i>"
+calls = []
+counted = Article.counted_inbox(calls)
+raise "counted: #{counted}" unless counted == "1 message"
+raise "count evaluated #{calls.size} times" unless calls.size == 1
+raise "percents: #{Article.percents.inspect}" unless Article.percents == ["100% sure %{x} N", "Hi %{name}"]
+raise "moods: #{Article.moods(true).inspect}" unless Article.moods(true) == ["Glad", "Hello world"]
+raise "moods: #{Article.moods(false).inspect}" unless Article.moods(false) == ["Down Al", "Store"]
+raise "visibility: #{Article.visibility("private")}" unless [Article.visibility("public"), Article.visibility("private")] == ["Everyone", "Only me"]
+raise "visibility missing: #{Article.visibility("nope")}" unless Article.visibility("nope") == "Translation missing: en.visibility.nope"
+raise "visibility default: #{Article.visibility_or("nope")}" unless Article.visibility_or("nope") == "Unknown" && Article.visibility_or("public") == "Everyone"
+raise "letters: #{Article.letters("inbox", 2)}" unless Article.letters("inbox", 2) == "2 letters" && Article.letters("inbox", 1) == "1 letter"
+begin
+  Article.visibility("")
+  raise "subtree did not raise"
+rescue NotImplementedError
+end
+raise "missing: #{Article.missing_text(false).inspect}" unless Article.missing_text(false) == ["Translation missing: en.no.such.key", "Translation missing: en.shop.nope"]
+calls = []
+raise "unread: #{calls.inspect}" unless Article.unread_option(calls) == "Hello world" && calls == [1]
+raise "read before write: #{Article.read_before_write}" unless Article.read_before_write == "Hi before"
+calls = []
+ordered = Article.ordered_options(calls)
+raise "ordered: #{ordered} #{calls.inspect}" unless ordered == "Hi ab" && calls == ["a", "b"]
+puts "translate passed"
+"#;
+
+#[test]
+fn i18n_t_answers_the_locale() {
+    translate_app().run_ruby(TRANSLATE_ASSERTIONS).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn i18n_t_answers_the_locale_on_spinel() {
+    translate_app().run_spinel(TRANSLATE_ASSERTIONS).assert_passes();
+}
+
+#[test]
+fn template_t_answers_the_locale() {
+    translate_app().run_test("test/controllers/translations_controller_test.rb").assert_passes();
+}
+
+/// A `Rails::Engine` gem's `config/locales` load between Rails' English
+/// and the app's, as Rails assembles `I18n.load_path`: the gem's key
+/// resolves, and the app overrides one the gem also defines.
+fn engine_locale_app() -> emit_and_run::Overlay {
+    let gem = "vendor/bundle/ruby/3.4.0/gems/shelf-1.2.0";
+    emit_and_run::real_blog()
+        .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
+        .edit("Gemfile.lock", "  specs:\n", "  specs:\n    shelf (1.2.0)\n")
+        .write(&format!("{gem}/lib/shelf/engine.rb"), "module Shelf\n  class Engine < ::Rails::Engine\n  end\nend\n")
+        .write(&format!("{gem}/config/locales/shelf.en.yml"), "en:\n  shelf:\n    edit: \"Edit shelf\"\n    title: \"Gem title\"\n")
+        .write("config/locales/en.yml", "en:\n  hello: \"Hello world\"\n  shelf:\n    title: \"App title\"\n")
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def self.shelf_texts\n    [I18n.t(\"shelf.edit\"), I18n.t(\"shelf.title\")]\n  end\n",
+        )
+}
+
+#[test]
+fn an_engine_gem_s_locales_answer_beneath_the_app_s() {
+    engine_locale_app()
+        .run_ruby("raise Article.shelf_texts.inspect unless Article.shelf_texts == [\"Edit shelf\", \"App title\"]\nputs \"engine locales passed\"\n")
+        .assert_passes();
+}
+
+/// `raise_on_missing_translations` in the running environment's file
+/// makes a missing key raise `I18n::MissingTranslationData`.
+#[test]
+fn a_missing_translation_raises_where_the_environment_says_so() {
+    translate_app()
+        .edit(
+            "config/environments/development.rb",
+            "  # config.i18n.raise_on_missing_translations = true",
+            "  config.i18n.raise_on_missing_translations = true",
+        )
+        .run_ruby("begin\n  Article.missing_text(true)\n  raise \"no raise\"\nrescue I18n::MissingTranslationData => e\n  raise e.message unless e.message == \"Translation missing: en.no.such.key\"\nend\nraise \"found\" unless Article.scoped_title == \"Store\"\nputs \"raise passed\"\n")
+        .assert_passes();
+}
+
+/// A key computed at run time, a missing key with only key defaults, a
+/// `:strict` setting, or a call with a block stays an error.
+#[test]
+fn unresolvable_translations_stay_errors() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def self.missing\n    I18n.t(\"no.such.key\", default: :also_missing)\n  end\n\n  def self.dynamic(key)\n    I18n.t(key)\n  end\n\n  def self.blocked\n    I18n.t(\"hello\") { |text| text }\n  end\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert_eq!(errors.iter().filter(|e| e.contains("I18n not supported")).count(), 3, "{errors:?}");
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "config/environments/test.rb",
+            "  # config.i18n.raise_on_missing_translations = true",
+            "  config.i18n.raise_on_missing_translations = :strict",
+        )
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", "  validates :title, presence: true\n\n  def self.missing\n    I18n.t(\"no.such.key\")\n  end\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains(":strict")), "{errors:?}");
+}
+
+/// `errors[:field]` cannot tell fields apart when `errors.format` puts
+/// nothing before the message, so it stays an error.
+#[test]
+fn errors_index_under_a_message_only_format_stays_an_error() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .write("config/locales/en.yml", "en:\n  hello: \"Hello world\"\n  errors:\n    format: \"%{message}\"\n")
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def title_errors\n    errors[:title]\n  end\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("nothing before the message")), "{errors:?}");
+}
+
+/// A field the lowering cannot humanize at compile time keeps its error.
+#[test]
+fn errors_full_message_on_a_dynamic_field_stays_an_error() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def message_for(field)
+    errors.full_message(field, \"is taken\")
+  end
+",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("full_message lacks")), "{errors:?}");
 }
 
 /// A Sidekiq worker's class-side entries run its `perform` inline, as an
@@ -2078,6 +2561,148 @@ got = CommentDigest.titles
 raise "got #{got.inspect}" unless got == "First,Second,Second 1,2"
 "##,
         )
+        .assert_passes();
+}
+
+/// `ActiveSupport::TimeZone[name]`, `.all`, and a zone's `name`,
+/// `to_s`, `utc_offset`, `formatted_offset` and `now` answer what Rails
+/// answers. Only offsets no daylight saving moves are pinned here; the
+/// runtime port reads `utc_offset` as Rails does, as the period's base
+/// offset. Expected values are ActiveSupport 8.1's.
+#[test]
+fn time_zone_lookups_run() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/zones\", to: \"zones#show\"\n",
+        )
+        .write(
+            "app/controllers/zones_controller.rb",
+            r#"class ZonesController < ApplicationController
+  def show
+    all = ActiveSupport::TimeZone.all
+    render plain: [
+      ActiveSupport::TimeZone[params[:tz].to_s]&.name,
+      ActiveSupport::TimeZone["Asia/Tokyo"].to_s,
+      ActiveSupport::TimeZone["Nope"].nil?,
+      ActiveSupport::TimeZone["Tokyo"].now.formatted_offset,
+      ActiveSupport::TimeZone["UTC"].utc_offset,
+      all.size,
+      all.first.to_s,
+      all.last.to_s,
+      ActiveSupport::TimeZone["Tokyo"].formatted_offset
+    ].join("|")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/zones_controller_test.rb",
+            r#"require "test_helper"
+
+class ZonesControllerTest < ActionDispatch::IntegrationTest
+  test "time zone lookups" do
+    get "/zones", params: { tz: "Tokyo" }
+    assert_equal "Tokyo|(GMT+09:00) Asia/Tokyo|true|+09:00|0|152|(GMT-12:00) International Date Line West|(GMT+13:00) Tokelau Is.|+09:00", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/zones_controller_test.rb")
+        .assert_passes();
+}
+
+/// `ActiveSupport::HashWithIndifferentAccess` reads and writes a Symbol
+/// key as its String, nested hashes included, and its conversions
+/// (`merge`, `reverse_merge`, `dup`, `to_hash`, `symbolize_keys`) answer
+/// what Rails answers.
+#[test]
+fn hash_with_indifferent_access_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/indifferent\", to: \"indifferent#show\"\n  get \"/indifferent/loose\", to: \"indifferent#loose\"\n  get \"/indifferent/copies\", to: \"indifferent#copies\"\n",
+        )
+        .write(
+            "app/controllers/indifferent_controller.rb",
+            r#"class IndifferentController < ApplicationController
+  OPTIONS = { state: :trusted }.with_indifferent_access.freeze
+
+  def show
+    h = ActiveSupport::HashWithIndifferentAccess.new(a: 1, "b" => 2)
+    h[:c] = 3
+    key = :a
+    nested = { outer: { inner: 4 } }.with_indifferent_access
+    list = HashWithIndifferentAccess.new(items: [{ id: 5 }])
+    w = ActiveSupport::HashWithIndifferentAccess.new
+    w[:name] = "x"
+    w[:rows] = [{ n: 8 }]
+    merged = h.merge(d: 6)
+    defaults = h.reverse_merge(a: 0, e: 7)
+    copy = h.dup
+    copy[:a] = 10
+    syms = h.symbolize_keys
+    render plain: [
+      h[:a], h["a"], h[key], h[:b], h.fetch(:c), h.key?(:b), h.values_at(:a, :c).join(","),
+      h.slice(:a, :c).keys.join(","), h.except(:b).keys.join(","),
+      nested[:outer][:inner], nested.dig(:outer, :inner), list[:items][0][:id], w["name"], w[:rows][0][:n],
+      merged[:d], defaults[:a], defaults[:e], copy[:a], h[:a],
+      h.to_hash.keys.join(","), syms[:a], h.is_a?(Hash), h.delete(:c), h.key?(:c), h.keys.join(","),
+      h.select { |k, v| v > 1 }.keys.join(","), h.map { |k, v| k + v.to_s }.join(",")
+    ].join("|")
+  end
+
+  def loose
+    h = ActiveSupport::HashWithIndifferentAccess.new(a: 1, "b" => 2)
+    t = h.to_h
+    t["z"] = 1
+    filled = h.with_defaults(a: 0, f: 9)
+    loose = ActiveSupport::HashWithIndifferentAccess.new
+    loose[:cfg] = { deep: { leaf: "y" } }
+    loose.fetch(:cfg)[:deep][:leaf] = "z"
+    loose.update(more: 1)
+    render plain: [
+      h.key?(:z), filled[:a], filled[:f], loose.dig(:cfg, :deep, :leaf), loose[:cfg].key?(:deep), loose[:more]
+    ].join("|")
+  end
+
+  def copies
+    src = ActiveSupport::HashWithIndifferentAccess.new(n: { k: 1 }, drop: 2)
+    cp = ActiveSupport::HashWithIndifferentAccess.new(src)
+    src[:n][:k] = 2
+    bag = ActiveSupport::HashWithIndifferentAccess.new
+    bag[:syms] = [:a]
+    keys = %i[n drop]
+    render plain: [cp[:n][:k], src.without(:drop).keys.join(","), bag[:syms].include?(:a), src.slice(*keys).keys.join(","), OPTIONS[:state], OPTIONS.frozen?, src[:n].keys.join(",")].join("|")
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/indifferent_controller_test.rb",
+            r#"require "test_helper"
+
+class IndifferentControllerTest < ActionDispatch::IntegrationTest
+  test "indifferent access" do
+    get "/indifferent"
+    assert_equal "1|1|1|2|3|true|1,3|a,c|a,c|4|4|5|x|8|6|1|7|10|1|a,b,c|1|true|3|false|a,b|b|a1,b2", response.body
+  end
+
+  test "untyped values read back indifferently" do
+    get "/indifferent/loose"
+    assert_equal "false|1|9|z|true|1", response.body
+  end
+
+  test "an indifferent source is copied shallowly" do
+    get "/indifferent/copies"
+    assert_equal "2|n|true|n,drop|trusted|true|k", response.body
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/indifferent_controller_test.rb")
         .assert_passes();
 }
 
@@ -4418,13 +5043,11 @@ puts "ok"
         .assert_passes();
 }
 
-/// #139 typed `Model.human_attribute_name` as a String, which took the
-/// call from an error to clean, but no runtime defines it, so every
-/// page rendering the form raises `undefined method
-/// 'human_attribute_name' for class Article`. It belongs once, in
-/// `runtime/ruby/active_record/base.rb`, where every target gets it.
+/// #139 typed `Model.human_attribute_name` as a String, but no runtime
+/// defined it, so every page rendering the form raised `undefined method
+/// 'human_attribute_name' for class Article` (#147). A literal attribute
+/// now folds to the locale's name at compile time.
 #[test]
-#[ignore = "check is clean but the emitted view raises NoMethodError: no runtime defines human_attribute_name (#147)"]
 fn human_attribute_name_runs() {
     emit_and_run::real_blog()
         .edit(
@@ -8324,6 +8947,60 @@ end
         .assert_passes();
 }
 
+/// lobsters keeps its site settings in a top-level
+/// `class << Rails.application` block. Rubydex records no constant
+/// references inside a singleton class opened on an expression, so the
+/// `ENV` and `Rails` written there have no source answer; they must still
+/// resolve as the modeled constants, not emit as refusal stubs.
+#[test]
+fn rails_application_singleton_settings_read_env_and_rails() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "config/application.rb",
+            r#"module TestApp
+  class Application < Rails::Application
+  end
+end
+
+class << Rails.application
+  def open_signups?
+    ENV["OPEN_SIGNUPS"] == "true"
+  end
+
+  def domain
+    "example.test"
+  end
+
+  def root_url
+    "https://#{Rails.application.domain}/"
+  end
+end
+"#,
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"ENV["OPEN_SIGNUPS"] = "true"
+raise "ENV read: open_signups? must be true" unless Rails.application.open_signups?
+ENV["OPEN_SIGNUPS"] = "false"
+raise "ENV read: open_signups? must be false" if Rails.application.open_signups?
+url = Rails.application.root_url
+raise "Rails.application chain: #{url.inspect}" unless url == "https://example.test/"
+"#,
+        );
+    run.assert_passes();
+}
+
 /// `if:` / `unless:` guards a callback. Ingest used to reject the
 /// declaration outright, so the callback was silently dropped and ran in
 /// no circumstance. A zero-arity lambda body (`if: -> { color.blank? }`)
@@ -11751,6 +12428,22 @@ raise "association(:article).loaded? answered #{got.inspect}" unless got == [fal
         .assert_passes();
 }
 
+/// Campfire's messages_count test: `Message.reflect_on_association(:room)`
+/// and `assert_not reflection.counter_cache_column` (trigger-backed count,
+/// not an AR `counter_cache:`).
+#[test]
+fn reflect_on_association_answers_without_counter_cache() {
+    emit_and_run::real_blog()
+        .run_ruby(r#"
+reflection = Comment.reflect_on_association(:article)
+raise "missing reflection" if reflection.nil?
+raise "expected Symbol name, got #{reflection.name.inspect}" unless reflection.name == :article
+raise "counter_cache_column should be nil, got #{reflection.counter_cache_column.inspect}" unless reflection.counter_cache_column.nil?
+raise "unknown assoc should be nil" unless Comment.reflect_on_association(:missing).nil?
+"#)
+        .assert_passes();
+}
+
 /// `owner.<has_many>.reload` reads the rows again (campfire's rooms
 /// test: `assert_empty room.memberships.reload`).
 #[test]
@@ -12789,5 +13482,288 @@ raise "data reopen" unless Ns::Inner.new(v: 5).plus == 6 && Ns::Inner.new(v: 5).
 raise "nested struct reopen" unless Ns::Tagged.new(t: "z").tag == "t:z"
 "#,
         )
+        .assert_passes();
+}
+
+/// A runtime façade's scalar constants (`Markly::SMART = 0` in
+/// runtime/ruby/gem_facades.rb) used to carry no type: the constant table
+/// typed Hash/Array/`.new` values only, so after the Rubydex integration an
+/// app's `Markly::SMART` reference became a refusal stub and lobsters'
+/// `Markdowner` raised at render. On the CRuby tree Markly is the real gem.
+#[test]
+fn markly_flag_constants_resolve_and_render_through_the_real_gem() {
+    let run = emit_and_run::empty_app()
+        .write("Gemfile", "source \"https://rubygems.org\"\ngem \"rails\"\ngem \"markly\"\n")
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "lib/markdown_renderer.rb",
+            "class MarkdownRenderer\n  def self.render(text)\n    root = Markly.parse(text, flags: Markly::SMART, extensions: [:strikethrough])\n    root.to_html(flags: Markly::DEFAULT, extensions: [:strikethrough])\n  end\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"html = MarkdownRenderer.render("**bold** ~~gone~~")
+raise "Markly render: #{html.inspect}" unless html.include?("<strong>bold</strong>") && html.include?("<del>gone</del>")
+"#,
+        );
+    run.assert_passes();
+}
+
+/// A class body that initializes `@@` variables beside constants was
+/// refused whole at ingest ("requires source ordering"), because the
+/// emitter does not keep their relative order. When every constant and
+/// every initializer is a literal neither can observe the other, so the
+/// order is free. Lobsters' `Twitter` (`@@CONSUMER_KEY = nil`,
+/// `MAX_TWEET_LEN = 280`) disappeared from the tree, and /settings raised.
+#[test]
+fn literal_class_variables_beside_literal_constants_ingest() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "lib/poster.rb",
+            "class Poster\n  cattr_accessor :CONSUMER_KEY\n\n  @@CONSUMER_KEY = nil\n\n  MAX_LEN = 280\n  SHORT_LEN = 23\n\n  def self.enabled?\n    self.CONSUMER_KEY.present?\n  end\n\n  def self.room\n    MAX_LEN - SHORT_LEN\n  end\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"raise "enabled? must start false" if Poster.enabled?
+raise "constants: #{Poster.room}" unless Poster.room == 257
+Poster.CONSUMER_KEY = "key"
+raise "enabled? must follow the class variable" unless Poster.enabled?
+"#,
+        );
+    run.assert_passes();
+}
+
+/// `recv.try(:m)` narrows to the classes that define `m`, and a model
+/// defines every column reader without spelling it as a `def`. Counting
+/// only `def`s made lobsters' `@user.try(:username)` narrow to `ModNote`
+/// (whose `delegate :username` is a method) and answer nil for every
+/// `User`: a logged-in page rendered `data-username=''`.
+#[test]
+fn try_answers_a_column_reader_beside_a_class_that_defines_the_method() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
+        .write("lib/note.rb", "class Note\n  def name\n    \"note\"\n  end\nend\n")
+        .write(
+            "lib/presenter.rb",
+            "class Presenter\n  def self.label(obj)\n    obj.try(:name)\n  end\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"w = Widget.new(name: "gizmo")
+raise "column reader: #{Presenter.label(w).inspect}" unless Presenter.label(w) == "gizmo"
+raise "defined method: #{Presenter.label(Note.new).inspect}" unless Presenter.label(Note.new) == "note"
+raise "nil receiver" unless Presenter.label(nil).nil?
+"#,
+        );
+    run.assert_passes();
+}
+
+#[test]
+fn render_inertia_answers_html_and_json_visits() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/pages/show\", to: \"pages#show\"\n",
+        )
+        .write(
+            "config/initializers/inertia_rails.rb",
+            "InertiaRails.configure do |config|\n  config.use_script_element_for_initial_page = true\nend\n",
+        )
+        .write(
+            "app/controllers/pages_controller.rb",
+            r#"class PagesController < ApplicationController
+  def show
+    render inertia: "pages/show", props: {
+      title: "Hello </script>",
+      count: -> { Article.count },
+      label: -> { "eager-lambda" }
+    }
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/pages_controller_test.rb",
+            r#"require "test_helper"
+
+class PagesControllerTest < ActionDispatch::IntegrationTest
+  test "a first visit renders the page object inside the layout" do
+    get "/pages/show"
+    assert_response :success
+    page = %({"component":"pages/show","props":{"title":"Hello \\u003c/script\\u003e","count":#{Article.count},"label":"eager-lambda"},) +
+      %("url":"/pages/show","version":null,"encryptHistory":false,"clearHistory":false})
+    assert_includes response.body, %(<script data-page="app" type="application/json">#{page}</script>\n<div id="app"></div>)
+    assert_includes response.body, "<title>Real Blog</title>"
+    assert_equal "X-Inertia", response.headers["vary"]
+  end
+
+  test "an Inertia visit gets the page object as JSON" do
+    get "/pages/show", headers: { "X-Inertia" => "true" }
+    assert_response :success
+    assert_equal "true", response.headers["x-inertia"]
+    assert_equal "X-Inertia", response.headers["vary"]
+    page = response.parsed_body
+    assert_equal "pages/show", page["component"]
+    assert_equal(
+      { "title" => "Hello </script>", "count" => Article.count, "label" => "eager-lambda" },
+      page["props"]
+    )
+    assert_equal "/pages/show", page["url"]
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/pages_controller_test.rb")
+        .assert_passes();
+}
+
+#[test]
+fn inertia_protocol_shared_props_reloads_deferral_and_errors() {
+    emit_and_run::real_blog()
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"/inertia_articles\", to: \"inertia_articles#index\"\n  patch \"/inertia_articles\", to: \"inertia_articles#update\"\n",
+        )
+        .write(
+            "config/initializers/inertia_rails.rb",
+            "InertiaRails.configure do |config|\n  config.version = \"v1\"\n  config.encrypt_history = true\n  config.always_include_errors_hash = true\n  config.use_script_element_for_initial_page = true\nend\n",
+        )
+        .edit(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n",
+            "class ApplicationController < ActionController::Base\n  inertia_share articleCount: -> { Article.count },\n                appName: \"Real Blog\",\n                secret: InertiaRails.optional { \"opt\" }\n",
+        )
+        .write(
+            "app/controllers/inertia_articles_controller.rb",
+            r#"class InertiaArticlesController < ApplicationController
+  def index
+    render inertia: "inertia_articles/index", props: {
+      titles: Article.order(:id).pluck(:title),
+      inertiaVisit: request.inertia?,
+      stats: InertiaRails.defer { { total: Article.count } }
+    }
+  end
+
+  def update
+    if params[:title].to_s.empty?
+      redirect_to "/inertia_articles", inertia: { errors: { title: ["can't be blank"] } }
+    else
+      redirect_to "/inertia_articles"
+    end
+  end
+end
+"#,
+        )
+        .write(
+            "test/controllers/inertia_articles_controller_test.rb",
+            r#"require "test_helper"
+
+class InertiaArticlesControllerTest < ActionDispatch::IntegrationTest
+  INERTIA = { "X-Inertia" => "true", "X-Inertia-Version" => "v1" }
+
+  test "a first visit includes shared props and lists the deferred one" do
+    get "/inertia_articles"
+    assert_response :success
+    props = %("props":{"errors":{},"articleCount":#{Article.count},"appName":"Real Blog",) +
+      %("titles":#{Article.order(:id).pluck(:title).to_json},"inertiaVisit":false},)
+    assert_includes response.body, props
+    assert_includes response.body, %("version":"v1","encryptHistory":true,"clearHistory":false,)
+    assert_includes response.body, %("sharedProps":["errors","articleCount","appName","secret"],"deferredProps":{"default":["stats"]}})
+  end
+
+  test "an Inertia visit with the current version gets JSON" do
+    get "/inertia_articles", headers: INERTIA
+    assert_response :success
+    page = response.parsed_body
+    assert_equal %w[errors articleCount appName titles inertiaVisit], page["props"].keys
+    assert_equal true, page["props"]["inertiaVisit"]
+    assert_equal({ "default" => ["stats"] }, page["deferredProps"])
+  end
+
+  test "a stale version gets 409 and the URL to reload" do
+    get "/inertia_articles", headers: { "X-Inertia" => "true", "X-Inertia-Version" => "v0" }
+    assert_response 409
+    assert_equal "http://www.example.com/inertia_articles", response.headers["x-inertia-location"]
+  end
+
+  test "a partial reload answers only the props it names" do
+    get "/inertia_articles", headers: INERTIA.merge("X-Inertia-Partial-Component" => "inertia_articles/index",
+                                                    "X-Inertia-Partial-Data" => "secret,stats")
+    page = response.parsed_body
+    assert_equal({ "errors" => {}, "secret" => "opt", "stats" => { "total" => Article.count } }, page["props"])
+    assert_nil page["deferredProps"]
+  end
+
+  test "a partial reload can leave props out" do
+    get "/inertia_articles", headers: INERTIA.merge("X-Inertia-Partial-Component" => "inertia_articles/index",
+                                                    "X-Inertia-Partial-Except" => "titles,articleCount")
+    assert_equal %w[errors appName secret inertiaVisit stats], response.parsed_body["props"].keys
+  end
+
+  test "partial headers for another component are ignored" do
+    get "/inertia_articles", headers: INERTIA.merge("X-Inertia-Partial-Component" => "other/page",
+                                                    "X-Inertia-Partial-Data" => "secret")
+    assert_equal %w[errors articleCount appName titles inertiaVisit], response.parsed_body["props"].keys
+  end
+
+  test "a failed Inertia PATCH redirects with 303 and the errors reach the next visit once" do
+    patch "/inertia_articles", params: { title: "" }, headers: INERTIA
+    assert_response 303
+    assert_redirected_to "/inertia_articles"
+    get "/inertia_articles", headers: INERTIA
+    assert_equal({ "title" => ["can't be blank"] }, response.parsed_body["props"]["errors"])
+    get "/inertia_articles", headers: INERTIA
+    assert_equal({}, response.parsed_body["props"]["errors"])
+  end
+
+  test "a stale version keeps the stored errors for the full-page reload" do
+    patch "/inertia_articles", params: { title: "" }, headers: INERTIA
+    get "/inertia_articles", headers: { "X-Inertia" => "true", "X-Inertia-Version" => "v0" }
+    assert_response 409
+    get "/inertia_articles"
+    assert_includes response.body, %("props":{"errors":{"title":["can't be blank"]},)
+  end
+
+  test "a PATCH outside Inertia keeps its 302" do
+    patch "/inertia_articles", params: { title: "ok" }
+    assert_response 302
+  end
+end
+"#,
+        )
+        .run_test("test/controllers/inertia_articles_controller_test.rb")
         .assert_passes();
 }

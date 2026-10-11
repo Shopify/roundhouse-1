@@ -399,18 +399,39 @@ pub(crate) fn collect_definers(app: &App) -> TryDefiners {
 }
 
 /// method name -> the app classes defining it as an INSTANCE method.
+///
+/// A model answers more than its `def`s: Rails generates a reader for
+/// every column, every `attr_*`, and every association. Leaving those out
+/// made `@user.try(:username)` in lobsters' layout narrow to the one class
+/// that spelled the name as a method (`ModNote`, through a `delegate`),
+/// so a logged-in `User` rendered `data-username=''`.
 fn definers_by_name(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
     let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::default();
     for m in &app.models {
         let owner = m.name.0.clone();
+        let mut define = |name: &Symbol| {
+            out.entry(name.clone()).or_default().insert(owner.clone());
+        };
         for name in SYNTHESIZED_ON_EVERY_MODEL {
-            out.entry(Symbol::from(name)).or_default().insert(owner.clone());
+            define(&Symbol::from(name));
+        }
+        for name in m.attributes.fields.keys() {
+            define(name);
+        }
+        if let Some(table) = app.schema.tables.get(&m.table.0) {
+            for column in &table.columns {
+                define(&column.name);
+            }
         }
         for item in &m.body {
-            if let crate::dialect::ModelBodyItem::Method { method, .. } = item {
-                if matches!(method.receiver, MethodReceiver::Instance) {
-                    out.entry(method.name.clone()).or_default().insert(owner.clone());
+            match item {
+                crate::dialect::ModelBodyItem::Method { method, .. }
+                    if matches!(method.receiver, MethodReceiver::Instance) =>
+                {
+                    define(&method.name);
                 }
+                crate::dialect::ModelBodyItem::Association { assoc, .. } => define(assoc.name()),
+                _ => {}
             }
         }
     }

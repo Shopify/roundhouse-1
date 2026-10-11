@@ -56,6 +56,14 @@ pub enum BuildTarget {
     /// emits from the INGEST-shape App (`bin/roundhouse` skips
     /// `analyze_and_lower` for it) — see `emit::roda`.
     Roda,
+    /// Rails → Ruby as a partial evaluator: specialize what the analysis
+    /// can resolve, leave the rest as residual Ruby running on the real
+    /// gems (Rails included). Stage 0 is the identity — the residue is
+    /// the whole app, walked verbatim — so the gate (`tests/futamura.rs`:
+    /// the app's own Rails suite, run against the output) exists before
+    /// the first specialization does. Like `Roda`, skips
+    /// `analyze_and_lower` in `bin/roundhouse`.
+    Futamura,
     Crystal,
     Elixir,
     Go,
@@ -105,6 +113,12 @@ impl BuildTarget {
         BuildTarget::TypescriptWorker,
     ];
 
+    /// Targets the `--site` build archives beyond [`Self::ALL`]: they
+    /// get a browse archive, but sit outside the per-target test
+    /// matrices that iterate `ALL` (futamura's gate is the app's own
+    /// Rails suite, `tests/futamura.rs`).
+    pub const SITE_ONLY: &'static [BuildTarget] = &[BuildTarget::Futamura];
+
     /// Targets valid for `--target LANG` (transpile to directory).
     /// Excludes `Blog` (source-only) — `--target blog` would mean
     /// "copy the input to the output," which is a `cp -r`, not a
@@ -114,6 +128,7 @@ impl BuildTarget {
         BuildTarget::Ruby,
         BuildTarget::Jruby,
         BuildTarget::Roda,
+        BuildTarget::Futamura,
         BuildTarget::Crystal,
         BuildTarget::Elixir,
         BuildTarget::Go,
@@ -135,6 +150,7 @@ impl BuildTarget {
             BuildTarget::Ruby => "ruby",
             BuildTarget::Jruby => "jruby",
             BuildTarget::Roda => "roda",
+            BuildTarget::Futamura => "futamura",
             BuildTarget::Crystal => "crystal",
             BuildTarget::Elixir => "elixir",
             BuildTarget::Go => "go",
@@ -161,9 +177,10 @@ impl BuildTarget {
     /// "unsupported at strict-target emit" a WARNING on one side of
     /// this predicate and an ERROR on the other (issue #76).
     ///
-    /// `Roda` converts to real Sequel datasets and skips the lowerings
+    /// `Roda` converts to real Sequel datasets and `Futamura` leaves an
+    /// unfolded chain on real ActiveRecord; both skip the lowerings
     /// entirely (`bin/roundhouse`), so no residue is ever raised
-    /// against it; `Blog` is the source fixture walked verbatim.
+    /// against them; `Blog` is the source fixture walked verbatim.
     /// Matched exhaustively on purpose — a new target has to answer
     /// this question rather than inherit an answer.
     pub fn has_runtime_relation(self) -> bool {
@@ -172,7 +189,8 @@ impl BuildTarget {
             | BuildTarget::Spinel
             | BuildTarget::Ruby
             | BuildTarget::Jruby
-            | BuildTarget::Roda => true,
+            | BuildTarget::Roda
+            | BuildTarget::Futamura => true,
             BuildTarget::Crystal
             | BuildTarget::Elixir
             | BuildTarget::Go
@@ -195,6 +213,9 @@ impl BuildTarget {
     fn supports_generated_column_insert_returning(self) -> bool {
         match self {
             BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel => true,
+            // Real Rails persists generated columns itself; `target_files`
+            // returns the verbatim tree before this question is asked.
+            BuildTarget::Futamura => true,
             BuildTarget::Blog
             | BuildTarget::Roda
             | BuildTarget::Crystal
@@ -291,6 +312,20 @@ pub fn target_readme(target: BuildTarget) -> String {
              sidecars to the compiler itself, so no seeding is needed:\n\
              ```sh\n\
              spin test\n\
+             ```\n"
+        }
+        BuildTarget::Futamura => {
+            "Rails → Ruby as a partial evaluator: what Roundhouse can \
+             resolve statically is specialized, and everything else stays \
+             residual Ruby running on the app's real gems, Rails included. \
+             This is stage 0, the identity: the residue is the whole app, \
+             so the tree is the Rails source unchanged (dotfiles and binary \
+             files are not carried yet). Build, run and test it as the Rails \
+             app it is:\n\n\
+             ```sh\n\
+             bundle install\n\
+             bin/rails db:prepare\n\
+             bin/rails test\n\
              ```\n"
         }
         BuildTarget::Roda => {
@@ -593,7 +628,7 @@ pub fn target_readme(target: BuildTarget) -> String {
         // The Roda conversion serves through rackup (default :9292) and
         // has no Action Cable surface — its README body already carries
         // the run instructions.
-        BuildTarget::Roda => "",
+        BuildTarget::Roda | BuildTarget::Futamura => "",
         _ => {
             "Running it serves the blog on http://localhost:3000 \
              (set `PORT` to override), with live Turbo Stream \
@@ -984,6 +1019,8 @@ fn target_emits_app_library_classes(target: BuildTarget) -> bool {
             | BuildTarget::Spinel
             | BuildTarget::Typescript
             | BuildTarget::TypescriptWorker
+            // Carries every class verbatim (it returns before this check).
+            | BuildTarget::Futamura
         // Roda omitted: spike emit does not walk `app.library_classes`.
     )
 }
@@ -1880,6 +1917,28 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    // Stage 0 of the specializer: the identity. Nothing is specialized
+    // yet, so none of the trimming or refusals below apply — every construct is
+    // residue, and the residue runs on Rails.
+    if target == BuildTarget::Futamura {
+        let mut files = futamura_files(fixture)?;
+        let report = emit::futamura::specialize(app, &mut files)?;
+        eprintln!(
+            "roundhouse: futamura: specialized {} query site(s); {} left to Rails{}",
+            report.specialized.len(),
+            report.residue.len(),
+            if std::env::var_os("ROUNDHOUSE_FUTAMURA_LEDGER").is_some() { "" } else { " (ROUNDHOUSE_FUTAMURA_LEDGER=1 lists them)" },
+        );
+        if std::env::var_os("ROUNDHOUSE_FUTAMURA_LEDGER").is_some() {
+            for s in &report.specialized {
+                eprintln!("  specialized {s}");
+            }
+            for r in &report.residue {
+                eprintln!("  residue     {r}");
+            }
+        }
+        return Ok(ensure_readme(files, target));
+    }
     if primary_postgresql(app) && !matches!(target, BuildTarget::Ruby | BuildTarget::Blog) {
         return Err(format!("postgresql database: no emitted runtime adapter for target {} (not substituted)", target.as_str()));
     }
@@ -2101,6 +2160,7 @@ pub fn target_files(
     }
     let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || match target {
         BuildTarget::Blog => blog_files(fixture),
+        BuildTarget::Futamura => futamura_files(fixture),
         BuildTarget::Spinel => spinel_files_with_source_markers(app, fixture).and_then(|(mut files, _)| {
             spinel_relation_model_handle(&mut files)?;
             spin_shape(files)
@@ -2561,6 +2621,33 @@ pub fn unparsable_ruby_files(files: &[(String, String)], target: BuildTarget) ->
     bad
 }
 
+/// Give each emitted file the executable bits its source counterpart
+/// has. Only the Futamura target needs it: its tree IS the source app,
+/// whose `bin/rails` and friends must still run. Every other target
+/// documents its run step as `ruby main.rb`-shaped commands.
+pub fn copy_exec_bits(src: &Path, files: &[(String, String)], dest: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (rel, _) in files {
+            let Ok(meta) = fs::metadata(src.join(rel)) else { continue };
+            let exec = meta.permissions().mode() & 0o111;
+            if exec == 0 {
+                continue;
+            }
+            let path = dest.join(rel);
+            let mut perms = fs::metadata(&path)
+                .map_err(|e| format!("stat {}: {e}", path.display()))?
+                .permissions();
+            perms.set_mode(perms.mode() | exec);
+            fs::set_permissions(&path, perms).map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (src, files, dest);
+    Ok(())
+}
+
 /// Write `files` to `dest` — each entry's path is taken relative to
 /// `dest`, parent dirs created as needed. Used by the `--target LANG`
 /// mode of the `roundhouse` binary. Identical files are left untouched
@@ -2633,6 +2720,50 @@ pub fn sort_files(files: Vec<EmittedFile>) -> Vec<(String, String)> {
 fn blog_files(fixture: &Path) -> Result<Vec<(String, String)>, String> {
     let mut files: Vec<(String, String)> = Vec::new();
     walk_ruby(fixture, fixture, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// Stage-0 Futamura tree: the app as source control holds it. Unlike
+/// [`blog_files`] it keeps dotfiles (`.ruby-version` decides which Ruby
+/// runs the residue) and the `.keep` files that hold Rails' empty
+/// directories open. What it leaves out is run-time state, named by
+/// the paths a generated Rails app's `.gitignore` excludes. Binary
+/// files travel separately, as `App::binary_assets`.
+fn futamura_files(app_root: &Path) -> Result<Vec<(String, String)>, String> {
+    const UNWALKED: [&str; 2] = [".git", "node_modules"];
+    const STATE: [&str; 5] = ["log/", "tmp/", "storage/", "app/assets/builds/", "public/assets/"];
+    let generated_state = |rel: &str| {
+        (STATE.iter().any(|dir| rel.starts_with(dir)) && !rel.ends_with("/.keep"))
+            || rel.starts_with(".bundle")
+            || rel == "config/master.key"
+    };
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
+        for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("read entry: {e}"))?;
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("strip prefix: {e}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if entry.file_type().map_err(|e| format!("stat: {e}"))?.is_dir() {
+                if !UNWALKED.contains(&rel.as_str()) {
+                    walk(root, &path, out)?;
+                }
+            } else {
+                out.push((rel, path));
+            }
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    walk(app_root, app_root, &mut paths)?;
+    let mut files: Vec<(String, String)> = paths
+        .into_iter()
+        .filter(|(rel, _)| !generated_state(rel))
+        .filter_map(|(rel, path)| fs::read_to_string(&path).ok().map(|content| (rel, content)))
+        .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
@@ -17318,7 +17449,9 @@ pub fn build_site(fixture: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("mkdir {}: {e}", out.display()))?;
 
     // Archive generation cleans browse/, so copy its viewer assets afterwards.
-    build_archives(fixture, out, BuildTarget::ALL)?;
+    let targets: Vec<BuildTarget> =
+        BuildTarget::ALL.iter().chain(BuildTarget::SITE_ONLY).copied().collect();
+    build_archives(fixture, out, &targets)?;
     copy_site_assets(out)?;
     copy_create_blog(out)?;
     crate::guide::render_site(out)?;
@@ -17336,13 +17469,24 @@ pub fn build_archives(fixture: &Path, out: &Path, targets: &[BuildTarget]) -> Re
     fs::create_dir_all(&browse).map_err(|e| format!("mkdir {}: {e}", browse.display()))?;
     let mut app =
         ingest_app(fixture).map_err(|e| format!("ingest {}: {e}", fixture.display()))?;
+    // Futamura needs the types but none of the lowerings, same split as
+    // the single-target driver (`bin/roundhouse`).
+    let analyzed = targets.contains(&BuildTarget::Futamura).then(|| {
+        let mut app = app.clone();
+        crate::analyze::Analyzer::new(&app).analyze(&mut app);
+        app
+    });
     // Analyze + the same post-analyze shared lowerings as the
     // single-target driver; the site build has no diagnostic surface,
     // so the residue is dropped.
     let _ = crate::session::analyze_and_lower(&mut app);
 
     for target in targets {
-        let files = target_files(&app, fixture, *target)?;
+        let app = match (target, &analyzed) {
+            (BuildTarget::Futamura, Some(analyzed)) => analyzed,
+            _ => &app,
+        };
+        let files = target_files(app, fixture, *target)?;
         let name = target.as_str();
 
         let json_path = out.join("browse").join(format!("{name}.json"));

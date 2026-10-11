@@ -27,6 +27,12 @@
 //! line-wrap idiom) fold to one literal first — a runtime `<<` on a
 //! frozen literal is a hazard the bake sidesteps.
 //!
+//! `errors.full_message(:field, msg)` bakes the same text without touching
+//! the accumulator: Rails answers the humanized field before the message
+//! (the bare message for `:base`), which is a pure function of the two
+//! arguments. Only that shape is typed (`full_message_bakes`); any other
+//! spelling keeps analyze's Errors gap.
+//!
 //! Purely shape-directed; runs on the post-analyze hook
 //! (`apply_post_analyze_lowerings`) with its siblings so every target
 //! consumes the grounded form. Scope is `for_each_hook_body` (views
@@ -46,14 +52,72 @@ pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let localized = app.locale_files.first().map(|f| (f.clone(), app.locale_files.len()));
     let port = super::active_model_model::ValidationsPort::of(app);
+    let data = LabelData::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let owner = owner.cloned();
         let locals = port.locals(body);
-        let site = Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref(), locals: &locals };
+        let site = Site {
+            localized: localized.as_ref(),
+            port: &port,
+            owner: owner.as_ref(),
+            locals: &locals,
+            labels: data.at(owner.as_ref()),
+        };
         rewrite_errors_add(body, &site, &mut diags)
     });
     diags.extend(port.take_notes());
     diags
+}
+
+/// Each model's stamped i18n, and the app's for an `errors` whose model
+/// is not known, held apart from the `App` the walk borrows mutably.
+pub(crate) struct LabelData {
+    models: std::collections::HashMap<crate::ident::ClassId, crate::i18n::ModelI18n>,
+    unknown: crate::i18n::ModelI18n,
+}
+
+impl LabelData {
+    pub(crate) fn of(app: &App) -> Self {
+        LabelData {
+            models: app.models.iter().map(|m| (m.name.clone(), m.i18n.clone())).collect(),
+            unknown: crate::i18n::ModelI18n {
+                scope: "activerecord".into(),
+                keys: Vec::new(),
+                catalog: app.i18n.subset_for("activerecord", &[]),
+            },
+        }
+    }
+
+    pub(crate) fn at<'a>(&'a self, owner: Option<&'a crate::ident::ClassId>) -> Labels<'a> {
+        Labels { data: self, owner }
+    }
+}
+
+/// What a baked message needs to name its attribute as Rails would.
+pub(crate) struct Labels<'a> {
+    data: &'a LabelData,
+    owner: Option<&'a crate::ident::ClassId>,
+}
+
+impl Labels<'_> {
+    /// The text a full message for `field` starts with, before its message;
+    /// `None` when `errors.format` does not end in the message.
+    pub(crate) fn message_prefix(&self, errors_reader: &Expr, field: &str) -> Option<String> {
+        let i18n = self.model(errors_reader);
+        let format = i18n.errors_format().replace("%{attribute}", &i18n.human_attribute_name(field));
+        format.strip_suffix("%{message}").filter(|p| !p.contains("%{message}")).map(str::to_string)
+    }
+
+    /// The model whose `errors` this is: the reader's receiver's type, or the owner for `errors` on self.
+    fn model(&self, errors_reader: &Expr) -> &crate::i18n::ModelI18n {
+        let ExprNode::Send { recv, .. } = &*errors_reader.node else { return &self.data.unknown };
+        let id = match recv.as_ref().map(|r| (&*r.node, r.ty.as_ref())) {
+            None | Some((ExprNode::SelfRef, _)) => self.owner,
+            Some((_, Some(crate::ty::Ty::Class { id, .. }))) => Some(id),
+            _ => None,
+        };
+        id.and_then(|id| self.data.models.get(id)).unwrap_or(&self.data.unknown)
+    }
 }
 
 fn residue(expr: &Expr, reason: &str) -> Diagnostic {
@@ -89,19 +153,39 @@ fn fold_str_concat(e: Expr) -> Expr {
     Expr::new(e.span, ExprNode::Lit { value: Literal::Str { value: format!("{lv}{rv}") } })
 }
 
-/// Where a body sits: the app's locale files, and which classes keep
-/// ActiveModel::Errors (the port) with the body's owner.
+/// Where a body sits: the app's locale files, which classes keep
+/// ActiveModel::Errors (the port) with the body's owner, and the labels
+/// the owner's i18n names attributes by.
 struct Site<'a> {
     localized: Option<&'a (String, usize)>,
     port: &'a super::active_model_model::ValidationsPort,
     owner: Option<&'a crate::ident::ClassId>,
     locals: &'a super::active_model_model::PortLocals,
+    labels: Labels<'a>,
 }
 
 fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
     let localized = site.localized;
+    let labels = &site.labels;
     expr.node
         .for_each_child_mut(&mut |c| rewrite_errors_add(c, site, diags));
+    if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
+        if method.as_str() == "full_message" && full_message_bakes(recv.as_ref(), args, block.as_ref()) {
+            let span = expr.span;
+            let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+            let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
+            let i18n = labels.model(recv.as_ref().expect("checked errors reader"));
+            let mut args = args.into_iter();
+            let field_expr = args.next().expect("checked two args");
+            let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
+                unreachable!()
+            };
+            let message = baked_message(i18n, span, field.as_str(), args.next().map(fold_str_concat));
+            *expr = message;
+            expr.ty = Some(crate::ty::Ty::Str);
+            return;
+        }
+    }
     // Any `add` on an `errors` reader is this pass's construct; decide
     // ground-vs-residue below.
     let recognized = matches!(
@@ -186,26 +270,24 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         msg = Some(fold_str_concat(entries.into_iter().next().unwrap().1));
     }
     // A Symbol message is an error TYPE, which Rails translates
-    // (`errors.add(attr, :blank)` reads "can't be blank"). The
-    // count-free entries of activemodel's and activerecord's default
-    // en.yml bake to their text; any other type stays residue.
+    // (`errors.add(attr, :blank)` reads "can't be blank"). On a Symbol
+    // field the model's i18n (its locale data over Rails' defaults) gives
+    // the text. A local field's model and attribute are only known at run
+    // time, so there the count-free entries of activemodel's and
+    // activerecord's default en.yml bake to their text, unless the app
+    // has locale files that could say otherwise; any other type stays
+    // residue.
     let symbol_type = match msg.as_ref().map(|m| &*m.node) {
         Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.clone()),
         _ => None,
     };
-    // Rails looks the type up through the app's locale data first
-    // (`activerecord.errors.models.<model>.attributes.<attr>.<type>`,
-    // the model's, its ancestors', `activerecord.errors.messages`,
-    // `errors.attributes.<attr>`, `errors.messages`), and the record's
-    // class is not known here: with locale files present the default
-    // text is not the answer, so the site declines by name.
-    let translated = if localized.is_some() {
+    let translated = if static_field || localized.is_some() {
         None
     } else {
         symbol_type.as_ref().and_then(|t| default_error_message(t.as_str()))
     };
     let unrecognized = matches!(msg.as_ref().map(|m| &*m.node), Some(ExprNode::Hash { .. }))
-        || (symbol_type.is_some() && translated.is_none());
+        || (!static_field && symbol_type.is_some() && translated.is_none());
     if unrecognized {
         let reason = match (&symbol_type, localized) {
             (Some(t), Some((first, n))) => format!(
@@ -256,28 +338,20 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
             unreachable!()
         };
-        let humanized = super::model_to_library::validations::humanize(field.as_str());
-        if field.as_str() == "base" {
-            // :base attaches the message to the record, not a field.
-            msg.unwrap_or_else(|| str_lit(span, "is invalid"))
-        } else {
-            match msg {
-                Some(m) => match &*m.node {
-                    ExprNode::Lit { value: Literal::Str { value } } => {
-                        str_lit(span, &format!("{humanized} {value}"))
-                    }
-                    _ => Expr::new(
-                        span,
-                        ExprNode::StringInterp {
-                            parts: vec![
-                                InterpPart::Text { value: format!("{humanized} ") },
-                                InterpPart::Expr { expr: m },
-                            ],
-                        },
-                    ),
-                },
-                None => str_lit(span, &format!("{humanized} is invalid")),
+        let reader = recv.as_ref().expect("checked errors reader");
+        let i18n = labels.model(reader);
+        // Rails looks a Symbol message (or none, `:invalid`) up as an error type.
+        let kind = match msg.as_ref().map(|m| &*m.node) {
+            None => Some("invalid".to_string()),
+            Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.as_str().to_string()),
+            _ => None,
+        };
+        match kind {
+            Some(kind) => {
+                let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!() };
+                parts_expr(span, i18n.full_error(field.as_str(), &kind, &Default::default()), owner.as_ref(), field.as_str())
             }
+            None => baked_message(i18n, span, field.as_str(), msg),
         }
     } else {
         // `attribute.to_s == "base" ? msg : "#{ActiveSupport.humanize(
@@ -405,4 +479,83 @@ fn default_error_message(error_type: &str) -> Option<&'static str> {
         "taken" => "has already been taken",
         _ => return None,
     })
+}
+
+/// `<errors reader>.full_message(:field, message)`: the one shape whose
+/// text `rewrite_errors_add` bakes. Shared with analyze, which types it
+/// `String` only when this holds.
+pub(crate) fn full_message_bakes(recv: Option<&Expr>, args: &[Expr], block: Option<&Expr>) -> bool {
+    block.is_none()
+        && args.len() == 2
+        && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } })
+        && !matches!(&*args[1].node, ExprNode::Hash { .. })
+        && recv.is_some_and(|r| matches!(&*r.node, ExprNode::Send { recv: owner, method, args, .. }
+            if method.as_str() == "errors" && args.is_empty() && owner.as_ref().is_none_or(reads_without_effect)))
+}
+
+/// Folding drops the receiver, so only one whose evaluation does nothing.
+fn reads_without_effect(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef)
+}
+
+/// A looked-up message as a string: a literal when every part is known,
+/// else an interpolation reading `field` off `owner` (self when `None`)
+/// where `%{value}` stood.
+pub(crate) fn parts_expr(
+    span: crate::span::Span,
+    parts: Vec<crate::i18n::Part>,
+    owner: Option<&Expr>,
+    field: &str,
+) -> Expr {
+    if let [crate::i18n::Part::Text(text)] = parts.as_slice() {
+        return Expr::new(span, ExprNode::Lit { value: Literal::Str { value: text.clone() } });
+    }
+    let parts = parts
+        .into_iter()
+        .map(|p| match p {
+            crate::i18n::Part::Text(value) => InterpPart::Text { value },
+            crate::i18n::Part::Value => InterpPart::Expr {
+                expr: Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: owner.cloned(),
+                        method: Symbol::from(field),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+            },
+        })
+        .collect();
+    Expr::new(span, ExprNode::StringInterp { parts })
+}
+
+/// The full message Rails stores for `field` given a String message:
+/// `errors.format` over the attribute's human name, the bare message for
+/// `:base`.
+fn baked_message(
+    i18n: &crate::i18n::ModelI18n,
+    span: crate::span::Span,
+    field: &str,
+    msg: Option<Expr>,
+) -> Expr {
+    let lit = |value: String| Expr::new(span, ExprNode::Lit { value: Literal::Str { value } });
+    let Some(msg) = msg else {
+        return parts_expr(span, i18n.full_error(field, "invalid", &Default::default()), None, field);
+    };
+    if field == "base" {
+        return msg;
+    }
+    if let ExprNode::Lit { value: Literal::Str { value } } = &*msg.node {
+        return lit(i18n.full_message(field, value));
+    }
+    // A dynamic message splices into the format where `%{message}` stands.
+    let format = i18n.errors_format().replace("%{attribute}", &i18n.human_attribute_name(field));
+    let (before, after) = format.split_once("%{message}").unwrap_or((format.as_str(), ""));
+    let mut parts = vec![InterpPart::Text { value: before.to_string() }, InterpPart::Expr { expr: msg }];
+    if !after.is_empty() {
+        parts.push(InterpPart::Text { value: after.to_string() });
+    }
+    Expr::new(span, ExprNode::StringInterp { parts })
 }

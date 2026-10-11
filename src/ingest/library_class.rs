@@ -1275,9 +1275,23 @@ pub fn ingest_rails_application_singleton_methods(
                 ),
             });
         }
-        out.extend(body.methods);
+        // Rubydex records no constant references inside a singleton
+        // class opened on an expression, so its constants carry no
+        // source answer to require.
+        let mut methods = body.methods;
+        for method in &mut methods {
+            mark_unindexed_const_refs(&mut method.body);
+        }
+        out.extend(methods);
     }
     Ok(out)
+}
+
+fn mark_unindexed_const_refs(expr: &mut crate::expr::Expr) {
+    if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
+        expr.decisions |= crate::expr::UNINDEXED_SCOPE_CONST_REF;
+    }
+    expr.node.for_each_child_mut(&mut mark_unindexed_const_refs);
 }
 
 /// Build a LibraryClass for a class declaration, prepending the
@@ -6818,6 +6832,12 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "typed_store",
     "broadcasts_to",
     "delegate",
+    // Devise's scope declaration: `devise :database_authenticatable, …`
+    // in a concern's `included do` (Jumpstart's `User::Authenticatable`)
+    // makes every includer a Devise scope exactly as a direct call in
+    // the model body does; `analyze::registry::controllers` reads it
+    // off `model.body` for `current_<scope>` and friends.
+    "devise",
     // `included do include Other end` runs on the includer: spliced
     // after the includer's own `include` line, `Other` sits ahead of
     // this concern in the lookup order, as in Ruby.

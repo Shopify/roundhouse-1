@@ -81,7 +81,7 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
         } = assoc
         {
             let mut check =
-                inline_belongs_to_check(name, foreign_key, target, *polymorphic);
+                inline_belongs_to_check(Messages(Some(model)), name, foreign_key, target, *polymorphic);
             check.inherit_span(span);
             // Rails adds `:required` to the association's name:
             // `validates_presence_of name, message: :required`, an Error
@@ -143,7 +143,7 @@ pub(crate) fn push_subclass_belongs_to_checks(methods: &mut Vec<MethodDef>, view
     let mut checks = Vec::new();
     for (span, assoc) in view.spanned_associations() {
         if let Association::BelongsTo { name, target, foreign_key, optional: false, polymorphic, .. } = assoc {
-            let mut check = inline_belongs_to_check(name, foreign_key, target, *polymorphic);
+            let mut check = inline_belongs_to_check(Messages(Some(view)), name, foreign_key, target, *polymorphic);
             check.inherit_span(span);
             tag_error_detail(&mut check, name, &typed_detail("blank", vec![]));
             checks.push(check);
@@ -269,6 +269,7 @@ pub(crate) fn validation_statements_split<'v>(
                 model_human: &model_human,
                 i18n_keys: &declarer.i18n_keys,
                 i18n_scope,
+                i18n: Some(&model.i18n).filter(|i| !i.is_default()),
                 message: options.and_then(|o| o.message.as_ref()).or(own_message.as_ref()),
             };
             let reader = Expr::new(
@@ -345,7 +346,8 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
     }
     let mut out = Vec::new();
     for attr in crate::lower::secure_password::secure_password_attrs(&model.body) {
-        let human = humanize(attr.as_str());
+        let human = model.human_attribute_name(attr.as_str());
+        let msgs = Messages(Some(model));
         let plain = ivar(&attr);
         let digest = ivar(&Symbol::from(format!("{}_digest", attr.as_str())));
         let confirmation = ivar(&Symbol::from(format!("{}_confirmation", attr.as_str())));
@@ -359,7 +361,7 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
         // the mismatch to `<attr>_confirmation` (validates_confirmation_of).
         let confirmation_attr = Symbol::from(format!("{}_confirmation", attr.as_str()));
         let start = out.len();
-        out.push(if_with_nil_else(blank(digest), errors_push(format!("{human} can't be blank"))));
+        out.push(if_with_nil_else(blank(digest), errors_push_expr(msgs.error(attr.as_str(), "blank", &Default::default()))));
         out.push(if_with_nil_else(
             bool_op(
                 BoolOpKind::And,
@@ -369,7 +371,7 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
                     ExprNode::Lit { value: Literal::Int { value: 72 } },
                 )]),
             ),
-            errors_push(format!("{human} is too long")),
+            errors_push_expr(msgs.error(attr.as_str(), "password_too_long", &Default::default())),
         ));
         out.push(if_with_nil_else(
             bool_op(
@@ -377,7 +379,11 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
                 bool_op(BoolOpKind::And, present(plain.clone()), not(send(confirmation.clone(), "nil?", vec![]))),
                 send(confirmation, "!=", vec![plain]),
             ),
-            errors_push(format!("{human} confirmation doesn't match {human}")),
+            errors_push_expr(msgs.error(
+                &format!("{}_confirmation", attr.as_str()),
+                "confirmation",
+                &ErrorOpts { attribute: Some(human.clone()), ..Default::default() },
+            )),
         ));
         // Rails: `errors.add(attribute, :blank)`, BCrypt's
         // `errors.add(attribute, :password_too_long)` and
@@ -1184,6 +1190,7 @@ fn validation_rule_to_calls(
 /// Rails would pass — and the id-presence half is the part that
 /// catches the real error (an unset owner).
 fn inline_belongs_to_check(
+    msgs: Messages,
     assoc_name: &Symbol,
     foreign_key: &Symbol,
     target: &ClassId,
@@ -1201,7 +1208,7 @@ fn inline_belongs_to_check(
             ExprNode::Lit { value: Literal::Int { value: 0 } },
         )],
     );
-    let push_err = errors_push(format!("{} must exist", humanize(assoc_name.as_str())));
+    let push_err = errors_push_expr(msgs.error(assoc_name.as_str(), "required", &Default::default()));
     if polymorphic {
         return if_with_nil_else(bool_op(BoolOpKind::Or, nil_check, zero_check), push_err);
     }
@@ -2131,10 +2138,21 @@ pub(super) struct ErrorText<'a> {
     model_human: &'a str,
     i18n_keys: &'a [String],
     i18n_scope: &'a str,
+    /// The model's catalog entries, when the app's locale adds any: its
+    /// attribute names and message wording then come from there.
+    i18n: Option<&'a crate::i18n::ModelI18n>,
     message: Option<&'a RuleMessage>,
 }
 
 impl ErrorText<'_> {
+    /// The attribute as the message names it: `human_attribute_name`.
+    fn human(&self) -> String {
+        match self.i18n {
+            Some(i18n) => i18n.human_attribute_name(self.attr.as_str()),
+            None => humanize(self.attr.as_str()),
+        }
+    }
+
     /// `errors << "<Attr> <message>"` for an error of type `kind`
     /// (`blank`, `too_long`, ...), its `%{count}` `count`, and the value
     /// `%{value}` and a callable message see.
@@ -2172,7 +2190,7 @@ impl ErrorText<'_> {
     }
 
     fn push_message(&self, kind: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
-        let human = humanize(self.attr.as_str());
+        let human = self.human();
         match self.message {
             None => self.push_type(kind, count, value),
             Some(RuleMessage::Key { key }) => self.push_type(key.as_str(), count, value),
@@ -2267,6 +2285,28 @@ impl ErrorText<'_> {
     /// (`one` for 1), or — for a type nothing translates — the text I18n
     /// answers for a missing translation, naming the keys it tried.
     fn push_type(&self, kind: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
+        // The app's locale words the message: `ActiveModel::Error.generate_message`
+        // over the catalog (a run-time `count` keeps the English plural form).
+        if let Some(i18n) = self.i18n {
+            let opts = match count {
+                None => Some(crate::i18n::ErrorOpts::default()),
+                Some(Count::Static(c)) => Some(crate::i18n::ErrorOpts::count(format_count(c))),
+                Some(Count::Dynamic(_)) => None,
+            };
+            if let Some(parts) = opts.and_then(|o| i18n.try_full_error(self.attr.as_str(), kind, &o)) {
+                let parts = parts
+                    .into_iter()
+                    .map(|p| match p {
+                        crate::i18n::Part::Text(value) => InterpPart::Text { value },
+                        crate::i18n::Part::Value => InterpPart::Expr { expr: value() },
+                    })
+                    .collect::<Vec<_>>();
+                return errors_push_expr(match parts.as_slice() {
+                    [InterpPart::Text { value }] => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: value.clone() } }),
+                    _ => Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }),
+                });
+            }
+        }
         let Some((one, other)) = crate::dialect::active_model_en_message(kind) else {
             let attr = self.attr.as_str();
             let scope = self.i18n_scope;
@@ -2308,7 +2348,7 @@ impl ErrorText<'_> {
     /// `"<Attr> <template>"` with I18n's interpolation of the keys
     /// ActiveModel supplies (ingest admits no others).
     fn interpolate(&self, template: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
-        let human = humanize(self.attr.as_str());
+        let human = self.human();
         let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("{human} ") }];
         let push_text = |parts: &mut Vec<InterpPart>, t: &str| match parts.last_mut() {
             Some(InterpPart::Text { value }) => value.push_str(t),
@@ -2455,21 +2495,25 @@ fn not(e: Expr) -> Expr {
     )
 }
 
-/// Humanize an attribute name for an error message, matching Rails'
-/// `errors.full_messages` (`String#humanize` + the `"%{attribute}
-/// %{message}"` format): drop a trailing `_id`, turn `_` into spaces,
-/// and upcase the first letter. So `body` → `Body`, `author_id` →
-/// `Author`, `first_name` → `First name`. The full message is baked
-/// here (this lowerer inlines literal strings, not runtime
-/// interpolation — see the module header), so the humanization has to
-/// happen at lower time rather than in an errors object.
+/// `String#humanize` on an attribute name, for the messages the lowerer
+/// bakes without a model's catalog.
 pub(crate) fn humanize(attr: &str) -> String {
-    let trimmed = attr.strip_suffix("_id").unwrap_or(attr);
-    let spaced = trimmed.replace('_', " ");
-    let mut chars = spaced.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+    crate::i18n::humanize(attr)
+}
+
+/// What a baked message needs from its model: the attribute's
+/// `human_attribute_name` and the locale's `errors.format`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Messages<'a>(pub(crate) Option<&'a Model>);
+
+use crate::i18n::ErrorOpts;
+
+impl Messages<'_> {
+    /// The full message Rails stores for an error of `kind` on `attr`.
+    fn error(&self, attr: &str, kind: &str, opts: &ErrorOpts) -> Expr {
+        let default = crate::i18n::ModelI18n::default();
+        let i18n = self.0.map(|m| &m.i18n).unwrap_or(&default);
+        crate::lower::errors_add::parts_expr(Span::synthetic(), i18n.full_error(attr, kind, opts), None, attr)
     }
 }
 
@@ -2682,7 +2726,7 @@ mod tests {
 
     fn plain(attr: &Symbol) -> ErrorText<'_> {
         let keys: &'static [String] = Box::leak(vec![String::from("post")].into_boxed_slice());
-        ErrorText { attr, model_human: "Post", i18n_keys: keys, i18n_scope: "activerecord", message: None }
+        ErrorText { attr, model_human: "Post", i18n_keys: keys, i18n_scope: "activerecord", i18n: None, message: None }
     }
 
     #[test]
@@ -2737,7 +2781,7 @@ mod tests {
     fn presence_message_replaces_the_default_text() {
         let a = attr();
         let message = RuleMessage::Text { text: "must be given".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", i18n: None, message: Some(&message) };
         let expr = inline_presence_check(&a, None, &ivar(&a), &text);
         assert_eq!(collect_error_messages(&expr), vec!["Title must be given"]);
     }
@@ -2789,7 +2833,7 @@ mod tests {
     fn length_message_interpolates_count() {
         let a = attr();
         let message = RuleMessage::Text { text: "needs %{count} for %{model}".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", i18n: None, message: Some(&message) };
         let exprs = inline_length_check(&ivar(&a), None, Some(4), &text, None);
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(msgs, vec!["Title needs 4 for Post"]);
@@ -2871,7 +2915,7 @@ mod tests {
         let assoc_name = Symbol::from("article");
         let foreign_key = Symbol::from("article_id");
         let target = ClassId(Symbol::from("Article"));
-        let expr = inline_belongs_to_check(&assoc_name, &foreign_key, &target, false);
+        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, &target, false);
         assert_eq!(collect_error_messages(&expr), vec!["Article must exist"]);
     }
 
@@ -2883,7 +2927,7 @@ mod tests {
         let assoc_name = Symbol::from("record");
         let foreign_key = Symbol::from("record_id");
         let target = ClassId(Symbol::from("Record"));
-        let expr = inline_belongs_to_check(&assoc_name, &foreign_key, &target, true);
+        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, &target, true);
         assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
         let rendered = format!("{expr:?}");
         assert!(

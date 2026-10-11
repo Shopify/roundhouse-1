@@ -108,6 +108,7 @@ pub fn ingest_sequel_model(
         after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
+        i18n: Default::default(),
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,

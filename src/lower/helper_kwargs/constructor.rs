@@ -464,6 +464,16 @@ fn rewrite_instance_call(
             return;
         }
     }
+    if !is_constructor && super::SEND_METHODS.contains(&method.as_str()) {
+        let class_id = class_id.to_string();
+        super::owned::refuse_send(
+            expr.span,
+            args,
+            |name| params.slots.contains_key(&(class_id.clone(), name.clone())),
+            diagnostics,
+        );
+        return;
+    }
     let method = if is_constructor {
         Symbol::from("initialize")
     } else {
@@ -481,8 +491,8 @@ fn rewrite_instance_call(
                 diagnostics,
             );
         }
-    } else {
-        super::respell(args, slots, true);
+    } else if let Err(reason) = super::respell(args, slots, true) {
+        super::refuse(expr.span, reason, diagnostics);
     }
 }
 

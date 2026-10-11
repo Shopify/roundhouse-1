@@ -33,6 +33,10 @@ use roundhouse::ingest::ingest_app;
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/array_excluding.rs"]
+mod array_excluding;
+#[path = "spinel_toolchain/array_excluding.rs"]
+mod array_excluding_native;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
 #[path = "support/class_configuration.rs"]
@@ -71,6 +75,8 @@ mod campfire_caches_contract;
 mod campfire_caches;
 #[path = "spinel_toolchain/ordinalize.rs"]
 mod ordinalize;
+#[path = "spinel_toolchain/params_helper_no_permit.rs"]
+mod params_helper_no_permit;
 
 /// Compile and execute the shared custom Data factory contract with Spinel;
 /// successful Ruby emission alone does not establish native target support.

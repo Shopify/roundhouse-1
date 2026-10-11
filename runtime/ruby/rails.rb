@@ -153,6 +153,10 @@ module Rails
     warn(line)
   end
 
+  def self.error
+    ActiveSupport::ErrorReporter.new
+  end
+
   def self.application
     Application.new
   end
@@ -240,6 +244,10 @@ module Rails
 
     def staging?
       @name == "staging"
+    end
+
+    def to_s
+      @name
     end
   end
 

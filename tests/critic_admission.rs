@@ -10,6 +10,14 @@ fn refuses(body: &str, expected: &str) {
 }
 
 fn refuses_with(body: &str, expected: &str, extra: &[(&str, &str)]) {
+    gate(body, expected, extra, false);
+}
+
+fn admits(body: &str) {
+    gate(body, "", &[], true);
+}
+
+fn gate(body: &str, expected: &str, extra: &[(&str, &str)], admitted: bool) {
     let root = std::env::temp_dir().join(format!("rh_admission_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
     for (path, text) in [
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n".to_string()),
@@ -32,6 +40,10 @@ fn refuses_with(body: &str, expected: &str, extra: &[(&str, &str)]) {
         if args[0] != "check" { command.arg("-o").arg(root.join("emitted")); }
         let output = command.output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        if admitted {
+            assert!(output.status.success(), "{args:?} refused {body}: {text}");
+            continue;
+        }
         assert!(!output.status.success(), "{args:?} accepted {body}: {text}");
         assert!(text.contains(expected), "{args:?} lost named refusal {expected}: {text}");
     }
@@ -56,9 +68,20 @@ fn new_errors_api_requires_runtime_support() {
     // `added?`, `details`, `where`, `merge!`, `Error#options` and `delete`
     // have a runtime port now (runtime/spinel/active_model_errors.rb); the
     // rest of activemodel's errors.rb still has none and is refused by name.
-    for body in ["errors.slice!(:title)", "errors.group_by_attribute", "errors.copy!(errors)", "errors.generate_message(:title, :blank)"] {
+    for body in ["errors.slice!(:title)", "errors.group_by_attribute", "errors.copy!(errors)", "errors.generate_message(:title, :blank)", "f = title.to_sym; errors.full_message(f, \"is taken\")"] {
         refuses(body, "ActiveModel::Errors");
     }
+}
+
+#[test]
+fn errors_full_message_on_a_literal_field_is_admitted() {
+    admits("errors.full_message(:title, \"is taken\").upcase");
+    admits("other = Probe.new; other.errors.full_message(:base, title.to_s)");
+}
+
+#[test]
+fn errors_full_message_on_a_computed_receiver_is_refused() {
+    refuses("Probe.create!(title: \"x\").errors.full_message(:title, \"is taken\")", "ActiveModel::Errors");
 }
 
 #[test]
