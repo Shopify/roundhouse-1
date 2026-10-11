@@ -4868,7 +4868,6 @@ fn resolve_through_chain(
     depth: usize,
 ) -> Option<(Vec<String>, String, Symbol)> {
     use crate::dialect::Association;
-    use crate::naming::pluralize_snake;
 
     if depth > 4 {
         return None;
@@ -4885,12 +4884,12 @@ fn resolve_through_chain(
     // How the join model's rows tie back to the owner: directly by the
     // sibling's fk, or through the sibling's own chain.
     let (back_joins, edge_table, edge_fk) = match thr_through {
-        None => (Vec::new(), pluralize_snake(thr_target.0.as_str()), thr_fk.clone()),
+        None => (Vec::new(), model_table_name(models, thr_target), thr_fk.clone()),
         Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1)?,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
-    let thr_table = pluralize_snake(thr_target.0.as_str());
-    let target_table = pluralize_snake(target.0.as_str());
+    let thr_table = model_table_name(models, thr_target);
+    let target_table = model_table_name(models, target);
     let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
     // The source belongs_to on the join model (`Vote.belongs_to :story`)
     // — matched by target class, so `source:` renames resolve without a
@@ -4938,6 +4937,16 @@ fn resolve_through_chain(
     ));
     joins.extend(back_joins);
     Some((joins, edge_table, edge_fk))
+}
+
+/// The table a model reads: its own (`self.table_name`, a namespace's
+/// `table_name_prefix`), else Rails' default from the demodulized class
+/// name (`compute_table_name`).
+fn model_table_name(models: &[crate::dialect::Model], class: &ClassId) -> String {
+    match models.iter().find(|m| &m.name == class) {
+        Some(m) => m.table.0.as_str().to_string(),
+        None => crate::naming::rails_table_name(class.0.as_str()),
+    }
 }
 
 /// Keep the same polymorphic owner restriction on lazy and batched through joins.
@@ -18178,7 +18187,7 @@ enum PreloadKind {
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
-    Through { target: String, join: String, group_col: String, order: Option<String> },
+    Through { target: String, table: String, join: String, group_col: String, order: Option<String> },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
     /// `ActiveStorage::Attached` on each record (`attr`, owner class).
@@ -18203,7 +18212,6 @@ enum PreloadKind {
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
     use crate::dialect::Association;
-    use crate::naming::pluralize_snake;
 
     let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
     let mut out = Vec::new();
@@ -18294,13 +18302,14 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 else {
                     continue;
                 };
-                let thr_table = pluralize_snake(thr_target.0.as_str());
-                let target_table = pluralize_snake(target.0.as_str());
+                let thr_table = model_table_name(&app.models, thr_target);
+                let target_table = model_table_name(&app.models, target);
                 let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::Through {
                         target: target.0.as_str().to_string(),
+                        table: target_table.clone(),
                         join: format!(
                             "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
                         ),
@@ -18470,8 +18479,7 @@ end
 "#
                 );
             }
-            PreloadKind::Through { target, join, group_col, order } => {
-                let table = crate::naming::pluralize_snake(target.as_str());
+            PreloadKind::Through { target, table, join, group_col, order } => {
                 let order_sql = match order {
                     Some(o) => format!(" ORDER BY {o}"),
                     None => String::new(),
