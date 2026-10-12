@@ -118,8 +118,11 @@ module Futamura
       reflection = model._reflect_on_association(name)
       return unless reflection&.belongs_to? && !reflection.polymorphic?
 
-      primary_key = reflection.join_primary_key
-      foreign_key = reflection.join_foreign_key
+      # Where Rails has query constraints (`belongs_to ..., query_constraints:`), the predicate
+      # builder reads `query_primary_key` / `query_foreign_key` (AssociationQueryValue), which are
+      # composite when the join keys (`join_primary_key` / `join_foreign_key`) are one column.
+      primary_key = reflection.respond_to?(:query_primary_key) ? reflection.query_primary_key : reflection.join_primary_key
+      foreign_key = reflection.respond_to?(:query_foreign_key) ? reflection.query_foreign_key : reflection.join_foreign_key
       return if primary_key.is_a?(Array) || foreign_key.is_a?(Array)
 
       value.respond_to?(primary_key) ? value.public_send(primary_key) : value
@@ -133,11 +136,30 @@ module Futamura
       value.respond_to?(:id) ? value.id : value
     end
 
+    # Whether a request-time value cannot be one placeholder of a StatementCache: anything but a
+    # scalar Rails quotes as a single value. The predicate builder turns an Array, a Set, a Range,
+    # a Relation, a Hash or a record into an IN list, BETWEEN, a subquery, nested conditions or
+    # a key (PredicateBuilder handlers), and a StatementCache's own check
+    # (`StatementCache.unsupported_value?`) names only some of them, so the scalars are listed
+    # instead. nil is `IS NULL`. A value of any other class is Rails' to bind.
+    def unsupported_bind?(value)
+      case value
+      when Integer, String, Symbol, Float, BigDecimal, true, false, Date, Time, ActiveSupport::TimeWithZone then false
+      else true
+      end
+    end
+
     # `root:` is the `self` of a chain written against an implicit class
     # self: the statement is the model's own, so any other class (a subclass
     # adds its type condition, a concern's method is shared) runs the chain.
     def records(key, binds, owner: nil, association: nil, root: nil, &fallback)
-      return fallback.call if binds.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+      # An owner that is not a record (a test double) is asked nothing: not by a guard, and not by
+      # the bind expressions, which a site rooted at an association reader passes as a lambda for
+      # that reason (the chain as written does not read the owner's key).
+      return fallback.call if owner && !(ActiveRecord::Base === owner)
+
+      binds = binds.call if Proc === binds
+      return fallback.call if binds.any? { |value| unsupported_bind?(value) }
 
       statement = @statements.fetch(key)
       # Named by a String so that defining a statement loads no model: a class
@@ -157,7 +179,7 @@ module Futamura
       # (Association#scope) replaces a default equality condition on a column
       # the association constrains; the chain built here keeps both.
       return fallback.call if owner && (columns.map { |column| Array(column).first } & statement.owner_columns).any?
-      return fallback.call if defaults.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+      return fallback.call if defaults.any? { |value| unsupported_bind?(value) }
 
       binds = defaults + binds
       compiled = nil
@@ -304,7 +326,7 @@ module Futamura
 
         list = node.values
         return "list_length" unless (2..MAX_LIST).cover?(list.size)
-        return "list_value" if list.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+        return "list_value" if list.any? { |value| unsupported_bind?(value) }
 
         [[attribute.name.to_s, node.type, list.size].freeze, list]
       when Arel::Nodes::Equality, Arel::Nodes::NotEqual
@@ -381,14 +403,22 @@ module Futamura
     def compile(statement, connection, columns, extensions)
       relation = nil
       overrides = []
-      cache = ActiveRecord::StatementCache.create(connection) do |params|
-        relation = if statement.unscoped
-          statement.build.call(params)
-        else
-          base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
-          base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
-          base.scoping { statement.build.call(params) }
+      # Rails builds the relation over placeholders (StatementCache::Substitute) that stand for
+      # values it would read keys, attributes or elements from; a condition that does that (a
+      # composite association key, say) raises here, where the chain with real values may not.
+      # Such a chain is Rails' to run, as one it cannot build is.
+      cache = begin
+        ActiveRecord::StatementCache.create(connection) do |params|
+          relation = if statement.unscoped
+            statement.build.call(params)
+          else
+            base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
+            base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
+            base.scoping { statement.build.call(params) }
+          end
         end
+      rescue StandardError
+        return false
       end
       return false if overrides.any?
       return false if relation.eager_loading? || relation.readonly_value
@@ -728,8 +758,11 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         # the model in brackets ("scoping_block[Shop]"); `model_unloaded` is a statement whose model
         # class was never resolved, which only a call refused before that (a bind) can leave behind.
         def reason(key, binds, root, owner = nil, association = nil)
+          return "owner_not_record" if owner && !(ActiveRecord::Base === owner)
+
+          binds = binds.call if Proc === binds
           # find_index, not find: the value that is refused is usually nil.
-          index = binds.index { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+          index = binds.index { |value| Futamura.unsupported_bind?(value) }
           return "bind_#{kind(binds[index])}" if index
 
           statement = Futamura.instance_variable_get(:@statements).fetch(key)

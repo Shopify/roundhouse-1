@@ -279,7 +279,11 @@ impl<'a> Specializer<'a> {
             None => String::new(),
         };
         let root = if chain.implicit_self { ", root: self" } else { "" };
-        let call = format!("Futamura.records(:{key}, [{}]{owner}{root}) {{ {{orig}} }}", binds.join(", "));
+        // A chain rooted at an association reader reads the owner's key, which the source does not:
+        // the binds are a lambda the runtime calls only once the owner is known to be a record (a
+        // test double that stands for the owner is not asked for it).
+        let binds = if chain.owner.is_some() { format!("-> {{ [{}] }}", binds.join(", ")) } else { format!("[{}]", binds.join(", ")) };
+        let call = format!("Futamura.records(:{key}, {binds}{owner}{root}) {{ {{orig}} }}");
         Ok(Site { span: e.span, call, define })
     }
 
