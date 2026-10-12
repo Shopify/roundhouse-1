@@ -81,6 +81,14 @@ module Futamura
       value.respond_to?(primary_key) ? value.public_send(primary_key) : value
     end
 
+    # What `Model.find_by(column: value)` reads from a value that responds to
+    # `id` (core.rb `find_by`: `value = value.id if value.respond_to?(:id)`, for a
+    # key that is not an association) before it builds the statement; the call
+    # site passes this for a `find_by` written on the class itself.
+    def find_by_value(value)
+      value.respond_to?(:id) ? value.id : value
+    end
+
     # `root:` is the `self` of a chain written against an implicit class
     # self: the statement is the model's own, so any other class (a subclass
     # adds its type condition, a concern's method is shared) runs the chain.

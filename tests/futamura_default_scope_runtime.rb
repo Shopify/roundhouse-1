@@ -8,7 +8,7 @@ ActiveRecord::Schema.verbose = false
 ActiveRecord::Schema.define do
   create_table(:items) { |t| t.integer :shop_id; t.string :code; t.boolean :archived, default: false }
   create_table(:ranked) { |t| t.string :code }
-  create_table(:plain) { |t| t.string :code }
+  create_table(:plain) { |t| t.string :code; t.integer :owner_id }
   create_table(:legacy) { |t| t.integer :shop_id; t.string :code }
   %i[isles guarded anons loaders flips].each { |name| create_table(name) { |t| t.integer :shop_id; t.string :code } }
 end
@@ -67,6 +67,7 @@ Futamura.define(:item, Item, one: true) { |p| Item.all.where(code: p.bind).send(
 Futamura.define(:item_unscoped, Item, one: true, unscoped: true) { |p| Item.unscoped.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:ranked, Ranked, one: true) { |p| Ranked.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:plain, "Plain", one: true) { |p| Plain.all.where(code: p.bind).send(:ordered_relation).limit(1) }
+Futamura.define(:plain_owner, "Plain", one: true) { |p| Plain.all.where(owner_id: p.bind).limit(1) }
 Futamura.define(:legacy, Legacy, one: true) { |p| Legacy.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 %i[isle guarded anon loader flip].each do |name|
   klass = name.to_s.capitalize.constantize
@@ -114,6 +115,10 @@ Current.flip = false
 calls = 0
 calls += 1 while look(:flip, Flip, "x") && opaque[Flip] && calls < Futamura::OPAQUE_RETRY * 2
 out["flip"] = [refused_for_good, calls < Futamura::OPAQUE_RETRY, opaque[Flip].nil?]
+# `Model.find_by(owner_id: record)` reads the record's id (core.rb find_by); the call site passes find_by_value.
+Ref = Struct.new(:id)
+Plain.create!(code: "owned", owner_id: 7)
+out["find_by_id"] = [Futamura.records(:plain_owner, [Futamura.find_by_value(Ref.new(7))]) { Plain.find_by(owner_id: Ref.new(7)) }&.code]
 puts out.map { |k, v| "#{k}=#{v.inspect}" }
 puts "fallbacks=#{$fallbacks}"
 puts $log.map(&:inspect).join(" ")

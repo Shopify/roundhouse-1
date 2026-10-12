@@ -287,7 +287,7 @@ mod single_record_terminals {
         assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
         assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
         assert!(out.contains("[params[:id].to_s]) { Story.where(short_id: params[:id].to_s).first }"), "{out}");
-        assert!(out.contains("[params[:id] || params[:story_id]]) {"), "{out}");
+        assert!(out.contains("[Futamura.find_by_value(params[:id] || params[:story_id])]) {"), "{out}");
     }
 }
 
@@ -623,6 +623,7 @@ mod default_scope_runtime {
         // Five refusals do not disable a model for good: refused, then
         // evaluated again within OPAQUE_RETRY calls, and simple again.
         assert!(normal.contains("flip=[true, true, true]"), "{normal}");
+        assert!(normal.contains("find_by_id=[\"owned\"]"), "{normal}");
         assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
     }
 
@@ -688,7 +689,7 @@ mod association_keys {
         // Rails expands the name itself when it builds the statement.
         assert!(init.contains("Note.all.where(author: p.bind, slug: p.bind).limit(1)"), "{init}");
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
-        assert!(finder.contains("[Futamura.association_key(::Note, :author, author), slug]"), "{finder}");
+        assert!(finder.contains("[Futamura.association_key(::Note, :author, author), Futamura.find_by_value(slug)]"), "{finder}");
     }
 
     #[test]
@@ -751,8 +752,20 @@ mod more_links_and_values {
         let (report, files) = run("class Finder\n  def self.named\n    Tenant.find_by(name: Tenant::NAME)\n  end\n  def self.again(x)\n    Tenant.find_by(name: Tenant.fetch(x))\n  end\nend\n");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
-        assert!(finder.contains("Futamura.records(") && finder.contains("[Tenant::NAME]"), "{finder}");
+        assert!(finder.contains("Futamura.records(") && finder.contains("[Futamura.find_by_value(Tenant::NAME)]"), "{finder}");
         assert!(report.residue.iter().any(|r| r.contains("value is Send")), "{:?}", report.residue);
+    }
+
+    /// core.rb `find_by` (the class method) reads a value that responds to `id`
+    /// as that id before it builds the statement; Relation#find_by, which is
+    /// `where(hash).take`, does not.
+    #[test]
+    fn find_by_on_the_class_reads_ids_as_core_find_by_does_but_on_a_relation_does_not() {
+        let (report, files) = run("class Finder\n  def self.on_class(x)\n    Tenant.find_by(name: x)\n  end\n  def self.on_relation(x)\n    Tenant.where(name: \"a\").find_by(name: x)\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
+        let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.contains("[Futamura.find_by_value(x)]"), "{finder}");
+        assert_eq!(finder.matches("Futamura.find_by_value").count(), 1, "{finder}");
     }
 
     #[test]

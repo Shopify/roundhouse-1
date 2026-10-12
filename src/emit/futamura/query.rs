@@ -110,6 +110,10 @@ struct Chain {
     /// association's target holds; `first`/`last`/`take`/`to_a` on the proxy
     /// itself answer from the target when it is loaded or has unsaved records.
     after_reader: bool,
+    /// `Model.find_by(hash)` called on the class: Core::ClassMethods#find_by
+    /// reads a value that responds to `id` as that id (core.rb) before it
+    /// builds the statement; Relation#find_by (`where(hash).take`) does not.
+    class_find_by: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -553,6 +557,7 @@ impl<'a> Specializer<'a> {
                             // site converts it the way Rails would.
                             chain.where_binds.push(match belongs_to {
                                 Some(_) => format!("Futamura.association_key(::{}, :{}, {src})", chain.model.0.as_str(), column.as_str()),
+                                None if chain.class_find_by => format!("Futamura.find_by_value({src})"),
                                 None => src,
                             });
                             "p.bind".into()
@@ -649,7 +654,11 @@ impl<'a> Specializer<'a> {
                 if chain.limited {
                     return Err("find_by after limit".into());
                 }
-                let (chain, _) = self.apply(chain, &Symbol::from("where"), args, cx)?;
+                // On the class itself (no link before it, not an inlined
+                // scope body, whose self is a Relation), not on a Relation.
+                chain.class_find_by = chain.links.is_empty() && chain.owner.is_none() && !chain.unscoped && cx.self_chain.is_none();
+                let (mut chain, _) = self.apply(chain, &Symbol::from("where"), args, cx)?;
+                chain.class_find_by = false;
                 return self.apply(chain, &Symbol::from("take"), &[], cx);
             }
             "to_a" if args.is_empty() => return Ok((chain, Terminal::Records { reverse: false })),
@@ -869,6 +878,7 @@ impl Chain {
             owner_keys: Vec::new(),
             owner_columns: Vec::new(),
             after_reader: false,
+            class_find_by: false,
         }
     }
 }
