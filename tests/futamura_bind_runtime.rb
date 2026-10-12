@@ -134,6 +134,48 @@ out["owner"] = {
 out["owner"][:record] = counted { run(:crate_items, binds, owner: a, association: :items) { Item.where(crate_id: a.id).first } }.then { |(id, f)| "#{id}/#{f}" }
 out["owner"][:asked_after] = asked.inspect
 
+# 5. A value of a class outside the scalar list is bound when the predicate builder would build
+# `column = <bind>` for it whatever it is (no record key to read, no handler but the default),
+# and is Rails' when it would not.
+class TypedId # wraps an integer key the way a value object does: serialized by the column's type (to_i)
+  def initialize(value) = @value = value
+  def to_i = @value
+end
+IdBearer = Struct.new(:id) # PredicateBuilder#build reads value.id
+Pair = Struct.new(:first, :second)
+# Rails 8.2 makes a predicate builder shareable (frozen) when it is built: no handler can be added.
+$handler = begin
+  Crate.predicate_builder.register_handler(Pair, ->(attribute, pair) { attribute.eq(pair.first) })
+  true
+rescue FrozenError
+  false
+end
+Futamura.define(:by_zone, "Crate", one: true, via: :where) { |p| Crate.all.where(zone: p.bind).limit(1) }
+out["typed"] = {
+  value_object: counted { run(:by_zone, [TypedId.new(3)]) { Crate.where(zone: TypedId.new(3)).first } },
+  record_key: counted { run(:by_zone, [IdBearer.new(2)]) { Crate.where(zone: IdBearer.new(2)).first } },
+  handler: $handler ? counted { run(:by_zone, [Pair.new(1, 2)]) { Crate.where(zone: Pair.new(1, 2)).first } } : "n/a",
+  hash: counted { run(:by_zone, [{ zone: 3 }]) { Crate.where(zone: { zone: 3 }).first } },
+}.transform_values { |v| v.is_a?(Array) ? "#{v[0].inspect}/#{v[1]}" : v }
+
+# 6. nil is `IS NULL`: one statement for each pattern of nil positions among the binds (here
+# `code` then `zone`), up to MAX_NILS; more is Rails'.
+Crate.create!(code: "d", zone: nil)
+Crate.create!(code: nil, zone: 4)
+Crate.create!(code: nil, zone: nil)
+Futamura.define(:by_both, "Crate", one: true, via: :where) { |p| Crate.all.where(code: p.bind).where(zone: p.bind).limit(1) }
+both = ->(code, zone) { counted { run(:by_both, [code, zone]) { Crate.where(code: code).where(zone: zone).first } }.then { |(id, f)| "#{id.inspect}/#{f}" } }
+out["nil"] = {
+  none: both.call("b", 2),
+  first: both.call(nil, 4),
+  second: both.call("d", nil),
+  both: both.call(nil, nil),
+  none_again: both.call("c", 3),
+  first_again: both.call(nil, 4),
+  missing: both.call(nil, 99),
+  many: counted { run(:by_both, [nil, nil, nil, nil]) { Crate.where(code: nil).where(zone: nil).first } }.then { |(id, f)| "#{id.inspect}/#{f}" },
+}
+
 out.each do |name, group|
   puts "#{name}=" + (group.is_a?(Hash) ? group.map { |k, v| "#{k}:#{v}" }.join(" ") : group.inspect)
 end
