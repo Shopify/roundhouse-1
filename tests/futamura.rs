@@ -834,7 +834,7 @@ mod default_condition_runtime {
 /// A statement is built over placeholders and run with the values in order, so it must keep one
 /// slot for each placeholder (`StatementCache::BindMap`). An integer IN list serializes a
 /// placeholder to nil and `HomogeneousIn#casted_values` compacts it away, shifting every later
-/// value by one; such a statement, and one whose build raises an Exception that is not a
+/// value by one; such a statement, one that froze the default scope of a joined model, and one whose build raises an Exception that is not a
 /// StandardError, is Rails' chain to run. The probe (`tests/futamura_bind_count_runtime.rb`) runs
 /// real ActiveRecord on SQLite.
 mod bind_count_runtime {
@@ -861,6 +861,13 @@ mod bind_count_runtime {
         assert!(normal.contains("rank=[[[2], 1], [[1, 2], 1]]\n"), "{normal}");
         // The same list over a string column keeps its slots: the statement answers.
         assert!(normal.contains("name=[[[2], 0], [[1, 2], 0]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_default_scope_evaluated_while_building_is_not_frozen_into_the_statement() {
+        let Some(normal) = probe("0") else { return };
+        // Each call's default scope reads the state at that call: Rails' chain answers all three.
+        assert!(normal.contains("joined=[[[1], 1], [[2], 1], [[1], 1]]\n"), "{normal}");
     }
 
     #[test]

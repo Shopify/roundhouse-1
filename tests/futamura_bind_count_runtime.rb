@@ -13,11 +13,17 @@ ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:"
 ActiveRecord::Schema.verbose = false
 ActiveRecord::Schema.define do
   %i[ranks names].each { |name| create_table(name) { |t| t.integer :rank; t.string :label; t.string :code } }
+  create_table(:children) { |t| t.string :state }
+  create_table(:parents) { |t| t.string :code; t.integer :child_id }
 end
 class ApplicationRecord < ActiveRecord::Base; self.abstract_class = true; end
 # An IN list over an integer column in a default scope, and the same over a string column.
 class Rank < ApplicationRecord; default_scope { where(rank: [1, 2]) }; end
 class Name < ApplicationRecord; default_scope { where(label: %w[a b]) }; end
+# A joined model's default scope (Reflection#join_scope) is evaluated while the statement is built.
+$state = "a"
+class Child < ApplicationRecord; default_scope { where(state: $state) }; end
+class Parent < ApplicationRecord; belongs_to :child; end
 
 load ARGV[0]
 class Unexpected < Exception; end
@@ -30,6 +36,7 @@ Futamura.define(:raising, Rank, unscoped: true, via: :where) do |p|
   raise Unexpected, "built over a placeholder" if value.is_a?(ActiveRecord::StatementCache::Substitute)
   Rank.unscoped.where(code: value)
 end
+Futamura.define(:joined, Parent, via: :where) { |p| Parent.all.joins(:child).where(code: p.bind) }
 
 $fallbacks = 0
 Rank.unscoped { [[1, "x"], [2, "x"], [3, "x"], [2, "y"]].each { |rank, code| Rank.create!(rank: rank, code: code) } }
@@ -49,3 +56,14 @@ end
 before = $fallbacks
 result = Futamura.records(:raising, ["x"]) { $fallbacks += 1; Rank.unscoped.where(code: "x").to_a }
 puts "raising=#{[result.map(&:id), $fallbacks - before].inspect}"
+
+# The joined model's default scope reads `$state` at every call; a statement built once would keep the first.
+Child.unscoped { %w[a b].each { |state| Parent.create!(code: "x", child: Child.create!(state: state)) } }
+joined = %w[a b a].map do |state|
+  $state = state
+  before = $fallbacks
+  records = Futamura.records(:joined, ["x"]) { $fallbacks += 1; Parent.joins(:child).where(code: "x").to_a }
+  [records.map(&:id), $fallbacks - before]
+end
+puts "joined=#{joined.inspect}"
+puts "joined.ids=#{joined.map(&:first).inspect}"
