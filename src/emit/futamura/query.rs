@@ -114,6 +114,9 @@ struct Chain {
     /// reads a value that responds to `id` as that id (core.rb) before it
     /// builds the statement; Relation#find_by (`where(hash).take`) does not.
     class_find_by: bool,
+    /// The first call on the model class (`where`, `find_by`, `all`...) of a chain rooted
+    /// at the class; the runtime sends the call to Rails when that class method was redefined.
+    root_call: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -242,6 +245,10 @@ impl<'a> Specializer<'a> {
             Terminal::One => ", one: true",
         };
         let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
+        let option = match &chain.root_call {
+            Some(call) => format!("{option}, via: :{call}"),
+            None => option,
+        };
         let quoted = |columns: &[String]| columns.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
         let option = if chain.owner.is_some() {
             let relation = if chain.after_reader { ", relation: true" } else { "" };
@@ -487,6 +494,9 @@ impl<'a> Specializer<'a> {
         if rails_generated_scope(model, method) && args.is_empty() {
             chain.links.push(format!(".{}", method.as_str()));
             return Ok((chain, Terminal::Link));
+        }
+        if chain.root_call.is_none() && chain.owner.is_none() && chain.links.is_empty() && cx.self_chain.is_none() {
+            chain.root_call = Some(method.as_str().to_string());
         }
         match method.as_str() {
             // `where.not(...)` is WhereChain#not: the same conditions, negated
@@ -879,6 +889,7 @@ impl Chain {
             owner_columns: Vec::new(),
             after_reader: false,
             class_find_by: false,
+            root_call: None,
         }
     }
 }

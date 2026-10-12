@@ -284,8 +284,8 @@ mod single_record_terminals {
         let get = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
         let init = get(INITIALIZER);
         let out = get("app/controllers/stories_controller.rb");
-        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
-        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true, via: :where) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true, via: :find_by) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
         assert!(out.contains("[params[:id].to_s]) { Story.where(short_id: params[:id].to_s).first }"), "{out}");
         assert!(out.contains("[Futamura.find_by_value(params[:id] || params[:story_id])]) {"), "{out}");
     }
@@ -567,7 +567,7 @@ mod default_scope_runtime {
         assert_eq!(report.specialized.len(), 6, "{:?}", report.residue);
         assert!(!report.residue.iter().any(|r| r.contains("default_scope")), "{:?}", report.residue);
         let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("\"ScopedThing\") { |p| ScopedThing.all.where(name: p.bind) }"), "{init}");
+        assert!(init.contains("\"ScopedThing\", via: :where) { |p| ScopedThing.all.where(name: p.bind) }"), "{init}");
     }
 
     /// `Model.unscoped` has no default scopes, which the runtime is told so
@@ -576,7 +576,7 @@ mod default_scope_runtime {
     fn a_chain_rooted_at_unscoped_says_so() {
         let (_, files) = run();
         let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("\"ScopedThing\", unscoped: true) { |p| ScopedThing.unscoped.where(name: p.bind) }"), "{init}");
+        assert!(init.contains("\"ScopedThing\", unscoped: true, via: :unscoped) { |p| ScopedThing.unscoped.where(name: p.bind) }"), "{init}");
         assert!(!init.contains("PlainThing, unscoped"), "{init}");
     }
 
@@ -624,6 +624,8 @@ mod default_scope_runtime {
         // evaluated again within OPAQUE_RETRY calls, and simple again.
         assert!(normal.contains("flip=[true, true, true]"), "{normal}");
         assert!(normal.contains("find_by_id=[\"owned\"]"), "{normal}");
+        // A class method the class defines itself (a double) is not answered beside: Rails runs it.
+        assert!(normal.contains("via=[1, :double, 1]") && normal.contains("calls_via=1"), "{normal}");
         assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
     }
 
@@ -736,8 +738,8 @@ mod more_links_and_values {
     fn unscoped_directly_on_a_model_is_rooted_without_default_scopes() {
         let (report, files) = run("class Finder\n  def self.by_key(key)\n    Client.unscoped.where(key: key).first\n  end\n  def self.scoped(key)\n    Client.where(key: key).first\n  end\nend\n");
         assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
-        assert!(init(&files).contains("\"Client\", one: true, unscoped: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
-        assert!(init(&files).contains("\"Client\", one: true) { |p| Client.all.where(key: p.bind)"), "{}", init(&files));
+        assert!(init(&files).contains("\"Client\", one: true, unscoped: true, via: :unscoped) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
+        assert!(init(&files).contains("\"Client\", one: true, via: :where) { |p| Client.all.where(key: p.bind)"), "{}", init(&files));
     }
 
     #[test]
@@ -805,7 +807,7 @@ mod implicit_class_self {
         let page = &tree_files.iter().find(|(p, _)| p == "app/models/page.rb").unwrap().1;
         assert!(page.contains("[slug], root: self) { where(slug: slug, live: true).order(:id).first }"), "{page}");
         let init = &tree_files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("\"Page\", one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
+        assert!(init.contains("\"Page\", one: true, via: :where) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
         // The instance method's `where` is not a class call: it stays Rails'.
         assert!(page.contains("    where(slug: slug).first\n"), "{page}");
     }

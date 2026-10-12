@@ -18,7 +18,7 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
 
   # What a model's default scopes add to a query, as the columns each
@@ -59,10 +59,19 @@ module Futamura
     # follow the reader (`notes.where(...).first`): Rails then builds a
     # Relation from `scope` and queries, where a terminal called on the reader
     # itself (`notes.first`) answers from the association's target.
-    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, &build)
+    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, via: nil, &build)
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped,
-                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation)
+                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via)
     end
+
+    # The class method a chain starts with, defined on a class itself: a test double (the chain
+    # would run beside it) or a model's own override. One a module brings in is not looked at.
+    def redefined?(model, name)
+      model.method(name).owner.singleton_class?
+    rescue NameError
+      true
+    end
+    private :redefined?
 
     # The key `where(association: value)` binds, as Rails'
     # PredicateBuilder::AssociationQueryValue#convert_to_id reads it: the
@@ -101,6 +110,7 @@ module Futamura
       model = statement.model
       model = statement.model = Object.const_get(model) if model.is_a?(String)
       return fallback.call if root && !root.equal?(model)
+      return fallback.call if statement.via && redefined?(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
 
       # A `Model.scoping { }` block is part of every `Model.all` inside it.
@@ -605,6 +615,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           model = statement.model
           return "model_unloaded" unless model.is_a?(Class)
           return "root_not_model" if root && !root.equal?(model)
+          return "class_method_redefined[#{model.name}.#{statement.via}]" if statement.via && Futamura.send(:redefined?, model, statement.via)
           return "owner_chain" if owner && !Futamura.send(:owner_chain?, owner, association, statement, model)
           return @compile_reasons[key] if @compile_reasons[key]
           return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope

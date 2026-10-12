@@ -69,6 +69,7 @@ Futamura.define(:ranked, Ranked, one: true) { |p| Ranked.all.where(code: p.bind)
 Futamura.define(:plain, "Plain", one: true) { |p| Plain.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:plain_owner, "Plain", one: true) { |p| Plain.all.where(owner_id: p.bind).limit(1) }
 Futamura.define(:legacy, Legacy, one: true) { |p| Legacy.all.where(code: p.bind).send(:ordered_relation).limit(1) }
+Futamura.define(:plain_find, "Plain", one: true, via: :find_by) { |p| Plain.all.where(code: p.bind).limit(1) }
 %i[isle guarded anon loader flip].each do |name|
   klass = name.to_s.capitalize.constantize
   Futamura.define(name, klass, one: true) { |p| klass.all.where(code: p.bind).send(:ordered_relation).limit(1) }
@@ -119,6 +120,17 @@ out["flip"] = [refused_for_good, calls < Futamura::OPAQUE_RETRY, opaque[Flip].ni
 Ref = Struct.new(:id)
 Plain.create!(code: "owned", owner_id: 7)
 out["find_by_id"] = [Futamura.records(:plain_owner, [Futamura.find_by_value(Ref.new(7))]) { Plain.find_by(owner_id: Ref.new(7)) }&.code]
+# A chain that starts with a class method the class itself defines (a test double, a model's override) is
+# Rails': the statement would answer beside the double.
+via = ->(double) { Futamura.records(:plain_find, ["x"]) { $fallbacks += 1; double || Plain.find_by(code: "x") } }
+before = $fallbacks
+plain_specialized = via.call(nil)&.id
+Plain.define_singleton_method(:find_by) { |*| :double }
+doubled = via.call(:double)
+Plain.singleton_class.send(:remove_method, :find_by)
+again = via.call(nil)&.id
+out["via"] = [plain_specialized, doubled, again]
+puts "calls_via=#{$fallbacks - before}"
 puts out.map { |k, v| "#{k}=#{v.inspect}" }
 puts "fallbacks=#{$fallbacks}"
 puts $log.map(&:inspect).join(" ")
