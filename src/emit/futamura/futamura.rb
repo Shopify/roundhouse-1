@@ -64,10 +64,12 @@ module Futamura
                                        owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via)
     end
 
-    # The class method a chain starts with, defined on a class itself: a test double (the chain
-    # would run beside it) or a model's own override. One a module brings in is not looked at.
+    # The class method a chain starts with, defined on a class itself or by an anonymous module
+    # (a test double prepends one; the chain would run beside it) or a model's own override. A
+    # named module's method is not looked at.
     def redefined?(model, name)
-      model.method(name).owner.singleton_class?
+      owner = model.method(name).owner
+      owner.singleton_class? || owner.name.nil?
     rescue NameError
       true
     end

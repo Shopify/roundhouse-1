@@ -625,7 +625,7 @@ mod default_scope_runtime {
         assert!(normal.contains("flip=[true, true, true]"), "{normal}");
         assert!(normal.contains("find_by_id=[\"owned\"]"), "{normal}");
         // A class method the class defines itself (a double) is not answered beside: Rails runs it.
-        assert!(normal.contains("via=[1, :double, 1]") && normal.contains("calls_via=1"), "{normal}");
+        assert!(normal.contains("via=[1, :double, 1, :prepended]") && normal.contains("calls_via=2"), "{normal}");
         assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
     }
 

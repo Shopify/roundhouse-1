@@ -129,7 +129,10 @@ Plain.define_singleton_method(:find_by) { |*| :double }
 doubled = via.call(:double)
 Plain.singleton_class.send(:remove_method, :find_by)
 again = via.call(nil)&.id
-out["via"] = [plain_specialized, doubled, again]
+# Mocha prepends an anonymous module to the class's singleton instead.
+Plain.singleton_class.prepend(Module.new { def find_by(*) = :prepended })
+prepended = via.call(:prepended)
+out["via"] = [plain_specialized, doubled, again, prepended]
 puts "calls_via=#{$fallbacks - before}"
 puts out.map { |k, v| "#{k}=#{v.inspect}" }
 puts "fallbacks=#{$fallbacks}"
