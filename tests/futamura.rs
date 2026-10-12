@@ -1045,12 +1045,13 @@ mod flow_paths_runtime {
             eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
             return;
         }
-        let schema = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"status\"\n    t.string \"kind\"\n  end\nend\n";
-        let model = "class Item < ApplicationRecord\n  def self.find_all(shop, status, kind)\n    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a\n  end\nend\n";
+        let schema = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"status\"\n    t.string \"kind\"\n  end\n  create_table \"notes\", force: :cascade do |t|\n    t.integer \"item_id\"\n    t.string \"body\"\n  end\nend\n";
+        let model = "class Item < ApplicationRecord\n  has_many :notes\n  def recent_notes\n    notes.order(id: :desc).first(2)\n  end\n  def self.find_all(shop, status, kind)\n    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a\n  end\nend\n";
         let files: Vec<(&str, &str)> = vec![
             ("db/schema.rb", schema),
             ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
             ("app/models/item.rb", model),
+            ("app/models/note.rb", "class Note < ApplicationRecord\n  belongs_to :item\nend\n"),
         ];
         let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
             files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
@@ -1058,7 +1059,7 @@ mod flow_paths_runtime {
         Analyzer::new(&app).analyze(&mut app);
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
         let report = specialize(&app, &mut tree_files).unwrap();
-        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
         let dir = std::env::temp_dir().join(format!("roundhouse-futamura-flow-runtime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (path, content) in &tree_files {
@@ -1072,7 +1073,7 @@ mod flow_paths_runtime {
             let out = String::from_utf8_lossy(&run.stdout).to_string();
             assert!(run.status.success(), "verify={verify}\n{out}\n{}", String::from_utf8_lossy(&run.stderr));
             assert!(!out.contains("MISMATCH"), "verify={verify}\n{out}");
-            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 7, "{out}");
+            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 8, "{out}");
             // Unverified, no call fell back to Rails' chain: every path was
             // served by its statement (verifying runs the fallback to compare).
             if verify == "0" {
@@ -1080,5 +1081,52 @@ mod flow_paths_runtime {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `lines.order(:id).first(2)` in an instance method of a model that declares
+/// `has_many :lines` is the association of `self`.
+mod implicit_self_association {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"orders\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"lines\", force: :cascade do |t|\n    t.integer \"order_id\"\n    t.string \"sku\"\n  end\nend\n";
+
+    fn run(order: &str) -> (roundhouse::emit::futamura::Report, String, String) {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/line.rb", "class Line < ApplicationRecord\n  belongs_to :order\nend\n"),
+            ("app/models/order.rb", order),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let get = |path: &str| tree_files.iter().find(|(p, _)| p == path).map(|(_, c)| c.clone()).unwrap_or_default();
+        (report, get("app/models/order.rb"), get(INITIALIZER))
+    }
+
+    #[test]
+    fn a_receiverless_has_many_reader_roots_the_chain_at_self() {
+        let (report, order, init) = run("class Order < ApplicationRecord\n  has_many :lines\n  def first_lines\n    lines.order(:id).first(2)\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(order.contains("Futamura.records(:models_order_4_5, [self.id], owner: self, association: :lines) { lines.order(:id).first(2) }"), "{order}");
+        assert!(init.contains("\"Line\") { |p| Line.all.where(order_id: p.bind).order(:id).send(:ordered_relation).limit(2) }"), "{init}");
+    }
+
+    #[test]
+    fn a_reader_the_model_redefines_or_gives_options_is_left_to_rails() {
+        let (report, _, _) = run("class Order < ApplicationRecord\n  has_many :lines\n  def lines = super.where(sku: \"x\")\n  def first_lines\n    lines.order(:id).first(2)\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(report.residue.iter().any(|r| r.contains("also defined as a method")), "{:?}", report.residue);
+        let (report, _, _) = run("class Order < ApplicationRecord\n  has_many :lines, -> { where(sku: \"x\") }\n  def first_lines\n    lines.order(:id).first(2)\n  end\nend\n");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(report.residue.iter().any(|r| r.contains("options the specializer does not model")), "{:?}", report.residue);
     }
 }

@@ -45,7 +45,8 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
         for item in &m.body {
             if let ModelBodyItem::Method { method, .. } = item {
                 let class_self = (method.receiver == MethodReceiver::Class).then_some(&m.name);
-                spec.method_body(&method.body, class_self, &mut sites, &mut residue);
+                let instance_self = (method.receiver != MethodReceiver::Class).then_some(&m.name);
+                spec.method_body_of(&method.body, class_self, instance_self, &mut sites, &mut residue);
             }
         }
     }

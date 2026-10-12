@@ -20,7 +20,7 @@ use std::cell::{Cell, RefCell};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{Symbol, VarId};
 
-use super::{Cx, Site, Specializer};
+use super::{Association, Chain, Cx, ModelBodyItem, Site, Specializer};
 
 /// The most `if`s one site may branch on (so 2^n statements).
 pub(super) const MAX_DECISIONS: usize = 3;
@@ -402,5 +402,27 @@ impl<'a> Specializer<'a> {
         let other = self.explore(decisions, cx, attempt);
         decisions.pop();
         Ok(Paths::Split { cond, then: Box::new(then), other: Box::new(other?) })
+    }
+}
+
+impl<'a> Specializer<'a> {
+    /// `lines` written without a receiver in an instance method of a model
+    /// that declares `has_many :lines`: the association of `self`, unless the
+    /// model also defines a method of that name (the reader would be that).
+    pub(super) fn self_assoc_root(&self, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Option<Chain>, String> {
+        let Some(model) = cx.instance_self.as_ref().and_then(|id| self.models.get(id.0.as_str())) else { return Ok(None) };
+        let Some(assoc) = model.body.iter().find_map(|item| match item {
+            ModelBodyItem::Association { assoc, .. } if assoc.name() == method => Some(assoc),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(assoc, Association::HasMany { .. }) {
+            return Err(format!("`{}` is not a has_many", method.as_str()));
+        }
+        if model.body.iter().any(|item| matches!(item, ModelBodyItem::Method { method: m, .. } if m.name == *method)) {
+            return Err(format!("`{}` is also defined as a method", method.as_str()));
+        }
+        self.has_many_root(assoc, method, args, || Ok("self".to_string())).map(Some)
     }
 }

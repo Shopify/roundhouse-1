@@ -14,6 +14,7 @@ module Rails
   def self.application = Struct.new(:config).new(PREPARE)
 end
 load File.join(ARGV[0], "config/initializers/futamura.rb")
+load File.join(ARGV[0], "app/models/note.rb")
 load File.join(ARGV[0], "app/models/item.rb")
 
 [[1, "open", "a"], [1, "closed", "a"], [1, "open", "b"], [2, "open", "a"], [2, "closed", "b"]].each do |shop, status, kind|
@@ -31,4 +32,9 @@ end)
   want = want.order(:id).map(&:id)
   puts "#{[shop, status, kind].inspect} #{got == want ? "ok" : "MISMATCH #{got.inspect} #{want.inspect}"} #{got.inspect}"
 end
+item = Item.first
+[3, 1, 0].each { |n| item.notes.create!(body: "n#{n}") if n > 0 }
+got = item.recent_notes.map(&:body)
+want = item.notes.order(id: :desc).limit(2).map(&:body)
+puts "recent_notes #{got == want ? "ok" : "MISMATCH"} #{got.inspect}"
 puts "fallbacks=#{fallbacks}"

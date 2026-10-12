@@ -142,6 +142,12 @@ impl<'a> Specializer<'a> {
     /// `class_self` is the model when the body is one of its class methods,
     /// where a receiver-less `where`/`find_by` is a call on that model.
     pub fn method_body(&self, body: &Expr, class_self: Option<&ClassId>, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
+        self.method_body_of(body, class_self, None, sites, residue)
+    }
+
+    /// `method_body`, also told the model whose instance method this body is
+    /// (`instance_self`), where a receiver-less `lines` is its association.
+    pub fn method_body_of(&self, body: &Expr, class_self: Option<&ClassId>, instance_self: Option<&ClassId>, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
         let mut locals = HashMap::new();
         collect_locals(body, &mut locals);
         let flow = flow::Flow::new(body);
@@ -152,6 +158,7 @@ impl<'a> Specializer<'a> {
             args: HashMap::new(),
             self_chain: None,
             class_self: class_self.cloned(),
+            instance_self: instance_self.cloned(),
         };
         self.visit(body, &cx, sites, residue);
     }
@@ -312,7 +319,11 @@ impl<'a> Specializer<'a> {
                             _ => Err(format!("`{}` mid-chain loads records", method.as_str())),
                         }
                     }
-                    None => Err(format!("implicit-self `{}`", method.as_str())),
+                    // An instance method's receiver-less reader is its own association.
+                    None => match self.self_assoc_root(method, args, cx)? {
+                        Some(root) => Ok(root),
+                        None => Err(format!("implicit-self `{}`", method.as_str())),
+                    },
                 },
             },
             ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
@@ -340,6 +351,16 @@ impl<'a> Specializer<'a> {
         }) else {
             return Ok(None);
         };
+        self.has_many_root(assoc, method, args, || match self.value(owner, cx)? {
+            Val::Bind(owner) => Ok(owner),
+            Val::Static(_) => Err("static association owner".into()),
+        })
+        .map(Some)
+    }
+
+    /// `owner.<method>` for a plain `has_many`, with `owner` the Ruby source
+    /// that evaluates to the record at the call site.
+    fn has_many_root(&self, assoc: &Association, method: &Symbol, args: &[Expr], owner: impl FnOnce() -> Result<String, String>) -> Result<Chain, String> {
         let Association::HasMany { target, foreign_key, through, as_interface, scope, .. } = assoc else {
             return Err(format!("`{}` is not a has_many", method.as_str()));
         };
@@ -349,13 +370,11 @@ impl<'a> Specializer<'a> {
         if !self.models.contains_key(target.0.as_str()) {
             return Err(format!("`{}` targets a non-model", method.as_str()));
         }
-        let Val::Bind(owner) = self.value(owner, cx)? else {
-            return Err("static association owner".into());
-        };
+        let owner = owner()?;
         let mut chain = Chain::new(target.clone(), Some((owner.clone(), method.clone())));
         chain.links.push(format!(".where({}: p.bind)", foreign_key.as_str()));
         chain.where_binds.push(format!("{owner}.id"));
-        Ok(Some(chain))
+        Ok(chain)
     }
 
     /// One link applied to a chain, and whether it was a terminal.
@@ -544,7 +563,7 @@ impl<'a> Specializer<'a> {
         for (p, a) in scope.params.iter().zip(args) {
             bound.insert(p.name.clone(), self.value(a, cx)?);
         }
-        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None };
+        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None, instance_self: None };
         let ExprNode::Send { recv, method, args, block: None, .. } = &*body.node else {
             return Err(format!("scope `{}` body is not a call chain", scope.name.as_str()));
         };
@@ -713,6 +732,8 @@ struct Cx<'b> {
     self_chain: Option<Chain>,
     /// The model whose class method this body is.
     class_self: Option<ClassId>,
+    /// The model whose instance method this body is.
+    instance_self: Option<ClassId>,
 }
 
 impl Chain {
