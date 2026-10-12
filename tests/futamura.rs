@@ -1498,3 +1498,100 @@ mod association_scopes_and_conditions {
         let _ = fs::remove_dir_all(&out);
     }
 }
+
+/// What a site prints for the values it binds, and for the constants its statement's block names.
+/// The call site is inside the original lexical scope, so a bound value is the expression as the
+/// source wrote it: a constant is not rooted at its namespace (`Namespace::Klass::NAME` is a
+/// NameError for a `private_constant`, Module#private_constant), and an expression the Ruby
+/// emitter has no lowering for is not printed as a `raise`. The statement's block runs in the
+/// initializer, outside that scope, so a private constant there is bound from the call site too.
+/// The probe (`tests/futamura_print_runtime.rb`) runs the emitted tree on real ActiveRecord.
+mod printed_values {
+    use super::{Command, fs, scratch, write};
+
+    const FINDER: &str = "\
+module Lookup
+  class Finder
+    KIND = \"k\"
+    LIMIT = 2
+    PAGE = 1 + 1
+    private_constant :KIND, :LIMIT, :PAGE
+
+    def self.by_kind(shop_id)
+      Widget.where(shop_id: shop_id, kind: KIND).to_a
+    end
+
+    def self.limited(shop_id)
+      Widget.where(shop_id: shop_id).limit(LIMIT).to_a
+    end
+
+    def self.paged(shop_id)
+      Widget.where(shop_id: shop_id).limit(PAGE).to_a
+    end
+
+    #: (singleton(ActiveRecord::Base) model) -> Widget?
+    def self.by_model(model)
+      Widget.find_by(owner_type: model.polymorphic_name, shop_id: 1)
+    end
+  end
+end
+";
+
+    fn emit() -> (std::path::PathBuf, String) {
+        let src = scratch("print-src");
+        let out = scratch("print-out");
+        write(&src, "db/schema.rb", b"ActiveRecord::Schema.define do\n  create_table \"owners\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"kind\"\n    t.string \"owner_type\"\n    t.integer \"owner_id\"\n    t.integer \"shop_id\"\n  end\nend\n");
+        write(&src, "app/models/application_record.rb", b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n");
+        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\nend\n");
+        write(&src, "app/models/owner.rb", b"class Owner < ApplicationRecord\n  has_many :widgets, as: :owner\nend\n");
+        write(&src, "app/services/lookup/finder.rb", FINDER.as_bytes());
+        let run = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(&src).output().unwrap();
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let finder = fs::read_to_string(out.join("app/services/lookup/finder.rb")).unwrap();
+        let _ = fs::remove_dir_all(&src);
+        (out, finder)
+    }
+
+    #[test]
+    fn bound_values_print_as_written_and_private_constants_are_not_rooted() {
+        let (out, finder) = emit();
+        // Read at the call site, inside the class body: the bare name.
+        assert!(finder.contains("[shop_id, KIND]) {"), "{finder}");
+        assert!(!finder.contains("Finder::KIND"), "{finder}");
+        // A receiver the emitter has no lowering for is printed from the source.
+        assert!(finder.contains("Futamura.find_by_value(model.polymorphic_name)"), "{finder}");
+        assert!(!finder.contains("not supported"), "{finder}");
+        // A constant in the block is public and rooted, a literal, or bound; never private and rooted.
+        let init = fs::read_to_string(out.join("config/initializers/futamura.rb")).unwrap();
+        assert!(!init.contains("Finder::PAGE") && !init.contains("Finder::LIMIT"), "{init}");
+        assert!(finder.contains("[shop_id, PAGE]"), "{finder}");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn the_emitted_finder_runs_on_activerecord_with_and_without_verify() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let (out, _) = emit();
+        let probe = root.join("tests/futamura_print_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        let verified = output("1");
+        let normal = output("0");
+        // Verify counts every call as a fallback; only the results are compared.
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("specialized=")).collect::<Vec<_>>().join("\n");
+        assert_eq!(results(&verified), results(&normal));
+        assert!(normal.ends_with("specialized=3\n"), "{normal}");
+        assert!(normal.contains("by_kind=[\"a\", \"b\", \"c\"]\n"), "{normal}");
+        assert!(normal.contains("limited=[\"a\", \"b\"]\n"), "{normal}");
+        assert!(normal.contains("by_model=[\"d\"]\n"), "{normal}");
+        let _ = fs::remove_dir_all(&out);
+    }
+}

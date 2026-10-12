@@ -146,6 +146,9 @@ pub struct Specializer<'a> {
     /// Models their own source makes `private_constant`: the generated
     /// initializer, outside their namespace, cannot name them.
     private_models: std::collections::HashSet<String>,
+    /// Bare names some source passes to `private_constant`: a constant of
+    /// that name is read only from inside its namespace's lexical scope.
+    private_constants: std::collections::HashSet<String>,
     /// The dumps of the databases other than the primary.
     schemas: super::schemas::DatabaseSchemas,
 }
@@ -163,7 +166,8 @@ impl<'a> Specializer<'a> {
             }
         }
         let private_models = app.models.iter().filter(|m| makes_private(app, m)).map(|m| m.name.0.as_str().to_string()).collect();
-        Specializer { app, models, int_consts, private_models, schemas }
+        let private_constants = private_constant_names(app);
+        Specializer { app, models, int_consts, private_models, private_constants, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -286,6 +290,24 @@ impl<'a> Specializer<'a> {
     fn source_text(&self, span: Span) -> &str {
         let text = &self.app.sources[span.file.0 as usize - 1].text;
         text.get(span.start as usize..span.end as usize).unwrap_or("")
+    }
+
+    /// The call-site expression `e` exactly as the source wrote it. The
+    /// Ruby emitter would print its own lowering (a constant rooted at its
+    /// namespace, an unsupported-construct `raise`), which is not what the
+    /// original chain evaluated; a value that cannot be quoted from the
+    /// source keeps its site Rails'.
+    fn written(&self, e: &Expr) -> Result<String, String> {
+        if e.span.is_synthetic() {
+            return Err(format!("`{}` has no source text", e.node.kind_str()));
+        }
+        let text = self.source_text(e.span).trim();
+        if text.is_empty() || text.contains('#') {
+            return Err("value has no single-line source text".into());
+        }
+        // `a or b` inside an argument list or an array is a syntax error.
+        let keyword = |w: &str| text.split_whitespace().any(|t| t == w);
+        Ok(if matches!(&*e.node, ExprNode::BoolOp { .. }) && (keyword("and") || keyword("or")) { format!("({text})") } else { text.to_string() })
     }
 
     fn key(&self, span: Span) -> String {
@@ -423,7 +445,7 @@ impl<'a> Specializer<'a> {
         if !self.models.contains_key(target.0.as_str()) {
             return Err(format!("`{}` targets a non-model", method.as_str()));
         }
-        let owner = owner()?;
+        let owner = parenthesized_unless_simple(owner()?);
         let mut chain = Chain::new(target.clone(), Some((owner.clone(), method.clone())));
         chain.links.push(format!(".where({}: p.bind)", foreign_key.as_str()));
         chain.where_binds.push(format!("{owner}.id"));
@@ -825,7 +847,7 @@ impl<'a> Specializer<'a> {
                 {
                     return Err(format!("`{}` may change between the local's assignment and the call that loads it", emit_expr(e)));
                 }
-                Ok(Val::Bind(emit_expr(e)))
+                Ok(Val::Bind(self.written(e)?))
             }
             other => Err(format!("value is {}", other.kind_str())),
         }
@@ -835,7 +857,12 @@ impl<'a> Specializer<'a> {
     /// else a request-time bind.
     fn limit_value(&self, e: &Expr, chain: &mut Chain, cx: &Cx) -> Result<String, String> {
         let v = match &*e.node {
-            ExprNode::Const { path } => self.int_const(path)?,
+            ExprNode::Const { path } => match self.int_const(path)? {
+                // A private constant is not nameable from the statement's
+                // block (outside the lexical scope): the call site reads it.
+                Val::Static(src) if src.parse::<i64>().is_err() && path.last().is_some_and(|n| self.private_constants.contains(n.as_str())) => self.value(e, cx)?,
+                v => v,
+            },
             _ => self.value(e, cx)?,
         };
         Ok(match v {
@@ -982,6 +1009,23 @@ fn makes_private(app: &App, model: &Model) -> bool {
     source.text.lines().map(str::trim_start).filter(|l| l.starts_with("private_constant")).any(|l| {
         l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word == bare)
     })
+}
+
+/// Every bare name a source gives to `private_constant` (Module#private_constant).
+fn private_constant_names(app: &App) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for source in app.sources.iter().filter(|s| s.text.contains("private_constant")) {
+        for line in source.text.lines().map(str::trim_start).filter(|l| l.starts_with("private_constant")) {
+            names.extend(line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).skip(1).filter(|w| !w.is_empty()).map(str::to_string));
+        }
+    }
+    names
+}
+
+/// `src` as the receiver of a method call: anything but a plain name/path
+/// needs parentheses to keep its operators from binding to the call.
+fn parenthesized_unless_simple(src: String) -> String {
+    if src.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | ':' | '.' | '?' | '!')) { src } else { format!("({src})") }
 }
 
 fn scope_named<'m>(m: &'m Model, name: &Symbol) -> Option<&'m Scope> {
