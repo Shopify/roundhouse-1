@@ -156,7 +156,7 @@ module Futamura
       # Merging the association's relation into the model's default scope
       # (Association#scope) replaces a default equality condition on a column
       # the association constrains; the chain built here keeps both.
-      return fallback.call if owner && (columns & statement.owner_columns).any?
+      return fallback.call if owner && (columns.map { |column| Array(column).first } & statement.owner_columns).any?
       return fallback.call if defaults.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
       binds = defaults + binds
@@ -275,20 +275,65 @@ module Futamura
       columns = []
       values = []
       predicates.drop(before.size).each do |node|
-        return unless node.instance_of?(Arel::Nodes::Equality)
+        condition = default_condition(model, node)
+        return unless condition.is_a?(Array)
+
+        columns << condition[0]
+        values.concat(condition[1])
+      end
+      [columns.freeze, values, extensions]
+    end
+
+    # The longest list of an `IN` default condition that gets a statement of its own (the
+    # length is part of the statement, so one statement per length).
+    MAX_LIST = 8
+
+    # One condition a default scope adds, as `[column, values]` or the name (a String) of
+    # what is wrong with it. `column` is the attribute name for `where(column: value)`, else
+    # `[name, :not_eq]`, `[name, :in, n]` or `[name, :notin, n]` (`where.not(column: value)`,
+    # `where(column: [n values])`, `where.not(column: [n values])`), which `compile` builds
+    # again over bind placeholders, the values being `values`.
+    def default_condition(model, node)
+      case node
+      when Arel::Nodes::HomogeneousIn
+        return "non_equality_homogeneousin" unless node.instance_of?(Arel::Nodes::HomogeneousIn)
+
+        attribute = node.attribute
+        return "attribute" unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
+        return "column" unless model.columns_hash.key?(attribute.name.to_s)
+
+        list = node.values
+        return "list_length" unless (2..MAX_LIST).cover?(list.size)
+        return "list_value" if list.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+
+        [[attribute.name.to_s, node.type, list.size].freeze, list]
+      when Arel::Nodes::Equality, Arel::Nodes::NotEqual
+        return "non_equality_#{node.class.name.split("::").last.downcase}" unless node.instance_of?(Arel::Nodes::Equality) || node.instance_of?(Arel::Nodes::NotEqual)
 
         attribute, bind = node.left, node.right
         # Predicate builder puts the QueryAttribute itself on the right (Arel
         # makes the bind of it when it compiles); a BindParam wraps one too.
         bind = bind.value if bind.is_a?(Arel::Nodes::BindParam)
-        return unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
-        return unless bind.is_a?(ActiveRecord::Relation::QueryAttribute)
-        return unless model.columns_hash.key?(attribute.name.to_s) && bind.name == attribute.name.to_s
+        return "attribute" unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
+        return "bind_" + bind.class.name.to_s.split("::").last.downcase unless bind.is_a?(ActiveRecord::Relation::QueryAttribute)
+        return "column" unless model.columns_hash.key?(attribute.name.to_s) && bind.name == attribute.name.to_s
 
-        columns << attribute.name.to_s
-        values << bind.value
+        name = attribute.name.to_s
+        [node.instance_of?(Arel::Nodes::Equality) ? name : [name, :not_eq].freeze, [bind.value]]
+      else
+        "non_equality_" + node.class.name.to_s.split("::").last.downcase
       end
-      [columns.freeze, values, extensions]
+    end
+
+    # `scope` with one default condition added, over a bind placeholder for each value.
+    def add_default_condition(scope, column, params)
+      name, op, size = column
+      case op
+      when nil then scope.where(column => params.bind)
+      when :not_eq then scope.where.not(name => params.bind)
+      when :in then scope.where(name => Array.new(size) { params.bind })
+      when :notin then scope.where.not(name => Array.new(size) { params.bind })
+      end
     end
 
     # Whether a module `extending` adds is one every call adds again (a named
@@ -340,7 +385,7 @@ module Futamura
         relation = if statement.unscoped
           statement.build.call(params)
         else
-          base = columns.inject(statement.model.send(:relation)) { |scope, column| scope.where(column => params.bind) }
+          base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
           base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
           base.scoping { statement.build.call(params) }
         end
@@ -719,13 +764,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return "prefix" unless predicates.first(before.size) == before
 
           predicates.drop(before.size).each do |node|
-            return "non_equality_" + node.class.name.to_s.split("::").last.downcase unless node.instance_of?(Arel::Nodes::Equality)
-
-            attribute, bind = node.left, node.right
-            bind = bind.value if bind.is_a?(Arel::Nodes::BindParam)
-            return "attribute" unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
-            return "bind_" + bind.class.name.to_s.split("::").last.downcase unless bind.is_a?(ActiveRecord::Relation::QueryAttribute)
-            return "column" unless model.columns_hash.key?(attribute.name.to_s) && bind.name == attribute.name.to_s
+            failure = Futamura.send(:default_condition, model, node)
+            return failure if failure.is_a?(String)
           end
           "shape_ok"
         rescue => e

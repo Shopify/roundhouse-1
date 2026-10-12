@@ -715,6 +715,47 @@ mod guards_runtime {
     }
 }
 
+/// A default scope's conditions are bound at run time. Besides `where(c: v)`, the static shapes
+/// `where.not(c: v)` (NotEqual) and `where(c: [..])` / `where.not(c: [..])` (HomogeneousIn,
+/// `IN` / `NOT IN`) over 2..=8 values are bound too (one statement for each list length);
+/// a longer list is Rails'. The probe (`tests/futamura_default_condition_runtime.rb`) runs real
+/// ActiveRecord on SQLite.
+mod default_condition_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_default_condition_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    /// Each line is `name=[[record id, calls that ran Rails' chain], ...]`.
+    #[test]
+    fn inequality_and_short_in_list_default_scopes_are_answered_by_the_statement() {
+        let Some(normal) = probe("0") else { return };
+        for (model, id) in [("hidden", 3), ("open", 3), ("closed", 2), ("mixed", 3)] {
+            assert!(normal.contains(&format!("{model}=[[{id}, 0], [{id}, 0], [nil, 0]]\n")), "{model}\n{normal}");
+        }
+        // Nine values is more than a statement is built for: Rails' chain runs.
+        assert!(normal.contains("long=[[4, 1], [4, 1], [nil, 1]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_same_default_scopes_agree_with_rails_under_verify() {
+        let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
+        let records = |s: &str| s.replace("[", "").replace("]", "").lines().map(|l| l.split(", ").step_by(2).collect::<Vec<_>>().join(",")).collect::<Vec<_>>();
+        assert_eq!(records(&verified), records(&normal), "{verified}\n{normal}");
+    }
+}
+
 /// `where(author: record_or_id)`: PredicateBuilder#expand_from_hash expands
 /// a `belongs_to` name to its foreign key (and, for a polymorphic one, the
 /// type column too). Only the non-polymorphic case is statically one
