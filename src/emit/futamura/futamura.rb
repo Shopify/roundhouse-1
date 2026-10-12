@@ -18,7 +18,7 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
 
   # What a model's default scopes add to a query, as the columns each
@@ -31,6 +31,7 @@ module Futamura
   @statements = {}
   @compiled = Concurrent::Map.new
   @opaque = Concurrent::Map.new
+  @owner_chains = Concurrent::Map.new
   VERIFY = ENV["FUTAMURA_VERIFY"] == "1"
 
   class << self
@@ -38,9 +39,13 @@ module Futamura
     # reverses; `one:` for `first`/`last`/`take`/`find_by`, which return
     # the first loaded record or nil; `unscoped:` for a chain rooted at
     # `Model.unscoped`, which has no default scopes. `model` is a class or
-    # the name of one, resolved at the first call.
-    def define(key, model, reverse: false, one: false, unscoped: false, &build)
-      @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped)
+    # the name of one, resolved at the first call. A chain rooted at an
+    # association reader names the key columns the reader compares to the
+    # owner (`owner_keys`, checked against the reflection) and every column
+    # the association constrains (`owner_columns`).
+    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], &build)
+      @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped,
+                                       owner_keys: owner_keys, owner_columns: owner_columns)
     end
 
     # The key `where(association: value)` binds, as Rails'
@@ -72,12 +77,17 @@ module Futamura
       model = statement.model
       model = statement.model = Object.const_get(model) if model.is_a?(String)
       return fallback.call if root && !root.equal?(model)
+      return fallback.call if owner && !owner_chain?(owner, association, statement, model)
 
       # A `Model.scoping { }` block is part of every `Model.all` inside it.
       return fallback.call if !statement.unscoped && model.current_scope
 
       columns, defaults = statement.unscoped ? NO_DEFAULTS : default_binds(model)
       return fallback.call unless columns
+      # Merging the association's relation into the model's default scope
+      # (Association#scope) replaces a default equality condition on a column
+      # the association constrains; the chain built here keeps both.
+      return fallback.call if owner && (columns & statement.owner_columns).any?
       return fallback.call if defaults.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
       binds = defaults + binds
@@ -108,6 +118,23 @@ module Futamura
     end
 
     private
+
+    # Whether `owner.association` reads like the statement says: a collection
+    # whose key columns are the ones the statement compares, on the owner's
+    # primary key, and no records of its own in memory (CollectionProxy reads a
+    # loaded target, and merges unsaved records into one, instead of querying).
+    def owner_chain?(owner, association, statement, model)
+      proxy = owner.association(association)
+      return false if owner.new_record? || proxy.loaded? || proxy.target.any?
+
+      @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do
+        reflection = owner.class._reflect_on_association(association)
+        primary_key = reflection&.active_record_primary_key
+        !!(reflection && reflection.collection? && !reflection.through_reflection? && reflection.klass.equal?(model) &&
+           primary_key.is_a?(String) && primary_key == owner.class.primary_key &&
+           (statement.owner_keys.nil? || statement.owner_keys == [reflection.foreign_key, reflection.type].compact.map(&:to_s)))
+      end
+    end
 
     # What `Model.all`'s default scopes add to a chain right now, for a
     # statement that is not rooted at `Model.unscoped`. A default scope is
@@ -475,12 +502,13 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         # Why the guards in Futamura.records sent a call to Rails' chain, in the order they are checked.
-        def reason(key, binds, root)
+        def reason(key, binds, root, owner = nil, association = nil)
           bad = binds.find { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
           return "bind_#{kind(bad)}" if bad
 
           statement = Futamura.instance_variable_get(:@statements).fetch(key)
           return "root_not_model" if root && !root.equal?(statement.model)
+          return "owner_chain" if owner && !Futamura.send(:owner_chain?, owner, association, statement, statement.model)
 
           @compile_reasons[key] || "compiled_false"
         end
@@ -531,7 +559,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           fell = nil
           fell_s = 0.0
           timed_fallback = proc do
-            fell = Stats.reason(key, binds, root)
+            fell = Stats.reason(key, binds, root, owner, association)
             t = Stats.now
             begin
               fallback.call
@@ -574,7 +602,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
 
         private
 
-        def compile(statement, connection)
+        def compile(statement, connection, columns)
           t = Stats.now
           result = super
           Stats.compiles << { model: statement.model.name, seconds: Stats.now - t, built: result ? true : false }

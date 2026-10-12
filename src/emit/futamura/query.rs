@@ -92,6 +92,18 @@ struct Chain {
     /// the model it was written in, so the call site passes `self` and a
     /// subclass (which adds its own type condition) runs Rails' chain.
     implicit_self: bool,
+    /// `where` with no arguments was applied: the next link must be `not`
+    /// (`WhereChain#not`), which is not a Relation until it is called.
+    pending_not: bool,
+    /// For an association-rooted chain: the key columns the reader compares
+    /// to the owner (foreign key, then the type column of `as:`), which the
+    /// runtime checks against the reflection it resolves.
+    owner_keys: Vec<String>,
+    /// For an association-rooted chain: every column the association itself
+    /// constrains (its keys and its scope's `where`s). Rails merges them into
+    /// the model's default scope, which replaces that scope's equality
+    /// condition on a column both name; a chained `where` would keep both.
+    owner_columns: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -220,6 +232,12 @@ impl<'a> Specializer<'a> {
             Terminal::One => ", one: true",
         };
         let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
+        let quoted = |columns: &[String]| columns.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
+        let option = if chain.owner.is_some() {
+            format!("{option}, owner_keys: [{}], owner_columns: [{}]", quoted(&chain.owner_keys), quoted(&chain.owner_columns))
+        } else {
+            option
+        };
         let key = format!("{}{}", self.key(e.span), cx.flow.suffix());
         let mut binds = chain.where_binds.clone();
         binds.extend(chain.limit_binds.iter().cloned());
@@ -351,7 +369,7 @@ impl<'a> Specializer<'a> {
         }) else {
             return Ok(None);
         };
-        self.has_many_root(assoc, method, args, || match self.value(owner, cx)? {
+        self.has_many_root(assoc, method, args, cx, || match self.value(owner, cx)? {
             Val::Bind(owner) => Ok(owner),
             Val::Static(_) => Err("static association owner".into()),
         })
@@ -360,11 +378,11 @@ impl<'a> Specializer<'a> {
 
     /// `owner.<method>` for a plain `has_many`, with `owner` the Ruby source
     /// that evaluates to the record at the call site.
-    fn has_many_root(&self, assoc: &Association, method: &Symbol, args: &[Expr], owner: impl FnOnce() -> Result<String, String>) -> Result<Chain, String> {
-        let Association::HasMany { target, foreign_key, through, as_interface, scope, .. } = assoc else {
+    fn has_many_root(&self, assoc: &Association, method: &Symbol, args: &[Expr], cx: &Cx, owner: impl FnOnce() -> Result<String, String>) -> Result<Chain, String> {
+        let Association::HasMany { target, foreign_key, through, as_interface, scope, scope_owner, .. } = assoc else {
             return Err(format!("`{}` is not a has_many", method.as_str()));
         };
-        if through.is_some() || as_interface.is_some() || scope.is_some() || !args.is_empty() {
+        if through.is_some() || scope_owner.is_some() || !args.is_empty() {
             return Err(format!("has_many `{}` has options the specializer does not model", method.as_str()));
         }
         if !self.models.contains_key(target.0.as_str()) {
@@ -374,12 +392,70 @@ impl<'a> Specializer<'a> {
         let mut chain = Chain::new(target.clone(), Some((owner.clone(), method.clone())));
         chain.links.push(format!(".where({}: p.bind)", foreign_key.as_str()));
         chain.where_binds.push(format!("{owner}.id"));
+        chain.owner_keys.push(foreign_key.as_str().to_string());
+        // AssociationScope#last_chain_scope: the key, then the type column of a
+        // polymorphic `as:`, whose value is the owner's `polymorphic_name`.
+        if let Some(interface) = as_interface {
+            let type_column = format!("{}_type", interface.as_str());
+            chain.links.push(format!(".where({type_column}: p.bind)"));
+            chain.where_binds.push(format!("{owner}.class.polymorphic_name"));
+            chain.owner_keys.push(type_column);
+        }
+        chain.owner_columns = chain.owner_keys.clone();
+        if let Some(body) = scope {
+            chain = self.association_scope(chain, method, body, cx)?;
+        }
         Ok(chain)
+    }
+
+    /// The scope lambda of an association (`has_many :x, -> { order(:id) }`),
+    /// evaluated by Rails against the association's relation
+    /// (association_scope.rb `add_constraints`: its `where`s are added after
+    /// the key's, its orders come before the chain's). The body goes through
+    /// the same walk as a scope's, so only literal links are accepted.
+    fn association_scope(&self, chain: Chain, name: &Symbol, body: &Expr, cx: &Cx) -> Result<Chain, String> {
+        let scope = Scope { name: name.clone(), params: Vec::new(), body: body.clone() };
+        let (mut chain, terminal) = self.inline(chain, &scope, &[], cx)?;
+        if terminal != Terminal::Link || chain.pending_not {
+            return Err(format!("has_many `{}` scope does not end in a relation", name.as_str()));
+        }
+        let target = self.models[chain.model.0.as_str()];
+        self.scope_where_columns(target, body, 0, &mut chain.owner_columns);
+        Ok(chain)
+    }
+
+    /// Columns a scope body's `where(column: ...)` links name, following
+    /// calls to the model's own scopes.
+    fn scope_where_columns(&self, model: &Model, e: &Expr, depth: usize, out: &mut Vec<String>) {
+        if let ExprNode::Send { method, args, .. } = &*e.node {
+            if method.as_str() == "where" {
+                for entries in args.iter().filter_map(|a| match &*a.node {
+                    ExprNode::Hash { entries, .. } => Some(entries),
+                    _ => None,
+                }) {
+                    for (k, _) in entries {
+                        if let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node {
+                            out.push(value.as_str().to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(s) = scope_named(model, method)
+                && depth < 8
+            {
+                self.scope_where_columns(model, &s.body, depth + 1, out);
+            }
+        }
+        e.node.for_each_child(&mut |c| self.scope_where_columns(model, c, depth, out));
     }
 
     /// One link applied to a chain, and whether it was a terminal.
     fn apply(&self, mut chain: Chain, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<(Chain, Terminal), String> {
         let model = self.models[chain.model.0.as_str()];
+        // `where` with no arguments answers a WhereChain, not a Relation.
+        if chain.pending_not && method.as_str() != "not" {
+            return Err(format!("`where` followed by `{}`, not `not`", method.as_str()));
+        }
         if let Some(scope) = scope_named(model, method) {
             if scope.params.is_empty() && args.is_empty() && self.static_scope(model, &scope.body, 0) {
                 chain.links.push(format!(".{}", method.as_str()));
@@ -394,7 +470,29 @@ impl<'a> Specializer<'a> {
             return Ok((chain, Terminal::Link));
         }
         match method.as_str() {
-            "where" => {
+            // `where.not(...)` is WhereChain#not: the same conditions, negated
+            // (a hash is NOT (a AND b), as Rails builds it).
+            "where" | "not" => {
+                let negate = method.as_str() == "not";
+                if negate != chain.pending_not {
+                    return Err("`not` without `where`".into());
+                }
+                if !negate && args.is_empty() {
+                    chain.pending_not = true;
+                    return Ok((chain, Terminal::Link));
+                }
+                chain.pending_not = false;
+                let negation = if negate { ".not" } else { "" };
+                // A SQL fragment with literal arguments (`where("a <= ?", 5)`):
+                // Rails sanitizes it into the SQL text when it builds the
+                // statement, so only literals can take part; a request-time
+                // value cannot be a bind.
+                if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Str { .. } })) {
+                    let literal: Option<Vec<String>> = args.iter().map(static_literal).collect();
+                    let literal = literal.ok_or("where with a SQL fragment and a request-time value")?;
+                    chain.links.push(format!(".where{negation}({})", literal.join(", ")));
+                    return Ok((chain, Terminal::Link));
+                }
                 let [arg] = args else { return Err("where with other than one argument".into()) };
                 let ExprNode::Hash { entries, .. } = &*arg.node else {
                     return Err("where with a non-hash condition".into());
@@ -425,7 +523,11 @@ impl<'a> Specializer<'a> {
                             Err(why) => return Err(format!("where on `{}`: {why}", column.as_str())),
                         },
                     }
-                    if matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::Range { .. }) {
+                    // An Array is an IN list whose length a StatementCache
+                    // cannot bind (`unsupported_value?`), so only one written
+                    // out in the source is part of the statement.
+                    let literal_list = matches!(&*v.node, ExprNode::Array { elements, .. } if elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { .. })));
+                    if !literal_list && matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::Range { .. }) {
                         return Err("where value is a collection".into());
                     }
                     let value = match self.value(v, cx)? {
@@ -443,7 +545,7 @@ impl<'a> Specializer<'a> {
                     };
                     pairs.push(format!("{}: {value}", column.as_str()));
                 }
-                chain.links.push(format!(".where({})", pairs.join(", ")));
+                chain.links.push(format!(".where{negation}({})", pairs.join(", ")));
             }
             "order" | "preload" | "includes" => {
                 let mut literal = Vec::new();
@@ -748,6 +850,9 @@ impl Chain {
             limited: false,
             unscoped: false,
             implicit_self: false,
+            pending_not: false,
+            owner_keys: Vec::new(),
+            owner_columns: Vec::new(),
         }
     }
 }

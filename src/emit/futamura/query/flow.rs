@@ -423,6 +423,6 @@ impl<'a> Specializer<'a> {
         if model.body.iter().any(|item| matches!(item, ModelBodyItem::Method { method: m, .. } if m.name == *method)) {
             return Err(format!("`{}` is also defined as a method", method.as_str()));
         }
-        self.has_many_root(assoc, method, args, || Ok("self".to_string())).map(Some)
+        self.has_many_root(assoc, method, args, cx, || Ok("self".to_string())).map(Some)
     }
 }
