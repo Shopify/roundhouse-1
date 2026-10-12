@@ -5,7 +5,7 @@
 //! Relation over bind placeholders:
 //!
 //! ```ruby
-//! Futamura.define(:key, Message, reverse: true) { |p|
+//! Futamura.define(:key, "Message", reverse: true) { |p|
 //!   Message.where(room_id: p.bind).with_creator.order(:created_at).limit(40).reverse_order }
 //! ```
 //!
@@ -29,11 +29,13 @@
 //! - Terminal: `first(n)` / `last(n)` on an ordered chain, or `to_a`.
 //!
 //! Request-time values become binds evaluated at the call site. Anything
-//! else declines with a reason, and the site stays Rails'. A model that
-//! may have a `default_scope` (its own source, superclasses, or included
-//! modules, transitively; see `scoping`) is never specialized: ingest does
-//! not model it, so the generated root `where` could not be trusted to be
-//! complete.
+//! else declines with a reason, and the site stays Rails'. A model's
+//! `default_scope` is Ruby that runs when `Model.all` is evaluated, so it
+//! is not decided here: the runtime has Rails evaluate it at each call and
+//! builds the statement over the equality conditions it found there, as
+//! binds (`Futamura.default_binds`), or runs Rails' chain when it is
+//! anything else. A chain rooted at `Model.unscoped` has no default scopes
+//! and says so (`unscoped: true`).
 
 use std::collections::HashMap;
 
@@ -111,8 +113,9 @@ pub struct Specializer<'a> {
     /// Integer class constants by bare name; `None` when two classes give
     /// the same name different values.
     int_consts: HashMap<String, Option<i64>>,
-    /// Models that may carry a `default_scope`, with why.
-    default_scoped: HashMap<String, String>,
+    /// Models their own source makes `private_constant`: the generated
+    /// initializer, outside their namespace, cannot name them.
+    private_models: std::collections::HashSet<String>,
     /// The dumps of the databases other than the primary.
     schemas: super::schemas::DatabaseSchemas,
 }
@@ -129,13 +132,8 @@ impl<'a> Specializer<'a> {
                 }
             }
         }
-        let scoping = super::scoping::DefaultScopes::new(app);
-        let default_scoped = app
-            .models
-            .iter()
-            .filter_map(|m| scoping.why(m).map(|why| (m.name.0.as_str().to_string(), why)))
-            .collect();
-        Specializer { app, models, int_consts, default_scoped, schemas }
+        let private_models = app.models.iter().filter(|m| makes_private(app, m)).map(|m| m.name.0.as_str().to_string()).collect();
+        Specializer { app, models, int_consts, private_models, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -190,14 +188,19 @@ impl<'a> Specializer<'a> {
         if e.span.is_synthetic() {
             return Some(Err("synthesized call site".into()));
         }
+        // `a&.b` is lowered to `a && a.b`, whose guard the specialized call
+        // (which reads `a.id` before it runs anything) would drop.
+        if self.source_text(e.span).contains("&.") {
+            return Some(Err("safe navigation in the chain".into()));
+        }
         Some(self.specialize(e, recv, method, args, cx))
     }
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
-        if let Some(why) = self.default_scoped.get(chain.model.0.as_str()).filter(|_| !chain.unscoped) {
-            return Err(format!("{} may have a default_scope ({why})", chain.model.0.as_str()));
+        if self.private_models.contains(chain.model.0.as_str()) {
+            return Err(format!("{} is a private_constant", chain.model.0.as_str()));
         }
         let option = match terminal {
             Terminal::Link => return Err("chain does not end in a terminal".into()),
@@ -205,13 +208,14 @@ impl<'a> Specializer<'a> {
             Terminal::Records { reverse: true } => ", reverse: true",
             Terminal::One => ", one: true",
         };
+        let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
         let key = self.key(e.span);
         let mut binds = chain.where_binds.clone();
         binds.extend(chain.limit_binds.iter().cloned());
         // `Model.all` roots the block in a Relation: a link such as
         // `ordered_relation` is a Relation method, not a class method.
         let define = format!(
-            "Futamura.define(:{key}, {model}{option}) {{ |p| {model}.{root}{links} }}",
+            "Futamura.define(:{key}, \"{model}\"{option}) {{ |p| {model}.{root}{links} }}",
             model = chain.model.0.as_str(),
             root = if chain.unscoped { "unscoped" } else { "all" },
             links = chain.links.concat(),
@@ -223,6 +227,11 @@ impl<'a> Specializer<'a> {
         let root = if chain.implicit_self { ", root: self" } else { "" };
         let call = format!("Futamura.records(:{key}, [{}]{owner}{root}) {{ {{orig}} }}", binds.join(", "));
         Ok(Site { span: e.span, call, define })
+    }
+
+    fn source_text(&self, span: Span) -> &str {
+        let text = &self.app.sources[span.file.0 as usize - 1].text;
+        text.get(span.start as usize..span.end as usize).unwrap_or("")
     }
 
     fn key(&self, span: Span) -> String {
@@ -740,6 +749,17 @@ fn non_nil_class(ty: &Ty) -> Option<&ClassId> {
     }
 }
 
+/// Does the model's own source mark its constant `private_constant`? A private
+/// constant cannot be named as `Namespace::Model` from outside the namespace
+/// (Module#private_constant), which the generated initializer does.
+fn makes_private(app: &App, model: &Model) -> bool {
+    let Some(source) = (model.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else { return false };
+    let bare = model.name.0.as_str().rsplit("::").next().unwrap_or("");
+    source.text.lines().map(str::trim_start).filter(|l| l.starts_with("private_constant")).any(|l| {
+        l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word == bare)
+    })
+}
+
 fn scope_named<'m>(m: &'m Model, name: &Symbol) -> Option<&'m Scope> {
     m.body.iter().find_map(|item| match item {
         ModelBodyItem::Scope { scope, .. } if &scope.name == name => Some(scope),
@@ -802,7 +822,10 @@ fn static_literal(e: &Expr) -> Option<String> {
 /// combined with `||`/`&&`. Blocks and anything else decline.
 fn is_call_site_value(e: &Expr) -> bool {
     match &*e.node {
-        ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef => true,
+        // A local the analysis introduced (`__safe_nav1` for `a&.b`) is not in
+        // the source, so the call site cannot read it.
+        ExprNode::Var { name, .. } => !name.as_str().starts_with("__"),
+        ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
         // A constant names the same object at the call site as in the
         // fallback block (same lexical scope). Only as a value or argument:
         // a call on a constant (`Enum.serialize(x)`) runs arbitrary class

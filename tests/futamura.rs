@@ -230,7 +230,7 @@ end
         // and `last(n)` follows Rails' FinderMethods: ordered_relation,
         // limit, reverse_order, then the rows reversed.
         assert!(init.contains(
-            "Futamura.define(:controllers_messages_controller_4_17, Message, reverse: true) \
+            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true) \
              { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
@@ -284,8 +284,8 @@ mod single_record_terminals {
         let get = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
         let init = get(INITIALIZER);
         let out = get("app/controllers/stories_controller.rb");
-        assert!(init.contains("Story, one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
-        assert!(init.contains("Story, one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
         assert!(out.contains("[params[:id].to_s]) { Story.where(short_id: params[:id].to_s).first }"), "{out}");
         assert!(out.contains("[params[:id] || params[:story_id]]) {"), "{out}");
     }
@@ -516,38 +516,37 @@ mod dumps_with_unmodeled_statements {
     }
 }
 
-/// Rails inherits default scopes down the superclass chain and through
-/// included modules (activerecord/lib/active_record/scoping/default.rb), so
-/// only a model that reaches a `default_scope` is left to Rails.
-mod default_scope_reach {
+/// A model's default scopes are Ruby that runs when `Model.all` is
+/// evaluated (activerecord/lib/active_record/scoping/default.rb), possibly
+/// reading request state or branching. The emit therefore does not decide
+/// them: a chain on such a model is specialized like any other, and the
+/// runtime has Rails evaluate the scopes at each call and bind what they
+/// compare.
+mod default_scope_runtime {
     use std::path::PathBuf;
+    use std::process::Command;
 
     use roundhouse::analyze::Analyzer;
-    use roundhouse::emit::futamura::specialize;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
     use roundhouse::ingest::ingest_app_from_tree;
 
-    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"plain_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"scoped_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"nested_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"derived_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"dynamic_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"gem_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"plain_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"scoped_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"nested_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"derived_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"dynamic_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
 
-    fn run() -> roundhouse::emit::futamura::Report {
+    fn run() -> (roundhouse::emit::futamura::Report, Vec<(String, String)>) {
         let files: Vec<(&str, &str)> = vec![
             ("db/schema.rb", SCHEMA),
             ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
-            // A concern that scopes whoever includes it.
             ("app/models/concerns/tenanted.rb", "module Tenanted\n  extend ActiveSupport::Concern\n  included do\n    default_scope { where(name: Current.name) }\n  end\nend\n"),
-            // A concern that reaches the scoping one only through another.
             ("app/models/concerns/wrapped.rb", "module Wrapped\n  extend ActiveSupport::Concern\n  included do\n    include Tenanted\n  end\nend\n"),
-            ("app/models/concerns/harmless.rb", "module Harmless\n  extend ActiveSupport::Concern\n  def hello = 1\nend\n"),
             ("app/models/base_thing.rb", "class BaseThing < ApplicationRecord\n  self.abstract_class = true\n  default_scope { order(:id) }\nend\n"),
-            ("app/models/plain_thing.rb", "class PlainThing < ApplicationRecord\n  include Harmless\nend\n"),
+            ("app/models/plain_thing.rb", "class PlainThing < ApplicationRecord\nend\n"),
             ("app/models/scoped_thing.rb", "class ScopedThing < ApplicationRecord\n  include Tenanted\nend\n"),
             ("app/models/nested_thing.rb", "class NestedThing < ApplicationRecord\n  include Wrapped\nend\n"),
             ("app/models/derived_thing.rb", "class DerivedThing < BaseThing\nend\n"),
             ("app/models/dynamic_thing.rb", "class DynamicThing < ApplicationRecord\n  include Module.new\nend\n"),
-            // A gem's module has no app source: Rails reports its scopes at run time.
-            ("app/models/gem_thing.rb", "class GemThing < ApplicationRecord\n  include Discard::Model\nend\n"),
             (
                 "app/services/finder.rb",
-                "class Finder\n  def self.all_of(x)\n    [PlainThing.where(name: x).to_a, ScopedThing.where(name: x).to_a, NestedThing.where(name: x).to_a, DerivedThing.where(name: x).to_a, DynamicThing.where(name: x).to_a, GemThing.where(name: x).to_a]\n  end\nend\n",
+                "class Finder\n  def self.all_of(x)\n    [PlainThing.where(name: x).to_a, ScopedThing.where(name: x).to_a, NestedThing.where(name: x).to_a, DerivedThing.where(name: x).to_a, DynamicThing.where(name: x).to_a]\n  end\n  def self.bare(x)\n    ScopedThing.unscoped.where(name: x).to_a\n  end\nend\n",
             ),
         ];
         let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
@@ -555,52 +554,65 @@ mod default_scope_reach {
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         Analyzer::new(&app).analyze(&mut app);
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
-        specialize(&app, &mut tree_files).unwrap()
-    }
-
-    #[test]
-    fn only_models_that_reach_a_default_scope_stay_residue() {
-        let report = run();
-        let residue = report.residue.join("\n");
-        for stays in ["ScopedThing", "NestedThing", "DerivedThing", "DynamicThing"] {
-            assert!(residue.contains(&format!("{stays} may have a default_scope")), "{stays}: {residue}");
-        }
-        // The unrelated concern's default_scope no longer taints every model.
-        assert!(!residue.contains("PlainThing may have"), "{residue}");
-        assert!(!residue.contains("GemThing may have"), "{residue}");
-        assert_eq!(report.specialized.len(), 2, "{:?}\n{residue}", report.specialized);
-    }
-
-    /// A constant is resolved through the namespaces around it, so a model
-    /// is not tainted by a same-named class in another namespace.
-    #[test]
-    fn a_same_named_class_in_another_namespace_does_not_taint_a_model() {
-        let files: Vec<(&str, &str)> = vec![
-            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"admin_things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
-            ("app/models/concerns/tenanted.rb", "module Tenanted\n  extend ActiveSupport::Concern\n  included do\n    default_scope { where(name: Current.name) }\n  end\nend\n"),
-            ("app/models/thing.rb", "class Thing < ApplicationRecord\nend\n"),
-            ("app/models/admin/thing.rb", "module Admin\n  class Thing < ApplicationRecord\n    include Tenanted\n  end\nend\n"),
-            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    [Thing.where(name: x).to_a, Admin::Thing.where(name: x).to_a]\n  end\nend\n"),
-        ];
-        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
-            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
-        let mut app = ingest_app_from_tree(tree).expect("ingest");
-        Analyzer::new(&app).analyze(&mut app);
-        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
         let report = specialize(&app, &mut tree_files).unwrap();
-        let residue = report.residue.join("\n");
-        assert!(residue.contains("Admin::Thing may have a default_scope"), "{residue}");
-        assert!(!residue.contains(": Thing may have"), "{residue}");
-        assert_eq!(report.specialized.len(), 1, "{residue}");
+        (report, tree_files)
     }
 
+    /// Reaching a `default_scope` (own, inherited, through a concern or
+    /// through a module the walk cannot follow) no longer keeps a chain
+    /// from being specialized: the runtime decides.
     #[test]
-    fn the_residue_names_where_the_default_scope_came_from() {
-        let report = run();
-        let residue = report.residue.join("\n");
-        assert!(residue.contains("tenanted.rb declares a default_scope"), "{residue}");
-        assert!(residue.contains("base_thing.rb declares a default_scope"), "{residue}");
-        assert!(residue.contains("dynamic_thing.rb includes a module the specializer cannot resolve"), "{residue}");
+    fn a_chain_on_a_model_that_reaches_a_default_scope_is_specialized() {
+        let (report, files) = run();
+        assert_eq!(report.specialized.len(), 6, "{:?}", report.residue);
+        assert!(!report.residue.iter().any(|r| r.contains("default_scope")), "{:?}", report.residue);
+        let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
+        assert!(init.contains("\"ScopedThing\") { |p| ScopedThing.all.where(name: p.bind) }"), "{init}");
+    }
+
+    /// `Model.unscoped` has no default scopes, which the runtime is told so
+    /// it does not evaluate them for the statement.
+    #[test]
+    fn a_chain_rooted_at_unscoped_says_so() {
+        let (_, files) = run();
+        let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
+        assert!(init.contains("\"ScopedThing\", unscoped: true) { |p| ScopedThing.unscoped.where(name: p.bind) }"), "{init}");
+        assert!(!init.contains("PlainThing, unscoped"), "{init}");
+    }
+
+    /// The run-time half, against real ActiveRecord on SQLite with
+    /// FUTAMURA_VERIFY=1 (every specialized result is compared with Rails'
+    /// own chain, and a mismatch raises). The probe covers a default scope
+    /// that reads state and branches, one that is not a plain condition, a
+    /// `default_scope` method, nil, `unscoped`, and `scoping`/`unscoped`
+    /// blocks. Skipped when ActiveRecord and sqlite3 are not installed.
+    #[test]
+    fn default_scopes_are_bound_at_run_time_and_agree_with_rails_under_verify() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_default_scope_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        let verified = output("1");
+        let normal = output("0");
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("fallbacks=") && !l.starts_with("calls_item=") && !l.starts_with('[')).collect::<Vec<_>>().join("\n");
+        // Specialized and Rails' answers agree (verify raises otherwise), and
+        // the verified run changes nothing.
+        assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
+        assert!(normal.contains("item/1=[1, 1]\nitem/2=[2]\nitem/3=[nil]\nitem/nil=[1]\narchived=nil\nunscoped=1\n"), "{normal}");
+        // The scope ran once for a call the specialized statement served,
+        // and a call it cannot serve ran Rails' chain (nil, a join/order,
+        // a scoping block).
+        assert!(normal.contains("calls_item=[1, 0]"), "{normal}");
+        assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
     }
 }
 
@@ -683,14 +695,13 @@ mod more_links_and_values {
     }
 
     /// Scoping::Default::ClassMethods#unscoped is `relation` without the
-    /// default scopes, so the statement is rooted there and the model's
-    /// default scope no longer stands in the way.
+    /// default scopes, so the statement is rooted there and says so.
     #[test]
-    fn unscoped_directly_on_a_model_drops_the_default_scope_guard() {
+    fn unscoped_directly_on_a_model_is_rooted_without_default_scopes() {
         let (report, files) = run("class Finder\n  def self.by_key(key)\n    Client.unscoped.where(key: key).first\n  end\n  def self.scoped(key)\n    Client.where(key: key).first\n  end\nend\n");
-        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
-        assert!(init(&files).contains("Client, one: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
-        assert!(report.residue.iter().any(|r| r.contains("Client may have a default_scope")), "{:?}", report.residue);
+        assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
+        assert!(init(&files).contains("\"Client\", one: true, unscoped: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
+        assert!(init(&files).contains("\"Client\", one: true) { |p| Client.all.where(key: p.bind)"), "{}", init(&files));
     }
 
     #[test]
@@ -746,7 +757,7 @@ mod implicit_class_self {
         let page = &tree_files.iter().find(|(p, _)| p == "app/models/page.rb").unwrap().1;
         assert!(page.contains("[slug], root: self) { where(slug: slug, live: true).order(:id).first }"), "{page}");
         let init = &tree_files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("Page, one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
+        assert!(init.contains("\"Page\", one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
         // The instance method's `where` is not a class call: it stays Rails'.
         assert!(page.contains("    where(slug: slug).first\n"), "{page}");
     }
@@ -803,5 +814,96 @@ mod runtime_stats {
         if let Ok(ruby) = Command::new("ruby").arg("-c").arg(out.join(INITIALIZER)).output() {
             assert!(ruby.status.success(), "{}", String::from_utf8_lossy(&ruby.stderr));
         }
+    }
+}
+
+/// A concern's method is analyzed once for each class that includes it, but
+/// its source is one text: copies that specialize alike are spliced once,
+/// not reported as overlapping.
+mod shared_concern_sites {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn one_site_in_a_concern_included_twice_is_specialized_once() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("app/models/concerns/findable.rb", "module Findable\n  extend ActiveSupport::Concern\n  def same_named\n    Thing.where(name: name).to_a\n  end\nend\n"),
+            ("app/models/thing.rb", "class Thing < ApplicationRecord\n  include Findable\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\n  include Findable\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.is_empty(), "{:?}", report.residue);
+    }
+}
+
+/// `Module#private_constant`: `Namespace::Model` raises NameError outside the
+/// namespace, and the generated initializer is outside every namespace.
+mod private_model_constants {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_model_that_makes_its_own_constant_private_is_left_to_rails() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/hidden/thing.rb", "module Hidden\n  class Thing < ApplicationRecord\n  end\n  private_constant(:Thing)\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\nend\n"),
+            ("app/services/hidden/finder.rb", "module Hidden\n  class Finder\n    def self.of(x)\n      Thing.where(name: x).to_a\n    end\n  end\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    Other.where(name: x).to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("Hidden::Thing is a private_constant")), "{:?}", report.residue);
+    }
+}
+
+/// `a&.b` returns nil for a nil `a`; the specialized call reads the owner's
+/// key first (`a.id`), and analysis binds a non-trivial owner to a temp local
+/// (`__safe_nav1`) that exists only in its IR, so such a chain stays Rails'.
+mod safe_navigation_owner {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_chain_through_safe_navigation_is_left_to_rails() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"messages\", force: :cascade do |t|\n    t.integer \"room_id\"\n    t.string \"body\"\n  end\nend\n"),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\n  has_many :messages\nend\n"),
+            ("app/models/message.rb", "class Message < ApplicationRecord\n  belongs_to :room\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  #: (Room?) -> Array[Message]?\n  def self.of(room)\n    room&.messages&.to_a\n  end\n  #: (Room) -> Array[Message]\n  def self.sure(room)\n    room.messages.to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let finder = &tree_files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.lines().filter(|l| l.contains("room&.messages")).all(|l| !l.contains("Futamura.records")), "{finder}");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("safe navigation in the chain")), "{:?}", report.residue);
     }
 }

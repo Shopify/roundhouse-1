@@ -18,19 +18,29 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
+
+  # What a model's default scopes add to a query, as the columns each
+  # compares for equality and the values it compared them to.
+  NO_DEFAULTS = [[].freeze, [].freeze].freeze
+  # A model whose default scopes are this many times in a row not that
+  # simple is left to Rails' chain without evaluating them first.
+  OPAQUE_LIMIT = 5
 
   @statements = {}
   @compiled = Concurrent::Map.new
+  @opaque = Concurrent::Map.new
   VERIFY = ENV["FUTAMURA_VERIFY"] == "1"
 
   class << self
     # `reverse:` for `last(n)`, whose rows Rails loads newest first and
     # reverses; `one:` for `first`/`last`/`take`/`find_by`, which return
-    # the first loaded record or nil.
-    def define(key, model, reverse: false, one: false, &build)
-      @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one)
+    # the first loaded record or nil; `unscoped:` for a chain rooted at
+    # `Model.unscoped`, which has no default scopes. `model` is a class or
+    # the name of one, resolved at the first call.
+    def define(key, model, reverse: false, one: false, unscoped: false, &build)
+      @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped)
     end
 
     # The key `where(association: value)` binds, as Rails'
@@ -57,12 +67,23 @@ module Futamura
       return fallback.call if binds.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
       statement = @statements.fetch(key)
-      return fallback.call if root && !root.equal?(statement.model)
-
+      # Named by a String so that defining a statement loads no model: a class
+      # body may need run-time state (I18n) a `to_prepare` hook runs too early for.
       model = statement.model
+      model = statement.model = Object.const_get(model) if model.is_a?(String)
+      return fallback.call if root && !root.equal?(model)
+
+      # A `Model.scoping { }` block is part of every `Model.all` inside it.
+      return fallback.call if !statement.unscoped && model.current_scope
+
+      columns, defaults = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+      return fallback.call unless columns
+      return fallback.call if defaults.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+
+      binds = defaults + binds
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements]) { compile(statement, connection) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns]) { compile(statement, connection, columns) }
         compiled && compiled.cache.execute(binds, connection)
       end
       return fallback.call unless compiled
@@ -88,17 +109,78 @@ module Futamura
 
     private
 
+    # What `Model.all`'s default scopes add to a chain right now, for a
+    # statement that is not rooted at `Model.unscoped`. A default scope is
+    # Ruby that runs at query time (it may read request state, branch, or
+    # return nil), so Rails evaluates it here, once per call, exactly as
+    # `Model.all` would. The result is usable only when it is the model's
+    # `unscoped` relation plus `where(column: value)` equality conditions on
+    # its own table: then the statement is built over the same conditions
+    # with the values as binds (see `compile`), and one statement serves
+    # every value. Anything else (a condition that is not equality, nil, a
+    # join, an order, an extension...) is nil, and the caller runs Rails'
+    # chain. Returns `[columns, values]`.
+    def default_binds(model)
+      return NO_DEFAULTS if model.default_scopes.empty? && !default_scope_method?(model)
+      return if (@opaque[model] || 0) >= OPAQUE_LIMIT
+
+      shape = default_shape(model, model.unscoped, model.default_scoped)
+      if shape
+        @opaque.delete(model)
+      else
+        @opaque[model] = (@opaque[model] || 0) + 1
+      end
+      shape
+    end
+
+    # Scoping::Default::ClassMethods#build_default_scope also honors a
+    # class that defines `default_scope` itself.
+    def default_scope_method?(model)
+      !ActiveRecord::Base.is_a?(model.method(:default_scope).owner)
+    end
+
+    def default_shape(model, base, scoped)
+      return unless scoped.values.except(:where) == base.values.except(:where)
+
+      before = base.where_clause.send(:predicates)
+      predicates = scoped.where_clause.send(:predicates)
+      return unless predicates.first(before.size) == before
+
+      columns = []
+      values = []
+      predicates.drop(before.size).each do |node|
+        return unless node.instance_of?(Arel::Nodes::Equality)
+
+        attribute, bind = node.left, node.right
+        # Predicate builder puts the QueryAttribute itself on the right (Arel
+        # makes the bind of it when it compiles); a BindParam wraps one too.
+        bind = bind.value if bind.is_a?(Arel::Nodes::BindParam)
+        return unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
+        return unless bind.is_a?(ActiveRecord::Relation::QueryAttribute)
+        return unless model.columns_hash.key?(attribute.name.to_s) && bind.name == attribute.name.to_s
+
+        columns << attribute.name.to_s
+        values << bind.value
+      end
+      [columns.freeze, values]
+    end
+
     # Build the Relation once and keep what loading it needs. `false` (not
     # nil, so compute_if_absent remembers it) when Rails would load it in a
-    # way a StatementCache cannot reproduce.
-    def compile(statement, connection)
-      # `Model.all` applies default scopes, and the block runs once: a scope
-      # a gem or a reopened class added, which Roundhouse's source walk did
-      # not see, may read request state. Rails' own path handles it.
-      return false if statement.model.default_scopes.any?
-
+    # way a StatementCache cannot reproduce. A chain that is not rooted at
+    # `Model.unscoped` is built inside `Model.unscoped.where(column: bind)...
+    # .scoping`, so its `Model.all` is that relation: no default scope runs
+    # and none is frozen into the statement.
+    def compile(statement, connection, columns)
       relation = nil
-      cache = ActiveRecord::StatementCache.create(connection) { |params| relation = statement.build.call(params) }
+      cache = ActiveRecord::StatementCache.create(connection) do |params|
+        relation = if statement.unscoped
+          statement.build.call(params)
+        else
+          base = columns.inject(statement.model.unscoped) { |scope, column| scope.where(column => params.bind) }
+          base.scoping { statement.build.call(params) }
+        end
+      end
       return false if relation.eager_loading? || relation.readonly_value || relation.extending_values.any?
 
       preload = relation.preload_values + relation.includes_values
