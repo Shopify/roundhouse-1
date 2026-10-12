@@ -831,6 +831,52 @@ mod default_condition_runtime {
     }
 }
 
+/// A statement is built over placeholders and run with the values in order, so it must keep one
+/// slot for each placeholder (`StatementCache::BindMap`). An integer IN list serializes a
+/// placeholder to nil and `HomogeneousIn#casted_values` compacts it away, shifting every later
+/// value by one; such a statement, and one whose build raises an Exception that is not a
+/// StandardError, is Rails' chain to run. The probe (`tests/futamura_bind_count_runtime.rb`) runs
+/// real ActiveRecord on SQLite.
+mod bind_count_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_bind_count_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    /// Each line is `name=[[record ids, calls that ran Rails' chain], ...]`.
+    #[test]
+    fn a_statement_that_lost_placeholders_runs_rails_chain() {
+        let Some(normal) = probe("0") else { return };
+        assert!(normal.contains("rank=[[[2], 1], [[1, 2], 1]]\n"), "{normal}");
+        // The same list over a string column keeps its slots: the statement answers.
+        assert!(normal.contains("name=[[[2], 0], [[1, 2], 0]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_build_that_raises_an_exception_is_a_refusal_not_a_crash() {
+        let Some(normal) = probe("0") else { return };
+        assert!(normal.contains("raising=[[1, 2, 3], 1]\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_same_chains_agree_with_rails_under_verify() {
+        let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
+        // Verify runs the chain as written next to the statement, so only the records are compared.
+        let ids = |s: &str| s.lines().filter(|l| l.contains(".ids=")).map(String::from).collect::<Vec<_>>();
+        assert_eq!(ids(&verified), ids(&normal), "{verified}\n{normal}");    }
+}
+
 /// `where(author: record_or_id)`: PredicateBuilder#expand_from_hash expands
 /// a `belongs_to` name to its foreign key (and, for a polymorphic one, the
 /// type column too). Only the non-polymorphic case is statically one
