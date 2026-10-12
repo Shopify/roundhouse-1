@@ -5,7 +5,7 @@
 //! Relation over bind placeholders:
 //!
 //! ```ruby
-//! Futamura.define(:key, Message, reverse: true) { |p|
+//! Futamura.define(:key, "Message", reverse: true) { |p|
 //!   Message.where(room_id: p.bind).with_creator.order(:created_at).limit(40).reverse_order }
 //! ```
 //!
@@ -113,6 +113,9 @@ pub struct Specializer<'a> {
     /// Integer class constants by bare name; `None` when two classes give
     /// the same name different values.
     int_consts: HashMap<String, Option<i64>>,
+    /// Models their own source makes `private_constant`: the generated
+    /// initializer, outside their namespace, cannot name them.
+    private_models: std::collections::HashSet<String>,
     /// The dumps of the databases other than the primary.
     schemas: super::schemas::DatabaseSchemas,
 }
@@ -129,7 +132,8 @@ impl<'a> Specializer<'a> {
                 }
             }
         }
-        Specializer { app, models, int_consts, schemas }
+        let private_models = app.models.iter().filter(|m| makes_private(app, m)).map(|m| m.name.0.as_str().to_string()).collect();
+        Specializer { app, models, int_consts, private_models, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -190,6 +194,9 @@ impl<'a> Specializer<'a> {
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
+        if self.private_models.contains(chain.model.0.as_str()) {
+            return Err(format!("{} is a private_constant", chain.model.0.as_str()));
+        }
         let option = match terminal {
             Terminal::Link => return Err("chain does not end in a terminal".into()),
             Terminal::Records { reverse: false } => "",
@@ -203,7 +210,7 @@ impl<'a> Specializer<'a> {
         // `Model.all` roots the block in a Relation: a link such as
         // `ordered_relation` is a Relation method, not a class method.
         let define = format!(
-            "Futamura.define(:{key}, {model}{option}) {{ |p| {model}.{root}{links} }}",
+            "Futamura.define(:{key}, \"{model}\"{option}) {{ |p| {model}.{root}{links} }}",
             model = chain.model.0.as_str(),
             root = if chain.unscoped { "unscoped" } else { "all" },
             links = chain.links.concat(),
@@ -730,6 +737,17 @@ fn non_nil_class(ty: &Ty) -> Option<&ClassId> {
         }
         _ => None,
     }
+}
+
+/// Does the model's own source mark its constant `private_constant`? A private
+/// constant cannot be named as `Namespace::Model` from outside the namespace
+/// (Module#private_constant), which the generated initializer does.
+fn makes_private(app: &App, model: &Model) -> bool {
+    let Some(source) = (model.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else { return false };
+    let bare = model.name.0.as_str().rsplit("::").next().unwrap_or("");
+    source.text.lines().map(str::trim_start).filter(|l| l.starts_with("private_constant")).any(|l| {
+        l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word == bare)
+    })
 }
 
 fn scope_named<'m>(m: &'m Model, name: &Symbol) -> Option<&'m Scope> {

@@ -37,7 +37,8 @@ module Futamura
     # `reverse:` for `last(n)`, whose rows Rails loads newest first and
     # reverses; `one:` for `first`/`last`/`take`/`find_by`, which return
     # the first loaded record or nil; `unscoped:` for a chain rooted at
-    # `Model.unscoped`, which has no default scopes.
+    # `Model.unscoped`, which has no default scopes. `model` is a class or
+    # the name of one, resolved at the first call.
     def define(key, model, reverse: false, one: false, unscoped: false, &build)
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped)
     end
@@ -66,9 +67,12 @@ module Futamura
       return fallback.call if binds.any? { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
 
       statement = @statements.fetch(key)
-      return fallback.call if root && !root.equal?(statement.model)
-
+      # Named by a String so that defining a statement loads no model: a class
+      # body may need run-time state (I18n) a `to_prepare` hook runs too early for.
       model = statement.model
+      model = statement.model = Object.const_get(model) if model.is_a?(String)
+      return fallback.call if root && !root.equal?(model)
+
       # A `Model.scoping { }` block is part of every `Model.all` inside it.
       return fallback.call if !statement.unscoped && model.current_scope
 

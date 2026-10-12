@@ -230,7 +230,7 @@ end
         // and `last(n)` follows Rails' FinderMethods: ordered_relation,
         // limit, reverse_order, then the rows reversed.
         assert!(init.contains(
-            "Futamura.define(:controllers_messages_controller_4_17, Message, reverse: true) \
+            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true) \
              { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
@@ -284,8 +284,8 @@ mod single_record_terminals {
         let get = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
         let init = get(INITIALIZER);
         let out = get("app/controllers/stories_controller.rb");
-        assert!(init.contains("Story, one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
-        assert!(init.contains("Story, one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
+        assert!(init.contains("\"Story\", one: true) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
         assert!(out.contains("[params[:id].to_s]) { Story.where(short_id: params[:id].to_s).first }"), "{out}");
         assert!(out.contains("[params[:id] || params[:story_id]]) {"), "{out}");
     }
@@ -567,7 +567,7 @@ mod default_scope_runtime {
         assert_eq!(report.specialized.len(), 6, "{:?}", report.residue);
         assert!(!report.residue.iter().any(|r| r.contains("default_scope")), "{:?}", report.residue);
         let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("ScopedThing) { |p| ScopedThing.all.where(name: p.bind) }"), "{init}");
+        assert!(init.contains("\"ScopedThing\") { |p| ScopedThing.all.where(name: p.bind) }"), "{init}");
     }
 
     /// `Model.unscoped` has no default scopes, which the runtime is told so
@@ -576,7 +576,7 @@ mod default_scope_runtime {
     fn a_chain_rooted_at_unscoped_says_so() {
         let (_, files) = run();
         let init = &files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("ScopedThing, unscoped: true) { |p| ScopedThing.unscoped.where(name: p.bind) }"), "{init}");
+        assert!(init.contains("\"ScopedThing\", unscoped: true) { |p| ScopedThing.unscoped.where(name: p.bind) }"), "{init}");
         assert!(!init.contains("PlainThing, unscoped"), "{init}");
     }
 
@@ -700,8 +700,8 @@ mod more_links_and_values {
     fn unscoped_directly_on_a_model_is_rooted_without_default_scopes() {
         let (report, files) = run("class Finder\n  def self.by_key(key)\n    Client.unscoped.where(key: key).first\n  end\n  def self.scoped(key)\n    Client.where(key: key).first\n  end\nend\n");
         assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
-        assert!(init(&files).contains("Client, one: true, unscoped: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
-        assert!(init(&files).contains("Client, one: true) { |p| Client.all.where(key: p.bind)"), "{}", init(&files));
+        assert!(init(&files).contains("\"Client\", one: true, unscoped: true) { |p| Client.unscoped.where(key: p.bind)"), "{}", init(&files));
+        assert!(init(&files).contains("\"Client\", one: true) { |p| Client.all.where(key: p.bind)"), "{}", init(&files));
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod implicit_class_self {
         let page = &tree_files.iter().find(|(p, _)| p == "app/models/page.rb").unwrap().1;
         assert!(page.contains("[slug], root: self) { where(slug: slug, live: true).order(:id).first }"), "{page}");
         let init = &tree_files.iter().find(|(p, _)| p == INITIALIZER).unwrap().1;
-        assert!(init.contains("Page, one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
+        assert!(init.contains("\"Page\", one: true) { |p| Page.all.where(slug: p.bind, live: true).order(:id)"), "{init}");
         // The instance method's `where` is not a class call: it stays Rails'.
         assert!(page.contains("    where(slug: slug).first\n"), "{page}");
     }
@@ -789,5 +789,35 @@ mod shared_concern_sites {
         let report = specialize(&app, &mut tree_files).unwrap();
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
         assert!(report.residue.is_empty(), "{:?}", report.residue);
+    }
+}
+
+/// `Module#private_constant`: `Namespace::Model` raises NameError outside the
+/// namespace, and the generated initializer is outside every namespace.
+mod private_model_constants {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_model_that_makes_its_own_constant_private_is_left_to_rails() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/hidden/thing.rb", "module Hidden\n  class Thing < ApplicationRecord\n  end\n  private_constant(:Thing)\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\nend\n"),
+            ("app/services/hidden/finder.rb", "module Hidden\n  class Finder\n    def self.of(x)\n      Thing.where(name: x).to_a\n    end\n  end\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  def self.of(x)\n    Other.where(name: x).to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("Hidden::Thing is a private_constant")), "{:?}", report.residue);
     }
 }

@@ -31,7 +31,7 @@ load ARGV[0]
 Futamura.define(:item, Item, one: true) { |p| Item.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:item_unscoped, Item, one: true, unscoped: true) { |p| Item.unscoped.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:ranked, Ranked, one: true) { |p| Ranked.all.where(code: p.bind).send(:ordered_relation).limit(1) }
-Futamura.define(:plain, Plain, one: true) { |p| Plain.all.where(code: p.bind).send(:ordered_relation).limit(1) }
+Futamura.define(:plain, "Plain", one: true) { |p| Plain.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:legacy, Legacy, one: true) { |p| Legacy.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 
 $fallbacks = 0; $log = []
