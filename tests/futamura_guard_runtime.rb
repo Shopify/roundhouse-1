@@ -130,6 +130,24 @@ Current.zone = 1
 out["extension_scope"] = [counted { run(:tag_recent, ["x"]) { Tag.all.where(code: "x").recent.first } }]
 Current.zone = nil
 
+# 5b. Rails' own `where`, reached through another path to the same files (a gem home whose
+# entries are symlinks): its source_location names the other path, but it is still Rails'. The
+# same method defined from a file outside Rails is the app's.
+require "tmpdir"
+require "fileutils"
+alias_home = Dir.mktmpdir("fut-guard")
+real_rails = File.realpath(Futamura.send(:rails_dir))
+File.symlink(real_rails, "#{alias_home}/active_record")
+%w[Linked Elsewhere].each do |name|
+  Object.const_set(name, Class.new(ApplicationRecord) { self.table_name = "tags" })
+  Futamura.define(:"#{name.downcase}_where", name, one: true, via: :where) { |p| Object.const_get(name).all.where(code: p.bind).limit(1) }
+end
+Linked.singleton_class.class_eval("def where(*args) = super", "#{alias_home}/active_record/querying.rb", 1)
+Elsewhere.singleton_class.class_eval("def where(*args) = super", "#{alias_home}/not_rails.rb", 1)
+out["aliased_rails_path"] = [counted { run(:linked_where, ["x"]) { Linked.where(code: "x").first } }]
+out["outside_rails"] = [counted { run(:elsewhere_where, ["x"]) { Elsewhere.where(code: "x").first } }]
+FileUtils.rm_rf(alias_home)
+
 # 6. A Relation builder patched in (a module prepended to ActiveRecord::Relation) is not built once.
 ActiveRecord::Relation.prepend(Module.new { def limit(*) = super })
 out["patched"] = [counted { run(:plain_where, ["x"]) { Plain.all.where(code: "x").first } }]

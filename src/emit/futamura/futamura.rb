@@ -84,9 +84,24 @@ module Futamura
       return false if owner.name.nil? && !owner.singleton_class?
 
       location = method.source_location&.first
-      !location.nil? && location.start_with?(rails_dir)
+      !location.nil? && (location.start_with?(rails_dir) || in_rails_dir?(location))
     end
     private :rails_method?
+
+    # The same files reached through another path (a gem home whose entries are symlinks, as
+    # in a Nix store: the methods' source_location and the gem's own differ by prefix only).
+    def in_rails_dir?(location)
+      @rails_locations ||= {}
+      return @rails_locations[location] if @rails_locations.key?(location)
+
+      @rails_locations[location] = begin
+        (@rails_real_dir ||= "#{File.realpath(rails_dir)}/")
+        File.realpath(location).start_with?(@rails_real_dir)
+      rescue SystemCallError
+        false
+      end
+    end
+    private :in_rails_dir?
 
     # The first of `names` (a Symbol or a list of them) that `model` redefines, or nil.
     def redefined_class_method(model, names)

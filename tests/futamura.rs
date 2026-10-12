@@ -694,7 +694,10 @@ mod guards_runtime {
         assert!(normal.contains("reader_unscoped_redefined=[[3, 1]]\n"), "{normal}");
         // A default scope's `extending` module that defines a name a scope has; a Relation builder
         // patched in by a module prepended to ActiveRecord::Relation.
-        assert!(normal.contains("extension_scope=[[1, 1]]\npatched=[[1, 1]]\n"), "{normal}");
+        assert!(normal.contains("extension_scope=[[1, 1]]"), "{normal}");
+        assert!(normal.contains("patched=[[1, 1]]\n"), "{normal}");
+        // Rails' own method reached through a symlinked path to the same files is still Rails'; one defined from outside Rails is not.
+        assert!(normal.contains("aliased_rails_path=[[1, 0]]\noutside_rails=[[1, 1]]\n"), "{normal}");
     }
 
     #[test]
