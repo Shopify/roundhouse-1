@@ -156,6 +156,21 @@ per request become binds, evaluated at the call site. `first`/`last`
 use Rails' own `ordered_relation`, so an unordered chain gets Rails'
 implicit order.
 
+A chain may be rooted at a local assigned on several paths
+(`scope = M.where(a: x); scope = scope.where(b: y) if c`, or an `if` that
+assigns a relation in each arm, or an `if` expression as a link's
+receiver). `query/flow.rs` finds the assignments that reach each read
+(straight-line code and `if`/`unless`/ternary only; loops, blocks over the
+local, `case`, `rescue`, `||=` and multiple assignment stay Rails'),
+specializes each path on its own (at most three branches, so eight
+statements, keyed `<site>_<t|f…>`), and the call site picks the statement
+with the condition Ruby tested. It repeats that condition only when it is
+a plain read: a parameter or a local written once before it, an instance
+variable the method never writes, and `present?`/`blank?`/`nil?`/`any?`/
+`empty?`/`none?`/`==`/`!=`/`!`/`&&`/`||` over those. In an instance
+method, a receiver-less reader of a plain `has_many` the model declares
+(and does not redefine) is that association of `self`.
+
 Coverage (`ROUNDHOUSE_FUTAMURA_LEDGER=1` lists every site left to
 Rails, with its reason): Campfire 90b3300, 6 sites, including both
 default message-page chains; the rest are string conditions over
