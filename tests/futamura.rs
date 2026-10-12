@@ -230,7 +230,7 @@ end
         // and `last(n)` follows Rails' FinderMethods: ordered_relation,
         // limit, reverse_order, then the rows reversed.
         assert!(init.contains(
-            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true) \
+            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, owner_keys: [\"room_id\"], owner_columns: [\"room_id\"]) \
              { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
@@ -905,5 +905,134 @@ mod safe_navigation_owner {
         assert!(finder.lines().filter(|l| l.contains("room&.messages")).all(|l| !l.contains("Futamura.records")), "{finder}");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
         assert!(report.residue.iter().any(|r| r.contains("safe navigation in the chain")), "{:?}", report.residue);
+    }
+}
+
+/// has_many readers with a scope lambda or `as:`, `where.not`, SQL fragments
+/// with literal arguments, and literal IN lists
+/// (tests/fixtures/futamura_assoc_app).
+mod association_scopes_and_conditions {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futamura_assoc_app")
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    fn run() -> (roundhouse::emit::futamura::Report, Vec<(String, String)>) {
+        let root = fixture();
+        let mut paths = Vec::new();
+        walk(&root, &mut paths);
+        let files: Vec<(String, String)> =
+            paths.iter().map(|p| (p.strip_prefix(&root).unwrap().to_string_lossy().to_string(), fs::read_to_string(p).unwrap())).collect();
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> = files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files = files;
+        let report = specialize(&app, &mut tree_files).unwrap();
+        (report, tree_files)
+    }
+
+    fn init(files: &[(String, String)]) -> &str {
+        &files.iter().find(|(p, _)| p == INITIALIZER).expect("initializer").1
+    }
+
+    /// association_scope.rb `last_chain_scope` adds the key, then the type of
+    /// a polymorphic `as:`; `add_constraints` adds the scope lambda's
+    /// conditions and orders after the key. The runtime is told the key
+    /// columns to check against the reflection, and every column the
+    /// association constrains.
+    #[test]
+    fn a_has_many_reader_with_a_literal_scope_or_as_is_specialized() {
+        let (report, files) = run();
+        let init = init(&files);
+        assert!(
+            init.contains("owner_keys: [\"room_id\"], owner_columns: [\"room_id\", \"pinned\"]) { |p| Message.all.where(room_id: p.bind).where(pinned: true).order(:id) }"),
+            "{init}"
+        );
+        assert!(init.contains("Message.all.where(room_id: p.bind).order(\"id DESC\").send(:ordered_relation).limit(2)"), "{init}");
+        assert!(
+            init.contains("\"Note\", owner_keys: [\"subject_id\", \"subject_type\"], owner_columns: [\"subject_id\", \"subject_type\"]) { |p| Note.all.where(subject_id: p.bind).where(subject_type: p.bind) }"),
+            "{init}"
+        );
+        let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.contains("[room.id, room.class.polymorphic_name], owner: room, association: :notes"), "{finder}");
+        // A scope that reads the owner is evaluated per owner: Rails'.
+        assert!(report.residue.iter().any(|r| r.contains("has_many `scoped_messages` has options")), "{:?}", report.residue);
+    }
+
+    /// WhereChain#not negates the conditions it is given; a SQL fragment with
+    /// literal arguments is sanitized into the statement when Rails builds
+    /// it, so a request-time value cannot be one of them.
+    #[test]
+    fn where_not_fragments_and_literal_lists_are_specialized() {
+        let (report, files) = run();
+        let init = init(&files);
+        assert!(init.contains("Message.all.where.not(kind: [\"visible\"]).order(:id)"), "{init}");
+        assert!(init.contains("Message.all.where(kind: [\"visible\", \"hidden\"]).order(:id)"), "{init}");
+        assert!(init.contains("Message.all.where.not(\"body IS NULL\").order(:id)"), "{init}");
+        assert!(init.contains("Message.all.where(room_id: p.bind).where(\"body LIKE ?\", \"a%\").order(:id)"), "{init}");
+        assert!(init.contains("Message.all.where(room_id: p.bind).where.not(body: nil).order(:id)"), "{init}");
+        assert!(report.residue.iter().any(|r| r.contains("where with a SQL fragment and a request-time value")), "{:?}", report.residue);
+    }
+
+    /// The run-time half, against real ActiveRecord on SQLite with
+    /// FUTAMURA_VERIFY=1 (every specialized result is compared with Rails'
+    /// own chain, and a mismatch raises). Covers the guards: an association
+    /// that is loaded or holds an unsaved record answers from memory, and a
+    /// default scope's condition on a column the association constrains is
+    /// replaced by the association's, so those calls run Rails' chain.
+    /// Skipped when ActiveRecord and sqlite3 are not installed.
+    #[test]
+    fn association_statements_agree_with_rails_under_verify() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-assoc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(fixture()).output().unwrap();
+        assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
+        let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_assoc_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        // Verify mode runs Rails' chain as well, so it counts every call as a
+        // fallback: only its results are compared.
+        let results = |s: &str| s.lines().map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        let verified = output("1");
+        let normal = output("0");
+        assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
+        let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
+        let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
+        for name in ["not_blank", "pinned", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment"] {
+            assert!(specialized(name), "{name}\n{normal}");
+        }
+        for name in ["remarks", "loaded", "unsaved"] {
+            assert!(fell_back(name), "{name}\n{normal}");
+        }
+        assert!(normal.contains("remarks=[1] "), "{normal}");
+        assert!(normal.contains("unsaved=[1, 3, nil] "), "{normal}");
+        assert!(normal.contains("notes=[1] "), "{normal}");
+        let _ = fs::remove_dir_all(&out);
     }
 }
