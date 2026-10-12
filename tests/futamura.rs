@@ -821,3 +821,35 @@ mod private_model_constants {
         assert!(report.residue.iter().any(|r| r.contains("Hidden::Thing is a private_constant")), "{:?}", report.residue);
     }
 }
+
+/// `a&.b` returns nil for a nil `a`; the specialized call reads the owner's
+/// key first (`a.id`), and analysis binds a non-trivial owner to a temp local
+/// (`__safe_nav1`) that exists only in its IR, so such a chain stays Rails'.
+mod safe_navigation_owner {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_chain_through_safe_navigation_is_left_to_rails() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"messages\", force: :cascade do |t|\n    t.integer \"room_id\"\n    t.string \"body\"\n  end\nend\n"),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\n  has_many :messages\nend\n"),
+            ("app/models/message.rb", "class Message < ApplicationRecord\n  belongs_to :room\nend\n"),
+            ("app/services/finder.rb", "class Finder\n  #: (Room?) -> Array[Message]?\n  def self.of(room)\n    room&.messages&.to_a\n  end\n  #: (Room) -> Array[Message]\n  def self.sure(room)\n    room.messages.to_a\n  end\nend\n"),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let finder = &tree_files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert!(finder.lines().filter(|l| l.contains("room&.messages")).all(|l| !l.contains("Futamura.records")), "{finder}");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("safe navigation in the chain")), "{:?}", report.residue);
+    }
+}

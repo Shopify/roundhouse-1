@@ -188,6 +188,11 @@ impl<'a> Specializer<'a> {
         if e.span.is_synthetic() {
             return Some(Err("synthesized call site".into()));
         }
+        // `a&.b` is lowered to `a && a.b`, whose guard the specialized call
+        // (which reads `a.id` before it runs anything) would drop.
+        if self.source_text(e.span).contains("&.") {
+            return Some(Err("safe navigation in the chain".into()));
+        }
         Some(self.specialize(e, recv, method, args, cx))
     }
 
@@ -222,6 +227,11 @@ impl<'a> Specializer<'a> {
         let root = if chain.implicit_self { ", root: self" } else { "" };
         let call = format!("Futamura.records(:{key}, [{}]{owner}{root}) {{ {{orig}} }}", binds.join(", "));
         Ok(Site { span: e.span, call, define })
+    }
+
+    fn source_text(&self, span: Span) -> &str {
+        let text = &self.app.sources[span.file.0 as usize - 1].text;
+        text.get(span.start as usize..span.end as usize).unwrap_or("")
     }
 
     fn key(&self, span: Span) -> String {
@@ -812,7 +822,10 @@ fn static_literal(e: &Expr) -> Option<String> {
 /// combined with `||`/`&&`. Blocks and anything else decline.
 fn is_call_site_value(e: &Expr) -> bool {
     match &*e.node {
-        ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::SelfRef => true,
+        // A local the analysis introduced (`__safe_nav1` for `a&.b`) is not in
+        // the source, so the call site cannot read it.
+        ExprNode::Var { name, .. } => !name.as_str().starts_with("__"),
+        ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
         // A constant names the same object at the call site as in the
         // fallback block (same lexical scope). Only as a value or argument:
         // a call on a constant (`Enum.serialize(x)`) runs arbitrary class
