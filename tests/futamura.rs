@@ -220,9 +220,9 @@ end
         let report = specialize(&app, &mut files).unwrap();
         let controller = file(&files, "app/controllers/messages_controller.rb");
         let init = file(&files, INITIALIZER);
-        // The call site binds the owner's id and keeps the chain as fallback.
+        // The call site binds the owner's id (in a lambda the runtime calls once the owner is a record) and keeps the chain as fallback.
         assert!(controller.contains(
-            "@messages = Futamura.records(:controllers_messages_controller_4_17, [@room.id], owner: @room, \
+            "@messages = Futamura.records(:controllers_messages_controller_4_17, -> { [@room.id] }, owner: @room, \
              association: :messages) { @room.messages.with_creator.last_page }"
         ), "{controller}");
         // Static scopes stay calls for Rails to build; the terminal scope is
@@ -709,6 +709,78 @@ mod guards_runtime {
                     let ids: Vec<&str> = rest.split("], [").map(|pair| pair.trim_matches(|c| c == '[' || c == ']').split(", ").next().unwrap()).collect();
                     format!("{name}:{}", ids.join(","))
                 })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(records(&verified), records(&normal), "{verified}\n{normal}");
+    }
+}
+
+/// A StatementCache placeholder stands for one scalar. A value Rails' predicate builder expands
+/// (Array, Set, Range, Relation, record, composite association key) or a test double that stands
+/// for an owner never reaches one. The probe (`tests/futamura_bind_runtime.rb`) runs real
+/// ActiveRecord on SQLite; each field is `<record id>/<calls that ran Rails' chain>`.
+mod bind_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_bind_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    #[test]
+    fn only_a_scalar_is_bound_and_every_value_rails_expands_runs_rails_chain() {
+        let Some(normal) = probe("0") else { return };
+        // Scalars are answered by the statement (0 fallbacks).
+        assert!(normal.contains(
+            "scalar=integer:1/0 string:2/0 symbol:3/0 true:1/0 false:2/0 date:1/0 time:1/0 zoned:1/0 decimal:1/0\n"
+        ), "{normal}");
+        // An Array, a Set (which has no entry in StatementCache.unsupported_value?), a Range, a
+        // Relation, a record and nil are Rails': it expands them into IN, BETWEEN, a subquery or
+        // IS NULL, and here finds the same record it would without a statement.
+        assert!(normal.contains(
+            "collection=array:1/1 set:1/1 range:2/1 endless:2/1 relation:3/1 empty_set:nil/1 record:2/1 nil:nil/1\n"
+        ), "{normal}");
+    }
+
+    #[test]
+    fn an_association_key_that_is_not_one_column_runs_rails_chain() {
+        let Some(normal) = probe("0") else { return };
+        // A composite target has no single key to bind. With query constraints (Rails 8.2) the
+        // join keys are one column and the query keys are not: the key is read like the
+        // predicate builder reads it (n/a where the Rails in use has no such option).
+        assert!(normal.contains("association=single:1/0 composite_key:nil composite:1/1 constrained_key:"), "{normal}");
+        let line = normal.lines().find(|l| l.starts_with("association=")).unwrap();
+        assert!(line.ends_with("constrained_key:n/a constrained:n/a") || line.ends_with("constrained_key:nil constrained:1/1"), "{line}");
+        // A chain that cannot be built over placeholders is Rails' too, from the first call on.
+        assert!(normal.contains("unbuildable=[[2, 1], [3, 1]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_test_double_owner_is_asked_nothing() {
+        let Some(normal) = probe("0") else { return };
+        // The double raises for anything it was not told to expect: the binds lambda (which reads
+        // the owner's key) is not called for it, and is for a record, whose chain is answered.
+        assert!(normal.contains("owner=double:1/1 asked:[] record:1/0 asked_after:[:binds]\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_same_calls_agree_with_rails_under_verify() {
+        let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
+        // Verify runs Rails' chain beside every specialized call and raises on a difference, so
+        // only the records agree, not the number of chains run.
+        let records = |s: &str| {
+            s.lines()
+                .filter(|l| l.starts_with("scalar=") || l.starts_with("collection="))
+                .map(|l| l.split(' ').map(|t| t.rsplit_once('/').map_or(t, |(id, _)| id).to_string()).collect::<Vec<_>>().join(" "))
                 .collect::<Vec<_>>()
         };
         assert_eq!(records(&verified), records(&normal), "{verified}\n{normal}");
@@ -1351,7 +1423,7 @@ mod implicit_self_association {
     fn a_receiverless_has_many_reader_roots_the_chain_at_self() {
         let (report, order, init) = run("class Order < ApplicationRecord\n  has_many :lines\n  def first_lines\n    lines.order(:id).first(2)\n  end\nend\n");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
-        assert!(order.contains("Futamura.records(:models_order_4_5, [self.id], owner: self, association: :lines) { lines.order(:id).first(2) }"), "{order}");
+        assert!(order.contains("Futamura.records(:models_order_4_5, -> { [self.id] }, owner: self, association: :lines) { lines.order(:id).first(2) }"), "{order}");
         assert!(init.contains("\"Line\", owner_keys: [\"order_id\"], owner_columns: [\"order_id\"], relation: true) { |p| Line.all.where(order_id: p.bind).order(:id).send(:ordered_relation).limit(2) }"), "{init}");
     }
 
@@ -1432,7 +1504,7 @@ mod association_scopes_and_conditions {
             "{init}"
         );
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
-        assert!(finder.contains("[room.id, room.class.polymorphic_name], owner: room, association: :notes"), "{finder}");
+        assert!(finder.contains("-> { [room.id, room.class.polymorphic_name] }, owner: room, association: :notes"), "{finder}");
         // A scope that reads the owner is evaluated per owner: Rails'.
         assert!(report.residue.iter().any(|r| r.contains("has_many `scoped_messages` has options")), "{:?}", report.residue);
     }
