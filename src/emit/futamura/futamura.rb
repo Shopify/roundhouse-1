@@ -194,6 +194,12 @@ module Futamura
       # (Association#scope) replaces a default equality condition on a column
       # the association constrains; the chain built here keeps both.
       return fallback.call if owner && (columns.map { |column| Array(column).first } & statement.owner_columns).any?
+      if owner && redefined?(model, :unscoped)
+        merged = merge_unscoped(model, columns, defaults)
+        return fallback.call unless merged
+        columns, defaults = merged
+        return fallback.call if (columns.map { |column| Array(column).first } & statement.owner_columns).any?
+      end
       return fallback.call if defaults.any? { |value| unsupported_bind?(value) }
 
       binds = defaults + binds
@@ -238,7 +244,9 @@ module Futamura
       # A reader the owner's class redefines, or a double stubs (Mocha prepends an anonymous
       # module to the object's singleton class), answers something other than the association.
       return :reader_redefined if redefined?(owner, association)
-      return :scope_redefined if scope_redefined?(model)
+      # A redefined `unscoped` is merged in by `merge_unscoped` (the association's own scope
+      # starts from it), except under a statement rooted at `unscoped` itself.
+      return :scope_redefined if redefined?(model, :scope_for_association) || (statement.unscoped && redefined?(model, :unscoped))
 
       proxy = owner.association(association)
       return :owner_new_record if owner.new_record?
@@ -256,6 +264,44 @@ module Futamura
            (statement.owner_keys.nil? || statement.owner_keys == [reflection.foreign_key, reflection.type].compact.map(&:to_s)))
       end
       :reflection unless shape
+    end
+
+    # The conditions of `model.unscoped` where the class redefines it, in `default_shape`'s form,
+    # or nil when they are not plain bound conditions. Rails starts an association's scope from
+    # `klass.unscoped` (AssociationScope.scope) and merges it into the class's `scope_for_association`
+    # (Association#scope: target_scope.merge!(association_scope)), so a redefinition that adds
+    # `where(column: value)` on request state is a condition of every association read: a bind, as
+    # the default scopes' are. The class's `unscoped` runs here once per call, as it does for Rails.
+    def unscoped_conditions(model)
+      shape = default_shape(model, model.send(:relation), model.unscoped)
+      shape if shape && shape[2].empty?
+    rescue StandardError
+      nil
+    end
+
+    # `columns` and `defaults` (default scope conditions, `default_binds`) after the merge of
+    # `unscoped_conditions` (Relation::Merger#merge_clauses, WhereClause#merge): every condition the
+    # default scopes have on a column `unscoped` conditions are on is dropped, then the `unscoped`
+    # ones are added. nil when `unscoped_conditions` is.
+    def merge_unscoped(model, columns, defaults)
+      shape = unscoped_conditions(model)
+      return unless shape
+
+      unscoped_columns, unscoped_values = shape
+      names = unscoped_columns.map { |column| Array(column).first }
+      kept_columns = []
+      kept_values = []
+      offset = 0
+      columns.each do |column|
+        width = column.is_a?(Array) && %i[in notin].include?(column[1]) ? column[2] : 1
+        values = defaults[offset, width]
+        offset += width
+        next if names.include?(Array(column).first)
+
+        kept_columns << column
+        kept_values.concat(values)
+      end
+      [(kept_columns + unscoped_columns).freeze, kept_values + unscoped_values]
     end
 
     # What `Model.all`'s default scopes add to a chain right now, for a
@@ -791,6 +837,11 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return @compile_reasons[key] if @compile_reasons[key]
           return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope
 
+          if owner && !statement.unscoped && Futamura.send(:redefined?, model, :unscoped) && !Futamura.send(:unscoped_conditions, model)
+            cause = default_shape_failure(model, model.unscoped) rescue "raises"
+            return "owner_unscoped_#{cause}[#{model.name}]"
+          end
+
           if !statement.unscoped && (model.default_scopes.any? || Futamura.send(:default_scope_method?, model))
             cause = default_shape_failure(model)
             opaque = ((Futamura.instance_variable_get(:@opaque)[model] || [0]).first >= Futamura::OPAQUE_LIMIT)
@@ -801,9 +852,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         # Futamura.default_shape's checks, in order, naming the first one that refuses (read only).
-        def default_shape_failure(model)
+        def default_shape_failure(model, scoped = model.default_scoped)
           base = model.send(:relation)
-          scoped = model.default_scoped
           return "values" unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
           return "extending" unless (scoped.extending_values - base.extending_values).all? { |mod| Futamura.send(:extension?, mod) }
 

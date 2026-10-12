@@ -12,7 +12,7 @@ ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:"
 ActiveRecord::Schema.verbose = false
 ActiveRecord::Schema.define do
   create_table(:rooms) { |t| t.string :name }
-  %i[pieces parts bits tags twigs].each { |name| create_table(name) { |t| t.integer :zone; t.string :code; t.integer :room_id } }
+  %i[pieces parts bits tags twigs slabs ribs].each { |name| create_table(name) { |t| t.integer :zone; t.string :code; t.integer :room_id } }
 end
 class Current; class << self; attr_accessor :zone; end; end
 class ApplicationRecord < ActiveRecord::Base; self.abstract_class = true; end
@@ -38,6 +38,22 @@ class Part < ApplicationRecord
   extend WhereOverride
 end
 
+# `unscoped` that adds an order (not a bound condition), and one that adds a condition on a
+# column the class's default scope has one on.
+module OrderedClassMethods
+  def unscoped(&block)
+    relation = super(&nil).order(:id)
+    block ? relation.scoping(&block) : relation
+  end
+end
+class Slab < ApplicationRecord
+  extend OrderedClassMethods
+end
+class Rib < ApplicationRecord
+  extend ZoneClassMethods
+  default_scope { where(zone: 1) }
+end
+
 class Plain < ApplicationRecord
   self.table_name = "bits"
 end
@@ -50,6 +66,8 @@ class Room < ApplicationRecord
   has_many :pieces
   has_many :twigs
   has_many :tags
+  has_many :slabs
+  has_many :ribs
 end
 class Tag < ApplicationRecord
   scope :recent, -> { order(:id) }
@@ -66,6 +84,8 @@ Futamura.define(:part_where, "Part", one: true, via: :where) { |p| Part.all.wher
 Futamura.define(:bit_later, "Bit", one: true, via: [:later, :recent]) { |p| Bit.all.where(code: p.bind).later.limit(1) }
 Futamura.define(:room_twigs, "Twig", one: true, relation: true, via: :where, owner_keys: ["room_id"], owner_columns: ["room_id"]) { |p| Twig.all.where(room_id: p.bind).where(code: p.bind).limit(1) }
 Futamura.define(:room_pieces, "Piece", one: true, relation: true, via: :where, owner_keys: ["room_id"], owner_columns: ["room_id"]) { |p| Piece.all.where(room_id: p.bind).where(code: p.bind).limit(1) }
+Futamura.define(:room_slabs, "Slab", one: true, relation: true, via: :where, owner_keys: ["room_id"], owner_columns: ["room_id"]) { |p| Slab.all.where(room_id: p.bind).where(code: p.bind).limit(1) }
+Futamura.define(:room_ribs, "Rib", one: true, relation: true, via: :where, owner_keys: ["room_id"], owner_columns: ["room_id"]) { |p| Rib.all.where(room_id: p.bind).where(code: p.bind).limit(1) }
 Futamura.define(:plain_where, "Plain", one: true, via: :where) { |p| Plain.all.where(code: p.bind).limit(1) }
 Futamura.define(:tag_recent, "Tag", one: true, via: [:recent]) { |p| Tag.all.where(code: p.bind).recent.limit(1) }
 
@@ -120,9 +140,23 @@ class Room
 end
 out["reader_overridden"] = [counted { reader.call(Room.find(room.id)) }]
 # Rails starts an association's scope from `klass.unscoped`: a class that redefines it (Piece) has
-# its own condition in every read of the association, which the statement does not have.
-Current.zone = 1
-out["reader_unscoped_redefined"] = [counted { run(:room_pieces, [room.id, "y"], owner: room, association: :pieces) { room.pieces.where(code: "y").first } }]
+# its own condition in every read of the association. One that adds `where(column: value)` on
+# request state is bound at run time (the zone is read on every call, so the answer follows it);
+# one that adds an order (Slab) is Rails' to run.
+out["reader_unscoped_redefined"] = [1, 2, 1].map do |zone|
+  Current.zone = zone
+  counted { run(:room_pieces, [room.id, "y"], owner: Room.find(room.id), association: :pieces) { Room.find(room.id).pieces.where(code: "y").first } }
+end
+Slab.insert_all([{ zone: 1, code: "y", room_id: room.id }])
+out["reader_unscoped_order"] = [counted { run(:room_slabs, [room.id, "y"], owner: room, association: :slabs) { room.slabs.where(code: "y").first } }]
+# The default scope's condition on the column `unscoped` conditions are on is replaced by them
+# (WhereClause#merge), as Association#scope merges the association's scope into the class's.
+# (insert_all takes the default scope's attributes, so the rows are written by SQL.)
+[1, 2].each { |zone| ActiveRecord::Base.connection.execute("INSERT INTO ribs (zone, code, room_id) VALUES (#{zone}, 'y', #{room.id})") }
+out["reader_unscoped_default_column"] = [2, 1].map do |zone|
+  Current.zone = zone
+  counted { run(:room_ribs, [room.id, "y"], owner: Room.find(room.id), association: :ribs) { Room.find(room.id).ribs.where(code: "y").first } }
+end
 Current.zone = nil
 
 # 5. A default scope's extension defines a method a scope has the name of: the chain calls it.
