@@ -309,6 +309,12 @@ impl<'a> Specializer<'a> {
         if text.is_empty() || text.contains('#') {
             return Err("value has no single-line source text".into());
         }
+        // Ruby 3.1 value omission (`where(shop_id:)`): the implied value's span is the
+        // key's `name:`; the expression it stands for is the bare name.
+        let text = match text.strip_suffix(':') {
+            Some(name) if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => name,
+            _ => text,
+        };
         // `a or b` inside an argument list or an array is a syntax error.
         let keyword = |w: &str| text.split_whitespace().any(|t| t == w);
         Ok(if matches!(&*e.node, ExprNode::BoolOp { .. }) && (keyword("and") || keyword("or")) { format!("({text})") } else { text.to_string() })

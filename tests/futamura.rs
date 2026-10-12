@@ -1593,6 +1593,10 @@ module Lookup
       Widget.where(shop_id: shop_id, kind: KIND).to_a
     end
 
+    def self.omitted(shop_id)
+      Widget.where(shop_id:, kind: KIND).to_a
+    end
+
     def self.limited(shop_id)
       Widget.where(shop_id: shop_id).limit(LIMIT).to_a
     end
@@ -1629,6 +1633,9 @@ end
         let (out, finder) = emit();
         // Read at the call site, inside the class body: the bare name.
         assert!(finder.contains("[shop_id, KIND]) {"), "{finder}");
+        // A value-omitted hash entry (`shop_id:`, Ruby 3.1) binds the name, not the key text.
+        assert!(!finder.contains("[shop_id:"), "{finder}");
+        assert_eq!(finder.matches("[shop_id, KIND]) {").count(), 2, "{finder}");
         assert!(!finder.contains("Finder::KIND"), "{finder}");
         // A receiver the emitter has no lowering for is printed from the source.
         assert!(finder.contains("Futamura.find_by_value(model.polymorphic_name)"), "{finder}");
