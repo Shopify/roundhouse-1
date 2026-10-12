@@ -907,3 +907,178 @@ mod safe_navigation_owner {
         assert!(report.residue.iter().any(|r| r.contains("safe navigation in the chain")), "{:?}", report.residue);
     }
 }
+
+/// A local the method assigns on several paths (`scope = scope.where(..) if c`)
+/// is no longer left to Rails because it is "not assigned exactly once": each
+/// path gets its own statement and the call site picks it with the condition
+/// Ruby tested. Only straight-line code and `if` are followed.
+mod locals_assigned_on_several_paths {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::{INITIALIZER, specialize};
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"status\"\n    t.string \"kind\"\n  end\nend\n";
+
+    fn run(body: &str) -> (roundhouse::emit::futamura::Report, String, String) {
+        let finder = format!("class Item < ApplicationRecord\n  def self.find_all(shop, status, kind)\n{body}\n  end\nend\n");
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/item.rb", &finder),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let get = |path: &str| tree_files.iter().find(|(p, _)| p == path).map(|(_, c)| c.clone()).unwrap_or_default();
+        (report, get("app/models/item.rb"), get(INITIALIZER))
+    }
+
+    #[test]
+    fn a_relation_reassigned_under_modifier_ifs_gets_a_statement_per_path() {
+        let (report, item, init) = run(
+            "    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a",
+        );
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        for chain in [
+            "Item.all.where(shop_id: p.bind).where(status: p.bind).where(kind: p.bind).order(:id) }",
+            "Item.all.where(shop_id: p.bind).where(status: p.bind).order(:id) }",
+            "Item.all.where(shop_id: p.bind).where(kind: p.bind).order(:id) }",
+            "Item.all.where(shop_id: p.bind).order(:id) }",
+        ] {
+            assert!(init.contains(chain), "{chain}\n{init}");
+        }
+        // The call site picks a path with the conditions the `if`s tested, and
+        // each path binds only the values its chain has.
+        assert!(item.contains("((kind.present?) ? ((status.present?) ? Futamura.records(:models_item_6_5_tt, [shop, status, kind])"), "{item}");
+        assert!(item.contains("Futamura.records(:models_item_6_5_ff, [shop])"), "{item}");
+        // Every path keeps the original chain as its fallback.
+        assert_eq!(item.matches("{ scope.order(:id).to_a }").count(), 4, "{item}");
+    }
+
+    #[test]
+    fn an_if_else_that_assigns_a_relation_on_both_sides_is_one_statement_per_branch() {
+        let (report, _, init) = run(
+            "    if kind.nil?\n      scope = Item.where(shop_id: shop)\n    else\n      scope = Item.where(kind: kind)\n    end\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(init.contains("Item.all.where(shop_id: p.bind) }"), "{init}");
+        assert!(init.contains("Item.all.where(kind: p.bind) }"), "{init}");
+    }
+
+    #[test]
+    fn an_if_expression_as_the_receiver_of_a_chain_follows_each_branch() {
+        let (report, item, init) = run(
+            "    scope = if status == \"open\" then Item.where(status: \"open\") else Item.where(shop_id: shop) end\n    scope.order(:id).to_a",
+        );
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(item.contains("((status == \"open\") ?"), "{item}");
+        assert!(init.contains("Item.all.where(status: \"open\").order(:id) }"), "{init}");
+    }
+
+    #[test]
+    fn a_branch_condition_that_is_not_a_plain_read_is_left_to_rails_with_a_reason() {
+        let (report, item, _) = run(
+            "    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if Item.count > 3\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 0);
+        assert!(item.contains("    scope.to_a\n"), "{item}");
+        assert!(report.residue.iter().any(|r| r.contains("branch condition is not a plain read")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_condition_over_a_local_reassigned_before_the_call_is_left_to_rails() {
+        // `status` changes after the `if` tested it: the call site would read
+        // the new value.
+        let (report, _, _) = run(
+            "    scope = Item.where(shop_id: shop)\n    scope = scope.where(kind: kind) if status.present?\n    status = nil\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 0);
+        assert!(report.residue.iter().any(|r| r.contains("branch condition")), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn assignments_in_loops_and_blocks_over_the_local_are_left_to_rails() {
+        let (report, _, _) = run(
+            "    scope = Item.where(shop_id: shop)\n    [status, kind].each { |v| scope = scope.where(kind: v) }\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 0);
+        assert!(report.residue.iter().any(|r| r.contains("reassigned")), "{:?}", report.residue);
+        let (report, _, _) = run("    scope = Item.where(shop_id: shop)\n    scope ||= Item.where(kind: kind)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0);
+        let (report, _, _) = run(
+            "    scope = Item.where(shop_id: shop)\n    case kind\n    when \"a\" then scope = scope.where(kind: \"a\")\n    end\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 0, "{:?}", report.residue);
+    }
+
+    #[test]
+    fn more_than_three_branches_are_left_to_rails() {
+        let (report, _, _) = run(
+            "    scope = Item.where(shop_id: shop)\n    scope = scope.where(kind: \"a\") if kind == \"a\"\n    scope = scope.where(kind: \"b\") if kind == \"b\"\n    scope = scope.where(kind: \"c\") if kind == \"c\"\n    scope = scope.where(kind: \"d\") if kind == \"d\"\n    scope.to_a",
+        );
+        assert_eq!(report.specialized.len(), 0);
+        assert!(report.residue.iter().any(|r| r.contains("more than 3 branches")), "{:?}", report.residue);
+    }
+}
+
+mod flow_paths_runtime {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    /// The run-time half, against real ActiveRecord on SQLite: every path of
+    /// a relation built under `if`s is served by its own statement, and under
+    /// FUTAMURA_VERIFY=1 each is compared with Rails' own chain (a mismatch
+    /// raises). Skipped when ActiveRecord and sqlite3 are not installed.
+    #[test]
+    fn each_path_of_a_conditionally_built_relation_agrees_with_rails_under_verify() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let schema = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"status\"\n    t.string \"kind\"\n  end\nend\n";
+        let model = "class Item < ApplicationRecord\n  def self.find_all(shop, status, kind)\n    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a\n  end\nend\n";
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", schema),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/item.rb", model),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let dir = std::env::temp_dir().join(format!("roundhouse-futamura-flow-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, content) in &tree_files {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, content).unwrap();
+        }
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_flow_runtime.rb");
+        for verify in ["1", "0"] {
+            let run = Command::new("ruby").arg(&probe).arg(&dir).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            let out = String::from_utf8_lossy(&run.stdout).to_string();
+            assert!(run.status.success(), "verify={verify}\n{out}\n{}", String::from_utf8_lossy(&run.stderr));
+            assert!(!out.contains("MISMATCH"), "verify={verify}\n{out}");
+            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 7, "{out}");
+            // Unverified, no call fell back to Rails' chain: every path was
+            // served by its statement (verifying runs the fallback to compare).
+            if verify == "0" {
+                assert!(out.contains("fallbacks=0"), "{out}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

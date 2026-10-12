@@ -39,6 +39,8 @@
 
 use std::collections::HashMap;
 
+mod flow;
+
 use crate::App;
 use crate::dialect::{Association, Model, ModelBodyItem, Scope};
 use crate::emit::ruby::emit_expr;
@@ -142,8 +144,10 @@ impl<'a> Specializer<'a> {
     pub fn method_body(&self, body: &Expr, class_self: Option<&ClassId>, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
         let mut locals = HashMap::new();
         collect_locals(body, &mut locals);
+        let flow = flow::Flow::new(body);
         let cx = Cx {
             locals: &locals,
+            flow: &flow,
             depth: Default::default(),
             args: HashMap::new(),
             self_chain: None,
@@ -175,7 +179,7 @@ impl<'a> Specializer<'a> {
         let model = match relation_model(recv) {
             Some(id) => id.clone(),
             None if TERMINALS.contains(&method.as_str()) || self.any_scope_named(method) => {
-                self.chain(recv, cx).ok()?.model
+                cx.flow.probe(|| self.chain(recv, cx)).ok()?.model
             }
             None => return None,
         };
@@ -193,7 +197,7 @@ impl<'a> Specializer<'a> {
         if self.source_text(e.span).contains("&.") {
             return Some(Err("safe navigation in the chain".into()));
         }
-        Some(self.specialize(e, recv, method, args, cx))
+        Some(self.specialize_paths(e, recv, method, args, cx))
     }
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
@@ -209,7 +213,7 @@ impl<'a> Specializer<'a> {
             Terminal::One => ", one: true",
         };
         let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
-        let key = self.key(e.span);
+        let key = format!("{}{}", self.key(e.span), cx.flow.suffix());
         let mut binds = chain.where_binds.clone();
         binds.extend(chain.limit_binds.iter().cloned());
         // `Model.all` roots the block in a Relation: a link such as
@@ -265,8 +269,15 @@ impl<'a> Specializer<'a> {
         match &*e.node {
             ExprNode::Var { id, name } => match cx.locals.get(&(*id, name.clone())) {
                 Some(Some(value)) => self.chain(value, cx),
-                _ => Err(format!("`{}` is not assigned exactly once", name.as_str())),
+                // Assigned on several paths: the assignment reaching this read.
+                Some(None) => self.chain(cx.flow.reaching(e, *id, name)?, cx),
+                None => Err(format!("`{}` is not assigned exactly once", name.as_str())),
             },
+            // `x = if c then Model.where(a: 1) else Model.where(b: 2) end`: the
+            // branch the call site's own `c` takes, one statement per branch.
+            ExprNode::If { then_branch, else_branch, .. } if cx.self_chain.is_none() => {
+                self.chain(if cx.flow.choose(e)? { then_branch } else { else_branch }, cx)
+            }
             ExprNode::Const { path } => {
                 // `::Shop` is a path with an empty first segment (ingest keeps
                 // the root so qualification passes leave it alone); a model is
@@ -533,7 +544,7 @@ impl<'a> Specializer<'a> {
         for (p, a) in scope.params.iter().zip(args) {
             bound.insert(p.name.clone(), self.value(a, cx)?);
         }
-        let inner = Cx { locals: cx.locals, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None };
+        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None };
         let ExprNode::Send { recv, method, args, block: None, .. } = &*body.node else {
             return Err(format!("scope `{}` body is not a call chain", scope.name.as_str()));
         };
@@ -690,6 +701,8 @@ impl<'a> Specializer<'a> {
 
 struct Cx<'b> {
     locals: &'b HashMap<(VarId, Symbol), Option<&'b Expr>>,
+    /// The `if`s a chain's locals were assigned under.
+    flow: &'b flow::Flow<'b>,
     /// Chain-walk nesting (locals, links, inlined scopes), bounded so a
     /// self-referencing local (`stories = stories.where(...)`) or mutually
     /// recursive scopes end in a residue rather than a stack overflow.
@@ -846,6 +859,17 @@ fn is_call_site_value(e: &Expr) -> bool {
 fn collect_locals<'e>(e: &'e Expr, out: &mut HashMap<(VarId, Symbol), Option<&'e Expr>>) {
     if let ExprNode::Assign { target: LValue::Var { id, name }, value } = &*e.node {
         out.entry((*id, name.clone())).and_modify(|v| *v = None).or_insert(Some(value));
+    }
+    // `x ||= v` and `x, y = ...` write the local too, whatever it held.
+    let compound = match &*e.node {
+        ExprNode::OpAssign { target, .. } => std::slice::from_ref(target),
+        ExprNode::MultiAssign { targets, .. } => targets.as_slice(),
+        _ => &[],
+    };
+    for target in compound {
+        if let LValue::Var { id, name } = target {
+            out.insert((*id, name.clone()), None);
+        }
     }
     e.node.for_each_child(&mut |c| collect_locals(c, out));
 }
