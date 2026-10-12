@@ -114,9 +114,12 @@ struct Chain {
     /// reads a value that responds to `id` as that id (core.rb) before it
     /// builds the statement; Relation#find_by (`where(hash).take`) does not.
     class_find_by: bool,
-    /// The first call on the model class (`where`, `find_by`, `all`...) of a chain rooted
-    /// at the class; the runtime sends the call to Rails when that class method was redefined.
-    root_call: Option<String>,
+    /// The class-level methods the chain's behavior depends on: the first call on the model
+    /// class (`where`, `find_by`, `all`, `unscoped`...) of a chain rooted at the class, and every
+    /// scope a link calls (a Relation answers a scope by calling it on the class). The runtime
+    /// sends the call to Rails when any of them is not ActiveRecord's own (a model or an
+    /// extended module redefined it, a test double stubbed it).
+    class_calls: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -245,9 +248,10 @@ impl<'a> Specializer<'a> {
             Terminal::One => ", one: true",
         };
         let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
-        let option = match &chain.root_call {
-            Some(call) => format!("{option}, via: :{call}"),
-            None => option,
+        let option = match chain.class_calls.as_slice() {
+            [] => option,
+            [call] => format!("{option}, via: :{call}"),
+            calls => format!("{option}, via: [{}]", calls.iter().map(|c| format!(":{c}")).collect::<Vec<_>>().join(", ")),
         };
         let quoted = |columns: &[String]| columns.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
         let option = if chain.owner.is_some() {
@@ -483,6 +487,7 @@ impl<'a> Specializer<'a> {
             chain.after_reader = true;
         }
         if let Some(scope) = scope_named(model, method) {
+            chain.call_class_method(method);
             if scope.params.is_empty() && args.is_empty() && self.static_scope(model, &scope.body, 0) {
                 chain.links.push(format!(".{}", method.as_str()));
                 chain.ordered |= mentions(&scope.body, "order");
@@ -492,11 +497,12 @@ impl<'a> Specializer<'a> {
             return self.inline(chain, scope, args, cx);
         }
         if rails_generated_scope(model, method) && args.is_empty() {
+            chain.call_class_method(method);
             chain.links.push(format!(".{}", method.as_str()));
             return Ok((chain, Terminal::Link));
         }
-        if chain.root_call.is_none() && chain.owner.is_none() && chain.links.is_empty() && cx.self_chain.is_none() {
-            chain.root_call = Some(method.as_str().to_string());
+        if chain.class_calls.is_empty() && chain.owner.is_none() && chain.links.is_empty() && cx.self_chain.is_none() {
+            chain.call_class_method(method);
         }
         match method.as_str() {
             // `where.not(...)` is WhereChain#not: the same conditions, negated
@@ -889,7 +895,13 @@ impl Chain {
             owner_columns: Vec::new(),
             after_reader: false,
             class_find_by: false,
-            root_call: None,
+            class_calls: Vec::new(),
+        }
+    }
+
+    fn call_class_method(&mut self, method: &Symbol) {
+        if !self.class_calls.iter().any(|c| c == method.as_str()) {
+            self.class_calls.push(method.as_str().to_string());
         }
     }
 }

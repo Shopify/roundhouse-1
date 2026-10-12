@@ -228,9 +228,11 @@ end
         // Static scopes stay calls for Rails to build; the terminal scope is
         // inlined, its constant qualified so the initializer can name it,
         // and `last(n)` follows Rails' FinderMethods: ordered_relation,
-        // limit, reverse_order, then the rows reversed.
+        // limit, reverse_order, then the rows reversed. Every scope the chain
+        // calls is a class method Rails answers by calling it on the class, so
+        // the statement names them for the runtime to check (`via:`).
         assert!(init.contains(
-            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, owner_keys: [\"room_id\"], owner_columns: [\"room_id\"], relation: true) \
+            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, via: [:with_creator, :last_page, :ordered], owner_keys: [\"room_id\"], owner_columns: [\"room_id\"], relation: true) \
              { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
@@ -651,6 +653,65 @@ mod default_scope_runtime {
         assert!(out.contains("thing specialized=1 fallback={\"bind_array\" => 1, \"bind_nil\" => 1}"), "{out}");
         assert!(out.contains("ranked specialized=0 fallback={\"default_scope_values[RankedThing]\" => 1}"), "{out}");
         assert!(out.contains("scoped specialized=1 fallback={}"), "{out}");
+    }
+}
+
+/// A statement is built once, from the chain as written, so it may stand for the chain only
+/// while every method the chain calls is ActiveRecord's own. The probe
+/// (`tests/futamura_guard_runtime.rb`) runs real ActiveRecord on SQLite.
+mod guards_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_guard_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    /// Each line is `name=[[record id, calls that ran Rails' chain], ...]`.
+    #[test]
+    fn a_method_the_chain_calls_that_is_not_activerecords_own_runs_rails_chain() {
+        let Some(normal) = probe("0") else { return };
+        // `unscoped` and `where` redefined by a module the class extends read request state on
+        // every call (a different row for each zone); the statement would keep the first call's.
+        assert!(normal.contains("unscoped=[[1, 1], [2, 1], [1, 1]]\nwhere=[[1, 1], [2, 1]]\n"), "{normal}");
+        // A scope Rails defined is answered by the statement (0 fallbacks); the same scope
+        // stubbed by an anonymous prepended module (Mocha), or one the scope calls, or one the
+        // class body redefined after `scope :recent`, is Rails'.
+        assert!(normal.contains("scope=[[1, 0], [2, 1], [2, 1]]\nscope_redefined=[[2, 1]]\n"), "{normal}");
+        // An association reader: Rails' own, then stubbed on the owner, then redefined by its class.
+        assert!(normal.contains("reader=[[1, 0], [nil, 1], [1, 0]]\nreader_overridden=[[nil, 1]]\n"), "{normal}");
+        // Rails reads an association from `klass.unscoped`: redefining it puts a condition in
+        // every read the statement (built from the class's plain relation) does not have.
+        assert!(normal.contains("reader_unscoped_redefined=[[3, 1]]\n"), "{normal}");
+        // A default scope's `extending` module that defines a name a scope has; a Relation builder
+        // patched in by a module prepended to ActiveRecord::Relation.
+        assert!(normal.contains("extension_scope=[[1, 1]]\npatched=[[1, 1]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_same_calls_agree_with_rails_under_verify() {
+        let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
+        // Verify runs Rails' chain beside every specialized call (and raises on a difference), so
+        // only the records agree, not the number of chains run.
+        let records = |s: &str| {
+            s.lines()
+                .map(|l| {
+                    let (name, rest) = l.split_once('=').unwrap();
+                    let ids: Vec<&str> = rest.split("], [").map(|pair| pair.trim_matches(|c| c == '[' || c == ']').split(", ").next().unwrap()).collect();
+                    format!("{name}:{}", ids.join(","))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(records(&verified), records(&normal), "{verified}\n{normal}");
     }
 }
 

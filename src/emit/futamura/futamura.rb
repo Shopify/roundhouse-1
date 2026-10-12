@@ -64,16 +64,49 @@ module Futamura
                                        owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via)
     end
 
-    # The class method a chain starts with, defined on a class itself or by an anonymous module
-    # (a test double prepends one; the chain would run beside it) or a model's own override. A
-    # named module's method is not looked at.
-    def redefined?(model, name)
-      owner = model.method(name).owner
-      owner.singleton_class? || owner.name.nil?
+    # Whether a method the chain calls on `target` (a class, or a record for an association
+    # reader) is something other than ActiveRecord's own. A method is Rails' when the code
+    # that defines it is in the ActiveRecord gem (`where`, `unscoped`, `find_by`, a generated
+    # scope or reader...). One defined by an app class, by a module it extends the class
+    # with (a model overriding `unscoped`), by an anonymous module (a test double prepends
+    # one) or by a double on the singleton class is the app's: it may read request state or
+    # return something else on every call, so the statement, built once from the chain as
+    # written, may not stand for it.
+    def redefined?(target, name)
+      !rails_method?(target.method(name))
     rescue NameError
       true
     end
     private :redefined?
+
+    def rails_method?(method)
+      owner = method.owner
+      return false if owner.name.nil? && !owner.singleton_class?
+
+      location = method.source_location&.first
+      !location.nil? && location.start_with?(rails_dir)
+    end
+    private :rails_method?
+
+    # The first of `names` (a Symbol or a list of them) that `model` redefines, or nil.
+    def redefined_class_method(model, names)
+      Array(names).find { |name| redefined?(model, name) }
+    end
+    private :redefined_class_method
+
+    # Rails starts an association's scope from `klass.unscoped` and `klass.scope_for_association`
+    # (AssociationScope, Association#target_scope, Preloader::Association): a class that
+    # redefines either has its own conditions in every association read, which a statement
+    # built from the class's plain relation does not have.
+    def scope_redefined?(klass)
+      %i[unscoped scope_for_association].any? { |name| redefined?(klass, name) }
+    end
+    private :scope_redefined?
+
+    def rails_dir
+      @rails_dir ||= "#{File.dirname(ActiveRecord.method(:gem_version).source_location.first)}/"
+    end
+    private :rails_dir
 
     # The key `where(association: value)` binds, as Rails'
     # PredicateBuilder::AssociationQueryValue#convert_to_id reads it: the
@@ -112,7 +145,7 @@ module Futamura
       model = statement.model
       model = statement.model = Object.const_get(model) if model.is_a?(String)
       return fallback.call if root && !root.equal?(model)
-      return fallback.call if statement.via && redefined?(model, statement.via)
+      return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
 
       # A `Model.scoping { }` block is part of every `Model.all` inside it.
@@ -160,18 +193,32 @@ module Futamura
     # primary key, and no records of its own in memory (CollectionProxy reads a
     # loaded target, and merges unsaved records into one, instead of querying).
     def owner_chain?(owner, association, statement, model)
-      proxy = owner.association(association)
-      return false if owner.new_record?
-      # A terminal on the proxy itself reads the target; links after the reader query.
-      return false if !statement.relation && (proxy.loaded? || proxy.target.any?)
+      owner_chain_failure(owner, association, statement, model).nil?
+    end
 
-      @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do
+    # Why `owner_chain?` is false (a Symbol), or nil.
+    def owner_chain_failure(owner, association, statement, model)
+      # A reader the owner's class redefines, or a double stubs (Mocha prepends an anonymous
+      # module to the object's singleton class), answers something other than the association.
+      return :reader_redefined if redefined?(owner, association)
+      return :scope_redefined if scope_redefined?(model)
+
+      proxy = owner.association(association)
+      return :owner_new_record if owner.new_record?
+      # A terminal on the proxy itself reads the target; links after the reader query.
+      unless statement.relation
+        return :target_loaded if proxy.loaded?
+        return :target_unsaved if proxy.target.any?
+      end
+
+      shape = @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do
         reflection = owner.class._reflect_on_association(association)
         primary_key = reflection&.active_record_primary_key
         !!(reflection && reflection.collection? && !reflection.through_reflection? && reflection.klass.equal?(model) &&
            primary_key.is_a?(String) && primary_key == owner.class.primary_key &&
            (statement.owner_keys.nil? || statement.owner_keys == [reflection.foreign_key, reflection.type].compact.map(&:to_s)))
       end
+      :reflection unless shape
     end
 
     # What `Model.all`'s default scopes add to a chain right now, for a
@@ -198,7 +245,7 @@ module Futamura
         return
       end
 
-      shape = default_shape(model, model.unscoped, model.default_scoped)
+      shape = default_shape(model, model.send(:relation), model.default_scoped)
       if shape
         @opaque.delete(model)
       else
@@ -261,6 +308,13 @@ module Futamura
       end
     end
 
+    # The instance methods of `mod` that are class methods of `model` too (a scope): a Relation
+    # answers a scope by calling the class's, and an extended Relation answers with the module's
+    # own method first.
+    def scope_overrides(mod, model)
+      (mod.instance_methods + mod.private_instance_methods).select { |name| model.respond_to?(name, true) }
+    end
+
     # The instance methods of `mod` that ActiveRecord::Relation defines too.
     def overridden(mod)
       (mod.instance_methods + mod.private_instance_methods).select do |name|
@@ -271,8 +325,9 @@ module Futamura
     # Build the Relation once and keep what loading it needs. `false` (not
     # nil, so compute_if_absent remembers it) when Rails would load it in a
     # way a StatementCache cannot reproduce. A chain that is not rooted at
-    # `Model.unscoped` is built inside `Model.unscoped.where(column: bind)...
-    # .scoping`, so its `Model.all` is that relation: no default scope runs
+    # `Model.unscoped` is built inside `relation.where(column: bind)....scoping` (`relation`, the
+    # class's own plain Relation as `all` starts from, not `unscoped`, which a class may
+    # redefine), so its `Model.all` is that relation: no default scope runs
     # and none is frozen into the statement. The default scopes' `extensions`
     # are applied to that relation, so a link of the chain that one of them
     # overrides behaves as it does on Rails' `Model.all`; but the statement
@@ -285,25 +340,40 @@ module Futamura
         relation = if statement.unscoped
           statement.build.call(params)
         else
-          base = columns.inject(statement.model.unscoped) { |scope, column| scope.where(column => params.bind) }
-          base = watch_overrides(base.extending(*extensions), extensions, overrides) if extensions.any?
+          base = columns.inject(statement.model.send(:relation)) { |scope, column| scope.where(column => params.bind) }
+          base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
           base.scoping { statement.build.call(params) }
         end
       end
       return false if overrides.any?
       return false if relation.eager_loading? || relation.readonly_value
+      return false unless builders_are_rails?(statement.model)
       return false unless (relation.extending_values - extensions).all? { |mod| plain_extension?(mod) }
 
       preload = relation.preload_values + relation.includes_values
       Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value)
     end
 
+    # Relation methods a chain's links call. A statement is built once, so a link that something
+    # redefined (a module prepended to ActiveRecord::Relation, one in the model's own relation
+    # class) would run only then; the chain as written runs it on every call.
+    BUILDERS = %i[where order limit preload includes joins left_joins left_outer_joins select group reorder lock
+                  distinct reverse_order unscope ordered_relation].freeze
+
+    # (Looked up on the model's Relation class, not the relation: an `extending` module a default
+    # scope adds is the watcher's business, `watch_overrides`.)
+    def builders_are_rails?(model)
+      relation_class = model.relation_delegate_class(ActiveRecord::Relation)
+      BUILDERS.all? { |name| rails_method?(relation_class.instance_method(name)) }
+    end
+    private :builders_are_rails?
+
     # `relation` with a module in front of its extensions that records which
     # of their Relation-overriding methods get called (and then calls them).
     # Extended on the object itself, not through `extending`, so it is not one
     # of the relation's extending_values; spawn/clone carry it along.
-    def watch_overrides(relation, extensions, calls)
-      names = extensions.flat_map { |mod| overridden(mod) }.uniq
+    def watch_overrides(relation, extensions, calls, model)
+      names = extensions.flat_map { |mod| overridden(mod) + scope_overrides(mod, model) }.uniq
       return relation if names.empty?
 
       relation.extend(Module.new do
@@ -453,9 +523,13 @@ module Futamura
         location
       end
 
-      # A `Model.scoping { }` block changes scope_for_association.
+      # A `Model.scoping { }` block changes scope_for_association, and so does a class that
+      # redefines `unscoped` or `scope_for_association` (the plan builds the scope once).
       def scoped?(nodes)
-        nodes.any? { |n| n.reflection.klass.current_scope || scoped?(n.children) }
+        nodes.any? do |n|
+          klass = n.reflection.klass
+          klass.current_scope || Futamura.send(:scope_redefined?, klass) || scoped?(n.children)
+        end
       end
 
       # Preloader::Association#build_scope, built once per association,
@@ -617,8 +691,10 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           model = statement.model
           return "model_unloaded" unless model.is_a?(Class)
           return "root_not_model" if root && !root.equal?(model)
-          return "class_method_redefined[#{model.name}.#{statement.via}]" if statement.via && Futamura.send(:redefined?, model, statement.via)
-          return "owner_chain" if owner && !Futamura.send(:owner_chain?, owner, association, statement, model)
+          redefined = statement.via && Futamura.send(:redefined_class_method, model, statement.via)
+          return "class_method_redefined[#{model.name}.#{redefined}]" if redefined
+          failure = owner && Futamura.send(:owner_chain_failure, owner, association, statement, model)
+          return "owner_chain_#{failure}" if failure
           return @compile_reasons[key] if @compile_reasons[key]
           return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope
 
@@ -633,7 +709,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
 
         # Futamura.default_shape's checks, in order, naming the first one that refuses (read only).
         def default_shape_failure(model)
-          base = model.unscoped
+          base = model.send(:relation)
           scoped = model.default_scoped
           return "values" unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
           return "extending" unless (scoped.extending_values - base.extending_values).all? { |mod| Futamura.send(:extension?, mod) }
