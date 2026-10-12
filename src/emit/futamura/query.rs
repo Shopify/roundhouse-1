@@ -187,6 +187,8 @@ impl<'a> Specializer<'a> {
             self_chain: None,
             class_self: class_self.cloned(),
             instance_self: instance_self.cloned(),
+            through_local: Default::default(),
+            terminal: Default::default(),
         };
         self.visit(body, &cx, sites, residue);
     }
@@ -236,6 +238,7 @@ impl<'a> Specializer<'a> {
     }
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
+        cx.terminal.set(e.span.start);
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
         if self.private_models.contains(chain.model.0.as_str()) {
@@ -315,9 +318,9 @@ impl<'a> Specializer<'a> {
     fn chain_at(&self, e: &Expr, cx: &Cx) -> Result<Chain, String> {
         match &*e.node {
             ExprNode::Var { id, name } => match cx.locals.get(&(*id, name.clone())) {
-                Some(Some(value)) => self.chain(value, cx),
+                Some(Some(value)) => self.chain_through_local(value, cx),
                 // Assigned on several paths: the assignment reaching this read.
-                Some(None) => self.chain(cx.flow.reaching(e, *id, name)?, cx),
+                Some(None) => self.chain_through_local(cx.flow.reaching(e, *id, name)?, cx),
                 None => Err(format!("`{}` is not assigned exactly once", name.as_str())),
             },
             // `x = if c then Model.where(a: 1) else Model.where(b: 2) end`: the
@@ -379,6 +382,16 @@ impl<'a> Specializer<'a> {
             ExprNode::Send { block: Some(_), method, .. } => Err(format!("`{}` with a block", method.as_str())),
             other => Err(format!("chain rooted at {}", other.kind_str())),
         }
+    }
+
+    /// The chain a local was assigned. Its values are read where the terminal is, which is
+    /// later than where the original chain read them (see `Cx::through_local`).
+    fn chain_through_local(&self, value: &Expr, cx: &Cx) -> Result<Chain, String> {
+        let outer = cx.through_local.get();
+        cx.through_local.set(Some(outer.map_or(value.span.end, |o| o.min(value.span.end))));
+        let chain = self.chain(value, cx);
+        cx.through_local.set(outer);
+        chain
     }
 
     /// `owner.messages` for a plain `has_many` on a typed owner.
@@ -705,7 +718,7 @@ impl<'a> Specializer<'a> {
         for (p, a) in scope.params.iter().zip(args) {
             bound.insert(p.name.clone(), self.value(a, cx)?);
         }
-        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None, instance_self: None };
+        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None, instance_self: None, through_local: cx.through_local.clone(), terminal: cx.terminal.clone() };
         let ExprNode::Send { recv, method, args, block: None, .. } = &*body.node else {
             return Err(format!("scope `{}` body is not a call chain", scope.name.as_str()));
         };
@@ -765,6 +778,15 @@ impl<'a> Specializer<'a> {
         out
     }
 
+    /// A call that only adds a condition to a relation (or is a model's scope).
+    fn is_relation_link(&self, method: &Symbol) -> bool {
+        matches!(
+            method.as_str(),
+            "where" | "not" | "order" | "limit" | "preload" | "includes" | "joins" | "left_joins" | "left_outer_joins" | "select" | "group"
+                | "reorder" | "lock" | "distinct" | "all" | "reverse_order"
+        ) || self.any_scope_named(method)
+    }
+
     fn any_scope_named(&self, name: &Symbol) -> bool {
         self.models.values().any(|m| scope_named(m, name).is_some())
     }
@@ -796,7 +818,15 @@ impl<'a> Specializer<'a> {
             // Inside a scope body, anything else is evaluated against the
             // model class, which the call site cannot reproduce.
             _ if cx.self_chain.is_some() => Err("scope body value other than a literal or parameter".into()),
-            _ if is_call_site_value(e) => Ok(Val::Bind(emit_expr(e))),
+            _ if is_call_site_value(e) => {
+                // Read at the terminal: the same value the chain read when its local was assigned?
+                if let Some(from) = cx.through_local.get()
+                    && !cx.flow.same_value_later(e, from, cx.terminal.get(), &|m| self.is_relation_link(m))
+                {
+                    return Err(format!("`{}` may change between the local's assignment and the call that loads it", emit_expr(e)));
+                }
+                Ok(Val::Bind(emit_expr(e)))
+            }
             other => Err(format!("value is {}", other.kind_str())),
         }
     }
@@ -876,6 +906,12 @@ struct Cx<'b> {
     class_self: Option<ClassId>,
     /// The model whose instance method this body is.
     instance_self: Option<ClassId>,
+    /// While the walk is inside the value of a local the chain goes through: the end of the
+    /// earliest such assignment. A request-time value found there is read later (at the
+    /// terminal) than the original chain read it.
+    through_local: std::cell::Cell<Option<u32>>,
+    /// Where the terminal of the site being specialized starts.
+    terminal: std::cell::Cell<u32>,
 }
 
 impl Chain {

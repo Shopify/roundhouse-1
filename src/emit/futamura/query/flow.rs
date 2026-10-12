@@ -323,6 +323,66 @@ impl<'e> Flow<'e> {
     }
 }
 
+impl Flow<'_> {
+    /// Whether a request-time value `e`, which the call site reads at `to`, is what the chain
+    /// read where its local was assigned (`from`, the end of the assigned value). A chain
+    /// that goes through a local is built where the local is assigned but the statement
+    /// reads its values at the terminal; a value that changes in between would bind
+    /// differently from the original chain. A local is the same when it is a parameter or
+    /// written once before the read; an instance variable when the method never writes it;
+    /// and a call's result (or an instance variable another method may write) when nothing
+    /// but links on a relation runs in between (`link` says which calls those are) and the
+    /// terminal does not run in a block given to a call made after the assignment.
+    pub(super) fn same_value_later(&self, e: &Expr, from: u32, to: u32, link: &dyn Fn(&Symbol) -> bool) -> bool {
+        let same = |x: &Expr| self.same_value_later(x, from, to, link);
+        match &*e.node {
+            ExprNode::Var { id, name } => self.stable_local(*id, name, e.span.start),
+            ExprNode::Ivar { name } => !self.writes_ivar(name) && self.quiet_between(from, to, link),
+            ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::SelfRef => true,
+            ExprNode::Send { recv, args, block: None, .. } => {
+                recv.as_ref().is_none_or(|r| same(r)) && args.iter().all(same) && self.quiet_between(from, to, link)
+            }
+            ExprNode::BoolOp { left, right, .. } => same(left) && same(right),
+            _ => false,
+        }
+    }
+
+    /// Whether the code between two offsets only reads locals and builds relations: no call that
+    /// is not a `link`, no write to anything but a local, and no block still open at
+    /// `to` (its body may run again later).
+    fn quiet_between(&self, from: u32, to: u32, link: &dyn Fn(&Symbol) -> bool) -> bool {
+        fn walk(e: &Expr, from: u32, to: u32, link: &dyn Fn(&Symbol) -> bool, quiet: &mut bool) {
+            // A block (its Lambda has no span of its own) given to a call that starts after `from`
+            // and is still open at `to`.
+            if matches!(&*e.node, ExprNode::Send { block: Some(_), .. }) && e.span.start >= from && e.span.start <= to && e.span.end > to {
+                *quiet = false;
+            }
+            if e.span.start >= from && e.span.end <= to {
+                let ok = match &*e.node {
+                    ExprNode::Send { method, .. } => link(method),
+                    ExprNode::Assign { target, .. } => matches!(target, LValue::Var { .. }),
+                    ExprNode::Seq { .. }
+                    | ExprNode::Lit { .. }
+                    | ExprNode::Var { .. }
+                    | ExprNode::Ivar { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::SelfRef
+                    | ExprNode::Hash { .. }
+                    | ExprNode::Array { .. }
+                    | ExprNode::BoolOp { .. }
+                    | ExprNode::If { .. } => true,
+                    _ => false,
+                };
+                *quiet &= ok;
+            }
+            e.node.for_each_child(&mut |c| walk(c, from, to, link, quiet));
+        }
+        let mut quiet = true;
+        walk(self.body, from, to, link, &mut quiet);
+        quiet
+    }
+}
+
 fn contains(e: &Expr, at: &Expr) -> bool {
     if std::ptr::eq(e, at) {
         return true;

@@ -1137,6 +1137,86 @@ mod locals_assigned_on_several_paths {
     }
 }
 
+/// A request-time value is read at the call site, where the terminal is. When the chain goes
+/// through a local (`scope = Item.where(shop_id: shop)` ... `scope.to_a`) that is later than
+/// the `where` ran, so a value that can change in between would be read late and bound
+/// differently from what the original chain used. Such a site stays Rails'.
+mod bind_timing {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"kind\"\n  end\nend\n";
+
+    fn run(body: &str) -> roundhouse::emit::futamura::Report {
+        let finder = format!("class Item < ApplicationRecord\n  def self.find_all(shop, kind)\n{body}\n  end\nend\n");
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/item.rb", &finder),
+        ];
+        let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        specialize(&app, &mut tree_files).unwrap()
+    }
+
+    fn timing_residue(report: &roundhouse::emit::futamura::Report) -> bool {
+        report.residue.iter().any(|r| r.contains("may change between"))
+    }
+
+    #[test]
+    fn a_value_nothing_reassigns_is_read_late_harmlessly() {
+        // A parameter, or a local written once before the chain, has the same value at the call site.
+        let report = run("    scope = Item.where(shop_id: shop)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let report = run("    id = shop\n    scope = Item.where(shop_id: id)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        // A chain written as one expression reads its values when the call does.
+        let report = run("    shop = 7\n    Item.where(shop_id: shop).to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_local_reassigned_after_the_relation_was_built_is_left_to_rails() {
+        // Rails' chain bound the old `shop`; the call site would bind 7.
+        let report = run("    scope = Item.where(shop_id: shop)\n    shop = 7\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(timing_residue(&report), "{:?}", report.residue);
+        let report = run("    id = 1\n    scope = Item.where(shop_id: id)\n    id = 2\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(timing_residue(&report), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn an_instance_variable_written_in_the_method_is_left_to_rails() {
+        let report = run("    scope = Item.where(shop_id: @shop)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        let report = run("    scope = Item.where(shop_id: @shop)\n    @shop = 7\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(timing_residue(&report), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_call_that_can_change_what_a_value_reads_is_left_to_rails() {
+        // Nothing runs between the `where` and the terminal but more links on the relation.
+        let report = run("    scope = Item.where(shop_id: shop.id)\n    scope = scope.where(kind: kind)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        // Another call may change `shop.id`.
+        let report = run("    scope = Item.where(shop_id: shop.id)\n    shop.reload\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(timing_residue(&report), "{:?}", report.residue);
+        // The terminal runs later, in a block, as many times as the block is called.
+        let report = run("    scope = Item.where(shop_id: shop.id)\n    [1].each { scope.to_a }");
+        assert_eq!(report.specialized.len(), 0);
+        assert!(timing_residue(&report), "{:?}", report.residue);
+    }
+}
+
 mod flow_paths_runtime {
     use std::path::PathBuf;
     use std::process::Command;
