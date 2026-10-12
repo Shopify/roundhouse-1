@@ -104,6 +104,12 @@ struct Chain {
     /// the model's default scope, which replaces that scope's equality
     /// condition on a column both name; a chained `where` would keep both.
     owner_columns: Vec<String>,
+    /// For an association-rooted chain: a link (not just a terminal) was
+    /// called after the reader. Rails' CollectionProxy delegates the query
+    /// methods to `scope`, a fresh Relation that queries whatever the
+    /// association's target holds; `first`/`last`/`take`/`to_a` on the proxy
+    /// itself answer from the target when it is loaded or has unsaved records.
+    after_reader: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -234,7 +240,8 @@ impl<'a> Specializer<'a> {
         let option = if chain.unscoped { format!("{option}, unscoped: true") } else { option.to_string() };
         let quoted = |columns: &[String]| columns.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
         let option = if chain.owner.is_some() {
-            format!("{option}, owner_keys: [{}], owner_columns: [{}]", quoted(&chain.owner_keys), quoted(&chain.owner_columns))
+            let relation = if chain.after_reader { ", relation: true" } else { "" };
+            format!("{option}, owner_keys: [{}], owner_columns: [{}]{relation}", quoted(&chain.owner_keys), quoted(&chain.owner_columns))
         } else {
             option
         };
@@ -404,6 +411,8 @@ impl<'a> Specializer<'a> {
         chain.owner_columns = chain.owner_keys.clone();
         if let Some(body) = scope {
             chain = self.association_scope(chain, method, body, cx)?;
+            // The scope lambda is part of the reader, not a link after it.
+            chain.after_reader = false;
         }
         Ok(chain)
     }
@@ -455,6 +464,12 @@ impl<'a> Specializer<'a> {
         // `where` with no arguments answers a WhereChain, not a Relation.
         if chain.pending_not && method.as_str() != "not" {
             return Err(format!("`where` followed by `{}`, not `not`", method.as_str()));
+        }
+        // Not on CollectionProxy's delegation list (collection_proxy.rb): the
+        // terminals it answers itself, `select` it overrides, `all` it leaves
+        // to the class.
+        if !matches!(method.as_str(), "first" | "last" | "take" | "to_a" | "select" | "all") {
+            chain.after_reader = true;
         }
         if let Some(scope) = scope_named(model, method) {
             if scope.params.is_empty() && args.is_empty() && self.static_scope(model, &scope.body, 0) {
@@ -853,6 +868,7 @@ impl Chain {
             pending_not: false,
             owner_keys: Vec::new(),
             owner_columns: Vec::new(),
+            after_reader: false,
         }
     }
 }

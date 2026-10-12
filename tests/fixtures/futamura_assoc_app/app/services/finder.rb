@@ -10,6 +10,11 @@ class Finder
   end
 
   #: (Room) -> untyped
+  def self.pinned_ordered(room)
+    room.pinned.order(:id).to_a
+  end
+
+  #: (Room) -> untyped
   def self.first_pinned(room)
     room.pinned.first
   end

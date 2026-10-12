@@ -34,10 +34,16 @@ end)
 end
 item = Item.first
 [3, 1, 0].each { |n| item.notes.create!(body: "n#{n}") if n > 0 }
-# A fresh owner: creating through the association fills its target, and the
-# runtime then leaves the call to Rails (see Futamura.compile).
-item = Item.find(item.id)
+# Creating through the association filled its target. A link after the reader
+# (`notes.order(..).first(2)`) builds a Relation from `scope`, which queries
+# whatever the target holds, so the statement serves it; a terminal on the
+# reader itself (`notes.first(2)`) answers from the target, so Rails runs it.
 got = item.recent_notes.map(&:body)
 want = item.notes.order(id: :desc).limit(2).map(&:body)
 puts "recent_notes #{got == want ? "ok" : "MISMATCH"} #{got.inspect}"
+fallbacks_after_link = fallbacks
+got = item.top_notes.map(&:body)
+want = item.notes.target.first(2).map(&:body)
+puts "top_notes #{got == want ? "ok" : "MISMATCH"} #{got.inspect}"
+puts "target_terminal_fallbacks=#{fallbacks - fallbacks_after_link}"
 puts "fallbacks=#{fallbacks}"

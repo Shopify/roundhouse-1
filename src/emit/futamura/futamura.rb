@@ -18,19 +18,32 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
 
   # What a model's default scopes add to a query, as the columns each
-  # compares for equality and the values it compared them to.
-  NO_DEFAULTS = [[].freeze, [].freeze].freeze
+  # compares for equality, the values it compared them to, and the modules
+  # they extend the relation with (`extending`).
+  NO_DEFAULTS = [[].freeze, [].freeze, [].freeze].freeze
   # A model whose default scopes are this many times in a row not that
-  # simple is left to Rails' chain without evaluating them first.
+  # simple is left to Rails' chain without evaluating them first, except for
+  # one call in OPAQUE_RETRY: a default scope that reads request state may be
+  # simple again later.
   OPAQUE_LIMIT = 5
+  OPAQUE_RETRY = 64
+  # Relation methods that load records. A module a default scope extends the
+  # relation with may override a link of the chain (the chain then runs it
+  # once, while the statement is built: see `compile`), but not these, which
+  # the statement replaces on every call.
+  LOADING = %i[load reload records to_a to_ary exec_queries exec_main_query instantiate_records
+               preload_associations skip_query_cache_if_necessary first last take find_by find_nth
+               find_nth_with_limit find_last ordered_relation arel build_arel klass model
+               scope_for_association strict_loading!].freeze
 
   @statements = {}
   @compiled = Concurrent::Map.new
   @opaque = Concurrent::Map.new
+  @extensions = Concurrent::Map.new
   @owner_chains = Concurrent::Map.new
   VERIFY = ENV["FUTAMURA_VERIFY"] == "1"
 
@@ -42,10 +55,13 @@ module Futamura
     # the name of one, resolved at the first call. A chain rooted at an
     # association reader names the key columns the reader compares to the
     # owner (`owner_keys`, checked against the reflection) and every column
-    # the association constrains (`owner_columns`).
-    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], &build)
+    # the association constrains (`owner_columns`). `relation:` says links
+    # follow the reader (`notes.where(...).first`): Rails then builds a
+    # Relation from `scope` and queries, where a terminal called on the reader
+    # itself (`notes.first`) answers from the association's target.
+    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, &build)
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped,
-                                       owner_keys: owner_keys, owner_columns: owner_columns)
+                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation)
     end
 
     # The key `where(association: value)` binds, as Rails'
@@ -82,7 +98,7 @@ module Futamura
       # A `Model.scoping { }` block is part of every `Model.all` inside it.
       return fallback.call if !statement.unscoped && model.current_scope
 
-      columns, defaults = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+      columns, defaults, extensions = statement.unscoped ? NO_DEFAULTS : default_binds(model)
       return fallback.call unless columns
       # Merging the association's relation into the model's default scope
       # (Association#scope) replaces a default equality condition on a column
@@ -93,7 +109,7 @@ module Futamura
       binds = defaults + binds
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns]) { compile(statement, connection, columns) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions]) { compile(statement, connection, columns, extensions) }
         compiled && compiled.cache.execute(binds, connection)
       end
       return fallback.call unless compiled
@@ -125,7 +141,9 @@ module Futamura
     # loaded target, and merges unsaved records into one, instead of querying).
     def owner_chain?(owner, association, statement, model)
       proxy = owner.association(association)
-      return false if owner.new_record? || proxy.loaded? || proxy.target.any?
+      return false if owner.new_record?
+      # A terminal on the proxy itself reads the target; links after the reader query.
+      return false if !statement.relation && (proxy.loaded? || proxy.target.any?)
 
       @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do
         reflection = owner.class._reflect_on_association(association)
@@ -144,18 +162,27 @@ module Futamura
     # `unscoped` relation plus `where(column: value)` equality conditions on
     # its own table: then the statement is built over the same conditions
     # with the values as binds (see `compile`), and one statement serves
-    # every value. Anything else (a condition that is not equality, nil, a
-    # join, an order, an extension...) is nil, and the caller runs Rails'
-    # chain. Returns `[columns, values]`.
+    # every value. `extending` only adds modules to the Relation object
+    # (query_methods.rb `extending!`), so modules that are named constants (the
+    # same ones at every call) are accepted too, and `compile` builds the
+    # statement over a relation extended with them. Anything else (a condition
+    # that is not equality, nil, a join, an order, an anonymous extension...)
+    # is nil, and the caller runs Rails' chain. Returns `[columns, values,
+    # extensions]`.
     def default_binds(model)
       return NO_DEFAULTS if model.default_scopes.empty? && !default_scope_method?(model)
-      return if (@opaque[model] || 0) >= OPAQUE_LIMIT
+
+      refused, skipped = @opaque[model] || [0, 0]
+      if refused >= OPAQUE_LIMIT && skipped + 1 < OPAQUE_RETRY
+        @opaque[model] = [refused, skipped + 1]
+        return
+      end
 
       shape = default_shape(model, model.unscoped, model.default_scoped)
       if shape
         @opaque.delete(model)
       else
-        @opaque[model] = (@opaque[model] || 0) + 1
+        @opaque[model] = [refused + 1, 0]
       end
       shape
     end
@@ -167,7 +194,12 @@ module Futamura
     end
 
     def default_shape(model, base, scoped)
-      return unless scoped.values.except(:where) == base.values.except(:where)
+      return unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+
+      extensions = scoped.extending_values
+      return unless extensions.first(base.extending_values.size) == base.extending_values
+      extensions = (extensions - base.extending_values).freeze
+      return unless extensions.all? { |mod| extension?(mod) }
 
       before = base.where_clause.send(:predicates)
       predicates = scoped.where_clause.send(:predicates)
@@ -189,7 +221,31 @@ module Futamura
         columns << attribute.name.to_s
         values << bind.value
       end
-      [columns.freeze, values]
+      [columns.freeze, values, extensions]
+    end
+
+    # Whether a module `extending` adds is one every call adds again (a named
+    # constant, not one made by a block) and leaves the loading of records to
+    # Rails (see LOADING).
+    def extension?(mod)
+      @extensions.compute_if_absent([:default, mod]) do
+        mod.is_a?(Module) && !mod.name.nil? && (overridden(mod) & LOADING).empty?
+      end
+    end
+
+    # Whether `extending(mod)` in the chain itself adds methods only, none of
+    # which a Relation already has: the statement does not run them.
+    def plain_extension?(mod)
+      @extensions.compute_if_absent([:chain, mod]) do
+        mod.is_a?(Module) && !mod.name.nil? && overridden(mod).empty?
+      end
+    end
+
+    # The instance methods of `mod` that ActiveRecord::Relation defines too.
+    def overridden(mod)
+      (mod.instance_methods + mod.private_instance_methods).select do |name|
+        ActiveRecord::Relation.method_defined?(name) || ActiveRecord::Relation.private_method_defined?(name)
+      end
     end
 
     # Build the Relation once and keep what loading it needs. `false` (not
@@ -197,21 +253,48 @@ module Futamura
     # way a StatementCache cannot reproduce. A chain that is not rooted at
     # `Model.unscoped` is built inside `Model.unscoped.where(column: bind)...
     # .scoping`, so its `Model.all` is that relation: no default scope runs
-    # and none is frozen into the statement.
-    def compile(statement, connection, columns)
+    # and none is frozen into the statement. The default scopes' `extensions`
+    # are applied to that relation, so a link of the chain that one of them
+    # overrides behaves as it does on Rails' `Model.all`; but the statement
+    # runs the chain once, so it is refused (`false`) when the chain called
+    # such a link at all.
+    def compile(statement, connection, columns, extensions)
       relation = nil
+      overrides = []
       cache = ActiveRecord::StatementCache.create(connection) do |params|
         relation = if statement.unscoped
           statement.build.call(params)
         else
           base = columns.inject(statement.model.unscoped) { |scope, column| scope.where(column => params.bind) }
+          base = watch_overrides(base.extending(*extensions), extensions, overrides) if extensions.any?
           base.scoping { statement.build.call(params) }
         end
       end
-      return false if relation.eager_loading? || relation.readonly_value || relation.extending_values.any?
+      return false if overrides.any?
+      return false if relation.eager_loading? || relation.readonly_value
+      return false unless (relation.extending_values - extensions).all? { |mod| plain_extension?(mod) }
 
       preload = relation.preload_values + relation.includes_values
       Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value)
+    end
+
+    # `relation` with a module in front of its extensions that records which
+    # of their Relation-overriding methods get called (and then calls them).
+    # Extended on the object itself, not through `extending`, so it is not one
+    # of the relation's extending_values; spawn/clone carry it along.
+    def watch_overrides(relation, extensions, calls)
+      names = extensions.flat_map { |mod| overridden(mod) }.uniq
+      return relation if names.empty?
+
+      relation.extend(Module.new do
+        names.each do |name|
+          define_method(name) do |*args, &block|
+            calls << name
+            super(*args, &block)
+          end
+          ruby2_keywords(name)
+        end
+      end)
     end
 
     def verify(key, result, expected, preload)
@@ -502,15 +585,54 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         # Why the guards in Futamura.records sent a call to Rails' chain, in the order they are checked.
+        # A guard that is none of the first three is named by what Futamura.records tests next, with
+        # the model in brackets ("scoping_block[Shop]"); `model_unloaded` is a statement whose model
+        # class was never resolved, which only a call refused before that (a bind) can leave behind.
         def reason(key, binds, root, owner = nil, association = nil)
-          bad = binds.find { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
-          return "bind_#{kind(bad)}" if bad
+          # find_index, not find: the value that is refused is usually nil.
+          index = binds.index { |value| ActiveRecord::StatementCache.unsupported_value?(value) }
+          return "bind_#{kind(binds[index])}" if index
 
           statement = Futamura.instance_variable_get(:@statements).fetch(key)
-          return "root_not_model" if root && !root.equal?(statement.model)
-          return "owner_chain" if owner && !Futamura.send(:owner_chain?, owner, association, statement, statement.model)
+          model = statement.model
+          return "model_unloaded" unless model.is_a?(Class)
+          return "root_not_model" if root && !root.equal?(model)
+          return "owner_chain" if owner && !Futamura.send(:owner_chain?, owner, association, statement, model)
+          return @compile_reasons[key] if @compile_reasons[key]
+          return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope
 
-          @compile_reasons[key] || "compiled_false"
+          if !statement.unscoped && (model.default_scopes.any? || Futamura.send(:default_scope_method?, model))
+            cause = default_shape_failure(model)
+            opaque = ((Futamura.instance_variable_get(:@opaque)[model] || [0]).first >= Futamura::OPAQUE_LIMIT)
+            return "default_scope_#{cause}#{opaque ? "_after_limit" : ""}[#{model.name}]"
+          end
+
+          "compiled_false[#{model.name}]"
+        end
+
+        # Futamura.default_shape's checks, in order, naming the first one that refuses (read only).
+        def default_shape_failure(model)
+          base = model.unscoped
+          scoped = model.default_scoped
+          return "values" unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+          return "extending" unless (scoped.extending_values - base.extending_values).all? { |mod| Futamura.send(:extension?, mod) }
+
+          before = base.where_clause.send(:predicates)
+          predicates = scoped.where_clause.send(:predicates)
+          return "prefix" unless predicates.first(before.size) == before
+
+          predicates.drop(before.size).each do |node|
+            return "non_equality_" + node.class.name.to_s.split("::").last.downcase unless node.instance_of?(Arel::Nodes::Equality)
+
+            attribute, bind = node.left, node.right
+            bind = bind.value if bind.is_a?(Arel::Nodes::BindParam)
+            return "attribute" unless attribute.is_a?(Arel::Attributes::Attribute) && attribute.relation == model.arel_table
+            return "bind_" + bind.class.name.to_s.split("::").last.downcase unless bind.is_a?(ActiveRecord::Relation::QueryAttribute)
+            return "column" unless model.columns_hash.key?(attribute.name.to_s) && bind.name == attribute.name.to_s
+          end
+          "shape_ok"
+        rescue => e
+          "raises_#{e.class.name.to_s.split("::").last.downcase}"
         end
 
         def kind(value)
@@ -602,13 +724,14 @@ if ENV["FUTAMURA_STATS"].to_s != ""
 
         private
 
-        def compile(statement, connection, columns)
+        # `*`: forwards whatever arguments compile takes (statement, connection, columns, extensions...).
+        def compile(statement, connection, *)
           t = Stats.now
           result = super
           Stats.compiles << { model: statement.model.name, seconds: Stats.now - t, built: result ? true : false }
           unless result
             key = Futamura.instance_variable_get(:@statements).key(statement)
-            Stats.compile_reasons[key] = statement.model.default_scopes.any? ? "default_scopes" : "relation_needs_rails"
+            Stats.compile_reasons[key] = "relation_needs_rails[#{statement.model.name}]"
           end
           result
         end

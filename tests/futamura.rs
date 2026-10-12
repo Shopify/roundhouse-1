@@ -230,7 +230,7 @@ end
         // and `last(n)` follows Rails' FinderMethods: ordered_relation,
         // limit, reverse_order, then the rows reversed.
         assert!(init.contains(
-            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, owner_keys: [\"room_id\"], owner_columns: [\"room_id\"]) \
+            "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, owner_keys: [\"room_id\"], owner_columns: [\"room_id\"], relation: true) \
              { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
@@ -603,7 +603,7 @@ mod default_scope_runtime {
         };
         let verified = output("1");
         let normal = output("0");
-        let results = |s: &str| s.lines().filter(|l| !l.starts_with("fallbacks=") && !l.starts_with("calls_item=") && !l.starts_with('[')).collect::<Vec<_>>().join("\n");
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("fallbacks=") && !l.starts_with("calls_") && !l.starts_with('[')).collect::<Vec<_>>().join("\n");
         // Specialized and Rails' answers agree (verify raises otherwise), and
         // the verified run changes nothing.
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
@@ -612,7 +612,42 @@ mod default_scope_runtime {
         // and a call it cannot serve ran Rails' chain (nil, a join/order,
         // a scoping block).
         assert!(normal.contains("calls_item=[1, 0]"), "{normal}");
+        // `extending` in a default scope (query_methods.rb extending!): a named
+        // module that leaves the chain's links and the loaders alone is served by
+        // the statement; one overriding a link the chain calls (`where`) or a
+        // loader (`load`), or made by a block, runs Rails' chain.
+        assert!(normal.contains("calls_ext_isle=0 built=true"), "{normal}");
+        for name in ["guarded", "anon", "loader"] {
+            assert!(normal.contains(&format!("calls_ext_{name}=1 built=false")), "{name}\n{normal}");
+        }
+        // Five refusals do not disable a model for good: refused, then
+        // evaluated again within OPAQUE_RETRY calls, and simple again.
+        assert!(normal.contains("flip=[true, true, true]"), "{normal}");
         assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
+    }
+
+    /// The FUTAMURA_STATS block names why a call ran Rails' chain. A nil bind
+    /// (which a StatementCache refuses) is `bind_nil`, not a statement whose
+    /// model never loaded; a default scope that is not a plain condition says
+    /// which check it failed; and the block's `compile` hook takes the
+    /// arguments compile takes. Skipped when ActiveRecord and sqlite3 are not
+    /// installed.
+    #[test]
+    fn stats_name_the_guard_that_sent_a_call_to_rails() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_stats_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).output().unwrap();
+        let out = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(run.status.success(), "{out}\n{}", String::from_utf8_lossy(&run.stderr));
+        assert!(out.contains("thing specialized=1 fallback={\"bind_array\" => 1, \"bind_nil\" => 1}"), "{out}");
+        assert!(out.contains("ranked specialized=0 fallback={\"default_scope_values[RankedThing]\" => 1}"), "{out}");
+        assert!(out.contains("scoped specialized=1 fallback={}"), "{out}");
     }
 }
 
@@ -1046,7 +1081,7 @@ mod flow_paths_runtime {
             return;
         }
         let schema = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"status\"\n    t.string \"kind\"\n  end\n  create_table \"notes\", force: :cascade do |t|\n    t.integer \"item_id\"\n    t.string \"body\"\n  end\nend\n";
-        let model = "class Item < ApplicationRecord\n  has_many :notes\n  def recent_notes\n    notes.order(id: :desc).first(2)\n  end\n  def self.find_all(shop, status, kind)\n    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a\n  end\nend\n";
+        let model = "class Item < ApplicationRecord\n  has_many :notes\n  def recent_notes\n    notes.order(id: :desc).first(2)\n  end\n  def top_notes\n    notes.first(2)\n  end\n  def self.find_all(shop, status, kind)\n    scope = Item.where(shop_id: shop)\n    scope = scope.where(status: status) if status.present?\n    scope = scope.where(kind: kind) if kind.present?\n    scope.order(:id).to_a\n  end\nend\n";
         let files: Vec<(&str, &str)> = vec![
             ("db/schema.rb", schema),
             ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
@@ -1059,7 +1094,7 @@ mod flow_paths_runtime {
         Analyzer::new(&app).analyze(&mut app);
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
         let report = specialize(&app, &mut tree_files).unwrap();
-        assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
+        assert_eq!(report.specialized.len(), 3, "{:?}", report.residue);
         let dir = std::env::temp_dir().join(format!("roundhouse-futamura-flow-runtime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (path, content) in &tree_files {
@@ -1073,11 +1108,14 @@ mod flow_paths_runtime {
             let out = String::from_utf8_lossy(&run.stdout).to_string();
             assert!(run.status.success(), "verify={verify}\n{out}\n{}", String::from_utf8_lossy(&run.stderr));
             assert!(!out.contains("MISMATCH"), "verify={verify}\n{out}");
-            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 8, "{out}");
-            // Unverified, no call fell back to Rails' chain: every path was
-            // served by its statement (verifying runs the fallback to compare).
+            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 9, "{out}");
+            // A terminal on the reader itself reads the filled target: Rails'.
+            assert!(out.contains("target_terminal_fallbacks=1"), "{out}");
+            // Unverified, only that call fell back to Rails' chain: every
+            // other path was served by its statement (verifying runs the
+            // fallback to compare).
             if verify == "0" {
-                assert!(out.contains("fallbacks=0"), "{out}");
+                assert!(out.contains("fallbacks=1\n"), "{out}");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1117,7 +1155,7 @@ mod implicit_self_association {
         let (report, order, init) = run("class Order < ApplicationRecord\n  has_many :lines\n  def first_lines\n    lines.order(:id).first(2)\n  end\nend\n");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
         assert!(order.contains("Futamura.records(:models_order_4_5, [self.id], owner: self, association: :lines) { lines.order(:id).first(2) }"), "{order}");
-        assert!(init.contains("\"Line\", owner_keys: [\"order_id\"], owner_columns: [\"order_id\"]) { |p| Line.all.where(order_id: p.bind).order(:id).send(:ordered_relation).limit(2) }"), "{init}");
+        assert!(init.contains("\"Line\", owner_keys: [\"order_id\"], owner_columns: [\"order_id\"], relation: true) { |p| Line.all.where(order_id: p.bind).order(:id).send(:ordered_relation).limit(2) }"), "{init}");
     }
 
     #[test]
@@ -1249,13 +1287,15 @@ mod association_scopes_and_conditions {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
-        for name in ["not_blank", "pinned", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment"] {
+        for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
         for name in ["remarks", "loaded", "unsaved"] {
             assert!(fell_back(name), "{name}\n{normal}");
         }
         assert!(normal.contains("remarks=[1] "), "{normal}");
+        // The reader's own target is not consulted once a link follows it.
+        assert!(normal.contains("loaded_chain=[1, 3] ") && normal.contains("unsaved_chain=[1, 3] "), "{normal}");
         assert!(normal.contains("unsaved=[1, 3, nil] "), "{normal}");
         assert!(normal.contains("notes=[1] "), "{normal}");
         let _ = fs::remove_dir_all(&out);

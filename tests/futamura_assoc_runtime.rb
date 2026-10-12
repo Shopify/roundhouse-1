@@ -46,6 +46,7 @@ end
 
 show("not_blank") { Finder.not_blank(room) }
 show("pinned") { Finder.pinned(room) }
+show("pinned_ordered") { Finder.pinned_ordered(room) }
 show("first_pinned") { Finder.first_pinned(room) }
 show("newest") { Finder.newest(room) }
 show("notes") { Finder.notes(room) }
@@ -62,9 +63,12 @@ show("remarks") { Finder.remarks(room) }
 loaded = Room.find(room.id)
 loaded.pinned.load
 show("loaded") { Finder.pinned(loaded) }
+# A link after the reader builds a Relation from `scope`, which queries.
+show("loaded_chain") { Finder.pinned_ordered(loaded) }
 building = Room.find(room.id)
 building.pinned.build(room_id: room.id, body: "unsaved", pinned: true)
 show("unsaved") { Finder.pinned(building) }
+show("unsaved_chain") { Finder.pinned_ordered(building) }
 puts "unsaved_size=#{Finder.pinned(building).size}"
 # A has_many the scope of which reads the owner stays Rails'.
 puts "scoped=#{Finder.scoped(room).map(&:id).inspect}"
