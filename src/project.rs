@@ -12628,13 +12628,10 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     // but recognizes GeneratorError only as a literal rescue name, and
     // its `packages/net` stops short of net/protocol's `HTTPBadResponse`
     // and net/http's `HTTPHeaderSyntaxError` (a CRuby-only constant gap
-    // until Spinel grows it).
-    if target == "spinel" {
-        return if matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError") {
-            Some("bundled_constant")
-        } else {
-            None
-        };
+    // until Spinel grows it). The names only the CRuby tree supplies
+    // (the SQLite3 adapter's) fall through to their refusal below.
+    if target == "spinel" && matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError") {
+        return Some("bundled_constant");
     }
     if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
         // JRuby, Spinel and Roda ship the same runtime files as CRuby.
