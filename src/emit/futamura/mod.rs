@@ -88,7 +88,7 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
             copies.entry((site.span.start, site.span.end)).or_default().push(site);
         }
         for (_, mut group) in copies {
-            if group.iter().all(|s| s.call == group[0].call && s.define == group[0].define) {
+            if group.iter().all(|s| s.call == group[0].call && s.define == group[0].define && s.hoists == group[0].hoists) {
                 sites.push(group.swap_remove(0));
             } else {
                 report.residue.push(format!("{}: specializes differently for the classes sharing its source", location(group[0].span)));
@@ -102,8 +102,12 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
                 continue;
             }
             let (start, end) = (site.span.start as usize, site.span.end as usize);
-            let orig = &content[start..end];
-            let call = site.call.replace("{orig}", orig);
+            // The fallback reads the values the call site evaluated ahead of the call.
+            let mut orig = content[start..end].to_string();
+            for (s, e, read) in site.hoists.iter().rev() {
+                orig.replace_range(*s as usize - start..*e as usize - start, read);
+            }
+            let call = site.call.replace("{orig}", &orig);
             content.replace_range(start..end, &call);
             last_start = site.span.start;
             report.specialized.push(location(site.span));
