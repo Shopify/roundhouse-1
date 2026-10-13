@@ -2125,6 +2125,59 @@ mod preload_runtime {
     }
 }
 
+/// Preloads whose reflections compare several columns (array `primary_key:`/`foreign_key:`):
+/// Preloader::Association#derive_key reads one value per column and skips an owner with a nil in
+/// any of them; LoaderQuery#load_records_for_keys builds `where(column => values)` per column
+/// (an IN list each). The runtime plans them and runs the same queries; a list against a list of
+/// another length is Rails' (counted as `composite_key`). Real ActiveRecord on SQLite
+/// (`tests/futamura_cpk_preload_runtime.rb`, over tests/fixtures/futamura_cpk_app).
+mod composite_key_preload {
+    use std::process::Command;
+
+    fn probe(verify: &str, stats: Option<&std::path::Path>) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_cpk_preload_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let mut run = Command::new("ruby");
+        run.arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify);
+        if let Some(dir) = stats {
+            run.env("FUTAMURA_STATS", dir);
+        }
+        let run = run.output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    #[test]
+    fn composite_preloads_load_what_rails_loads_with_the_same_queries() {
+        let dir = std::env::temp_dir().join(format!("futamura-cpk-preload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let normal = probe("0", Some(&dir));
+        let verified = probe("1", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (Some(normal), Some(verified)) = (normal, verified) else { return };
+        for out in [&normal, &verified] {
+            for name in ["lines", "gifts", "crates", "lines_order", "parcels"] {
+                assert!(out.contains(&format!("{name}=same queries=1/1 sql=true\n")), "{name}\n{out}");
+            }
+            assert!(out.contains("nested=same queries=2/2 sql=true\n"), "{out}");
+        }
+        // A nil in one key column leaves the owner without a target; the other regions' rows are not its.
+        assert!(normal.contains("lines_targets=[[1, [[1, 2]]], [2, [[5]]], [3, [[]]]]\n"), "{normal}");
+        // One IN list per key column, not a tuple condition.
+        assert!(normal.contains("\"lines\".\"region_id\" IN (?, ?) AND \"lines\".\"order_id\" IN (?, ?)"), "{normal}");
+        // Planned, not handed to Rails: only the lists of different lengths are refused.
+        assert!(normal.contains("[:lines, \"Order\", [[:lines, []]]]") && normal.contains("[:order, \"Line\", [[:order, []]]]"), "{normal}");
+        assert!(normal.contains("[:parcels, \"Order\", \"composite_key\"]"), "{normal}");
+        assert!(normal.contains("refusals={\"composite_key\" => 1}\n"), "{normal}");
+    }
+}
+
 /// `where(column: Klass)`: a Class has no `id`, so the predicate builder builds `column = <bind>`
 /// with it as the value (BasicObjectHandler) and the adapter inlines `Class#to_s` (no prepared
 /// statements) or raises TypeError (prepared statements); a Class that answers `id` is read as the
