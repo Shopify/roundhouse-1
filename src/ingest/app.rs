@@ -837,7 +837,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             let outer = model.name.clone();
                             app.models.push(model);
                             if let Some(classes) =
-                                survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
+                                survey::unwrap_or_drop_file(ingest_library_classes_beside_model(&source, &path_str, &outer))?
                             {
                                 let nested = beside_model(&outer, classes, &model_bases);
                                 let (concern_items, concern_enum_decls, concern_guarded) =
@@ -1034,7 +1034,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         app.models.push(model);
                         // Classes nested in the model's body are classes
                         // of their own, exactly as under `app/models`.
-                        let classes = match ingest_library_classes(&source, &path_str) {
+                        let classes = match ingest_library_classes_beside_model(&source, &path_str, &outer) {
                             Ok(classes) => Some(classes),
                             Err(err) => {
                                 drop_library_file(&mut app, &path_str, &err);
@@ -10269,6 +10269,33 @@ fn without_conditional_declarations_of(
             !declared.iter().any(|d| name == d || name.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with("::")))
         })
         .collect()
+}
+
+/// The library walk over a model file, for the classes `beside_model`
+/// keeps. It walks the model's own class too, whose keyword `alias`es the
+/// model walk resolves after synthesis (an alias of an enum predicate, a
+/// column or an association names a method this walk never sees), so
+/// those are captured instead of refusing the file, and dropped with the
+/// model's own class. One in any other class is refused as before.
+fn ingest_library_classes_beside_model(
+    source: &[u8],
+    path: &str,
+    outer: &crate::ident::ClassId,
+) -> IngestResult<Vec<crate::dialect::LibraryClass>> {
+    let (classes, deferred) =
+        super::inherited_alias::capturing(|| ingest_library_classes(source, path));
+    let classes = classes?;
+    let foreign = deferred.iter().find(|site| {
+        !classes
+            .iter()
+            .any(|lc| lc.name == *outer && lc.unknown_calls.iter().any(|call| call.span == **site))
+    });
+    if let Some(site) = foreign {
+        let err = super::inherited_alias::refusal(path);
+        super::error_site::note(&err, site.start as usize, site.end as usize);
+        return Err(err);
+    }
+    Ok(classes)
 }
 
 /// The classes a MODEL's file declares besides the model, which its own
