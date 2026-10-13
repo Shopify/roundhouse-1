@@ -19,6 +19,16 @@ use roundhouse::project::BuildTarget;
 use roundhouse::ty::Ty;
 use roundhouse::App;
 
+/// `ingest` installs the app's `extensions:` as process-wide facts that the
+/// analysis then reads (`extensions::install`), so two apps ingested and
+/// analyzed at once in this binary see each other's. A test holds this for
+/// its whole ingest-to-emit run.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn analyzed(files: &[(&str, &str)]) -> App {
     let tree: HashMap<PathBuf, Vec<u8>> =
         files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
@@ -73,6 +83,7 @@ fn probe(body: &str) -> App {
 
 #[test]
 fn value_constants_take_their_rbs_types() {
+    let _serial = serial();
     let app = probe("    [Encoding::UTF_8, File::FNM_EXTGLOB, Math::PI, Float::INFINITY]");
     assert_eq!(type_of(&app, "Encoding::UTF_8"), class("Encoding"));
     // Declared in File::Constants, which File includes.
@@ -84,6 +95,7 @@ fn value_constants_take_their_rbs_types() {
 
 #[test]
 fn stdlib_namespaces_resolve_to_their_classes() {
+    let _serial = serial();
     let app = probe("    [URI::HTTPS, OpenSSL::HMAC, Benchmark, Gem::Version]");
     for name in ["URI::HTTPS", "OpenSSL::HMAC", "Benchmark", "Gem::Version"] {
         assert_eq!(type_of(&app, name), class(name), "{name}");
@@ -93,6 +105,7 @@ fn stdlib_namespaces_resolve_to_their_classes() {
 
 #[test]
 fn a_class_alias_resolves_to_its_target() {
+    let _serial = serial();
     let app = probe("    Queue");
     assert_eq!(type_of(&app, "Thread::Queue"), class("Thread::Queue"));
     assert!(errors(&app).is_empty(), "{:#?}", errors(&app));
@@ -102,6 +115,7 @@ fn a_class_alias_resolves_to_its_target() {
 /// before Ruby's top-level one; outside `Foo` the name is Ruby's.
 #[test]
 fn an_app_namesake_wins_over_ruby() {
+    let _serial = serial();
     let app = analyzed(&[
         ("app/lib/foo.rb", "module Foo\n  class NotImplementedError < StandardError\n  end\n\n  class Job\n    def run\n      NotImplementedError\n    end\n  end\nend\n"),
         ("app/lib/probe.rb", "class Probe\n  def run\n    NotImplementedError\n  end\nend\n"),
@@ -141,6 +155,7 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesu
 /// A gem's RBI names its constant before Ruby's signatures do.
 #[test]
 fn a_gem_constant_stays_the_gems() {
+    let _serial = serial();
     let (_, errors) = emit_and_run::empty_app()
         .write("Gemfile.lock", LOCK)
         .write("roundhouse.yml", "extensions:\n  - ext\n")
@@ -212,6 +227,7 @@ fn emitted_links(dir: &std::path::Path) -> String {
 /// Encoding is core and needs none.
 #[test]
 fn the_ruby_tree_requires_the_stdlib_it_names() {
+    let _serial = serial();
     let (dir, errors) = links_app().emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let links = emitted_links(&dir);
@@ -223,11 +239,13 @@ fn the_ruby_tree_requires_the_stdlib_it_names() {
 /// Run on the pinned interpreter (`ruby` on PATH must be Ruby 4.0).
 #[test]
 fn stdlib_constants_run_in_emitted_ruby() {
+    let _serial = serial();
     links_app().run_test("test/models/links_test.rb").assert_passes();
 }
 
 #[test]
 fn jruby_admits_them() {
+    let _serial = serial();
     let (_, errors) = links_app().emit(BuildTarget::Jruby);
     assert!(errors.is_empty(), "{errors:#?}");
 }
@@ -236,6 +254,7 @@ fn jruby_admits_them() {
 /// name rather than emit a reference to nothing.
 #[test]
 fn another_runtime_refuses_them_by_name() {
+    let _serial = serial();
     for target in [BuildTarget::Crystal, BuildTarget::Typescript] {
         let (_, errors) = links_app().emit(target);
         for name in ["URI::HTTPS", "Shellwords"] {
