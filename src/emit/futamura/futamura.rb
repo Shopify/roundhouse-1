@@ -1583,6 +1583,15 @@ end
 # that ran second hits what the first stored), unless FUTAMURA_STATS_AB_UNCACHED=1 runs both of them uncached.
 # FUTAMURA_STATS_HELPERS=1 also times the pure guard helpers one by one (`helpers` in the dump: calls, inclusive and
 # self CPU); that adds a clock read to each of them, so use it to rank them, not to total the guard phase.
+# FUTAMURA_STATS also counts the queries Futamura did not serve, by the innermost app frame that issued them
+# (`app_queries` in the dump: `path:line` relative to `app_root` => {calls, cached, names}). Rails' chain at a
+# site Futamura left alone runs uninstrumented, so this is what ranks residue by how often it runs
+# (tools/loops/residue-weight.rb joins it with the compile-time residue list). The seam is the `sql.active_record`
+# event of a SELECT/WITH statement: a relation load, calculation, `exists?` or `find_by` each publish one, and so
+# does a query cache hit (`cached`). A statement executed inside a Futamura.records call, outside its fallback block,
+# is counted in `served_queries`; every other one is counted at its site. Frames inside Rails, gems, vendor/ and
+# this file are skipped, and the verify shadow is ignored. `caller_locations` is read only for a statement Futamura
+# did not serve, and only when stats are on.
 # The dump records `clock_read_ns`, what one CPU clock read costs here (a system call): each call pays about four
 # of them inside its phases.
 if ENV["FUTAMURA_STATS"].to_s != ""
@@ -1596,7 +1605,10 @@ if ENV["FUTAMURA_STATS"].to_s != ""
                         :guard_cpu, :exec_cpu, :fallback_cpu, :compile_cpu, :ab_spec_cpu, :ab_orig_cpu, :ab_cached, keyword_init: true)
       # One Futamura.records call in flight: where its phases begin, and the CPU that is not its own (naming a
       # fallback reason, building a statement, the verify shadow, nested calls made from its chain).
-      Frame = Struct.new(:exec_at, :overhead_cpu, :overhead_s, :compile_cpu, :compile_s, :shadow_cpu, :shadow_depth, :nested_cpu)
+      Frame = Struct.new(:exec_at, :overhead_cpu, :overhead_s, :compile_cpu, :compile_s, :shadow_cpu, :shadow_depth, :nested_cpu, :in_fallback)
+      # The queries Rails ran from one app line: how many, how many the query cache answered, and by the adapter's
+      # event name ("Shop Load", "Shop Count", "Shop Exists?").
+      AppQuery = Struct.new(:calls, :cached, :names)
 
       @sites = {}
       @compiles = []
@@ -1605,9 +1617,61 @@ if ENV["FUTAMURA_STATS"].to_s != ""
       @defined = []
       @preload_refusals = Hash.new(0)
       @helpers = Hash.new { |h, name| h[name] = [0, 0.0, 0.0] }
+      @served_queries = 0
+      @app_queries = Hash.new { |h, site| h[site] = AppQuery.new(0, 0, Hash.new(0)) }
+      SELECT = /\A[\s(]*(?:SELECT|WITH)\b/i
+      SKIPPED_EVENTS = %w[SCHEMA TRANSACTION].freeze
+      # A path that is not application code even when it sits under the app root (bundled gems, vendored code).
+      NOT_APP = %r{/(?:vendor|gems)/}
 
       class << self
-        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined, :helpers, :preload_refusals
+        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined, :helpers, :preload_refusals, :app_queries, :served_queries
+
+        # The application root: where an app frame's path begins (Rails.root, else the working directory).
+        def app_root
+          @app_root ||= begin
+            root = defined?(::Rails) && ::Rails.respond_to?(:root) && ::Rails.root ? ::Rails.root.to_s : Dir.pwd
+            root = ENV["FUTAMURA_STATS_ROOT"] if ENV["FUTAMURA_STATS_ROOT"].to_s != ""
+            root.chomp("/")
+          end
+        end
+
+        # The roots a frame's path may begin with (the same tree reached through a symlink).
+        def app_prefixes
+          @app_prefixes ||= [app_root, (File.realpath(app_root) rescue app_root)].uniq.map { |root| "#{root}/" }
+        end
+
+        # `path:line` (relative to the app root) of the innermost app frame, or nil. The frames are read a few at a
+        # time: the app's frame is almost always within the first dozen.
+        def app_site
+          [24, nil].each do |length|
+            frames = length ? caller_locations(1, length) : caller_locations(1)
+            frames.each do |frame|
+              path = frame.absolute_path || frame.path
+              next if path == __FILE__
+
+              prefix = app_prefixes.find { |p| path.start_with?(p) }
+              next if prefix.nil? || NOT_APP.match?("/#{path.delete_prefix(prefix)}")
+
+              return "#{path.delete_prefix(prefix)}:#{frame.lineno}"
+            end
+            return nil if length.nil? || frames.size < length
+          end
+        end
+
+        # One `sql.active_record` event (see the header comment).
+        def count_query(payload)
+          return if SKIPPED_EVENTS.include?(payload[:name]) || !SELECT.match?(payload[:sql].to_s)
+
+          frame = frames.last
+          return if frame&.shadow_depth&.positive?
+          return @served_queries += 1 if frame&.exec_at && !frame.in_fallback
+
+          row = @app_queries[app_site || "(no app frame)"]
+          row.calls += 1
+          row.cached += 1 if payload[:cached]
+          row.names[payload[:name].to_s] += 1
+        end
 
         def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -1723,7 +1787,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         def dump
-          return if @sites.empty? && @defined.empty? && @preload_refusals.empty?
+          return if @sites.empty? && @defined.empty? && @preload_refusals.empty? && @app_queries.empty?
 
           rows = @sites.transform_values do |s|
             h = s.to_h
@@ -1733,6 +1797,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           helpers = @helpers.transform_values { |calls, inclusive, self_cpu| { calls: calls, inclusive_cpu: inclusive, self_cpu: self_cpu } }
           File.write(File.join(DIR, "futamura-stats-#{Process.pid}.json"), JSON.generate(
             pid: Process.pid, defined: @defined, preload_refusals: @preload_refusals, sites: rows, compiles: @compiles,
+            app_root: app_root, served_queries: @served_queries, app_queries: @app_queries.transform_values(&:to_h),
             association_key: { calls: @association_keys[0], seconds: @association_keys[1] },
             clock_read_ns: clock_read_ns, ab_uncached: AB_UNCACHED, helpers: helpers
           ))
@@ -1756,7 +1821,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         def records(key, binds, owner: nil, association: nil, root: nil, &fallback)
           site = Stats.site(key)
           site.calls += 1
-          frame = Stats::Frame.new(nil, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+          frame = Stats::Frame.new(nil, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, false)
           frames = Stats.frames
           fell = nil
           fell_s = 0.0
@@ -1774,8 +1839,10 @@ if ENV["FUTAMURA_STATS"].to_s != ""
             frame.overhead_cpu += fell_at - o_cpu
             frame.overhead_s += t - o_s
             begin
+              frame.in_fallback = true
               fallback.call
             ensure
+              frame.in_fallback = false
               fell_s = Stats.now - t
               fell_cpu = Stats.cpu - fell_at
             end
@@ -1939,6 +2006,9 @@ if ENV["FUTAMURA_STATS"].to_s != ""
     # Preload entries Rails' Preloader keeps, by reason (one count per call of an entry).
     Preload.singleton_class.prepend(Module.new { def refused(reason) = Stats.preload_refusals[reason] += 1 })
     singleton_class.prepend(Stats::Helpers) if Stats::HELPERS
+    if defined?(::ActiveSupport::Notifications)
+      ::ActiveSupport::Notifications.subscribe("sql.active_record") { |*, payload| Stats.count_query(payload) }
+    end
     at_exit { Stats.dump }
   end
 end

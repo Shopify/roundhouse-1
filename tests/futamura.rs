@@ -2383,3 +2383,39 @@ mod strict_loading_terminals {
         let _ = fs::remove_dir_all(&out);
     }
 }
+
+/// FUTAMURA_STATS counts the queries Futamura did not serve by the innermost app frame that issued them
+/// (`path:line` under the app root), so the residue Rails runs can be ranked by how often it runs. Frames in Rails and
+/// under vendor/ are skipped, a chain over several lines is counted at the line of its terminal, a call that fell
+/// back is counted where it was written, and a statement the runtime served is only totalled. Real ActiveRecord on
+/// SQLite (`tests/futamura_resweight_runtime.rb`).
+mod resweight_runtime {
+    use std::process::Command;
+
+    #[test]
+    fn queries_rails_ran_are_counted_by_app_call_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_resweight_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).output().unwrap();
+        let out = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(run.status.success(), "{out}\n{}", String::from_utf8_lossy(&run.stderr));
+        assert!(out.starts_with("served=2\n"), "{out}");
+        // Written on one line, over several (the terminal's line), count, exists?, find_by.
+        assert!(out.contains("app/finders.rb:5 calls=5 cached=1 names={\"Thing Load\" => 5}\n"), "{out}");
+        assert!(out.contains("app/finders.rb:10 calls=2 cached=0 names={\"Thing Load\" => 2}\n"), "{out}");
+        assert!(out.contains("app/finders.rb:12 calls=1 cached=0 names={\"Thing Count\" => 1}\n"), "{out}");
+        assert!(out.contains("app/finders.rb:13 calls=1 cached=0 names={\"Thing Exists?\" => 1}\n"), "{out}");
+        assert!(out.contains("app/finders.rb:14 calls=1 cached=0 names={\"Thing Load\" => 1}\n"), "{out}");
+        // Through a vendored helper: the app line that called it. A fallback: where the call is written.
+        assert!(out.contains("app/finders.rb:15 calls=1 cached=0"), "{out}");
+        assert!(out.contains("app/finders.rb:4 calls=1 cached=0"), "{out}");
+        assert!(!out.contains("vendor/") && !out.contains("(no app frame)"), "{out}");
+        assert!(out.contains("dump_root=true dump_sites=true dump_served=2\n"), "{out}");
+    }
+}
