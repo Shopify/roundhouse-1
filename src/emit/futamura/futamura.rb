@@ -252,13 +252,65 @@ module Futamura
     private :redefined?
 
     def rails_method?(method)
+      defined_by_rails?(method) || sorbet_forwards_to_rails?(method)
+    end
+    private :rails_method?
+
+    def defined_by_rails?(method)
       owner = method.owner
       return false if owner.name.nil? && !owner.singleton_class?
 
       location = method.source_location&.first
       !location.nil? && (location.start_with?(rails_dir) || in_rails_dir?(location))
     end
-    private :rails_method?
+    private :defined_by_rails?
+
+    # A method sorbet-runtime installed in place of the one a `sig` was written for, when the
+    # call can only reach Rails' method with the result it would have given. The wrapper is told
+    # by where it is defined (the directory of sorbet-runtime's own method-wrapping code, not by
+    # name) and its signature is the one sorbet registered for it:
+    #   - `abstract`: CallValidation.create_abstract_wrapper is `defined?(super) ? super :
+    #     raise NotImplementedError`, no checks and no value of its own, so the call is the
+    #     next method in the ancestors (a `has_many` reader in GeneratedAssociationMethods
+    #     behind an interface's abstract declaration).
+    #   - checked: CallValidation.validate_call checks `bind`, every argument and the return
+    #     value against the sig's types and raises TypeError on a mismatch (and `void` replaces
+    #     the value), a check the specialized path would skip. The wrapper is transparent only
+    #     when there is nothing to check: no `bind`, no block type, every argument and the
+    #     return `T.untyped`; and then the method it wraps (`Signature#method`) decides.
+    # A sig that has not run yet is run here, as sorbet's first-call wrapper does.
+    def sorbet_forwards_to_rails?(method)
+      return false unless defined?(::T::Private::Methods) && sorbet_wrapper?(method)
+
+      signature = ::T::Private::Methods.signature_for_method(method)
+      return false if signature.nil?
+
+      if signature.mode == ::T::Private::Methods::Modes.abstract
+        super_method = method.super_method
+        !super_method.nil? && rails_method?(super_method)
+      else
+        sorbet_unchecked?(signature) && rails_method?(signature.method)
+      end
+    end
+    private :sorbet_forwards_to_rails?
+
+    def sorbet_wrapper?(method)
+      location = method.source_location&.first
+      return false if location.nil?
+
+      @sorbet_dir ||= File.dirname(::T::Private::Methods.method(:signature_for_method).source_location.first)
+      File.dirname(location) == @sorbet_dir
+    end
+    private :sorbet_wrapper?
+
+    def sorbet_unchecked?(signature)
+      untyped = ->(type) { type.nil? || type.is_a?(::T::Types::Untyped) }
+      signature.bind.nil? && signature.block_type.nil? &&
+        signature.effective_return_type.is_a?(::T::Types::Untyped) &&
+        [signature.arg_types, signature.kwarg_types].all? { |types| types.all? { |_name, type| untyped.call(type) } } &&
+        untyped.call(signature.rest_type) && untyped.call(signature.keyrest_type)
+    end
+    private :sorbet_unchecked?
 
     # The same files reached through another path (a gem home whose entries are symlinks, as
     # in a Nix store: the methods' source_location and the gem's own differ by prefix only).

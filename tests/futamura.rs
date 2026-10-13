@@ -740,6 +740,55 @@ mod guards_runtime {
         assert!(normal.contains("aliased_rails_path=[[1, 0]]\noutside_rails=[[1, 1]]\n"), "{normal}");
     }
 
+    /// A `sig` leaves a sorbet-runtime wrapper in place of the method. The probe
+    /// (`tests/futamura_sorbet_runtime.rb`) uses the gem when it loads, else a reproduction of its wrappers.
+    fn sorbet_probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_sorbet_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    /// Each line is `name=[[record id, calls that ran Rails' chain], ...]`, each reader read twice.
+    #[test]
+    fn a_sorbet_wrapper_that_can_only_forward_to_rails_method_is_looked_through() {
+        let Some(normal) = sorbet_probe("0") else { return };
+        // An abstract declaration over Rails' reader (`defined?(super) ? super : raise`) and over a class method
+        // is the method behind it: answered by the statement. A checked sig whose arguments and return are all
+        // `T.untyped` around Rails' reader is too.
+        assert!(normal.contains("abstract_room=[[1, 0], [1, 0]]\n"), "{normal}");
+        assert!(normal.contains("unscoped=[[1, 0], [1, 0]]\n"), "{normal}");
+        assert!(normal.contains("checked_room=[[1, 0], [1, 0]]\n"), "{normal}");
+        // An abstract wrapper whose `super` is a method the app defines, a sig that can raise on the value
+        // (a typed return) and one that replaces it (`void`) are Rails' to run.
+        assert!(normal.contains("overridden_room=[[nil, 1], [nil, 1]]\n"), "{normal}");
+        assert!(normal.contains("typed_room=[[1, 1], [1, 1]]\n"), "{normal}");
+        assert!(normal.contains("void_reader_rails=false\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_sorbet_calls_agree_with_rails_under_verify() {
+        let (Some(verified), Some(normal)) = (sorbet_probe("1"), sorbet_probe("0")) else { return };
+        let records = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with("sorbet=") && !l.starts_with("void_reader_rails="))
+                .map(|l| {
+                    let (name, rest) = l.split_once('=').unwrap();
+                    let ids: Vec<&str> = rest.split("], [").map(|pair| pair.trim_matches(|c| c == '[' || c == ']').split(", ").next().unwrap()).collect();
+                    format!("{name}:{}", ids.join(","))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(records(&verified), records(&normal), "{verified}\n{normal}");
+    }
+
     #[test]
     fn the_same_calls_agree_with_rails_under_verify() {
         let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
