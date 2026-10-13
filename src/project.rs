@@ -15747,18 +15747,13 @@ fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App
     if needed.is_empty() {
         return;
     }
-    let faceted = files.iter().find(|(path, _)| path == "runtime/gem_facades.rb").map(|(_, c)| c.clone()).unwrap_or_default();
     let Some((_, gemfile)) = files.iter_mut().find(|(path, _)| path == "Gemfile") else {
         return;
     };
     let mut eager_requires = Vec::new();
     for gem in needed {
         let namespace = crate::gems::namespace_of(&gem.name).to_ascii_lowercase();
-        // A gem runtime/gem_facades.rb already requires, guardedly and on
-        // demand (`runtime_gems`, the lock-gated entries), is not also
-        // required unguarded at the top of boot.rb: where it is not
-        // installed that turns a late undefined constant into a boot failure.
-        if namespace == gem.name && !faceted.contains(&format!("{:?}", gem.name)) {
+        if namespace == gem.name {
             eager_requires.push(gem.name.clone());
         }
         let version = gem.version.as_deref();
