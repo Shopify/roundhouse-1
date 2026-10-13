@@ -1139,7 +1139,7 @@ mod more_links_and_values {
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
         assert!(finder.contains("Futamura.records(") && finder.contains("[Futamura.find_by_value(Tenant::NAME)]"), "{finder}");
         // A call on a constant runs class code, so it is evaluated once, ahead of the call, and the fallback reads it back.
-        assert!(finder.contains("(__fut_services_finder_6_5 = [(Tenant.fetch(x))]; Futamura.records(:services_finder_6_5, [Futamura.find_by_value(__fut_services_finder_6_5[0])]) { Tenant.find_by(name: __fut_services_finder_6_5[0]) })"), "{finder}");
+        assert!(finder.contains("(__fut_services_finder_6_5 = []; Futamura.records(:services_finder_6_5, [Futamura.find_by_value((__fut_services_finder_6_5[0] = (Tenant.fetch(x))))]) { Tenant.find_by(name: __fut_services_finder_6_5[0]) })"), "{finder}");
     }
 
     /// core.rb `find_by` (the class method) reads a value that responds to `id`
@@ -2420,6 +2420,15 @@ module Lookup
   def self.first_named(name)
     Widget.find_by(name: tick(name))
   end
+
+  def self.stamp
+    calls << :stamp
+    1
+  end
+
+  def self.mixed
+    Widget.where(shop_id: stamp, kind: tick(\"K\")).to_a
+  end
 end
 ";
 
@@ -2440,12 +2449,14 @@ end
     #[test]
     fn a_call_value_is_evaluated_once_ahead_of_the_call_and_the_fallback_reads_it_back() {
         let (out, lookup) = emit(LOOKUP);
-        assert_eq!(lookup.matches("Futamura.records(").count(), 5, "{lookup}");
+        assert_eq!(lookup.matches("Futamura.records(").count(), 6, "{lookup}");
         // In argument order, parenthesized so any expression is valid in the array.
-        assert!(lookup.contains("(__fut_services_lookup_14_5 = [(tick(name)), (tick(kind))]; Futamura.records(:services_lookup_14_5, [__fut_services_lookup_14_5[0], __fut_services_lookup_14_5[1]]) { Widget.where(name: __fut_services_lookup_14_5[0], kind: __fut_services_lookup_14_5[1]).to_a })"), "{lookup}");
+        assert!(lookup.contains("(__fut_services_lookup_14_5 = []; Futamura.records(:services_lookup_14_5, [(__fut_services_lookup_14_5[0] = (tick(name))), (__fut_services_lookup_14_5[1] = (tick(kind)))]) { Widget.where(name: __fut_services_lookup_14_5[0], kind: __fut_services_lookup_14_5[1]).to_a })"), "{lookup}");
         // A plain read beside a call keeps its own text; only the call is read back.
-        assert!(lookup.contains("Futamura.records(:services_lookup_10_5, [__fut_services_lookup_10_5[0]]) { Widget.where(shop_id: 1, kind: __fut_services_lookup_10_5[0]).order(:id).to_a }"), "{lookup}");
+        assert!(lookup.contains("Futamura.records(:services_lookup_10_5, [(__fut_services_lookup_10_5[0] = (tick(kind)))]) { Widget.where(shop_id: 1, kind: __fut_services_lookup_10_5[0]).order(:id).to_a }"), "{lookup}");
         assert!(!lookup.contains("{ Widget.where(shop_id: 1, kind: tick(kind))"), "{lookup}");
+        // A plain read before a call stays before it among the binds, as the hash lists them.
+        assert!(lookup.contains("Futamura.records(:services_lookup_35_5, [stamp, (__fut_services_lookup_35_5[0] = (tick(\"K\")))])"), "{lookup}");
         let _ = fs::remove_dir_all(&out);
     }
 

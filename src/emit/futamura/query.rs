@@ -290,12 +290,15 @@ impl<'a> Specializer<'a> {
         let binds = if chain.owner.is_some() { format!("-> {{ [{}] }}", binds.join(", ")) } else { format!("[{}]", binds.join(", ")) };
         let mut call = format!("Futamura.records(:{key}, {binds}{owner}{root}) {{ {{orig}} }}");
         // A value that is not a plain read (a call, a block) is evaluated once, where Ruby evaluates
-        // the argument list (left to right, ahead of the call), into a local the fallback reads back.
+        // the argument list (left to right, ahead of the call): in its place among the binds, which
+        // are in source order, and stored in a local the fallback reads back.
         let mut hoists = Vec::new();
         if !chain.hoisted.is_empty() {
             let temp = format!("__fut_{key}");
-            let values = chain.hoisted.iter().map(|(_, src)| format!("({src})")).collect::<Vec<_>>().join(", ");
-            call = format!("({temp} = [{values}]; {})", call.replace(HOIST, &temp));
+            for (i, (_, src)) in chain.hoisted.iter().enumerate() {
+                call = call.replace(&format!("{HOIST}[{i}]"), &format!("({temp}[{i}] = ({src}))"));
+            }
+            call = format!("({temp} = []; {call})");
             hoists = chain.hoisted.iter().enumerate().map(|(i, (span, _))| (span.start, span.end, format!("{temp}[{i}]"))).collect();
             hoists.sort();
         }
