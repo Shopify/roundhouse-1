@@ -425,6 +425,7 @@ impl Paths {
                     span: then.span,
                     call: format!("(({cond}) ? {} : {})", then.call, other.call),
                     define: format!("{}\n  {}", then.define, other.define),
+                    hoists: Vec::new(),
                 }
             }
         }

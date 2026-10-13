@@ -1133,12 +1133,13 @@ mod more_links_and_values {
     }
 
     #[test]
-    fn a_constant_value_is_evaluated_at_the_call_site_but_a_call_on_one_is_not() {
+    fn a_constant_value_is_read_at_the_call_site_and_a_call_on_one_is_evaluated_once() {
         let (report, files) = run("class Finder\n  def self.named\n    Tenant.find_by(name: Tenant::NAME)\n  end\n  def self.again(x)\n    Tenant.find_by(name: Tenant.fetch(x))\n  end\nend\n");
-        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert_eq!(report.specialized.len(), 2, "{:?}", report.residue);
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
         assert!(finder.contains("Futamura.records(") && finder.contains("[Futamura.find_by_value(Tenant::NAME)]"), "{finder}");
-        assert!(report.residue.iter().any(|r| r.contains("value is Send")), "{:?}", report.residue);
+        // A call on a constant runs class code, so it is evaluated once, ahead of the call, and the fallback reads it back.
+        assert!(finder.contains("(__fut_services_finder_6_5 = []; Futamura.records(:services_finder_6_5, [Futamura.find_by_value((__fut_services_finder_6_5[0] = (Tenant.fetch(x))))]) { Tenant.find_by(name: __fut_services_finder_6_5[0]) })"), "{finder}");
     }
 
     /// core.rb `find_by` (the class method) reads a value that responds to `id`
@@ -2480,5 +2481,118 @@ mod resweight_runtime {
         assert!(out.contains("app/finders.rb:4 calls=1 cached=0"), "{out}");
         assert!(!out.contains("vendor/") && !out.contains("(no app frame)"), "{out}");
         assert!(out.contains("dump_root=true dump_sites=true dump_served=2\n"), "{out}");
+    }
+}
+
+/// A `where` value that is a call (not a plain read) is evaluated once, where Ruby evaluates the
+/// hash's values (while it builds the argument list, left to right, before `where` runs), and the
+/// fallback reads the result back. The probe (`tests/futamura_hoist_runtime.rb`) counts evaluations
+/// on real ActiveRecord, with and without `FUTAMURA_VERIFY=1`.
+mod hoisted_values {
+    use super::{Command, fs, scratch, write};
+
+    const LOOKUP: &str = "\
+module Lookup
+  def self.calls = (@calls ||= [])
+
+  def self.tick(value)
+    calls << value
+    value.to_s.downcase
+  end
+
+  def self.by_kind(kind)
+    Widget.where(shop_id: 1, kind: tick(kind)).order(:id).to_a
+  end
+
+  def self.ordered(name, kind)
+    Widget.where(name: tick(name), kind: tick(kind)).to_a
+  end
+
+  def self.listed(names)
+    Widget.where(shop_id: 1, name: names.map { |n| tick(n) }).to_a
+  end
+
+  def self.listed_with_block(pairs)
+    Widget.where(shop_id: 1, name: pairs.map(&:last).each { |n| tick(n) }).to_a
+  end
+
+  def self.first_named(name)
+    Widget.find_by(name: tick(name))
+  end
+
+  def self.stamp
+    calls << :stamp
+    1
+  end
+
+  def self.mixed
+    Widget.where(shop_id: stamp, kind: tick(\"K\")).to_a
+  end
+end
+";
+
+    fn emit(lookup: &str) -> (std::path::PathBuf, String) {
+        let src = scratch("hoist-src");
+        let out = scratch("hoist-out");
+        write(&src, "db/schema.rb", b"ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"kind\"\n    t.integer \"shop_id\"\n  end\nend\n");
+        write(&src, "app/models/application_record.rb", b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n");
+        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\nend\n");
+        write(&src, "app/services/lookup.rb", lookup.as_bytes());
+        let run = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(&src).output().unwrap();
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let finder = fs::read_to_string(out.join("app/services/lookup.rb")).unwrap();
+        let _ = fs::remove_dir_all(&src);
+        (out, finder)
+    }
+
+    #[test]
+    fn a_call_value_is_evaluated_once_ahead_of_the_call_and_the_fallback_reads_it_back() {
+        let (out, lookup) = emit(LOOKUP);
+        assert_eq!(lookup.matches("Futamura.records(").count(), 6, "{lookup}");
+        // In argument order, parenthesized so any expression is valid in the array.
+        assert!(lookup.contains("(__fut_services_lookup_14_5 = []; Futamura.records(:services_lookup_14_5, [(__fut_services_lookup_14_5[0] = (tick(name))), (__fut_services_lookup_14_5[1] = (tick(kind)))]) { Widget.where(name: __fut_services_lookup_14_5[0], kind: __fut_services_lookup_14_5[1]).to_a })"), "{lookup}");
+        // A plain read beside a call keeps its own text; only the call is read back.
+        assert!(lookup.contains("Futamura.records(:services_lookup_10_5, [(__fut_services_lookup_10_5[0] = (tick(kind)))]) { Widget.where(shop_id: 1, kind: __fut_services_lookup_10_5[0]).order(:id).to_a }"), "{lookup}");
+        assert!(!lookup.contains("{ Widget.where(shop_id: 1, kind: tick(kind))"), "{lookup}");
+        // A plain read before a call stays before it among the binds, as the hash lists them.
+        assert!(lookup.contains("Futamura.records(:services_lookup_35_5, [stamp, (__fut_services_lookup_35_5[0] = (tick(\"K\")))])"), "{lookup}");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_call_value_through_a_local_is_still_left_to_rails() {
+        let src = "module Lookup\n  def self.late(kind)\n    scope = Widget.where(kind: tick(kind))\n    scope.to_a\n  end\nend\n";
+        let (out, lookup) = emit(src);
+        assert_eq!(lookup.matches("Futamura.records(").count(), 0, "{lookup}");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn the_emitted_lookup_evaluates_each_value_once_with_and_without_verify() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let (out, _) = emit(LOOKUP);
+        let probe = root.join("tests/futamura_hoist_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        let verified = output("1");
+        let normal = output("0");
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("specialized=")).collect::<Vec<_>>().join("\n");
+        assert_eq!(results(&verified), results(&normal));
+        // Each value once per call, in the order the hash lists them.
+        assert!(normal.contains("by_kind=[\"a\", \"b\", \"c\"] calls=[\"K\"]\n"), "{normal}");
+        assert!(normal.contains("ordered=[\"a\"] calls=[\"A\", \"K\"]\n"), "{normal}");
+        assert!(normal.contains("listed=[\"a\", \"c\"] calls=[\"a\", \"c\"]\n"), "{normal}");
+        assert!(normal.contains("first_named=[\"b\"] calls=[\"B\"]\n"), "{normal}");
+        assert!(normal.contains("nil_value=[] calls=[nil]\n"), "{normal}");
+        assert!(normal.contains("redefined_where=[\"a\", \"b\", \"c\"] calls=[\"K\"]\n"), "{normal}");
+        let _ = fs::remove_dir_all(&out);
     }
 }

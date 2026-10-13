@@ -57,6 +57,9 @@ pub struct Site {
     pub call: String,
     /// The `Futamura.define` line for the generated initializer.
     pub define: String,
+    /// Values the call site evaluates once, ahead of the call, and the fallback reads back
+    /// instead of evaluating again: `(span, replacement)` over the site's source.
+    pub hoists: Vec<(u32, u32, String)>,
 }
 
 /// A query-shaped site that was left to Rails, and why.
@@ -64,6 +67,9 @@ pub struct Residue {
     pub span: Span,
     pub reason: String,
 }
+
+/// Stands for a hoisted value in a bind until the site's local is named.
+const HOIST: &str = "__FUT_H";
 
 #[derive(Clone)]
 enum Val {
@@ -83,6 +89,9 @@ struct Chain {
     /// Request-time values, in the order the chain's links take them from
     /// `p.bind` (a WHERE value or a constant LIMIT, in call order).
     where_binds: Vec<String>,
+    /// Request-time values the call site must evaluate once, in source order (`where_binds`
+    /// name them ``): the source span and text of each.
+    hoisted: Vec<(Span, String)>,
     ordered: bool,
     limited: bool,
     /// Rooted at `Model.unscoped`, which drops the model's default scopes.
@@ -311,8 +320,21 @@ impl<'a> Specializer<'a> {
         // the binds are a lambda the runtime calls only once the owner is known to be a record (a
         // test double that stands for the owner is not asked for it).
         let binds = if chain.owner.is_some() { format!("-> {{ [{}] }}", binds.join(", ")) } else { format!("[{}]", binds.join(", ")) };
-        let call = format!("Futamura.records(:{key}, {binds}{owner}{root}) {{ {{orig}} }}");
-        Ok(Site { span: e.span, call, define })
+        let mut call = format!("Futamura.records(:{key}, {binds}{owner}{root}) {{ {{orig}} }}");
+        // A value that is not a plain read (a call, a block) is evaluated once, where Ruby evaluates
+        // the argument list (left to right, ahead of the call): in its place among the binds, which
+        // are in source order, and stored in a local the fallback reads back.
+        let mut hoists = Vec::new();
+        if !chain.hoisted.is_empty() {
+            let temp = format!("__fut_{key}");
+            for (i, (_, src)) in chain.hoisted.iter().enumerate() {
+                call = call.replace(&format!("{HOIST}[{i}]"), &format!("({temp}[{i}] = ({src}))"));
+            }
+            call = format!("({temp} = []; {call})");
+            hoists = chain.hoisted.iter().enumerate().map(|(i, (span, _))| (span.start, span.end, format!("{temp}[{i}]"))).collect();
+            hoists.sort();
+        }
+        Ok(Site { span: e.span, call, define, hoists })
     }
 
     fn source_text(&self, span: Span) -> &str {
@@ -643,7 +665,7 @@ impl<'a> Specializer<'a> {
                     if !literal_list && matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::Range { .. }) {
                         return Err("where value is a collection".into());
                     }
-                    let value = match self.value(v, cx)? {
+                    let value = match self.where_value(v, cx, &mut chain)? {
                         Val::Static(src) => src,
                         Val::Bind(src) => {
                             // AssociationQueryValue turns a record into its key;
@@ -896,6 +918,32 @@ impl<'a> Specializer<'a> {
         }
     }
 
+    /// The value of a `where` hash entry. Where `value` accepts only plain reads (a local, a reader
+    /// chain, a constant), this also takes any other expression the chain itself evaluates (`ids.map(&:id)`,
+    /// `Digest.hexdigest(token)`): Ruby evaluates the hash's values when it builds the argument list, in
+    /// source order, before the `where` call (and Rails' `where` takes the finished hash), so the call
+    /// site may evaluate them first as long as it evaluates each once and the fallback reuses the result
+    /// (`Site::hoists`). Not where the value is read at another time than the chain read it (through a
+    /// local, inside an inlined scope), where it is read only once the owner is known (an association
+    /// root), or on a path chosen by a branch (the fallback's source is shared by every path).
+    fn where_value(&self, e: &Expr, cx: &Cx, chain: &mut Chain) -> Result<Val, String> {
+        let reason = match self.value(e, cx) {
+            Err(reason) if reason.starts_with("value is ") => reason,
+            other => return other,
+        };
+        if cx.self_chain.is_some() || cx.through_local.get().is_some() || chain.owner.is_some() || !cx.flow.suffix().is_empty() {
+            return Err(reason);
+        }
+        let text = self.written(e)?;
+        // The replacement must cover exactly the source the value was printed from, and a heredoc's
+        // body would stay where the line is, not follow the value into the argument array.
+        if text != self.source_text(e.span) || text.contains("<<") {
+            return Err("value source is not exactly its span".into());
+        }
+        chain.hoisted.push((e.span, text));
+        Ok(Val::Bind(format!("{HOIST}[{}]", chain.hoisted.len() - 1)))
+    }
+
     /// A `limit`/`first`/`last` count: a literal, else a request-time value.
     /// A constant is read per call, as Ruby evaluates `limit(LIMIT)` each time
     /// (a test may `stub_const` it), so it is never frozen into the statement:
@@ -977,6 +1025,7 @@ impl Chain {
             owner,
             links: Vec::new(),
             where_binds: Vec::new(),
+            hoisted: Vec::new(),
             ordered: false,
             limited: false,
             unscoped: false,
