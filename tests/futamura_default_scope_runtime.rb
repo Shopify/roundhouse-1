@@ -10,7 +10,7 @@ ActiveRecord::Schema.define do
   create_table(:ranked) { |t| t.string :code }
   create_table(:plain) { |t| t.string :code; t.integer :owner_id }
   create_table(:legacy) { |t| t.integer :shop_id; t.string :code }
-  %i[isles guarded anons loaders flips].each { |name| create_table(name) { |t| t.integer :shop_id; t.string :code } }
+  %i[isles guarded anons loaders flips branches grown].each { |name| create_table(name) { |t| t.integer :shop_id; t.string :code } }
 end
 class Current; class << self; attr_accessor :shop_id, :evaluated, :flip; end; end
 Current.evaluated = 0
@@ -62,6 +62,16 @@ class Flip < ApplicationRecord
   self.table_name = "flips"
   default_scope { Current.flip ? order(:id) : where(shop_id: Current.shop_id) }
 end
+# The columns a default scope compares change per call (which one is read at each call, not once).
+class Current; class << self; attr_accessor :branch; end; end
+class Branch < ApplicationRecord
+  self.table_name = "branches"
+  default_scope { Current.branch ? where(shop_id: Current.shop_id) : where(code: "x") }
+end
+# A default scope added after the first call is seen by the next.
+class Grown < ApplicationRecord
+  self.table_name = "grown"
+end
 load ARGV[0]
 Futamura.define(:item, Item, one: true) { |p| Item.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:item_unscoped, Item, one: true, unscoped: true) { |p| Item.unscoped.where(code: p.bind).send(:ordered_relation).limit(1) }
@@ -70,6 +80,10 @@ Futamura.define(:plain, "Plain", one: true) { |p| Plain.all.where(code: p.bind).
 Futamura.define(:plain_owner, "Plain", one: true) { |p| Plain.all.where(owner_id: p.bind).limit(1) }
 Futamura.define(:legacy, Legacy, one: true) { |p| Legacy.all.where(code: p.bind).send(:ordered_relation).limit(1) }
 Futamura.define(:plain_find, "Plain", one: true, via: :find_by) { |p| Plain.all.where(code: p.bind).limit(1) }
+%i[branch grown].each do |name|
+  klass = name.to_s.capitalize.constantize
+  Futamura.define(name, klass, one: true) { |p| klass.all.where(code: p.bind).send(:ordered_relation).limit(1) }
+end
 %i[isle guarded anon loader flip].each do |name|
   klass = name.to_s.capitalize.constantize
   Futamura.define(name, klass, one: true) { |p| klass.all.where(code: p.bind).send(:ordered_relation).limit(1) }
@@ -79,11 +93,22 @@ $fallbacks = 0; $log = []
 def look(key, model, code, tag = nil)
   Futamura.records(key, [code]) { $fallbacks += 1; $log << [key, :fallback]; model.where(code: code).first }&.id
 end
-[Isle, Guarded, Anon, Loader, Flip].each { |m| m.unscoped { m.create!(shop_id: 1, code: "x"); m.create!(shop_id: 2, code: "x") } }
+[Isle, Guarded, Anon, Loader, Flip, Branch, Grown].each { |m| m.unscoped { m.create!(shop_id: 1, code: "x"); m.create!(shop_id: 2, code: "x") } }
 Item.unscoped { Item.create!(shop_id: 1, code: "x"); Item.create!(shop_id: 2, code: "x"); Item.create!(shop_id: nil, code: "x"); Item.create!(shop_id: 1, code: "y", archived: true) }
 Ranked.create!(code: "x"); Plain.create!(code: "x")
 Legacy.unscoped { Legacy.create!(shop_id: 1, code: "x"); Legacy.create!(shop_id: nil, code: "x") }
 out = {}
+Current.shop_id = 1
+out["branch"] = [true, false, true, false].map { |b| Current.branch = b; Branch.unscoped { Branch.create!(shop_id: 2, code: "y") } if b.nil?; look(:branch, Branch, "x") }
+Current.shop_id = 2
+out["branch_shop2"] = [true, false].map { |b| Current.branch = b; look(:branch, Branch, "x") }
+Current.shop_id = 1
+Current.branch = nil
+out["grown"] = [look(:grown, Grown, "x")]
+Grown.send(:default_scope) { where(shop_id: 2) }
+out["grown"] << look(:grown, Grown, "x")
+Grown.default_scopes = []
+out["grown"] << look(:grown, Grown, "x")
 [1, 2, 3, nil, 1].each { |s| Current.shop_id = s; out["item/#{s.inspect}"] ||= []; out["item/#{s.inspect}"] << look(:item, Item, "x") }
 Current.shop_id = 1
 out["archived"] = look(:item, Item, "y")

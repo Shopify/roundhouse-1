@@ -874,31 +874,56 @@ module Futamura
       !ActiveRecord::Base.is_a?(model.method(:default_scope).owner)
     end
 
+    # The relation settings `default_shape` leaves to the checks of their own.
+    SHAPE_CHECKED = { where: true, extending: true, preload: true }.freeze
+
+    # `scoped` is `base` plus equality conditions, named extension modules and names-only preloads:
+    # `[columns, values, extensions, preloads]` of what it adds, else nil. Read on every call, so it
+    # allocates only for what it finds: the values are compared key by key (not
+    # `values.except(...) == ...`), and a list that adds nothing is the shared empty one.
     def default_shape(model, base, scoped)
-      return unless scoped.values.except(:where, :extending, :preload) == base.values.except(:where, :extending, :preload)
+      scoped_values = scoped.values
+      base_values = base.values
+      scoped_values.each do |key, value|
+        return if !SHAPE_CHECKED.key?(key) && !(base_values.key?(key) && base_values[key] == value)
+      end
+      base_values.each_key { |key| return if !SHAPE_CHECKED.key?(key) && !scoped_values.key?(key) }
 
       extensions = scoped.extending_values
-      return unless extensions.first(base.extending_values.size) == base.extending_values
-      extensions = (extensions - base.extending_values).freeze
-      return unless extensions.all? { |mod| extension?(mod) }
+      base_extensions = base.extending_values
+      if extensions.empty? && base_extensions.empty?
+        extensions = NO_DEFAULTS[2]
+      else
+        return unless extensions.first(base_extensions.size) == base_extensions
+        extensions = (extensions - base_extensions).freeze
+        return unless extensions.all? { |mod| extension?(mod) }
+      end
 
       preloads = scoped.preload_values
-      return unless preloads.first(base.preload_values.size) == base.preload_values
-      preloads = preloads.drop(base.preload_values.size).freeze
-      return unless preloads.all? { |spec| preload_spec?(spec) }
+      base_preloads = base.preload_values
+      if preloads.empty? && base_preloads.empty?
+        preloads = NO_DEFAULTS[3]
+      else
+        return unless preloads.first(base_preloads.size) == base_preloads
+        preloads = preloads.drop(base_preloads.size).freeze
+        return unless preloads.all? { |spec| preload_spec?(spec) }
+      end
 
       before = base.where_clause.send(:predicates)
       predicates = scoped.where_clause.send(:predicates)
       return unless predicates.first(before.size) == before
+      return [NO_DEFAULTS[0], NO_DEFAULTS[1], extensions, preloads] if predicates.size == before.size
 
       columns = []
       values = []
-      predicates.drop(before.size).each do |node|
-        condition = default_condition(model, node)
+      offset = before.size
+      while offset < predicates.size
+        condition = default_condition(model, predicates[offset])
         return unless condition.is_a?(Array)
 
         columns << condition[0]
         values.concat(condition[1])
+        offset += 1
       end
       [columns.freeze, values, extensions, preloads]
     end
