@@ -4594,7 +4594,7 @@ fn splice_concerns_into_models_named(
             let source = if prepend { &app.concern_prepended_items } else { &app.concern_model_items };
             let items: Vec<ModelBodyItem> = ordered
                 .iter()
-                .filter_map(|id| source.get(id).map(|items| (id, items)))
+                .map(|id| (id, source.get(id).map_or(&[][..], Vec::as_slice)))
                 .flat_map(|(id, items)| {
                     let class_attributes = super::class_attribute::declared_names(items);
                     let (model_name, defined) = (&model_name, &defined);
