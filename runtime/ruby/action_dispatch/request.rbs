@@ -84,7 +84,6 @@ module ActionDispatch
     def original_url: () -> String
     def url: () -> String
     def referrer: () -> String
-    def authorization: () -> String?
     def user_agent: () -> String
     def session_options: () -> Hash[Symbol, bool]
     def session_skip?: () -> bool
