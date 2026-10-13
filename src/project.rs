@@ -1921,10 +1921,10 @@ pub fn target_files(
     // yet, so none of the trimming or refusals below apply — every construct is
     // residue, and the residue runs on Rails.
     if target == BuildTarget::Futamura {
-        let tree = futamura_tree(fixture)?;
+        let tree = crate::timings::phase("futamura: stage 0 walk", || futamura_tree(fixture))?;
         let (carried_opaque, excluded) = (tree.opaque.len(), tree.excluded);
         let mut files = tree.text;
-        let report = emit::futamura::specialize(app, &mut files)?;
+        let report = crate::timings::phase("futamura: specialize", || emit::futamura::specialize(app, &mut files))?;
         // No silent drops: the stage-0 contract is every file source
         // control holds, so each deliberately excluded class is named.
         let excluded: Vec<String> = excluded.iter().map(|(class, n)| format!("{n} {class}")).collect();

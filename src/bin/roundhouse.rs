@@ -306,7 +306,7 @@ fn run_transpile(
     // which the error-recovering parser otherwise drops on the floor —
     // are collected and routed through the same report as emit gaps.
     let (app_result, parse_diags) =
-        roundhouse::ingest::prism::scope(|| ingest_app(input));
+        roundhouse::timings::phase("ingest", || roundhouse::ingest::prism::scope(|| ingest_app(input)));
     let mut survey_gaps =
         if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
     let mut app = match app_result {
@@ -351,7 +351,7 @@ fn run_transpile(
     let lower_diags = if target == BuildTarget::Roda {
         Vec::new()
     } else if target == BuildTarget::Futamura {
-        roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+        roundhouse::timings::phase("analyze", || roundhouse::analyze::Analyzer::new(&app).analyze(&mut app));
         Vec::new()
     } else {
         let mut diags = roundhouse::session::analyze_and_lower(&mut app);
@@ -494,14 +494,14 @@ fn run_transpile(
     // Gate passed (or every error was downgraded): materialize the emit
     // output, propagating any hard emit failure now.
     let files = files_result?;
-    project::write_to_dir(&files, out)?;
+    roundhouse::timings::phase("write: text files", || project::write_to_dir(&files, out))?;
     // The app's own binary files — images, fonts, binary test fixtures.
     // They never became `EmittedFile`s (that type's content is a
     // `String`), so before this they were dropped without a word.
-    let assets = project::write_binary_assets(&app.binary_assets, &files, out)?;
+    let assets = roundhouse::timings::phase("write: binary assets", || project::write_binary_assets(&app.binary_assets, &files, out))?;
     if target == BuildTarget::Futamura {
-        project::copy_exec_bits(input, &files, out)?;
-        project::write_futamura_opaque(input, out)?;
+        roundhouse::timings::phase("write: exec bits", || project::copy_exec_bits(input, &files, out))?;
+        roundhouse::timings::phase("write: non-UTF-8 files", || project::write_futamura_opaque(input, out))?;
     }
     eprintln!(
         "roundhouse: emitted {} files to {} ({})",
