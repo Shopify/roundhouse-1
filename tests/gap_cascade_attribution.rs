@@ -18,13 +18,15 @@ fn references_to_a_class_dropped_by_an_ingest_gap_are_coverage_notes() {
     let root = std::env::temp_dir().join(format!("roundhouse-gap-cascade-{}", std::process::id()));
     for (path, source) in [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        // `has_role?` is a gem's method: an alias of a method the body does not
-        // define refuses the whole model. (`private :has_role?` is carried as
-        // a visibility override of the inherited method, so it no longer is.)
-        ("app/models/article.rb", "class Article < ApplicationRecord\n  LIMIT = 5\n  alias role? has_role?\nend\n"),
+        // An alias whose new name is built at runtime refuses the whole model.
+        // (`alias role? has_role?` no longer does: a model's alias of a gem's
+        // method resolves at lowering, where an unresolved one is its own
+        // diagnostic, and `private :has_role?` is carried as a visibility
+        // override of the inherited method.)
+        ("app/models/article.rb", "class Article < ApplicationRecord\n  LIMIT = 5\n  alias :\"role#{1}\" :has_role?\nend\n"),
         // Sorts first, but Rails autoloads `Article` from `app/models/article.rb`: that is the cause named.
-        ("app/lib/early_patch.rb", "class Article < ApplicationRecord\n  alias role? has_role?\nend\n"),
-        ("app/models/admin/summary.rb", "class Admin::Summary < ApplicationRecord\n  alias role? has_role?\nend\n"),
+        ("app/lib/early_patch.rb", "class Article < ApplicationRecord\n  alias :\"role#{1}\" :has_role?\nend\n"),
+        ("app/models/admin/summary.rb", "class Admin::Summary < ApplicationRecord\n  alias :\"role#{1}\" :has_role?\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         (
             "app/controllers/articles_controller.rb",
