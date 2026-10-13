@@ -1837,3 +1837,47 @@ mod composite_keys_and_scoping_blocks {
         let _ = fs::remove_dir_all(&out);
     }
 }
+
+/// FUTAMURA_VERIFY=1 runs Rails' own chain beside the specialized statement and compares the two.
+/// The comparison is not the application's: a `sql.active_record` subscriber (a test that counts
+/// the statements of one kind) must see the same events as without verify, inside a query cache and
+/// inside a transaction, and a preload through a polymorphic association must be compared the way
+/// Preloader::Branch#grouped_records loads it (records of a class without the next association are
+/// skipped). Real ActiveRecord on SQLite (`tests/futamura_verify_runtime.rb`).
+mod verify_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_verify_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    #[test]
+    fn a_sql_subscriber_sees_the_same_statements_with_and_without_verify() {
+        let (Some(verified), Some(normal)) = (probe("1"), probe("0")) else { return };
+        // Everything but the fallback count (verify runs Rails' chain at every call).
+        let events = |s: &str| s.lines().filter(|l| !l.starts_with("fallbacks=")).collect::<Vec<_>>().join("\n");
+        assert_eq!(events(&verified), events(&normal), "{verified}\n{normal}");
+        assert!(normal.contains("notes=[[1], {\"Note Load\" => 1}]\n"), "{normal}");
+        assert!(normal.contains("notes_in_transaction=[[2], {\"Note Load\" => 1}]\n"), "{normal}");
+        assert!(normal.contains("fallbacks=0\n"), "{normal}");
+        // The shadow ran: it did not skip Rails' chain, and it left the instrumenter slot as it found it.
+        assert!(!verified.contains("fallbacks=0\n"), "{verified}");
+        assert!(verified.contains("slot_restored=true\n"), "{verified}");
+    }
+
+    #[test]
+    fn a_preload_through_a_polymorphic_association_skips_records_without_the_reflection() {
+        let Some(verified) = probe("1") else { return };
+        assert!(verified.contains("regions=[[\"Country\", 1], [\"Province\", 1]]\n"), "{verified}");
+    }
+}

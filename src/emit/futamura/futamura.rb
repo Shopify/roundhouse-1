@@ -350,7 +350,7 @@ module Futamura
       records.reverse! if statement.reverse
       result = statement.one ? records.first : records
 
-      verify(key, result, fallback.call, compiled.preload) if VERIFY
+      verify(key, result, shadow(model, &fallback), compiled.preload) if VERIFY
       result
     end
 
@@ -730,6 +730,38 @@ module Futamura
       end)
     end
 
+    # What `sql.active_record` subscribers see of Rails' own chain when it runs only to be
+    # compared (FUTAMURA_VERIFY=1). The adapter publishes through `instrumenter`, which reads
+    # ActiveSupport::IsolatedExecutionState[:active_record_instrumenter] before falling back to
+    # ActiveSupport::Notifications.instrumenter (AbstractAdapter#log); the slot is Rails' own seam
+    # for buffering a background query's events (QueryIntent::EventBuffer), and it is per thread or
+    # fiber. Pointing it at `Silent` for the block hides the shadow's statements from application
+    # subscribers (a test that counts "X Load" events sees what the specialized run alone issues)
+    # while the statements still run on the same leased connection and inside the same transaction.
+    # The query cache announces a hit with `Notifications.instrument` directly, past the slot, and
+    # the specialized statement may already have stored its rows there: `uncached` makes the shadow
+    # run its statements, so that the rows are compared with the database's, not with the cache's.
+    # Hidden: `sql.active_record` events of the shadow only. Not hidden: instantiation, strict
+    # loading and transaction events, and the SQL comments QueryLogs adds, which are made before the
+    # statement is published. An adapter whose `log` does not read the slot (before Rails 8.2)
+    # still publishes the shadow's statements.
+    module Silent
+      def self.instrument(_name, payload = {})
+        yield payload if block_given?
+      end
+    end
+
+    def shadow(model)
+      state = ActiveSupport::IsolatedExecutionState
+      previous = state[:active_record_instrumenter]
+      state[:active_record_instrumenter] = Silent
+      begin
+        model.uncached { yield }
+      ensure
+        state[:active_record_instrumenter] = previous
+      end
+    end
+
     def verify(key, result, expected, preload)
       got = Array(result).map(&:id)
       want = Array(expected).map(&:id)
@@ -807,12 +839,16 @@ module Futamura
       end
 
       # Which associations a preload loaded, and to what, through the tree.
-      def signature(records, spec)
+      def signature(records, spec, polymorphic_parent = false)
         nodes(spec).map do |name, child|
-          records.map do |record|
+          records.filter_map do |record|
+            # Preloader::Branch#grouped_records: a record whose class lacks the reflection is
+            # skipped when the association that loaded it is polymorphic (its targets are of
+            # several classes), and only then; otherwise `association` raises as it does in Rails.
+            next if polymorphic_parent && !record.class._reflect_on_association(name)
             association = record.association(name)
             targets = Array.wrap(association.target)
-            [record.id, association.loaded?, targets.map(&:id), child ? signature(targets, child) : nil]
+            [record.id, association.loaded?, targets.map(&:id), child ? signature(targets, child, !!association.reflection.polymorphic?) : nil]
           end
         end
       end
