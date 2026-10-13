@@ -1174,27 +1174,84 @@ end
 # original chain after (or before, alternating) every specialized call and
 # times it, so the two paths can be compared per site; like FUTAMURA_VERIFY it
 # runs the chain twice, so it is for measuring, not for gating.
+#
+# Every figure comes in wall seconds (`*_s`, CLOCK_MONOTONIC) and in CPU seconds of the calling thread
+# (`*_cpu`, CLOCK_THREAD_CPUTIME_ID: PostgreSQL's round trip and other threads' work are not in it, so a
+# per-call saving of tens of microseconds is visible where process-CPU ABAB totals cannot resolve it). A call to
+# Futamura.records is split into phases:
+#   guard     everything up to the point where the statement is executed: the guards, the statement lookup, the
+#             connection checkout (up to `serialize_slots`, which only the specialized path reaches); also all of
+#             the work of a call that ran Rails' chain before that chain started, excluding naming its reason;
+#   exec      the specialized statement: serializing the binds, executing it, instantiating, preloading;
+#   fallback  Rails' chain (the call site's block);
+#   compile   building a statement (once per statement; counted apart, not in guard).
+# FUTAMURA_STATS_AB=1 adds `ab_*`: for every specialized call after a site's first, the call's whole cost and
+# the original chain's, as wall (`ab_spec_s`, `ab_orig_s`) and CPU (`ab_spec_cpu`, `ab_orig_cpu`) seconds. Both
+# paths read through the query cache when it is on (`ab_cached` counts the samples taken with it enabled: the path
+# that ran second hits what the first stored), unless FUTAMURA_STATS_AB_UNCACHED=1 runs both of them uncached.
+# FUTAMURA_STATS_HELPERS=1 also times the pure guard helpers one by one (`helpers` in the dump: calls, inclusive and
+# self CPU); that adds a clock read to each of them, so use it to rank them, not to total the guard phase.
+# The dump records `clock_read_ns`, what one CPU clock read costs here (a system call): each call pays about four
+# of them inside its phases.
 if ENV["FUTAMURA_STATS"].to_s != ""
   module Futamura
     module Stats
       DIR = ENV["FUTAMURA_STATS"]
       AB = ENV["FUTAMURA_STATS_AB"] == "1"
-      Site = Struct.new(:calls, :specialized, :fallback, :specialized_s, :fallback_s, :guard_s, :ab_calls, :ab_spec_s, :ab_orig_s, keyword_init: true)
+      AB_UNCACHED = ENV["FUTAMURA_STATS_AB_UNCACHED"] == "1"
+      HELPERS = ENV["FUTAMURA_STATS_HELPERS"] == "1"
+      Site = Struct.new(:calls, :specialized, :fallback, :specialized_s, :fallback_s, :guard_s, :ab_calls, :ab_spec_s, :ab_orig_s,
+                        :guard_cpu, :exec_cpu, :fallback_cpu, :compile_cpu, :ab_spec_cpu, :ab_orig_cpu, :ab_cached, keyword_init: true)
+      # One Futamura.records call in flight: where its phases begin, and the CPU that is not its own (naming a
+      # fallback reason, building a statement, the verify shadow, nested calls made from its chain).
+      Frame = Struct.new(:exec_at, :overhead_cpu, :overhead_s, :compile_cpu, :compile_s, :shadow_cpu, :shadow_depth, :nested_cpu)
 
       @sites = {}
       @compiles = []
       @compile_reasons = {}
       @association_keys = [0, 0.0]
       @defined = []
+      @helpers = Hash.new { |h, name| h[name] = [0, 0.0, 0.0] }
 
       class << self
-        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined
+        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined, :helpers
 
         def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
+        def cpu = Process.clock_gettime(Process::CLOCK_THREAD_CPUTIME_ID)
+
+        # The calls to Futamura.records in flight on this thread (a chain run by a call may make more).
+        def frames = (Thread.current[:futamura_stats_frames] ||= [])
+
         def site(key)
           @sites[key] ||= Site.new(calls: 0, specialized: 0, fallback: Hash.new(0), specialized_s: 0.0, fallback_s: 0.0,
-                                   guard_s: 0.0, ab_calls: 0, ab_spec_s: 0.0, ab_orig_s: 0.0)
+                                   guard_s: 0.0, ab_calls: 0, ab_spec_s: 0.0, ab_orig_s: 0.0, guard_cpu: 0.0, exec_cpu: 0.0,
+                                   fallback_cpu: 0.0, compile_cpu: 0.0, ab_spec_cpu: 0.0, ab_orig_cpu: 0.0, ab_cached: 0)
+        end
+
+        # What one `cpu` read costs (they are system calls), measured once.
+        def clock_read_ns
+          @clock_read_ns ||= begin
+            started = cpu
+            1000.times { cpu }
+            ((cpu - started) / 1000 * 1e9).round
+          end
+        end
+
+        # Whether `key`'s model reads through the query cache right now (nil when that is not known).
+        def query_cache?(key)
+          model = Futamura.instance_variable_get(:@statements)[key]&.model
+          model.is_a?(Class) ? !!model.connection_pool.query_cache_enabled : nil
+        rescue StandardError
+          nil
+        end
+
+        # The block, uncached when AB_UNCACHED: both paths then execute their statements.
+        def ab_scope(key, &block)
+          return yield unless AB_UNCACHED
+
+          model = Futamura.instance_variable_get(:@statements)[key]&.model
+          model.is_a?(Class) ? model.uncached(&block) : yield
         end
 
         # Why the guards in Futamura.records sent a call to Rails' chain, in the order they are checked.
@@ -1280,9 +1337,11 @@ if ENV["FUTAMURA_STATS"].to_s != ""
             h[:fallback] = s.fallback
             h
           end
+          helpers = @helpers.transform_values { |calls, inclusive, self_cpu| { calls: calls, inclusive_cpu: inclusive, self_cpu: self_cpu } }
           File.write(File.join(DIR, "futamura-stats-#{Process.pid}.json"), JSON.generate(
             pid: Process.pid, defined: @defined, sites: rows, compiles: @compiles,
-            association_key: { calls: @association_keys[0], seconds: @association_keys[1] }
+            association_key: { calls: @association_keys[0], seconds: @association_keys[1] },
+            clock_read_ns: clock_read_ns, ab_uncached: AB_UNCACHED, helpers: helpers
           ))
         end
       end
@@ -1304,47 +1363,87 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         def records(key, binds, owner: nil, association: nil, root: nil, &fallback)
           site = Stats.site(key)
           site.calls += 1
+          frame = Stats::Frame.new(nil, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+          frames = Stats.frames
           fell = nil
           fell_s = 0.0
+          fell_cpu = 0.0
+          fell_at = nil
           timed_fallback = proc do
+            # The verify shadow runs Rails' chain beside a specialized call: not a fallback.
+            next fallback.call if frame.shadow_depth.positive?
+
+            o_cpu = Stats.cpu
+            o_s = Stats.now
             fell = Stats.reason(key, binds, root, owner, association)
+            fell_at = Stats.cpu
             t = Stats.now
+            frame.overhead_cpu += fell_at - o_cpu
+            frame.overhead_s += t - o_s
             begin
               fallback.call
             ensure
               fell_s = Stats.now - t
+              fell_cpu = Stats.cpu - fell_at
             end
           end
-          started = Stats.now
           first = !Stats.instance_variable_get(:@seen_keys).include?(key)
           Stats.instance_variable_get(:@seen_keys) << key
+          cached = Stats::AB ? Stats.query_cache?(key) : nil
           orig_first = Stats::AB && site.calls.odd?
           if orig_first
             t = Stats.now
-            fallback.call
+            c = Stats.cpu
+            Stats.ab_scope(key) { fallback.call }
             orig_s = Stats.now - t
-            started = Stats.now
+            orig_cpu = Stats.cpu - c
           end
-          result = super(key, binds, owner: owner, association: association, root: root, &timed_fallback)
-          total = Stats.now - started
+          frames.push(frame)
+          started = Stats.now
+          started_cpu = Stats.cpu
+          begin
+            result = Stats.ab_scope(key) { super(key, binds, owner: owner, association: association, root: root, &timed_fallback) }
+          ensure
+            ended_cpu = Stats.cpu
+            ended = Stats.now
+            frames.pop
+          end
+          total = ended - started - frame.compile_s
+          total_cpu = ended_cpu - started_cpu
+          frames.last.nested_cpu += total_cpu if frames.last
+          # The CPU phases. The guard phase ends where the statement starts executing, or for a call that ran
+          # Rails' chain without getting there, where the chain starts. Naming the fallback reason, building a
+          # statement and the verify shadow are not the call's own and come off the phase they fell in.
+          exec_at = frame.exec_at
+          guard_end = exec_at || fell_at || ended_cpu
+          site.guard_cpu += [guard_end - started_cpu - frame.compile_cpu - (exec_at ? 0.0 : frame.overhead_cpu), 0.0].max
           if fell
             site.fallback[fell] += 1
             site.fallback_s += fell_s
-            site.guard_s += total - fell_s
+            site.guard_s += [total - fell_s - frame.overhead_s, 0.0].max
+            site.fallback_cpu += [fell_cpu - frame.nested_cpu, 0.0].max
+            site.exec_cpu += [fell_at - exec_at - frame.overhead_cpu, 0.0].max if exec_at
           else
             site.specialized += 1
             site.specialized_s += total
+            site.exec_cpu += [ended_cpu - exec_at - frame.shadow_cpu - frame.nested_cpu, 0.0].max if exec_at
             if Stats::AB && !first
               unless orig_first
                 t = Stats.now
-                fallback.call
+                c = Stats.cpu
+                Stats.ab_scope(key) { fallback.call }
                 orig_s = Stats.now - t
+                orig_cpu = Stats.cpu - c
               end
               site.ab_calls += 1
+              site.ab_cached += 1 if cached
               site.ab_spec_s += total
               site.ab_orig_s += orig_s
+              site.ab_spec_cpu += total_cpu - frame.compile_cpu - frame.shadow_cpu
+              site.ab_orig_cpu += orig_cpu
             end
           end
+          site.compile_cpu += frame.compile_cpu
           result
         end
 
@@ -1353,13 +1452,90 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         # `*`: forwards whatever arguments compile takes (statement, connection, columns, extensions...).
         def compile(statement, connection, *)
           t = Stats.now
+          c = Stats.cpu
           result = super
-          Stats.compiles << { model: statement.model.name, seconds: Stats.now - t, built: result ? true : false }
+          seconds = Stats.now - t
+          cpu = Stats.cpu - c
+          Stats.compiles << { model: statement.model.name, seconds: seconds, cpu: cpu, built: result ? true : false }
+          if (frame = Stats.frames.last)
+            frame.compile_cpu += cpu
+            frame.compile_s += seconds
+          end
           unless result
             key = Futamura.instance_variable_get(:@statements).key(statement)
             Stats.compile_reasons[key] = "relation_needs_rails[#{statement.model.name}]"
           end
           result
+        end
+
+        # The first thing the specialized path does once it has a statement; the guard phase ends here.
+        def serialize_slots(*)
+          frame = Stats.frames.last
+          frame.exec_at ||= Stats.cpu if frame
+          super
+        end
+
+        # The verify shadow and the comparison are checks, not the call's own work.
+        def shadow(model, &block)
+          frame = Stats.frames.last
+          return super unless frame
+
+          frame.shadow_depth += 1
+          c = Stats.cpu
+          begin
+            super
+          ensure
+            frame.shadow_cpu += Stats.cpu - c
+            frame.shadow_depth -= 1
+          end
+        end
+
+        def verify(*)
+          frame = Stats.frames.last
+          return super unless frame
+
+          c = Stats.cpu
+          begin
+            super
+          ensure
+            frame.shadow_cpu += Stats.cpu - c
+          end
+        end
+      end
+
+      # FUTAMURA_STATS_HELPERS=1: the guard helpers of Futamura.records, each timed (inclusive, and self: what its
+      # own helpers took off), globally rather than per site.
+      module Helpers
+        NAMES = %i[bind_nils fixed_values bind_lists unsupported_bind? list_bind? scalar_class? redefined_class_method redefined?
+                   rails_method? in_rails_dir? owner_chain? owner_key_extras default_binds default_scope_method? default_shape
+                   current_scope_binds merge_unscoped without_columns serialize_slots find_by_value association_key].freeze
+        @children = []
+
+        class << self
+          attr_reader :children
+        end
+
+        NAMES.each do |name|
+          next unless Futamura.singleton_class.method_defined?(name) || Futamura.singleton_class.private_method_defined?(name)
+
+          private_flag = Futamura.singleton_class.private_method_defined?(name)
+          define_method(name) do |*args, **opts, &block|
+            children = Helpers.children
+            children.push(0.0)
+            t = Stats.cpu
+            begin
+              super(*args, **opts, &block)
+            ensure
+              inclusive = Stats.cpu - t
+              inner = children.pop
+              row = Stats.helpers[name]
+              row[0] += 1
+              row[1] += inclusive
+              row[2] += inclusive - inner
+              children[-1] += inclusive unless children.empty?
+            end
+          end
+          private name if private_flag
         end
       end
 
@@ -1367,6 +1543,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
     end
 
     singleton_class.prepend(Stats::Instrument)
+    singleton_class.prepend(Stats::Helpers) if Stats::HELPERS
     at_exit { Stats.dump }
   end
 end
