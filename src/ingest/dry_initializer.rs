@@ -309,7 +309,19 @@ pub(super) fn drop_type_constants(app: &mut App, sources: &[crate::span::SourceF
         lc.constants.retain(|(_, value)| {
             !super::dry_types::holds_dry_type(value, &holder, &types_modules, &names, &plain)
         });
+        // `include Dry.Types()` is the gem's too: carried as a body
+        // statement it would run at load and find no `Dry.Types`.
+        lc.unknown_calls.retain(|call| !includes_dry_types(call));
     }
+}
+
+fn includes_dry_types(call: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return false };
+    method.as_str() == "include"
+        && args.iter().any(|arg| {
+            matches!(&*arg.node, ExprNode::Send { recv: Some(recv), method, .. }
+                if method.as_str() == "Types" && is_const(recv, "Dry"))
+        })
 }
 
 fn is_const(expr: &Expr, name: &str) -> bool {
