@@ -12,9 +12,27 @@ use roundhouse::lower::apply_errors_add_lowering;
 use roundhouse::App;
 
 fn lower_and_emit(source: &str) -> (String, Vec<Diagnostic>) {
+    lower_and_emit_on(source, None)
+}
+
+/// On the PostgreSQL CRuby tree, which records each push through the
+/// `ActiveModel::ErrorAttributes` hint rather than an `error_details` array.
+fn lower_and_emit_on_postgresql(source: &str) -> (String, Vec<Diagnostic>) {
+    lower_and_emit_on(source, Some(roundhouse::database::DatabaseAdapter::Postgresql))
+}
+
+fn lower_and_emit_on(source: &str, adapter: Option<roundhouse::database::DatabaseAdapter>) -> (String, Vec<Diagnostic>) {
     let classes =
         ingest_library_classes(source.as_bytes(), "test.rb").expect("ingest test source");
     let mut app = App::new();
+    app.database_yml = adapter.map(|adapter| roundhouse::database::DatabaseYml {
+        path: "config/database.yml".into(),
+        adapter,
+        renderer: None,
+        present: true,
+        manifest: false,
+        test_adapters: Vec::new(),
+    });
     for lc in classes {
         app.library_classes.push(lc);
     }
@@ -185,7 +203,7 @@ end
 #[test]
 fn parameter_field_humanizes_at_run_time() {
     // An EachValidator's `validate_each(record, attribute, value)`.
-    let (out, diags) = lower_and_emit(
+    let (out, diags) = lower_and_emit_on_postgresql(
         r#"
 class LowercaseValidator
   def validate_each(record, attribute, value)
