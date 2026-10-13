@@ -47,7 +47,10 @@ end
 show("not_blank") { Finder.not_blank(room) }
 show("pinned") { Finder.pinned(room) }
 show("pinned_ordered") { Finder.pinned_ordered(room) }
-show("first_pinned") { Finder.first_pinned(room) }
+# `pinned` above loaded `room.pinned` (CollectionProxy#records), so `first` on this owner reads the target:
+# a fresh owner has none.
+show("first_pinned") { Finder.first_pinned(Room.find(room.id)) }
+show("first_pinned_loaded") { Finder.first_pinned(room) }
 show("newest") { Finder.newest(room) }
 show("notes") { Finder.notes(room) }
 show("same_column") { Finder.same_column(room) }

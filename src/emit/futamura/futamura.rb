@@ -18,7 +18,7 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, :plain, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :loads, :via, :plain, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, :joined, :order, keyword_init: true)
 
   # `StatementCache::Params` that keeps the placeholders handed out, in the order they were (`compile`
@@ -229,10 +229,11 @@ module Futamura
     # the association constrains (`owner_columns`). `relation:` says links
     # follow the reader (`notes.where(...).first`): Rails then builds a
     # Relation from `scope` and queries, where a terminal called on the reader
-    # itself (`notes.first`) answers from the association's target.
-    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, via: nil, &build)
+    # itself (`notes.first`) answers from the association's target. `loads:` marks the
+    # terminal that loads that target (`notes.to_a`: CollectionProxy#records, `load_target`).
+    def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, loads: false, via: nil, &build)
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped,
-                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via, plain: [nil, nil])
+                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, loads: loads, via: via, plain: [nil, nil])
     end
 
     # Whether a method the chain calls on `target` (a class, or a record for an association
@@ -555,7 +556,7 @@ module Futamura
       if owner
         proxy = owner.association(association)
         records.each do |record|
-          proxy.set_inverse_instance_from_queries(record)
+          statement.loads ? proxy.set_inverse_instance(record) : proxy.set_inverse_instance_from_queries(record)
           proxy.set_strict_loading(record)
         end
       end
@@ -567,9 +568,39 @@ module Futamura
       records.reverse! if statement.reverse
       result = statement.one ? records.first : records
 
+      if statement.loads && proxy
+        # CollectionProxy#to_a is `load_target.dup`: the association keeps the records, the caller
+        # gets a copy.
+        if VERIFY
+          # Rails' own read loads the target (the shadow is the fallback, run on the real owner);
+          # the target it set must be the one `load_target` is replaced by here.
+          expected = shadow(model, &fallback)
+          verify(key, result, expected, compiled.preload)
+          verify_loaded(key, proxy, records)
+        else
+          load_target(proxy, records)
+        end
+        return records.dup
+      end
+
       verify(key, result, shadow(model, &fallback), compiled.preload) if VERIFY
       result
     end
+
+    # What CollectionAssociation#load_target leaves once `find_target` answered `records`
+    # (`@target = merge_target_lists(find_target, target); loaded!`): `owner_chain_failure` held
+    # the target empty, so the merge is `records` and the assignment is Association#target=
+    # (the same call Preloader::Association#associate_records_to_owner makes).
+    def load_target(proxy, records)
+      proxy.target = records
+    end
+
+    def verify_loaded(key, proxy, records)
+      return if proxy.loaded? && proxy.target.map(&:id) == records.map(&:id)
+
+      raise "futamura #{key}: association target #{proxy.loaded? ? proxy.target.map(&:id).inspect : 'not loaded'} != specialized #{records.map(&:id).inspect}"
+    end
+    private :load_target, :verify_loaded
 
     # `binds` (the defaults', the chain's, the extra keys') in the order of the statement's
     # placeholders, with the joined models' default scope values at the places their joins have
@@ -644,6 +675,8 @@ module Futamura
       unless statement.relation
         return :target_loaded if proxy.loaded?
         return :target_unsaved if proxy.target.any?
+        # `load_target` raises on a strict-loading owner (Association#find_target); Rails' read does.
+        return :strict_loading if statement.loads && proxy.send(:violates_strict_loading?)
       end
 
       shape = @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do

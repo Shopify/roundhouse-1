@@ -1641,12 +1641,12 @@ mod association_scopes_and_conditions {
         let (report, files) = run();
         let init = init(&files);
         assert!(
-            init.contains("owner_keys: [\"room_id\"], owner_columns: [\"room_id\", \"pinned\"]) { |p| Message.all.where(room_id: p.bind).where(pinned: true).order(:id) }"),
+            init.contains("owner_keys: [\"room_id\"], owner_columns: [\"room_id\", \"pinned\"], loads: true) { |p| Message.all.where(room_id: p.bind).where(pinned: true).order(:id) }"),
             "{init}"
         );
         assert!(init.contains("Message.all.where(room_id: p.bind).order(\"id DESC\").send(:ordered_relation).limit(2)"), "{init}");
         assert!(
-            init.contains("\"Note\", owner_keys: [\"subject_id\", \"subject_type\"], owner_columns: [\"subject_id\", \"subject_type\"]) { |p| Note.all.where(subject_id: p.bind).where(subject_type: p.bind) }"),
+            init.contains("\"Note\", owner_keys: [\"subject_id\", \"subject_type\"], owner_columns: [\"subject_id\", \"subject_type\"], loads: true) { |p| Note.all.where(subject_id: p.bind).where(subject_type: p.bind) }"),
             "{init}"
         );
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
@@ -1705,7 +1705,7 @@ mod association_scopes_and_conditions {
         for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment", "remarks"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
-        for name in ["loaded", "unsaved"] {
+        for name in ["loaded", "unsaved", "first_pinned_loaded"] {
             assert!(fell_back(name), "{name}\n{normal}");
         }
         // The association's own condition on a column replaces the default scope's (WhereClause#merge).
@@ -2063,5 +2063,82 @@ mod class_bind_runtime {
             let Some(verified) = probe("1", prepared) else { return };
             assert!(verified.contains("key=keyed_class:2/1\n"), "{verified}");
         }
+    }
+}
+
+/// `to_a` on a collection reader is CollectionProxy#records, which loads the association's target
+/// (CollectionAssociation#load_target: `@target = merge_target_lists(find_target, target); loaded!`),
+/// so a later read of the reader is served from memory. The specialized terminal makes the same
+/// assignment (Association#target=, as Preloader::Association#associate_records_to_owner does);
+/// `first`/`take`, or a link before `to_a`, query without loading it. The probe
+/// (`tests/futamura_load_runtime.rb`) compares each scenario with Rails' own reader on real
+/// ActiveRecord (SQLite): results, the loaded flag, the target, inverses, strict loading and the
+/// number of queries.
+mod loaded_targets {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futamura_load_app")
+    }
+
+    fn emit(out: &Path) -> String {
+        let _ = fs::remove_dir_all(out);
+        let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(out).arg(fixture()).output().unwrap();
+        assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
+        fs::read_to_string(out.join("config/initializers/futamura.rb")).unwrap()
+    }
+
+    #[test]
+    fn only_to_a_on_the_reader_itself_is_marked_as_loading_the_target() {
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-loads-{}", std::process::id()));
+        let init = emit(&out);
+        let define = |key: &str| init.lines().find(|l| l.contains(&format!("Futamura.define(:{key},"))).unwrap_or_else(|| panic!("{key}\n{init}")).to_string();
+        // `room.messages.to_a`, and with the scope lambda the reader carries.
+        assert!(define("services_finder_4_5").contains(", loads: true)"), "{init}");
+        assert!(define("services_finder_9_5").contains(", loads: true)"), "{init}");
+        // `first` answers from a query while the target is not loaded; a link makes a Relation.
+        assert!(!define("services_finder_14_5").contains("loads:"), "{init}");
+        assert!(!define("services_finder_19_5").contains("loads:"), "{init}");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_specialized_to_a_loads_the_target_as_rails_does() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-loads-run-{}", std::process::id()));
+        emit(&out);
+        let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_load_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        let verified = output("1");
+        let normal = output("0");
+        for run in [&verified, &normal] {
+            assert!(!run.contains("same=false"), "{run}");
+            assert_eq!(run.lines().count(), 10, "{run}");
+        }
+        // Verify mode runs Rails' chain at every call: the state and the queries are the same, the counts of
+        // specialized calls are not.
+        let state = |s: &str| s.lines().map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        assert_eq!(state(&verified), state(&normal), "{verified}\n{normal}");
+        // The first read loads the target (one query), later reads are Rails' reads of it.
+        assert!(normal.contains("twice same=true [[1, 2, 3], true, [1, 2, 3], true, true] extra=nil queries=1 spec=1 fall=1"), "{normal}");
+        assert!(normal.contains("to_a_then_reads same=true [[3, true, 1, 3], true, [1, 2, 3], true, true] extra=nil queries=1 spec=1 fall=0"), "{normal}");
+        assert!(normal.contains("first_does_not_load same=true [[1], false, nil, nil, nil] extra=nil queries=1"), "{normal}");
+        assert!(normal.contains("relation_does_not_load same=true [[1, 2, 3], false, nil, nil, nil] extra=nil queries=1 spec=1"), "{normal}");
+        assert!(normal.contains("scope_lambda_loads same=true [[3, 2, 1], true, [3, 2, 1], true, true]"), "{normal}");
+        // Unsaved records, a new owner and a strict-loading owner are Rails' reads.
+        assert!(normal.contains("new_record_before_load same=true [[1, 2, 3, nil], true, [1, 2, 3, nil], true, true] extra=nil queries=1 spec=0 fall=1"), "{normal}");
+        assert!(normal.contains("strict_loading same=true [[\"ActiveRecord::StrictLoadingViolationError\"], false, nil, nil, nil]"), "{normal}");
+        assert!(normal.contains("extra=[true, true, true] queries=1"), "{normal}");
+        let _ = fs::remove_dir_all(&out);
     }
 }

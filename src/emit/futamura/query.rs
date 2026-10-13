@@ -109,6 +109,11 @@ struct Chain {
     /// association's target holds; `first`/`last`/`take`/`to_a` on the proxy
     /// itself answer from the target when it is loaded or has unsaved records.
     after_reader: bool,
+    /// For an association-rooted chain: nothing but the reader has been called so far (`to_a` may
+    /// be the terminal). `to_a` on the proxy itself is CollectionProxy#records, which loads the
+    /// association's target (CollectionAssociation#load_target); `first`/`last`/`take`, a link
+    /// or a relation's `to_a` query without loading it.
+    on_proxy: bool,
     /// `Model.find_by(hash)` called on the class: Core::ClassMethods#find_by
     /// reads a value that responds to `id` as that id (core.rb) before it
     /// builds the statement; Relation#find_by (`where(hash).take`) does not.
@@ -250,7 +255,8 @@ impl<'a> Specializer<'a> {
         let quoted = |columns: &[String]| columns.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
         let option = if chain.owner.is_some() {
             let relation = if chain.after_reader { ", relation: true" } else { "" };
-            format!("{option}, owner_keys: [{}], owner_columns: [{}]{relation}", quoted(&chain.owner_keys), quoted(&chain.owner_columns))
+            let loads = if chain.on_proxy && matches!(terminal, Terminal::Records { reverse: false }) { ", loads: true" } else { "" };
+            format!("{option}, owner_keys: [{}], owner_columns: [{}]{relation}{loads}", quoted(&chain.owner_keys), quoted(&chain.owner_columns))
         } else {
             option
         };
@@ -459,6 +465,7 @@ impl<'a> Specializer<'a> {
             chain = self.association_scope(chain, method, body, cx)?;
             // The scope lambda is part of the reader, not a link after it.
             chain.after_reader = false;
+            chain.on_proxy = true;
         }
         Ok(chain)
     }
@@ -516,6 +523,9 @@ impl<'a> Specializer<'a> {
         // to the class.
         if !matches!(method.as_str(), "first" | "last" | "take" | "to_a" | "select" | "all") {
             chain.after_reader = true;
+        }
+        if method.as_str() != "to_a" {
+            chain.on_proxy = false;
         }
         if let Some(scope) = scope_named(model, method) {
             chain.call_class_method(method);
@@ -924,6 +934,7 @@ struct Cx<'b> {
 
 impl Chain {
     fn new(model: ClassId, owner: Option<(String, Symbol)>) -> Self {
+        let owner_is_some = owner.is_some();
         Chain {
             model,
             owner,
@@ -937,6 +948,7 @@ impl Chain {
             owner_keys: Vec::new(),
             owner_columns: Vec::new(),
             after_reader: false,
+            on_proxy: owner_is_some,
             class_find_by: false,
             class_calls: Vec::new(),
         }
