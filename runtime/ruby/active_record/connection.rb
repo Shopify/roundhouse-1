@@ -1991,6 +1991,7 @@ module ActiveRecord
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
       @errors = _fresh_errors
+      @error_details = []
       begin
         ActiveRecord::RuntimeValidations.run(self)
       ensure
