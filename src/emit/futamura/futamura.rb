@@ -1217,8 +1217,8 @@ module Futamura
           refused("mixed_owner_classes")
           return rails(records, spec, strict)
         end
-        if scoped?(roots)
-          refused("scoping_block")
+        if (reason = scoped?(roots))
+          refused(reason)
           return rails(records, spec, strict)
         end
 
@@ -1318,10 +1318,15 @@ module Futamura
       # that asks the class at every call (`dynamic`) follows a scoping block as Rails does:
       # scope_for_association is Rails' own.
       def scoped?(nodes)
-        nodes.any? do |n|
+        nodes.each do |n|
           klass = n.reflection.klass
-          (!n.dynamic && klass.current_scope) || Futamura.send(:scope_redefined?, klass) || scoped?(n.children)
+          return "scoping_block" if !n.dynamic && klass.current_scope
+          return "scope_redefined" if Futamura.send(:scope_redefined?, klass)
+
+          reason = scoped?(n.children)
+          return reason if reason
         end
+        nil
       end
 
       # Preloader::Association#build_scope: built once per association, owner class and
