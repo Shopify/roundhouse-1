@@ -23,7 +23,7 @@ end
 fn errors(extra: &[(&str, &str)]) -> Vec<String> {
     let mut all: Vec<(&str, &str)> = vec![
         ("db/schema.rb", SCHEMA),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
         (
             "app/models/keystore.rb",
             "class Keystore < ApplicationRecord\n  def self.value_for(key)\n    self.where(key: key).limit(1).pluck(:value).first\n  end\nend\n",

@@ -353,7 +353,7 @@ fn a_try_on_a_nullable_receiver_resolves_through_the_narrowing() {
         ("db/schema.rb", SCHEMA),
         ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
         ("app/models/user.rb", "class User < ApplicationRecord\nend\n"),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
         (
             "app/controllers/application_controller.rb",
             "class ApplicationController < ActionController::Base\nend\n",
