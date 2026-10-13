@@ -657,6 +657,42 @@ mod default_scope_runtime {
         assert!(out.contains("ranked specialized=0 fallback={\"default_scope_values[RankedThing]\" => 1}"), "{out}");
         assert!(out.contains("scoped specialized=1 fallback={}"), "{out}");
     }
+
+    fn cpu_probe(verify: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_stats_cpu_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).output().unwrap();
+        let out = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(run.status.success(), "verify={verify}\n{out}\n{}", String::from_utf8_lossy(&run.stderr));
+        Some(out)
+    }
+
+    /// Per-site thread-CPU accounting: a call's guard phase (up to the statement), the specialized execute and
+    /// instantiate, and Rails' chain are timed apart; `FUTAMURA_STATS_AB=1` times the chain beside every specialized
+    /// call after a site's first; `FUTAMURA_STATS_HELPERS=1` times each guard helper.
+    #[test]
+    fn stats_time_the_guard_phase_the_specialized_path_and_the_chain_in_cpu() {
+        let Some(out) = cpu_probe("0") else { return };
+        assert!(out.contains("calls=9 specialized=8 fallback=1\nab_calls=7 chain_runs=10\n"), "{out}");
+        assert!(out.contains("guard_cpu_positive=true exec_cpu_positive=true fallback_cpu_positive=true\n"), "{out}");
+        assert!(out.contains("ab_cpu_positive=true compile_cpu_positive=true\nphases_within_wall=true\nclock_read_ns=true\n"), "{out}");
+        assert!(out.contains("helpers=true\nhelper_self_le_inclusive=true\ncompiles=1 compile_cpu=true\n"), "{out}");
+    }
+
+    /// The verify shadow is Rails' chain run beside a specialized call to compare: not a fallback, and not CPU of
+    /// the call's phases.
+    #[test]
+    fn the_verify_shadow_is_not_counted_as_a_fallback() {
+        let Some(out) = cpu_probe("1") else { return };
+        assert!(out.contains("calls=9 specialized=8 fallback=1\nab_calls=7 "), "{out}");
+        assert!(out.contains("phases_within_wall=true\n"), "{out}");
+    }
 }
 
 /// A statement is built once, from the chain as written, so it may stand for the chain only
