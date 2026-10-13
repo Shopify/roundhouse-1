@@ -748,10 +748,15 @@ fn accept_held_required_targets(
     }
 }
 
-/// `if <cond>; errors << "<message>"; end`.
+/// `if <cond>; errors << "<message>"; end`, the push possibly followed
+/// by the `error_details` push of a tree that keeps them.
 fn pushes_message(stmt: &Expr, message: &str) -> bool {
     let ExprNode::If { then_branch, .. } = &*stmt.node else { return false };
-    let ExprNode::Send { method, args, .. } = &*then_branch.node else { return false };
+    let push = match &*then_branch.node {
+        ExprNode::Seq { exprs } if exprs.len() == 2 => &exprs[0],
+        _ => then_branch,
+    };
+    let ExprNode::Send { method, args, .. } = &*push.node else { return false };
     method.as_str() == "<<"
         && matches!(args.as_slice(), [m] if matches!(&*m.node, ExprNode::Lit { value: Literal::Str { value } } if value == message))
 }
