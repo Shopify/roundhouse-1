@@ -156,23 +156,15 @@ pub(super) fn apply_with_plans(
             e.decisions |= crate::expr::RUBY_NATIVE_KEYWORD_SPLAT;
         }
         if plans.get(&e.span) == Some(&KeywordPolicy::Legacy) {
-            // `lower::kwsplat` resolves a callee through the receiver's
-            // class (or the enclosing class for a receiverless call) and
-            // decides there whether the Hash stays positional, expands
-            // to keywords or is restored as `**`. Only a call it cannot
-            // resolve keeps the source's splat in emitted Ruby: a dynamic
-            // `send`, or a receiver with no class type.
-            let mut callee_unresolved = false;
+            // Every erased splat is marked: the Ruby family writes it back
+            // as `**` (its defs keep their keyword rest natively).
+            // `lower::kwsplat` clears the mark where it resolves a callee
+            // that takes the Hash positionally; it resolves instance
+            // methods only, so a class-side or dynamic callee keeps it.
             let (args, constructor_splat) = match &mut *e.node {
                 ExprNode::Send {
                     recv, method, args, ..
                 } => {
-                    callee_unresolved = matches!(
-                        method.as_str(),
-                        "send" | "public_send" | "__send__"
-                    ) || recv.as_ref().is_some_and(|recv| {
-                        !matches!(recv.ty, Some(crate::ty::Ty::Class { .. }))
-                    });
                     let constructor_splat = method.as_str() == "new"
                         && args
                             .iter()
@@ -200,20 +192,14 @@ pub(super) fn apply_with_plans(
                         });
                     (Some(args), constructor_splat)
                 }
-                // `lower::kwsplat` resolves no `super`'s callee.
-                ExprNode::Super { args: Some(args), .. } => {
-                    callee_unresolved = true;
-                    (Some(args), false)
-                }
+                ExprNode::Super { args: Some(args), .. } => (Some(args), false),
                 _ => (None, false),
             };
             if let Some(args) = args.filter(|_| !constructor_splat) {
                 for arg in args {
                     if let ExprNode::KeywordSplat { value } = &mut *arg.node {
                         *arg = std::mem::replace(value, super::typing::nil_lit());
-                        if callee_unresolved {
-                            arg.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
-                        }
+                        arg.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
                     }
                 }
             }
