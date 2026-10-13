@@ -839,15 +839,24 @@ pub fn locked_external_gem_namespaces(app: &crate::App) -> std::collections::BTr
         .collect()
 }
 
-/// True when `detail` names a constant under `root` (`Rouge::X`), not a
-/// longer identifier that merely ends with the root (`NotRouge::X`).
+/// True when `detail` names a constant under `root` (`Rouge::X`, or the
+/// rooted `::Rouge::X`), not a longer identifier that merely ends with the
+/// root (`NotRouge::X`), nor a path that only passes through a constant
+/// of that name (`App::Types::Rouge::X`: the app's own).
 pub fn detail_names_external_namespace(detail: &str, root: &str) -> bool {
     let needle = format!("{root}::");
     let bytes = detail.as_bytes();
     let mut start = 0;
     while let Some(rel) = detail[start..].find(&needle) {
         let abs = start + rel;
-        let boundary_ok = abs == 0 || !is_ruby_ident_byte(bytes[abs - 1]);
+        let boundary_ok = match abs {
+            0 => true,
+            _ if bytes[abs - 1] == b':' => {
+                // `::Root` starts a path; `Outer::Root` continues one.
+                abs >= 2 && bytes[abs - 2] == b':' && (abs == 2 || !is_ruby_ident_byte(bytes[abs - 3]))
+            }
+            _ => !is_ruby_ident_byte(bytes[abs - 1]),
+        };
         if boundary_ok {
             return true;
         }

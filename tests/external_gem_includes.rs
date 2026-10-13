@@ -74,6 +74,12 @@ fn namespace_match_requires_identifier_boundary() {
         !roundhouse::gems::detail_names_external_namespace("NotRouge::X", "Rouge"),
         "longer identifiers that merely end with the root must not match"
     );
+    assert!(roundhouse::gems::detail_names_external_namespace("x is ::Rouge::X", "Rouge"));
+    assert!(roundhouse::gems::detail_names_external_namespace("Rouge::A looked up in Rouge::B", "Rouge"));
+    assert!(
+        !roundhouse::gems::detail_names_external_namespace("App::Types::Rouge::X", "Rouge"),
+        "an app constant of the root's name, reached through its own namespace, is not the gem's"
+    );
 }
 
 #[test]
