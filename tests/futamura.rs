@@ -611,8 +611,7 @@ mod default_scope_runtime {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         assert!(normal.contains("item/1=[1, 1]\nitem/2=[2]\nitem/3=[nil]\nitem/nil=[1]\narchived=nil\nunscoped=1\n"), "{normal}");
         // The scope ran once for a call the specialized statement served,
-        // and a call it cannot serve ran Rails' chain (nil, a join/order,
-        // a scoping block).
+        // and a call it cannot serve ran Rails' chain (nil, a join/order).
         assert!(normal.contains("calls_item=[1, 0]"), "{normal}");
         // `extending` in a default scope (query_methods.rb extending!): a named
         // module that leaves the chain's links and the loaders alone is served by
@@ -628,7 +627,10 @@ mod default_scope_runtime {
         assert!(normal.contains("find_by_id=[\"owned\"]"), "{normal}");
         // A class method the class defines itself (a double) is not answered beside: Rails runs it.
         assert!(normal.contains("via=[1, :double, 1, :prepended]") && normal.contains("calls_via=2"), "{normal}");
-        assert!(normal.contains("[:item, :fallback] [:item, :fallback] [:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]"), "{normal}");
+        // A `scoping`/`unscoped` block is the chain's starting relation (Scoping::Named::ClassMethods#all clones it,
+        // adding no default scope), so equality conditions in it are bound like a default scope's: the item calls inside
+        // them are served by the statement, and only the ranked/legacy/extension/flip ones ran Rails' chain.
+        assert!(normal.contains("[:ranked, :fallback] [:ranked, :fallback] [:legacy, :fallback]") && !normal.contains("[:item, :fallback]"), "{normal}");
     }
 
     /// The FUTAMURA_STATS block names why a call ran Rails' chain. A nil bind
@@ -1754,6 +1756,62 @@ end
         assert!(normal.contains("by_kind=[\"a\", \"b\", \"c\"]\n"), "{normal}");
         assert!(normal.contains("limited=[\"a\", \"b\"]\n"), "{normal}");
         assert!(normal.contains("by_model=[\"d\"]\n"), "{normal}");
+        let _ = fs::remove_dir_all(&out);
+    }
+}
+
+/// The run-time half for readers whose reflection compares more columns than the one the
+/// statement names (a composite `primary_key:`/`foreign_key:` pair list, association_scope.rb
+/// `last_chain_scope`: one equality per column pair, the value read from the owner), and for
+/// chains called inside `Model.scoping { }` (Scoping::Named::ClassMethods#all clones the scope).
+/// Real ActiveRecord on SQLite; FUTAMURA_VERIFY=1 compares every specialized result with Rails'
+/// own chain (tests/fixtures/futamura_cpk_app, tests/futamura_cpk_runtime.rb).
+mod composite_keys_and_scoping_blocks {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn composite_owner_keys_and_scoping_blocks_agree_with_rails_under_verify() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-cpk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+            .args(["--target", "futamura", "-o"])
+            .arg(&out)
+            .arg(manifest.join("tests/fixtures/futamura_cpk_app"))
+            .output()
+            .unwrap();
+        assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
+        let probe = manifest.join("tests/futamura_cpk_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        // Verify mode counts every call as a fallback: only its results are compared.
+        let results = |s: &str| s.lines().map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        let verified = output("1");
+        let normal = output("0");
+        assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
+        let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
+        let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
+        for name in ["lines", "lines_other", "gifts", "parcels", "by_sku", "of_order", "scoped_sku", "scoped_sku_other", "scoped_unscoped", "scoped_in", "scoped_assoc_reader_ids"] {
+            assert!(specialized(name), "{name}\n{normal}");
+        }
+        // A scope that orders is not equality conditions alone; an association reader does not
+        // see the current scope (Association#scope) and is left to Rails; a nil key is IS NULL.
+        for name in ["scoped_ordered", "scoped_reader", "lines_nil_region"] {
+            assert!(fell_back(name), "{name}\n{normal}");
+        }
+        // The other key columns are conditions: the rows of another region or shop are not the order's.
+        assert!(normal.contains("lines=[1, 2] ") && normal.contains("lines_other=[5] ") && normal.contains("gifts=[2] "), "{normal}");
+        assert!(normal.contains("scoped_sku=[1] ") && normal.contains("scoped_unscoped=[4] "), "{normal}");
         let _ = fs::remove_dir_all(&out);
     }
 }
