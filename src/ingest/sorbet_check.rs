@@ -634,13 +634,13 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
     match (method.as_str(), args.as_slice()) {
         ("untyped" | "anything", []) => Some(Ty::Untyped),
         ("boolean", []) => Some(Ty::Bool),
-        ("nilable", [inner]) => Some(Ty::Union { variants: vec![type_object_ty(inner)?, Ty::Nil] }),
+        ("nilable", [inner]) => Some(Ty::Union { variants: vec![type_object_ty(inner)?, Ty::Nil].into() }),
         ("any", members) => Some(Ty::Union { variants: members.iter().map(type_object_ty).collect::<Option<_>>()? }),
         // The intersection `sorbet_sig` reads `T.all(A, B)` as.
         ("all", members) if members.len() >= 2 => {
             Some(crate::rbs::intersection_ty(members.iter().map(type_object_ty).collect::<Option<_>>()?))
         }
-        ("class_of", [class]) => Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(const_name(class)?.as_str())), args: Vec::new() }),
+        ("class_of", [class]) => Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(const_name(class)?.as_str())), args: Default::default() }),
         // A symbol-keyed shape is the record `sorbet_sig` reads `{a: X}`
         // as; one with a string key is the `T::Hash` sorbet widens a
         // shape to (`FixedHash#subtype_of_single?`), keys and values
@@ -672,10 +672,10 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
                 }
             }
             if all_symbols {
-                return Some(Ty::Record { row: crate::ty::Row { fields, rest: None } });
+                return Some(Ty::Record { row: crate::ty::Row { fields: fields.into(), rest: None } });
             }
-            let union = |mut tys: Vec<Ty>| if tys.len() == 1 { tys.remove(0) } else { Ty::Union { variants: tys } };
-            Some(Ty::Hash { key: Box::new(union(keys)), value: Box::new(union(values)) })
+            let union = |mut tys: Vec<Ty>| if tys.len() == 1 { tys.remove(0) } else { Ty::Union { variants: tys.into() } };
+            Some(Ty::Hash { key: std::sync::Arc::new(union(keys)), value: std::sync::Arc::new(union(values)) })
         }
         // A tuple is the tuple `sorbet_sig` reads `[A, B]` as.
         ("fixed_array", [array]) => {
@@ -688,12 +688,12 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
             let mut params = Vec::new();
             for (key, value) in entries {
                 let ExprNode::Lit { value: Literal::Sym { value: name } } = &*key.node else { return None };
-                params.push(crate::ty::Param { name: name.clone(), ty: type_object_ty(value)?, kind: crate::ty::ParamKind::Required });
+                params.push(crate::ty::Param { name: name.clone(), ty: std::sync::Arc::new(type_object_ty(value)?), kind: crate::ty::ParamKind::Required });
             }
             let void = matches!(&*ret.node, ExprNode::Send { recv: Some(recv), method, args, .. }
                 if method.as_str() == "void" && args.is_empty() && const_name(recv).as_deref() == Some(HELPER));
             let ret = if void { Ty::Nil } else { type_object_ty(ret)? };
-            Some(Ty::Fn { params, block: None, ret: Box::new(ret), effects: crate::effect::EffectSet::default() })
+            Some(Ty::Fn { params: params.into(), block: None, ret: std::sync::Arc::new(ret), effects: crate::effect::EffectSet::default() })
         }
         ("generic", [label, _outer, rest @ ..]) => {
             let ExprNode::Lit { value: Literal::Str { value: label } } = &*label.node else { return None };

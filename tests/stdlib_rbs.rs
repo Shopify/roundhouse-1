@@ -56,7 +56,7 @@ fn type_of(app: &App, written: &str) -> Ty {
 }
 
 fn class(name: &str) -> Ty {
-    Ty::Class { id: ClassId(roundhouse::ident::Symbol::from(name)), args: vec![] }
+    Ty::Class { id: ClassId(roundhouse::ident::Symbol::from(name)), args: Default::default() }
 }
 
 fn errors(app: &App) -> Vec<String> {

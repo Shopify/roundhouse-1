@@ -1,10 +1,10 @@
 //! A guard on a column reader narrows with the reader's type.
 //!
-//! `return false if metadata.nil?` on Core's SignupLink
-//! (`serialize :metadata, coder: VersionedSerializer.column(Hash)`) narrowed
-//! the reads after it to the storage column's `String`, so
-//! `metadata.fetch(...)` was refused on String. The narrowing now starts
-//! from the reader the class registered; a plain column keeps its type.
+//! `return false if payload.nil?` on a model with `serialize :payload,
+//! coder: JSON` narrowed the reads after it to the storage column's
+//! `String`, so `payload.fetch(...)` was refused on String. The narrowing
+//! now starts from the reader the class registered; a plain column keeps
+//! its type.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,4 +44,25 @@ fn a_nil_guard_on_a_plain_column_narrows_to_the_column_type() {
     let (ok, text) = check(model);
     assert!(!ok, "{text}");
     assert!(text.contains("no known method `fetch` on String"), "{text}");
+}
+
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
+/// The guarded read runs against the decoded value, not the storage text.
+#[test]
+fn a_guarded_serialized_read_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  serialize :body, coder: JSON\n\n  #: -> untyped\n  def flag?\n    return false if body.nil?\n\n    body.fetch(\"flag\", false)\n  end\n\n",
+        )
+        .run_ruby(
+            r#"article = Article.new(title: "Probe", body: { "flag" => true })
+raise "decoded read lost" unless article.flag? == true
+raise "nil guard lost" unless Article.new(title: "Probe").flag? == false
+"#,
+        )
+        .assert_passes();
 }

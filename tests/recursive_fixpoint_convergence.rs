@@ -351,7 +351,7 @@ fn a_return_that_feeds_its_own_argument_settles_on_the_join_of_its_cycle() {
     };
     // The settled type admits every state of the cycle: the precise
     // `Array[Sym]` and the `Untyped` from the unresolved provider list.
-    let syms = Ty::Array { elem: Box::new(Ty::Sym) };
+    let syms = Ty::Array { elem: std::sync::Arc::new(Ty::Sym) };
     let admits = |want: &Ty| match param {
         Ty::Untyped => true,
         Ty::Union { variants } => variants.contains(want) || variants.contains(&Ty::Untyped),

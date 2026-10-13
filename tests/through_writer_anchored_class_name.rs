@@ -1,8 +1,8 @@
 //! Emitted-program regression for the `has_many :through` collection
 //! writer when the associations name their classes top-level-anchored
 //! (`class_name: "::Ns::Label"`) and the through association is
-//! polymorphic (`as:`), the shape of Core's
-//! `Markets::Platform::Responder` concern on `Checkouts::CheckoutProfile`.
+//! polymorphic (`as:`), the shape of a `Admin::Report::Handler`
+//! concern included into several models.
 //!
 //! The writer's `_sync_<name>` looked the join model up by the raw
 //! `class_name` spelling, missed it (`"::Ns::Labeling"` is not

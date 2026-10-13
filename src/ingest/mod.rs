@@ -17,12 +17,17 @@
 
 mod alba;
 mod boot_requires;
+mod pagy;
 mod graphql_ruby;
+mod guarded_include;
 pub(crate) mod class_attribute;
 pub(crate) mod autoload_glob;
 pub(crate) mod cattr;
 mod class_configuration;
 pub(crate) mod concern_class_attribute;
+mod dry_initializer;
+mod dry_struct;
+mod dry_types;
 pub mod allow_browser;
 pub mod app;
 mod concern_accessors;
@@ -57,6 +62,8 @@ pub mod channel_callbacks;
 pub mod current_attributes;
 pub mod class_eval_macro;
 pub mod delegate;
+mod acts_as_votable;
+mod discard;
 mod model_delegate;
 pub mod thread_mattr;
 pub mod model;
@@ -76,6 +83,7 @@ pub mod prism;
 pub mod rbi;
 pub mod rate_limit;
 pub mod inertia;
+pub mod initializer_ledger;
 pub mod roda_app;
 pub mod routes;
 pub mod singleton_class;
@@ -100,6 +108,7 @@ mod test_mixin;
 pub mod util;
 pub mod view;
 mod view_helper_includes;
+pub mod vite;
 mod visibility;
 mod zeitwerk;
 
@@ -109,7 +118,8 @@ pub use expr::ingest_expr;
 pub use fixture::ingest_fixture_file;
 pub use jbuilder::ingest_jbuilder;
 pub use library_class::{
-    classify_class_file, ingest_library_class, ingest_library_classes, ClassKind,
+    classify_class_file, ingest_library_class, ingest_library_classes,
+    ingest_nested_library_classes, ClassKind,
 };
 pub use model::ingest_model;
 pub use roda_app::{ingest_roda_app_with_vfs, is_roda_app};

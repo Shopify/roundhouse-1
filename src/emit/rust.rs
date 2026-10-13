@@ -197,10 +197,12 @@ use crate::models::*;
 #[allow(unused_imports)]
 use crate::views::*;
 #[allow(unused_imports)]
-use crate::errors_ext::{raise, NotImplementedError, RecordNotFound, RecordInvalid};
+use crate::errors_ext::{raise, ArgumentError, NotImplementedError, RecordNotFound, RecordInvalid};
 ";
 
 const MODEL_IMPORTS: &str = "\
+#[allow(unused_imports)]
+use crate::active_record_base::ErrorDetail;
 #[allow(unused_imports)]
 use crate::param_value::ParamValue;
 #[allow(unused_imports)]
@@ -348,18 +350,31 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // calls in a runtime file resolve to other methods in the same
     // file. Cross-unit miscompiles, if they surface, get added to
     // `register_hand_written_runtime` against the concrete site.
-    // Runtime emit (inside `rust_units`) walks `emit_library_class`
-    // before the cross-LC registry exists, so install a default
-    // `EmitCtx` for the duration. Phase 2 of #24 moved the per-class
-    // scope thread-locals (`IVAR_TYPES`, `CLASS_METHOD_PARAM_TYS`,
-    // `STATIC_METHODS`, `CONSTRUCTOR_FIELDS`) onto `EmitCtx` fields;
+    // Runtime emit walks `emit_library_class` inside `rust_units`. Seed
+    // the Const-recv registry from every runtime Library LC first so
+    // sibling classes in one source file resolve — e.g.
+    // `AssociationReflection::new` called from `ActiveRecord::Base`
+    // (#832). An empty `EmitCtx` left that call padded against
+    // Base#initialize and emitted `None` for a Value param. Phase 2
+    // of #24 moved the per-class scope thread-locals onto `EmitCtx`;
     // the `with_X<F>` wrappers panic if no `EmitCtx` is installed.
-    // The empty struct's pipeline-global registries are fine here —
-    // runtime files don't call back into the app's class methods, and
-    // the real `EmitCtx` (populated below by
-    // `collect_global_class_methods`) wraps the subsequent per-file
-    // app emit loop.
-    let runtime_units = crate::emit::rust::expr::with_emit_ctx(EmitCtx::default(), || {
+    // App emit installs a fuller ctx below via
+    // `collect_global_class_methods` (models + runtime + …).
+    let mut runtime_lcs_pre: Vec<crate::dialect::LibraryClass> = Vec::new();
+    crate::runtime_loader::rust_library_classes(|classes| {
+        runtime_lcs_pre.extend(classes.iter().cloned());
+    })
+    .expect("rust runtime parse failed (Ruby source error)");
+    let runtime_emit_ctx = collect_global_class_methods(
+        &[],
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &runtime_lcs_pre,
+    );
+    let runtime_units = crate::emit::rust::expr::with_emit_ctx(runtime_emit_ctx, || {
         crate::runtime_loader::rust_units(|_path, mut classes| {
             let registry = crate::emit::rust::decide::str_color::build_registry(&classes, &[]);
             crate::emit::rust::decide::str_color::color_classes(&mut classes, &registry);
@@ -856,6 +871,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     "\nimpl {name} {{\n\
                         pub fn mark_persisted_bang(&mut self) {{ }}\n\
                         pub fn errors(&self) -> Vec<String> {{ crate::errors_ext::validation_errors_snapshot() }}\n\
+                        pub fn error_details(&self) -> Vec<crate::active_record_base::ErrorDetail> {{ crate::errors_ext::validation_error_details_snapshot().iter().map(|(a, k, m)| crate::active_record_base::ErrorDetail::new(a, k, m)).collect() }}\n\
+                        pub fn push_error_detail(error: crate::active_record_base::ErrorDetail) {{ crate::errors_ext::validation_error_details_push(error.attribute(), error.kind(), error.message()) }}\n\
+                        pub fn error_messages_for(&self, attribute: &str) -> Vec<String> {{ crate::errors_ext::validation_error_details_snapshot().into_iter().filter(|(a, _, _)| a == attribute).map(|(_, _, m)| m).collect() }}\n\
                         pub fn save(&mut self) -> bool {{\n\
                             crate::errors_ext::validation_errors_clear();\n\
                             self.validate();\n\
@@ -914,10 +932,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             // and the bare `errors().push` falls through harmlessly
             // until updated.
             let content = format!("{MODEL_IMPORTS}{body}{ar_shim}");
-            let content = content.replace(
-                "self.errors().push(",
-                "crate::errors_ext::validation_errors_push(",
-            );
+            let content = content
+                .replace("self.errors().push(", "crate::errors_ext::validation_errors_push(")
+                .replace("self.error_details().push(", "Self::push_error_detail(");
             files.push(EmittedFile {
                 path: PathBuf::from(format!("src/models/{stem}.rs")),
                 content,
@@ -2319,7 +2336,7 @@ fn collect_global_class_methods(
                     .iter()
                     .map(|p| Param {
                         name: Symbol::from(p.as_str()),
-                        ty: Ty::Untyped,
+                        ty: Ty::Untyped.into(),
                         kind: ParamKind::Required,
                     })
                     .collect(),

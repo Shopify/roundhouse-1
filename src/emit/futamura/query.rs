@@ -18,7 +18,8 @@
 //!
 //! - Root: a model constant, or a plain `has_many` reader on a typed owner
 //!   (no `through:`, `as:`, or scope lambda; a `primary_key:` option is
-//!   not in the IR yet, so it cannot be refused).
+//!   refused — the bind is the owner's `id`, which a keyed association does
+//!   not match).
 //! - Links: `where(column: value)` (or `where(belongs_to_name: record_or_id)`,
 //!   bound as the key Rails' AssociationQueryValue would take), `order`/`preload`/`includes` with
 //!   literal arguments, `limit`, and scopes. A scope whose body only
@@ -542,6 +543,9 @@ impl<'a> Specializer<'a> {
         let Association::HasMany { target, foreign_key, through, as_interface, scope, scope_owner, .. } = assoc else {
             return Err(format!("`{}` is not a has_many", method.as_str()));
         };
+        if crate::lower::assoc_primary_key::custom_primary_key(assoc).is_some() {
+            return Err(format!("has_many `{}` declares `primary_key:`", method.as_str()));
+        }
         if through.is_some() || scope_owner.is_some() || !args.is_empty() {
             return Err(format!("has_many `{}` has options the specializer does not model", method.as_str()));
         }

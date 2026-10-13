@@ -79,6 +79,14 @@ pub(crate) fn file_program_files(app: &App, emitted: &std::collections::BTreeSet
         .collect()
 }
 
+pub(crate) fn with_external_gem_namespaces<R>(
+    namespaces: &std::collections::BTreeSet<String>,
+    includes: std::collections::BTreeMap<String, Vec<String>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    expr::with_external_gem_namespaces(namespaces, includes, f)
+}
+
 /// Emit a single `MethodDef` as Ruby source (trailing newline included).
 /// The signature and effects are not emitted — they belong to the RBS
 /// sidecar, not to Ruby itself. Used by the runtime-extraction pipeline
@@ -342,7 +350,7 @@ fn relax_from_stmt_handle(lc: &mut LibraryClass) {
         if m.name.as_str() == "from_stmt" && m.receiver == MethodReceiver::Class {
             if let Some(crate::ty::Ty::Fn { params, .. }) = m.signature.as_mut() {
                 if let Some(p) = params.first_mut() {
-                    p.ty = crate::ty::Ty::Untyped;
+                    p.ty = crate::ty::Ty::Untyped.into();
                 }
             }
         }
@@ -398,6 +406,7 @@ pub(crate) fn materialize_models(
         materialization,
         crate::lower::model_to_library::FinderInputs::Request,
         true,
+        crate::lower::model_to_library::ErrorsReaders::CreatedOnFirstRead,
         if app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) {
             crate::lower::arel::SqlDialect::Postgres
         } else {
@@ -408,10 +417,20 @@ pub(crate) fn materialize_models(
 }
 
 pub fn emit_lowered_models(app: &App) -> Vec<EmittedFile> {
+    let (lcs, params_specs) = lowered_model_lcs(app);
+    emit_model_classes(&lcs, app, &params_specs)
+}
+
+/// The model classes `emit_lowered_models` writes, before rendering.
+/// Shared with `emit::futamura::routes`, which walks what is emitted.
+pub(crate) fn lowered_model_lcs(
+    app: &App,
+) -> (Vec<LibraryClass>, crate::lower::controller_to_library::params::ParamsSpecs) {
     let (mut lcs, params_specs) = materialize_models(
         app,
         crate::lower::model_to_library::Materialization::Emit,
     );
+    library::preserve_record_receiver_returns(&mut lcs, app);
     // The sqlite statement handle `Db.prepare` returns is a per-target
     // `Db` primitive: an integer cursor on most adapters (the shared
     // model lowerer's `Ty::Int` default), but an opaque FFI `void *` on
@@ -426,8 +445,7 @@ pub fn emit_lowered_models(app: &App) -> Vec<EmittedFile> {
         relax_from_stmt_handle(lc);
     }
     apply_model_lowering(&mut lcs, app);
-
-    emit_model_classes(&lcs, app, &params_specs)
+    (lcs, params_specs)
 }
 
 /// The existing ordered Ruby IR producers, shared with accessor admission.
@@ -503,7 +521,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // as Rails' later job does.
     library::apply_broadcast_located_record(&mut lcs, app);
     library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     // Runtime-Relation eager loading: per-model `preload_associations`
     // machinery + belongs_to reader cache guards, so `includes(...)`
@@ -511,8 +529,8 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // N+1 lazy reads. Runs last so nothing reprocesses the synthesized
     // bodies (no-op unless the app mentions includes).
     library::apply_preload_lowering(&mut lcs, app, &no_views);
-    // A belongs_to reader memoizes, and writing the foreign key
-    // invalidates it (no-op for models with no belongs_to). AFTER the
+    // A belongs_to reader memoizes, and writing the foreign key or the
+    // association invalidates it (no-op for models with no belongs_to). AFTER the
     // preload pass, which is what puts the `return @<name>_cache if
     // @<name>_loaded` guard on the reader — this pass memoizes into
     // that same cache and would have nothing to prepend itself to if it
@@ -598,10 +616,11 @@ fn emit_model_classes(
 /// with `def self.statements` returning the DDL list. Per-statement
 /// (rather than one joined string) so adapters that don't support
 /// multi-statement execution work too. Consumes the universal
-/// `lower_schema_to_library_functions` output, sharing shape across
-/// every target.
+/// `lower_schema_module_functions` output, sharing shape across
+/// every target. An app without tables still gets the module, with an
+/// empty statement list.
 pub fn emit_lowered_schema(app: &App) -> EmittedFile {
-    let funcs = crate::lower::lower_schema_to_library_functions(&app.schema);
+    let funcs = crate::lower::lower_schema_module_functions(&app.schema);
     library::emit_module_file(&funcs, app, PathBuf::from("config/schema.rb"))
 }
 
@@ -609,7 +628,7 @@ pub fn emit_lowered_schema(app: &App) -> EmittedFile {
 /// `.rbs`. Replaces `emit_lowered_schema` at call sites that want
 /// the typed sidecar emitted alongside.
 pub fn emit_lowered_schema_pair(app: &App) -> Vec<EmittedFile> {
-    let funcs = crate::lower::lower_schema_to_library_functions(&app.schema);
+    let funcs = crate::lower::lower_schema_module_functions(&app.schema);
     library::emit_module_file_pair(&funcs, app, PathBuf::from("config/schema.rb"))
 }
 
@@ -719,7 +738,7 @@ pub fn emit_lowered_controllers(app: &App) -> Vec<EmittedFile> {
     // that argument's escaping comes off (no-op without such a site).
     library::apply_raw_helper_monomorphization(&mut lcs, app);
     library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     // Layout wrap at render call sites — the seam where the @ivars a
     // layout reads are in scope. Converged with the CRuby tree
@@ -744,6 +763,13 @@ pub fn emit_lowered_controllers(app: &App) -> Vec<EmittedFile> {
 /// re-emit controllers through this and dedupe last-wins over the
 /// spinel-shape files.
 pub fn emit_lowered_controllers_with_layout(app: &App) -> Vec<EmittedFile> {
+    let lcs = lowered_controller_lcs_with_layout(app);
+    emit_lowered_controllers_from_lcs(&lcs, app)
+}
+
+/// The controller classes `emit_lowered_controllers_with_layout`
+/// writes, before rendering. Shared with `emit::futamura::routes`.
+pub(crate) fn lowered_controller_lcs_with_layout(app: &App) -> Vec<LibraryClass> {
     // FULL: the CRuby/JRuby trees ship the overlay (JsonRender) so the
     // widened respond_to arms all resolve; these files dedupe last-wins
     // over the spinel-shape ones.
@@ -757,10 +783,10 @@ pub fn emit_lowered_controllers_with_layout(app: &App) -> Vec<EmittedFile> {
     // that argument's escaping comes off (no-op without such a site).
     library::apply_raw_helper_monomorphization(&mut lcs, app);
     library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     library::apply_layout_lowering(&mut lcs, app);
-    emit_lowered_controllers_from_lcs(&lcs, app)
+    lcs
 }
 
 /// Bulk lower controllers in spinel-shape. Synthesized siblings
@@ -911,6 +937,20 @@ fn prepend_sibling_classes(
 /// template named `<base>_json.rb` to avoid colliding with the html
 /// sibling. Both files reopen the same `Views::<Plural>` module.
 pub fn emit_lowered_views(app: &App) -> Vec<EmittedFile> {
+    let (html_views, lcs) = lowered_view_lcs(app);
+    html_views
+        .iter()
+        .zip(lcs.iter())
+        .flat_map(|(v, lc)| {
+            let out_path = view_output_path(&crate::lower::view::view_output_stem(v));
+            library::emit_library_class_pair(lc, app, out_path)
+        })
+        .collect()
+}
+
+/// The html view classes `emit_lowered_views` writes, paired with their
+/// views, before rendering. Shared with `emit::futamura::routes`.
+pub(crate) fn lowered_view_lcs(app: &App) -> (Vec<&crate::dialect::View>, Vec<LibraryClass>) {
     // Lower every view through ONE per-app context, then run the
     // Ruby-family passes over the whole group at once — per-view pass
     // application rebuilt the scope/assoc/helper registries for every
@@ -947,7 +987,7 @@ pub fn emit_lowered_views(app: &App) -> Vec<EmittedFile> {
     // Nullable columns hydrate to nil on the Ruby tree — synthesized
     // `.empty?` predicate forms in view bodies must tolerate it.
     library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     // A view whose own namespace shadows a top-level app class
     // (`Views::Stats` over `Stats`) must reference it absolutely, or
@@ -965,14 +1005,7 @@ pub fn emit_lowered_views(app: &App) -> Vec<EmittedFile> {
     // appending into the view's own buffer. The variants are added on
     // the helper side (`emit_library_class_decls`) from the same table.
     crate::lower::tag_block_passing::apply_views(&mut lcs, &crate::lower::tag_block_passing::variants(app));
-    html_views
-        .iter()
-        .zip(lcs.iter())
-        .flat_map(|(v, lc)| {
-            let out_path = view_output_path(&crate::lower::view::view_output_stem(v));
-            library::emit_library_class_pair(lc, app, out_path)
-        })
-        .collect()
+    (html_views, lcs)
 }
 
 /// Lower each json-format `app.views` entry through `jbuilder_to_library`
@@ -985,7 +1018,8 @@ pub fn emit_lowered_jbuilder_views(app: &App) -> Vec<EmittedFile> {
         .iter()
         .filter(|v| v.jbuilder)
         .flat_map(|v| {
-            let lc = crate::lower::lower_jbuilder_to_library_class(v, app);
+            let mut lc = crate::lower::lower_jbuilder_to_library_class(v, app);
+            library::apply_zoned_json_time_lowering(std::slice::from_mut(&mut lc), app);
             let out_path = jbuilder_view_output_path(v.name.as_str());
             library::emit_library_class_pair(&lc, app, out_path)
         })

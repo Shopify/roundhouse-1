@@ -1,10 +1,10 @@
 //! A namespace's `table_name_prefix` written inside `class << self`.
 //!
-//! Every prefix Core declares is in that form (`ShopifyPayments`,
-//! `Billing`, `Shipping`, `Checkouts::One`, …). Only `def
-//! self.table_name_prefix` was read, so `ShopifyPayments::Account` looked
-//! for `accounts`, bound no schema row, and its columns (`shop_id`,
-//! `product_key`, …) were `no known method`.
+//! Rails asks a model's nearest module parent for `table_name_prefix`, and
+//! a prefix is as often written inside `class << self` as `def self.`.
+//! Only `def self.table_name_prefix` was read, so `Billing::Charge` looked
+//! for `charges`, bound no schema row, and its columns (`product_key`, …)
+//! were `no known method`.
 
 use std::process::Command;
 
@@ -12,7 +12,7 @@ fn check(name: &str, namespace: &str) -> String {
     let root = std::env::temp_dir().join(format!("rh_table_name_prefix_singleton_{}_{name}", std::process::id()));
     let files = [
         ("roundhouse.yml", "test_paths:\n  - test\n".to_string()),
-        ("db/structure.sql", "CREATE TABLE core.billing_charges (\n    id bigint NOT NULL,\n    product_key character varying NOT NULL\n);\n".to_string()),
+        ("db/structure.sql", "CREATE TABLE public.billing_charges (\n    id bigint NOT NULL,\n    product_key character varying NOT NULL\n);\n".to_string()),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".to_string()),
         ("app/models/billing.rb", namespace.to_string()),
         ("app/models/billing/charge.rb", "module Billing\n  class Charge < ApplicationRecord\n    #: -> untyped\n    def use = product_key.zzz\n  end\nend\n".to_string()),
@@ -40,23 +40,23 @@ fn both_singleton_spellings_prefix_the_table() {
 
 #[test]
 fn an_extend_self_prefix_overrides_the_outer_one() {
-    // Core's `Payments::PaymentFlexibility`: `extend self` and a plain
-    // `def table_name_prefix` returning "", so `PaymentSchedule` reads
-    // `payment_schedules`, not `payments_payment_schedules`.
+    // A module that `extend self`s and defines a plain
+    // `def table_name_prefix` returning "" overrides the outer one, so `Entry` reads
+    // `entries`, not `ledger_entries`.
     let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
-        ("db/structure.sql", "CREATE TABLE core.payment_schedules (\n    id bigint NOT NULL,\n    label character varying NOT NULL\n);\n"),
+        ("db/structure.sql", "CREATE TABLE public.entries (\n    id bigint NOT NULL,\n    label character varying NOT NULL\n);\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        ("app/models/payments.rb", "module Payments\n  class << self\n    def table_name_prefix\n      \"payments_\"\n    end\n  end\nend\n"),
-        ("app/services/payments/flex.rb", "module Payments\n  module Flex\n    extend self\n\n    def table_name_prefix\n      \"\" # override Payments\n    end\n  end\nend\n"),
-        ("app/models/payments/flex/payment_schedule.rb", "module Payments\n  module Flex\n    class PaymentSchedule < ApplicationRecord\n    end\n  end\nend\n"),
+        ("app/models/ledger.rb", "module Ledger\n  def self.table_name_prefix\n    \"ledger_\"\n  end\nend\n"),
+        ("app/services/ledger/extended.rb", "module Ledger\n  module Extended\n    extend self\n\n    def table_name_prefix\n      \"\" # override Ledger\n    end\n  end\nend\n"),
+        ("app/models/ledger/extended/entry.rb", "module Ledger\n  module Extended\n    class Entry < ApplicationRecord\n    end\n  end\nend\n"),
     ]
     .into_iter()
     .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
     .collect();
     let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
-    let table = app.models.iter().find(|m| m.name.0.as_str() == "Payments::Flex::PaymentSchedule").map(|m| m.table.0.to_string());
-    assert_eq!(table.as_deref(), Some("payment_schedules"));
+    let table = app.models.iter().find(|m| m.name.0.as_str() == "Ledger::Extended::Entry").map(|m| m.table.0.to_string());
+    assert_eq!(table.as_deref(), Some("entries"));
 }
 
 #[test]
@@ -64,11 +64,11 @@ fn a_nested_empty_prefix_overrides_the_outer_one() {
     let root = std::env::temp_dir().join(format!("rh_table_name_prefix_singleton_{}_empty", std::process::id()));
     let files = [
         ("roundhouse.yml", "test_paths:\n  - test\n"),
-        ("db/structure.sql", "CREATE TABLE core.vaults (\n    id bigint NOT NULL,\n    label character varying NOT NULL\n);\n"),
+        ("db/structure.sql", "CREATE TABLE public.vaults (\n    id bigint NOT NULL,\n    label character varying NOT NULL\n);\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        ("app/models/payments.rb", "module Payments\n  class << self\n    def table_name_prefix\n      \"payments_\"\n    end\n  end\nend\n"),
-        ("app/models/payments/inner.rb", "module Payments\n  module Inner\n    class << self\n      def table_name_prefix\n        \"\"\n      end\n    end\n  end\nend\n"),
-        ("app/models/payments/inner/vault.rb", "module Payments\n  module Inner\n    class Vault < ApplicationRecord\n      #: -> untyped\n      def use = label.yyy\n    end\n  end\nend\n"),
+        ("app/models/ledger.rb", "module Ledger\n  def self.table_name_prefix\n    \"ledger_\"\n  end\nend\n"),
+        ("app/models/ledger/inner.rb", "module Ledger\n  module Inner\n    class << self\n      def table_name_prefix\n        \"\"\n      end\n    end\n  end\nend\n"),
+        ("app/models/ledger/inner/vault.rb", "module Ledger\n  module Inner\n    class Vault < ApplicationRecord\n      #: -> untyped\n      def use = label.yyy\n    end\n  end\nend\n"),
     ];
     for (path, text) in files {
         let file = root.join(path);

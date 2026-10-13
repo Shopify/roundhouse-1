@@ -204,7 +204,7 @@ fn resolve_attrs(body: &mut Expr, at: usize) {
                 parenthesized: true,
             },
         ),
-        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
     );
     let assign = Expr::new(
         Span::synthetic(),
@@ -229,7 +229,7 @@ fn synth_attribute_aliases(owner: &ClassId, model: &Model, table: &Table) -> Met
         pairs.push(("id_value".to_string(), "id".to_string()));
     }
     let entries = pairs.into_iter().map(|(n, o)| (lit_str(n), lit_str(o))).collect();
-    let ty = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) };
+    let ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,

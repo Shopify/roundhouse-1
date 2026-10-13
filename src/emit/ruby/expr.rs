@@ -11,7 +11,7 @@ use crate::ty::Ty;
 
 use super::shared::indent_lines;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     /// True while emitting the body of a CORE-CLASS REOPEN (`class
@@ -46,6 +46,17 @@ thread_local! {
     /// (`rooted_if_shadowed`). `None` outside a class emit.
     static LEXICAL_SCOPE: std::cell::RefCell<Option<(Vec<String>, std::rc::Rc<crate::det::HashSet<String>>)>> =
         const { std::cell::RefCell::new(None) };
+    /// Direct, locked unknown-gem namespaces admitted by the Ruby project
+    /// emitter. Other targets retain their constant refusal.
+    static EXTERNAL_GEM_NAMESPACES: RefCell<std::collections::BTreeSet<String>> = const {
+        RefCell::new(std::collections::BTreeSet::new())
+    };
+    /// `gems::statically_resolved_external_includes` of the app being
+    /// emitted, computed once with the namespaces above: it scans every
+    /// class, and asked per class it was most of Mastodon's emit.
+    static EXTERNAL_INCLUDES: RefCell<std::collections::BTreeMap<String, Vec<String>>> = const {
+        RefCell::new(std::collections::BTreeMap::new())
+    };
 }
 
 /// Restores the previous lexical scope on drop (`enter_lexical_scope`).
@@ -207,6 +218,32 @@ pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+pub(super) fn with_external_gem_namespaces<R>(
+    namespaces: &std::collections::BTreeSet<String>,
+    includes: std::collections::BTreeMap<String, Vec<String>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = EXTERNAL_GEM_NAMESPACES
+        .with(|current| std::mem::replace(&mut *current.borrow_mut(), namespaces.clone()));
+    let previous_includes = EXTERNAL_INCLUDES.with(|current| current.replace(includes));
+    let result = f();
+    EXTERNAL_GEM_NAMESPACES.with(|current| {
+        *current.borrow_mut() = previous;
+    });
+    EXTERNAL_INCLUDES.with(|current| current.replace(previous_includes));
+    result
+}
+
+/// The literal requires that carry an external include (`detail` is its
+/// "X includes unresolved Y" key), when the emit admitted them.
+pub(super) fn external_include_features(detail: &str) -> Vec<String> {
+    EXTERNAL_INCLUDES.with(|includes| includes.borrow().get(detail).cloned().unwrap_or_default())
+}
+
+pub(crate) fn external_gem_namespace_is_enabled(namespace: &str) -> bool {
+    EXTERNAL_GEM_NAMESPACES.with(|namespaces| namespaces.borrow().contains(namespace))
+}
+
 /// The raise `emit_expr` writes for a site a diagnostic replaced, or
 /// `None` for a site that emits as itself.
 fn diagnostic_stub(e: &Expr) -> Option<String> {
@@ -262,6 +299,9 @@ fn diagnostic_stub(e: &Expr) -> Option<String> {
 /// Emit Ruby-family syntax while retaining diagnostics and typed primitive
 /// semantics, including the no-block form of String#bytes with literal &nil.
 pub fn emit_expr(e: &Expr) -> String {
+    if is_locked_external_gem_constant(e) {
+        return emit_node(&e.node);
+    }
     if let Some(stub) = diagnostic_stub(e) {
         return stub;
     }
@@ -589,6 +629,24 @@ fn singular_builder(e: &Expr) -> Option<String> {
         block: None,
         parenthesized: true,
     }))
+}
+
+fn is_locked_external_gem_constant(expr: &Expr) -> bool {
+    let Some(DiagnosticKind::Unsupported {
+        construct, detail, ..
+    }) = &expr.diagnostic
+    else {
+        return false;
+    };
+    if construct.as_str() != "constant" {
+        return false;
+    }
+    EXTERNAL_GEM_NAMESPACES.with(|namespaces| {
+        namespaces
+            .borrow()
+            .iter()
+            .any(|root| crate::gems::detail_names_external_namespace(detail, root))
+    })
 }
 
 /// A string literal ingested from `+"literal"`. Written back with its
@@ -1369,6 +1427,7 @@ fn emit_string_interp(parts: &[crate::expr::InterpPart]) -> String {
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),
                     '#' => out.push_str("\\#"),
+                    c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
                     other => out.push(other),
                 }
             }
@@ -1679,8 +1738,9 @@ fn recv_needs_parens(r: &Expr) -> bool {
 /// collapse `:sym` to a string and need no help. A genuinely symbol-keyed
 /// hash (`Hash[Symbol, _]`, e.g. a keyword-arg hash like
 /// `StoryRepository#@params`) has a different type and is left alone, as
-/// is any `untyped`/unknown receiver — we coerce on positive evidence
-/// only.
+/// is any `untyped`/unknown receiver. A request's params value is
+/// String-keyed at run time whatever the key's static type, so it also
+/// matches (`is_indifferent_params`) and its keys are coerced in full.
 ///
 /// This is the type-directed emit hook (the `[]` analog of the shared
 /// `classify_add`/`_sub`/`_cmp` operator dispatch) where a future
@@ -1695,18 +1755,29 @@ fn is_string_keyed_hash(recv: &Expr) -> bool {
     }
 }
 
+/// Is `recv` a request's params, the indifferent-access store? Either a
+/// params value (`ParamValue`) or the lowered controller's own `@params`,
+/// which is typed as a plain `Hash[String, untyped]` and is told apart
+/// from other hashes by being that ivar.
+fn is_indifferent_params(recv: &Expr) -> bool {
+    match &*recv.node {
+        ExprNode::Ivar { name } if name.as_str() == "params" => true,
+        _ => matches!(recv.ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == crate::analyze::PARAM_VALUE),
+    }
+}
+
 /// Coerce a key indexing a string-keyed hash: a symbol literal `:id` →
-/// `"id"`, an already-string key unchanged, and a Symbol-typed dynamic key
-/// wrapped with `.to_s`. Safe on a `Hash[String, _]` — the key is a string, so
-/// `.to_s` is a no-op on a string and repairs a symbol.
-fn coerce_str_key(key: &Expr) -> String {
+/// `"id"`, an already-string key unchanged, and a dynamic key wrapped
+/// with `.to_s`. On params (`indifferent`) every dynamic key is wrapped:
+/// the key may hold a Symbol the static type does not show, and the store
+/// reads it by its String. On a plain `Hash[String, _]` only a key typed
+/// Symbol is, since the signature may sit over a hash that natively
+/// misses a Symbol key and an untyped key is then emitted as written.
+fn coerce_str_key(key: &Expr, indifferent: bool) -> String {
     match &*key.node {
         ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
         ExprNode::Lit { value: Literal::Str { .. } } => emit_expr(key),
-        // Not every dynamic key: the receiver's `Hash[String, _]` may come from a signature over
-        // a plain Hash, where `values[key]` with a Symbol `key` natively misses the String entry.
-        // Only a key known to be a Symbol is the indifferent-access idiom.
-        _ if !matches!(key.ty, Some(Ty::Sym)) => emit_expr(key),
+        _ if !indifferent && !matches!(key.ty, Some(Ty::Sym)) => emit_expr(key),
         _ => {
             let k = emit_expr(key);
             if recv_needs_parens(key) { format!("({k}).to_s") } else { format!("{k}.to_s") }
@@ -1733,11 +1804,12 @@ fn coerce_str_sym_key(key: &Expr) -> String {
 /// `h[x]` → `h[x.to_s]` case a literal-only pre-pass could not).
 fn emit_str_hash_access(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
     let recv_s = emit_expr(recv);
+    let indifferent = is_indifferent_params(recv);
     match method {
-        "[]" if args.len() == 1 => Some(format!("{recv_s}[{}]", coerce_str_key(&args[0]))),
+        "[]" if args.len() == 1 => Some(format!("{recv_s}[{}]", coerce_str_key(&args[0], indifferent))),
         "[]=" if args.len() == 2 => Some(format!(
             "{recv_s}[{}] = {}",
-            coerce_str_key(&args[0]),
+            coerce_str_key(&args[0], indifferent),
             emit_arg(&args[1])
         )),
         "fetch" | "key?" | "has_key?" | "include?" | "delete" if !args.is_empty() => {
@@ -2338,7 +2410,7 @@ fn emit_lvalue(lv: &LValue) -> String {
             // Index-write target (`h[:x] = …`): coerce the key when writing
             // to a string-keyed hash, same as the read path above.
             let key = if is_string_keyed_hash(recv) {
-                coerce_str_key(index)
+                coerce_str_key(index, is_indifferent_params(recv))
             } else {
                 emit_expr(index)
             };

@@ -3,7 +3,8 @@
 //! only where the receiver is known not to be a class object. A value
 //! typed `Class` answers the query (`klass.include?(Mod)`). A receiver of
 //! unknown or gradual type gets the diagnostics any other send on it
-//! gets, not a claim that a Module was required.
+//! gets, not a claim that a Module was required. A known instance of an
+//! app class is still refused.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -11,9 +12,10 @@ use roundhouse::project::BuildTarget;
 
 fn app(lib: &str) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
-        .write("lib/tags.rb", lib)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :items do |t|\n    t.string :name\n  end\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("app/services/tags.rb", lib)
 }
 
 fn errors(lib: &str) -> Vec<String> {
@@ -27,22 +29,18 @@ const TAGS: &str = r#"class Tags
 end
 "#;
 
+const ANCESTRY_QUERY: &str = r#"
+raise "tagged" unless Tags.new.tagged?(Note.new)
+raise "plain" if Tags.new.tagged?(Plain.new)
+"#;
+
 #[test]
 fn a_class_value_answers_include() {
     app(TAGS)
-        .write("lib/tagged.rb", "module Tagged\n  def tag\n    \"tagged\"\n  end\nend\n")
-        .write("lib/note.rb", "class Note\n  include Tagged\nend\n")
-        .write("lib/plain.rb", "class Plain\nend\n")
-        .write("test/tags_test.rb", r#"require "test_helper"
-require "tags"
-class TagsTest < ActiveSupport::TestCase
-  test "the ancestry query on a record's class" do
-    assert_equal true, Tags.new.tagged?(Note.new)
-    assert_equal false, Tags.new.tagged?(Plain.new)
-  end
-end
-"#)
-        .run_test("test/models/tags_test.rb")
+        .write("app/services/tagged.rb", "module Tagged\n  def tag\n    \"tagged\"\n  end\nend\n")
+        .write("app/services/note.rb", "class Note\n  include Tagged\nend\n")
+        .write("app/services/plain.rb", "class Plain\nend\n")
+        .run_ruby(ANCESTRY_QUERY)
         .assert_passes();
 }
 
@@ -58,4 +56,14 @@ fn an_unknown_or_gradual_receiver_is_not_a_missing_module() {
 fn a_known_instance_is_still_refused() {
     let errors = errors("class Tags\n  def has?\n    Tags.new.include?(1)\n  end\nend\n");
     assert!(errors.iter().any(|e| e.contains("Module protocol")), "{errors:#?}");
+}
+
+#[test]
+fn a_receiver_typed_class_or_module_is_not_a_missing_module() {
+    for ty in ["Class", "Module"] {
+        let errors = errors(&format!(
+            "class Tags\n  #: ({ty}) -> bool\n  def tagged?(klass)\n    klass.include?(Comparable)\n  end\nend\n"
+        ));
+        assert!(!errors.iter().any(|e| e.contains("Module protocol")), "{ty}: {errors:#?}");
+    }
 }

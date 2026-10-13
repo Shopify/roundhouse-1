@@ -176,7 +176,7 @@ fn build_fixture_class(
 ) -> LibraryClass {
     let owner_name = format!("{}Fixtures", camelize(f.name.as_str()));
     let owner_id = ClassId(Symbol::from(owner_name.clone()));
-    let class_ty = Ty::Class { id: f.class.clone(), args: vec![] };
+    let class_ty = Ty::Class { id: f.class.clone(), args: vec![].into() };
 
     // Each label method (`one`, `two`, …) returns the persisted record
     // looked up by id. The actual insert happens in `_fixtures_load!`,
@@ -368,7 +368,7 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
             Span::synthetic(),
             ExprNode::Const { path: vec![cls.0.clone()] },
         ),
-        Ty::Class { id: cls.clone(), args: vec![] },
+        Ty::Class { id: cls.clone(), args: vec![].into() },
     );
     with_ty(
         Expr::new(
@@ -381,7 +381,7 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
                 parenthesized: true,
             },
         ),
-        Ty::Class { id: cls.clone(), args: vec![] },
+        Ty::Class { id: cls.clone(), args: vec![].into() },
     )
 }
 
@@ -427,7 +427,7 @@ fn build_load_method_body(
     all: &LoweredFixtureSet,
     defaults: &[&Column],
 ) -> Expr {
-    let class_ty = Ty::Class { id: cls.clone(), args: vec![] };
+    let class_ty = Ty::Class { id: cls.clone(), args: vec![].into() };
     let instance_sym = Symbol::from("instance");
 
     let mut exprs: Vec<Expr> = Vec::new();
@@ -606,7 +606,7 @@ fn load_file_blob(id: i64, blob: &crate::dialect::FixtureFileBlob) -> Expr {
             Span::synthetic(),
             ExprNode::Const { path: vec![Symbol::from("ActiveStorage"), Symbol::from("FixtureSet")] },
         ),
-        Ty::Class { id: ClassId(Symbol::from("ActiveStorage::FixtureSet")), args: vec![] },
+        Ty::Class { id: ClassId(Symbol::from("ActiveStorage::FixtureSet")), args: vec![].into() },
     );
     with_ty(
         Expr::new(
@@ -796,7 +796,7 @@ fn rewrite_fixture_call(e: &Expr, fixture_names: &[Symbol]) -> Option<Expr> {
                 e.span,
                 ExprNode::Const { path: vec![Symbol::from(owner.as_str())] },
             ),
-            Ty::Class { id: owner_id.clone(), args: vec![] },
+            Ty::Class { id: owner_id.clone(), args: vec![].into() },
         )
     };
     // One argument → one record.
@@ -896,7 +896,7 @@ fn class_method(owner: &ClassId, name: Symbol, params: Vec<crate::dialect::Param
 fn build_raw_row_fixture_class(set: &crate::lower::fixtures::RawFixtureSet, wants_by_label: bool) -> LibraryClass {
     let owner_name = format!("{}Fixtures", camelize(set.name.as_str()));
     let owner_id = ClassId(Symbol::from(owner_name));
-    let class_ty = Ty::Class { id: set.class.clone(), args: vec![] };
+    let class_ty = Ty::Class { id: set.class.clone(), args: vec![].into() };
 
     // Rails' `Fixture#find` finds by the model's key columns of the row
     // the set inserted (`fixture.slice(*primary_key)`), so each accessor
@@ -906,7 +906,7 @@ fn build_raw_row_fixture_class(set: &crate::lower::fixtures::RawFixtureSet, want
         .map(|index| {
             let rows = with_ty(
                 Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from(FIXTURE_ROWS_IVAR) }),
-                Ty::Array { elem: Box::new(Ty::Untyped) },
+                Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
             );
             send(
                 Some(test_fixtures_const()),
@@ -1031,7 +1031,7 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
                         style: crate::expr::ArrayStyle::Brackets,
                     },
                 ),
-                Ty::Array { elem: Box::new(Ty::Str) },
+                Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
             );
             let rows = with_ty(
                 Expr::new(
@@ -1052,7 +1052,7 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
                         style: crate::expr::ArrayStyle::Brackets,
                     },
                 ),
-                Ty::Array { elem: Box::new(Ty::Untyped) },
+                Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
             );
             let mut args = vec![lit_str(set.table.as_str().to_string()), columns_hash, timestamps, rows];
             if set.rules == crate::lower::fixtures::FixtureRules::FasterFixtures {
@@ -1084,7 +1084,7 @@ fn build_raw_row_load_body(set: &crate::lower::fixtures::RawFixtureSet) -> Expr 
                         Some(test_fixtures_const()),
                         "insert_fixture_rows",
                         args,
-                        Ty::Array { elem: Box::new(Ty::Untyped) },
+                        Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
                     ),
                 },
             ));
@@ -1110,7 +1110,7 @@ fn test_fixtures_const() -> Expr {
 fn class_const(cls: &ClassId) -> Expr {
     with_ty(
         Expr::new(Span::synthetic(), ExprNode::Const { path: vec![cls.0.clone()] }),
-        Ty::Class { id: cls.clone(), args: vec![] },
+        Ty::Class { id: cls.clone(), args: vec![].into() },
     )
 }
 
@@ -1127,7 +1127,7 @@ fn send(recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
 fn hash_lit(entries: Vec<(Expr, Expr)>) -> Expr {
     with_ty(
         Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }),
-        Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) },
     )
 }
 
@@ -1214,7 +1214,7 @@ fn yaml_value_expr(v: &serde_yaml_ng::Value) -> Expr {
                     style: crate::expr::ArrayStyle::Brackets,
                 },
             ),
-            Ty::Array { elem: Box::new(Ty::Untyped) },
+            Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
         ),
         Y::Mapping(map) => hash_lit(map.iter().map(|(k, v)| (yaml_value_expr(k), yaml_value_expr(v))).collect()),
         Y::Tagged(t) => yaml_value_expr(&t.value),

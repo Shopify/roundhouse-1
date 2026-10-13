@@ -23,7 +23,7 @@ fn params_of(files: &[(&str, &str)], class: &str, method: &str) -> Vec<Ty> {
         .or_else(|| owner.methods.iter().find(|m| m.name.as_str() == method))
         .expect("method");
     let Some(Ty::Fn { params, .. }) = &def.signature else { panic!("typed: {:?}", def.signature) };
-    params.iter().map(|p| p.ty.clone()).collect()
+    params.iter().map(|p| (*p.ty).clone()).collect()
 }
 
 fn params_of_get(client: &str) -> Vec<Ty> {
@@ -41,8 +41,8 @@ fn params_of_get(client: &str) -> Vec<Ty> {
 fn caller_options_hash() -> Ty {
     let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
     Ty::Hash {
-        key: Box::new(Ty::Union { variants: vec![Ty::Sym, unknown()] }),
-        value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
+        key: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Sym, unknown()].into() }),
+        value: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Int, unknown()].into() }),
     }
 }
 

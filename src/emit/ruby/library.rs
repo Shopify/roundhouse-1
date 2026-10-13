@@ -20,6 +20,91 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+/// Base's shared methods return Base in the runtime sidecar. A concrete
+/// forwarder discards that ABI result and returns its own `self`, so the
+/// model type promised by analysis is also true with Spinel's RBS seeds.
+pub(super) fn preserve_record_receiver_returns(lcs: &mut [LibraryClass], app: &App) {
+    let templates = crate::runtime_src::parse_methods(
+        "def reload(options = nil)\n  super(options)\n  self\nend\ndef lock!(lock = true)\n  super(lock)\n  self\nend\n",
+    ).expect("receiver-return forwarders parse");
+    let classes: HashMap<ClassId, ()> = app.models.iter().map(|m| &m.name)
+        .chain(app.library_classes.iter().map(|lc| &lc.name))
+        .map(|id| (id.clone(), ())).collect();
+    for lc in lcs {
+        if !app.models.iter().any(|m| m.name == lc.name && app.schema.tables.contains_key(&m.table.0)) {
+            continue;
+        }
+        let self_ty = Ty::Class { id: lc.name.clone(), args: vec![].into() };
+        for template in &templates {
+            if lc.methods.iter().any(|m| m.name == template.name && m.receiver == MethodReceiver::Instance)
+                || record_return_overridden(app, &classes, &lc.name, template.name.as_str())
+            {
+                continue;
+            }
+            let mut method = template.clone();
+            method.name_span = Span::synthetic();
+            method.enclosing_class = Some(lc.name.0.clone());
+            method.body.ty = Some(self_ty.clone());
+            let params = method.params.iter().map(|p| crate::ty::Param {
+                name: p.name.clone(),
+                // `lock!` takes Rails' lock clause; `reload`'s options are open.
+                ty: if method.name.as_str() == "reload" {
+                    Ty::Untyped.into()
+                } else {
+                    Ty::Union { variants: vec![Ty::Bool, Ty::Str, Ty::Nil].into() }.into()
+                },
+                kind: crate::ty::ParamKind::Optional,
+            }).collect::<Vec<_>>().into();
+            method.signature = Some(Ty::Fn {
+                params,
+                ret: std::sync::Arc::new(self_ty.clone()),
+                block: None,
+                effects: crate::effect::EffectSet::default(),
+            });
+            lc.methods.push(method);
+        }
+    }
+}
+
+/// Source overrides, including those on ApplicationRecord or a mixin,
+/// may return a different object. Do not interpose a self-returning wrapper.
+fn record_return_overridden(app: &App, classes: &HashMap<ClassId, ()>, class: &ClassId, method: &str) -> bool {
+    let mut pending = vec![class.clone()];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) { continue; }
+        // Per-file ingest can retain a relative include. Resolve it in
+        // its owner's scope before looking for the concern's override.
+        let resolve = |written: &ClassId| crate::analyze::lexical_class(written, id.0.as_str(), classes)
+            .unwrap_or_else(|| written.clone());
+        let relevant = |m: &MethodDef| m.receiver == MethodReceiver::Instance
+            && (m.name.as_str() == method || (method == "lock!" && m.name.as_str() == "reload"));
+        if let Some(model) = app.models.iter().find(|m| m.name == id) {
+            if model.methods().any(relevant) { return true; }
+            // Parents are written relative to the subclass (`< Base` inside
+            // `module Admin`); resolve them the same way includes already are.
+            pending.extend(model.parent.iter().map(resolve));
+            for item in &model.body {
+                let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                if method.as_str() != "include" { continue; }
+                for arg in args {
+                    if let ExprNode::Const { path } = &*arg.node {
+                        let written = ClassId(Symbol::from(path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::")));
+                        pending.push(resolve(&written));
+                    }
+                }
+            }
+        }
+        if let Some(lc) = app.library_classes.iter().find(|lc| lc.name == id) {
+            if lc.methods.iter().any(relevant) { return true; }
+            pending.extend(lc.parent.iter().map(resolve));
+            pending.extend(lc.includes.iter().map(resolve));
+        }
+    }
+    false
+}
+
 /// Lower library classes for Ruby and emit their source/RBS file pairs, grouping
 /// nested declarations with their owners where possible. Lifted Data factories
 /// participate in lowering but emit inside their owner's constant declaration,
@@ -68,6 +153,10 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     crate::lower::sti_scope::push_type_condition_methods(&mut lcs, app);
     apply_scope_lowering(&mut lcs, app);
     crate::timings::lap("emit library: scope_lowering");
+    // ActiveJob payloads: the enqueue arm of each planned job's
+    // `perform_later`, and `to_gid_uri` beside `to_gid_param`.
+    // Ruby-family only, like the GlobalID runtime it writes through.
+    crate::lower::job_payload::apply_ruby(&mut lcs, app);
     apply_library_partial_render_lowering(&mut lcs, app);
     crate::timings::lap("emit library: partial_render");
     // The Attachment's readers on a content-type attachable (campfire's
@@ -115,7 +204,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     crate::timings::lap("emit library: hydration_nil");
     apply_nilsafe_empty_lowering(&mut lcs);
     crate::timings::lap("emit library: nilsafe_empty");
-    apply_time_format_lowering(&mut lcs);
+    apply_time_format_lowering(&mut lcs, app);
     crate::timings::lap("emit library: time_format");
     // Same rooting the view pipeline applies, for the same reason one
     // step over: a class nested in a namespace that SHADOWS what it
@@ -2324,7 +2413,7 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol, owner
                 .unwrap_or(params.len());
             params.insert(at, crate::ty::Param {
                 name: rel_param.clone(),
-                ty: Ty::Relation { of: owner.clone() },
+                ty: Ty::Relation { of: owner.clone() }.into(),
                 kind: crate::ty::ParamKind::Keyword { required: false },
             });
         }
@@ -2347,7 +2436,7 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol, owner
             at,
             crate::ty::Param {
                 name: rel_param.clone(),
-                ty: Ty::Untyped,
+                ty: Ty::Untyped.into(),
                 kind: crate::ty::ParamKind::Optional,
             },
         );
@@ -2401,6 +2490,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             crate::lower::attached::push_preload_scope_methods(&mut lc.methods, model);
             crate::lower::attachable::push_attachable_sgid(&mut lc.methods, model, &attachable);
             crate::lower::broadcasts::push_to_gid_param(&mut lc.methods, model);
+            crate::lower::job_payload::push_model_to_gid_uri(&mut lc.methods, model);
         }
     }
     drop(_span);
@@ -5411,6 +5501,15 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         declarations.entry(other.name.0.as_str()).or_default().push(other);
     }
     declarations.retain(|_, all| all.len() > 1);
+    // Instance-method names the app defines anywhere that collide with a
+    // framework view helper; only these need the ancestry lookup above.
+    let app_framework_helper_names: BTreeSet<String> = app
+        .models
+        .iter()
+        .flat_map(|m| m.methods().map(|d| d.name.as_str().to_string()).collect::<Vec<_>>())
+        .chain(app.library_classes.iter().flat_map(|c| c.methods.iter().map(|d| d.name.as_str().to_string())))
+        .filter(|n| is_framework_view_helper(n))
+        .collect();
     for lc in lcs.iter_mut() {
         // CONTROLLERS in the index provide `helper_method`s to views:
         // only the call-site rewrite applies to them — their methods
@@ -5506,6 +5605,31 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                         MethodReceiver::Class => own_class_side.insert(m.name.clone()),
                     };
                 }
+            }
+        }
+        // A framework-helper name the app defines on a SUPERCLASS or in an
+        // INCLUDED module (`ApplicationRecord#dom_class`, a concern's
+        // `number_to_currency`) is the same self-dispatch: qualifying it to
+        // `ViewHelpers` would call a different method than analysis kept.
+        // Resolved by the analyzer's own ancestry walk, PER SIDE: an
+        // instance method body is shadowed by inherited instance methods, a
+        // class-method body only by class-side ones (the class object
+        // cannot dispatch an instance method).
+        for class_side in [false, true] {
+            let inherited = app_framework_helper_names
+                .iter()
+                .filter(|n| {
+                    if class_side {
+                        crate::analyze::source_class_method(app, &lc.name, n)
+                    } else {
+                        crate::analyze::source_instance_method(app, &lc.name, n)
+                    }
+                })
+                .map(|n| Symbol::from(n.as_str()));
+            if class_side {
+                own_class_side.extend(inherited);
+            } else {
+                own_instance_side.extend(inherited);
             }
         }
         for m in &mut lc.methods {
@@ -6692,10 +6816,10 @@ fn rewrite_helper_calls(
                 // campfire's join form rendered `action="/join/"`.
                 if m == "params" {
                     expr.ty = Some(crate::ty::Ty::Hash {
-                        key: Box::new(crate::ty::Ty::Str),
-                        value: Box::new(crate::ty::Ty::Class {
+                        key: std::sync::Arc::new(crate::ty::Ty::Str),
+                        value: std::sync::Arc::new(crate::ty::Ty::Class {
                             id: ClassId(Symbol::from("Roundhouse::ParamValue")),
-                            args: vec![],
+                            args: vec![].into(),
                         }),
                     });
                 }
@@ -7461,9 +7585,6 @@ pub(crate) fn apply_duration_lowering(lcs: &mut [LibraryClass], app: &App) {
 pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
     let all_models: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
-    if all_models.is_empty() {
-        return;
-    }
     let slug_models = models_overriding_to_param(app);
     let assoc_targets = singular_association_targets(app);
     let collection_targets = collection_association_targets(app);
@@ -7826,7 +7947,7 @@ fn route_helper_param_types(
         };
         out.insert(
             f.name.as_str().to_string(),
-            params.iter().map(|p| p.ty.clone()).collect(),
+            params.iter().map(|p| (*p.ty).clone()).collect(),
         );
     }
     out
@@ -7941,12 +8062,19 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
     // Rails renders a record there with `to_param` too. The helper's
     // query key is typed to match (routes_to_library::query_param_demand
     // types a record-valued key `String` for a slug model, else `Integer`).
+    // An Integer under any other key (`page: page + 1`) goes through
+    // `to_s`, as `project_route_helper_ids` does in test bodies.
     if let ExprNode::Send { args, .. } = &mut *expr.node {
+        use crate::lower::controller_to_library::rewrites::{int_in_query_slot, to_s_of};
         if let Some(last) = args.last_mut() {
             if let ExprNode::Hash { entries, kwargs: true } = &mut *last.node {
-                for (_, v) in entries.iter_mut() {
+                for (k, v) in entries.iter_mut() {
                     if let Some(model) = arg_record_model(v, sig) {
                         project_record_arg(v, &model, sig, false);
+                    } else if int_in_query_slot(k, v) {
+                        let mut to_s = to_s_of(v.clone());
+                        to_s.ty = Some(Ty::Str);
+                        *v = to_s;
                     }
                 }
             }
@@ -8755,13 +8883,105 @@ fn widen_fk_zero_guards(expr: &mut Expr, fks: &BTreeSet<Symbol>) {
 /// Zero-arg receiver sends only. Ruby-emit-path pass: the module
 /// function it names is ruby-family runtime, so this must not run from
 /// shared `lower/`.
-pub(crate) fn apply_time_format_lowering(lcs: &mut [LibraryClass]) {
+pub(crate) fn apply_time_format_lowering(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         for m in &mut lc.methods {
             rewrite_rfc2822(&mut m.body);
             rewrite_time_parse(&mut m.body);
         }
     }
+    apply_zoned_json_time_lowering(lcs, app);
+}
+
+/// Every `JsonBuilder.encode_datetime` in `lcs` grounds to the app's
+/// zone (`rewrite_zoned_encode_datetime`) when that zone is not UTC; a
+/// no-op otherwise. Runs with the other time-format rewrites (models'
+/// `as_json` writers, controllers, html views) and on the lowered
+/// jbuilder views, which take no other ruby-family pass.
+pub(crate) fn apply_zoned_json_time_lowering(lcs: &mut [LibraryClass], app: &App) {
+    if !app_presents_time_zoned(app) {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        for m in &mut lc.methods {
+            rewrite_zoned_encode_datetime(&mut m.body);
+        }
+    }
+}
+
+/// Whether the app's `config.time_zone` makes Rails write a JSON
+/// timestamp with an offset rather than `Z`.
+///
+/// `TimeWithZone#xmlschema` writes `Z` only when the zone itself is UTC
+/// (its abbreviation is "UTC" or "UCT"): Rails' default, and the names
+/// below. Every other zone writes the offset it has AT THAT INSTANT —
+/// `Europe/Paris` is `+02:00` in October and `+01:00` in January, and
+/// `London` is `+00:00`, not `Z` — so the offset cannot be fixed here.
+/// Ingest lifts the zone into a `config_time_zone` method on the
+/// `Rails::Application` reopen; an app with none presents UTC.
+fn app_presents_time_zoned(app: &App) -> bool {
+    const UTC_ZONES: [&str; 8] =
+        ["UTC", "Etc/UTC", "Universal", "Etc/Universal", "Zulu", "Etc/Zulu", "UCT", "Etc/UCT"];
+    let Some(application) = &app.rails_application else { return false };
+    let Some(method) = application.methods.iter().find(|m| m.name.as_str() == "config_time_zone") else {
+        return false;
+    };
+    let lit = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => &method.body,
+    };
+    match &*lit.node {
+        ExprNode::Lit { value: Literal::Str { value } } => !UTC_ZONES.contains(&value.as_str()),
+        _ => false,
+    }
+}
+
+/// `JsonBuilder.encode_datetime(raw)` →
+/// `JsonBuilder.encode_value(ActiveSupport.json_time(raw))`, for an app
+/// whose `config.time_zone` is not UTC (`app_presents_time_zoned`).
+///
+/// The jbuilder lowerer and the default `as_json` writer serialize a
+/// datetime column through `encode_datetime`, a string reformat of the
+/// stored UTC text that always ends in `Z`. Rails presents the column
+/// as a `TimeWithZone` in the app's zone, so its JSON carries that
+/// zone's offset. `ActiveSupport.json_time` is the runtime seam that
+/// already renders it (`xmlschema(3)` of the hydrated value, which
+/// `parse_db_time` lands in the app's zone; DST-correct, because the
+/// offset is resolved per instant), and the one a model's own `as_json`
+/// writer uses (`PairEncoding::ZonedTime`).
+///
+/// Ruby-emit-path pass, like `rewrite_rfc2822`: `json_time` ships in
+/// the ruby-family trees (the CRuby/JRuby overlay and the spinel
+/// subset), not on the strict targets, whose runtimes present UTC, so
+/// the shared lowerer keeps emitting `encode_datetime`.
+fn rewrite_zoned_encode_datetime(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_zoned_encode_datetime(c));
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node else {
+        return;
+    };
+    if method.as_str() != "encode_datetime" || args.len() != 1 {
+        return;
+    }
+    if !matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "JsonBuilder") {
+        return;
+    }
+    let raw = args[0].clone();
+    let mut zoned = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
+            )),
+            method: Symbol::from("json_time"),
+            args: vec![raw],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    zoned.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
+    *method = Symbol::from("encode_value");
+    *args = vec![zoned];
 }
 
 // Not left as `Time.parse`: spinel ships no stdlib `time` (matz/spinel#1118), so it grounds like `rfc2822` above.
@@ -9782,6 +10002,20 @@ fn emit_library_class_decl_inner(
     let self_anchor = out_path.with_extension("").to_string_lossy().into_owned();
     let mut s = String::new();
 
+    let mut emitted_external_require = false;
+    for included in &lc.includes {
+        let detail = format!("{} includes unresolved {}", lc.name.0, included.0);
+        if external_include_is_enabled(&detail) {
+            for feature in super::expr::external_include_features(&detail) {
+                writeln!(s, "require {feature:?}").unwrap();
+                emitted_external_require = true;
+            }
+        }
+    }
+    if emitted_external_require {
+        writeln!(s).unwrap();
+    }
+
     // A constant whose initializer runs this class's own methods at load
     // time (see `partition_deferred_constants`) drags those method
     // bodies' constant refs into LOAD time with it — `Sound::BUILTIN`
@@ -10406,7 +10640,7 @@ fn emit_library_class_decl_inner(
     let replayed: Vec<&Expr> = if railtie || is_application_reopen(lc) || replays_foreign_class_body(lc, app) {
         lc.unknown_calls
             .iter()
-            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
+            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c) && !is_preserved_external_include(c))
             .collect()
     } else {
         for call in dropped_class_body_calls(lc, app) {
@@ -11250,6 +11484,9 @@ fn emit_library_class_decl_inner(
             write_library_method(&mut s, lc, index, &body_pad, &instance_form);
         }
     }
+    if !replayed.is_empty() && !lc.methods.is_empty() {
+        writeln!(s).unwrap();
+    }
 
     for (_, inc) in positioned.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
@@ -11651,17 +11888,47 @@ fn hooked_mixin_position(lc: &LibraryClass, inc: &ClassId, app: &App, hook: &str
     let base = hook.params[0].name.clone();
     let mut called: Vec<Symbol> = Vec::new();
     let mut named: Vec<Symbol> = Vec::new();
+    /// Methods a call on `base` looks up by name, so the method must
+    /// already exist: the symbol arguments are the names looked up
+    /// (`alias_method`'s second argument is the existing one). A call that
+    /// defines its argument (`attr_accessor :x`, `validates :x`, `delegate
+    /// :x`) names no method the class must have defined first: moving the
+    /// include after a later `def x` would let the hook's definition
+    /// clobber the class's own.
+    fn looked_up(method: &str, args: &[Expr]) -> Vec<Symbol> {
+        let syms = |args: &[Expr]| -> Vec<Symbol> {
+            args.iter()
+                .filter_map(|arg| match &*arg.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        match method {
+            "alias_method" => args.get(1).map(|a| syms(std::slice::from_ref(a))).unwrap_or_default(),
+            "instance_method" | "method_defined?" | "public_method_defined?" | "private_method_defined?"
+            | "protected_method_defined?" | "remove_method" | "undef_method" | "public" | "private"
+            | "protected" | "module_function" | "public_instance_method" => syms(args),
+            _ => Vec::new(),
+        }
+    }
     fn walk(e: &Expr, base: &Symbol, called: &mut Vec<Symbol>, named: &mut Vec<Symbol>) {
         if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
             if matches!(&*r.node, ExprNode::Var { name, .. } if name == base) {
                 if !called.contains(method) {
                     called.push(method.clone());
                 }
-                for arg in args {
-                    if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
-                        if !named.contains(value) {
-                            named.push(value.clone());
-                        }
+                // `base.send(:alias_method, :a, :b)` is `base.alias_method :a, :b`.
+                let forwarded = matches!(method.as_str(), "send" | "public_send" | "__send__");
+                let lookup = match args.first().map(|a| &*a.node) {
+                    Some(ExprNode::Lit { value: Literal::Sym { value } }) if forwarded => {
+                        looked_up(value.as_str(), &args[1..])
+                    }
+                    _ => looked_up(method.as_str(), args),
+                };
+                for name in lookup {
+                    if !named.contains(&name) {
+                        named.push(name);
                     }
                 }
             }
@@ -16198,6 +16465,8 @@ pub(crate) fn dropped_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> V
         .filter(|call| {
             !own.iter().any(|c| std::ptr::eq(*c, *call))
                 && !crate::analyze::is_include_refusal(call)
+                && !is_preserved_external_include(call)
+                && !crate::lower::job_payload::modelled_class_body_call(app, lc, call)
                 && !carried_block(call)
                 && !modelled_elsewhere(lc, call)
                 && !written_pair(call)
@@ -16270,6 +16539,27 @@ fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
         );
     }
     crate::emit::diagnostics::push(diagnostic);
+}
+
+fn is_preserved_external_include(call: &Expr) -> bool {
+    matches!(
+        &call.diagnostic,
+        Some(crate::diagnostic::DiagnosticKind::Unsupported {
+            construct,
+            detail,
+            ..
+        }) if construct.as_str() == "include"
+            && external_include_is_enabled(detail)
+            && !super::expr::external_include_features(detail).is_empty()
+    )
+}
+
+fn external_include_is_enabled(detail: &str) -> bool {
+    let Some(module) = detail.split(" includes unresolved ").nth(1) else {
+        return false;
+    };
+    let namespace = module.split("::").next().unwrap_or(module);
+    super::expr::external_gem_namespace_is_enabled(namespace)
 }
 
 /// Is this name one of the app's own CLASSES (not a module)? Namespace
@@ -17064,7 +17354,7 @@ fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
     if written.starts_with("::") {
         return parent.clone();
     }
-    let defined = |candidate: &str| is_model_or_library_class(candidate, app);
+    let defined = |candidate: &str| is_model_or_library_class(candidate, app) || is_controller_named(candidate, app);
     let mut scope: Vec<&str> = child.split("::").collect();
     scope.pop();
     while !scope.is_empty() {
@@ -17265,13 +17555,22 @@ fn require_path_for_body_const(
     // `Sound::Image` lives at app/models/sound/image.rb even though the
     // reference's first segment is `Sound`. Resolve the full path before
     // the self-reference short-circuit below.
+    // A value constant (`Shop::Types::LABEL`) lives in the file of the
+    // longest prefix that is a class or module (`Shop::Types`), which
+    // neither the whole path nor its first segment (`Shop`, a bare
+    // namespace) names.
     let joined = path.join("::");
-    if joined != self_name && is_model_or_library_class(&joined, app) {
+    let holder = (1..=path.len())
+        .rev()
+        .map(|n| path[..n].join("::"))
+        .find(|prefix| prefix.contains("::") && is_model_or_library_class(prefix, app))
+        .unwrap_or_else(|| joined.clone());
+    if holder != self_name && is_model_or_library_class(&holder, app) {
         // The file that DEFINES it, which for a nested class is its
         // parent's — and when that is the file being emitted, there is
         // nothing to require: the class is already in it.
-        let owner = file_owner(&joined, app);
-        if owner == self_name || (owner == joined && autoloads_as_nested_subclass(&joined, self_name, app)) {
+        let owner = file_owner(&holder, app);
+        if owner == self_name || (owner == holder && autoloads_as_nested_subclass(&holder, self_name, app)) {
             return None;
         }
         return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
@@ -18723,13 +19022,14 @@ fn expr_mentions_includes(expr: &Expr) -> bool {
 
 /// One preloadable association, resolved against the app's model set.
 enum PreloadKind {
-    /// (fk column on the owner, target class, target table)
-    BelongsTo { fk: String, target: String, table: String },
+    /// (fk column on the owner, target class, target table, the `Db`
+    /// helper that renders the target's key list for `IN (...)`)
+    BelongsTo { fk: String, target: String, table: String, key_list: &'static str },
     /// (fk column on the target, target class)
-    HasMany { fk: String, target: String },
+    HasMany { fk: String, owner_key: String, target: String },
     /// `has_one` — same FK-on-target batch as has_many, installing one
     /// record (or nil) per owner through the single-record preload setter.
-    HasOne { fk: String, target: String },
+    HasOne { fk: String, owner_key: String, target: String },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -18762,17 +19062,39 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
     let mut out = Vec::new();
     for assoc in model.associations() {
+        // A refused association (`assoc_primary_key`) has no reader to
+        // preload into.
+        if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+            continue;
+        }
         match assoc {
             Association::BelongsTo { name, target, foreign_key, .. } => {
                 let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
                     continue;
                 };
+                // A uuid / string key is a quoted literal in `IN (...)`;
+                // the integer helper would `to_i` it to its leading
+                // digits and find nothing (cf. #310 for `Relation#ids`).
+                let string_key = app
+                    .schema
+                    .tables
+                    .get(&target_model.table.0)
+                    .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+                    .is_some_and(|c| {
+                        matches!(
+                            c.col_type,
+                            crate::schema::ColumnType::Uuid
+                                | crate::schema::ColumnType::String { .. }
+                                | crate::schema::ColumnType::Text
+                        )
+                    });
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::BelongsTo {
                         fk: foreign_key.as_str().to_string(),
                         target: target.0.as_str().to_string(),
                         table: target_model.table.0.as_str().to_string(),
+                        key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
                     },
                 ));
             }
@@ -18790,6 +19112,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     name.as_str().to_string(),
                     PreloadKind::HasMany {
                         fk: foreign_key.as_str().to_string(),
+                        owner_key: assoc.owner_key().as_str().to_string(),
                         target: target.0.as_str().to_string(),
                     },
                 ));
@@ -18808,6 +19131,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     name.as_str().to_string(),
                     PreloadKind::HasOne {
                         fk: foreign_key.as_str().to_string(),
+                        owner_key: assoc.owner_key().as_str().to_string(),
                         target: target.0.as_str().to_string(),
                     },
                 ));
@@ -18914,6 +19238,18 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     out
 }
 
+/// The statements gathering the owners' keys into `ids` for a batch
+/// preload. `id` is never nil; any other `primary_key:` column can be,
+/// and a nil key matches no child (Rails skips it too), so it is
+/// skipped rather than sent as `IS NULL`.
+fn collect_owner_keys(owner_key: &str) -> String {
+    if owner_key == "id" {
+        "    ids << r.id".to_string()
+    } else {
+        format!("    v = r.{owner_key}\n    ids << v unless v.nil?")
+    }
+}
+
 /// Extract the string literal from an assoc-scope lambda body of the
 /// exact shape `order("...")` (lobsters `has_many :tags, -> { order
 ///('tags.is_media desc, tags.tag') }, through: :taggings`).
@@ -18941,7 +19277,7 @@ fn preload_methods_source(model: &crate::dialect::Model, app: &App, subclass_vie
     // Batch loaders + belongs_to cache setters.
     for (name, kind) in &targets {
         match kind {
-            PreloadKind::BelongsTo { fk, target, table } => {
+            PreloadKind::BelongsTo { fk, target, table, key_list } => {
                 let _ = write!(
                     src,
                     r#"
@@ -18954,7 +19290,7 @@ def self._preload_batch_{name}(records)
   ids.uniq!
   by_id = {{}}
   if ids.length > 0
-    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.id IN (" + Db.escape_int_list(ids) + ")").each do |rec|
+    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.id IN (" + Db.{key_list}(ids) + ")").each do |rec|
       by_id[rec.id] = rec
     end
   end
@@ -18972,14 +19308,15 @@ end
 "#
                 );
             }
-            PreloadKind::HasMany { fk, target } => {
+            PreloadKind::HasMany { fk, owner_key, target } => {
+                let collect_keys = collect_owner_keys(owner_key);
                 let _ = write!(
                     src,
                     r#"
 def self._preload_batch_{name}(records)
   ids = []
   records.each do |r|
-    ids << r.id
+{collect_keys}
   end
   loaded = []
   if ids.length > 0
@@ -18992,21 +19329,22 @@ def self._preload_batch_{name}(records)
     grouped[k] << rec
   end
   records.each do |r|
-    r._preload_{name}(grouped[r.id] || [])
+    r._preload_{name}(grouped[r.{owner_key}] || [])
   end
   loaded
 end
 "#
                 );
             }
-            PreloadKind::HasOne { fk, target } => {
+            PreloadKind::HasOne { fk, owner_key, target } => {
+                let collect_keys = collect_owner_keys(owner_key);
                 let _ = write!(
                     src,
                     r#"
 def self._preload_batch_{name}(records)
   ids = []
   records.each do |r|
-    ids << r.id
+{collect_keys}
   end
   by_id = {{}}
   loaded = []
@@ -19018,7 +19356,7 @@ def self._preload_batch_{name}(records)
     by_id[k] = rec if by_id[k].nil?
   end
   records.each do |r|
-    r._preload_{name}(by_id[r.id])
+    r._preload_{name}(by_id[r.{owner_key}])
   end
   loaded
 end
@@ -19472,11 +19810,11 @@ mod insert_rel_param_tests {
         let sig = Ty::Fn {
             params: vec![crate::ty::Param {
                 name: Symbol::from("tags"),
-                ty: Ty::Untyped,
+                ty: Ty::Untyped.into(),
                 kind: ParamKind::Rest,
-            }],
+            }].into(),
             block: None,
-            ret: Box::new(Ty::Untyped),
+            ret: std::sync::Arc::new(Ty::Untyped),
             effects: crate::effect::EffectSet::pure(),
         };
         let mut m = bare_method(params, Some(sig));
@@ -19493,7 +19831,7 @@ mod insert_rel_param_tests {
         };
         let rel_ty_param = params.iter().find(|p| p.name == rel_param).expect("__rel in signature");
         assert_eq!(rel_ty_param.kind, ParamKind::Keyword { required: false });
-        assert_eq!(rel_ty_param.ty, Ty::Relation { of: owner });
+        assert_eq!(*rel_ty_param.ty, Ty::Relation { of: owner });
     }
 
     /// The untouched case: no rest param, `__rel` stays exactly what it
@@ -19507,11 +19845,11 @@ mod insert_rel_param_tests {
         let sig = Ty::Fn {
             params: vec![crate::ty::Param {
                 name: Symbol::from("user"),
-                ty: Ty::Untyped,
+                ty: Ty::Untyped.into(),
                 kind: ParamKind::Required,
-            }],
+            }].into(),
             block: None,
-            ret: Box::new(Ty::Untyped),
+            ret: std::sync::Arc::new(Ty::Untyped),
             effects: crate::effect::EffectSet::pure(),
         };
         let mut m = bare_method(params, Some(sig));
@@ -19527,7 +19865,7 @@ mod insert_rel_param_tests {
         };
         let rel_ty_param = params.iter().find(|p| p.name == rel_param).expect("__rel in signature");
         assert_eq!(rel_ty_param.kind, ParamKind::Optional);
-        assert_eq!(rel_ty_param.ty, Ty::Untyped, "unchanged: still Untyped, not Relation");
+        assert_eq!(*rel_ty_param.ty, Ty::Untyped, "unchanged: still Untyped, not Relation");
     }
 
     /// `def f(*tags, **opts)`: no keyword may follow `**opts`, so `__rel:`
@@ -19539,11 +19877,11 @@ mod insert_rel_param_tests {
         let params = vec![Param::rest(Symbol::from("tags")), kwrest];
         let sig = Ty::Fn {
             params: vec![
-                crate::ty::Param { name: Symbol::from("tags"), ty: Ty::Untyped, kind: ParamKind::Rest },
-                crate::ty::Param { name: Symbol::from("opts"), ty: Ty::Untyped, kind: ParamKind::KeywordRest },
-            ],
+                crate::ty::Param { name: Symbol::from("tags"), ty: Ty::Untyped.into(), kind: ParamKind::Rest },
+                crate::ty::Param { name: Symbol::from("opts"), ty: Ty::Untyped.into(), kind: ParamKind::KeywordRest },
+            ].into(),
             block: None,
-            ret: Box::new(Ty::Untyped),
+            ret: std::sync::Arc::new(Ty::Untyped),
             effects: crate::effect::EffectSet::pure(),
         };
         let mut m = bare_method(params, Some(sig));

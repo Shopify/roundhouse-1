@@ -410,10 +410,9 @@ fn unique_key_gap(file: &str, table: &str, seg: &str) -> IngestError {
 
 /// A comma-separated entry inside `CREATE TABLE (...)` that is a
 /// table-level constraint rather than a column definition. The keyword
-/// is a whole word: Postgres dumps column names unquoted, and Core's
-/// `checkout_id`, `unique_id` and `excluded_from_rbac_migration` (58
-/// columns) were read as `CHECK`/`UNIQUE`/`EXCLUDE` constraints and
-/// dropped.
+/// is a whole word: Postgres dumps column names unquoted, and columns
+/// named `checkout_id`, `unique_id` or `excluded_flag` were read as
+/// `CHECK`/`UNIQUE`/`EXCLUDE` constraints and dropped.
 fn is_table_level_constraint(seg: &str) -> bool {
     const KW: &[&str] = &["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "CHECK", "EXCLUDE", "FOREIGN KEY"];
     KW.iter().any(|k| {
@@ -1827,6 +1826,7 @@ mod tests {
         assert!(!is_table_level_constraint("checkout_id bigint"));
         assert!(!is_table_level_constraint("unique_id character varying(255) NOT NULL"));
         assert!(!is_table_level_constraint("excluded_from_rbac_migration boolean"));
+        assert!(!is_table_level_constraint("excluded_flag boolean"));
         assert!(!is_table_level_constraint("constraints jsonb"));
         assert!(is_table_level_constraint("CHECK ((amount > 0))"));
         assert!(is_table_level_constraint("CHECK(amount > 0)"));

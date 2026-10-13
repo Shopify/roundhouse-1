@@ -150,6 +150,18 @@ impl Analyzer {
                 for scope_item in model.scopes() {
                     self.collect_send_sites(&scope_item.body, Some(&model.name), MethodReceiver::Class, helpers, out);
                 }
+                // A block-form lifecycle hook (`after_create_commit -> {
+                // room.receive(self) }`) is a method body that only becomes
+                // a method at lowering, so its calls were never sites: the
+                // callee's parameters stayed untyped. campfire's
+                // `Room#receive(message)` was, and through it the message
+                // `Room::PushMessageJob` is enqueued with.
+                for item in model.body.iter() {
+                    let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+                    if let Some(body) = super::block_callback_body(expr) {
+                        self.collect_send_sites(body, Some(&model.name), MethodReceiver::Instance, helpers, out);
+                    }
+                }
             }
             Unit::Library(i, _) => {
                 let lc = &app.library_classes[*i];

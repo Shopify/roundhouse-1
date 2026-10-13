@@ -843,8 +843,9 @@ fn strip_format_kwarg(arg: &Expr) -> Option<Expr> {
 /// expects ONE kwargs hash, not multiple.
 /// `ActionController::JsonRender.encode(<value>)` — the runtime JSON
 /// encoder behind inline `render json: <expr>` whose value neither
-/// `as_json_poro` nor the primitive-collection path handles. CRuby answers it via
-/// the overlay (as_json-aware recursive encode); a strict target whose
+/// `as_json_poro` nor the primitive-collection path handles. The ruby family
+/// answers it via runtime/spinel/action_controller_json_render.rb
+/// (as_json-aware recursive encode); a strict target whose
 /// app reaches this call surfaces an unresolved-constant gap loudly
 /// rather than silently rendering html.
 /// `ActionView::ViewHelpers.html_escape(<body>)` — the `render html:`
@@ -1140,6 +1141,12 @@ pub(super) fn rewrite_assoc_through_parent_typed(
         let ExprNode::Ivar { name: parent_name } = &*inner_recv.node else {
             return None;
         };
+        // The foreign key below comes from the ivar's name and the
+        // parent's value from `.id`; an association keyed on another
+        // owner column (`primary_key:`) needs the declaration instead.
+        if params_specs.is_keyed_assoc(assoc_method) {
+            return None;
+        }
         let model_class = crate::naming::singularize_camelize(assoc_method.as_str());
         let fk = format!("{}_id", parent_name.as_str());
         Some(match kind {
@@ -1716,6 +1723,14 @@ pub(super) fn rewrite_update_to_typed_variant(
             return None;
         }
         let spec = match_params_helper(&args[0], &helper_specs, params_specs)?;
+        // The variant exists only on the model the resource is named
+        // after. With none (a record wrapped under another key), the
+        // call stays Rails' `update` / `update!`; once the body is typed,
+        // `params::hand_update_the_attrs` gives it the attribute Hash
+        // when the argument turns out to be the params object (#856).
+        if !params_specs.has_typed_update(spec) {
+            return None;
+        }
         Some(Expr::new(
             e.span,
             ExprNode::Send {
@@ -2737,7 +2752,7 @@ fn project_arg(a: &Expr) -> Expr {
 /// An Integer-typed value under a query key the helper types
 /// `String?` — every key but `id` / `*_id` (Integer segments) and
 /// `format`.
-fn int_in_query_slot(k: &Expr, v: &Expr) -> bool {
+pub(crate) fn int_in_query_slot(k: &Expr, v: &Expr) -> bool {
     let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
         return false;
     };
@@ -2765,7 +2780,7 @@ fn arg_carries_a_model(a: &Expr) -> bool {
     }
 }
 
-fn to_s_of(a: Expr) -> Expr {
+pub(crate) fn to_s_of(a: Expr) -> Expr {
     Expr::new(
         a.span,
         ExprNode::Send {
@@ -2832,7 +2847,7 @@ pub(crate) fn typed_exception_const(segments: &[&str], span: Span) -> Expr {
     let mut expr = const_path(segments, span);
     expr.ty = Some(crate::ty::Ty::Class {
         id: crate::ident::ClassId(Symbol::from(name)),
-        args: vec![],
+        args: vec![].into(),
     });
     expr
 }

@@ -45,7 +45,7 @@ fn rewrite(expr: &mut Expr, models: &crate::det::HashSet<String>) {
         if !models.contains(&name) {
             continue;
         }
-        let ty = Ty::Class { id: ClassId(Symbol::from(name.as_str())), args: vec![] };
+        let ty = Ty::Class { id: ClassId(Symbol::from(name.as_str())), args: vec![].into() };
         substitute(&mut arm.body, scrutinee, &ty);
     }
 }

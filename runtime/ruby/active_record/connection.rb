@@ -197,6 +197,25 @@ module ActiveRecord
     end
   end
 
+  # The edges of `Model.transaction`, for work that has to wait for the
+  # COMMIT. No-ops here, so this file stays self-contained; the
+  # Ruby-family job registry (runtime/job_registry.rb) redefines them to
+  # hold the ActiveJob payloads of jobs that set
+  # `enqueue_after_transaction_commit`, and a later definition wins.
+  module TransactionHooks
+    def self.began
+      nil
+    end
+
+    def self.committed
+      nil
+    end
+
+    def self.rolled_back
+      nil
+    end
+  end
+
   # attribute_registration.rb's `decorate_attributes` block, bound to the
   # attribute it decorates: the `(name, cast_type)` block as the
   # `call(cast_type)` a declared-type decoration answers.
@@ -544,16 +563,16 @@ module ActiveRecord
     # models override `_exists_primary_key_input` with schema-selected
     # dispatch (same split as find) so Spinel never compiles String into
     # an Integer adapter slot. No argument asks for any row (Rails'
-    # `exists?(conditions = :none)`); the default is a private sentinel so
-    # the typed signature does not widen.
-    def self.exists?(id = EXISTS_ANY_ROW)
+    # `exists?(conditions = :none)`); the optional argument is a splat
+    # so "absent" and `nil` stay distinct without an untyped default.
+    def self.exists?(*ids)
+      return all.exists? if ids.empty?
+      raise ArgumentError, "wrong number of arguments (given #{ids.length}, expected 0..1)" if ids.length > 1
+      id = ids[0]
       return false if id.nil?
-      return all.exists? if EXISTS_ANY_ROW.equal?(id)
       return all.exists?(id) if _scoped_reads?
       _exists_primary_key_input(id)
     end
-    EXISTS_ANY_ROW = Object.new.freeze
-    private_constant :EXISTS_ANY_ROW
 
     # Fallback for hand-written subclasses using the generic adapter.
     def self._exists_primary_key_input(id)
@@ -724,6 +743,9 @@ module ActiveRecord
     # `raise ActiveRecord::Rollback` inside the block rolls the
     # transaction back without the exception escaping, and the call
     # answers nil.
+    #
+    # The outermost transaction's edges are reported to
+    # `TransactionHooks` (above). A nested block reports nothing.
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
       depth = Db._txn_depth
       if depth > 0
@@ -767,6 +789,7 @@ module ActiveRecord
         end
       else
         Db.exec("BEGIN")
+        ActiveRecord::TransactionHooks.began
         Db._txn_depth = 1
         rolled_back = false
         begin
@@ -777,6 +800,7 @@ module ActiveRecord
             rolled_back = true
             Db._txn_depth = 0
             Db.exec("ROLLBACK")
+            ActiveRecord::TransactionHooks.rolled_back
             result = nil
           rescue Exception => e
             rolled_back = true
@@ -789,6 +813,7 @@ module ActiveRecord
               # transaction, not just the statement, does this) — the
               # ROLLBACK's own failure must not hide the real error below.
             end
+            ActiveRecord::TransactionHooks.rolled_back
             raise e
           end
         ensure
@@ -796,7 +821,21 @@ module ActiveRecord
             nil
           else
             Db._txn_depth = 0
-            Db.exec("COMMIT")
+            begin
+              Db.exec("COMMIT")
+            rescue Exception => e
+              # A failed COMMIT (SQLITE_BUSY, a deferred constraint) leaves
+              # the transaction open: end it, and tell the hooks it rolled
+              # back so nothing held for it is queued by a later COMMIT.
+              begin
+                Db.exec("ROLLBACK")
+              rescue StandardError
+                # Already ended; the COMMIT's error is the one to raise.
+              end
+              ActiveRecord::TransactionHooks.rolled_back
+              raise e
+            end
+            ActiveRecord::TransactionHooks.committed
           end
         end
       end

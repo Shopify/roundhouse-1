@@ -36,10 +36,9 @@
 //! ## The encoder, monomorphized
 //!
 //! `as_json` answers the Hash; something still has to turn it into
-//! text. The CRuby overlay's `ActionController::JsonRender.encode` walks
+//! text. The runtime's `ActionController::JsonRender.encode` walks
 //! that Hash reflectively (`respond_to?(:as_json)`, `case value when
-//! Hash …`), which no strict target can bind — on the spinel tree the
-//! constant is unresolved and every `POST /unfurl_links` is a 500.
+//! Hash …`), which no strict target can bind.
 //!
 //! The key set is known here, so the text is written down too: the same
 //! readers become an `as_json_str` writer ([`super::as_json_writer`],
@@ -67,7 +66,7 @@
 //! `Relation[Story]`) is a JSON array of each record's text.
 //!
 //! Primitive-only Hash/Array values use JSON.generate in the controller
-//! rewrite. What keeps the runtime encoder, CRuby-only as before: a
+//! rewrite. What keeps the runtime encoder (ruby family only): a
 //! collection containing objects or temporal values, an untyped value, and a model whose
 //! `as_json` is outside the two idioms or has a value with no encoding
 //! here (a nested record, a Hash).
@@ -131,12 +130,16 @@ pub fn apply_as_json_synthesis(app: &mut App, registry: &HashMap<ClassId, ClassI
             written.insert(model.name.clone());
             continue;
         }
-        // A TABLE-backed record without its own `as_json` serializes
-        // its columns in Rails (`serializable_hash`), not its
-        // `attr_accessor`s — a different answer this path does not
-        // write. The declared-readers writer is for the tableless class
-        // (`Opengraph::Metadata`); a record keeps the runtime encoder.
-        if app.schema.tables.contains_key(&model.table.0) {
+        // Not the declared readers below: a table-backed record serializes its columns (`serializable_hash`), not its `attr_accessor`s.
+        if let Some(table) = app.schema.tables.get(&model.table.0) {
+            if let Ok(writer) = super::as_json_record::column_writer(model, table, registry) {
+                model.body.push(ModelBodyItem::Method {
+                    method: writer,
+                    leading_comments: Vec::new(),
+                    leading_blank_line: true,
+                });
+                written.insert(model.name.clone());
+            }
             continue;
         }
         // The `attr_*` family, splat expanded — the SAME list the
@@ -301,7 +304,7 @@ fn collection_text(value: &Expr, id: &ClassId) -> Expr {
     let item = Symbol::from("record");
     let item_ref = with_ty(
         Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() }),
-        Ty::Class { id: id.clone(), args: vec![] },
+        Ty::Class { id: id.clone(), args: vec![].into() },
     );
     let block = Expr::new(
         span,
@@ -328,7 +331,7 @@ fn collection_text(value: &Expr, id: &ClassId) -> Expr {
             ty,
         )
     };
-    let mapped = send(value.clone(), "map", vec![], Some(block), Ty::Array { elem: Box::new(Ty::Str) });
+    let mapped = send(value.clone(), "map", vec![], Some(block), Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
     let joined = send(mapped, "join", vec![str_lit(",")], None, Ty::Str);
     let open = send(str_lit("["), "+", vec![joined], None, Ty::Str);
     send(open, "+", vec![str_lit("]")], None, Ty::Str)
@@ -387,7 +390,7 @@ fn declared_as_json_writer(
 }
 
 /// The encoder a value of type `ty` takes, when there is one.
-fn encoding_for(ty: &Ty) -> Result<PairEncoding, ShapeError> {
+pub(super) fn encoding_for(ty: &Ty) -> Result<PairEncoding, ShapeError> {
     fn scalar(ty: &Ty) -> bool {
         match ty {
             Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,

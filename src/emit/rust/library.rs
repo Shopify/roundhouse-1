@@ -515,7 +515,7 @@ fn collect_class_method_param_tys(
             Some(Ty::Fn { params, .. }) => params
                 .iter()
                 .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-                .map(|p| p.ty.clone())
+                .map(|p| (*p.ty).clone())
                 .collect(),
             _ => continue,
         };
@@ -598,7 +598,7 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
                 t
             }
             Some(t) => Ty::Union {
-                variants: vec![Ty::Nil, t],
+                variants: vec![Ty::Nil, t].into(),
             },
             // Nil-only ivar (e.g. `@location = nil` with no other
             // assignments visible in the class body) — widen to
@@ -606,7 +606,7 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
             // value-typed payload without an E0308. Without widening
             // the field types as `()` and every other path fails.
             None => Ty::Union {
-                variants: vec![Ty::Nil, Ty::Untyped],
+                variants: vec![Ty::Nil, Ty::Untyped].into(),
             },
         }
     } else {
@@ -692,7 +692,7 @@ fn walk_collect_ivars(
                 record(
                     name.as_str(),
                     Ty::Array {
-                        elem: Box::new(elem),
+                        elem: std::sync::Arc::new(elem),
                     },
                     order,
                     observed,
@@ -716,8 +716,8 @@ fn walk_collect_ivars(
                     record(
                         key,
                         Ty::Hash {
-                            key: Box::new(k_ty),
-                            value: Box::new(v_ty),
+                            key: std::sync::Arc::new(k_ty),
+                            value: std::sync::Arc::new(v_ty),
                         },
                         order,
                         observed,

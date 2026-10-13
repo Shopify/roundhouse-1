@@ -32,3 +32,24 @@ fn has_attribute_resolves_on_a_model() {
     assert!(!errors.iter().any(|e| e.contains("has_attribute?")), "{errors:?}");
     assert!(!errors.iter().any(|e| e.contains("`association`")), "{errors:?}");
 }
+
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
+/// The emitted program answers `has_attribute?` from the schema.
+#[test]
+fn has_attribute_runs_on_a_model() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  #: (Article) -> bool\n  def same_title_column?(other)\n    other.has_attribute?(:title) && has_attribute?(:title)\n  end\n\n  #: -> bool\n  def knows_missing? = has_attribute?(:no_such_column)\n\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Probe", body: "A body long enough to pass.")
+raise "known column not found" unless article.same_title_column?(article)
+raise "missing column found" if article.knows_missing?
+"#,
+        )
+        .assert_passes();
+}

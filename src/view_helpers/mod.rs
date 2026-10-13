@@ -50,6 +50,9 @@ pub(crate) fn is_marker_include(path: &[&str]) -> bool {
 /// (`time_ago_in_words_label` calls both bare).
 pub(crate) const QUALIFIED: &[&str] = &[
     "image_tag",
+    // `include ActionView::RecordIdentifier` brings `dom_id` (below)
+    // and its sibling `dom_class` into non-view classes.
+    "dom_class",
     "image_path",
     // The general asset helper beside the image one — same
     // body, and campfire asks it for an mp3.

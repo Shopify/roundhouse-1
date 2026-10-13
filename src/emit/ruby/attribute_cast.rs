@@ -210,12 +210,12 @@ fn nil_unsaved_id(lc: &mut LibraryClass, model: &Model, table: &Table) {
         if !matches!(&*m.body.node, ExprNode::Ivar { name } if *name == slot) {
             continue;
         }
-        let nilable = |t: Ty| Ty::Union { variants: vec![t, Ty::Nil] };
+        let nilable = |t: Ty| Ty::Union { variants: vec![t, Ty::Nil].into() };
         let ty = m.body.ty.clone().map(nilable);
         m.body = id_value(col);
         m.body.ty = ty;
         if let Some(Ty::Fn { ret, .. }) = &mut m.signature {
-            **ret = nilable((**ret).clone());
+            *ret = std::sync::Arc::new(nilable((**ret).clone()));
         }
     }
 }
@@ -234,7 +234,7 @@ fn nil_unsaved_param(lc: &mut LibraryClass) {
             continue;
         }
         let id = || send(self_ref(), "id", vec![]);
-        let ty = m.body.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil] });
+        let ty = m.body.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil].into() });
         m.body = sp(ExprNode::If {
             cond: send(id(), "nil?", vec![]),
             then_branch: lit(Literal::Nil),
@@ -516,7 +516,7 @@ fn raw_row_values(lc: &mut LibraryClass, cols: &[(&Column, Kind)]) {
                 (ColumnType::Decimal { .. }, _) => *value = lookup,
                 (_, Kind::Time) => {
                     let mut text = send(konst("ActiveSupport"), "format_db_time", vec![lookup]);
-                    text.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil] });
+                    text.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
                     *value = text;
                 }
                 _ => {}

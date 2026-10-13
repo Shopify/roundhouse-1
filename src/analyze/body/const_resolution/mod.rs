@@ -4,6 +4,8 @@
 //! Roundhouse retains source-position answers and keys inferred values
 //! by Rubydex declaration IDs.
 
+mod hoist;
+
 use std::collections::hash_map::Entry;
 use crate::det::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -25,6 +27,7 @@ use rubydex::resolution::Resolver;
 use crate::ident::{ClassId, Symbol};
 use crate::span::{FileId, SourceFile, Span};
 use crate::ty::Ty;
+use hoist::{hoisted_name, nested_namespaces_index, runtime_value_types};
 
 // Rubydex's minimal built-ins stop at Object/Module/Class. Ruby's own
 // signatures (`rbs/`, `crate::stdlib_rbs`) declare the rest of the core
@@ -431,23 +434,6 @@ fn is_runtime_only(graph: &Graph, declaration: &Declaration) -> bool {
         })
 }
 
-/// The name a declaration answers to once ingest has hoisted it.
-///
-/// Rubydex names what `class << self` declares by its singleton class:
-/// `Locking::<Locking>::ERROR`. Every Roundhouse walk replays such a
-/// constant in the enclosing body (`singleton_class::SingletonBody::
-/// class_body`, `library_class::walk_decl_body`), so emitted code defines
-/// it as `Locking::ERROR`. Qualifying a reference with the singleton
-/// segment emitted `Locking::<Locking>::ERROR`, which is not Ruby.
-fn hoisted_name(name: &str) -> std::borrow::Cow<'_, str> {
-    if !name.contains('<') {
-        return std::borrow::Cow::Borrowed(name);
-    }
-    std::borrow::Cow::Owned(
-        name.split("::").filter(|segment| !segment.starts_with('<')).collect::<Vec<_>>().join("::"),
-    )
-}
-
 /// `X::<X>::NAME`: a constant written directly in `X`'s `class << self`
 /// (one singleton level, X's own).
 fn declared_on_singleton(name: &str) -> bool {
@@ -502,35 +488,6 @@ fn is_assigned_value(graph: &Graph, declaration: &Declaration) -> bool {
     assigned
 }
 
-/// Literal runtime values come from the same embedded implementations
-/// the name graph indexes. Keep their full owners, not suffix aliases,
-/// and share types between references instead of copying their trees.
-fn runtime_value_types() -> &'static HashMap<String, Arc<Ty>> {
-    static VALUES: std::sync::OnceLock<HashMap<String, Arc<Ty>>> = std::sync::OnceLock::new();
-    VALUES.get_or_init(|| {
-        let mut values: HashMap<String, Arc<Ty>> = HashMap::default();
-        let mut ambiguous = crate::det::HashSet::default();
-        for (_, text) in crate::runtime_files::ruby_sources() {
-            let (_, owners) = crate::runtime_src::parse_module_constant_tables(text, true);
-            for (owner, constants) in owners {
-                for (name, ty) in constants {
-                    let name = format!("{}::{}", owner.0.as_str(), name.as_str());
-                    if ambiguous.contains(&name) {
-                        continue;
-                    }
-                    if values.get(&name).is_some_and(|previous| **previous != ty) {
-                        values.remove(&name);
-                        ambiguous.insert(name);
-                    } else {
-                        values.insert(name, Arc::new(ty));
-                    }
-                }
-            }
-        }
-        values
-    })
-}
-
 impl ConstResolver {
     /// Index real Ruby app sources with their original 1-based file IDs.
     #[cfg(test)]
@@ -570,14 +527,9 @@ impl ConstResolver {
                 source_namespaces.insert(target.clone());
             }
         }
-        let mut nested_namespaces: HashMap<Box<str>, Vec<Box<str>>> = HashMap::default();
-        for name in &source_namespaces {
-            for (at, _) in name.match_indices("::") {
-                if source_namespaces.contains(&name[..at]) {
-                    nested_namespaces.entry(Box::from(&name[..at])).or_default().push(name.clone());
-                }
-            }
-        }
+        let mut declared: Vec<&str> = source_namespaces.iter().map(|name| name.as_ref()).collect();
+        declared.sort_unstable();
+        let nested_namespaces = nested_namespaces_index(&declared);
         let mut source_constants: HashMap<Box<str>, Option<DeclarationId>> = HashMap::default();
         for (declaration, name) in files.iter().flatten().flat_map(|file| file.constant_classes.iter()) {
             match source_constants.entry(Box::from(name.0.as_str())) {
@@ -1906,6 +1858,27 @@ mod tests {
                 assert_eq!(runtime.as_deref(), Some(&crate::ty::Ty::Str));
             }
             _ => panic!("ActiveSupport::ParameterFilter::FILTERED must resolve to the runtime value"),
+        }
+    }
+
+    /// An app that reads a scalar constant of a runtime module
+    /// (`ActiveRecord::SignedId::SALT = "active_record/signed_id"`, nested
+    /// two modules deep) must get the constant's literal type, or the
+    /// read is refused as an unsupported constant.
+    #[test]
+    fn a_runtime_module_scalar_constant_resolves_with_its_literal_type() {
+        let text = "module SaltProbe\n  R = \"#{ActiveRecord::SignedId::SALT}\".freeze\nend\n";
+        let sources = vec![SourceFile { path: "lib/salt_probe.rb".into(), text: text.into() }];
+        let resolver = ConstResolver::from_app_sources(&sources);
+        let end = (text.find("SALT}").unwrap() + "SALT".len()) as u32;
+        let span = Span { file: FileId(1), start: end - 40, end };
+        let path: Vec<Symbol> = ["ActiveRecord", "SignedId", "SALT"].into_iter().map(Symbol::from).collect();
+        match resolver.reference(span, &path) {
+            Some(Some(ResolvedConstant::Value { name, runtime, .. })) => {
+                assert_eq!(name.0.as_str(), "ActiveRecord::SignedId::SALT");
+                assert_eq!(runtime.as_deref(), Some(&crate::ty::Ty::Str));
+            }
+            _ => panic!("ActiveRecord::SignedId::SALT must resolve to the runtime value"),
         }
     }
 }

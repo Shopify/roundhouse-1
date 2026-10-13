@@ -55,6 +55,21 @@ pub fn ingest_test_file(source: &[u8], file: &str) -> IngestResult<Option<TestMo
 /// two suites. Non-test top-level classes are shared by every module
 /// as helpers, the way they were for the one.
 pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModule>> {
+    ingest_test_classes(source, file, true)
+}
+
+/// The test classes a support file (`test/test_helper.rb`) defines: only
+/// classes that read as test classes, with no single-class fallback, so a
+/// helper's plain `class RecordingLogger < Logger` is never mistaken for one.
+pub fn ingest_test_bases(source: &[u8], file: &str) -> IngestResult<Vec<TestModule>> {
+    ingest_test_classes(source, file, false)
+}
+
+fn ingest_test_classes(
+    source: &[u8],
+    file: &str,
+    single_class_fallback: bool,
+) -> IngestResult<Vec<TestModule>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -72,6 +87,9 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
     // class inside a module is not a candidate here: a support file
     // in a test directory often declares one, and it has no tests.
     if test_nodes.is_empty() {
+        if !single_class_fallback {
+            return Ok(Vec::new());
+        }
         let mut helper_nodes = helper_nodes;
         let Some(first) = helper_nodes.iter().position(|(scope, c)| scope.is_empty() && may_be_test_class(c)) else {
             refuse_unreached_test_classes(&root, &[], file)?;
@@ -634,6 +652,10 @@ pub(super) fn ingest_test_class(
             if let Some(body) = ingest_teardown_block(&stmt, file)? {
                 teardowns.push(body);
                 after_teardown_blocks = true;
+                continue;
+            }
+            if let Some(body) = ingest_teardown_block(&stmt, file)? {
+                teardowns.push(body);
                 continue;
             }
             if let Some(body) = ingest_setup_declaration(&stmt, file)? {
@@ -1798,12 +1820,24 @@ pub(super) fn ingest_setup_declaration(
 }
 
 /// `teardown do … end`: the block's body. Any other `teardown` call
-/// (`teardown :close_files`, a block argument) is refused by name: it
-/// would otherwise fall to the unrecognized-statement drop below and
-/// its cleanup would silently never run.
+/// (`teardown :close_files`, a block argument, `self.teardown do`) is
+/// refused by name: it would otherwise fall to the unrecognized-statement
+/// drop below and its cleanup would silently never run.
 pub(super) fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
-    if call.receiver().is_some() || constant_id_str(&call.name()) != "teardown" {
+    if constant_id_str(&call.name()) != "teardown" {
+        return Ok(None);
+    }
+    // Receiverless `teardown do` is the ActiveSupport form. `self.teardown
+    // do` is the same callback in some suites; refuse it rather than drop.
+    if let Some(recv) = call.receiver() {
+        let is_self = recv.as_self_node().is_some();
+        if is_self {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "test teardown not modeled: only receiverless `teardown do … end` runs after each test".into(),
+            });
+        }
         return Ok(None);
     }
     let block = call.block().and_then(|b| b.as_block_node());

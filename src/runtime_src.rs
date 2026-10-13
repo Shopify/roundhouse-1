@@ -317,7 +317,7 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
             let name = std::str::from_utf8(konst.name().as_slice()).ok()?;
             return Some(Ty::Class {
                 id: crate::ident::ClassId(crate::ident::Symbol::new(name)),
-                args: vec![],
+                args: vec![].into(),
             });
         }
         // A list literal turned into a Set or joined into a String, the
@@ -329,7 +329,7 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         // stays untyped.
         if matches!(name, "to_set" | "join") && call.receiver().is_some_and(|recv| is_list_literal(&recv)) {
             return Some(if name == "to_set" {
-                Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::new("Set")), args: vec![] }
+                Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::new("Set")), args: Default::default() }
             } else {
                 Ty::Str
             });
@@ -344,8 +344,8 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         let first = hash.elements().iter().next();
         let Some(first) = first else {
             return Some(Ty::Hash {
-                key: Box::new(Ty::Untyped),
-                value: Box::new(Ty::Untyped),
+                key: std::sync::Arc::new(Ty::Untyped),
+                value: std::sync::Arc::new(Ty::Untyped),
             });
         };
         let assoc = first.as_assoc_node()?;
@@ -360,14 +360,14 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
                 .flatten()
         })?;
         return Some(Ty::Hash {
-            key: Box::new(key_ty),
-            value: Box::new(value_ty),
+            key: std::sync::Arc::new(key_ty),
+            value: std::sync::Arc::new(value_ty),
         });
     }
     if let Some(array) = node.as_array_node() {
         let first = array.elements().iter().next();
         let Some(first) = first else {
-            return Some(Ty::Array { elem: Box::new(Ty::Untyped) });
+            return Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) });
         };
         // Literal elements first; a `Klass.new(…)` element falls through
         // to the constructed-instance rule above, which is how a table
@@ -375,7 +375,7 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         // types as `Array[IPAddr]` rather than not at all.
         let elem_ty = type_of_literal_node(&first)
             .or_else(|| type_of_const_literal(&first))?;
-        return Some(Ty::Array { elem: Box::new(elem_ty) });
+        return Some(Ty::Array { elem: std::sync::Arc::new(elem_ty) });
     }
     // Regex literal -> Ty::Class { Regexp }. The body-typer's existing
     // Regexp dispatch (instance methods `match?`, `source`, etc.)
@@ -384,7 +384,7 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
     if node.as_regular_expression_node().is_some() {
         return Some(Ty::Class {
             id: crate::ident::ClassId(crate::ident::Symbol::new("Regexp")),
-            args: vec![],
+            args: vec![].into(),
         });
     }
     // A scalar literal (`FILTERED = "[FILTERED]"`) types as itself.
@@ -661,12 +661,12 @@ pub fn parse_library_with_rbs(
             ctx.enclosing_def = Some((m.name.clone(), matches!(m.receiver, MethodReceiver::Class)));
             if let Some(Ty::Fn { params, .. }) = &m.signature {
                 for (param, p) in m.params.iter().zip(params.iter()) {
-                    ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
+                    ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
                 }
             }
             ctx.self_ty = Some(Ty::Class {
                 id: lc.name.clone(),
-                args: vec![],
+                args: vec![].into(),
             });
             ctx.ivar_bindings = ivars.clone();
             ctx.constants = scope_constants.clone();
@@ -722,7 +722,7 @@ pub fn parse_library_with_rbs(
         if !flow_ivars.is_empty() {
             let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
                 .into_iter()
-                .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil] }))
+                .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
                 .collect();
             for m in &mut lc.methods {
                 let mut ctx = build_ctx(m, &reseeded);
@@ -757,13 +757,13 @@ fn seed_well_known_classes(
     crate::lower::view_to_library::insert_db_stub(classes);
 
     let row_ty = Ty::Hash {
-        key: Box::new(Ty::Str),
-        value: Box::new(Ty::Untyped),
+        key: std::sync::Arc::new(Ty::Str),
+        value: std::sync::Arc::new(Ty::Untyped),
     };
     let nilable_row = Ty::Union {
-        variants: vec![row_ty.clone(), Ty::Nil],
+        variants: vec![row_ty.clone(), Ty::Nil].into(),
     };
-    let array_of_rows = Ty::Array { elem: Box::new(row_ty.clone()) };
+    let array_of_rows = Ty::Array { elem: std::sync::Arc::new(row_ty.clone()) };
     let mut adapter_iface = ClassInfo::default();
     adapter_iface
         .instance_methods
@@ -1050,20 +1050,27 @@ pub fn parse_methods_with_rbs_in_ctx(
         ctx.class_side = m.receiver == MethodReceiver::Class;
         if let Some(Ty::Fn { params, .. }) = &m.signature {
             for (param, p) in m.params.iter().zip(params.iter()) {
-                ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
+                ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
             }
             // `def subscribe(subscriber, &block)`: the captured block is
             // the signature's block, which `m.params` does not carry.
             if let Some(block_param) = &m.block_param {
                 if let Some(p) = params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
-                    ctx.local_bindings.insert(block_param.name.clone(), p.ty.clone());
+                    ctx.local_bindings.insert(block_param.name.clone(), (*p.ty).clone());
+                }
+            }
+            // `def subscribe(subscriber, &block)`: the captured block is
+            // the signature's block, which `m.params` does not carry.
+            if let Some(block_param) = &m.block_param {
+                if let Some(p) = params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
+                    ctx.local_bindings.insert(block_param.name.clone(), (*p.ty).clone());
                 }
             }
         }
         if let Some(enclosing) = &m.enclosing_class {
             ctx.self_ty = Some(Ty::Class {
                 id: crate::ident::ClassId(enclosing.clone()),
-                args: vec![],
+                args: vec![].into(),
             });
         }
         ctx.ivar_bindings = ivars.clone();
@@ -1093,7 +1100,7 @@ pub fn parse_methods_with_rbs_in_ctx(
     if !flow_ivars.is_empty() {
         let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
             .into_iter()
-            .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil] }))
+            .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
             .collect();
         for m in &mut methods {
             let mut ctx = build_ctx(m, &reseeded);
@@ -1681,11 +1688,11 @@ mod tests {
         .expect("parses");
         assert_eq!(
             types.get(&Symbol::from("OPTION_ALIASES")),
-            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Array { elem: Box::new(Ty::Sym) }) })
+            Some(&Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }) })
         );
         assert_eq!(
             types.get(&Symbol::from("POOL")),
-            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Int) })
+            Some(&Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Int) })
         );
     }
 
@@ -1702,11 +1709,11 @@ mod tests {
         assert_eq!(types.get(&Symbol::from("STRING")), Some(&Ty::Str));
         assert_eq!(
             types.get(&Symbol::from("FALSE_VALUES")),
-            Some(&Ty::Class { id: crate::ident::ClassId(Symbol::from("Set")), args: vec![] })
+            Some(&Ty::Class { id: crate::ident::ClassId(Symbol::from("Set")), args: Default::default() })
         );
         assert_eq!(
             types.get(&Symbol::from("OPTION_ALIASES")),
-            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Array { elem: Box::new(Ty::Sym) }) })
+            Some(&Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }) })
         );
         assert_eq!(types.get(&Symbol::from("LABEL")), Some(&Ty::Str));
         // A `join` off a non-list receiver is not a String by shape.
@@ -2027,8 +2034,8 @@ mod tests {
             panic!("expected Ty::Fn, got {sig:?}");
         };
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].ty, Ty::Int);
-        assert_eq!(params[1].ty, Ty::Str);
+        assert_eq!(params[0].ty, Ty::Int.into());
+        assert_eq!(params[1].ty, Ty::Str.into());
         assert_eq!(**ret, Ty::Str);
 
         // Param kinds come from RBS (Required in this case).

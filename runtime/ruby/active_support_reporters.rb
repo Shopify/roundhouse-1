@@ -3,11 +3,13 @@
 # ActiveSupport's two process-wide reporters, ported from the Rails Core
 # runs, 8.2.0.alpha (Shopify/rails 5813559f4aed): `Rails.event` (EventReporter, active_support/event_reporter.rb)
 # and `Rails.error` (ErrorReporter, active_support/error_reporter.rb),
-# with the ParameterFilter that redacts event payloads and the
-# ExecutionContext an error report reads its context from.
+# with the ParameterFilter that redacts event payloads
+# (active_support/parameter_filter.rb) and the ExecutionContext an error
+# report reads its context from (active_support/execution_context.rb).
+# `Rails.error` / `Rails.event` answer the reporters below as railties'
+# lib/rails.rb does (`ActiveSupport.error_reporter` / `.event_reporter`).
 #
-# Metaprogramming-free like rails.rb, with three deliberate differences
-# (and the reported-error flag kept beside the error, see REPORTED):
+# Metaprogramming-free like rails.rb, with these deliberate differences:
 #
 # - Rails keeps event tags, event context and event debug mode in Fiber
 #   storage (inherited by fibers and threads a fiber starts) and the
@@ -17,10 +19,31 @@
 # - `rescue *error_classes => e` is written as `rescue Exception => e`
 #   plus a class test that re-raises anything not listed; the set of
 #   errors handled is the same.
+# - The reported-error flag (`@__rails_error_reported`) is kept beside the
+#   error, in REPORTED, by object_id.
 # - ExecutionContext has no `current_attributes_instances`: nothing here
 #   defines CurrentAttributes, which is what registers them. Its
 #   `after_change` callbacks (execution_context.rb) run after every change
 #   to the context, which is how QueryLogs clears its cached comment.
+# - A report to an ErrorReporter with no subscribers is logged through
+#   Rails.logger, where Rails drops it (see ErrorReporter#report).
+# - ensure_backtrace trims this file's frames from `backtrace` by their
+#   "path:" prefix and leaves `backtrace_locations` whole; Rails reads the
+#   locations' paths and shifts both. Spinel has no backtrace_locations.
+#
+# Released activesupport (8.1) and the main-branch reporters differ
+# in the places listed here, so a reader can tell what each file is
+# following. The 8.2-only parts are additive:
+#
+# - EventReporter#notify / #debug take `filter_payload:`, and
+#   `EventReporter.filter_parameters` overrides ActiveSupport.filter_parameters
+#   for one reporter (8.1 filters every Hash payload with the global list).
+# - ErrorReporter hands each subscriber a deep_dup of the context (8.1
+#   passes the one Hash to all of them).
+# - A subscriber's filter sees the event name alone, before the payload is
+#   built (Core's 8.2.0.alpha); with no subscriber left nothing is built.
+# - Event debug mode starts on (8.1: off until the railtie sets it from the
+#   log level); an emitted program has no railtie to set it.
 #
 # `ActiveSupport.filter_parameters` starts empty, as in Rails before the
 # railtie copies `config.filter_parameters` into it.
@@ -98,9 +121,15 @@ module ActiveSupport
 
     def value_for_key(key, value, full_parent_key, original_params)
       full_key = full_parent_key.nil? ? key.to_s : "#{full_parent_key}.#{key}"
-      if @regexps.any? { |r| r.match?(key.to_s) }
+      # `=~`, not `match?`: Spinel types `r` as poly (the filters arrive
+      # untyped), and a poly `match?` dispatch reaches PlatformAgent's
+      # private `match?(pattern)` with a String, after which Spinel
+      # compiles that method's own `String#match?` as an unconditional
+      # NoMethodError (campfire's /rooms/1 under a Chrome user agent;
+      # matz/spinel#8633).
+      if @regexps.any? { |r| !(r =~ key.to_s).nil? }
         @mask
-      elsif @deep_regexps.any? { |r| r.match?(full_key) }
+      elsif @deep_regexps.any? { |r| !(r =~ full_key).nil? }
         @mask
       elsif value.is_a?(Hash)
         filter_hash(value, full_key, original_params)
@@ -583,6 +612,7 @@ module ActiveSupport
       unless SEVERITIES.include?(severity)
         raise ArgumentError, "severity must be one of #{SEVERITIES.map(&:inspect).join(", ")}, got: #{severity.inspect}"
       end
+      return log_unsubscribed(error, severity) if @subscribers.empty?
       base = ActiveSupport::ExecutionContext.to_h
       (context || {}).each { |key, value| base[key] = value }
       full_context = @context_middlewares.execute(error, context: base, handled: handled, severity: severity, source: source)
@@ -609,6 +639,24 @@ module ActiveSupport
     end
 
     private
+
+    # Rails drops a report nothing subscribes to. The emitted program has
+    # no error subscribers unless it adds one, so such a report is logged
+    # through Rails.logger at its severity instead, as the one place the
+    # error is not lost. Once anything subscribes, delivery is Rails' and
+    # nothing is logged here. The error is not flagged as reported, so a
+    # later subscriber still sees a repeat of it.
+    def log_unsubscribed(error, severity)
+      message = "#{error.class}: #{error.message}"
+      if severity == :info
+        Rails.logger.info(message)
+      elsif severity == :warning
+        Rails.logger.warn(message)
+      else
+        Rails.logger.error(message)
+      end
+      nil
+    end
 
     # Object#deep_dup (core_ext/object/deep_dup.rb): each subscriber gets
     # its own copy of the context.
@@ -660,11 +708,11 @@ module ActiveSupport
       rescue Exception
         nil
       end
-      locations = error.backtrace_locations
+      lines = error.backtrace
+      prefix = "#{__FILE__}:"
       count = 0
-      count += 1 while count < locations.length && locations[count].path == __FILE__
-      locations.shift(count)
-      error.backtrace.shift(count)
+      count += 1 while count < lines.length && lines[count].start_with?(prefix)
+      lines.shift(count)
       nil
     end
   end

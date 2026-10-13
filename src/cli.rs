@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::analyze::{diagnose, Analyzer, Severity};
+use crate::analyze::{diagnose, Analyzer, Diagnostic, DiagnosticKind, Severity};
 use crate::ingest::{ingest_app, survey, IngestError};
 
 /// `roundhouse lsp`: serve the read-only Language Server over stdio
@@ -135,18 +135,25 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     let mut fixture: Option<String> = None;
     let mut list_unknown_sends = false;
     let mut initializer_ledger: Option<String> = None;
+    let mut inventory_path: Option<String> = None;
+    // Default on with `--continue`: the punch list alone is not a peel
+    // worklist. `--no-hotspots` opts out; `--hotspots` forces it on in
+    // strict mode too.
+    let mut hotspots: Option<bool> = None;
 
-    let mut args = args.iter();
+    let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: roundhouse check [--continue|--strict] [--unknown-sends] [APP]\n\n\
+                    "Usage: roundhouse check [--continue|--strict] [--unknown-sends]\n\
+                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [APP]\n\n\
                      Analyze the Rails app at APP (default {default_app}) and print the\n\
                      diagnostics; exit 1 on parse or type errors.\n\n\
                      Options:\n\
                        --continue   Record unsupported constructs as a punch list and keep\n\
-                                    going (also ROUNDHOUSE_INGEST_SURVEY=1).\n\
+                                    going (also ROUNDHOUSE_INGEST_SURVEY=1). Prints a ranked\n\
+                                    hotspot report unless --no-hotspots.\n\
                        --strict     Abort at the first unsupported construct (default).\n\
                        --unknown-sends\n\
                                     List each send on an unknown or gradual receiver (always\n\
@@ -154,7 +161,14 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                        --initializer-ledger PATH\n\
                                     After ingest, write each boot initializer statement and\n\
                                     its fate (applied / refused / unmodeled) to PATH as JSON\n\
-                                    lines, and stop before analysis."
+                                    lines, and stop before analysis.\n\
+                       --inventory PATH\n\
+                                    Write a machine-readable JSON inventory (diagnostics,\n\
+                                    survey gaps, ranked hotspots) to PATH.\n\
+                       --hotspots   Print the ranked error/survey hotspot report (default\n\
+                                    on with --continue).\n\
+                       --no-hotspots\n\
+                                    Suppress the hotspot report."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -168,6 +182,18 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             },
             "--continue" => continue_on_error = true,
             "--strict" => continue_on_error = false,
+            "--hotspots" => hotspots = Some(true),
+            "--no-hotspots" => hotspots = Some(false),
+            "--inventory" => {
+                let Some(path) = args.next() else {
+                    eprintln!("roundhouse-check: --inventory requires a PATH argument");
+                    return ExitCode::from(2);
+                };
+                inventory_path = Some(path.to_string());
+            }
+            other if other.starts_with("--inventory=") => {
+                inventory_path = Some(other["--inventory=".len()..].to_string());
+            }
             other if other.starts_with("--") => {
                 eprintln!("roundhouse-check: unknown flag {other}");
                 return ExitCode::from(2);
@@ -181,6 +207,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             }
         }
     }
+    let show_hotspots = hotspots.unwrap_or(continue_on_error);
 
     let fixture = fixture.unwrap_or_else(|| default_app.to_string());
     let path = Path::new(&fixture);
@@ -267,9 +294,25 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     let mut had_output = false;
     // Parse diagnostics lead — earliest phase, and usually the root
     // cause of any downstream analyze noise on the recovered AST.
+    // The initializer ledger (a warning per boot statement no recognizer
+    // reads) collapses to a count unless `--continue` asks for the list.
+    let is_ledger = |d: &Diagnostic| matches!(d.kind, DiagnosticKind::UnconsumedInitializer { .. });
+    let ledger_count = parse_diags.iter().filter(|d| is_ledger(d)).count();
     for d in &parse_diags {
+        if is_ledger(d) && !continue_on_error {
+            continue;
+        }
         eprintln!("{}", d.render(&app.sources));
         had_output = true;
+    }
+    if ledger_count > 0 && !continue_on_error {
+        eprintln!(
+            "{ledger_count} unconsumed initializer statement(s) (warnings) — rerun with --continue to list them"
+        );
+        had_output = true;
+    }
+    if ledger_count > 0 && continue_on_error {
+        eprint!("{}", crate::ingest::initializer_ledger::render_summary(&parse_diags));
     }
     for d in &diags {
         eprintln!("{}", d.render(&app.sources));
@@ -279,6 +322,34 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     if !survey_errors.is_empty() {
         print_survey_report(&survey_errors);
         had_output = true;
+    }
+
+    let inventory = crate::check_report::build(
+        &fixture,
+        path,
+        &app.sources,
+        &parse_diags,
+        &diags,
+        &survey_errors,
+        census.as_ref(),
+    );
+    if show_hotspots {
+        eprint!("{}", crate::check_report::render_hotspots(&inventory));
+        had_output = true;
+    }
+    if let Some(out_path) = &inventory_path {
+        match serde_json::to_string_pretty(&inventory) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(out_path, format!("{json}\n")) {
+                    eprintln!("roundhouse-check: failed to write --inventory {out_path}: {err}");
+                    return ExitCode::from(2);
+                }
+            }
+            Err(err) => {
+                eprintln!("roundhouse-check: failed to serialize inventory: {err}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     if had_output {

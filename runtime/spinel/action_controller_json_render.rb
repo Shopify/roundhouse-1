@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-# CRuby overlay: runtime encoder behind inline `render json: <expr>`
-# (the controller rewrite lowers that to
+# Runtime encoder behind inline `render json: <expr>` on the CRuby, JRuby
+# and spinel trees (the controller rewrite lowers that to
 # `render(ActionController::JsonRender.encode(v), content_type:
 # "application/json")`).
 #
@@ -16,14 +16,14 @@
 # shadows the gem's — routing through it here would `to_s` the payload
 # into Ruby-inspect notation, not JSON.
 #
-# CRuby-only by nature (respond_to? dispatch). A site whose value the
-# compiler typed as a class it could write an `as_json_str` writer for
+# A site whose value the compiler typed as a class it could write an
+# `as_json_str` writer for
 # — declared readers, or a model's own `as_json` in a shape
 # lower::as_json_shape reads, or a collection of either — never reaches
 # this: lower::as_json_poro respells it `render plain: <text>,
 # content_type: "application/json"`, on every target. What is left here
 # — a Hash literal, an untyped value, an `as_json` outside those shapes
-# — surfaces on other targets as an unresolved constant until the
+# — surfaces on the strict targets as an unresolved constant until the
 # writer covers it.
 module ActionController
   module JsonRender

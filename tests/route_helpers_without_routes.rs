@@ -1,9 +1,6 @@
 //! A controller that names route helpers, in an app whose tree carries no
-//! `config/routes.rb`. Shopify Core's test slice is one: its routes load
-//! lazily and the selected test reaches none of them. Its
-//! ApplicationController reads `controller_path` (AbstractController::Base)
-//! and the suffix rule made that `RouteHelpers.controller_path`; with no
-//! routes no `app/route_helpers.rb` was emitted, and the tree did not boot
+//! `config/routes.rb` (an engine, a gem's test app). With no routes no
+//! `app/route_helpers.rb` was emitted, and the tree did not boot
 //! (`cannot load such file -- app/route_helpers`).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -45,6 +42,10 @@ fn framework_path_methods_are_not_route_helpers() {
 #[test]
 fn a_tree_without_routes_loads_the_route_helpers_it_names() {
     let (dir, _) = app().emit(BuildTarget::Ruby);
+    let controller =
+        std::fs::read_to_string(dir.join("app/controllers/application_controller.rb")).expect("controller");
+    assert!(controller.contains("RouteHelpers.cart_path"), "{controller}");
+    assert!(!controller.contains("RouteHelpers.controller_path"), "{controller}");
     let helpers = std::fs::read_to_string(dir.join("app/route_helpers.rb")).expect("app/route_helpers.rb");
     assert!(helpers.contains("module RouteHelpers\nend\n"), "{helpers}");
     let out = emit_and_run::ruby()

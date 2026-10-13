@@ -201,7 +201,7 @@ fn rewrite_guards(e: &mut Expr, names: &BTreeSet<Symbol>) {
     };
     if let Some(flag) = replacement {
         let mut read = Expr::new(span, ExprNode::Ivar { name: flag });
-        read.ty = Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] });
+        read.ty = Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() });
         *e = read;
     }
 }

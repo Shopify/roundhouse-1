@@ -1,11 +1,10 @@
 //! A class that defines its own `then` does not yield its receiver.
 //!
 //! Kernel#then yields `self`, so the analyzer binds the block parameter
-//! to the receiver's type. promise.rb's `Promise#then` yields the
-//! fulfilled value instead (Core's `load_customer_tag_values.then
-//! { |owned_tags| owned_tags.include?(tag) }`); binding it to Promise
-//! made `include?` read as Module#include? on a Promise instance and
-//! refused it. Native Ruby on the same source is the oracle.
+//! to the receiver's type. A promise's `then` yields the fulfilled value
+//! instead (`deferred.then { |owned| owned.include?(tag) }`); binding it
+//! to the promise made `include?` read as Module#include? on a promise
+//! instance and refused it. Native Ruby on the same source is the oracle.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;

@@ -70,13 +70,13 @@ fn untie(ty: &Ty, prior: &Ty) -> Ty {
             if !rest.contains(&Ty::Untyped) {
                 rest.push(Ty::Untyped);
             }
-            return Ty::Union { variants: rest };
+            return Ty::Union { variants: rest.into() };
         }
         untie(t, prior)
     };
     match ty {
-        Ty::Array { elem } => Ty::Array { elem: Box::new(go(elem)) },
-        Ty::Hash { key, value } => Ty::Hash { key: Box::new(go(key)), value: Box::new(go(value)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(go(elem)) },
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(go(key)), value: std::sync::Arc::new(go(value)) },
         Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(go).collect() },
         Ty::Union { variants } => Ty::Union { variants: variants.iter().map(go).collect() },
         Ty::Record { row } => Ty::Record {
@@ -189,7 +189,7 @@ mod tests {
     fn cfg() -> Ty {
         Ty::Class {
             id: ClassId(Symbol::from("Probe::Configuration")),
-            args: vec![],
+            args: vec![].into(),
         }
     }
 
@@ -217,10 +217,10 @@ mod tests {
     #[test]
     fn a_nested_union_of_unknown_arms_is_not_informative() {
         let unknown = Ty::Union {
-            variants: vec![Ty::Union { variants: vec![Ty::Untyped, Ty::Var { var: TyVar(0) }] }, Ty::Untyped],
+            variants: vec![Ty::Union { variants: vec![Ty::Untyped, Ty::Var { var: TyVar(0) }].into() }, Ty::Untyped].into(),
         };
         assert!(!has_informative_core(&unknown));
-        let known = Ty::Union { variants: vec![Ty::Union { variants: vec![Ty::Str, Ty::Untyped] }, Ty::Untyped] };
+        let known = Ty::Union { variants: vec![Ty::Union { variants: vec![Ty::Str, Ty::Untyped].into() }, Ty::Untyped].into() };
         assert!(has_informative_core(&known));
     }
 
@@ -242,8 +242,8 @@ mod tests {
         let method = Symbol::from("config");
         let mut table = HashMap::default();
         let fn_ty = Ty::Fn {
-            params: vec![],
-            ret: Box::new(Ty::Str),
+            params: vec![].into(),
+            ret: std::sync::Arc::new(Ty::Str),
             block: None,
             effects: crate::effect::EffectSet::default(),
         };
@@ -309,7 +309,7 @@ mod tests {
         insert_inferred_return(
             &mut table,
             &method,
-            Ty::Union { variants: vec![Ty::Untyped, Ty::Untyped] },
+            Ty::Union { variants: vec![Ty::Untyped, Ty::Untyped].into() },
         );
         assert_eq!(table.get(&method), Some(&concrete));
     }
@@ -324,15 +324,15 @@ mod tests {
     }
 
     fn arr(elem: Ty) -> Ty {
-        Ty::Array { elem: Box::new(elem) }
+        Ty::Array { elem: std::sync::Arc::new(elem) }
     }
 
     fn sym_hash(value: Ty) -> Ty {
-        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(value) }
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(value) }
     }
 
     fn union(variants: Vec<Ty>) -> Ty {
-        Ty::Union { variants }
+        Ty::Union { variants: variants.into() }
     }
 
     /// Stores `first`, then the body type `unroll` builds from the stored
@@ -377,7 +377,7 @@ mod tests {
         // never there as one term.
         let unroll = |r: &Ty| {
             let mut variants = match r {
-                Ty::Union { variants } => variants.clone(),
+                Ty::Union { variants } => Vec::from(variants.clone()),
                 other => vec![other.clone()],
             };
             variants.push(Ty::Int);

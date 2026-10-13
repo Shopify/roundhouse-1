@@ -192,6 +192,11 @@ pub(crate) fn rewrite_node(
         // pipeline follows for a send with no receiver to dispatch on.
         Some(arms) if arms.is_empty() => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
         Some(arms) => {
+            // Under a one-class test the call's receiver IS that class:
+            // the narrowing is the guard that makes the call resolve.
+            if let ([klass], ExprNode::Send { recv: Some(r), .. }) = (arms.as_slice(), &mut *call.node) {
+                r.ty = Some(Ty::Class { id: crate::ident::ClassId(klass.clone()), args: Vec::new().into() });
+            }
             let test = arms
                 .into_iter()
                 .map(|klass| is_a(span, &recv, &klass))
@@ -343,7 +348,7 @@ fn ancestry(name: &Symbol, parents: &HashMap<Symbol, Symbol>) -> Vec<Symbol> {
 
 fn is_a(span: crate::span::Span, recv: &Expr, klass: &Symbol) -> Expr {
     let path: Vec<Symbol> = klass.as_str().split("::").map(Symbol::from).collect();
-    Expr::new(
+    let mut test = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(recv.clone()),
@@ -352,7 +357,13 @@ fn is_a(span: crate::span::Span, recv: &Expr, klass: &Symbol) -> Expr {
             block: None,
             parenthesized: true,
         },
-    )
+    );
+    // Typed here because no analysis pass runs after this one: an
+    // untyped Send over a typed (often nullable) receiver reads, at the
+    // post-lowering diagnose, as a dispatch that failed. `is_a?` answers
+    // a Bool on every receiver, nil included.
+    test.ty = Some(Ty::Bool);
+    test
 }
 
 /// Methods the pipeline SYNTHESIZES onto every model, which this pass

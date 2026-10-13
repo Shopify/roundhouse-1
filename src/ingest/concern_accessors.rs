@@ -561,7 +561,7 @@ pub(super) fn validate(
         return Ok(());
     }
     // The surface probe analyzes and lowers a clone of the whole app, on
-    // full Core a second complete analysis. Only a name that passes every
+    // a large app a second complete analysis. Only a name that passes every
     // syntactic check reads it, so a dry pass finds those models and the
     // probe covers just them (or does not run at all).
     let mut probed = HashSet::default();

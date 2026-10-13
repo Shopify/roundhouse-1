@@ -67,7 +67,7 @@ pub(super) fn through_writer_join(
     if thr_through.is_some() {
         return ThroughWriterJoin::Nested(join_class);
     }
-    // `class_name: "::Markets::Platform::Condition"` keeps its leading
+    // `class_name: "::Admin::Report::Rule"` keeps its leading
     // `::` in the IR; the model's own name never has it. Compare the
     // constant paths, not the spellings, or a top-level-anchored
     // class_name misses its join model and falls to the convention.
@@ -77,7 +77,7 @@ pub(super) fn through_writer_join(
     let Some(join_model) = models.iter().find(|m| same(&m.name, &join_class)) else {
         // Rails' source `belongs_to` defaults its key from the
         // association name, which is unqualified: `condition_id` for
-        // `Markets::Platform::Condition`, never a `::`-pathed name.
+        // `Admin::Report::Rule`, never a `::`-pathed name.
         let src_fk = Symbol::from(format!(
             "{}_id",
             crate::naming::snake_case(crate::naming::demodulize(
@@ -139,11 +139,16 @@ pub(super) fn push_association_methods(
                 extension,
                 ..
             } => {
+                if crate::lower::assoc_primary_key::refuse(model, models, assoc, span) {
+                    continue;
+                }
+                let owner_key = assoc.owner_key();
                 methods.push(synth_has_many_reader(
                     owner,
                     name,
                     target,
                     foreign_key,
+                    &owner_key,
                     as_interface.as_ref(),
                     scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
                     through.is_some(),
@@ -177,7 +182,7 @@ pub(super) fn push_association_methods(
                     owner,
                     Symbol::from(format!("{}_target", name.as_str())),
                     cache_ivar(name),
-                    Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) },
+                    Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) },
                 ));
                 {
                     // A model that writes its own `<singular>_ids`
@@ -353,8 +358,10 @@ pub(super) fn push_association_methods(
                 ..
             } => {
                 let sentinel = fk_sentinel(model, foreign_key);
-                // `primary_key: "uuid"`: the target's key the fk holds.
-                let assoc_pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
+                // `primary_key: "uuid"`: the target's key the fk holds; else the
+                // target's own primary key.
+                let assoc_pk =
+                    crate::lower::scope_chain::association_primary_key(models, target, primary_key.as_ref());
                 methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone()));
                 // Rails provides the writer alongside the reader
                 // (`comment.story = obj` stores the foreign key). A
@@ -384,11 +391,16 @@ pub(super) fn push_association_methods(
                 autosave,
                 ..
             } => {
+                if crate::lower::assoc_primary_key::refuse(model, models, assoc, span) {
+                    continue;
+                }
+                let owner_key = assoc.owner_key();
                 methods.push(synth_has_one_reader(
                     owner,
                     name,
                     target,
                     foreign_key,
+                    &owner_key,
                     as_interface.as_ref(),
                     scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
                 ));
@@ -413,6 +425,7 @@ pub(super) fn push_association_methods(
                         owner,
                         name,
                         foreign_key,
+                        &owner_key,
                         as_interface.as_ref(),
                     ));
                     let call = Expr::new(
@@ -469,7 +482,7 @@ fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
         },
     );
     body.ty = Some(Ty::Array {
-        elem: Box::new(Ty::Sym),
+        elem: std::sync::Arc::new(Ty::Sym),
     });
     methods.push(MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -483,7 +496,7 @@ fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
         signature: Some(fn_sig(
             vec![],
             Ty::Array {
-                elem: Box::new(Ty::Sym),
+                elem: std::sync::Arc::new(Ty::Sym),
             },
         )),
         effects: EffectSet::default(),
@@ -495,11 +508,38 @@ fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
     });
 }
 
+/// A keyed association (`primary_key:` other than `id`) must not match
+/// when the owner's key is NULL: Rails answers nil / empty for it, but
+/// `where(fk: nil)` is `fk IS NULL`, which would return every orphan
+/// child. The extra predicate makes a nil key match nothing and is
+/// redundant otherwise.
+fn guard_nil_owner_key(query: Expr, foreign_key: &Symbol, owner_key: &Symbol) -> Expr {
+    if owner_key.as_str() == "id" {
+        return query;
+    }
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(query),
+            method: Symbol::from("where"),
+            args: vec![Expr::new(
+                Span::synthetic(),
+                ExprNode::Lit {
+                    value: Literal::Str { value: format!("{} IS NOT NULL", foreign_key.as_str()) },
+                },
+            )],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
 fn synth_has_many_reader(
     owner: &ClassId,
     name: &Symbol,
     target: &ClassId,
     foreign_key: &Symbol,
+    owner_key: &Symbol,
     as_interface: Option<&Symbol>,
     scope: Option<&Expr>,
     through: bool,
@@ -513,7 +553,7 @@ fn synth_has_many_reader(
         lit_sym(foreign_key.clone()),
         Expr::new(
             Span::synthetic(),
-            ExprNode::Ivar { name: Symbol::from("id") },
+            ExprNode::Ivar { name: owner_key.clone() },
         ),
     )];
     if let Some(intf) = as_interface {
@@ -555,6 +595,7 @@ fn synth_has_many_reader(
     // `_preload_comments`) does not apply scopes yet; readers cover
     // the per-record access pattern (show pages), which is where
     // ordering is user-visible today.
+    let lazy_query = guard_nil_owner_key(lazy_query, foreign_key, owner_key);
     let lazy_query = match scope {
         Some(scope_expr) => graft_scope(scope_expr, lazy_query),
         None => lazy_query,
@@ -626,7 +667,7 @@ fn synth_has_many_reader(
     let ret = if through {
         Ty::Relation { of: target.clone() }
     } else {
-        Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) }
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) }
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -731,7 +772,7 @@ fn synth_has_many_id_reader(owner: &ClassId, name: &Symbol) -> MethodDef {
         // `id` is `Integer` on every model, so unlike `pluck` (whose
         // own RBS hands back `Array[untyped]`) this projection can name
         // the element type it actually produces.
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Int) })),
+        signature: Some(fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Int) })),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -953,12 +994,13 @@ fn synth_has_one_reader(
     name: &Symbol,
     target: &ClassId,
     foreign_key: &Symbol,
+    owner_key: &Symbol,
     as_interface: Option<&Symbol>,
     scope: Option<&Expr>,
 ) -> MethodDef {
     let mut entries = vec![(
         lit_sym(foreign_key.clone()),
-        Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("id") }),
+        Expr::new(Span::synthetic(), ExprNode::Ivar { name: owner_key.clone() }),
     )];
     // See `synth_has_many_reader` — `as:` adds the type-half scope.
     if let Some(intf) = as_interface {
@@ -986,6 +1028,7 @@ fn synth_has_one_reader(
             parenthesized: true,
         },
     );
+    let query = guard_nil_owner_key(query, foreign_key, owner_key);
     let query = match scope {
         Some(scope_expr) => graft_scope(scope_expr, query),
         None => query,
@@ -1025,7 +1068,7 @@ fn synth_has_one_reader(
         signature: Some(fn_sig(
             vec![],
             Ty::Union {
-                variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+                variants: vec![Ty::Class { id: target.clone(), args: vec![].into() }, Ty::Nil].into(),
             },
         )),
         effects: EffectSet::default(),
@@ -1042,7 +1085,7 @@ fn synth_has_one_reader(
 fn synth_has_one_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
     let rec = Symbol::from("rec");
     let rec_ty = Ty::Union {
-        variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+        variants: vec![Ty::Class { id: target.clone(), args: vec![].into() }, Ty::Nil].into(),
     };
     synth_assoc_cache_seed(
         owner,
@@ -1058,7 +1101,7 @@ fn synth_has_one_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId
 fn synth_has_one_writer(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
     let value = Symbol::from("value");
     let value_ty = Ty::Union {
-        variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+        variants: vec![Ty::Class { id: target.clone(), args: vec![].into() }, Ty::Nil].into(),
     };
     synth_assoc_cache_seed(
         owner,
@@ -1120,6 +1163,7 @@ fn synth_has_one_autosave(
     owner: &ClassId,
     name: &Symbol,
     foreign_key: &Symbol,
+    owner_key: &Symbol,
     as_interface: Option<&Symbol>,
 ) -> MethodDef {
     let cache = || Expr::new(Span::synthetic(), ExprNode::Ivar { name: cache_ivar(name) });
@@ -1159,7 +1203,7 @@ fn synth_has_one_autosave(
             method: Symbol::from(format!("{}=", foreign_key.as_str())),
             args: vec![Expr::new(
                 Span::synthetic(),
-                ExprNode::Ivar { name: Symbol::from("id") },
+                ExprNode::Ivar { name: owner_key.clone() },
             )],
             block: None,
             parenthesized: false,
@@ -1242,7 +1286,7 @@ fn push_singular_loaded_reader(
 
 /// `def reload_<name>; @<name>_loaded = false; <name>; end`.
 fn synth_has_many_reload(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
-    let ret = Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) };
+    let ret = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) };
     let reset = Expr::new(
         Span::synthetic(),
         ExprNode::Assign {
@@ -1358,7 +1402,7 @@ pub(in crate::lower::model_to_library) fn assoc_cache_ivar_bindings(
             Association::HasMany { name, target, .. } => {
                 out.push((
                     cache_ivar(name),
-                    Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) },
+                    Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) },
                 ));
                 out.push((loaded_ivar(name), Ty::Bool));
             }
@@ -1367,9 +1411,9 @@ pub(in crate::lower::model_to_library) fn assoc_cache_ivar_bindings(
                     cache_ivar(name),
                     Ty::Union {
                         variants: vec![
-                            Ty::Class { id: target.clone(), args: vec![] },
+                            Ty::Class { id: target.clone(), args: vec![].into() },
                             Ty::Nil,
-                        ],
+                        ].into(),
                     },
                 ));
                 out.push((loaded_ivar(name), Ty::Bool));
@@ -1398,7 +1442,7 @@ fn lit_bool(value: bool) -> Expr {
 /// the controller side depends on is the `_preload_<assoc>` method name.
 fn synth_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
     let list = Symbol::from("list");
-    let list_ty = Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) };
+    let list_ty = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) };
     synth_assoc_cache_seed(
         owner,
         Symbol::from(format!("_preload_{}", name.as_str())),
@@ -1481,9 +1525,9 @@ fn synth_belongs_to_reader(
             vec![],
             Ty::Union {
                 variants: vec![
-                    Ty::Class { id: target.clone(), args: vec![] },
+                    Ty::Class { id: target.clone(), args: vec![].into() },
                     Ty::Nil,
-                ],
+                ].into(),
             },
         )),
         effects: EffectSet::default(),
@@ -1562,7 +1606,7 @@ fn synth_polymorphic_reader(
 
     let mut variants: Vec<Ty> = targets
         .iter()
-        .map(|t| Ty::Class { id: t.clone(), args: vec![] })
+        .map(|t| Ty::Class { id: t.clone(), args: vec![].into() })
         .collect();
     variants.push(Ty::Nil);
     MethodDef {
@@ -1574,7 +1618,7 @@ fn synth_polymorphic_reader(
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
         body,
-        signature: Some(fn_sig(vec![], Ty::Union { variants })),
+        signature: Some(fn_sig(vec![], Ty::Union { variants: variants.into() })),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -1582,6 +1626,33 @@ fn synth_polymorphic_reader(
         mutates_self: false,
         block_param: None,
     }
+}
+
+/// `case scrutinee when Target then <arm(Target)> … end` over a polymorphic
+/// belongs_to's resolved implementor set. The class-pattern `when` keeps the
+/// type string a compile-time constant per arm (no `.class.name`), and an
+/// STI subclass instance lands in its implementor's arm — so what the writer
+/// stores and what a `where(assoc: record)` condition compares to are the
+/// same value by construction. Shared by `synth_polymorphic_writer` and the
+/// polymorphic condition lowering in `scope_chain`.
+pub(crate) fn polymorphic_type_switch(
+    scrutinee: Expr,
+    targets: &[ClassId],
+    arm_body: impl Fn(&ClassId) -> Expr,
+    otherwise: Option<Expr>,
+) -> Expr {
+    let mut arms: Vec<crate::expr::Arm> = targets
+        .iter()
+        .map(|t| crate::expr::Arm {
+            pattern: crate::expr::Pattern::Expr { expr: class_const(t) },
+            guard: None,
+            body: arm_body(t),
+        })
+        .collect();
+    if let Some(body) = otherwise {
+        arms.push(crate::expr::Arm { pattern: crate::expr::Pattern::Wildcard, guard: None, body });
+    }
+    Expr::new(Span::synthetic(), ExprNode::Case { scrutinee, arms })
 }
 
 fn synth_polymorphic_writer(
@@ -1647,18 +1718,9 @@ fn synth_polymorphic_writer(
             parenthesized: false,
         },
     );
-    let type_arms: Vec<crate::expr::Arm> = targets
-        .iter()
-        .map(|t| crate::expr::Arm {
-            pattern: crate::expr::Pattern::Expr { expr: class_const(t) },
-            guard: None,
-            body: assign(&type_col, lit_str(t.0.as_str())),
-        })
-        .collect();
-    let type_switch = Expr::new(
-        Span::synthetic(),
-        ExprNode::Case { scrutinee: var_ref(value.clone()), arms: type_arms },
-    );
+    let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
+        assign(&type_col, lit_str(t.0.as_str()))
+    }, None);
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::If {
@@ -1673,7 +1735,7 @@ fn synth_polymorphic_writer(
 
     let mut variants: Vec<Ty> = targets
         .iter()
-        .map(|t| Ty::Class { id: t.clone(), args: vec![] })
+        .map(|t| Ty::Class { id: t.clone(), args: vec![].into() })
         .collect();
     variants.push(Ty::Nil);
     MethodDef {
@@ -1685,7 +1747,7 @@ fn synth_polymorphic_writer(
         receiver: MethodReceiver::Instance,
         params: vec![Param::positional(value.clone())],
         body,
-        signature: Some(fn_sig(vec![(value, Ty::Union { variants })], Ty::Nil)),
+        signature: Some(fn_sig(vec![(value, Ty::Union { variants: variants.into() })], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -1771,7 +1833,7 @@ fn synth_belongs_to_writer(
     // targets from having to thread the assign's value out of an
     // if/else statement position.
     let value_ty = Ty::Union {
-        variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+        variants: vec![Ty::Class { id: target.clone(), args: vec![].into() }, Ty::Nil].into(),
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -1826,7 +1888,7 @@ fn synth_belongs_to_writer(
 /// target loaded). `_sync_<name>` consumes the stale flag at save.
 fn synth_through_collection_writer(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
     let values = Symbol::from("values");
-    let values_ty = Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) };
+    let values_ty = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: target.clone(), args: vec![].into() }) };
     let ivar_assign = |ivar: String, value: Expr| {
         Expr::new(
             Span::synthetic(),

@@ -1,7 +1,7 @@
 //! A Rational literal (`999999.9r`, `3r`, and `1/3r`, which is `1 / 3r`)
 //! lowers to its exact value, `Rational(numerator, denominator)`.
 //!
-//! Ingest refused `RationalNode`, so a Core file holding a Rational
+//! Ingest refused `RationalNode`, so a file holding a Rational
 //! constant was not emitted at all. Lowering through Float would round
 //! the value, so ingest builds the Kernel `Rational` call from Prism's
 //! numerator and denominator. Native Ruby on the same source is the oracle.
@@ -36,13 +36,15 @@ end
 
 const REPORT: &str = "p Ratlab::Limits.report\n";
 
+const CONFIG: &str = "Rails.application.configure do\n  config.eager_load = false\nend\n";
+
 #[test]
 fn rational_literals_keep_their_exact_value_like_native() {
     let dir = std::env::temp_dir().join(format!("roundhouse-rational-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let rat = dir.join("limits.rb");
     std::fs::write(&rat, RAT).unwrap();
-    let native = std::process::Command::new("ruby")
+    let native = emit_and_run::ruby()
         .arg("-e")
         .arg(format!("require {:?}\n{REPORT}", rat.display().to_string()))
         .output()
@@ -61,11 +63,15 @@ fn rational_literals_keep_their_exact_value_like_native() {
         "native control"
     );
 
-    let (emitted, errors) = emit_and_run::real_blog()
-        .write("app/lib/ratlab/limits.rb", RAT)
-        .emit(BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
-    let source = std::fs::read_to_string(emitted.join("app/models/ratlab/limits.rb"))
+    let run = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\" do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("config/environments/development.rb", CONFIG)
+        .write("lib/ratlab/limits.rb", RAT)
+        .run_ruby(REPORT);
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    let source = std::fs::read_to_string(run.emitted.join("app/models/ratlab/limits.rb"))
         .expect("emitted limits");
     for lowered in [
         "MAX = Rational(9999999, 10)",
@@ -78,21 +84,5 @@ fn rational_literals_keep_their_exact_value_like_native() {
         );
     }
 
-    let main = emitted.join("main").display().to_string();
-    let output = emit_and_run::ruby()
-        .arg("-e")
-        .arg(format!(
-            "require {main:?}\nMain.configure_default_adapter!\nrequire_relative \"app/models/ratlab/limits\"\n{REPORT}"
-        ))
-        .current_dir(&emitted)
-        .env("BLOG_DB", ":memory:")
-        .output()
-        .expect("spawn ruby");
-    assert!(
-        output.status.success(),
-        "emitted program failed in {}:\n{}",
-        emitted.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert_eq!(run.stdout, expected);
 }

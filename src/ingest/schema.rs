@@ -121,7 +121,8 @@ pub fn ingest_schema_with_generated_expression_dialect(
 /// Only the migration's `change` method is replayed (`up` when no
 /// `change` exists; `down` is never touched). Schema-mutating verbs we
 /// can't fold deterministically (`change_table`, `execute`, raw-SQL
-/// shapes — see `UNSUPPORTED_VERBS`) error with a pointer to
+/// shapes — see `UNSUPPORTED_VERBS`, or a verb whose table or column
+/// name is not a literal) error with a pointer to
 /// `rails db:migrate`, which materializes the schema.rb this fallback
 /// substitutes for. Receiver-less calls that aren't recognized verbs
 /// are ignored: migrations legitimately contain arbitrary Ruby (data
@@ -234,9 +235,9 @@ fn apply_migration_verb(
         .unwrap_or_default();
     let arg_name = |i: usize| args.get(i).and_then(table_name_value);
     // A verb whose table or column name is not a literal cannot apply,
-    // and skipping it left the column typed: Core's
-    // `remove_column(:metaobject_index, :"str_value_#{slot}")` in a
-    // `STR_SLOTS.each` loop kept six dropped columns.
+    // and skipping it left the column typed: a
+    // `remove_column(:idx, :"col_#{n}")` in an `each` loop
+    // kept the dropped columns.
     let named = match verb {
         "drop_table" | "add_timestamps" => 1,
         "rename_table" | "remove_column" | "change_column_null" | "change_column_default"
@@ -1598,8 +1599,8 @@ fn column_with_type(
         // hash columns.
         "integer" if matches!(opts.limit, Some(5..=8)) => ColumnType::BigInt,
         // `smallint` is the PostgreSQL adapter's native type name, which
-        // `t.column :island, :smallint` passes through (Core's
-        // `db/migrate_globaldb`); structure.sql's `smallint` reads alike.
+        // `t.column :island, :smallint` passes through; structure.sql's
+        // `smallint` reads alike.
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
@@ -1967,19 +1968,19 @@ mod tests {
     #[test]
     fn a_non_literal_column_name_is_a_gap_not_a_skip() {
         let mut schema = fold(&[r#"
-            class CreateIdx < ActiveRecord::Migration[8.2]
+            class CreateIdx < ActiveRecord::Migration[8.1]
               def change
                 create_table :idx do |t|
-                  t.string :str_value_1
+                  t.string :col_1
                 end
               end
             end
         "#]);
         let err = ingest_migration(
             br#"
-            class DropSlots < ActiveRecord::Migration[8.2]
+            class DropSlots < ActiveRecord::Migration[8.1]
               def up
-                (1..1).each { |slot| remove_column(:idx, :"str_value_#{slot}") }
+                (1..1).each { |n| remove_column(:idx, :"col_#{n}") }
               end
             end
         "#,
@@ -1992,7 +1993,7 @@ mod tests {
 
     #[test]
     fn generic_column_with_a_native_type() {
-        // Core's db/migrate_globaldb: `t.column(:island, :smallint, …)`.
+        // `t.column(:island, :smallint, …)`.
         let schema = fold(&[r#"
             class CreateCounts < ActiveRecord::Migration[8.1]
               def change

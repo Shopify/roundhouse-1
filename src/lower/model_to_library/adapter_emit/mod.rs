@@ -103,9 +103,9 @@ pub(super) fn synth_find_primary_key_input(model: &Model, table: &Table) -> Meth
         "_adapter_find_by_id",
         Ty::Union {
             variants: vec![
-                Ty::Class { id: owner.clone(), args: vec![] },
+                Ty::Class { id: owner.clone(), args: vec![].into() },
                 Ty::Nil,
-            ],
+            ].into(),
         },
         super::nil_lit(),
     )
@@ -194,8 +194,8 @@ fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, diale
     let owner = &model.name;
     let id = Symbol::from("id");
     let key_ty = key_ty(model, table);
-    let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
-    let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
+    let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
+    let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil].into() };
 
     let op = ArelOp::Select(Select {
         single_record: true, // _adapter_find_by_id — one record or nil
@@ -228,7 +228,7 @@ fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, diale
 }
 
 fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
-    let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
+    let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
 
     let op = ArelOp::Select(Select {
         single_record: false, // _adapter_all — a collection
@@ -250,7 +250,7 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: S
         receiver: MethodReceiver::Class,
         params: vec![],
         body: dialect.visit(&op, schema, owner),
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(owner_ty) })),
+        signature: Some(fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(owner_ty) })),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -269,8 +269,8 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: S
 /// `ActiveRecord.adapter` is not wired under the Level-3 architecture).
 fn synth_adapter_last(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let owner = &model.name;
-    let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
-    let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
+    let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
+    let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil].into() };
 
     let last = |columns: Vec<Symbol>| {
         let op = ArelOp::Select(Select {
@@ -922,7 +922,7 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
     let owner = &model.name;
     let stmt = Symbol::from("stmt");
     let db = ClassId(Symbol::from("Db"));
-    let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
+    let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
 
     // Rails' `reload` clears the association cache — owned by
     // associations (same kinds as `assoc_cache_ivar_bindings`).
@@ -1103,7 +1103,7 @@ fn synth_class_string_list(model: &Model, name: &str, names: Vec<String>) -> Met
     let owner = &model.name;
     let elements = names.into_iter().map(arel_lit_str).collect();
     let mut body = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets });
-    body.ty = Some(Ty::Array { elem: Box::new(Ty::Str) });
+    body.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -1113,7 +1113,7 @@ fn synth_class_string_list(model: &Model, name: &str, names: Vec<String>) -> Met
         receiver: MethodReceiver::Class,
         params: vec![],
         body,
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Str) })),
+        signature: Some(fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) })),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -1237,8 +1237,8 @@ fn synth_hydrate_all(owner: &ClassId) -> MethodDef {
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from("Db"));
-    let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
-    let owner_array_ty = Ty::Array { elem: Box::new(owner_ty) };
+    let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
+    let owner_array_ty = Ty::Array { elem: std::sync::Arc::new(owner_ty) };
 
     let stmt_assign = arel_assign(&stmt, arel_db_call(&db, "prepare", vec![var_ref(&sql)]));
     // Typed empty literal — same reason as the visitor's multi hydrate

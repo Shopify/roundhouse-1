@@ -2,7 +2,7 @@
 //! policy: a dynamic `send`, an ordinary callee) stays a keyword splat in
 //! emitted Ruby. In Ruby 3 a positional Hash does not bind keyword
 //! parameters, so `@connection.send(meth, *args, kwargs)` raised where the
-//! source's `**kwargs` worked (Shopify Core's Podding ConnectionProxy).
+//! source's `**kwargs` worked.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 

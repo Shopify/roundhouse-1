@@ -31,11 +31,21 @@ use crate::ty::Ty;
 
 /// Build the `Schema` module as a single LibraryFunction:
 /// `Schema.statements() -> Array<String>` returning the rendered
-/// DDL statements; an empty list when `schema.tables` is empty.
+/// DDL statements. Empty when `schema.tables` is empty — apps
+/// without persisted models don't need a Schema artifact.
 pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction> {
-    // No tables still means a `Schema` whose statement list is empty:
-    // every harness loads `Schema.statements` unconditionally, so an app
-    // without a database (a library and its tests) must still define it.
+    if schema.tables.is_empty() {
+        return Vec::new();
+    }
+    lower_schema_module_functions(schema)
+}
+
+/// The same `Schema` module, defined even when `schema.tables` is empty
+/// (`statements` returns `[]`). Every harness loads `Schema.statements`
+/// unconditionally, so an app without a database (a library and its
+/// tests) must still define it; other targets keep the empty-skip of
+/// [`lower_schema_to_library_functions`].
+pub fn lower_schema_module_functions(schema: &Schema) -> Vec<LibraryFunction> {
     schema_functions(crate::emit::shared::schema_sql::render_schema_statements(schema))
 }
 
@@ -56,7 +66,7 @@ fn schema_functions(stmts: Vec<String>) -> Vec<LibraryFunction> {
             Span::synthetic(),
             ExprNode::Array { elements, style: ArrayStyle::Brackets },
         ),
-        Ty::Array { elem: Box::new(Ty::Str) },
+        Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
     );
     vec![LibraryFunction {
         module_path,
@@ -65,7 +75,7 @@ fn schema_functions(stmts: Vec<String>) -> Vec<LibraryFunction> {
         unsupported_formals: None,
         has_anonymous_block: false,
         body,
-        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Str) })),
+        signature: Some(fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) })),
         effects: EffectSet::default(),
         is_async: false,
     }]

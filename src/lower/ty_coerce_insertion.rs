@@ -91,7 +91,7 @@ fn build_registry_from(lcs: &[&LibraryClass]) -> CalleeRegistry {
                     .filter(|p| {
                         !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
                     })
-                    .map(|p| p.ty.clone())
+                    .map(|p| (*p.ty).clone())
                     .collect(),
                 _ => continue,
             };
@@ -148,7 +148,7 @@ fn build_registry(lcs: &[LibraryClass]) -> CalleeRegistry {
                     .filter(|p| {
                         !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
                     })
-                    .map(|p| p.ty.clone())
+                    .map(|p| (*p.ty).clone())
                     .collect(),
                 _ => continue,
             };
@@ -683,7 +683,7 @@ mod tests {
         let mut registry: CalleeRegistry = HashMap::default();
         registry.entry("Foo".into()).or_default().insert(
             "take".into(),
-            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil] }],
+            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }],
         );
         let lambda = Expr::new(
             Span::synthetic(),
@@ -709,7 +709,7 @@ mod tests {
         let mut registry: CalleeRegistry = HashMap::default();
         registry.entry("Foo".into()).or_default().insert(
             "take".into(),
-            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil] }],
+            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }],
         );
         let signature = crate::expr::BlockSignature {
             optionals: vec![(Symbol::from("size"), call_take())],

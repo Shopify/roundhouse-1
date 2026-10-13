@@ -78,7 +78,7 @@ pub(super) fn register(
         }
         let instance = Ty::Class {
             id: id.clone(),
-            args: vec![],
+            args: vec![].into(),
         };
         let mut info = classes.remove(&id).unwrap_or_default();
         info.class_methods
@@ -133,7 +133,7 @@ fn register_factory_classes(
         info.parent = Some(ClassId(Symbol::from(generator)));
         info.class_methods
             .entry(Symbol::from("new"))
-            .or_insert_with(|| Ty::Class { id: class.name.clone(), args: vec![] });
+            .or_insert_with(|| Ty::Class { id: class.name.clone(), args: Default::default() });
         for arg in args {
             let ExprNode::Lit { value: Literal::Sym { value: member } } = &*arg.node else {
                 continue;
@@ -209,7 +209,7 @@ pub(super) fn register_blockless_structs(
         let mut info = ClassInfo::default();
         info.app_declared = true;
         info.parent = Some(ClassId(Symbol::from("Struct")));
-        info.class_methods.insert(Symbol::from("new"), Ty::Class { id: id.clone(), args: vec![] });
+        info.class_methods.insert(Symbol::from("new"), Ty::Class { id: id.clone(), args: Default::default() });
         for member in names {
             info.instance_methods.insert(Symbol::from(format!("{}=", member.as_str())), Ty::Untyped);
             info.instance_methods.insert(member, Ty::Untyped);

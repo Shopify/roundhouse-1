@@ -566,7 +566,7 @@ fn assoc_scope_shape(
     let hash_params: HashSet<Symbol> = match &method_def.signature {
         Some(crate::ty::Ty::Fn { params, .. }) => params
             .iter()
-            .filter(|p| matches!(p.ty, crate::ty::Ty::Hash { .. }))
+            .filter(|p| matches!(*p.ty, crate::ty::Ty::Hash { .. }))
             .map(|p| p.name.clone())
             .collect(),
         _ => HashSet::default(),
@@ -1163,6 +1163,9 @@ pub struct AssocRegistry {
     /// (model, belongs_to name) -> foreign-key column, for
     /// `where(user: user)` -> `where(user_id: user && user.id)`.
     belongs_to_fk: HashMap<(ClassId, Symbol), Symbol>,
+    /// (model, belongs_to name) pairs declared `polymorphic: true`: their
+    /// condition also constrains `<name>_type` (see `lower_relation_args`).
+    polymorphic_belongs_to: HashMap<(ClassId, Symbol), (Symbol, Vec<ClassId>)>,
     /// (model, association name) -> the association target's CLASS.
     /// A NESTED join (`joins(user: :memberships)`) resolves its second
     /// hop against the first hop's target, and only a ClassId can be
@@ -1242,6 +1245,14 @@ pub struct AssocRegistry {
     /// The association names in `has_many_unseedable`, for the
     /// owner-less question `is_unseedable(None, _)` asks.
     has_many_unseedable_names: crate::det::HashSet<Symbol>,
+    /// `(model, has_many name)` -> the OWNER column the foreign key
+    /// matches, for every has_many declaring `primary_key:` (absent
+    /// means `id`). The seed's `where(fk => owner.<key>)` and the
+    /// constructors' preset foreign key read it, so a has_many keyed on
+    /// a non-id column seeds the rows Rails would. The by-NAME rung has
+    /// no owner to ask, so a name that is keyed anywhere is declined
+    /// there (`is_unseedable`).
+    has_many_owner_key: HashMap<(ClassId, Symbol), Symbol>,
     /// `(association name, extension method)` for every `has_many :x do
     /// def m … end end` in the app. The model lowerer FLATTENS those onto
     /// the owner as `<assoc>_<method>` instance methods
@@ -1311,6 +1322,11 @@ impl AssocRegistry {
     fn belongs_to_fk(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.belongs_to_fk.get(&(model.clone(), assoc.clone()))
     }
+    /// `(type column, resolved implementor classes)` of a polymorphic
+    /// belongs_to; the set is empty when no `as:` inverse resolved it.
+    fn polymorphic_belongs_to(&self, model: &ClassId, assoc: &Symbol) -> Option<&(Symbol, Vec<ClassId>)> {
+        self.polymorphic_belongs_to.get(&(model.clone(), assoc.clone()))
+    }
     fn assoc_table(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.assoc_table.get(&(model.clone(), assoc.clone()))
     }
@@ -1348,8 +1364,19 @@ impl AssocRegistry {
     fn is_unseedable(&self, owner: Option<&ClassId>, assoc: &Symbol) -> bool {
         match owner {
             Some(m) => self.has_many_unseedable.contains(&(m.clone(), assoc.clone())),
-            None => self.has_many_unseedable_names.contains(assoc),
+            None => {
+                self.has_many_unseedable_names.contains(assoc)
+                    || self.has_many_owner_key.keys().any(|(_, a)| a == assoc)
+            }
         }
+    }
+    /// The owner column `model.<assoc>`'s foreign key matches
+    /// (`primary_key:`), `id` when undeclared.
+    fn has_many_owner_key(&self, model: Option<&ClassId>, assoc: &Symbol) -> Symbol {
+        model
+            .and_then(|m| self.has_many_owner_key.get(&(m.clone(), assoc.clone())))
+            .cloned()
+            .unwrap_or_else(|| Symbol::from("id"))
     }
 }
 
@@ -1414,6 +1441,19 @@ pub(crate) fn scope_is_row_preserving(scope: &Expr) -> bool {
     walk(scope)
 }
 
+/// Rails' `association_primary_key` for a `belongs_to`: the declaration's
+/// `primary_key:`, else the target model's own primary key, else `id`.
+pub(crate) fn association_primary_key(
+    models: &[Model],
+    target: &ClassId,
+    declared: Option<&Symbol>,
+) -> Symbol {
+    declared
+        .cloned()
+        .or_else(|| models.iter().find(|o| &o.name == target).and_then(|o| o.primary_key.clone()))
+        .unwrap_or_else(|| Symbol::from("id"))
+}
+
 /// Build the association registry. Table names use the same
 /// `pluralize_snake` the synthesized `table_name` methods use, so the
 /// generated SQL and the runtime agree by construction.
@@ -1455,19 +1495,23 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
         }
         for a in m.associations() {
             match a {
-                Association::BelongsTo { name, target, foreign_key, primary_key, .. } => {
+                Association::BelongsTo {
+                    name, target, foreign_key, primary_key, polymorphic, polymorphic_targets, foreign_type, ..
+                } => {
+                    if *polymorphic {
+                        let type_col = foreign_type
+                            .clone()
+                            .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str())));
+                        reg.polymorphic_belongs_to
+                            .insert((m.name.clone(), name.clone()), (type_col, polymorphic_targets.clone()));
+                    }
                     let t = reg.table_for(target);
                     // Rails' `association_primary_key`: the declaration's
                     // `primary_key:`, else the target's own primary key.
-                    // Core's `belongs_to :product, foreign_key:
+                    // A `belongs_to :product, foreign_key:
                     // "product_uuid", primary_key: "uuid"` joined on
                     // `products.id` (a uuid) against a varchar fk.
-                    let pk = primary_key
-                        .clone()
-                        .or_else(|| {
-                            models.iter().find(|o| &o.name == target).and_then(|o| o.primary_key.clone())
-                        })
-                        .unwrap_or_else(|| Symbol::from("id"));
+                    let pk = association_primary_key(models, target, primary_key.as_ref());
                     reg.join_tails.insert(
                         (m.name.clone(), name.clone()),
                         format!("{t} ON {t}.{pk} = {own}.{foreign_key}"),
@@ -1499,6 +1543,11 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     for x in extension {
                         reg.assoc_extension.insert((name.clone(), x.name.clone()));
                     }
+                    let owner_key = a.owner_key();
+                    if owner_key.as_str() != "id" {
+                        reg.has_many_owner_key
+                            .insert((m.name.clone(), name.clone()), owner_key.clone());
+                    }
                     if as_interface.is_some()
                         || scope.as_ref().is_some_and(|s| !scope_is_row_preserving(s))
                     {
@@ -1512,7 +1561,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if scope_owner.is_none() {
                         reg.join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} ON {t}.{foreign_key} = {own}.id"),
+                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}"),
                         );
                     }
                     reg.has_many_fk.insert(
@@ -1526,7 +1575,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if name.as_str() != t {
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.{foreign_key} = {own}.id"),
+                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}"),
                         );
                     }
                     let entry = (target.clone(), foreign_key.clone());
@@ -1540,11 +1589,12 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                         .or_insert(Some(entry));
                 }
                 Association::HasOne { name, target, foreign_key, scope_owner, .. } => {
+                    let owner_key = a.owner_key();
                     let t = reg.table_for(target);
                     if scope_owner.is_none() {
                         reg.join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} ON {t}.{foreign_key} = {own}.id"),
+                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}"),
                         );
                     }
                     reg.assoc_table
@@ -1554,7 +1604,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if name.as_str() != t {
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.{foreign_key} = {own}.id"),
+                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}"),
                         );
                     }
                 }
@@ -1566,6 +1616,11 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                 // target class supplies the source fk (survives `source:`
                 // renames, which ingest folds into `target`).
                 Association::HasMany { name, target, through: Some(thr_name), .. } => {
+                    // A keyed hop is refused at synthesis; no join tail
+                    // is better than one that joins on `id`.
+                    if super::assoc_primary_key::unsupported_reason(m, models, a).is_some() {
+                        continue;
+                    }
                     let Some(Association::HasMany { target: thr_target, foreign_key: thr_fk, .. }) =
                         m.associations().find(|a| {
                             matches!(a, Association::HasMany { name, .. } if name == thr_name)
@@ -1585,12 +1640,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     };
                     let thr_table = reg.table_for(thr_target);
                     let target_table = reg.table_for(target);
-                    let src_pk = src_pk
-                        .clone()
-                        .or_else(|| {
-                            models.iter().find(|o| &o.name == target).and_then(|o| o.primary_key.clone())
-                        })
-                        .unwrap_or_else(|| Symbol::from("id"));
+                    let src_pk = association_primary_key(models, target, src_pk.as_ref());
                     reg.join_tails.insert(
                         (m.name.clone(), name.clone()),
                         format!(
@@ -1985,7 +2035,7 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                         method.as_str(),
                         "offset" | "limit" | "order" | "reorder" | "joins" | "left_outer_joins"
                             | "left_joins" | "includes" | "preload" | "eager_load" | "references" | "group"
-                            | "having" | "merge"
+                            | "having" | "merge" | "unscope"
                     ));
             if is_where
                 || is_relation_terminal(method.as_str(), args, block.as_ref())
@@ -2301,9 +2351,11 @@ fn is_relation_chain_method(name: &str) -> bool {
             // search paged every message in the table.
             | "reorder"
             // `unscope(where: :col)` drops a condition the relation
-            // gathered (activerecord query_methods.rb `unscope!`): a
+            // gathered (activerecord query_methods.rb `unscope!`;
+            // `Discard::Model`'s `with_discarded` is exactly that): a
             // scope body that is only that call acts on the relation the
-            // scope runs against, as `reorder` above.
+            // scope runs against, as `reorder` above. An Array has no
+            // `unscope`, so the site can only mean Relation.
             | "unscope"
     )
 }
@@ -2966,12 +3018,12 @@ fn assoc_owner_seed(
         || next.is_none_or(|(method, args, block)| !reader_array_answers(method.as_str(), args, block));
     resolve_assoc_read(owner, aname, ctx.models, ctx.assocs, ctx.plain_subclasses, by_name)
         .filter(|(owner_model, _, _)| !ctx.assocs.is_unseedable(owner_model.as_ref(), aname))
-        .map(|(_, target, fk)| {
+        .map(|(owner_model, target, fk)| {
             let owner_id = syn(
                 span,
                 ExprNode::Send {
                     recv: Some(owner.clone()),
-                    method: Symbol::from("id"),
+                    method: ctx.assocs.has_many_owner_key(owner_model.as_ref(), aname),
                     args: vec![],
                     block: None,
                     parenthesized: false,
@@ -3333,6 +3385,10 @@ fn join_literal(sql: String, span: crate::span::Span) -> ExprNode {
     ExprNode::StringInterp { parts }
 }
 
+/// The `<name>_type` value a polymorphic condition uses for a record that is
+/// none of the association's implementors: matches no stored row.
+const POLYMORPHIC_NO_TYPE: &str = "<not a polymorphic type>";
+
 fn lower_relation_args(
     model: &ClassId,
     method: &Symbol,
@@ -3383,10 +3439,71 @@ fn lower_relation_args(
             for a in args.iter_mut() {
                 let span = a.span;
                 let ExprNode::Hash { entries, .. } = &mut *a.node else { continue };
+                let mut type_conditions: Vec<(Expr, Expr)> = Vec::new();
+                // (value, type column) of each polymorphic condition whose
+                // value may be nil at run time; see the guard after the loop.
+                let mut nil_guards: Vec<(Expr, Symbol)> = Vec::new();
                 for (k, v) in entries.iter_mut() {
                     let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
                         continue;
                     };
+                    // A POLYMORPHIC belongs_to also constrains its type
+                    // column: `where(voter: user)` is `voter_id = u.id AND
+                    // voter_type = 'User'`. The type value is the SAME
+                    // `case value when Target then "Target"` switch the
+                    // polymorphic writer stores with (shared
+                    // `polymorphic_type_switch`), so read and write cannot
+                    // disagree: an STI subclass lands in its implementor's
+                    // arm. A literal nil is IS NULL on both columns, as the
+                    // plain `where(user: nil)` path. The value is read more
+                    // than once, so only an effect-free read qualifies. Where
+                    // the type half cannot be built (no resolved implementors
+                    // — framework models such as ActionText::RichText#record
+                    // — or a non-simple value) the key falls through to the
+                    // plain rename to `<name>_id` below: the type stays
+                    // unconstrained, exactly as before this lowering existed,
+                    // never a reference to a column that does not exist.
+                    if let Some((type_col, targets)) = ctx.assocs.polymorphic_belongs_to(model, key) {
+                        let simple = match &*v.node {
+                            ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
+                            ExprNode::Send { recv: None, args, block: None, .. } => args.is_empty(),
+                            _ => false,
+                        };
+                        if let Some(fk) = ctx.assocs.belongs_to_fk(model, key) {
+                            if matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) {
+                                // Rails: `where(voter: nil)` is `voter_id IS NULL`
+                                // alone — no type condition (verified against
+                                // Rails 8.1), so only the key is renamed.
+                                *k.node = ExprNode::Lit { value: Literal::Sym { value: fk.clone() } };
+                                continue;
+                            }
+                            if simple && !targets.is_empty() {
+                                let type_value = crate::lower::model_to_library::polymorphic_type_switch(
+                                    v.clone(),
+                                    targets,
+                                    |t| syn(span, ExprNode::Lit { value: Literal::Str { value: t.0.as_str().to_string() } }),
+                                    // A value that is none of the implementors can
+                                    // match no row (Rails compares to its
+                                    // `polymorphic_name`, which no stored row has).
+                                    // The writer stores a class name, or `""` for
+                                    // nil; this sentinel is neither — `<` and a
+                                    // space cannot appear in a constant name — so
+                                    // it can collide with nothing, and it is not
+                                    // nil, so it is not `IS NULL` either.
+                                    Some(syn(span, ExprNode::Lit {
+                                        value: Literal::Str { value: POLYMORPHIC_NO_TYPE.to_string() },
+                                    })),
+                                );
+                                type_conditions.push((
+                                    syn(span, ExprNode::Lit { value: Literal::Sym { value: type_col.clone() } }),
+                                    type_value,
+                                ));
+                                nil_guards.push((v.clone(), type_col.clone()));
+                                *k.node = ExprNode::Lit { value: Literal::Sym { value: fk.clone() } };
+                                continue;
+                            }
+                        }
+                    }
                     // Nested-hash value: the key names conditions on the
                     // JOINED table (`Comment.joins(:story).where(story:
                     // {merged_story_id: id})`), not on this model's
@@ -3469,6 +3586,41 @@ fn lower_relation_args(
                             },
                         );
                     }
+                }
+                entries.extend(type_conditions);
+                // A value that is nil at run time must behave as the literal
+                // `nil` does (Rails: `voter_id IS NULL`, no type condition),
+                // not fall into the no-type sentinel. The type half cannot be
+                // omitted from a hash conditionally, so the whole condition
+                // hash is chosen by `v.nil?`; only one branch is evaluated, so
+                // the other entries are not read twice. One guarded
+                // polymorphic key per hash; a second is left on the switch.
+                if let [(guard_value, type_col)] = nil_guards.as_slice() {
+                    let without_type: Vec<(Expr, Expr)> = entries
+                        .iter()
+                        .filter(|(k, _)| {
+                            !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value == type_col)
+                        })
+                        .cloned()
+                        .collect();
+                    let guarded = syn(span, ExprNode::Send {
+                        recv: Some(guard_value.clone()),
+                        method: Symbol::from("nil?"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    });
+                    // Braced: a brace-less (keyword) hash is not an expression
+                    // inside an `if`.
+                    let mut with_type = std::mem::replace(&mut *a.node, ExprNode::Lit { value: Literal::Nil });
+                    if let ExprNode::Hash { kwargs, .. } = &mut with_type {
+                        *kwargs = false;
+                    }
+                    *a.node = ExprNode::If {
+                        cond: guarded,
+                        then_branch: syn(span, ExprNode::Hash { entries: without_type, kwargs: false }),
+                        else_branch: syn(span, with_type),
+                    };
                 }
             }
         }
@@ -4266,7 +4418,8 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             }
                             ctx.assocs.has_many_fk(&self_model, aname).cloned().map(
                                 |(target, fk)| {
-                                    (target, fk, syn(span, ExprNode::Ivar { name: Symbol::from("id") }))
+                                    let key = ctx.assocs.has_many_owner_key(Some(&self_model), aname);
+                                    (target, fk, syn(span, ExprNode::Ivar { name: key }))
                                 },
                             )
                         }),
@@ -4463,6 +4616,18 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         // the foreign key as `scope_attributes` too.
                         let assoc_cm = ctx.assoc_class_method_params(&target, &method);
                         if is_scope || is_chain || is_term || assoc_cm.is_some() {
+                            // An owner key other than `id` can be NULL, and
+                            // `where(fk: nil)` would match the child rows
+                            // whose fk is NULL. Rails never matches a nil
+                            // owner key, so the seed excludes them.
+                            let keyed_guard = !matches!(
+                                &*owner_id.node,
+                                ExprNode::Ivar { name } if name.as_str() == "id"
+                            ) && !matches!(
+                                &*owner_id.node,
+                                ExprNode::Send { method, .. } if method.as_str() == "id"
+                            );
+                            let guard_sql = format!("{} IS NOT NULL", fk.as_str());
                             let fk_hash = syn(
                                 span,
                                 ExprNode::Hash {
@@ -4488,6 +4653,23 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     parenthesized: true,
                                 },
                             );
+                            if keyed_guard {
+                                seed = syn(
+                                    span,
+                                    ExprNode::Send {
+                                        recv: Some(seed),
+                                        method: Symbol::from("where"),
+                                        args: vec![syn(
+                                            span,
+                                            ExprNode::Lit {
+                                                value: Literal::Str { value: guard_sql },
+                                            },
+                                        )],
+                                        block: None,
+                                        parenthesized: true,
+                                    },
+                                );
+                            }
                             // The seed REPLACES `<owner>.<assoc>`, and with
                             // it the reader's eager-load cache: a scope
                             // reached through a preloaded association
@@ -5362,6 +5544,88 @@ mod tests {
     /// off the story and then users off the HIDDEN STORY. The second hop
     /// is resolved against the first's target class, which is the fact
     /// `assoc_target` exists to answer.
+
+    fn polymorphic_fixture(targets: Vec<ClassId>) -> AssocRegistry {
+        let mut reg = AssocRegistry::default();
+        let owner = ClassId(Symbol::from("ActionText::RichText"));
+        reg.belongs_to_fk.insert((owner.clone(), Symbol::from("record")), Symbol::from("record_id"));
+        reg.polymorphic_belongs_to
+            .insert((owner, Symbol::from("record")), (Symbol::from("record_type"), targets));
+        reg
+    }
+
+    fn where_record(value: Expr, reg: &AssocRegistry) -> Vec<(String, String)> {
+        let (scopes, models) = (ScopeRegistry::default(), HashSet::default());
+        let ctx = ctx_with(&scopes, &models, reg);
+        let mut args = vec![hash_arg(vec![(sym_lit("record"), value)])];
+        lower_relation_args(&ClassId(Symbol::from("ActionText::RichText")), &Symbol::from("where"), &mut args, &ctx);
+        let hash = match &*args[0].node {
+            ExprNode::If { else_branch, .. } => else_branch,
+            _ => &args[0],
+        };
+        let ExprNode::Hash { entries, .. } = &*hash.node else { panic!("hash") };
+        entries
+            .iter()
+            .map(|(k, v)| {
+                let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node else { panic!("key") };
+                (value.as_str().to_string(), format!("{:?}", v.node).chars().take(12).collect())
+            })
+            .collect()
+    }
+
+    fn var(name: &str) -> Expr {
+        Expr::new(span(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) })
+    }
+
+    #[test]
+    fn polymorphic_without_resolved_targets_renames_to_id_only() {
+        // ActionText::RichText#record / ActiveStorage::Attachment#record:
+        // framework polymorphics whose implementors are not resolved keep
+        // the pre-existing `record_id` rename, never an unknown `record`.
+        let keys: Vec<String> =
+            where_record(var("message"), &polymorphic_fixture(vec![])).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["record_id"]);
+    }
+
+    #[test]
+    fn polymorphic_with_targets_adds_the_type_switch() {
+        let reg = polymorphic_fixture(vec![ClassId(Symbol::from("Message"))]);
+        let keys: Vec<String> = where_record(var("message"), &reg).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["record_id", "record_type"]);
+        // The type switch has an otherwise-arm no stored row can match, so a
+        // value that is none of the implementors finds nothing (not `IS NULL`).
+        let (scopes, models) = (ScopeRegistry::default(), HashSet::default());
+        let ctx = ctx_with(&scopes, &models, &reg);
+        let mut args = vec![hash_arg(vec![(sym_lit("record"), var("message"))])];
+        lower_relation_args(&ClassId(Symbol::from("ActionText::RichText")), &Symbol::from("where"), &mut args, &ctx);
+        // A possibly-nil variable chooses the hash by `v.nil?`: the nil branch
+        // is `record_id` alone (Rails), the other carries the type switch.
+        let ExprNode::If { then_branch, else_branch, .. } = &*args[0].node else { panic!("nil guard") };
+        let ExprNode::Hash { entries: nil_entries, .. } = &*then_branch.node else { panic!("hash") };
+        assert_eq!(nil_entries.len(), 1);
+        let ExprNode::Hash { entries, .. } = &*else_branch.node else { panic!("hash") };
+        let ExprNode::Case { arms, .. } = &*entries[1].1.node else { panic!("case") };
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(arms[1].pattern, crate::expr::Pattern::Wildcard));
+        assert!(matches!(
+            &*arms[1].body.node,
+            ExprNode::Lit { value: Literal::Str { value } } if value == POLYMORPHIC_NO_TYPE
+        ));
+        // A non-simple value cannot be read twice: id-only, as before.
+        let call = Expr::new(
+            span(),
+            ExprNode::Send {
+                recv: Some(var("x")),
+                method: Symbol::from("message"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        let keys: Vec<String> = where_record(call, &reg).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["record_id"]);
+    }
+
     #[test]
     fn joins_nested_hash_expands_both_hops() {
         let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
@@ -5466,7 +5730,7 @@ mod tests {
         let mut comments_var =
             Expr::new(span(), ExprNode::Var { id: VarId(1), name: Symbol::from("comments") });
         comments_var.ty = Some(crate::ty::Ty::Array {
-            elem: Box::new(crate::ty::Ty::Untyped),
+            elem: std::sync::Arc::new(crate::ty::Ty::Untyped),
         });
         let mut args = vec![Expr::new(
             span(),
@@ -6041,7 +6305,7 @@ mod tests {
 
     #[test]
     fn registry_belongs_to_join_uses_declared_primary_key() {
-        // Core's `belongs_to :product, foreign_key: "product_uuid",
+        // `belongs_to :product, foreign_key: "product_uuid",
         // primary_key: "uuid"` — Rails joins on `products.uuid`; the
         // `products.id` join compared a PG uuid with a varchar fk.
         let price = ingest(
@@ -6205,7 +6469,7 @@ mod tests {
         );
         let expr = rewrite_by_name_call(None, None, "where", vec![id_hash]);
         assert!(seeded_extension_relation(&expr), "`where` seeds by name, got {:?}", expr.node);
-        let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![] };
+        let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![].into() };
         let expr = rewrite_by_name_call(Some(field), None, "exists?", vec![]);
         assert!(kept_dynamic_call(&expr, "exists?"), "a stamped Field keeps its own method, got {:?}", expr.node);
     }
@@ -6215,12 +6479,12 @@ mod tests {
     /// model's `extensions` says nothing about it.
     #[test]
     fn by_name_rung_declines_a_stamped_non_model_owner() {
-        let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![] };
+        let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![].into() };
         let expr = rewrite_by_name_read(Some(field), Some("Shop"));
         assert!(kept_dynamic_read(&expr), "expected `f.extensions.any?`, got {:?}", expr.node);
         // A stamped MODEL that doesn't declare it is no better a reason
         // to borrow Commitment's foreign key.
-        let shop = crate::ty::Ty::Class { id: ClassId(Symbol::from("Shop")), args: vec![] };
+        let shop = crate::ty::Ty::Class { id: ClassId(Symbol::from("Shop")), args: vec![].into() };
         let expr = rewrite_by_name_read(Some(shop), Some("Shop"));
         assert!(kept_dynamic_read(&expr), "expected `f.extensions.any?`, got {:?}", expr.node);
     }
@@ -6232,7 +6496,7 @@ mod tests {
     fn by_name_and_typed_rungs_still_seed_where_they_apply() {
         let expr = rewrite_by_name_read(None, Some("Shop"));
         assert!(seeded_extension_relation(&expr), "model body seeds by name, got {:?}", expr.node);
-        let commitment = crate::ty::Ty::Class { id: ClassId(Symbol::from("Commitment")), args: vec![] };
+        let commitment = crate::ty::Ty::Class { id: ClassId(Symbol::from("Commitment")), args: vec![].into() };
         let expr = rewrite_by_name_read(Some(commitment), None);
         assert!(seeded_extension_relation(&expr), "typed owner seeds, got {:?}", expr.node);
     }

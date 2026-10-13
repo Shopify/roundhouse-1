@@ -125,10 +125,10 @@ fn cut(t: Ty, old: &Ty, nested: bool) -> Ty {
         return Ty::Untyped;
     }
     match t {
-        Ty::Array { elem } => Ty::Array { elem: Box::new(cut(*elem, old, true)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(cut(std::sync::Arc::unwrap_or_clone(elem), old, true)) },
         Ty::Hash { key, value } => Ty::Hash {
-            key: Box::new(cut(*key, old, true)),
-            value: Box::new(cut(*value, old, true)),
+            key: std::sync::Arc::new(cut(std::sync::Arc::unwrap_or_clone(key), old, true)),
+            value: std::sync::Arc::new(cut(std::sync::Arc::unwrap_or_clone(value), old, true)),
         },
         Ty::Tuple { elems } => {
             Ty::Tuple { elems: elems.into_iter().map(|e| cut(e, old, true)).collect() }
@@ -188,7 +188,7 @@ mod tests {
     use crate::ident::TyVar;
 
     fn hash(k: Ty, v: Ty) -> Ty {
-        Ty::Hash { key: Box::new(k), value: Box::new(v) }
+        Ty::Hash { key: std::sync::Arc::new(k), value: std::sync::Arc::new(v) }
     }
     fn union(vs: Vec<Ty>) -> Ty {
         vs.into_iter().reduce(super::super::body::union_of).unwrap()
@@ -221,7 +221,7 @@ mod tests {
         let old = hash(Ty::Sym, Ty::Str);
         let new = hash(Ty::Sym, union(vec![Ty::Int, Ty::Str]));
         assert_eq!(widen_recursive_return(&old, new.clone()), new);
-        let new = Ty::Array { elem: Box::new(Ty::Int) };
+        let new = Ty::Array { elem: std::sync::Arc::new(Ty::Int) };
         assert_eq!(widen_recursive_return(&Ty::Int, new.clone()), new);
     }
 }

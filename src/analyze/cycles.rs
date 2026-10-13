@@ -219,10 +219,10 @@ pub(super) fn limit(t: Ty, keep: usize) -> Ty {
     }
     let below = keep.saturating_sub(1);
     match t {
-        Ty::Array { elem } => Ty::Array { elem: Box::new(limit(*elem, below)) },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(limit(std::sync::Arc::unwrap_or_clone(elem), below)) },
         Ty::Hash { key, value } => Ty::Hash {
-            key: Box::new(limit(*key, below)),
-            value: Box::new(limit(*value, below)),
+            key: std::sync::Arc::new(limit(std::sync::Arc::unwrap_or_clone(key), below)),
+            value: std::sync::Arc::new(limit(std::sync::Arc::unwrap_or_clone(value), below)),
         },
         Ty::Tuple { elems } => Ty::Tuple { elems: elems.into_iter().map(|e| limit(e, below)).collect() },
         Ty::Record { row } => Ty::Record {
@@ -266,7 +266,7 @@ impl Analyzer {
             Slot::Params(key) => self
                 .inferred_params
                 .get(key)
-                .map(|v| Ty::Tuple { elems: v.clone() }),
+                .map(|v| Ty::Tuple { elems: v.clone().into() }),
         }
     }
 
@@ -284,7 +284,7 @@ impl Analyzer {
             }
             Slot::Params(key) => {
                 if let Ty::Tuple { elems } = ty {
-                    self.inferred_params.insert(key.clone(), elems);
+                    self.inferred_params.insert(key.clone(), elems.into());
                 }
             }
         }
@@ -319,8 +319,8 @@ impl Analyzer {
             if b != Some(tys) {
                 out.push((
                     Slot::Params(key.clone()),
-                    b.map(|v| Ty::Tuple { elems: v.clone() }),
-                    Ty::Tuple { elems: tys.clone() },
+                    b.map(|v| Ty::Tuple { elems: v.clone().into() }),
+                    Ty::Tuple { elems: tys.clone().into() },
                 ));
             }
         }
@@ -451,11 +451,11 @@ mod tests {
     fn params_join_position_by_position() {
         let slot = Slot::Params((ClassId(Symbol::from("A")), Symbol::from("m"), crate::dialect::MethodReceiver::Instance));
         let var = Ty::Var { var: TyVar(0) };
-        let a = Ty::Tuple { elems: vec![Ty::Nil, Ty::Int] };
-        let b = Ty::Tuple { elems: vec![union_of(var.clone(), Ty::Nil), Ty::Int] };
+        let a = Ty::Tuple { elems: vec![Ty::Nil, Ty::Int].into() };
+        let b = Ty::Tuple { elems: vec![union_of(var.clone(), Ty::Nil), Ty::Int].into() };
         let j = join(&slot, a, b.clone()).unwrap();
         assert_eq!(j, b);
-        let short = Ty::Tuple { elems: vec![Ty::Nil] };
+        let short = Ty::Tuple { elems: vec![Ty::Nil].into() };
         assert_eq!(join(&slot, short, j), None);
     }
 }

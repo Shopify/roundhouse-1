@@ -20,7 +20,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     {
         let errors_ty = Ty::Class {
             id: ClassId(Symbol::from("ActiveModel::Errors")),
-            args: vec![],
+            args: vec![].into(),
         };
         let mut validations = ClassInfo::default();
         for (m, ty) in [
@@ -54,15 +54,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // Supports count/[]/any?/each and flows a Error instance to blocks.
     let error_ty = Ty::Class {
         id: ClassId(Symbol::from("ActiveModel::Error")),
-        args: vec![],
+        args: vec![].into(),
     };
     // The collection self-type, returned by the mutating/chaining methods
     // (`<<`/`add`/`clear`) so a validate-method chain stays typed.
     let errors_ty = Ty::Class {
         id: ClassId(Symbol::from("ActiveModel::Errors")),
-        args: vec![],
+        args: vec![].into(),
     };
-    let str_arr = || Ty::Array { elem: Box::new(Ty::Str) };
+    let str_arr = || Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
     let mut errors_cls = ClassInfo::default();
     for (m, ty) in [
         ("count", Ty::Int),
@@ -87,13 +87,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         (
             "details",
             Ty::Hash {
-                key: Box::new(Ty::Sym),
-                value: Box::new(Ty::Array {
-                    elem: Box::new(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+                key: std::sync::Arc::new(Ty::Sym),
+                value: std::sync::Arc::new(Ty::Array {
+                    elem: std::sync::Arc::new(Ty::Hash {
+                        key: std::sync::Arc::new(Ty::Sym),
+                        value: std::sync::Arc::new(Ty::Untyped),
+                    }),
                 }),
             },
         ),
-        ("messages", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
+        ("messages", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),
         // `.each` yields an Error — registered via block_params_for below.
         ("each", error_ty.clone()),
         // `errors << "message"` is the transpiled-shape idiom for adding
@@ -108,20 +111,20 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // attribute beside it (runtime/spinel/active_model_errors.rb) and
         // the read is refused where that port is absent
         // (`analyze::runtime_reads::GATED_METHODS`).
-        ("attribute_names", Ty::Array { elem: Box::new(Ty::Sym) }),
+        ("attribute_names", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
         // `to_hash(full_messages = false)` and `as_json(options = nil)`:
         // the messages (short, or full) grouped by attribute. Recorded
         // and refused as `attribute_names` is; `messages` too, where
         // `lower::errors_index` does not ground the read.
-        ("to_hash", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
-        ("as_json", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
+        ("to_hash", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),
+        ("as_json", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),
         // `merge!(other)`: another collection's errors, each with its
         // attribute; answers `other`'s Error objects.
-        ("merge!", Ty::Array { elem: Box::new(error_ty.clone()) }),
+        ("merge!", Ty::Array { elem: std::sync::Arc::new(error_ty.clone()) }),
         // The queries by attribute (and type, and options), `delete`
         // (the short messages removed, or nil) and `import(error,
         // override_options)`, answered from the same records.
-        ("where", Ty::Array { elem: Box::new(error_ty.clone()) }),
+        ("where", Ty::Array { elem: std::sync::Arc::new(error_ty.clone()) }),
         ("key?", Ty::Bool),
         ("has_key?", Ty::Bool),
         ("exclude?", Ty::Bool),
@@ -132,8 +135,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // translated attribute names), which only `lower::errors_add` evaluates,
         // for a literal field on a plain `errors` reader. The port's humanize
         // alone would answer another call wrongly.
-        ("delete", Ty::Union { variants: vec![str_arr(), Ty::Nil] }),
-        ("import", Ty::Array { elem: Box::new(error_ty.clone()) }),
+        ("delete", Ty::Union { variants: vec![str_arr(), Ty::Nil].into() }),
+        ("import", Ty::Array { elem: std::sync::Arc::new(error_ty.clone()) }),
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }
@@ -149,8 +152,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // because it is a record for a singular association and an Array for
     // a collection.
     {
-        let assoc_ty = Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Associations::Association")), args: vec![] };
-        let nilable_assoc = Ty::Union { variants: vec![assoc_ty.clone(), Ty::Nil] };
+        let assoc_ty = Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Associations::Association")), args: vec![].into() };
+        let nilable_assoc = Ty::Union { variants: vec![assoc_ty.clone(), Ty::Nil].into() };
         let mut assoc = ClassInfo::default();
         for (m, ty) in [
             ("owner", Ty::Untyped),
@@ -199,9 +202,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // runtime/spinel/active_model_errors.rb's Error answers them
         // where the push recorded them.
         ("raw_type", Ty::Untyped),
-        ("options", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
-        ("details", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
-        ("detail", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+        ("options", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }),
+        ("details", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }),
+        ("detail", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }),
         ("match?", Ty::Bool),
         ("strict_match?", Ty::Bool),
     ] {

@@ -1,20 +1,11 @@
 //! `T.must(x)` as sorbet-runtime runs it, in emitted Ruby: the value
 //! when it is not nil (`false` included), else `TypeError` with
-//! sorbet's message ("Passed `nil` into T.must"). Shopify Core does not
-//! replace `T::Configuration`'s inline type error handler, whose default
+//! sorbet's message ("Passed `nil` into T.must"), through
+//! `T::Configuration`'s inline type error handler, whose default
 //! re-raises. The argument is evaluated once, whether it is a local, an
 //! ivar or a call. No tree loads sorbet-runtime: the check is lowered.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
-
-fn app(lib: &str, test: &str) -> emit_and_run::Overlay {
-    emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("app/.keep", "")
-        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
-        .write("lib/lookup.rb", lib)
-        .write("test/lookup_test.rb", test)
-}
 
 const LIB: &str = r#"class Lookup
   def initialize(names)
@@ -40,29 +31,34 @@ const LIB: &str = r#"class Lookup
 end
 "#;
 
-const TEST: &str = r#"require "test_helper"
-require "lookup"
-class LookupTest < ActiveSupport::TestCase
-  test "present values pass through" do
-    lookup = Lookup.new(["ada", "grace"])
-    assert_equal "ADA", lookup.first_name
-    assert_equal ["ada", "grace"], lookup.names
-    assert_equal 0, lookup.pass(0)
-    assert_equal false, lookup.pass(false)
-    assert_equal 1, lookup.counted
-  end
-  test "nil raises sorbet's TypeError" do
-    error = assert_raises(TypeError) { Lookup.new([]).first_name }
-    assert_equal "Passed `nil` into T.must", error.message
-    local = assert_raises(TypeError) { Lookup.new([]).pass(nil) }
-    assert_equal "Passed `nil` into T.must", local.message
-    ivar = assert_raises(TypeError) { Lookup.new(nil).names }
-    assert_equal "Passed `nil` into T.must", ivar.message
-  end
+const SCRIPT: &str = r#"
+require_relative "app/models/lookup"
+def fails_with(message)
+  yield
+  raise "expected TypeError"
+rescue TypeError => error
+  raise "wrong message: #{error.message}" unless error.message == message
 end
+
+lookup = Lookup.new(["ada", "grace"])
+raise "first_name" unless lookup.first_name == "ADA"
+raise "names" unless lookup.names == ["ada", "grace"]
+raise "zero" unless lookup.pass(0) == 0
+raise "false" unless lookup.pass(false) == false
+raise "evaluated once" unless lookup.counted == 1
+fails_with("Passed `nil` into T.must") { Lookup.new([]).first_name }
+fails_with("Passed `nil` into T.must") { Lookup.new([]).pass(nil) }
+fails_with("Passed `nil` into T.must") { Lookup.new(nil).names }
+puts "T.must contract passed"
 "#;
 
 #[test]
 fn t_must_runs_in_emitted_ruby() {
-    app(LIB, TEST).run_test("test/models/lookup_test.rb").assert_passes();
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :items do |t|\n    t.string :name\n  end\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("app/services/lookup.rb", LIB)
+        .run_ruby(SCRIPT)
+        .assert_passes();
 }

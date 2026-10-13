@@ -46,7 +46,7 @@ fn literal_data_declarations_register_exact_members_without_writers() {
         let class = &classes[&id];
         assert_eq!(
             class.class_methods.get(&Symbol::from("new")),
-            Some(&Ty::Class { id, args: vec![] })
+            Some(&Ty::Class { id, args: vec![].into() })
         );
         for member in members {
             assert_eq!(
@@ -521,7 +521,7 @@ fn file_level_blockless_factories_are_top_level_classes() {
     {
         let analyzer = Analyzer::new(&app);
         let class = &analyzer.class_registry()[&id];
-        assert_eq!(class.class_methods.get(&Symbol::from("new")), Some(&Ty::Class { id: id.clone(), args: vec![] }));
+        assert_eq!(class.class_methods.get(&Symbol::from("new")), Some(&Ty::Class { id: id.clone(), args: vec![].into() }));
         assert!(class.instance_methods.contains_key(&Symbol::from("name")));
         assert!(!class.instance_methods.contains_key(&Symbol::from("name=")));
     }

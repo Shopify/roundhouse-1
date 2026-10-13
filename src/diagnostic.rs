@@ -78,6 +78,7 @@ impl Diagnostic {
             DiagnosticKind::IngestUnsupported { .. } => "ingest_unsupported",
             DiagnosticKind::IngestRefused { .. } => "ingest_unsupported",
             DiagnosticKind::AttributeTypeUnevaluated { .. } => "attribute_type_unevaluated",
+            DiagnosticKind::UnconsumedInitializer { .. } => "unconsumed_initializer",
         }
     }
 
@@ -94,6 +95,7 @@ impl Diagnostic {
             DiagnosticKind::BlankUnlowered { .. } => Severity::Warning,
             DiagnosticKind::LowerResidue { .. } => Severity::Warning,
             DiagnosticKind::AttributeTypeUnevaluated { .. } => Severity::Warning,
+            DiagnosticKind::UnconsumedInitializer { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -276,6 +278,12 @@ impl Diagnostic {
                 attribute.as_str(),
                 call.as_str()
             ),
+            DiagnosticKind::UnconsumedInitializer { owner, statement, location } => format!(
+                "`{}` ({}, {}) is read by no recognizer: it has no effect on the compiled app",
+                statement.as_str(),
+                owner.as_str(),
+                location.as_str()
+            ),
         }
     }
 
@@ -352,7 +360,7 @@ mod tests {
                 method: Symbol::from("frobnicate"),
                 recv_ty: Ty::Class {
                     id: ClassId(Symbol::from("Article")),
-                    args: vec![],
+                    args: vec![].into(),
                 },
             },
             severity: Severity::Error,
@@ -606,4 +614,14 @@ pub enum DiagnosticKind {
     /// column is typed gradually. Warning: the program runs the real
     /// behavior; only the static type is open.
     AttributeTypeUnevaluated { model: Symbol, attribute: Symbol, call: Symbol },
+    /// A boot statement — in `config/initializers/*.rb`, an engine class
+    /// body or `config/application.rb` — that no existing ingest
+    /// recognizer reads, so the compiled app silently runs without it
+    /// (see `ingest::initializer_ledger`). Warning: the statement may be
+    /// harmless, but nothing says so until a recognizer or the inert
+    /// allowlist does. `owner` names where the statement lives (`host
+    /// initializer`, `engine SourceMonitor::Engine class body`, …),
+    /// `statement` its head (`SourceMonitor.configure`), `location` the
+    /// `path:line:col` it starts at.
+    UnconsumedInitializer { owner: Symbol, statement: Symbol, location: Symbol },
 }

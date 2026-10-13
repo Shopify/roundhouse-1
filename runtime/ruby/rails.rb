@@ -15,6 +15,9 @@ require_relative "active_support_reporters"
 # `Rails.cache` is a no-op store (every `fetch` recomputes via its block);
 # correct, just not actually caching, which is adequate until a real cache
 # backend is wired.
+
+require_relative "active_support_reporters"
+
 module Rails
   class << self
     # RAILS_ENV, parked by the scaffold main.rb at boot (the runtime

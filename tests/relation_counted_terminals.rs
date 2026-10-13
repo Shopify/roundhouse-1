@@ -388,6 +388,7 @@ fn counted_terminal_on_a_model_class_runs() {
             "db/schema.rb",
             "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
         )
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
         .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
         .write("app/models/widget.rb", "class Widget < ApplicationRecord\n  def self.opening\n    first(2)\n  end\nend\n")
         .write(

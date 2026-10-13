@@ -132,8 +132,8 @@ pub fn lower_current_attributes(app: &mut crate::App) {
         app.library_classes[i].methods.extend(methods);
     }
     // Declared like an inline signature, so the analysis reads the
-    // written type in the class's lexical scope (`BuyerContext::…`
-    // inside `Customers::CustomerAccount`).
+    // written type in the class's lexical scope (`Context::…`
+    // inside a namespaced `Current`).
     for (class, name, signature) in signatures {
         app.rbs_signatures.entry(class).or_default().entry(name).or_insert(signature);
     }
@@ -144,18 +144,18 @@ pub fn lower_current_attributes(app: &mut crate::App) {
 #[derive(Default)]
 struct AttributeDecls {
     names: Vec<Symbol>,
-    /// The RBS type a single-name declaration carries.
+    /// The RBS type a declaration carries, per name it lists.
     declared: Vec<(Symbol, crate::ty::Ty)>,
     /// `default:` per name; every name of one declaration shares it.
     defaults: Vec<(Symbol, Expr)>,
 }
 
 /// `attribute :session, :user, :request` — consumed, not replayed.
-/// A single attribute may carry its type in a trailing RBS comment
-/// (Core's `attribute :buyer_context #: BuyerContext::CustomerAccountImpl`),
+/// An attribute may carry its type in a trailing RBS comment
+/// (`attribute :tenant #: Account::Context::Impl`),
 /// which ingest reads as a cast around the call: that type is returned
-/// with the name. Without unwrapping it the declaration was not taken,
-/// the class got no accessor, and `Current.buyer_context` had no method.
+/// with each name the call lists. Without unwrapping it the declaration was not taken,
+/// the class got no accessor, and `Current.tenant` had no method.
 ///
 /// The one option activesupport 8.2 takes is `default:`
 /// (`attribute :section, default: -> { NilSectionGlobals }`); it was
@@ -198,8 +198,8 @@ fn take_attribute_decls(lc: &mut LibraryClass) -> AttributeDecls {
         if names.is_empty() {
             return true;
         }
-        if let (Some(ty), [name]) = (declared_ty, names.as_slice()) {
-            out.declared.push((name.clone(), ty.clone()));
+        if let Some(ty) = declared_ty {
+            out.declared.extend(names.iter().map(|name| (name.clone(), ty.clone())));
         }
         if let Some(default) = default {
             out.defaults.extend(names.iter().map(|n| (n.clone(), default.clone())));
@@ -207,6 +207,38 @@ fn take_attribute_decls(lc: &mut LibraryClass) -> AttributeDecls {
         out.names.extend(names);
         false
     });
+    out
+}
+
+/// The synthesized reader answers, and the writer takes, an
+/// attribute's declared type, nilable: every attribute reads nil until
+/// the request sets it (and after `reset`), and callers ask exactly that
+/// (`create_tenant unless Current.tenant`). Read as written,
+/// the presence test would fold to true (see current_attributes_typing).
+/// Returns each accessor's signature.
+fn declare_attribute_types(methods: &mut [MethodDef], declared: &[(Symbol, crate::ty::Ty)]) -> Vec<(Symbol, crate::ty::Ty)> {
+    use crate::ty::{Param, ParamKind, Ty};
+    let mut out = Vec::new();
+    for (name, written) in declared {
+        let ty = &match written {
+            Ty::Nil => Ty::Nil,
+            Ty::Union { variants } if variants.contains(&Ty::Nil) => written.clone(),
+            _ => Ty::Union { variants: vec![written.clone(), Ty::Nil].into() },
+        };
+        let writer = format!("{}=", name.as_str());
+        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+            let params = if method.name == *name {
+                vec![]
+            } else if method.name.as_str() == writer {
+                vec![Param { name: Symbol::from("value"), ty: ty.clone().into(), kind: ParamKind::Required }].into()
+            } else {
+                continue;
+            };
+            let signature = Ty::Fn { params: params.into(), block: None, ret: std::sync::Arc::new(ty.clone()), effects: method.effects.clone() };
+            method.signature = Some(signature.clone());
+            out.push((method.name.clone(), signature));
+        }
+    }
     out
 }
 
@@ -349,38 +381,6 @@ fn prepend_default_assignments(lc: &mut LibraryClass, defaults: &[(Symbol, Defau
         _ => exprs.push(init.body.clone()),
     }
     init.body = Expr::new(span, ExprNode::Seq { exprs });
-}
-
-/// The synthesized reader answers, and the writer takes, an
-/// attribute's declared type, nilable: every attribute reads nil until
-/// the request sets it (and after `reset`), and Core asks exactly that
-/// (`create_buyer_context unless Current.buyer_context`). Read as written,
-/// the presence test would fold to true (see current_attributes_typing).
-/// Returns each accessor's signature.
-fn declare_attribute_types(methods: &mut [MethodDef], declared: &[(Symbol, crate::ty::Ty)]) -> Vec<(Symbol, crate::ty::Ty)> {
-    use crate::ty::{Param, ParamKind, Ty};
-    let mut out = Vec::new();
-    for (name, written) in declared {
-        let ty = &match written {
-            Ty::Nil => Ty::Nil,
-            Ty::Union { variants } if variants.contains(&Ty::Nil) => written.clone(),
-            _ => Ty::Union { variants: vec![written.clone(), Ty::Nil] },
-        };
-        let writer = format!("{}=", name.as_str());
-        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
-            let params = if method.name == *name {
-                vec![]
-            } else if method.name.as_str() == writer {
-                vec![Param { name: Symbol::from("value"), ty: ty.clone(), kind: ParamKind::Required }]
-            } else {
-                continue;
-            };
-            let signature = Ty::Fn { params, block: None, ret: Box::new(ty.clone()), effects: method.effects.clone() };
-            method.signature = Some(signature.clone());
-            out.push((method.name.clone(), signature));
-        }
-    }
-    out
 }
 
 /// `delegate :host, :protocol, to: :request, prefix: true, allow_nil: true`.

@@ -1,11 +1,10 @@
 //! The presence flag `lower::defined_ivar_memo` sets beside each
 //! `@x = …` ends the rewrite with a read of `@x` only where the
-//! assignment's value is used. graphql-client 0.25.0's
-//! `Client#initialize` assigns `@possible_types` mid-branch; the
-//! emitted `@possible_types` after the flag was a bare variable in void
-//! context, which CRuby warns about at parse time ("possibly useless use
-//! of a variable in void context") and Core's StrictWarning raises on,
-//! so Core's boot died loading graphql/client.
+//! assignment's value is used. An `initialize` that assigns `@possible`
+//! mid-branch must not emit a trailing bare `@possible`: a variable in
+//! void context, which CRuby warns about at parse time ("possibly
+//! useless use of a variable in void context") and a warnings-as-errors
+//! boot raises on.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -40,7 +39,7 @@ fn a_memoised_assignment_whose_value_is_unused_leaves_no_void_read() {
     let native = emit_and_run::ruby().args(["-W:no-deprecated", "-e", &format!("{CATALOG}\n{script}")]).output().expect("CRuby control");
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
 
-    let (tree, errors) = emit_and_run::empty_app().write("app/models/catalog.rb", CATALOG).emit(BuildTarget::Ruby);
+    let (tree, errors) = emit_and_run::empty_app().write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n").write("config/routes.rb", "Rails.application.routes.draw do\nend\n").write("app/models/catalog.rb", CATALOG).emit(BuildTarget::Ruby);
     let emitted = tree.join("app/models/catalog.rb");
     let text = std::fs::read_to_string(&emitted).unwrap_or_else(|_| panic!("no {}: {errors:#?}", emitted.display()));
     assert!(text.contains("@possible_defined = true"), "the guard is lowered to a flag:\n{text}");

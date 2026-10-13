@@ -35,9 +35,14 @@ fn peak_rss_mb() -> Option<u64> {
 }
 
 /// Run a phase and print measurements only when requested.
+///
+/// Resets the lap boundary afterward so a following `lap` does not
+/// attribute this phase's duration to the next named pass.
 pub fn phase<T>(name: impl std::fmt::Display, f: impl FnOnce() -> T) -> T {
     let _guard = begin(name);
-    f()
+    let result = f();
+    lap_start();
+    result
 }
 
 /// Start a timed span that prints when dropped. `None` when timings are off.

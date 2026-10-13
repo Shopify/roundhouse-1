@@ -12,16 +12,33 @@ use std::path::{Path, PathBuf};
 
 use super::super::EmittedFile;
 
-thread_local! {
-    /// True while rendering a class-side `def self.x` signature. See the
-    /// `Ty::SelfInstance` arm of `ty_to_rbs_in`.
-    static CLASS_SIDE_SIG: Cell<bool> = const { Cell::new(false) };
-}
 use crate::dialect::{
     AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver, MethodVisibility,
 };
 use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
 use crate::ty::{Param, ParamKind, Ty};
+
+thread_local! {
+    /// True while rendering a class-side `def self.x` signature. See the
+    /// `Ty::SelfInstance` arm of `ty_to_rbs_in`.
+    static CLASS_SIDE_SIG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sets [`CLASS_SIDE_SIG`] for its scope and restores the previous value
+/// on drop, so an early return cannot leak the flag.
+struct ClassSideGuard(bool);
+
+impl ClassSideGuard {
+    fn enter(class_side: bool) -> Self {
+        ClassSideGuard(CLASS_SIDE_SIG.with(|c| c.replace(class_side)))
+    }
+}
+
+impl Drop for ClassSideGuard {
+    fn drop(&mut self) {
+        CLASS_SIDE_SIG.with(|c| c.set(self.0));
+    }
+}
 
 /// Emit an `.rbs` sidecar for a single `LibraryClass`. The output
 /// path mirrors `rb_path` under a top-level `sig/` tree with the
@@ -250,7 +267,7 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
         MethodReceiver::Class => "self.",
     };
     let class_side = matches!(m.receiver, MethodReceiver::Class);
-    let prev = CLASS_SIDE_SIG.with(|c| c.replace(class_side));
+    let _side = ClassSideGuard::enter(class_side);
     // A full forwarder has no named rest binding. Neither its keywords
     // nor its block can be inferred from the synthetic signature slot.
     let sig = match &m.signature {
@@ -265,7 +282,6 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
         }
         _ => render_untyped_fallback(m),
     };
-    CLASS_SIDE_SIG.with(|c| c.set(prev));
     // RBS quotes a method name an identifier cannot spell in backticks
     // (`define_method("tag:unit")`).
     if crate::emit::ruby::def_spellable(m.name.as_str()) {
@@ -318,7 +334,7 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
         let name = p.name.as_str();
         // IR keyword-rest params name the collected Hash, while RBS
         // **T names the type of each keyword value (see rbs ingestion).
-        let param_ty = match (&p.kind, &p.ty) {
+        let param_ty = match (&p.kind, &*p.ty) {
             (ParamKind::KeywordRest, Ty::Hash { value, .. }) => &**value,
             _ => &p.ty,
         };
@@ -532,10 +548,10 @@ mod tests {
 
     #[test]
     fn keyword_rest_renders_values_not_a_nested_hash() {
-        let hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) };
+        let hash = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) };
         let params = [
-            Param { name: Symbol::from("mapping"), ty: hash.clone(), kind: ParamKind::Required },
-            Param { name: Symbol::from("opts"), ty: hash, kind: ParamKind::KeywordRest },
+            Param { name: Symbol::from("mapping"), ty: hash.clone().into(), kind: ParamKind::Required },
+            Param { name: Symbol::from("opts"), ty: hash.into(), kind: ParamKind::KeywordRest },
         ];
         assert_eq!(render_typed_params(&params, &[]), "Hash[Symbol, String] mapping, **String opts");
     }

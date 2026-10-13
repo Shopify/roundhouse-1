@@ -37,8 +37,7 @@ mod enum_constants;
 pub(in crate::ingest) use enum_constants::EnumConstants;
 
 /// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`,
-/// or the same def inside the module's `class << self` (every prefix Core
-/// declares: `ShopifyPayments`, `Billing`, `Shipping`, …).
+/// or the same def inside the module's `class << self`.
 /// Deliberately narrow: only a module-level singleton def whose body is a
 /// single string literal. A computed prefix would have to run to be known,
 /// and nothing in the corpus writes one.
@@ -64,9 +63,9 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
         full.extend(name_path);
         let Some(body) = module.body() else { continue };
         let stmts = flatten_statements(body);
-        // `extend self` makes every instance method a singleton one too:
-        // Core's `Payments::PaymentFlexibility` overrides `Payments`'
-        // `payments_` with a plain `def table_name_prefix = ""`.
+        // `extend self` makes every instance method a singleton one too, so a
+        // nested module can override an outer `ledger_` with a plain
+        // `def table_name_prefix = ""`.
         let extends_self = stmts.iter().any(|s| {
             s.as_call_node().is_some_and(|c| {
                 c.receiver().is_none()
@@ -109,13 +108,13 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     out
 }
 
-/// `isolate_namespace ForeignExchange` in an engine body: Rails defines
-/// `ForeignExchange.table_name_prefix` as the engine name and `_`
-/// (`foreign_exchange_`), unless the module already declares one. Core's
-/// `ForeignExchange::Rate` has no `table_name`; without the prefix it
-/// read `rates`, a table no schema has, and every column read on it was
+/// `isolate_namespace Billing` in an engine body: Rails defines
+/// `Billing.table_name_prefix` as the engine name and `_`
+/// (`billing_`), unless the module already declares one. A
+/// `Billing::Rate` with no `table_name` read `rates` without the
+/// prefix, a table no schema has, and every column read on it was
 /// `no known method`. The written module is the enclosing one it names
-/// (`module ForeignExchange; class Engine`), else the name as written.
+/// (`module Billing; class Engine`), else the name as written.
 pub fn ingest_isolated_namespace_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -148,9 +147,9 @@ pub fn ingest_isolated_namespace_prefixes(source: &[u8], file: &str) -> TablePre
 
 /// Each class one file declares with its own `self.table_name_prefix =
 /// "…"`, by full name. Rails keeps the prefix in a class attribute, so a
-/// model inherits it from its abstract base: Core's
-/// `Sales::Subscriptions::PackageRecord` sets `subscriptions_`, and its
-/// 22 models (`Line`, …) name no table and read `subscriptions_lines`.
+/// model inherits it from its abstract base: an abstract
+/// `PrefixedRecord` that sets `legacy_` gives its
+/// models (`Line`, …) that name no table `legacy_lines`.
 pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -239,6 +238,8 @@ pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)])
     let mut out = TablePrefixes::default();
     for (child, _) in pairs {
         let mut at = child.clone();
+        // A cycle guard: the walk follows `parent` links, so a cyclic
+        // hierarchy must end somewhere.
         for _ in 0..16 {
             if let Some(prefix) = own.get(&at) {
                 out.insert(child.clone(), prefix.clone());
@@ -529,31 +530,36 @@ pub(super) fn ingest_model_with_enum_constants(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
+            // `alias new old` (keyword form). Columns, associations,
+            // `attr_accessor` and `attribute` are synthesized later, in
+            // `lower::model_to_library` — this walk only sees
+            // hand-written `def`s and enum-generated methods, so
+            // resolving here would wrongly refuse an alias naming any
+            // of those (#481: an enum alias failed even though the
+            // model itself emitted fine). Record it as a typed body
+            // item, in order, and let `lower_model_to_library_class`
+            // resolve it after synthesis, with snapshot semantics.
             if let Some(alias) = stmt.as_alias_method_node() {
                 let to = super::library_class::alias_keyword_name(&alias.new_name());
                 let from = super::library_class::alias_keyword_name(&alias.old_name());
-                let copied = to.zip(from).and_then(|(to, from)| {
-                    body.iter().rev().find_map(|item| match item {
-                        ModelBodyItem::Method { method, .. }
-                            if method.name.as_str() == from
-                                && method.receiver == crate::dialect::MethodReceiver::Instance =>
-                        {
-                            let mut copy = method.clone();
-                            copy.name = crate::ident::Symbol::from(to.as_str());
-                            Some(copy)
-                        }
-                        _ => None,
-                    })
-                });
-                if let Some(method) = copied {
-                    body.push(ModelBodyItem::Method {
-                        method,
+                if let Some((to, from)) = to.zip(from) {
+                    let span = Span {
+                        file: super::sources::file_id(file),
+                        start: stmt.location().start_offset() as u32,
+                        end: stmt.location().end_offset() as u32,
+                    };
+                    body.push(ModelBodyItem::Alias {
+                        new: crate::ident::Symbol::from(to.as_str()),
+                        old: crate::ident::Symbol::from(from.as_str()),
                         leading_comments: leading,
                         leading_blank_line: leading_blank,
+                        span,
                     });
                     prev_end = Some(stmt.location().end_offset());
                     continue;
                 }
+                // Neither side is a plain name (e.g. a global variable
+                // alias, `alias $a $b`) — not a method alias at all.
                 return Err(IngestError::Unsupported {
                     file: file.into(),
                     message: "alias names a method this body has not defined".into(),
@@ -1722,7 +1728,7 @@ enum EnumStored {
 /// may name: the mapping itself (`enum :status, STATUSES`), a label
 /// (`NAME => NAME`, `"#{PENDING}": 1`) or a stored value
 /// (`active: ACTIVE`). Collected in source order so an alias
-/// (`ASSOCIATE = POS_USER`) resolves through the constant it names.
+/// (`ROLE_B = ROLE_A`) resolves through the constant it names.
 #[derive(Default)]
 pub(super) struct ClassConsts {
     /// `NAME = "x"`, `NAME = :x`, `NAME = 3`, `NAME = OTHER`.
@@ -2001,8 +2007,8 @@ fn serialized_enum_receiver<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
         && values.arguments().is_none() && values.block().is_none()).then_some(receiver)
 }
 
-/// A mapping whose labels fold to the same string (`ASSOCIATE =>
-/// ASSOCIATE, POS_USER => POS_USER` with `ASSOCIATE = POS_USER`) is one
+/// A mapping whose labels fold to the same string (`ROLE_B =>
+/// ROLE_B, ROLE_A => ROLE_A` with `ROLE_B = ROLE_A`) is one
 /// entry in the Hash Ruby builds: the first position, the last value.
 /// Kept as written, the generated `self.<plural>` literal would repeat a
 /// key, which Ruby warns about at parse time.
@@ -2046,6 +2052,8 @@ fn enum_label_pairs<'a>(
             },
             None => match consts.scalar(&value) {
                 Some(lit) => EnumStored::Lit(lit),
+                // `unknown: nil` names a NULL column: a literal too.
+                None if value.as_nil_node().is_some() => EnumStored::Lit(Literal::Nil),
                 None => EnumStored::Expr(ingest_expr(&value, file)?),
             },
         };
@@ -3152,6 +3160,7 @@ pub(super) fn parse_association(
             scope_owner,
             skip_validation: validate == Some(false),
             autosave: autosave == Some(true),
+            primary_key: primary_key.as_deref().map(Symbol::from),
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
@@ -3175,6 +3184,7 @@ pub(super) fn parse_association(
             scope,
             scope_owner,
             autosave: autosave.unwrap_or(false),
+            primary_key: primary_key.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
             name: name.clone(),
@@ -3326,8 +3336,8 @@ fn bare_table_identifier(name: &str) -> bool {
 
 /// The other way to name the table: a class-side reader answering one
 /// literal, `def self.table_name = "x"` or `class << self; def
-/// table_name; "x"; end; end` directly in the body (Core's
-/// `Shipping::Box::Measurement`). Rails reads the table through that
+/// table_name; "x"; end; end` directly in the body (a
+/// `Catalog::Item::Detail`). Rails reads the table through that
 /// method, so it binds the schema row. The direct `def self.` form is
 /// consumed like the setter (lowering writes `def self.table_name` from
 /// `Model::table`); the `class << self` form stays, saying the same name.
@@ -3404,7 +3414,7 @@ pub(crate) fn row_from_table(table: &Table) -> Row {
     for col in &table.columns {
         fields.insert(col.name.clone(), ty_of_column_slot(col));
     }
-    Row { fields, rest: None }
+    Row { fields: fields.into(), rest: None }
 }
 
 /// The attributes-row type for a column: `ty_of_column` widened with
@@ -3417,7 +3427,7 @@ pub(crate) fn row_from_table(table: &Table) -> Row {
 fn ty_of_column_slot(col: &crate::schema::Column) -> Ty {
     let base = ty_of_column(&col.col_type);
     if col.nullable && !col.primary_key {
-        Ty::Union { variants: vec![base, Ty::Nil] }
+        Ty::Union { variants: vec![base, Ty::Nil].into() }
     } else {
         base
     }

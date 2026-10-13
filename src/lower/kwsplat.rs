@@ -433,6 +433,13 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     let params = params.clone();
     let ExprNode::Send { args, .. } = &mut *expr.node else { return };
     restore_kwrest_splat(args, &params);
+    // A callee with no keyword parameter takes the Hash positionally, so
+    // the Ruby emitter must not write the source's `**` back over it.
+    if params.iter().all(|p| !p.keyword) {
+        for arg in args.iter_mut() {
+            arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
+        }
+    }
 }
 
 /// `f(**h)` into `def f(**rest)` survived ingest as a positional `h`.
@@ -731,7 +738,7 @@ fn index(hash: &Expr, key: &Symbol, value_ty: Ty) -> Expr {
     let ty = match &value_ty {
         Ty::Var { .. } | Ty::Untyped => Ty::Untyped,
         other => Ty::Union {
-            variants: vec![other.clone(), Ty::Nil],
+            variants: vec![other.clone(), Ty::Nil].into(),
         },
     };
     let mut e = Expr::new(

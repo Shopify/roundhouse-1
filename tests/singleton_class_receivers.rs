@@ -1,7 +1,7 @@
 //! `x.singleton_class`, `Module.new` and self in an instance method of
 //! a `Module` subclass are proven class object receivers.
 //!
-//! Core's `RandomBoundaryCheck` saves and restores `Kernel.rand` with
+//! A helper that saves and restores `Kernel.rand` does so with
 //! `Kernel.singleton_class.instance_method(:rand)` and
 //! `Kernel.singleton_class.define_method(:rand, saved)`. A singleton class
 //! is unique to its receiver, so (unlike `Probe.new.class`, which

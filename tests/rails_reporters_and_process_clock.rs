@@ -69,7 +69,7 @@ fn assign_ty(app: &roundhouse::App, name: &str) -> Ty {
 }
 
 #[test]
-fn unimplemented_tracers_are_refused_and_reporters_resolve() {
+fn reporters_resolve_and_application_tracers_are_refused() {
     let diags = diagnostics_for(
         r#"    Rails.event.notify("thing", message: "m")
     Rails.event.tagged(a: 1) { Rails.event.debug("d", message: "x") }
@@ -79,15 +79,18 @@ fn unimplemented_tracers_are_refused_and_reporters_resolve() {
     ShopifyTracer.in_span("x") { |s| 1 }
     1"#,
     );
-    for name in ["ShopifyTracer"] {
-        assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
-    }
+    // Rails.event / Rails.error are runtime/ruby/active_support_reporters.rb;
+    // an application's tracer is not stdlib and stays refused.
+    assert!(
+        !diags.is_empty() && diags.iter().all(|d| d.contains("ShopifyTracer")),
+        "only ShopifyTracer should be refused: {diags:?}"
+    );
     for gap in ["`event` on", "`error` on", "event lacks", "error lacks", "`notify`", "`report`", "`tagged`", "`handle`"] {
         assert!(!diags.iter().any(|d| d.contains(gap)), "reporter refused ({gap}): {diags:?}");
     }
     // Process.pid / clock_gettime / CLOCK_MONOTONIC are registered stdlib
     // (Campfire tip web-push + video previewer). They must not linger as
-    // residuals beside the still-unsupported reporters above.
+    // residuals beside the still-unsupported tracer above.
     assert!(
         diags.iter().all(|d| !d.contains("Process")),
         "Process should resolve: {diags:?}"

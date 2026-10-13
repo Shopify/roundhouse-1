@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn heterogeneous_nilable_union_is_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Int, Ty::Float, Ty::Bool, Ty::Nil],
+            variants: vec![Ty::Str, Ty::Int, Ty::Float, Ty::Bool, Ty::Nil].into(),
         };
         assert!(rust_value_shaped(&ty));
         assert_eq!(rust_ty(&ty), "serde_json::Value");
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn string_or_array_union_is_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Array { elem: Box::new(Ty::Untyped) }],
+            variants: vec![Ty::Str, Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }].into(),
         };
         assert!(rust_value_shaped(&ty));
         assert_eq!(rust_ty(&ty), "serde_json::Value");
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn string_symbol_union_is_not_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Sym],
+            variants: vec![Ty::Str, Ty::Sym].into(),
         };
         assert!(!rust_value_shaped(&ty));
         assert!(ty.is_stringish());
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn option_string_is_not_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Nil],
+            variants: vec![Ty::Str, Ty::Nil].into(),
         };
         assert!(!rust_value_shaped(&ty));
         assert!(rust_ty(&ty).starts_with("Option<"));
@@ -162,7 +162,7 @@ mod tests {
     /// deterministic aliases); its maps are std's.
     #[test]
     fn hash_is_the_emitted_crates_std_map() {
-        let ty = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Int) };
+        let ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Int) };
         assert_eq!(rust_ty(&ty), "std::collections::HashMap<String, i64>");
     }
 }

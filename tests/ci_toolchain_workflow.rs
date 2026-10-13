@@ -160,6 +160,10 @@ fn swift_compare_and_smoke_cache_swiftpm_checkouts() {
             key.contains("hashFiles('src/emit/swift/package.rs')"),
             "{job}: {key}"
         );
+        assert!(
+            key.contains("swift6.1"),
+            "{job}: cache key must track the Swift major.minor: {key}"
+        );
         keys.push(key.to_string());
     }
     assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));

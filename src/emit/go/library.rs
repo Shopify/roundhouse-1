@@ -1191,7 +1191,7 @@ fn signature_param_tys(m: &MethodDef) -> Option<Vec<Ty>> {
         params
             .iter()
             .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-            .map(|p| p.ty.clone())
+            .map(|p| (*p.ty).clone())
             .collect(),
     )
 }
@@ -1504,9 +1504,9 @@ fn collect_module_singleton_slots(methods: &[MethodDef]) -> Vec<(String, Ty)> {
             AccessorKind::AttributeWriter => match m.signature.as_ref() {
                 Some(Ty::Fn { params, .. }) => params
                     .first()
-                    .map(|p| p.ty.clone())
-                    .unwrap_or(Ty::Untyped),
-                _ => Ty::Untyped,
+                    .map(|p| (*p.ty).clone())
+                    .unwrap_or(Ty::Untyped.into()),
+                _ => Ty::Untyped.into(),
             },
             _ => continue,
         };

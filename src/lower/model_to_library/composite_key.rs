@@ -121,12 +121,12 @@ pub(super) fn rekey(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) 
          def self.primary_key\n  [{names}]\nend\n\
          def self.composite_primary_key?\n  true\nend\n"
     );
-    let strs = Ty::Array { elem: Box::new(Ty::Str) };
+    let strs = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
     for mut m in crate::runtime_src::parse_methods(&source).expect("composite key methods parse") {
         m.enclosing_class = Some(model.name.0.clone());
         let value = Symbol::from("value");
         m.signature = Some(match (m.receiver, m.name.as_str()) {
-            (MethodReceiver::Instance, "id") => fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Untyped) }),
+            (MethodReceiver::Instance, "id") => fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }),
             (MethodReceiver::Instance, _) => fn_sig(vec![(value, Ty::Untyped)], Ty::Untyped),
             (MethodReceiver::Class, "composite_primary_key?") => fn_sig(vec![], Ty::Bool),
             (MethodReceiver::Class, _) => fn_sig(vec![], strs.clone()),

@@ -1,13 +1,9 @@
 //! A global-variable write in a carried method body runs as Ruby runs it.
 //!
-//! Core's `gems/ci/lib/ci/test_onboarding/grind/forking_batch_runner.rb`
-//! restores `$stdout = STDOUT` / `$stderr = STDERR` in a forked child;
-//! the expression ingest refused a global write and the tree carried a
-//! bare `nil` in its place, which Core's strict warnings then raised on
-//! at boot ("possibly useless use of nil in void context"). A global
-//! write is an `LValue::Var` with its `$` name, as a read is; no local
-//! pass (the file program's and a railtie body's pre-declared locals)
-//! takes it for a local.
+//! Reduction: a method that restores `$stdout` / `$stderr` from the values
+//! it saved before capturing them. The expression ingest refused a global
+//! write, so the tree carried a bare `nil` in its place. A global write
+//! is an `LValue::Var` with its `$` name, as a read is.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -64,6 +60,9 @@ fn global_variable_writes_in_a_method_run_as_natively() {
     );
     let run = emit_and_run::empty_app()
         .write("config/environments/development.rb", "Rails.application.configure do\n  config.eager_load = false\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\" do |t|\n    t.string \"name\"\n  end\nend\n")
         .write("lib/stdio_restore.rb", LIB)
         .run_ruby(SCRIPT);
     assert!(run.success, "{}\n{}", run.stdout, run.stderr);

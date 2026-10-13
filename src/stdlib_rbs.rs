@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn value_constants_carry_their_declared_types() {
         assert_eq!(value_type("Encoding::UTF_8").map(|ty| (**ty).clone()),
-            Some(Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::from("Encoding")), args: vec![] }));
+            Some(Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::from("Encoding")), args: Default::default() }));
         assert_eq!(value_type("File::Constants::FNM_EXTGLOB").map(|ty| (**ty).clone()), Some(Ty::Int));
         assert_eq!(value_type("Math::PI").map(|ty| (**ty).clone()), Some(Ty::Float));
         assert!(alias_document().contains("Queue = Thread::Queue\n"));

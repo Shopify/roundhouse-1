@@ -1,6 +1,6 @@
 //! `#: self as T` (RBS inline) and `T.bind(self, T)` (Sorbet) say what
-//! `self` is from that statement to the end of the enclosing body: core
-//! writes them in `included do`, DSL and `define_method` blocks whose
+//! `self` is from that statement to the end of the enclosing body: Rails
+//! code writes them in `included do`, DSL and `define_method` blocks whose
 //! receiver the block is evaluated against. The typer reads the bound
 //! type for implicit- and explicit-self sends; `untyped` makes `self`
 //! gradual; a type nobody declares is reported. The binding runs no
@@ -10,74 +10,90 @@ use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use roundhouse::analyze::Analyzer;
+use roundhouse::analyze::{diagnose, Analyzer};
 use roundhouse::emit::ruby;
+use roundhouse::expr::{Expr, ExprNode};
 use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::ty::Ty;
+use roundhouse::App;
 
 const WIDGET: &str = "class Widget\n  #: -> String\n  def label\n    \"w\"\n  end\nend\n";
 
 const BUILDER: &str = "class Builder\n  #: { () -> void } -> void\n  def self.configure(&block)\n    Widget.new.instance_exec(&block)\n  end\nend\n";
 
-fn check(config: &str) -> String {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("rh_self_binding_{}_{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    for (path, text) in [
-        ("app/lib/widget.rb", WIDGET),
-        ("app/lib/builder.rb", BUILDER),
-        ("app/lib/config.rb", config),
-    ] {
-        let file = root.join(path);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(file, text).unwrap();
-    }
-    let output = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["check", "--continue", "--unknown-sends"])
-        .arg(&root)
-        .output()
-        .unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
-    format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))
+fn tree(config: &str) -> HashMap<PathBuf, Vec<u8>> {
+    [("app/lib/widget.rb", WIDGET), ("app/lib/builder.rb", BUILDER), ("app/lib/config.rb", config)]
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect()
 }
 
-fn summary(unknown: usize, gradual: usize, known: usize) -> String {
-    format!(
-        "roundhouse-check: {unknown} send(s) on unknown receivers, {gradual} on gradual receivers, {known} unresolved on known receivers"
-    )
+fn analyzed(config: &str) -> App {
+    let mut app = ingest_app_from_tree(tree(config)).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    app
+}
+
+/// The rendered diagnostics for `config`, one per line.
+fn check(config: &str) -> String {
+    let app = analyzed(config);
+    diagnose(&app).iter().map(|d| d.render(&app.sources)).collect::<Vec<_>>().join("\n")
+}
+
+/// The type of every send named `method` in `Config`'s methods, in order.
+fn send_types(app: &App, method: &str) -> Vec<Option<Ty>> {
+    fn walk(expr: &Expr, method: &str, out: &mut Vec<Option<Ty>>) {
+        if matches!(&*expr.node, ExprNode::Send { method: m, .. } if m.as_str() == method) {
+            out.push(expr.ty.clone());
+        }
+        expr.node.for_each_child(&mut |child| walk(child, method, out));
+    }
+    let mut out = Vec::new();
+    let config = app.library_classes.iter().find(|c| c.name.0.as_str() == "Config").expect("Config");
+    for m in &config.methods {
+        walk(&m.body, method, &mut out);
+    }
+    out
 }
 
 #[test]
 fn an_implicit_self_send_resolves_against_the_bound_type() {
     let config = "class Config\n  #: -> void\n  def narrowed\n    Builder.configure do\n      #: self as Widget\n      label.upcase\n    end\n  end\n\n  #: -> String\n  def plain\n    #: self as Widget\n    self.label.upcase\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains(&summary(0, 0, 0)), "{text}");
-    assert!(text.contains(" 0 error(s)"), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str), Some(Ty::Str)]);
+    assert_eq!(send_types(&app, "upcase"), vec![Some(Ty::Str), Some(Ty::Str)]);
+}
+
+/// Without the binding the same send has nothing to resolve against.
+#[test]
+fn an_unbound_block_leaves_the_send_untyped() {
+    let config = "class Config\n  #: -> void\n  def narrowed\n    Builder.configure do\n      label.upcase\n    end\n  end\nend\n";
+    let app = analyzed(config);
+    assert_ne!(send_types(&app, "label"), vec![Some(Ty::Str)]);
 }
 
 /// The bound type is checked like any other: a method it does not answer
-/// is a send that resolves to nothing on a known receiver.
+/// stays unresolved instead of being typed.
 #[test]
 fn sends_on_the_bound_type_are_checked() {
     let config = "class Config\n  #: -> void\n  def narrowed\n    Builder.configure do\n      #: self as Widget\n      label.frobnicate\n    end\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains("send `frobnicate` resolves to no method on its known receiver"), "{text}");
-    assert!(text.contains(&summary(0, 0, 1)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str)]);
+    assert_ne!(send_types(&app, "frobnicate"), vec![Some(Ty::Str)]);
 }
 
 #[test]
 fn t_bind_binds_self_like_the_comment() {
     let config = "class Config\n  #: -> void\n  def narrowed\n    Builder.configure do\n      T.bind(self, Widget)\n      label.upcase\n    end\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains(&summary(0, 0, 0)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str)]);
 }
 
 #[test]
 fn self_as_untyped_makes_self_gradual() {
     let config = "class Config\n  #: -> void\n  def loose\n    Builder.configure do\n      #: self as untyped\n      anything.goes\n    end\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains("send `goes` on a gradual (untyped) receiver is unchecked"), "{text}");
-    assert!(text.contains(&summary(0, 1, 0)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "goes"), vec![Some(Ty::Untyped)]);
 }
 
 #[test]
@@ -94,8 +110,9 @@ fn an_undeclared_bound_type_is_reported() {
 #[test]
 fn the_binding_covers_the_rest_of_its_body_only() {
     let config = "class Config\n  #: -> String\n  def own\n    \"c\"\n  end\n\n  #: -> void\n  def mixed\n    own.upcase\n    #: self as Widget\n    [1].each { label.upcase }\n  end\n\n  #: -> void\n  def after\n    own.upcase\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains(&summary(0, 0, 0)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "own"), vec![Some(Ty::Str), Some(Ty::Str)]);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str)]);
 }
 
 /// A binding retypes `self` only: the method it sits in is still the
@@ -104,17 +121,31 @@ fn the_binding_covers_the_rest_of_its_body_only() {
 #[test]
 fn a_bound_method_keeps_its_lexical_owner() {
     let config = "class Config\n  #: -> String\n  def run\n    #: self as Widget\n    label.upcase\n  end\nend\n\nclass Caller\n  #: -> void\n  def call\n    Config.new.run.upcase\n    Widget.new.run\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains("config.rb:13:5: note[unresolved_type]: send `run` resolves to no method on its known receiver"), "{text}");
-    assert!(text.contains(&summary(0, 0, 1)), "{text}");
+    let app = analyzed(config);
+    let mut runs = Vec::new();
+    for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == "Caller") {
+        for m in &class.methods {
+            fn walk(expr: &Expr, out: &mut Vec<Option<Ty>>) {
+                if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "run") {
+                    out.push(expr.ty.clone());
+                }
+                expr.node.for_each_child(&mut |child| walk(child, out));
+            }
+            walk(&m.body, &mut runs);
+        }
+    }
+    // `Config#run` answers its String; `Widget` never gained `run`.
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[0], Some(Ty::Str));
+    assert_ne!(runs[1], Some(Ty::Str));
 }
 
 /// Above a guard clause the binding covers the guard and what follows it.
 #[test]
 fn a_binding_above_a_guard_clause_covers_the_rest() {
     let config = "class Config\n  #: (bool) -> void\n  def guarded(skip)\n    #: self as Widget\n    return if skip\n    label.upcase\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains(&summary(0, 0, 0)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str)]);
 }
 
 /// The comment above a modifier statement is read once, for the whole
@@ -130,8 +161,8 @@ fn a_binding_above_a_modifier_is_read_once() {
 #[test]
 fn a_binding_in_a_brace_block_closed_on_its_last_line_is_read() {
     let config = "class Config\n  #: -> void\n  def braced\n    [1].each {\n      #: self as Widget\n      label.upcase }\n  end\nend\n";
-    let text = check(config);
-    assert!(text.contains(&summary(0, 0, 0)), "{text}");
+    let app = analyzed(config);
+    assert_eq!(send_types(&app, "label"), vec![Some(Ty::Str)]);
 }
 
 /// `singleton(X)` and `T.class_of(X)` bind `self` to the class object, so
@@ -146,16 +177,7 @@ fn a_class_object_binding_puts_self_on_the_class_side() {
 }
 
 fn emitted_config(config: &str) -> String {
-    let tree: HashMap<PathBuf, Vec<u8>> = [
-        ("app/lib/widget.rb", WIDGET),
-        ("app/lib/builder.rb", BUILDER),
-        ("app/lib/config.rb", config),
-    ]
-    .iter()
-    .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
-    .collect();
-    let mut app = ingest_app_from_tree(tree).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
+    let app = analyzed(config);
     ruby::emit_library(&app)
         .into_iter()
         .find(|f| f.path.to_string_lossy().ends_with("config.rb"))
@@ -219,4 +241,27 @@ fn only_the_ruby_family_emits_a_self_binding() {
     std::fs::remove_dir_all(&root).unwrap();
     assert!(ok && !text.contains("self binding"), "{text}");
     assert!(emitted.contains("def shout\n    self.title.to_s.upcase\n  end"), "{emitted}");
+}
+
+/// Only the binding shapes bind: a `T.cast(self, X)` statement that the
+/// sequence discards is an assertion on a value nobody reads, not a
+/// retyping of `self`, and no target refuses it as a binding.
+#[test]
+fn a_discarded_cast_of_self_binds_nothing() {
+    fn bindings(expr: &Expr, out: &mut usize) {
+        if roundhouse::expr::is_self_binding(expr) {
+            *out += 1;
+        }
+        expr.node.for_each_child(&mut |child| bindings(child, out));
+    }
+    let config = "class Config\n  #: -> void\n  def cast_first\n    T.cast(self, Widget)\n    label\n  end\nend\n";
+    let app = analyzed(config);
+    assert_ne!(send_types(&app, "label"), vec![Some(Ty::Str)]);
+    let mut found = 0;
+    for class in &app.library_classes {
+        for m in &class.methods {
+            bindings(&m.body, &mut found);
+        }
+    }
+    assert_eq!(found, 0);
 }

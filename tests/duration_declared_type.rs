@@ -1,7 +1,7 @@
-//! `TTL = 30.minutes #: ActiveSupport::Duration`, Shopify Core's
-//! spelling of a duration constant (110 sites). The Ruby-family trees
-//! ship that class (`runtime/spinel/active_support_duration.rb` and its
-//! CRuby overlay twin), so the ascription names a modeled dependency and
+//! `TTL = 30.minutes #: ActiveSupport::Duration`, a duration constant
+//! with a Sorbet-style ascription. The Ruby-family trees
+//! ship that class (`runtime/spinel/active_support_duration.rb`), so the
+//! ascription names a modeled dependency and
 //! its surface types the reads. A tree that ships no Duration refuses
 //! the value instead.
 #[path = "support/emit_and_run.rs"]
@@ -25,6 +25,9 @@ end
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :things do |t|\n    t.string :name\n  end\nend\n")
         .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
         .write("lib/cache_policy.rb", POLICY)
         .write("test/cache_policy_test.rb", r#"require "test_helper"
@@ -41,7 +44,7 @@ end
 #[test]
 fn a_declared_duration_is_a_modeled_dependency() {
     let (_, errors) = app().emit(BuildTarget::Ruby);
-    assert!(!errors.iter().any(|e| e.contains("ActiveSupport::Duration has no")), "{errors:#?}");
+    assert!(errors.is_empty(), "{errors:#?}");
 }
 
 #[test]
@@ -52,5 +55,5 @@ fn a_declared_duration_runs_in_emitted_ruby() {
 #[test]
 fn a_tree_without_a_duration_class_refuses_it() {
     let (_, errors) = app().emit(BuildTarget::Rust);
-    assert!(errors.iter().any(|e| e.contains("ActiveSupport::Duration")), "{errors:#?}");
+    assert!(errors.iter().any(|e| e.contains("the rust runtime ships none")), "{errors:#?}");
 }

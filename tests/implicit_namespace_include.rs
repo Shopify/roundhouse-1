@@ -1,38 +1,38 @@
 //! An include of a module that only nests other declarations.
 //!
-//! Core's `ShopifyPayments::Kyc::BusinessPlatform` is a Zeitwerk implicit
-//! namespace: a directory of classes with no file of its own. Tax invoice
-//! builders `include Kyc::BusinessPlatform` and read its classes bare.
+//! A Zeitwerk implicit namespace is a directory of classes with no file of
+//! its own (`app/models/outer/inner/leaf/` holding `item.rb`).
+//! A class that does `include Inner::Leaf` reads the nested classes bare.
 //! The include was refused as `includes unresolved` (no class models the
 //! module), though the bare read already resolved through it.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-const BUSINESS_TYPE: &str = r#"module Pay
-  module Kyc
-    module Platform
-      class BusinessType
-        def self.label = "corp"
+const ITEM: &str = r#"module Outer
+  module Inner
+    module Leaf
+      class Item
+        def self.label = "item"
       end
     end
   end
 end
 "#;
 
-const BUILDER: &str = r#"module Pay
-  module Tax
-    class Builder
-      include Kyc::Platform
+const READER: &str = r#"module Outer
+  module Other
+    class Reader
+      include Inner::Leaf
 
-      def label = BusinessType.label
+      def label = Item.label
     end
   end
 end
 "#;
 
-const MISSING: &str = r#"module Pay
+const MISSING: &str = r#"module Outer
   class Broken
-    include Kyc::Nowhere
+    include Inner::Nowhere
   end
 end
 "#;
@@ -40,24 +40,24 @@ end
 #[test]
 fn an_included_implicit_namespace_resolves_and_runs() {
     let run = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("app/models/pay/kyc/platform/business_type.rb", BUSINESS_TYPE)
-        .write("app/models/pay/tax/builder.rb", BUILDER)
-        .run_ruby("puts Pay::Tax::Builder.new.label\nputs Pay::Tax::Builder.include?(Pay::Kyc::Platform)\n");
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("app/models/outer/inner/leaf/item.rb", ITEM)
+        .write("app/models/outer/other/reader.rb", READER)
+        .run_ruby("puts Outer::Other::Reader.new.label\nputs Outer::Other::Reader.include?(Outer::Inner::Leaf)\n");
     run.assert_passes();
-    assert_eq!(run.stdout, "corp\ntrue\n");
-    let builder = std::fs::read_to_string(run.emitted.join("app/models/pay/tax/builder.rb")).expect("builder.rb");
-    assert!(!builder.contains("include not supported"), "{builder}");
+    assert_eq!(run.stdout, "item\ntrue\n");
+    let reader = std::fs::read_to_string(run.emitted.join("app/models/outer/other/reader.rb")).expect("reader.rb");
+    assert!(!reader.contains("include not supported"), "{reader}");
 }
 
-// `ShopifyPayments::Kyc` holds only the implicit `Kyc::BusinessPlatform`,
-// so the modeled class sits two namespaces down.
-const OUTER_BUILDER: &str = r#"module Pay
-  module Tax
-    class Outer
-      include Kyc
+// `Outer::Inner` holds only the implicit `Inner::Leaf`, so the modeled
+// class sits two namespaces down.
+const NESTED_READER: &str = r#"module Outer
+  module Other
+    class Nested
+      include Inner
 
-      def label = Platform::BusinessType.label
+      def label = Leaf::Item.label
     end
   end
 end
@@ -66,14 +66,14 @@ end
 #[test]
 fn an_included_namespace_of_namespaces_resolves_and_runs() {
     let run = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("app/models/pay/kyc/platform/business_type.rb", BUSINESS_TYPE)
-        .write("app/models/pay/tax/outer.rb", OUTER_BUILDER)
-        .run_ruby("puts Pay::Tax::Outer.new.label\nputs Pay::Tax::Outer.include?(Pay::Kyc)\n");
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("app/models/outer/inner/leaf/item.rb", ITEM)
+        .write("app/models/outer/other/nested.rb", NESTED_READER)
+        .run_ruby("puts Outer::Other::Nested.new.label\nputs Outer::Other::Nested.include?(Outer::Inner)\n");
     run.assert_passes();
-    assert_eq!(run.stdout, "corp\ntrue\n");
-    let outer = std::fs::read_to_string(run.emitted.join("app/models/pay/tax/outer.rb")).expect("outer.rb");
-    assert!(!outer.contains("include not supported"), "{outer}");
+    assert_eq!(run.stdout, "item\ntrue\n");
+    let nested = std::fs::read_to_string(run.emitted.join("app/models/outer/other/nested.rb")).expect("nested.rb");
+    assert!(!nested.contains("include not supported"), "{nested}");
 }
 
 #[test]
@@ -83,8 +83,8 @@ fn an_include_naming_no_namespace_stays_refused() {
     let tree: HashMap<PathBuf, Vec<u8>> = [
         ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
-        ("app/models/pay/kyc/platform/business_type.rb", BUSINESS_TYPE),
-        ("app/models/pay/broken.rb", MISSING),
+        ("app/models/outer/inner/leaf/item.rb", ITEM),
+        ("app/models/outer/broken.rb", MISSING),
     ]
     .into_iter()
     .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
@@ -92,5 +92,5 @@ fn an_include_naming_no_namespace_stays_refused() {
     let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
     roundhouse::session::analyze_and_lower(&mut app);
     let errors: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter().map(|d| d.to_string()).collect();
-    assert!(errors.iter().any(|e| e.contains("includes unresolved Kyc::Nowhere")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("includes unresolved Inner::Nowhere")), "{errors:?}");
 }

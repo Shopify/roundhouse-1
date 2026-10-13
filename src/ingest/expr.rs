@@ -4503,12 +4503,34 @@ fn note_signature(body: &Expr, signature: &crate::expr::BlockSignature) {
     });
 }
 
+/// A receiver `&.` may read twice without changing what the program
+/// does: a local, an ivar, a constant, `self`, or a literal.
+fn is_plain_read(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Var { .. }
+            | ExprNode::Ivar { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::SelfRef
+            | ExprNode::Lit { .. }
+    )
+}
+
+/// `a.b.c`: argument-less, block-less calls over a plain read
+/// ([`is_plain_read`]), the `a&.b` reader chain `&.` lowering repeats.
+fn is_reader_chain(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Send { recv: Some(recv), args, block: None, .. } if args.is_empty() => {
+            is_plain_read(recv) || is_reader_chain(recv)
+        }
+        _ => false,
+    }
+}
+
 /// A string literal whose bytes are not UTF-8: `"\x99*\n"` in a
-/// protobuf descriptor (Core's generated `*_pb.rb` files hand
-/// `descriptor_data` to `DescriptorPool#add_serialized_file`). A
+/// serialized binary blob (a generated file's `descriptor_data`). A
 /// `Literal::Str` holds UTF-8 text, and read lossily every invalid byte
-/// became U+FFFD, so the emitted descriptor no longer parsed ("Unable to
-/// parse FileDescriptorProto"). The literal is the same bytes in the
+/// became U+FFFD, so the emitted blob no longer parsed. The literal is the same bytes in the
 /// same encoding instead, built from their hex digits:
 /// `["0a21…"].pack("H*").force_encoding("UTF-8")`, then `.freeze` where
 /// the file's `frozen_string_literal: true` froze the literal. Ruby gives
@@ -4546,28 +4568,4 @@ fn binary_string(s: &ruby_prism::StringNode<'_>, span: Span, file: &str) -> Inge
         value = send(value, "freeze", Vec::new());
     }
     Ok(*value.node)
-}
-
-/// A receiver `&.` may read twice without changing what the program
-/// does: a local, an ivar, a constant, `self`, or a literal.
-fn is_plain_read(e: &Expr) -> bool {
-    matches!(
-        &*e.node,
-        ExprNode::Var { .. }
-            | ExprNode::Ivar { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::SelfRef
-            | ExprNode::Lit { .. }
-    )
-}
-
-/// `a.b.c`: argument-less, block-less calls over a plain read
-/// ([`is_plain_read`]), the `a&.b` reader chain `&.` lowering repeats.
-fn is_reader_chain(e: &Expr) -> bool {
-    match &*e.node {
-        ExprNode::Send { recv: Some(recv), args, block: None, .. } if args.is_empty() => {
-            is_plain_read(recv) || is_reader_chain(recv)
-        }
-        _ => false,
-    }
 }

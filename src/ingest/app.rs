@@ -27,14 +27,15 @@ use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
     ClassKind, ConcernClassMethodSpans, ConcernEnumDecl, classify_class_file,
     ingest_concern_class_method_spans, ingest_concern_filters,
-    ingest_concern_model_items_with_constants, ingest_concern_prepended_items,
-    ingest_helper_method_names, ingest_library_classes, ingest_rails_application_singleton_methods,
+    ingest_concern_included_redefs, ingest_concern_model_items_with_constants,
+    ingest_concern_prepended_items, ingest_helper_method_names, ingest_library_classes,
+    ingest_nested_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
 use super::routes::{EngineRouteSource, RouteHelperSource, ingest_routes_with_engines};
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
-use super::test::ingest_test_files;
+use super::test::{ingest_test_bases, ingest_test_files};
 use super::view::{ViewEngine, ingest_template};
 use super::survey::{self, unwrap_or_record};
 use super::{IngestError, IngestResult};
@@ -98,6 +99,65 @@ pub fn ingest_app_from_tree(tree: HashMap<PathBuf, Vec<u8>>) -> IngestResult<App
 
 /// The actual whole-app walker. Generic over [`Vfs`] so it can read
 /// from disk or from an in-memory map without code duplication.
+/// What `inflections.rb` ingest does with one expression: the single
+/// definition of which `inflect.<m>(…)` calls the app's inflections carry,
+/// shared with the initializer ledger so the two cannot drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum InflectEffect {
+    /// Not a call on the block parameter `inflect`.
+    NotInflect,
+    /// An `inflect.<m>` call no rule reads (`human`, `clear`, a wrong arity).
+    Ignored,
+    /// Carried into `AppInflections`.
+    Carried,
+    /// A `plural`/`singular` regex rule: counted, reported as one survey gap.
+    RegexRule,
+}
+
+/// Apply `e` to `out` when it is an `inflect.<m>(…)` call, and say what happened.
+pub(super) fn apply_inflect_send(
+    e: &crate::expr::Expr,
+    out: &mut crate::naming::AppInflections,
+) -> InflectEffect {
+    use crate::expr::{Expr, ExprNode, Literal};
+    fn strings(e: &Expr, out: &mut Vec<String>) {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => out.push(value.clone()),
+            ExprNode::Lit { value: Literal::Sym { value } } => out.push(value.as_str().to_string()),
+            ExprNode::Array { elements, .. } => elements.iter().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else {
+        return InflectEffect::NotInflect;
+    };
+    if !matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == "inflect") {
+        return InflectEffect::NotInflect;
+    }
+    let mut words = Vec::new();
+    args.iter().for_each(|a| strings(a, &mut words));
+    match method.as_str() {
+        "irregular" if words.len() == 2 => {
+            out.irregular.push((words[0].clone(), words[1].clone()));
+        }
+        "uncountable" => out.uncountable.extend(words),
+        "acronym" => out.acronym.extend(words),
+        // The string form carries; a regex rule cannot.
+        "singular" if words.len() == 2 && args.len() == 2 => {
+            out.singular.push((words[0].clone(), words[1].clone()));
+        }
+        "plural" if words.len() == 2 && args.len() == 2 => {
+            out.plural.push((words[0].clone(), words[1].clone()));
+        }
+        "plural" | "singular" => {
+            out.regex_rules += 1;
+            return InflectEffect::RegexRule;
+        }
+        _ => return InflectEffect::Ignored,
+    }
+    InflectEffect::Carried
+}
+
 /// `config/initializers/inflections.rb` → the app's inflection
 /// declarations: the `inflect.irregular` / `uncountable` / `acronym`
 /// calls inside the `ActiveSupport::Inflector.inflections(:en) do
@@ -158,45 +218,20 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
         }
     }
     fn walk(e: &Expr, file: &str, out: &mut crate::naming::AppInflections) {
-        if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
-            let on_inflect = matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == "inflect");
-            if on_inflect {
-                let mut words = Vec::new();
-                args.iter().for_each(|a| strings(a, &mut words));
+        // What is applied is consumed; a regex rule (or a declaration
+        // with a non-literal word) stays a gap.
+        if apply_inflect_send(e, out) == InflectEffect::Carried {
+            if let ExprNode::Send { method, args, .. } = &*e.node {
                 let literal = args.iter().all(all_literal);
-                let call = (method.as_str().to_string(), words.clone());
                 let applied = match method.as_str() {
-                    "irregular" if words.len() == 2 => {
-                        out.irregular.push((words[0].clone(), words[1].clone()));
-                        literal && args.len() == 2
-                    }
-                    "uncountable" => {
-                        out.uncountable.extend(words);
-                        literal
-                    }
-                    "acronym" => {
-                        out.acronym.extend(words);
-                        literal
-                    }
-                    // The string form carries; a regex rule cannot.
-                    "singular" if words.len() == 2 && args.len() == 2 => {
-                        out.singular.push((words[0].clone(), words[1].clone()));
-                        true
-                    }
-                    "plural" if words.len() == 2 && args.len() == 2 => {
-                        out.plural.push((words[0].clone(), words[1].clone()));
-                        true
-                    }
-                    "plural" | "singular" => {
-                        out.regex_rules += 1;
-                        false
-                    }
-                    _ => false,
+                    "irregular" => literal && args.len() == 2,
+                    "singular" | "plural" => true,
+                    _ => literal,
                 };
-                // What is applied is consumed; a regex rule (or a
-                // declaration with a non-literal word) stays a gap.
                 if applied {
-                    out.calls.push(call);
+                    let mut words = Vec::new();
+                    args.iter().for_each(|a| strings(a, &mut words));
+                    out.calls.push((method.as_str().to_string(), words));
                     super::initializers::consume(file, e.span.start as usize, e.span.end as usize);
                 }
             }
@@ -805,13 +840,16 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                                 survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                             {
                                 let nested = beside_model(&outer, classes, &model_bases);
-                                let (concern_items, concern_enum_decls) =
+                                let (concern_items, concern_enum_decls, concern_guarded) =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
                                     );
-                                app.concern_model_items.extend(concern_items.into_iter().filter(
-                                    |(id, _)| nested.iter().any(|class| class.name == *id),
-                                ));
+                                for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                                    app.concern_included_redefs.entry(id).or_default().push(name);
+                                }
+                                append_concern_items(&mut app, concern_items, concern_guarded, |id| {
+                                    nested.iter().any(|class| class.name == *id)
+                                });
                                 app.concern_prepended_items.extend(
                                     ingest_concern_prepended_items(&source, &path_str, &enum_constants)
                                         .into_iter()
@@ -839,13 +877,19 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         // carry `included do` declarations that belong
                         // to every includer: filters (controller-side)
                         // and model DSL (associations/scopes).
-                        app.concern_filters
-                            .extend(ingest_concern_filters(&source, &path_str));
-                        let (concern_items, concern_enum_decls) =
+                        if let Some(concern_filters) =
+                            unwrap_or_record(ingest_concern_filters(&source, &path_str))?
+                        {
+                            app.concern_filters.extend(concern_filters);
+                        }
+                        let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
-                        app.concern_model_items.extend(concern_items);
+                        for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                            app.concern_included_redefs.entry(id).or_default().push(name);
+                        }
+                        append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
                         app.concern_prepended_items
                             .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
                         app.view_visible_controller_methods
@@ -1002,13 +1046,16 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             let mut names: Vec<crate::ident::ClassId> = nested.iter().map(|c| c.name.clone()).collect();
                             names.push(outer.clone());
                             support_classes.push((entry.clone(), names));
-                            let (concern_items, concern_enum_decls) =
+                            for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                                app.concern_included_redefs.entry(id).or_default().push(name);
+                            }
+                            let (concern_items, concern_enum_decls, concern_guarded) =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
                                 );
-                            app.concern_model_items.extend(concern_items.into_iter().filter(
-                                |(id, _)| nested.iter().any(|class| class.name == *id),
-                            ));
+                            append_concern_items(&mut app, concern_items, concern_guarded, |id| {
+                                nested.iter().any(|class| class.name == *id)
+                            });
                             app.concern_prepended_items.extend(
                                 ingest_concern_prepended_items(&source, &path_str, &enum_constants)
                                     .into_iter()
@@ -1038,9 +1085,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 // Concern lives (`app/utils`, `app/jobs`, `lib`):
                 // collected as under `app/models/concerns`, so it
                 // runs on each includer or is reported there.
-                let (concern_items, concern_enum_decls) =
+                let (concern_items, concern_enum_decls, concern_guarded) =
                     ingest_concern_model_items_with_constants(&source, &path_str, &enum_constants);
-                app.concern_model_items.extend(concern_items);
+                for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                    app.concern_included_redefs.entry(id).or_default().push(name);
+                }
+                append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
                 app.concern_prepended_items
                     .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
                 concern_enums.extend(concern_enum_decls);
@@ -1301,6 +1351,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
+        app.loaded_frameworks =
+            crate::lower::defined_const_fold::loaded_frameworks(&String::from_utf8_lossy(&source));
         let file = app_config_path.display().to_string();
         // Two capture points: methods in the Application class body, and
         // the "site-wide settings" idiom — a top-level
@@ -1765,7 +1817,7 @@ end
             // `assignments`: a reader lifted from one consumes it.
             let mut assignment_sites: Vec<(String, usize, usize)> = Vec::new();
             for (path, bytes) in sources {
-                for a in extract_config_assignments(&bytes, &path) {
+                for a in extract_config_assignments_at(&bytes, &path) {
                     assignments.push((a.path, a.value));
                     assignment_sites.push((path.clone(), a.start, a.end));
                 }
@@ -2173,13 +2225,19 @@ end
                         survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                     {
                         app.library_classes.extend(classes);
-                        app.concern_filters
-                            .extend(ingest_concern_filters(&source, &path_str));
-                        let (concern_items, concern_enum_decls) =
+                        if let Some(concern_filters) =
+                            unwrap_or_record(ingest_concern_filters(&source, &path_str))?
+                        {
+                            app.concern_filters.extend(concern_filters);
+                        }
+                        let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
                                 &source, &path_str, &enum_constants,
                             );
-                        app.concern_model_items.extend(concern_items);
+                        for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                            app.concern_included_redefs.entry(id).or_default().push(name);
+                        }
+                        append_concern_items(&mut app, concern_items, concern_guarded, |_| true);
                         app.concern_prepended_items
                             .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
                         app.view_visible_controller_methods
@@ -2424,7 +2482,7 @@ end
     test_files.sort();
     test_files.dedup();
 
-    // A test-case base the helper DEFINES (`class SqliteTestCompat::TestCase
+    // A test-case base the helper DEFINES (`class GemCompat::TestCase
     // < ActiveSupport::TestCase`), which the app's tests then subclass. A
     // reopen (`class ActiveSupport::TestCase` with no superclass) is the
     // helper configuring Rails' own base, not a class of the app's.
@@ -2448,7 +2506,7 @@ end
                     helper_connection_blockers(vfs, dir, &helper_rb, &source, &extra_test_paths)?;
             }
             if let Some(tms) =
-                unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
+                unwrap_or_record(ingest_test_bases(&source, &helper_rb.display().to_string()))?
             {
                 for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
                     tm.source_file = Some("test/test_helper.rb".to_string());
@@ -2622,7 +2680,9 @@ end
             app.initializer_files.push(path);
         }
     }
-    app.inertia = super::inertia::load_inertia_config(vfs, dir)?;
+    app.vite_manifest = super::vite::read_manifest(vfs, dir);
+    let vite_digest = app.vite_manifest.as_ref().map(|m| m.digest.clone());
+    app.inertia = super::inertia::load_inertia_config(vfs, dir, vite_digest.as_deref())?;
 
     // Every app source is registered by here. Rubydex resolves a
     // SNAPSHOT on another thread while the passes below run, and those
@@ -2737,6 +2797,7 @@ end
     }
     app.i18n = catalog;
     app.i18n.missing = missing_policy(vfs, dir);
+    app.i18n.field_error_proc = field_error_proc_file(vfs, dir);
     crate::i18n::stamp_models(&mut app);
 
     // `sig/**/*.rbs` — user-authored RBS sidecars for app code the
@@ -2860,6 +2921,14 @@ end
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, &sources, &boot_initializers, initializer_defined);
     super::initializer_constants::keep(&mut app, dir, initializer_constants);
+    // The ledger of boot statements no recognizer above read. A warning
+    // per statement, in the ingest diagnostic channel; no `App` field.
+    super::initializer_ledger::record(
+        vfs,
+        dir,
+        &path_gems,
+        &engine_routes.keys().cloned().collect::<HashSet<String>>(),
+    );
     // Carrier provenance must not depend on where a module lives:
     // models, services, helpers and lib all use the same splice.
     let mut concern_class_method_spans = Vec::new();
@@ -2919,6 +2988,10 @@ end
         // ApplicationRecord.include(M) }`: the include ends the model's body.
         super::load_hook_includes::lift_autoload_includes(&mut app, vfs, &boot_initializers);
     }
+    // A model's `begin include(X) rescue NameError end` becomes its
+    // `include`s (or nothing), now that every module of the app is
+    // known; before the qualification below, which reads them.
+    super::guarded_include::splice_guarded_includes(&mut app);
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
     qualify_relative_includes(&mut app);
@@ -2934,6 +3007,12 @@ end
     if let Err(err) = super::alba::lower_alba_resources(&mut app, &sources) {
         survey::continue_or_fail(err)?;
     }
+    // `Dry::Struct` classes become plain readers and a constructor,
+    // before anything reads their methods.
+    super::dry_struct::lower_dry_structs(&mut app, &sources);
+    // After the structs: an option typed with a struct builds the lowered one.
+    super::dry_initializer::lower_dry_initializers(&mut app, &sources);
+    super::dry_initializer::drop_type_constants(&mut app, &sources);
     // graphql-ruby object types: analyzer-only field methods, so
     // inference carries each type's record class down the schema.
     super::graphql_ruby::lower_graphql_types(&mut app);
@@ -2977,6 +3056,9 @@ end
     app.carried_included_blocks =
         super::concern_accessors::carried_included_blocks(&app, &concern_class_method_spans);
     super::anonymous_class_concerns::expand(&mut app);
+    super::acts_as_votable::expand_acts_as_votable(&mut app)?;
+    // After the splice: `include Discard::Model` can arrive through a concern.
+    super::discard::expand_discard_models(&mut app)?;
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     super::define_method_loops::expand(&mut app, &sources);
     super::trusted_id_attribute::expand(&mut app);
@@ -3001,9 +3083,12 @@ end
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
     super::rate_limit::lower_rate_limit(&mut app);
+    // The concern that wraps the pagy gem's `pagy` in a bounds check.
+    super::pagy::lower_pagy(&mut app)?;
     super::invisible_captcha::lower_invisible_captcha(&mut app);
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
+    super::vite::lower_vite_tags(&mut app);
     // The app's own `ActiveSupport.run_load_hooks` sites, and then every
     // initializer statement no reader consumed or refused, carried to
     // run at boot (`initializer_programs`). PostgreSQL trees only: their
@@ -3113,6 +3198,7 @@ end
     // (campfire's `ContentFilters::EDITOR_FORMATTING_ATTRIBUTES`) that
     // are resolved to their literal here.
     app.content_helper_allowed_attributes = content_helper_attribute_additions(vfs, dir, &app);
+    app.content_helper_allowed_tags = content_helper_tag_additions(vfs, dir, &app);
     fold_concern_enums_into_models(&mut app, &concern_enums);
     // Include each base's Concern maps, and retain a child's own maps
     // (direct or Concern-declared) before filling inherited columns.
@@ -4063,9 +4149,12 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
             super::library_class::ingest_app_library_classes(&source, &path_str)
         });
         if ingested.is_ok() {
-            let (concern_items, concern_enum_decls) =
+            let (concern_items, concern_enum_decls, concern_guarded) =
                 ingest_concern_model_items_with_constants(&source, &path_str, enum_constants);
-            app.concern_model_items.extend(concern_items);
+            for (id, name) in ingest_concern_included_redefs(&source, &path_str) {
+                app.concern_included_redefs.entry(id).or_default().push(name);
+            }
+            append_concern_items(app, concern_items, concern_guarded, |_| true);
             app.concern_prepended_items
                 .extend(ingest_concern_prepended_items(&source, &path_str, enum_constants));
             concern_enums.extend(concern_enum_decls);
@@ -4509,9 +4598,34 @@ fn splice_concerns_into_models_named(
                 .flat_map(|(id, items)| {
                     let class_attributes = super::class_attribute::declared_names(items);
                     let (model_name, defined) = (&model_name, &defined);
-                    items.iter().map(move |item| {
-                        rehome_carried(rehome_default_fk(item, id, model_name), id, model_name, &class_attributes, defined)
-                    })
+                    // The module's unconditional items with the guarded
+                    // ones that admit this model, in source order (a
+                    // callback's place in the chain is its order).
+                    // `prepend` reads its own table, which has none.
+                    let guarded: &[crate::app::ConcernGuardedItem] = if prepend {
+                        &[]
+                    } else {
+                        app.concern_guarded_items.get(id).map_or(&[], Vec::as_slice)
+                    };
+                    let includer = model_name.0.as_str();
+                    let mut ordered: Vec<&ModelBodyItem> = Vec::new();
+                    for i in 0..=items.len() {
+                        for g in guarded {
+                            let here = if i == items.len() { g.at >= i } else { g.at == i };
+                            if here && g.guard.admits(includer) {
+                                ordered.push(&g.item);
+                            }
+                        }
+                        if let Some(item) = items.get(i) {
+                            ordered.push(item);
+                        }
+                    }
+                    ordered
+                        .into_iter()
+                        .map(move |item| {
+                            rehome_carried(rehome_default_fk(item, id, model_name), id, model_name, &class_attributes, defined)
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect();
             if items.is_empty() {
@@ -4525,10 +4639,10 @@ fn splice_concerns_into_models_named(
 }
 
 /// The concern an `include` arg written inside `owner` names. A rooted
-/// `::Ms::Concerns::X` (a leading empty segment) names the top-level
-/// `Ms::Concerns::X`, with no lexical lookup. A relative `Concerns::X`
-/// resolves from the owner's namespace outward (`Ms::Price::Concerns::X`,
-/// then `Ms::Concerns::X`), innermost first, falling back to the path as
+/// `::Blog::Concerns::X` (a leading empty segment) names the top-level
+/// `Blog::Concerns::X`, with no lexical lookup. A relative `Concerns::X`
+/// resolves from the owner's namespace outward (`Blog::Post::Concerns::X`,
+/// then `Blog::Concerns::X`), innermost first, falling back to the path as
 /// written. Keyed by the written path, a rooted include matched no
 /// concern and its `included do` block vanished from the includer.
 fn concern_named<V>(
@@ -6129,6 +6243,15 @@ const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
     // this generic one — see those functions' doc comments.
     "alias_method",
     "undef_method",
+    // `with_options(kw) do … end` — `ingest::controller::
+    // ingest_controller_with_options` claims every one of these at
+    // ingest time, before this scan ever runs: composed, it folds into
+    // the `Filter`/other body items its block held and never becomes an
+    // `Unknown` at all; declined, it stays `Unknown` WITH its own
+    // specific "with_options: …" gap already recorded (ALL-OR-NOTHING —
+    // see that function's doc comment). Either way this generic bucket
+    // (and the block-shaped one just below) would only double it.
+    "with_options",
 ];
 
 /// `using SomeRefinement` — Ruby's block-scoped monkey-patch
@@ -6285,8 +6408,22 @@ fn report_unrecognized_controller_macros(app: &App) {
                 });
                 continue;
             }
+            // Two more causes that already recorded their OWN specific
+            // gap for this exact method name — this generic bucket must
+            // not ALSO flag the call, which would double it.
+            // `stored_options_init`'s writer/reader split is one; a
+            // macro whose body held a BLOCK-FORM
+            // `around_action` that `controller::around_block_filter`
+            // recognized but refused (`app::expand_macro_filters`'
+            // `AroundRefusal`) is the other — the same exemption a
+            // hand-written `around_action { ... }` refusal already gets
+            // just above (`NAMED_CLAIMED_CONTROLLER_BLOCKS`), extended
+            // to the macro path, which reaches this blockless-call
+            // branch instead (the block lives in the macro's OWN body,
+            // not on this call site).
             if survey::recorded().iter().any(|gap| {
-                gap.contains("class configuration") && gap.contains(method.as_str())
+                (gap.contains("class configuration") || gap.contains("holds an around_action block that"))
+                    && gap.contains(method.as_str())
             }) {
                 continue;
             }
@@ -6414,6 +6551,16 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
             .filter_map(|(name, definitions)| (definitions > 1).then_some(name))
             .collect();
         shadowed_macros.extend(inherited_class_methods[&controller.name].iter().cloned());
+        // Shared with this controller's own hand-written block-form
+        // `around_action` pass (`ingest::controller::
+        // ingest_controller_with_nesting`), which always runs first:
+        // same owner-ident encoding, and a starting sequence number
+        // picked up AFTER whatever it already placed, so a macro's own
+        // block-form `around_action` never synthesizes the same method
+        // name as a hand-written one on this controller.
+        let around_block_owner_ident = super::controller::around_block_owner_ident(&controller.name);
+        let mut around_block_seq =
+            super::controller::next_around_block_seq(&controller.body, &around_block_owner_ident);
         let mut expanded: Vec<ControllerBodyItem> = Vec::new();
         for item in std::mem::take(&mut controller.body) {
             let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = &item
@@ -6508,7 +6655,13 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
             };
             let param_names: Vec<crate::Symbol> =
                 macro_def.params.iter().map(|p| p.name.clone()).collect();
-            match expand_macro_filters(&body, &module, &param_names) {
+            match expand_macro_filters(
+                &body,
+                &module,
+                &param_names,
+                &around_block_owner_ident,
+                &mut around_block_seq,
+            ) {
                 Ok(items) => {
                     let mut comments = leading_comments.clone();
                     let mut blank = *leading_blank_line;
@@ -6536,6 +6689,25 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                                     expr,
                                     leading_comments: std::mem::take(&mut comments),
                                     leading_blank_line: std::mem::take(&mut blank),
+                                });
+                            }
+                            // A block-form `around_action` the macro body
+                            // wraps — already fully lowered (synthesized
+                            // method, named `Around` filter) by
+                            // `controller::around_block_filter` itself,
+                            // unlike `Block` above: registered on THIS
+                            // controller (where the macro is called), same
+                            // as a hand-written one would be.
+                            MacroFilterItem::Around(filter, action) => {
+                                expanded.push(ControllerBodyItem::Filter {
+                                    filter,
+                                    leading_comments: std::mem::take(&mut comments),
+                                    leading_blank_line: std::mem::take(&mut blank),
+                                });
+                                expanded.push(ControllerBodyItem::Action {
+                                    action,
+                                    leading_comments: Vec::new(),
+                                    leading_blank_line: false,
                                 });
                             }
                         }
@@ -6568,6 +6740,23 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                     } else {
                         return Err(err);
                     }
+                }
+                // A block-form `around_action` `controller::
+                // around_block_filter` recognized but refused — same
+                // always-record-and-keep-whole shape as `NotFilterDsl`
+                // just below (this macro call is one gap, not a hard
+                // ingest failure), but with that function's own specific
+                // reason instead of the generic message.
+                Err(MacroExpansionRefusal::AroundRefusal(reason)) => {
+                    survey::record(&IngestError::Unsupported {
+                        file: format!("{}", controller.name.0.as_str()),
+                        message: format!(
+                            "class-body macro not expanded: `{}` from {} holds an around_action block that {reason}",
+                            method.as_str(),
+                            module.0.as_str()
+                        ),
+                    });
+                    expanded.push(item);
                 }
                 Err(MacroExpansionRefusal::NotFilterDsl) => {
                     survey::record(&IngestError::Unsupported {
@@ -7277,6 +7466,16 @@ fn filter_from_send(
 enum MacroFilterItem {
     Filter(crate::dialect::Filter),
     Block(crate::expr::Expr),
+    /// A block-form `around_action` the macro body wraps, already fully
+    /// lowered by `controller::around_block_filter` — a named `Around`
+    /// filter plus the synthesized method it dispatches to. Unlike
+    /// `Block` (which rides the SAME later path a hand-written
+    /// `before_action { ... }` does, via `lambda_filter_target`),
+    /// `around_action`'s own lowering has no such shared path to defer
+    /// to: `is_lambda_filter_macro` excludes it on purpose (see that
+    /// function's doc comment), so this crate's one around-action
+    /// lowering is called here directly instead of being duplicated.
+    Around(crate::dialect::Filter, crate::dialect::Action),
 }
 
 /// Every statement of a (parameter-substituted) macro body, expanded to a
@@ -7341,6 +7540,14 @@ enum MacroExpansionRefusal {
     /// parameter, …) — those stay `NotFilterDsl`, same as before this
     /// variant existed.
     NextRestructure { method: crate::Symbol },
+    /// A block-form `around_action` statement `controller::
+    /// around_block_filter` recognized but refused — the continuation
+    /// used for something other than a bare `.call`, 3+ block params, or
+    /// an unrepresentable option. Carries that function's own `reason`
+    /// string verbatim, the same specific wording a hand-written
+    /// `around_action { ... }` refusal already surfaces, rather than
+    /// folding it into `NotFilterDsl`'s generic message.
+    AroundRefusal(String),
     /// Every other refusal this function already had: an unreducible
     /// local, a statement that's neither Symbol-target nor block-form
     /// filter DSL, one after the filter, or no filter at all.
@@ -7351,6 +7558,8 @@ fn expand_macro_filters(
     body: &crate::expr::Expr,
     module: &crate::ident::ClassId,
     param_names: &[crate::Symbol],
+    owner_ident: &str,
+    around_seq: &mut u32,
 ) -> Result<Vec<MacroFilterItem>, MacroExpansionRefusal> {
     use crate::expr::{ExprNode, LValue};
 
@@ -7441,6 +7650,36 @@ fn expand_macro_filters(
                 && super::controller::next_restructure_refusal(candidate)
             {
                 return Err(MacroExpansionRefusal::NextRestructure { method: method.clone() });
+            }
+            // `around_action`'s block form is excluded from `is_lambda_
+            // filter_macro` on purpose (see its doc comment): a
+            // before/after block inlines as a plain conditional
+            // statement, but an around has to run the rest of the
+            // filter chain from inside its own body, which that path
+            // can't express. `controller::around_block_filter` is the
+            // ONE lowering for that shape, reused here rather than
+            // duplicated — same refusals, same synthesized-method
+            // machinery, just reached through a macro's (already
+            // parameter-substituted) body instead of a controller's own
+            // source. `raw_text: None`: this statement came from the
+            // macro's IR, not from source text in THIS file, so the one
+            // check that reads source text (the `.()` sugar spelling —
+            // see `around_block_filter`'s doc comment) is skipped.
+            if method.as_str() == "around_action" {
+                match super::controller::around_block_filter(candidate, None, owner_ident, around_seq)
+                {
+                    Some(Ok((filter, action))) => {
+                        out.push(MacroFilterItem::Around(filter, action));
+                        seen_filter = true;
+                        continue;
+                    }
+                    Some(Err(reason)) => return Err(MacroExpansionRefusal::AroundRefusal(reason)),
+                    // Not actually this shape (shouldn't happen given the
+                    // `method.as_str() == "around_action"` check above) —
+                    // fall through to the generic refusal rather than
+                    // silently drop the statement.
+                    None => return Err(MacroExpansionRefusal::NotFilterDsl),
+                }
             }
         }
         if let Some(block) = block_filter_from_macro_stmt(candidate) {
@@ -8681,9 +8920,8 @@ fn qualify_relative_includes(app: &mut App) {
         })
         .collect();
     // Past the lexical scopes Ruby searches the class's ancestors before
-    // the top level: Core's `Customers::CustomerEntity <
-    // CustomerFoundations::Entity` opens with `include(WithIdentifiers)`,
-    // which is `CustomerFoundations::Entity::WithIdentifiers`.
+    // the top level: `class Child < Base::Entity` opening with
+    // `include(WithIds)` means `Base::Entity::WithIds`.
     let parents: HashMap<String, crate::ident::ClassId> = app
         .library_classes
         .iter()
@@ -8732,6 +8970,7 @@ fn qualify_relative_includes(app: &mut App) {
                 continue;
             }
             let mut class = owner.clone();
+            // A cycle guard on the superclass walk.
             for _ in 0..32 {
                 let Some(parent) = parents.get(&class) else { break };
                 let written: Vec<crate::ident::Symbol> =
@@ -9662,7 +9901,7 @@ fn validate_additional_test_paths<V: Vfs + ?Sized>(
 }
 
 /// Return true when a path component below `root` is a symbolic link.
-fn path_has_symlink_component<V: Vfs + ?Sized>(vfs: &V, root: &Path, path: &Path) -> bool {
+pub(super) fn path_has_symlink_component<V: Vfs + ?Sized>(vfs: &V, root: &Path, path: &Path) -> bool {
     let relative = if root.as_os_str().is_empty() {
         path
     } else if let Ok(relative) = path.strip_prefix(root) {
@@ -9973,6 +10212,29 @@ fn gem_source_dirs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<(St
 /// The classes from `classes` that are NESTED under `outer` — the ones
 /// a model's or controller's own body walk skipped. The outer class
 /// itself is ingested by its own pass and must not be registered twice.
+/// Add one file's concern items to the app's, per module. A concern can
+/// be reopened in another file, and every `included do` block it has runs
+/// for the includer, so a second file's items are appended to the first's
+/// rather than replacing them.
+fn append_concern_items(
+    app: &mut App,
+    items: Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>,
+    guarded: super::library_class::ConcernGuardedItems,
+    keep: impl Fn(&crate::ident::ClassId) -> bool,
+) {
+    // A guarded item's `at` counts the unconditional items before it in
+    // its own file; offset it by what earlier files already hold.
+    for (id, items) in guarded.into_iter().filter(|(id, _)| keep(id)) {
+        let offset = app.concern_model_items.get(&id).map_or(0, Vec::len);
+        app.concern_guarded_items.entry(id).or_default().extend(
+            items.into_iter().map(|g| crate::app::ConcernGuardedItem { at: g.at + offset, ..g }),
+        );
+    }
+    for (id, items) in items.into_iter().filter(|(id, _)| keep(id)) {
+        app.concern_model_items.entry(id).or_default().extend(items);
+    }
+}
+
 fn nested_under(
     outer: &crate::ident::ClassId,
     classes: Vec<crate::dialect::LibraryClass>,
@@ -11432,7 +11694,7 @@ fn default_package_scan<V: Vfs + ?Sized>(vfs: &V, dir: &Path, out: &mut Vec<Path
 /// `time_zone` readers next to it: the file is railtie soup ingest does
 /// not model, and the generator ships the `<<` form commented out, so
 /// comment lines have to stay unmatched.
-fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
+pub(super) fn extract_autoload_path_roots(source: &[u8]) -> Vec<String> {
     let source = String::from_utf8_lossy(source);
     let mut roots = Vec::new();
     for line in source.lines() {
@@ -11751,7 +12013,7 @@ fn lib_dir_is_explicitly_required<V: Vfs + ?Sized>(vfs: &V, dir: &Path, subdir: 
 /// deliberately not parsed); commented lines don't match. Absent call
 /// or unrecognized shape → empty list (walk everything, the prior
 /// behavior).
-fn extract_autoload_lib_ignores(source: &[u8]) -> Vec<String> {
+pub(super) fn extract_autoload_lib_ignores(source: &[u8]) -> Vec<String> {
     let source = String::from_utf8_lossy(source);
     for line in source.lines() {
         let t = line.trim_start();
@@ -11877,7 +12139,7 @@ pub(super) const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
 /// `"%Y%m%d%H%M%S"` here), so it is deliberately not folded in:
 /// Date's format registry is not modeled, and sharing Time's table would
 /// render a full timestamp where Rails renders eight digits.
-fn extract_time_formats(
+pub(super) fn extract_time_formats(
     source: &[u8],
     file: &str,
 ) -> Vec<(String, TimeFormatSource, (usize, usize))> {
@@ -11976,7 +12238,7 @@ fn extract_time_formats(
 /// `prepend`/`include`, and the single argument is a constant — three
 /// facts readable off the parse with nothing resolved. Anything else in
 /// the file is ignored, exactly as it is today.
-fn extract_module_mixins(source: &[u8], file: &str) -> Vec<crate::app::ModuleMixin> {
+pub(super) fn extract_module_mixins(source: &[u8], file: &str) -> Vec<crate::app::ModuleMixin> {
     use crate::app::{MixinKind, ModuleMixin};
 
     let result = super::prism::parse(source, file);
@@ -12038,9 +12300,48 @@ fn extract_module_mixins(source: &[u8], file: &str) -> Vec<crate::app::ModuleMix
 ///   constant holding one. Anything else is a survey gap — the addition
 ///   is a computation this does not evaluate — rather than a guess.
 ///
-/// (`allowed_tags` has the same shape and is not read: nothing in the
-/// runtime consults Action Text's tag list.)
 fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &App) -> Vec<String> {
+    let mut out = content_helper_allow_list_additions(
+        vfs,
+        dir,
+        app,
+        "allowed_attributes=",
+        &["allowed_attributes", "sanitizer_allowed_attributes"],
+        "allowed_attributes",
+    );
+    if app.gem_lock.as_ref().is_some_and(|l| l.has("lexxy")) {
+        for n in ["controls", "poster", "data-language", "style", "value", "start"] {
+            if !out.iter().any(|x| x == n) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Same shape as attributes: campfire unions
+/// `ContentFilters::EDITOR_FORMATTING_TAGS` into `allowed_tags` at boot.
+/// Sanitize-on-render consults this list, so the additions must land in
+/// the emitted runtime (unlike the prior storage-only path).
+fn content_helper_tag_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &App) -> Vec<String> {
+    content_helper_allow_list_additions(
+        vfs,
+        dir,
+        app,
+        "allowed_tags=",
+        &["allowed_tags", "sanitizer_allowed_tags"],
+        "allowed_tags",
+    )
+}
+
+fn content_helper_allow_list_additions<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    app: &App,
+    assignment: &str,
+    base_methods: &[&str],
+    field: &str,
+) -> Vec<String> {
     use crate::expr::{ExprNode, Literal};
 
     let mut out: Vec<String> = Vec::new();
@@ -12051,15 +12352,6 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
             }
         }
     };
-    if app.gem_lock.as_ref().is_some_and(|l| l.has("lexxy")) {
-        add(
-            ["controls", "poster", "data-language", "style", "value", "start"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            &mut out,
-        );
-    }
 
     fn string_list(e: &crate::expr::Expr) -> Option<Vec<String>> {
         let ExprNode::Array { elements, .. } = &*e.node else { return None };
@@ -12073,13 +12365,13 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
     }
     // The current value or the framework defaults — what the runtime's
     // own list already is.
-    fn is_base(e: &crate::expr::Expr) -> bool {
+    fn is_base(e: &crate::expr::Expr, base_methods: &[&str]) -> bool {
         match &*e.node {
-            ExprNode::Send { method, .. } => {
-                matches!(method.as_str(), "allowed_attributes" | "sanitizer_allowed_attributes")
+            ExprNode::Send { method, .. } => base_methods.iter().any(|m| method.as_str() == *m),
+            ExprNode::BoolOp { left, right, .. } => {
+                is_base(left, base_methods) && is_base(right, base_methods)
             }
-            ExprNode::BoolOp { left, right, .. } => is_base(left) && is_base(right),
-            ExprNode::Seq { exprs } if exprs.len() == 1 => is_base(&exprs[0]),
+            ExprNode::Seq { exprs } if exprs.len() == 1 => is_base(&exprs[0], base_methods),
             _ => false,
         }
     }
@@ -12123,7 +12415,7 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
         let Some(program) = root.as_program_node() else { continue };
         for stmt in initializer_statements(&program) {
             let Some(call) = stmt.as_call_node() else { continue };
-            if super::util::constant_id_str(&call.name()) != "allowed_attributes=" {
+            if super::util::constant_id_str(&call.name()) != assignment {
                 continue;
             }
             let Some(recv) = call.receiver() else { continue };
@@ -12138,7 +12430,7 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
             operands(&value, &mut ops);
             let mut all_applied = true;
             for op in ops {
-                if is_base(op) {
+                if is_base(op, base_methods) {
                     continue;
                 }
                 match resolve(op) {
@@ -12147,7 +12439,9 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
                         all_applied = false;
                         survey::record(&IngestError::Unsupported {
                             file: file.clone(),
-                            message: "ActionText::ContentHelper.allowed_attributes addition is not a literal list or a constant holding one; the attributes it adds are not allowed by the emitted sanitizer".to_string(),
+                            message: format!(
+                                "ActionText::ContentHelper.{field} addition is not a literal list or a constant holding one; the {field} it adds are not allowed by the emitted sanitizer"
+                            ),
                         })
                     }
                 }
@@ -12223,7 +12517,7 @@ pub(super) fn initializer_statements<'a>(program: &ruby_prism::ProgramNode<'a>) 
 /// the parse. `except:`, a block, an `if:` — anything else — is not
 /// recorded, and the lowering reports the target it never sees a
 /// filter for.
-fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crate::app::InitializerFilter> {
+pub(super) fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crate::app::InitializerFilter> {
     use crate::app::InitializerFilter;
 
     let result = super::prism::parse(source, file);
@@ -12295,7 +12589,7 @@ pub(super) fn constant_text(node: &Node, src: &str) -> Option<String> {
 
 /// A registered format as its initializer spells it, before the lambda
 /// form is parsed into IR.
-enum TimeFormatSource {
+pub(super) enum TimeFormatSource {
     Strftime(String),
     Lambda { param: String, body: String },
 }
@@ -12316,6 +12610,15 @@ struct ConfigAssignment {
     start: usize,
     end: usize,
 }
+
+/// [`extract_config_assignments_at`] without the statement ranges.
+pub(super) fn extract_config_assignments(source: &[u8], file: &str) -> Vec<(Vec<String>, String)> {
+    extract_config_assignments_at(source, file)
+        .into_iter()
+        .map(|a| (a.path, a.value))
+        .collect()
+}
+
 
 /// Framework config an initializer may write that is deliberately INERT
 /// for the emitted runtime: setting it changes nothing the emitted app
@@ -12421,7 +12724,7 @@ pub(super) fn inert_framework_config(path: &[String]) -> bool {
     })
 }
 
-fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment> {
+fn extract_config_assignments_at(source: &[u8], file: &str) -> Vec<ConfigAssignment> {
     let result = super::prism::parse(source, file);
     let root = result.node();
     let src = String::from_utf8_lossy(source).into_owned();
@@ -13107,7 +13410,7 @@ fn extract_app_namespace(source: &[u8]) -> Option<String> {
     None
 }
 
-fn extract_session_cookie_key(bytes: &[u8], file: &str) -> Option<String> {
+pub(super) fn extract_session_cookie_key(bytes: &[u8], file: &str) -> Option<String> {
     let source = String::from_utf8_lossy(bytes);
     let mut seen_session_store: Option<usize> = None;
     let mut found = None;
@@ -13193,7 +13496,7 @@ fn quoted_after_key_label(text: &str) -> Option<String> {
 }
 
 /// Result of scanning an initializer for `video_preview_arguments`.
-enum VideoPreviewArgsExtract {
+pub(super) enum VideoPreviewArgsExtract {
     Absent,
     Value(String),
     /// Assignment present but not a pure string-literal concatenation.
@@ -13205,7 +13508,7 @@ enum VideoPreviewArgsExtract {
 /// the way campfire tip writes the `-vf … -frames:v 1 -f image2` argv.
 /// Returns the joined runtime string. Computed RHS forms (`+ ENV…`) are
 /// `Unsupported` rather than a wrong joined literal.
-fn extract_video_preview_arguments(source: &[u8]) -> VideoPreviewArgsExtract {
+pub(super) fn extract_video_preview_arguments(source: &[u8]) -> VideoPreviewArgsExtract {
     let source = String::from_utf8_lossy(source);
     let mut lines = source.lines().peekable();
     while let Some(line) = lines.next() {
@@ -13380,7 +13683,7 @@ fn consume_config_assignment(bytes: &[u8], file: &str, needle: &str) {
 /// Returns the replacement's written name (e.g. `TimeLimitedVideoPreviewer`).
 /// Full-line comments are stripped so a commented-out swap cannot match;
 /// the assignment + `.map` form is required (not a bare class mention).
-fn extract_video_previewer_replacement(source: &[u8]) -> Option<String> {
+pub(super) fn extract_video_previewer_replacement(source: &[u8]) -> Option<String> {
     let source = String::from_utf8_lossy(source);
     let active: String = source
         .lines()
@@ -13420,7 +13723,7 @@ fn extract_video_previewer_replacement(source: &[u8]) -> Option<String> {
 /// (campfire breaks after the `-=`), so the scan continues to the
 /// closing bracket. Only the subtractive form: an app REPLACING the
 /// list (`= %w[…]`) is not read, and keeps Rails' default.
-fn extract_variable_content_type_exclusions(bytes: &[u8], file: &str) -> Vec<String> {
+pub(super) fn extract_variable_content_type_exclusions(bytes: &[u8], file: &str) -> Vec<String> {
     let source = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     let mut lines = source.lines();
@@ -13457,7 +13760,7 @@ fn extract_variable_content_type_exclusions(bytes: &[u8], file: &str) -> Vec<Str
 /// only the `true` arms are policy (`false` is libvips' default).
 /// Parens are optional (`Vips.block_untrusted true`); a `#` comment
 /// does not count. Named blocks accept double or single quotes.
-fn extract_vips_loader_policy(bytes: &[u8], file: &str) -> (bool, Vec<String>) {
+pub(super) fn extract_vips_loader_policy(bytes: &[u8], file: &str) -> (bool, Vec<String>) {
     let source = String::from_utf8_lossy(bytes);
     // The applied calls (the `true` arms) are consumed: each is the
     // innermost statement at its line, a `Vips.block*` call.
@@ -13511,16 +13814,25 @@ fn extract_vips_loader_policy(bytes: &[u8], file: &str) -> (bool, Vec<String>) {
 /// read) is recognized but not evaluated: it is a survey gap, and this
 /// file contributes no page size rather than a guessed one.
 fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
+    kaminari_default_per_page(source, file).1
+}
+
+/// `(recognized, value)`: `recognized` is true when the source holds a
+/// `Kaminari.configure do |c| … c.default_per_page = … end` this reader
+/// reads (the initializer ledger's definition of "consumed"), whether or
+/// not its value is a positive Integer literal.
+pub(super) fn kaminari_default_per_page(source: &[u8], file: &str) -> (bool, Option<u64>) {
     let src = String::from_utf8_lossy(source);
     // Cheap skip before parsing: this runs over every initializer, and
     // most never name Kaminari.
     if !src.contains("Kaminari") {
-        return None;
+        return (false, None);
     }
     let result = super::prism::parse(source, file);
     let root = result.node();
-    let program = root.as_program_node()?;
+    let Some(program) = root.as_program_node() else { return (false, None) };
     let mut found = None;
+    let mut recognized = false;
     for stmt in initializer_statements(&program) {
         let Some(call) = stmt.as_call_node() else { continue };
         if super::util::constant_id_str(&call.name()) != "configure" {
@@ -13554,6 +13866,7 @@ fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
             if !on_param {
                 continue;
             }
+            recognized = true;
             let Some(args) = assign.arguments() else { continue };
             let args: Vec<_> = args.arguments().iter().collect();
             let [value] = args.as_slice() else { continue };
@@ -13579,7 +13892,7 @@ fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
             found = literal;
         }
     }
-    found
+    (recognized, found)
 }
 
 /// The two `config.active_support` settings the ActiveSupport::Cache port
@@ -13754,13 +14067,38 @@ fn app_helpers_blank_token_tag<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
     })
 }
 
+/// `:header_only` / `:header_or_legacy_token` at the start of `text`.
+fn forgery_strategy_value(text: &str) -> Option<String> {
+    let v = text.trim().trim_start_matches(':');
+    let name: String =
+        v.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    matches!(name.as_str(), "header_only" | "header_or_legacy_token").then_some(name)
+}
+
+/// The strategy an explicit `config.action_controller.forgery_protection_
+/// verification_strategy = :x` line (already trimmed, not a comment) sets.
+pub(super) fn forgery_strategy_line(line: &str) -> Option<String> {
+    let rest =
+        line.strip_prefix("config.action_controller.forgery_protection_verification_strategy")?;
+    rest.trim().strip_prefix('=').and_then(forgery_strategy_value)
+}
+
+/// The version a `config.load_defaults 8.1` / `config.load_defaults(8.1)`
+/// line (already trimmed, not a comment) names.
+pub(super) fn load_defaults_version(line: &str) -> Option<f64> {
+    let rest = line.strip_prefix("config.load_defaults")?;
+    let version: String = rest
+        .trim()
+        .trim_start_matches('(')
+        .trim_matches(|c| c == '"' || c == '\'')
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    version.parse::<f64>().ok()
+}
+
 fn read_forgery_verification_strategy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<String> {
-    fn strategy_value(text: &str) -> Option<String> {
-        let v = text.trim().trim_start_matches(':');
-        let name: String =
-            v.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-        matches!(name.as_str(), "header_only" | "header_or_legacy_token").then_some(name)
-    }
+    let strategy_value = forgery_strategy_value;
     let code_lines = |bytes: &[u8]| -> Vec<String> {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -13773,17 +14111,8 @@ fn read_forgery_verification_strategy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> O
     if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
         let lines = code_lines(&source);
         for line in &lines {
-            if let Some(rest) = line.strip_prefix("config.load_defaults") {
-                let version: String = rest
-                    .trim()
-                    .trim_start_matches('(')
-                    .trim_matches(|c| c == '"' || c == '\'')
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.')
-                    .collect();
-                if let Ok(v) = version.parse::<f64>() {
-                    strategy = (v >= 8.2).then(|| "header_only".to_string());
-                }
+            if let Some(v) = load_defaults_version(line) {
+                strategy = (v >= 8.2).then(|| "header_only".to_string());
             }
         }
         config_files.push(lines);
@@ -13802,12 +14131,8 @@ fn read_forgery_verification_strategy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> O
         }
     }
     for line in config_files.iter().flatten() {
-        if let Some(rest) =
-            line.strip_prefix("config.action_controller.forgery_protection_verification_strategy")
-        {
-            if let Some(v) = rest.trim().strip_prefix('=').and_then(strategy_value) {
-                strategy = Some(v);
-            }
+        if let Some(v) = forgery_strategy_line(line) {
+            strategy = Some(v);
         }
     }
     let controllers = dir.join("app/controllers");
@@ -13855,18 +14180,9 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
     if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
         let lines = code_lines(&source);
         for line in &lines {
-            if let Some(rest) = line.strip_prefix("config.load_defaults") {
-                // `config.load_defaults 8.1` and `config.load_defaults(8.1)`.
-                let version: String = rest
-                    .trim()
-                    .trim_start_matches('(')
-                    .trim_matches(|c| c == '"' || c == '\'')
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.')
-                    .collect();
-                if let Ok(v) = version.parse::<f64>() {
-                    default = v >= 7.0;
-                }
+            // `config.load_defaults 8.1` and `config.load_defaults(8.1)`.
+            if let Some(v) = load_defaults_version(line) {
+                default = v >= 7.0;
             }
         }
         files.push(lines);
@@ -13882,26 +14198,37 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
         }
     }
     for line in files.iter().flatten() {
-        if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
-            let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
-            if rest.starts_with("true") {
-                default = true;
-            } else if rest.starts_with("false") {
-                default = false;
-            }
-        } else if let Some(rest) = line.strip_prefix("wrap_parameters format:") {
-            // Receiverless only — `WidgetsController.wrap_parameters …` is
-            // that controller's call, not the app-wide on_load default.
-            // Format alone (the pre-7 generator); `include:` / `exclude:` /
-            // `name:` on the same line are not modeled as the app default.
-            if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
-                continue;
-            }
-            // Exact `:json` / `json` entry — not a substring of `:json_api`.
-            default = wrap_parameters_format_includes_json(rest);
+        if let Some(v) = wrap_parameters_line(line) {
+            default = v;
         }
     }
     default
+}
+
+/// What a trimmed, non-comment config line sets the app-wide
+/// `wrap_parameters_by_default` to, or `None` when the line says nothing
+/// about it. One definition for the lift and the initializer ledger.
+pub(super) fn wrap_parameters_line(line: &str) -> Option<bool> {
+    if let Some(i) = line.find("action_controller.wrap_parameters_by_default") {
+        let rest = line[i..].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+        if rest.starts_with("true") {
+            return Some(true);
+        }
+        if rest.starts_with("false") {
+            return Some(false);
+        }
+        return None;
+    }
+    let rest = line.strip_prefix("wrap_parameters format:")?;
+    // Receiverless only — `WidgetsController.wrap_parameters …` is
+    // that controller's call, not the app-wide on_load default.
+    // Format alone (the pre-7 generator); `include:` / `exclude:` /
+    // `name:` on the same line are not modeled as the app default.
+    if rest.contains("include:") || rest.contains("exclude:") || rest.contains("name:") {
+        return None;
+    }
+    // Exact `:json` / `json` entry — not a substring of `:json_api`.
+    Some(wrap_parameters_format_includes_json(rest))
 }
 
 /// Whether a `wrap_parameters format: …` argument list names `:json`
@@ -13913,7 +14240,7 @@ fn wrap_parameters_format_includes_json(rest: &str) -> bool {
         .any(|tok| tok == ":json" || tok == "json")
 }
 
-fn extract_config_time_zone(source: &[u8]) -> Option<String> {
+pub(super) fn extract_config_time_zone(source: &[u8]) -> Option<String> {
     let source = String::from_utf8_lossy(source);
     for line in source.lines() {
         let t = line.trim_start();
@@ -14479,6 +14806,12 @@ fn inherit_enums(models: &mut [crate::dialect::Model]) {
 }
 
 /// `config.i18n.default_locale = :xx` in `config/application.rb`, else `en`.
+/// The locale a trimmed config line's `config.i18n.default_locale = :xx` names.
+pub(super) fn default_locale_line(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("config.i18n.default_locale").map(str::trim)?;
+    locale_literal(rest.strip_prefix('=')?.trim())
+}
+
 fn default_locale<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> String {
     let path = dir.join("config/application.rb");
     let source = vfs.read_to_string(&path).unwrap_or_default();
@@ -14486,10 +14819,20 @@ fn default_locale<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> String {
         .lines()
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
-        .find_map(|l| l.strip_prefix("config.i18n.default_locale").map(str::trim))
-        .and_then(|rest| rest.strip_prefix('='))
-        .and_then(|v| locale_literal(v.trim()))
+        .find_map(default_locale_line)
         .unwrap_or_else(|| "en".to_string())
+}
+
+/// What a trimmed config line's `config.i18n.raise_on_missing_translations = v` sets.
+pub(super) fn raise_on_missing_line(l: &str) -> Option<Result<bool, String>> {
+    let value = l.strip_prefix("config.i18n.raise_on_missing_translations")?.trim().strip_prefix('=')?;
+    let value = value.split('#').next().unwrap_or("").trim();
+    Some(match value {
+        "true" => Ok(true),
+        "false" | "nil" => Ok(false),
+        ":strict" => Err("`raise_on_missing_translations = :strict` also raises from ActiveModel, which is not modeled".to_string()),
+        _ => Err(format!("`raise_on_missing_translations = {value}` is computed at boot")),
+    })
 }
 
 /// `config.i18n.raise_on_missing_translations` from `config/application.rb`
@@ -14497,16 +14840,7 @@ fn default_locale<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> String {
 fn missing_policy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::i18n::MissingPolicy {
     let setting = |path: &Path| -> Option<Result<bool, String>> {
         let source = vfs.read_to_string(path).ok()?;
-        source.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(|l| {
-            let value = l.strip_prefix("config.i18n.raise_on_missing_translations")?.trim().strip_prefix('=')?;
-            let value = value.split('#').next().unwrap_or("").trim();
-            Some(match value {
-                "true" => Ok(true),
-                "false" | "nil" => Ok(false),
-                ":strict" => Err("`raise_on_missing_translations = :strict` also raises from ActiveModel, which is not modeled".to_string()),
-                _ => Err(format!("`raise_on_missing_translations = {value}` is computed at boot")),
-            })
-        })
+        source.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(raise_on_missing_line)
     };
     let mut policy = crate::i18n::MissingPolicy::default();
     match setting(&dir.join("config/application.rb")) {
@@ -14526,6 +14860,31 @@ fn missing_policy<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::i18n::MissingP
         }
     }
     policy
+}
+
+/// The config file that sets `field_error_proc`, wherever Rails reads it from.
+fn field_error_proc_file<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<String> {
+    let mut files = vec![dir.join("config/application.rb")];
+    for sub in ["config/environments", "config/initializers"] {
+        let d = dir.join(sub);
+        let mut found = if vfs.is_dir(&d) { vfs.read_dir(&d).unwrap_or_default() } else { Vec::new() };
+        found.sort();
+        files.extend(found.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")));
+    }
+    files.into_iter().find(|path| {
+        vfs.read_to_string(path)
+            .is_ok_and(|source| source.lines().any(assigns_field_error_proc))
+    })
+    .map(|p| p.strip_prefix(dir).unwrap_or(&p).to_string_lossy().into_owned())
+}
+
+/// `….field_error_proc = …`, and not a line that only mentions the name.
+fn assigns_field_error_proc(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or("");
+    code.match_indices(".field_error_proc").any(|(at, name)| {
+        let rest = code[at + name.len()..].trim_start();
+        rest.starts_with('=') && !rest.starts_with("==")
+    })
 }
 
 /// `:fr`, `:"pt-BR"`, `"fr"` or `'fr'` at the start of `value`, ignoring what follows it.

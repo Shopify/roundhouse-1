@@ -1074,7 +1074,7 @@ fn length_rule(
         && min.is_none_or(|m| m.is_some())
         && max.is_none_or(|m| m.is_some());
     if simple {
-        return Ok(Ok(ValidationRule::Length { min: min.flatten(), max: max.flatten(), message: None }));
+        return Ok(Ok(ValidationRule::Length { min: min.flatten(), max: max.flatten(), message: None, allow_nil: None }));
     }
     let checks = [LengthOp::Is, LengthOp::Minimum, LengthOp::Maximum]
         .into_iter()

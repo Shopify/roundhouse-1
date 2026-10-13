@@ -1,6 +1,6 @@
 //! `Rails.root.join(...)` answers Pathname's file readers.
 //!
-//! Core's GraphApi::Authorization assigns a class-body constant from
+//! A class-body constant is often built from
 //! `Rails.root.join("db/data/...").readlines(chomp: true)`. The emitted
 //! `Rails::AppPath` had no `readlines`, so Kernel's private one answered
 //! and the file failed to load ("private method 'readlines' called").
@@ -13,7 +13,7 @@ fn rails_root_paths_read_the_file_they_name() {
 path = Rails.root.join("rails_root_list.txt")
 p path.readlines(chomp: true), path.readlines, path.read, path.exist?, Rails.root.join("missing.txt").exist?
 "#;
-    let run = emit_and_run::empty_app().run_ruby(script);
+    let run = emit_and_run::real_blog().run_ruby(script);
     run.assert_passes();
     assert_eq!(
         run.stdout,

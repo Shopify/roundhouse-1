@@ -8,6 +8,12 @@ module SqliteAdapter
     name.to_s
   end
 
+  # Writes run with their values written in: a Relation's bind marks
+  # (`Relation#bind_literal`) are dropped here, not lifted.
+  def self.execute_ddl(sql)
+    Db.exec(ActiveRecord::Relation.inline_sql(sql))
+  end
+
   def self.insert_result(sql)
     Db.exec(sql)
     Db.last_insert_rowid

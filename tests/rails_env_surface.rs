@@ -1,8 +1,9 @@
-//! `Rails.env` and the stdlib/ActiveSupport calls Core's boot code makes
-//! on it, against native Rails 8.1.4 as the oracle: the environment
-//! inquirer (`ActiveSupport::EnvironmentInquirer`, a String) compared,
+//! `Rails.env` and the stdlib/ActiveSupport calls a boot script makes on
+//! it, against native Rails as the oracle: the environment inquirer
+//! (`ActiveSupport::EnvironmentInquirer`, a String) compared,
 //! interpolated and asked `local?`; `present?`/`blank?`/`presence`;
-//! `File.socket?` / `File.dirname`; `warn`.
+//! `File.socket?` / `File.dirname`; `warn`. `RH_RAILS_ORACLE=<version>`
+//! pins the activesupport the native control loads.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -61,11 +62,14 @@ local: 'local' is a reserved environment name
 ";
 
 #[test]
-fn native_rails_8_1_4_answers() {
+fn native_rails_answers() {
+    let pin = std::env::var("RH_RAILS_ORACLE")
+        .map(|version| format!("gem \"activesupport\", \"{version}\"\n"))
+        .unwrap_or_default();
     let output = Command::new("ruby")
         .args(["-e"])
         .arg(format!(
-            "gem \"activesupport\", \"8.1.4\"\nrequire \"active_support\"\nrequire \"active_support/environment_inquirer\"\nrequire \"active_support/core_ext/object/blank\"\n{SURFACE}\nENV_OF = ->(name) {{ ActiveSupport::EnvironmentInquirer.new(name) }}\n{REPORT}"
+            "{pin}require \"active_support\"\nrequire \"active_support/environment_inquirer\"\nrequire \"active_support/core_ext/object/blank\"\n{SURFACE}\nENV_OF = ->(name) {{ ActiveSupport::EnvironmentInquirer.new(name) }}\n{REPORT}"
         ))
         .output()
         .expect("native Ruby control");

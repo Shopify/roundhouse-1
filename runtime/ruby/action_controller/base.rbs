@@ -116,7 +116,7 @@ module ActionController
     def self.allow_forgery_protection=: (bool) -> void
     # `attr_accessor` produces getter+setter pairs for each name.
     # `params` is a String-keyed Hash whose values are recursive
-    # `Roundhouse::ParamValue` — String leaves, nested Hashes, and
+    # `Roundhouse::ParamValue` — JSON scalar leaves, nested Hashes, and
     # Arrays (Rails-shape `comment[author][name]=x`, `tags[]=a`).
     # Each target's runtime declares its own recursive realization
     # (`runtime/crystal/param_value.cr`, `runtime/typescript/
@@ -210,6 +210,7 @@ module ActionController
     # signature in runtime/spinel/action_controller_head.rbs.
     def head: (Symbol status, ?content_type: String?, ?location: String?) -> void
     def response: () -> Base
+    # Strict stubs; Ruby/Spinel reopen in current.rb fills these in.
     def fresh_when: (untyped subject) -> void
     def stale?: (?etag: untyped) -> bool
     # Integer SECONDS on every duration-shaped keyword —

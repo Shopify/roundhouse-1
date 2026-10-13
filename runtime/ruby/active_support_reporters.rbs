@@ -136,6 +136,7 @@ module ActiveSupport
     def set_context: (**untyped context) ?{ () -> untyped } -> untyped
     def add_middleware: (untyped middleware) -> Array[untyped]
     def report: (untyped error, ?handled: bool, ?severity: Symbol, ?context: Hash[untyped, untyped]?, ?source: String) -> nil
+    def log_unsubscribed: (::Exception error, Symbol severity) -> nil
     def deep_dup: (untyped value) -> untyped
     def disabled_for_thread: () -> Array[untyped]?
     def disabled_subscribers: () -> Array[untyped]

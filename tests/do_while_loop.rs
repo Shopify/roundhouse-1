@@ -1,10 +1,9 @@
 //! `begin … end until cond` / `begin … end while cond` run the body
 //! before the first test.
 //!
-//! Core's `Podding::Database::Healthchecks::GlobaldbHealthBackend`
-//! retries a Stoplight probe with `begin … end until state != :error ||
-//! attempt >= 3`; ingest refused the form, and the walk dropped the
-//! whole file. Native Ruby on the same source is the oracle.
+//! A retry loop written `begin … end until state != :error || attempt >= 3`
+//! was refused by ingest, and the walk dropped the whole file. Native Ruby
+//! on the same source is the oracle.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -118,14 +117,14 @@ fn emitted_do_while_matches_native_ruby() {
 }
 
 #[test]
-fn a_next_aimed_at_the_loop_is_refused_at_its_line() {
+fn a_next_aimed_at_the_loop_is_surveyed_as_unsupported() {
     let root = std::env::temp_dir().join(format!("roundhouse-do-while-next-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         (
-            "lib/skipper.rb",
+            "app/lib/skipper.rb",
             "module Skipper\n  def self.run\n    i = 0\n    begin\n      i += 1\n      next if i == 1\n    end while i < 3\n    i\n  end\nend\n",
         ),
     ] {
@@ -133,11 +132,9 @@ fn a_next_aimed_at_the_loop_is_refused_at_its_line() {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, text).unwrap();
     }
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg(&root).output().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg("--continue").arg(&root).output().unwrap();
     let _ = std::fs::remove_dir_all(&root);
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        text.contains("lib/skipper.rb:4:5: error[ingest_unsupported]: `next` in a `begin … end while` body"),
-        "{text}"
-    );
+    assert!(text.contains("`next` in a `begin … end while` body"), "{text}");
+    assert!(text.contains("app/lib/skipper.rb"), "{text}");
 }

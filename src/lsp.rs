@@ -1452,12 +1452,22 @@ mod tests {
     /// A workspace opened through a symlink: the analysis names sources
     /// under the resolved root (`workspace_root`, as `ingest_app` does),
     /// and a hover answers for the file's path spelled either way.
+    #[cfg(unix)]
     #[test]
     fn hover_answers_through_a_symlinked_root() {
+        /// Removes the symlink even when an assertion panics first.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
         let target = std::env::current_dir().unwrap().join("fixtures/tiny-blog").canonicalize().unwrap();
         let link = std::env::temp_dir().join(format!("rh_lsp_symlink_{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let _cleanup = RemoveOnDrop(link.clone());
 
         let (ir, _) = crate::ingest::prism::scope(|| crate::ingest::ingest_app(&link));
         let mut app = ir.expect("tiny-blog should ingest");
@@ -1514,7 +1524,6 @@ mod tests {
         let _ = recv_response(&client, 4);
         send(Message::Notification(Notification { method: "exit".to_string(), params: json!(null) }));
         handle.join().unwrap().expect("server loop should end cleanly");
-        std::fs::remove_file(&link).unwrap();
     }
 
     #[test]

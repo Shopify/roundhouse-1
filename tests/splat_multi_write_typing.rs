@@ -60,15 +60,15 @@ first, *middle, last = path.split(".")
     // A target reads one element, which is nil past the end of a short
     // array (`*parents, leaf = "".split(".")` binds `leaf = nil`); a rest
     // is always an Array of the elements.
-    let array_of_str = Ty::Array { elem: Box::new(Ty::Str) };
-    let str_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+    let array_of_str = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
+    let str_or_nil = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
     for name in ["leaf", "first", "last", "whole"] {
         assert_eq!(ty_of(&types, name), Some(str_or_nil.clone()), "{name}: {types:?}");
     }
     for name in ["parents", "middle", "none"] {
         assert_eq!(ty_of(&types, name), Some(array_of_str.clone()), "{name}: {types:?}");
     }
-    let hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Int) };
-    assert_eq!(ty_of(&types, "h"), Some(Ty::Union { variants: vec![hash.clone(), Ty::Nil] }), "h: {types:?}");
-    assert_eq!(ty_of(&types, "empty"), Some(Ty::Array { elem: Box::new(hash) }), "empty: {types:?}");
+    let hash = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Int) };
+    assert_eq!(ty_of(&types, "h"), Some(Ty::Union { variants: vec![hash.clone(), Ty::Nil].into() }), "h: {types:?}");
+    assert_eq!(ty_of(&types, "empty"), Some(Ty::Array { elem: std::sync::Arc::new(hash) }), "empty: {types:?}");
 }

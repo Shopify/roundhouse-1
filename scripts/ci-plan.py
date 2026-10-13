@@ -88,7 +88,17 @@ SPINEL_TESTS = [
     "open_telemetry_stub_spinel",
     "around_block_filter_spinel",
     "plain_class_optional_keywords_spinel",
+    "active_job_payload",
+    "render_json_encoder_spinel",
 ]
+# Inputs of the ActiveJob payload gate (tests/active_job_payload.rs):
+# the files its driver loads beside it.
+ACTIVE_JOB_PAYLOAD_INPUTS = {
+    "runtime/ruby/active_job.rb",
+    "runtime/spinel/active_job_serialization.rb",
+    "runtime/spinel/global_id_locator.rb",
+    "runtime/spinel/base64.rb",
+}
 # Inputs of the PostgreSQL Db gate (tests/spinel_pg_db.rs): the shim, its
 # RBS, the contract and time parsing it compiles with, and the cases.
 PG_DB_INPUTS = {
@@ -386,6 +396,8 @@ def native_coverage(path):
         ):
             owned_tests.add("framework_tests_spinel")
         suites.update(owned_tests)
+    if path in ACTIVE_JOB_PAYLOAD_INPUTS or path.startswith("tests/active_job_payload/"):
+        suites.add("active_job_payload")
     if (
         path.startswith(("tests/rails_compat/", "tests/params_vectors/"))
         or path == "tests/rails_compat_vectors.rb"
@@ -421,7 +433,11 @@ def archive_and_campfire_jobs(path, interpreter_only):
     )
     shared_smoke = (
         path.startswith("e2e/") and not path.startswith("e2e/campfire/")
-    ) or path in {"scripts/smoke", "scripts/ci-playwright-install"}
+    ) or path in {
+        "scripts/smoke",
+        "scripts/ci-playwright-install",
+        "scripts/ci-npm",
+    }
     if campfire_archive or shared_smoke:
         jobs.update(
             (
@@ -540,6 +556,7 @@ def select(
         ) or path in {
             "scripts/smoke",
             "scripts/ci-playwright-install",
+            "scripts/ci-npm",
             "scripts/create-blog",
             "scripts/create-store",
             "bin/rh",
@@ -850,11 +867,10 @@ def _advisory_complete(job, need, advisory):
         return True
     if job in LEDGER_EXTRAS:
         return False
-    keys = (
-        ["default", "minor-gc", "verify-gen"]
-        if job == "campfire-spinel-compare"
-        else ["execution"]
-    )
+    keys = {
+        "campfire-spinel-compare": ["default", "minor-gc", "verify-gen"],
+        "spinel-toolchain": ["parity", "rest"],
+    }.get(job, ["execution"])
     return all(need.get("outputs", {}).get(key) == "success" for key in keys)
 
 

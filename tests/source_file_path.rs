@@ -1,11 +1,11 @@
 //! `__FILE__` and `__dir__` name the loaded file's absolute location, so
-//! a path built from them does not depend on the process's cwd. Core's
-//! `BootLib::ROOT = File.expand_path("../../../../..", __FILE__)` finds
-//! `config/secrets.*.json` that way. The Ruby family emits
+//! a path built from them does not depend on the process's cwd. A
+//! `ROOT = File.expand_path("../../..", __FILE__)` finds an app's config
+//! directory that way. The Ruby family emits
 //! `app/lib/locator.rb` as `app/models/locator.rb`, so the emitted
 //! literal is the source's app-relative path anchored on the emitted
 //! file's own `__dir__`: the app root maps to the output root, where the
-//! carried config files are.
+//! `config/` directory is.
 //!
 //! Native Ruby is the oracle. Both runs start from a cwd outside the app.
 
@@ -66,6 +66,35 @@ fn native_ruby_answers_from_another_cwd() {
     let _ = std::fs::remove_dir_all(&cwd);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
+}
+
+/// A file under `app/models` is emitted in place; the anchor holds there too,
+/// not only for a library class that relocates.
+#[test]
+fn an_active_record_model_body_is_anchored_too() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def self.source_dir = __dir__\n",
+        )
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let text = std::fs::read_to_string(emitted.join("app/models/article.rb")).expect("article.rb");
+    assert!(text.contains("File.expand_path(\"../../app/models\", __dir__)"), "{text}");
+    let cwd = elsewhere("model-cwd");
+    let main = emitted.join("main").display().to_string();
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("require {main:?}\nMain.configure_default_adapter!\nputs Article.source_dir"))
+        .current_dir(&cwd)
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("spawn ruby");
+    let _ = std::fs::remove_dir_all(&cwd);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(std::path::Path::new(&printed), emitted.join("app/models"), "{printed}");
 }
 
 #[test]

@@ -260,6 +260,7 @@ fn parse_sequel_association(
                 extension: Vec::new(),
                 skip_validation: false,
                 autosave: false,
+                primary_key: None,
             }
         }
         "one_to_one" => Association::HasOne {
@@ -279,6 +280,7 @@ fn parse_sequel_association(
             scope: None,
             scope_owner: None,
             autosave: false,
+            primary_key: None,
         },
         "many_to_one" => Association::BelongsTo {
             name: name.clone(),
@@ -504,6 +506,7 @@ fn parse_validation_helper(call: &ruby_prism::CallNode<'_>) -> Option<Vec<Valida
                             min,
                             max,
                             message: message.clone(),
+                            allow_nil: None,
                         }],
                     })
                     .collect()

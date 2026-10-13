@@ -152,6 +152,6 @@ fn out_param(
         key: format!("{}#{}", cid.0.as_str(), name.as_str()),
         before,
         after,
-        ty: short(&Ty::Tuple { elems: tys.to_vec() }),
+        ty: short(&Ty::Tuple { elems: tys.to_vec().into() }),
     });
 }

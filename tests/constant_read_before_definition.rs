@@ -47,7 +47,7 @@ fn library_ret(app: &roundhouse::App, class: &str, method: &str) -> Ty {
         .unwrap_or_else(|| panic!("{class} is a library class"));
     let m = lc.methods.iter().find(|m| m.name == Symbol::new(method)).unwrap_or_else(|| panic!("{class}#{method}"));
     match m.signature.clone().expect("inference wrote a signature") {
-        Ty::Fn { ret, .. } => *ret,
+        Ty::Fn { ret, .. } => (*ret).clone(),
         other => panic!("not a Fn: {other:?}"),
     }
 }
@@ -83,7 +83,7 @@ end
 "#;
 
 fn array_of_string_arrays() -> Ty {
-    Ty::Array { elem: Box::new(Ty::Array { elem: Box::new(Ty::Str) }) }
+    Ty::Array { elem: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Str) }) }
 }
 
 /// The same value, spelled with the constant it extends: no read of

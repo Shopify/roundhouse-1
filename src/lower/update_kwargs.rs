@@ -226,10 +226,11 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, keep_update: bool, diags:
                     variants: vec![
                         recv_ty.unwrap_or(Ty::Bool),
                         Ty::Nil,
-                    ],
+                    ]
+                    .into(),
                 })
             } else {
-                Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] })
+                Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() })
             };
         }
     }

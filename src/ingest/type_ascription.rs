@@ -341,7 +341,7 @@ fn rbs_type_with_vars(text: &str, vars: &[String]) -> Option<Ty> {
     let sigs = crate::rbs::parse_signatures(&src).ok()?;
     let (_, sig) = sigs.methods.into_iter().next()?;
     match sig {
-        Ty::Fn { ret, .. } => Some(*ret),
+        Ty::Fn { ret, .. } => Some(std::sync::Arc::unwrap_or_clone(ret)),
         _ => None,
     }
 }

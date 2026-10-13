@@ -254,6 +254,9 @@ fn diagnostic_signature(d: &roundhouse::analyze::Diagnostic) -> (String, String)
             "AttributeTypeUnevaluated".into(),
             format!("{}.{}", model.as_str(), attribute.as_str()),
         ),
+        DiagnosticKind::UnconsumedInitializer { statement, .. } => {
+            ("UnconsumedInitializer".into(), statement.as_str().to_string())
+        }
     }
 }
 

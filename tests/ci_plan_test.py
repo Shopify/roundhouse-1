@@ -743,7 +743,20 @@ class Routing(unittest.TestCase):
             "runtime/spinel/base64.rb": [
                 "spinel_web_push_crypto",
                 "rails_compat_vectors_spinel",
+                "active_job_payload",
             ],
+            # The payload gate's driver loads these beside it.
+            "runtime/ruby/active_job.rb": ["framework_tests_spinel", "active_job_payload"],
+            "runtime/spinel/active_job_serialization.rb": [
+                "framework_tests_spinel",
+                "active_job_payload",
+            ],
+            "runtime/spinel/global_id_locator.rb": [
+                "framework_tests_spinel",
+                "active_job_payload",
+            ],
+            "tests/active_job_payload/driver.rb": ["active_job_payload"],
+            "tests/active_job_payload/rails.json": ["active_job_payload"],
             "tests/spinel_db_lease.rb": ["spinel_db_lease"],
             "tests/spinel_stmt_cache_lru.rb": ["spinel_stmt_cache_lru"],
             "tests/support/db_concurrency_spinel.rb": ["db_sqlite_concurrency"],
@@ -917,6 +930,10 @@ class Routing(unittest.TestCase):
         self.assertTrue(plan["extras_advisory"])
         self.assertTrue(plan["spinel"])
         self.assertEqual(plan["extra_compare"], [])
+        npm = ci.select(["scripts/ci-npm"])
+        self.assertEqual(npm["smoke"], plan["smoke"])
+        self.assertEqual(npm["smoke_extra"], plan["smoke_extra"])
+        self.assertIn("campfire-smoke-docker", npm["jobs"])
         self.assertEqual(
             ci.select(["tools/compare/src/main.rs"])["extra_compare"],
             ["crystal", "kotlin", "swift", "csharp", "go", "elixir", "python"],
@@ -979,6 +996,8 @@ class Results(unittest.TestCase):
                         "default": "success",
                         "minor-gc": "success",
                         "verify-gen": "success",
+                        "parity": "success",
+                        "rest": "success",
                     },
                 }
                 for j in plan["jobs"]
@@ -1083,6 +1102,22 @@ class Results(unittest.TestCase):
                         del outputs[mode]
                     else:
                         outputs[mode] = status
+                    self.assertEqual(ci.check_results(plan, needs), ([], False))
+
+    def test_each_spinel_toolchain_shard_must_actually_pass_for_completion(self):
+        # The suite is a two-shard matrix; each shard writes its own output
+        # key, so one shard's success cannot stand in for the other's.
+        plan = ci.select([], spinel_lane=True)
+        self.assertIn("spinel-toolchain", plan["jobs"])
+        for shard in ["parity", "rest"]:
+            for status in ["failure", "cancelled", "", None]:
+                with self.subTest(shard=shard, status=status):
+                    needs = self.needs(plan)
+                    outputs = needs["spinel-toolchain"]["outputs"]
+                    if status is None:
+                        del outputs[shard]
+                    else:
+                        outputs[shard] = status
                     self.assertEqual(ci.check_results(plan, needs), ([], False))
 
     def test_advisory_ledger_extras_never_claim_complete_under_coe(self):

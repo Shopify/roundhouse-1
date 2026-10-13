@@ -1,14 +1,15 @@
 //! Two load-time names the emitted app must resolve the way Ruby's
-//! lexical scope does, from Core's `Podding` tree:
+//! lexical scope does:
 //!
-//! * `class KateProvider < Provider` inside `module Podish::Database`
-//!   names `Podish::Database::Provider`. The emitted file must require
-//!   that sibling before the class opens; the aggregator loads files in
-//!   name order, and `kate_provider` sorts first.
+//! * `class AlphaHandler < Base` inside `module Outer; module Inner`, and
+//!   `class AlphaReader < Base` inside `module Outer::Inner`, name
+//!   `Outer::Inner::Base`. The emitted file must require that sibling
+//!   before the class opens; the aggregator loads files in name order,
+//!   and `alpha_*` sorts before `base`.
 //! * A constant assigned inside `class << self` is read by bare name
 //!   from the block's own methods. Ingest hoists it to the enclosing
 //!   module, so the qualified reference must name that module, not
-//!   Rubydex's singleton segment (`Locking::<Locking>::ERR` is not Ruby).
+//!   Rubydex's singleton segment (`Gate::<Gate>::ERR` is not Ruby).
 //!
 //! Native Ruby is the oracle.
 
@@ -17,9 +18,9 @@ mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 
-const PROVIDER: &str = r#"module Podish
-  module Database
-    class Provider
+const BASE: &str = r#"module Outer
+  module Inner
+    class Base
       def kind
         "base"
       end
@@ -28,46 +29,57 @@ const PROVIDER: &str = r#"module Podish
 end
 "#;
 
-const KATE_PROVIDER: &str = r#"module Podish
-  module Database
-    class KateProvider < Provider
+const ALPHA_HANDLER: &str = r#"module Outer
+  module Inner
+    class AlphaHandler < Base
       def kind
-        "kate:" + super
+        "handler:" + super
       end
     end
   end
 end
 "#;
 
-const LOCKING: &str = r#"module Podish
-  module Locking
+const ALPHA_READER: &str = r#"module Outer::Inner
+  class AlphaReader < Base
+    def kind
+      "reader:" + super
+    end
+  end
+end
+"#;
+
+const GATE: &str = r#"module Outer
+  module Gate
     class << self
-      def check(on_lock)
-        raise ArgumentError, ON_LOCK_ERROR unless [:ignore, :raise].include?(on_lock)
-        on_lock
+      def check(option)
+        raise ArgumentError, ERR unless [:ignore, :raise].include?(option)
+        option
       end
 
-      ON_LOCK_ERROR = "Please provide a correct on_lock mechanism!"
+      ERR = "bad option"
     end
   end
 end
 "#;
 
-const REPORT: &str = r#"puts Podish::Database::KateProvider.new.kind
-puts Podish::Locking.check(:raise)
+const REPORT: &str = r#"puts Outer::Inner::AlphaHandler.new.kind
+puts Outer::Inner::AlphaReader.new.kind
+puts Outer::Gate.check(:raise)
 begin
-  Podish::Locking.check(:other)
+  Outer::Gate.check(:other)
 rescue ArgumentError => e
   puts e.message
 end
 "#;
 
-const EXPECTED: &str = "kate:base\nraise\nPlease provide a correct on_lock mechanism!\n";
+const EXPECTED: &str = "handler:base\nreader:base\nraise\nbad option\n";
 
 const FILES: &[(&str, &str)] = &[
-    ("app/lib/podish/database/provider.rb", PROVIDER),
-    ("app/lib/podish/database/kate_provider.rb", KATE_PROVIDER),
-    ("app/lib/podish/locking.rb", LOCKING),
+    ("app/lib/outer/inner/base.rb", BASE),
+    ("app/lib/outer/inner/alpha_handler.rb", ALPHA_HANDLER),
+    ("app/lib/outer/inner/alpha_reader.rb", ALPHA_READER),
+    ("app/lib/outer/gate.rb", GATE),
 ];
 
 #[test]

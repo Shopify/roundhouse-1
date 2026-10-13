@@ -60,8 +60,8 @@ fn last_expr(e: &Expr) -> &Expr {
     }
 }
 
-fn unknown() -> Box<Ty> {
-    Box::new(Ty::Var { var: TyVar(0) })
+fn unknown() -> std::sync::Arc<Ty> {
+    std::sync::Arc::new(Ty::Var { var: TyVar(0) })
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn a_keyword_rest_param_is_a_symbol_keyed_hash() {
         "{:?}",
         body_ty(&app, "options")
     );
-    assert_eq!(body_ty(&app, "option_keys"), Ty::Array { elem: Box::new(Ty::Sym) });
+    assert_eq!(body_ty(&app, "option_keys"), Ty::Array { elem: std::sync::Arc::new(Ty::Sym) });
 }
 
 #[test]

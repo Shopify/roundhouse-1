@@ -131,7 +131,7 @@ fn accept_string_name(m: &mut MethodDef) {
     m.body = sp(ExprNode::Seq { exprs: vec![to_sym, body] });
     if let Some(Ty::Fn { params, .. }) = m.signature.as_mut() {
         if let Some(first) = params.first_mut() {
-            first.ty = Ty::Union { variants: vec![Ty::Sym, Ty::Str] };
+            first.ty = std::sync::Arc::new(Ty::Union { variants: vec![Ty::Sym, Ty::Str].into() });
         }
     }
 }
@@ -153,7 +153,7 @@ fn schema_column_types(model: &Model, table: &Table, adapter: Option<&DatabaseAd
     for (name, ty) in declared {
         entries.push((str_lit(name.as_str()), declared_spec(&ty)));
     }
-    let ret = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Array { elem: Box::new(Ty::Untyped) }) };
+    let ret = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }) };
     MethodDef {
         visibility: MethodVisibility::Public,
         unsupported_formals: None,
