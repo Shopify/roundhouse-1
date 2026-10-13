@@ -576,15 +576,23 @@ end"#
 
 /// A concern's `ClassMethods` carrier written with `class << self; def
 /// extended(base)` hooks that singleton is the carrier module's own, not the
-/// includers' class side the carrier is flattened into, so the refusal says so.
+/// includers' class side the carrier is flattened into. Upstream refused it
+/// by name; the carrier module now keeps it as its own singleton (see
+/// `conditional_definitions`), and only a `class_methods do` block, which has
+/// no module of its own, is refused (`ingest_unsupported`).
 #[test]
-fn a_class_methods_carrier_singleton_is_refused_by_name() {
+fn a_class_methods_carrier_singleton_stays_the_carrier_modules_own() {
     let source = "module Sharded\n  extend ActiveSupport::Concern\n\n  module ClassMethods\n    class << self\n      def extended(base)\n        base\n      end\n    end\n\n    def sharded?\n      true\n    end\n  end\nend\n";
-    let error = ingest_library_classes(source.as_bytes(), "sharded.rb").unwrap_err();
-    assert!(
-        error.to_string().contains(
-            "`class << self` in a concern's `ClassMethods` defines the carrier module's own singleton methods"
-        ),
-        "{error}"
-    );
+    let classes = ingest_library_classes(source.as_bytes(), "sharded.rb").expect("ingests");
+    let carrier = classes
+        .iter()
+        .find(|c| c.name.0.as_str() == "Sharded::ClassMethods")
+        .expect("the carrier module is its own class");
+    let hook = carrier
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "extended")
+        .expect("the singleton hook stays on the carrier");
+    assert!(format!("{:?}", hook.receiver).contains("Class"), "{:?}", hook.receiver);
+    assert!(carrier.methods.iter().any(|m| m.name.as_str() == "sharded?"));
 }
