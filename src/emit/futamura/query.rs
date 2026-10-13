@@ -80,10 +80,9 @@ struct Chain {
     owner: Option<(String, Symbol)>,
     /// Ruby link sources appended to the model constant, in call order.
     links: Vec<String>,
-    /// Request-time values, in the order Rails binds them: WHERE values in
-    /// call order, then the LIMIT.
+    /// Request-time values, in the order the chain's links take them from
+    /// `p.bind` (a WHERE value or a constant LIMIT, in call order).
     where_binds: Vec<String>,
-    limit_binds: Vec<String>,
     ordered: bool,
     limited: bool,
     /// Rooted at `Model.unscoped`, which drops the model's default scopes.
@@ -140,9 +139,6 @@ const STATIC_BUILDERS: [&str; 9] = ["where", "order", "limit", "preload", "inclu
 pub struct Specializer<'a> {
     app: &'a App,
     models: HashMap<&'a str, &'a Model>,
-    /// Integer class constants by bare name; `None` when two classes give
-    /// the same name different values.
-    int_consts: HashMap<String, Option<i64>>,
     /// Models their own source makes `private_constant`: the generated
     /// initializer, outside their namespace, cannot name them.
     private_models: std::collections::HashSet<String>,
@@ -156,18 +152,9 @@ pub struct Specializer<'a> {
 impl<'a> Specializer<'a> {
     pub fn new(app: &'a App, schemas: super::schemas::DatabaseSchemas) -> Self {
         let models = app.models.iter().map(|m| (m.name.0.as_str(), m)).collect();
-        let mut int_consts: HashMap<String, Option<i64>> = HashMap::new();
-        for (name, value) in app.library_classes.iter().flat_map(|lc| lc.constants.iter()) {
-            if let ExprNode::Lit { value: Literal::Int { value } } = &*value.node {
-                let entry = int_consts.entry(name.as_str().to_string()).or_insert(Some(*value));
-                if *entry != Some(*value) {
-                    *entry = None;
-                }
-            }
-        }
         let private_models = app.models.iter().filter(|m| makes_private(app, m)).map(|m| m.name.0.as_str().to_string()).collect();
         let private_constants = private_constant_names(app);
-        Specializer { app, models, int_consts, private_models, private_constants, schemas }
+        Specializer { app, models, private_models, private_constants, schemas }
     }
 
     /// Every query site in a method body: specialized, or left with a reason.
@@ -268,8 +255,7 @@ impl<'a> Specializer<'a> {
             option
         };
         let key = format!("{}{}", self.key(e.span), cx.flow.suffix());
-        let mut binds = chain.where_binds.clone();
-        binds.extend(chain.limit_binds.iter().cloned());
+        let binds = chain.where_binds.clone();
         // `Model.all` roots the block in a Relation: a link such as
         // `ordered_relation` is a Relation method, not a class method.
         let define = format!(
@@ -863,52 +849,37 @@ impl<'a> Specializer<'a> {
         }
     }
 
-    /// A `limit`/`first`/`last` count: a literal or known integer constant,
-    /// else a request-time bind.
+    /// A `limit`/`first`/`last` count: a literal, else a request-time value.
+    /// A constant is read per call, as Ruby evaluates `limit(LIMIT)` each time
+    /// (a test may `stub_const` it), so it is never frozen into the statement:
+    /// the call site passes it fixed (`Futamura.fixed`), and the runtime builds
+    /// one statement per distinct value, since Rails' own `limit!` does
+    /// `Integer(value)` and so cannot take a StatementCache placeholder.
     fn limit_value(&self, e: &Expr, chain: &mut Chain, cx: &Cx) -> Result<String, String> {
         let v = match &*e.node {
-            ExprNode::Const { path } => match self.int_const(path)? {
-                // A private constant is not nameable from the statement's
-                // block (outside the lexical scope): the call site reads it.
-                Val::Static(src) if src.parse::<i64>().is_err() && path.last().is_some_and(|n| self.private_constants.contains(n.as_str())) => self.value(e, cx)?,
-                v => v,
-            },
+            ExprNode::Const { path } if cx.self_chain.is_some() => Val::Bind(self.scope_const(path)?),
             _ => self.value(e, cx)?,
         };
         Ok(match v {
             Val::Static(src) => src,
             Val::Bind(src) => {
-                chain.limit_binds.push(src);
+                chain.where_binds.push(if matches!(&*e.node, ExprNode::Const { .. }) { format!("Futamura.fixed({src})") } else { src });
                 "p.bind".into()
             }
         })
     }
 
-    /// An integer constant: its value when the declaring class records
-    /// one, else a qualified path (ingest resolves references, so a
-    /// multi-segment path names the constant from anywhere).
-    fn int_const(&self, path: &[Symbol]) -> Result<Val, String> {
-        let (name, owner) = path.split_last().ok_or("empty constant path")?;
-        let owner = owner.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-        let declared = self
-            .app
-            .library_classes
-            .iter()
-            .filter(|lc| owner.is_empty() || lc.name.0.as_str() == owner)
-            .flat_map(|lc| lc.constants.iter())
-            .find(|(n, _)| n == name)
-            .and_then(|(_, v)| match &*v.node {
-                ExprNode::Lit { value: Literal::Int { value } } => Some(*value),
-                _ => None,
-            });
-        match (declared, owner.is_empty()) {
-            (Some(n), _) => Ok(Val::Static(n.to_string())),
-            (None, true) => match self.int_consts.get(name.as_str()) {
-                Some(Some(n)) => Ok(Val::Static(n.to_string())),
-                _ => Err(format!("constant `{}` is not a known integer", name.as_str())),
-            },
-            (None, false) => Ok(Val::Static(format!("{owner}::{}", name.as_str()))),
+    /// A constant named inside a scope body, as the call site can read it:
+    /// its qualified path (ingest resolves references against the lexical
+    /// scope), which is the same slot the body reads. A private constant, or
+    /// a name ingest left unqualified, cannot be named from the call site.
+    fn scope_const(&self, path: &[Symbol]) -> Result<String, String> {
+        let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        let name = *names.last().ok_or("empty constant path")?;
+        if names.len() < 2 || self.private_constants.contains(name) {
+            return Err(format!("constant `{name}` in a scope body is not nameable from the call site"));
         }
+        Ok(format!("::{}", names.join("::")))
     }
 
     /// The association the model declares under `name`, if any.
@@ -958,7 +929,6 @@ impl Chain {
             owner,
             links: Vec::new(),
             where_binds: Vec::new(),
-            limit_binds: Vec::new(),
             ordered: false,
             limited: false,
             unscoped: false,

@@ -221,8 +221,9 @@ end
         let controller = file(&files, "app/controllers/messages_controller.rb");
         let init = file(&files, INITIALIZER);
         // The call site binds the owner's id (in a lambda the runtime calls once the owner is a record) and keeps the chain as fallback.
+        // The scope's constant limit is read per call (Ruby evaluates `limit(PAGE_SIZE)` each time), so the call site passes it fixed.
         assert!(controller.contains(
-            "@messages = Futamura.records(:controllers_messages_controller_4_17, -> { [@room.id] }, owner: @room, \
+            "@messages = Futamura.records(:controllers_messages_controller_4_17, -> { [@room.id, Futamura.fixed(::Message::PAGE_SIZE)] }, owner: @room, \
              association: :messages) { @room.messages.with_creator.last_page }"
         ), "{controller}");
         // Static scopes stay calls for Rails to build; the terminal scope is
@@ -233,7 +234,7 @@ end
         // the statement names them for the runtime to check (`via:`).
         assert!(init.contains(
             "Futamura.define(:controllers_messages_controller_4_17, \"Message\", reverse: true, via: [:with_creator, :last_page, :ordered], owner_keys: [\"room_id\"], owner_columns: [\"room_id\"], relation: true) \
-             { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(Message::PAGE_SIZE).reverse_order }"
+             { |p| Message.all.where(room_id: p.bind).with_creator.ordered.send(:ordered_relation).limit(p.bind).reverse_order }"
         ), "{init}");
         assert!(report.specialized.iter().any(|s| s.ends_with("messages_controller.rb:4:17")), "{:?}", report.specialized);
     }
@@ -1688,6 +1689,14 @@ module Lookup
       Widget.where(shop_id: shop_id).limit(PAGE).to_a
     end
 
+    def self.hidden_cap_for(shop_id)
+      Widget.where(shop_id: shop_id).hidden_cap.to_a
+    end
+
+    def self.capped_for(shop_id)
+      Widget.where(shop_id: shop_id).capped.to_a
+    end
+
     #: (singleton(ActiveRecord::Base) model) -> Widget?
     def self.by_model(model)
       Widget.find_by(owner_type: model.polymorphic_name, shop_id: 1)
@@ -1701,7 +1710,7 @@ end
         let out = scratch("print-out");
         write(&src, "db/schema.rb", b"ActiveRecord::Schema.define do\n  create_table \"owners\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"kind\"\n    t.string \"owner_type\"\n    t.integer \"owner_id\"\n    t.integer \"shop_id\"\n  end\nend\n");
         write(&src, "app/models/application_record.rb", b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n");
-        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\nend\n");
+        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\n  CAP = 2\n  HIDDEN = 2\n  private_constant :HIDDEN\n  scope :capped, -> { order(:id).limit(CAP) }\n  scope :hidden_cap, -> { order(:id).limit(HIDDEN) }\nend\n");
         write(&src, "app/models/owner.rb", b"class Owner < ApplicationRecord\n  has_many :widgets, as: :owner\nend\n");
         write(&src, "app/services/lookup/finder.rb", FINDER.as_bytes());
         let run = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(&src).output().unwrap();
@@ -1726,7 +1735,12 @@ end
         // A constant in the block is public and rooted, a literal, or bound; never private and rooted.
         let init = fs::read_to_string(out.join("config/initializers/futamura.rb")).unwrap();
         assert!(!init.contains("Finder::PAGE") && !init.contains("Finder::LIMIT"), "{init}");
-        assert!(finder.contains("[shop_id, PAGE]"), "{finder}");
+        // A constant limit is never part of the statement's text: the site reads it per call.
+        assert!(finder.contains("[shop_id, Futamura.fixed(PAGE)]"), "{finder}");
+        assert!(finder.contains("[shop_id, Futamura.fixed(LIMIT)]"), "{finder}");
+        assert_eq!(init.matches(".limit(p.bind)").count(), 3, "{init}");
+        // A private constant in a scope body cannot be named from the call site: that site stays Rails'.
+        assert_eq!(finder.matches("Futamura.records(").count(), 6, "{finder}");
         let _ = fs::remove_dir_all(&out);
     }
 
@@ -1750,7 +1764,15 @@ end
         // Verify counts every call as a fallback; only the results are compared.
         let results = |s: &str| s.lines().filter(|l| !l.starts_with("specialized=")).collect::<Vec<_>>().join("\n");
         assert_eq!(results(&verified), results(&normal));
-        assert!(normal.ends_with("specialized=3\n"), "{normal}");
+        // Every call ran specialized: a constant limit is a statement per value, not a refusal.
+        assert!(normal.ends_with("specialized=9\n"), "{normal}");
+        assert!(normal.contains("paged=[\"a\", \"b\"]\n"), "{normal}");
+        assert!(normal.contains("capped=[\"a\", \"b\"]\n"), "{normal}");
+        // A stubbed constant changes the next call's limit; restoring it restores the first statement's result.
+        assert!(normal.contains("limited_stubbed=[\"a\"]\n"), "{normal}");
+        assert!(normal.contains("paged_stubbed=[\"a\", \"b\", \"c\"]\n"), "{normal}");
+        assert!(normal.contains("capped_stubbed=[\"a\"]\n"), "{normal}");
+        assert!(normal.contains("limited_restored=[\"a\", \"b\"]\n"), "{normal}");
         assert!(normal.contains("by_kind=[\"a\", \"b\", \"c\"]\n"), "{normal}");
         assert!(normal.contains("limited=[\"a\", \"b\"]\n"), "{normal}");
         assert!(normal.contains("by_model=[\"d\"]\n"), "{normal}");

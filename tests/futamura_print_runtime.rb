@@ -1,8 +1,8 @@
 # Runtime probe for tests/futamura.rs (printed_values): the emitted tree on real ActiveRecord
 # (SQLite). usage: ruby probe.rb EMITTED_DIR   (FUTAMURA_VERIFY=1 optional)
 #
-# (`paged` is compiled by the test but not run: a `limit` bind needs an ActiveRecord whose `limit`
-# accepts a StatementCache substitute.)
+# A constant `limit` is read per call (a test may `stub_const` it), so the site passes it fixed and the
+# runtime builds one statement per value: the probe changes the constants and runs the sites again.
 # The finder's constants are `private_constant`: Ruby reads one only by its bare name from inside
 # the class body (`Lookup::Finder::KIND` is a NameError anywhere), so a value the site binds must
 # be printed the way the source wrote it, and a constant in the statement's block must be bound.
@@ -41,5 +41,20 @@ end
 show("by_kind") { Lookup::Finder.by_kind(1) }
 show("limited") { Lookup::Finder.limited(1) }
 show("by_model") { Lookup::Finder.by_model(Owner) }
+show("paged") { Lookup::Finder.paged(1) }
+show("capped") { Lookup::Finder.capped_for(1) }
+def stub_const(mod, name, value)
+  old = mod.const_get(name)
+  mod.send(:remove_const, name)
+  mod.const_set(name, value)
+  yield
+ensure
+  mod.send(:remove_const, name)
+  mod.const_set(name, old)
+end
+stub_const(Lookup::Finder, :LIMIT, 1) { show("limited_stubbed") { Lookup::Finder.limited(1) } }
+stub_const(Lookup::Finder, :PAGE, 3) { show("paged_stubbed") { Lookup::Finder.paged(1) } }
+stub_const(Widget, :CAP, 1) { show("capped_stubbed") { Lookup::Finder.capped_for(1) } }
+show("limited_restored") { Lookup::Finder.limited(1) }
 sites = Futamura::Stats.sites.values
 puts "specialized=#{sites.sum(&:specialized)}"

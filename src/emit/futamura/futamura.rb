@@ -41,6 +41,13 @@ module Futamura
   MAX_NILS = 3
   NO_NILS = [].freeze
 
+  # A value the call site reads on every call that the statement is built around rather than binds:
+  # a constant `limit(LIMIT)` names (read per call, so a test may stub it). Rails' `limit!` does
+  # `Integer(value)`, so no StatementCache placeholder can stand for it; each distinct value is a
+  # statement of its own, as each pattern of nils is.
+  Fixed = Struct.new(:value)
+  NO_FIXED = {}.freeze
+
   # What `association_key` answers for a condition that is not one key column. A Hash is never
   # one placeholder (`unsupported_bind?`), so a call carrying it runs Rails' chain.
   UNBINDABLE = {}.freeze
@@ -48,14 +55,17 @@ module Futamura
   # The `params` a chain is built with for a call whose values at some positions are nil: `bind` is
   # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere.
   class NilParams
-    def initialize(params, nils)
+    def initialize(params, nils, fixed = NO_FIXED)
       @params = params
       @nils = nils
+      @fixed = fixed
       @position = -1
     end
 
     def bind
       @position += 1
+      return @fixed[@position] if @fixed.key?(@position)
+
       @nils.include?(@position) ? nil : @params.bind
     end
   end
@@ -191,6 +201,25 @@ module Futamura
       value.respond_to?(:id) ? value.id : value
     end
 
+    # A value a statement is built around (see `Fixed`).
+    def fixed(value)
+      Fixed.new(value)
+    end
+
+    # The built-around values among `binds` by position (`NO_FIXED` for none), or nil when one is
+    # not an Integer or nil (a limit): such a call is Rails' to run.
+    def fixed_values(binds)
+      fixed = NO_FIXED
+      binds.each_with_index do |value, index|
+        next unless Fixed === value
+        return unless value.value.nil? || Integer === value.value
+
+        fixed = {} if fixed.equal?(NO_FIXED)
+        fixed[index] = value.value
+      end
+      fixed.freeze
+    end
+
     # Whether a request-time value cannot be one placeholder of a StatementCache: anything but a
     # scalar Rails quotes as a single value. The predicate builder turns an Array, a Set, a Range,
     # a Relation, a Hash or a record into an IN list, BETWEEN, a subquery, nested conditions or
@@ -235,6 +264,8 @@ module Futamura
     def bind_nils(model, binds)
       nils = NO_NILS
       binds.each_with_index do |value, index|
+        next if Fixed === value
+
         if value.nil?
           nils = nils.dup if nils.equal?(NO_NILS)
           nils << index
@@ -263,6 +294,8 @@ module Futamura
       model = statement.model = Object.const_get(model) if model.is_a?(String)
       nils = bind_nils(model, binds)
       return fallback.call unless nils
+      fixed = fixed_values(binds)
+      return fallback.call unless fixed
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
@@ -284,10 +317,10 @@ module Futamura
       end
       return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
-      binds = defaults + (nils.empty? ? binds : binds.reject(&:nil?))
+      binds = defaults + (nils.empty? && fixed.empty? ? binds : binds.reject { |value| value.nil? || Fixed === value })
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils]) { compile(statement, connection, columns, extensions, nils) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed]) { compile(statement, connection, columns, extensions, nils, fixed) }
         compiled && compiled.cache.execute(binds, connection)
       end
       return fallback.call unless compiled
@@ -543,7 +576,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions, nils = NO_NILS)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -558,7 +591,7 @@ module Futamura
       cache = begin
         default_scope_evaluations(evaluated) do
           ActiveRecord::StatementCache.create(connection) do |_|
-            chain_params = nils.empty? ? params : NilParams.new(params, nils)
+            chain_params = nils.empty? && fixed.empty? ? params : NilParams.new(params, nils, fixed)
             relation = if statement.unscoped
               statement.build.call(chain_params)
             else
@@ -943,9 +976,10 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return "model_unloaded" unless model.is_a?(Class)
 
           # find_index, not find: the value that is refused is usually an Array.
-          index = binds.index { |value| !value.nil? && Futamura.unsupported_bind?(value, model) }
+          index = binds.index { |value| !value.nil? && !(Futamura::Fixed === value) && Futamura.unsupported_bind?(value, model) }
           return "bind_#{kind(binds[index])}" if index
           return "bind_nil_many" if binds.count(&:nil?) > Futamura::MAX_NILS
+          return "bind_fixed_not_integer" unless Futamura.fixed_values(binds)
 
           return "root_not_model" if root && !root.equal?(model)
           redefined = statement.via && Futamura.send(:redefined_class_method, model, statement.via)
