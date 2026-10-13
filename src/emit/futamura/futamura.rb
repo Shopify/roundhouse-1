@@ -531,6 +531,9 @@ module Futamura
     # self: the statement is the model's own, so any other class (a subclass
     # adds its type condition, a concern's method is shared) runs the chain.
     def records(key, binds, owner: nil, association: nil, root: nil, &fallback)
+      # `owner&.reader.where(..)`: a nil owner runs the source as written, which returns nil or raises
+      # exactly as Ruby does (csend skips only its own call); the statement reads the owner's key.
+      return fallback.call if association && NilClass === owner
       # An owner that is not a record (a test double) is asked nothing: not by a guard, and not by
       # the bind expressions, which a site rooted at an association reader passes as a lambda for
       # that reason (the chain as written does not read the owner's key).
