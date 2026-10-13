@@ -264,12 +264,14 @@ module Futamura
     # (`StatementCache.unsupported_value?`) names only some of them, so the scalars are listed
     # instead. nil is `IS NULL` (see `bind_nils`). A value of a class outside the list is
     # Rails' to bind, unless `model` is given and the predicate builder treats the class as a
-    # scalar (`scalar_class?`).
+    # scalar (`scalar_class?`) and this value does not answer `id`: `PredicateBuilder#build` reads
+    # `value.id` of any value that responds to it, and `scalar_class?` knows only the class's
+    # instance methods, not a method one value defines on itself (a Class with `def self.id`).
     def unsupported_bind?(value, model = nil)
       case value
       when Integer, String, Symbol, Float, BigDecimal, true, false, Date, Time, ActiveSupport::TimeWithZone then false
       when nil then true
-      else !(model && scalar_class?(model, value.class))
+      else !(model && scalar_class?(model, value.class)) || value.respond_to?(:id)
       end
     end
 
