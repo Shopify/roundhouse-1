@@ -1309,24 +1309,27 @@ mod private_model_constants {
     }
 }
 
-/// `a&.b` returns nil for a nil `a`; the specialized call reads the owner's
-/// key first (`a.id`), and analysis binds a non-trivial owner to a temp local
-/// (`__safe_nav1`) that exists only in its IR, so such a chain stays Rails'.
-mod safe_navigation_owner {
+/// `a&.b` is Ruby's csend: it skips only its own call (`nil&.b.c` still sends `c` to nil). The
+/// lowering `a && a.b` leaves the chain walkable; a nil owner is sent to the source as written
+/// (`Futamura.records` runs its fallback block), and a `&.` after a relation or after the
+/// terminal is not a guard at all.
+mod safe_navigation {
     use std::path::PathBuf;
+    use std::process::Command;
 
     use roundhouse::analyze::Analyzer;
     use roundhouse::emit::futamura::specialize;
     use roundhouse::ingest::ingest_app_from_tree;
 
-    #[test]
-    fn a_chain_through_safe_navigation_is_left_to_rails() {
+    const FINDER: &str = "class Finder\n  #: (Room?) -> Array[Message]?\n  def self.to_a(room)\n    room&.messages&.to_a\n  end\n\n  #: (Room?) -> Message?\n  def self.link_then_first(room)\n    room&.messages&.where(body: [\"a\", \"b\"])&.first\n  end\n\n  #: (Room?) -> Message?\n  def self.mid_chain(room)\n    room&.messages.where(body: [\"b\", \"c\"]).first\n  end\n\n  #: (Room) -> Message?\n  def self.terminal(room)\n    room.messages.where(body: \"c\")&.first\n  end\n\n  #: (Room?) -> Message?\n  def self.by_value(room)\n    Message.find_by(room_id: room&.id)\n  end\n\n  #: (Room) -> String?\n  def self.after_load(room)\n    Message.where(room_id: room.id).order(:id).first&.body\n  end\nend\n";
+
+    fn emit(finder: &str) -> (roundhouse::emit::futamura::Report, Vec<(String, String)>) {
         let files: Vec<(&str, &str)> = vec![
             ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"messages\", force: :cascade do |t|\n    t.integer \"room_id\"\n    t.string \"body\"\n  end\nend\n"),
             ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
             ("app/models/room.rb", "class Room < ApplicationRecord\n  has_many :messages\nend\n"),
             ("app/models/message.rb", "class Message < ApplicationRecord\n  belongs_to :room\nend\n"),
-            ("app/services/finder.rb", "class Finder\n  #: (Room?) -> Array[Message]?\n  def self.of(room)\n    room&.messages&.to_a\n  end\n  #: (Room) -> Array[Message]\n  def self.sure(room)\n    room.messages.to_a\n  end\nend\n"),
+            ("app/services/finder.rb", finder),
         ];
         let tree: roundhouse::det::HashMap<PathBuf, Vec<u8>> =
             files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
@@ -1334,10 +1337,70 @@ mod safe_navigation_owner {
         Analyzer::new(&app).analyze(&mut app);
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
         let report = specialize(&app, &mut tree_files).unwrap();
+        (report, tree_files)
+    }
+
+    #[test]
+    fn a_guard_on_the_owner_specializes_and_one_after_a_relation_or_the_terminal_is_no_guard() {
+        let (report, tree_files) = emit(FINDER);
         let finder = &tree_files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
-        assert!(finder.lines().filter(|l| l.contains("room&.messages")).all(|l| !l.contains("Futamura.records")), "{finder}");
-        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
-        assert!(report.residue.iter().any(|r| r.contains("safe navigation in the chain")), "{:?}", report.residue);
+        assert_eq!(report.specialized.len(), 6, "{:?}\n{finder}", report.residue);
+        assert!(!report.residue.iter().any(|r| r.contains("safe navigation")), "{:?}", report.residue);
+        // The call site keeps the source (guards included) as the fallback block, and names the owner it reads.
+        for source in ["room&.messages&.to_a", "room&.messages&.where(body: [\"a\", \"b\"])&.first", "room&.messages.where(body: [\"b\", \"c\"]).first", "room.messages.where(body: \"c\")&.first"] {
+            let line = finder.lines().find(|l| l.contains(source)).unwrap_or_else(|| panic!("{source}\n{finder}"));
+            assert!(line.contains("Futamura.records(") && line.contains("owner: room, association: :messages"), "{line}");
+        }
+        // The `&.` follows the terminal / sits in a value: neither is part of the chain.
+        let after = finder.lines().find(|l| l.contains(".order(:id).first")).unwrap();
+        assert!(after.trim_end().ends_with("&.body"), "{after}");
+        assert!(finder.lines().any(|l| l.contains("Futamura.records") && l.contains("room&.id")), "{finder}");
+    }
+
+    #[test]
+    fn a_guard_on_a_receiver_that_is_not_a_plain_read_is_left_to_rails() {
+        let finder = "class Finder\n  #: (Array[Room]) -> Array[Message]?\n  def self.of(rooms)\n    rooms.pop&.messages&.to_a\n  end\nend\n";
+        let (report, tree_files) = emit(finder);
+        let source = &tree_files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
+        assert_eq!(report.specialized.len(), 0, "{source}");
+        assert!(!source.contains("Futamura.records"), "{source}");
+        assert!(report.residue.iter().any(|r| r.contains("value is")), "{:?}", report.residue);
+    }
+
+    /// The run-time half, against real ActiveRecord on SQLite: a nil owner returns nil or raises
+    /// as the source does, a record's chain is served by its statement, and under
+    /// FUTAMURA_VERIFY=1 each result is compared with Rails'. Skipped when ActiveRecord and sqlite3
+    /// are not installed.
+    #[test]
+    fn a_nil_owner_behaves_as_written_and_a_record_agrees_with_rails_under_verify() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let (_, tree_files) = emit(FINDER);
+        let dir = crate::unique_dir("safe-navigation-runtime");
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, content) in &tree_files {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, content).unwrap();
+        }
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_safe_navigation_runtime.rb");
+        for verify in ["1", "0"] {
+            let run = Command::new("ruby").arg(&probe).arg(&dir).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            let out = String::from_utf8_lossy(&run.stdout).to_string();
+            assert!(run.status.success(), "verify={verify}\n{out}\n{}", String::from_utf8_lossy(&run.stderr));
+            assert!(!out.contains("MISMATCH"), "verify={verify}\n{out}");
+            assert_eq!(out.lines().filter(|l| l.contains(" ok ")).count(), 14, "{out}");
+            assert!(out.contains("to_a nil ok :nil") && out.contains("after_load ok"), "{out}");
+            assert!(out.contains("mid_chain nil ok [:no_method_error, :where]"), "{out}");
+            // Unverified, only the nil owners fell back (the `nil` call of each of the four readers); every record's chain, and the `nil` value bind, was a statement.
+            if verify == "0" {
+                assert!(out.contains("fallbacks=4\n"), "{out}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

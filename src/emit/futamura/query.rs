@@ -225,12 +225,44 @@ impl<'a> Specializer<'a> {
         if e.span.is_synthetic() {
             return Some(Err("synthesized call site".into()));
         }
-        // `a&.b` is lowered to `a && a.b`, whose guard the specialized call
-        // (which reads `a.id` before it runs anything) would drop.
-        if self.source_text(e.span).contains("&.") {
-            return Some(Err("safe navigation in the chain".into()));
-        }
+        // `a&.b` is lowered to `a && a.b`; `chain` follows the guard (see `safe_navigation`).
         Some(self.specialize_paths(e, recv, method, args, cx))
+    }
+
+    /// Whether the call `send` was written with `&.` (a csend): the text between its receiver
+    /// and its method name, past whitespace and comments, opens with `&.`.
+    fn is_safe_navigation(&self, send: &Expr) -> bool {
+        let ExprNode::Send { recv: Some(recv), .. } = &*send.node else { return false };
+        if recv.span.is_synthetic() || send.span.is_synthetic() {
+            return false;
+        }
+        let Some(mut rest) = self.app.sources[recv.span.file.0 as usize - 1].text.get(recv.span.end as usize..send.span.end as usize) else {
+            return false;
+        };
+        loop {
+            rest = rest.trim_start();
+            match rest.strip_prefix('#') {
+                Some(comment) => rest = comment.split_once('\n').map_or("", |(_, tail)| tail),
+                None => return rest.starts_with("&."),
+            }
+        }
+    }
+
+    /// `a&.b(args)` reaches the specializer as `a && a.b(args)` (ingest lowers it so, binding a
+    /// receiver that is not a plain read to a temp local first) with both halves spanning the
+    /// whole call: the guarded call `a.b(args)`, when `e` is that lowering.
+    ///
+    /// Ruby's csend (compile.c `compile_call`, the `branchnil` around one send) skips only its
+    /// own call: `nil&.b.c` still sends `c` to nil, and only `a&.b&.c` skips both. The guard is
+    /// harmless to drop when `a` is a relation the chain went through to get here (a Relation
+    /// is never nil, so `&.` on it is `.`). It is not when `a` is an association's owner, which
+    /// the call site reads at run time: a nil owner has to run the source as written, which
+    /// returns nil or raises as Ruby does, so the site carries `association:` and the runtime
+    /// sends a nil owner to its fallback block (`Futamura.records`). A receiver that is not a
+    /// plain read of the call site cannot be read twice, and `value` refuses it as an owner.
+    fn safe_navigation<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        let ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right, .. } = &*e.node else { return None };
+        (right.span == e.span && self.is_safe_navigation(right)).then_some(right)
     }
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
@@ -352,6 +384,11 @@ impl<'a> Specializer<'a> {
             ExprNode::If { then_branch, else_branch, .. } if cx.self_chain.is_none() => {
                 self.chain(if cx.flow.choose(e)? { then_branch } else { else_branch }, cx)
             }
+            // `a&.b` as `a && a.b`: the guarded call, with `a`'s nil handled at run time.
+            ExprNode::BoolOp { .. } => match self.safe_navigation(e) {
+                Some(guarded) => self.chain(guarded, cx),
+                None => Err(format!("chain rooted at {}", e.node.kind_str())),
+            },
             ExprNode::Const { path } => {
                 // `::Shop` is a path with an empty first segment (ingest keeps
                 // the root so qualification passes leave it alone); a model is
