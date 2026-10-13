@@ -57,33 +57,34 @@ module Base64
   # last quantum, and the bits padding discards must be zero. Anything
   # else raises `ArgumentError, "invalid base64"`, as the stdlib does —
   # JWT and cookie verifiers rely on that to reject tampered input.
-  def self.strict_decode64(s)
-    n = s.length
-    if n % 4 != 0
-      raise ArgumentError, "invalid base64"
-    end
-    pad = 0
-    if n > 0 && s[n - 1] == "="
-      pad = 1
-      if s[n - 2] == "="
-        pad = 2
-      end
-    end
-    i = 0
-    while i < n - pad
-      if char_value(s[i]) < 0
-        raise ArgumentError, "invalid base64"
-      end
-      i = i + 1
-    end
-    if pad == 2 && (char_value(s[n - 3]) & 0x0F) != 0
-      raise ArgumentError, "invalid base64"
-    end
-    if pad == 1 && (char_value(s[n - 2]) & 0x03) != 0
-      raise ArgumentError, "invalid base64"
-    end
-    decode64(s)
+def self.strict_decode64(s)
+  n = s.bytesize
+  if n % 4 != 0
+    raise ArgumentError, "invalid base64"
   end
+  pad = 0
+  if n > 0 && s.getbyte(n - 1) == 61   # "="
+    pad = 1
+    if s.getbyte(n - 2) == 61
+      pad = 2
+    end
+  end
+  # By byte, so the check allocates nothing per character.
+  i = 0
+  while i < n - pad
+    if byte_value(s.getbyte(i)) < 0
+      raise ArgumentError, "invalid base64"
+    end
+    i = i + 1
+  end
+  if pad == 2 && (byte_value(s.getbyte(n - 3)) & 0x0F) != 0
+    raise ArgumentError, "invalid base64"
+  end
+  if pad == 1 && (byte_value(s.getbyte(n - 2)) & 0x03) != 0
+    raise ArgumentError, "invalid base64"
+  end
+  decode64(s)
+end
 
   # Ruby's lax `decode64` (`unpack1("m")`): skips any byte outside the
   # alphabet (newlines included) and stops at the first "=". Accumulates
@@ -134,12 +135,6 @@ module Base64
       i = i + 45
     end
     out
-  end
-
-  # The 6-bit value of one base64 alphabet character, or -1 for anything
-  # outside the alphabet (padding / separators).
-  def self.char_value(c)
-    byte_value(c.getbyte(0))
   end
 
   # The 6-bit value of one base64 alphabet byte, or -1 for anything
