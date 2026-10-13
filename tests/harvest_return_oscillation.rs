@@ -68,10 +68,11 @@ fn circular_config_load_emits_configuration_not_gradual_churn() {
         "expected Probe.config to settle on Probe::Configuration, got:\n{rbs}"
     );
     // `new` on a class-side `self` answers the receiving class, which a
-    // singleton signature spells `instance` (`Sub.load!` builds a Sub);
-    // the other branch is the configuration `Probe.config` holds.
+    // singleton signature spells `instance`; the other branch names the
+    // owner (`Probe.config` reads the same class back), and the owner
+    // already covers the receiver's own instance, so the union settles on it.
     assert!(
-        rbs.contains("def self.load!: () -> (instance | Probe::Configuration)"),
-        "expected Configuration.load! to settle on `instance | Probe::Configuration`, got:\n{rbs}"
+        rbs.contains("def self.load!: () -> Probe::Configuration"),
+        "expected Configuration.load! to settle on Probe::Configuration, got:\n{rbs}"
     );
 }
