@@ -12,8 +12,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A path no other test in this process (or a concurrent run) shares: tests run on parallel
+/// threads, so a name keyed by the pid alone is one directory for every test that uses it.
+/// Not created; callers that need it present use `scratch`.
+fn unique_dir(name: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("roundhouse-futamura-{name}-{}-{n}", std::process::id()))
+}
+
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-futamura-{name}-{}", std::process::id()));
+    let dir = unique_dir(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -1193,7 +1202,7 @@ mod runtime_stats {
     // stay valid Ruby with it.
     #[test]
     fn emitted_runtime_has_an_opt_in_stats_block_and_stays_valid_ruby() {
-        let dir = std::env::temp_dir().join(format!("roundhouse-futamura-stats-{}", std::process::id()));
+        let dir = crate::unique_dir("stats");
         let _ = fs::remove_dir_all(&dir);
         let src = dir.join("src");
         let out = dir.join("out");
@@ -1559,7 +1568,7 @@ mod flow_paths_runtime {
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
         let report = specialize(&app, &mut tree_files).unwrap();
         assert_eq!(report.specialized.len(), 3, "{:?}", report.residue);
-        let dir = std::env::temp_dir().join(format!("roundhouse-futamura-flow-runtime-{}", std::process::id()));
+        let dir = crate::unique_dir("flow-runtime");
         let _ = std::fs::remove_dir_all(&dir);
         for (path, content) in &tree_files {
             let target = dir.join(path);
@@ -1733,7 +1742,7 @@ mod association_scopes_and_conditions {
             eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
             return;
         }
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-assoc-{}", std::process::id()));
+        let out = crate::unique_dir("assoc");
         let _ = fs::remove_dir_all(&out);
         let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(fixture()).output().unwrap();
         assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
@@ -1911,7 +1920,7 @@ mod composite_keys_and_scoping_blocks {
             return;
         }
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-cpk-{}", std::process::id()));
+        let out = crate::unique_dir("cpk");
         let _ = fs::remove_dir_all(&out);
         let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
             .args(["--target", "futamura", "-o"])
@@ -1972,7 +1981,7 @@ mod list_binds {
             return;
         }
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-arrays-{}", std::process::id()));
+        let out = crate::unique_dir("arrays");
         let _ = fs::remove_dir_all(&out);
         let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
             .args(["--target", "futamura", "-o"])
@@ -2114,7 +2123,7 @@ mod preload_runtime {
 
     #[test]
     fn the_entries_rails_keeps_are_counted_by_reason_only_under_stats() {
-        let dir = std::env::temp_dir().join(format!("futamura-preload-stats-{}", std::process::id()));
+        let dir = crate::unique_dir("preload-stats");
         std::fs::create_dir_all(&dir).unwrap();
         let counted = probe("0", Some(&dir));
         let off = probe("0", None);
@@ -2204,7 +2213,7 @@ mod loaded_targets {
 
     #[test]
     fn only_to_a_on_the_reader_itself_is_marked_as_loading_the_target() {
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-loads-{}", std::process::id()));
+        let out = crate::unique_dir("loads");
         let init = emit(&out);
         let define = |key: &str| init.lines().find(|l| l.contains(&format!("Futamura.define(:{key},"))).unwrap_or_else(|| panic!("{key}\n{init}")).to_string();
         // `room.messages.to_a`, and with the scope lambda the reader carries.
@@ -2223,7 +2232,7 @@ mod loaded_targets {
             eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
             return;
         }
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-loads-run-{}", std::process::id()));
+        let out = crate::unique_dir("loads-run");
         emit(&out);
         let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_load_runtime.rb");
         let output = |verify: &str| {
@@ -2280,7 +2289,7 @@ mod strict_loading_terminals {
             eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
             return;
         }
-        let out = std::env::temp_dir().join(format!("roundhouse-futamura-strict-run-{}", std::process::id()));
+        let out = crate::unique_dir("strict-run");
         let _ = fs::remove_dir_all(&out);
         let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(fixture()).output().unwrap();
         assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
