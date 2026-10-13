@@ -39,6 +39,6 @@ puts "ab_cpu_positive=#{site["ab_spec_cpu"].positive? && site["ab_orig_cpu"].pos
 puts "phases_within_wall=#{site["guard_cpu"] + site["exec_cpu"] + site["fallback_cpu"] < site["specialized_s"] + site["fallback_s"] + site["guard_s"] + 0.05}"
 puts "clock_read_ns=#{doc["clock_read_ns"].positive?}"
 helpers = doc["helpers"]
-puts "helpers=#{%w[bind_nils redefined_class_method default_binds].all? { |name| helpers[name] && helpers[name]["calls"] >= 8 }}"
+puts "helpers=#{%w[bind_shape redefined_class_method default_binds].all? { |name| helpers[name] && helpers[name]["calls"] >= 8 }}"
 puts "helper_self_le_inclusive=#{helpers.values.all? { |h| h["self_cpu"] <= h["inclusive_cpu"] + 1e-9 }}"
 puts "compiles=#{doc["compiles"].size} compile_cpu=#{doc["compiles"].all? { |c| c["cpu"] }}"

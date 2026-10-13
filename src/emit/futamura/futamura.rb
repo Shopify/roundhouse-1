@@ -18,7 +18,7 @@
 # FUTAMURA_VERIFY=1 it runs as well, to check that both give the same
 # records in the same order, with the same associations loaded.
 module Futamura
-  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
+  Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, :plain, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, keyword_init: true)
 
   # `StatementCache::Params` that counts the placeholders handed out (`compile` compares the count
@@ -42,6 +42,7 @@ module Futamura
   NO_NILS = [].freeze
   # The key columns of an owner chain beyond the one the statement was written for (`owner_key_extras`).
   NO_EXTRAS = [].freeze
+  NO_EXTRA_VALUES = [].freeze
   # The `preload` a default scope adds to a chain (`default_shape`).
   NO_PRELOADS = [].freeze
 
@@ -60,6 +61,7 @@ module Futamura
   # whose length is part of the statement: one statement per length, from 1 to MAX_ARRAY values.
   NO_LISTS = {}.freeze
   MAX_ARRAY = 8
+  PLAIN_BINDS = [NO_NILS, NO_FIXED, NO_LISTS].freeze
 
   # The `params` a chain is built with for a call whose values at some positions are nil: `bind` is
   # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere. A position
@@ -148,7 +150,7 @@ module Futamura
     # itself (`notes.first`) answers from the association's target.
     def define(key, model, reverse: false, one: false, unscoped: false, owner_keys: nil, owner_columns: [], relation: false, via: nil, &build)
       @statements[key] = Statement.new(model: model, build: build, reverse: reverse, one: one, unscoped: unscoped,
-                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via)
+                                       owner_keys: owner_keys, owner_columns: owner_columns, relation: relation, via: via, plain: [nil, nil])
     end
 
     # Whether a method the chain calls on `target` (a class, or a record for an association
@@ -324,6 +326,37 @@ module Futamura
       nils.freeze
     end
 
+    # `bind_nils`, `fixed_values` and `bind_lists` in one pass over `binds`, as `[nils, fixed, lists]` (the same
+    # `NO_*` constants when a call has none of them, `PLAIN_BINDS` when it has none of any), or nil when one of
+    # them says the call is Rails' to run. A call carries a few binds and every call pays this, so it makes one
+    # walk, and no allocation for the usual call of scalars only.
+    def bind_shape(model, binds)
+      nils = fixed = lists = nil
+      index = 0
+      binds.each do |value|
+        case value
+        when Fixed
+          return unless value.value.nil? || Integer === value.value
+
+          (fixed ||= {})[index] = value.value
+        when nil
+          (nils ||= []) << index
+          return if nils.size > MAX_NILS
+        when Array
+          return unless list_bind?(model, value)
+
+          (lists ||= {})[index] = value.size
+        else
+          return if unsupported_bind?(value, model)
+        end
+        index += 1
+      end
+      return PLAIN_BINDS unless nils || fixed || lists
+
+      [nils ? nils.freeze : NO_NILS, fixed ? fixed.freeze : NO_FIXED, lists ? lists.freeze : NO_LISTS].freeze
+    end
+    private :bind_shape
+
     # The lengths of the lists among `binds` by position (`NO_LISTS` for none); `bind_nils` has
     # checked that each is one `list_bind?` accepts.
     def bind_lists(binds)
@@ -372,11 +405,9 @@ module Futamura
       # body may need run-time state (I18n) a `to_prepare` hook runs too early for.
       model = statement.model
       model = statement.model = Object.const_get(model) if model.is_a?(String)
-      nils = bind_nils(model, binds)
-      return fallback.call unless nils
-      fixed = fixed_values(binds)
-      return fallback.call unless fixed
-      lists = bind_lists(binds)
+      shape = bind_shape(model, binds)
+      return fallback.call unless shape
+      nils, fixed, lists = shape
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
@@ -388,7 +419,7 @@ module Futamura
         return result
       end
       extras = owner ? owner_key_extras(owner, association, statement) : NO_EXTRAS
-      extra_values = extras.map { |_, column| owner._read_attribute(column) }
+      extra_values = extras.empty? ? NO_EXTRA_VALUES : extras.map { |_, column| owner._read_attribute(column) }
       return fallback.call if extra_values.any? { |value| unsupported_bind?(value, model) }
       owned = extras.empty? ? statement.owner_columns : statement.owner_columns + extras.map(&:first)
 
@@ -415,10 +446,22 @@ module Futamura
 
       binds = binds.reject { |value| value.nil? || Fixed === value } unless nils.empty? && fixed.empty?
       binds = binds.flat_map { |value| Array === value ? value : [value] } unless lists.empty?
-      binds = defaults + binds + extra_values
+      binds = defaults + binds + extra_values unless defaults.empty? && extra_values.empty?
+      # A statement over no default conditions, extensions, preloads, nils, fixed values, key extras or lists (a model
+      # without default scopes, a call of scalars) is one per connection kind: it is found on the statement itself
+      # rather than by a key of nine parts that every call would build and hash.
+      plain = columns.equal?(NO_DEFAULTS[0]) && extensions.equal?(NO_DEFAULTS[2]) && preloads.equal?(NO_DEFAULTS[3]) &&
+              nils.equal?(NO_NILS) && fixed.equal?(NO_FIXED) && extras.equal?(NO_EXTRAS) && lists.equal?(NO_LISTS)
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists, preloads]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads) }
+        prepared = connection.prepared_statements
+        compiled = if plain
+          statement.plain[prepared ? 1 : 0].then do |known|
+            known.nil? ? (statement.plain[prepared ? 1 : 0] = compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads)) : known
+          end
+        else
+          @compiled.compute_if_absent([key, prepared, columns, extensions, nils, fixed, extras, lists, preloads]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads) }
+        end
         values = compiled && serialize_slots(compiled.slot_types, binds)
         values && compiled.cache.execute(values, connection)
       end
@@ -1506,7 +1549,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
       # FUTAMURA_STATS_HELPERS=1: the guard helpers of Futamura.records, each timed (inclusive, and self: what its
       # own helpers took off), globally rather than per site.
       module Helpers
-        NAMES = %i[bind_nils fixed_values bind_lists unsupported_bind? list_bind? scalar_class? redefined_class_method redefined?
+        NAMES = %i[bind_shape bind_nils fixed_values bind_lists unsupported_bind? list_bind? scalar_class? redefined_class_method redefined?
                    rails_method? in_rails_dir? owner_chain? owner_key_extras default_binds default_scope_method? default_shape
                    current_scope_binds merge_unscoped without_columns serialize_slots find_by_value association_key].freeze
         @children = []
