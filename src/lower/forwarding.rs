@@ -145,10 +145,26 @@ pub(super) fn apply_with_plans(
             diagnostics.push(keyword_refusal(*span, *policy));
         }
     }
+    // A receiverless `new` in a module body reaches whatever class
+    // extends the module (a `ClassMethods` carrier), so no callee can
+    // be resolved for it.
+    let mut module_new: HashSet<crate::span::Span> = HashSet::default();
+    fn module_news(e: &Expr, out: &mut HashSet<crate::span::Span>) {
+        if matches!(&*e.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "new") {
+            out.insert(e.span);
+        }
+        e.node.for_each_child(&mut |c| module_news(c, out));
+    }
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        for m in &lc.methods {
+            module_news(&m.body, &mut module_new);
+        }
+    }
     fn project(
         e: &mut Expr,
         plans: &HashMap<crate::span::Span, KeywordPolicy>,
         names: &ConstructorNames,
+        module_new: &HashSet<crate::span::Span>,
     ) {
         if plans.get(&e.span) == Some(&KeywordPolicy::NativeRuby) {
             // Kept as written. Every target but the Ruby family refuses it
@@ -170,7 +186,7 @@ pub(super) fn apply_with_plans(
                     callee_unresolved = matches!(
                         method.as_str(),
                         "send" | "public_send" | "__send__"
-                    ) || recv.as_ref().is_some_and(|recv| {
+                    ) || module_new.contains(&e.span) || recv.as_ref().is_some_and(|recv| {
                         !matches!(recv.ty, Some(crate::ty::Ty::Class { .. }))
                     });
                     let constructor_splat = method.as_str() == "new"
@@ -214,9 +230,9 @@ pub(super) fn apply_with_plans(
                 }
             }
         }
-        e.node.for_each_child_mut(&mut |c| project(c, plans, names));
+        e.node.for_each_child_mut(&mut |c| project(c, plans, names, module_new));
     }
-    super::for_each_forwarding_body(app, &mut |e| project(e, plans, names));
+    super::for_each_forwarding_body(app, &mut |e| project(e, plans, names, &module_new));
     diagnostics
 }
 
