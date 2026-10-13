@@ -88,30 +88,71 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
             copies.entry((site.span.start, site.span.end)).or_default().push(site);
         }
         for (_, mut group) in copies {
-            if group.iter().all(|s| s.call == group[0].call && s.define == group[0].define && s.hoists == group[0].hoists) {
+            if group.iter().all(|s| s.call == group[0].call && s.define == group[0].define && s.hoists == group[0].hoists && s.captures == group[0].captures) {
                 sites.push(group.swap_remove(0));
             } else {
                 report.residue.push(format!("{}: specializes differently for the classes sharing its source", location(group[0].span)));
             }
         }
+        // A site that reads values its locals' assignments keep needs those splices too: all or
+        // none. A splice that overlaps a site, or another splice, is not made, and the sites
+        // that read it stay Rails'.
+        let mut captures: Vec<(u32, u32, String)> = sites.iter().flat_map(|s| s.captures.iter().cloned()).collect();
+        captures.sort();
+        captures.dedup();
+        let site_spans: Vec<(u32, u32)> = sites.iter().map(|s| (s.span.start, s.span.end)).collect();
+        let overlaps = |a: &(u32, u32, String), b: (u32, u32)| a.0 < b.1 && b.0 < a.1;
+        let blocked: Vec<(u32, u32, String)> = captures
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                site_spans.iter().any(|b| overlaps(c, *b)) || captures.iter().enumerate().any(|(j, d)| *i != j && overlaps(c, (d.0, d.1)))
+            })
+            .map(|(_, c)| c.clone())
+            .collect();
+        sites.retain(|s| {
+            let keep = !s.captures.iter().any(|c| blocked.contains(c));
+            if !keep {
+                report.residue.push(format!("{}: a value kept at its local's assignment overlaps another splice", location(s.span)));
+            }
+            keep
+        });
+        captures.retain(|c| !blocked.contains(c));
         sites.sort_by_key(|s| std::cmp::Reverse(s.span.start));
         let mut last_start = u32::MAX;
+        let mut kept_sites = Vec::new();
         for site in sites {
             if site.span.end > last_start {
                 report.residue.push(format!("{}: overlaps another site", location(site.span)));
                 continue;
             }
-            let (start, end) = (site.span.start as usize, site.span.end as usize);
-            // The fallback reads the values the call site evaluated ahead of the call.
-            let mut orig = content[start..end].to_string();
-            for (s, e, read) in site.hoists.iter().rev() {
-                orig.replace_range(*s as usize - start..*e as usize - start, read);
-            }
-            let call = site.call.replace("{orig}", &orig);
-            content.replace_range(start..end, &call);
             last_start = site.span.start;
-            report.specialized.push(location(site.span));
-            defines.push(site.define);
+            kept_sites.push(site);
+        }
+        // Every splice, from the end so earlier offsets stay valid.
+        enum Splice {
+            Site(query::Site),
+            Capture(String),
+        }
+        let mut splices: Vec<(u32, u32, Splice)> = kept_sites.into_iter().map(|s| (s.span.start, s.span.end, Splice::Site(s))).collect();
+        splices.extend(captures.into_iter().map(|(start, end, text)| (start, end, Splice::Capture(text))));
+        splices.sort_by_key(|(start, ..)| std::cmp::Reverse(*start));
+        for (start, end, splice) in splices {
+            let (start, end) = (start as usize, end as usize);
+            match splice {
+                Splice::Capture(text) => content.replace_range(start..end, &text),
+                Splice::Site(site) => {
+                    // The fallback reads the values the call site evaluated among its binds.
+                    let mut orig = content[start..end].to_string();
+                    for (s, e, read) in site.hoists.iter().rev() {
+                        orig.replace_range(*s as usize - start..*e as usize - start, read);
+                    }
+                    let call = site.call.replace("{orig}", &orig);
+                    content.replace_range(start..end, &call);
+                    report.specialized.push(location(site.span));
+                    defines.push(site.define);
+                }
+            }
         }
     }
     report.residue.extend(residue.into_iter().map(|r| format!("{}: {}", location(r.span), r.reason)));

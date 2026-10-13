@@ -57,9 +57,13 @@ pub struct Site {
     pub call: String,
     /// The `Futamura.define` line for the generated initializer.
     pub define: String,
-    /// Values the call site evaluates once, ahead of the call, and the fallback reads back
-    /// instead of evaluating again: `(span, replacement)` over the site's source.
+    /// Values the call site evaluates once, in place among its binds, and the fallback reads back
+    /// instead of evaluating again: `(start, end, replacement)` over the site's source.
     pub hoists: Vec<(u32, u32, String)>,
+    /// Values a relation local's assignment evaluates once and keeps in a local the call site
+    /// reads, instead of evaluating them again at the terminal: `(start, end, replacement)` over
+    /// the source of the assignment. Spliced only together with the site (see `specialize`).
+    pub captures: Vec<(u32, u32, String)>,
 }
 
 /// A query-shaped site that was left to Rails, and why.
@@ -70,6 +74,16 @@ pub struct Residue {
 
 /// Stands for a hoisted value in a bind until the site's local is named.
 const HOIST: &str = "__FUT_H";
+
+/// A value the call site evaluates in place among its binds and the fallback reads back.
+#[derive(Clone)]
+struct Hoist {
+    span: Span,
+    src: String,
+    /// The key of a value-omitted hash entry (`where(shop_id:)`), whose span is `shop_id:`: the
+    /// fallback reads `shop_id: <temp>`.
+    key: Option<String>,
+}
 
 #[derive(Clone)]
 enum Val {
@@ -90,8 +104,8 @@ struct Chain {
     /// `p.bind` (a WHERE value or a constant LIMIT, in call order).
     where_binds: Vec<String>,
     /// Request-time values the call site must evaluate once, in source order (`where_binds`
-    /// name them ``): the source span and text of each.
-    hoisted: Vec<(Span, String)>,
+    /// name them `HOIST[i]`).
+    hoisted: Vec<Hoist>,
     ordered: bool,
     limited: bool,
     /// Rooted at `Model.unscoped`, which drops the model's default scopes.
@@ -184,6 +198,7 @@ impl<'a> Specializer<'a> {
         let mut locals = HashMap::new();
         collect_locals(body, &mut locals);
         let flow = flow::Flow::new(body);
+        let captured = std::cell::RefCell::new(Vec::new());
         let cx = Cx {
             locals: &locals,
             flow: &flow,
@@ -193,6 +208,8 @@ impl<'a> Specializer<'a> {
             class_self: class_self.cloned(),
             instance_self: instance_self.cloned(),
             through_local: Default::default(),
+            capturable: Default::default(),
+            captured: &captured,
             terminal: Default::default(),
         };
         self.visit(body, &cx, sites, residue);
@@ -276,6 +293,7 @@ impl<'a> Specializer<'a> {
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         cx.terminal.set(e.span.start);
+        cx.captured.borrow_mut().clear();
         let chain = self.chain(recv, cx)?;
         let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
         if self.private_models.contains(chain.model.0.as_str()) {
@@ -321,20 +339,40 @@ impl<'a> Specializer<'a> {
         // test double that stands for the owner is not asked for it).
         let binds = if chain.owner.is_some() { format!("-> {{ [{}] }}", binds.join(", ")) } else { format!("[{}]", binds.join(", ")) };
         let mut call = format!("Futamura.records(:{key}, {binds}{owner}{root}) {{ {{orig}} }}");
-        // A value that is not a plain read (a call, a block) is evaluated once, where Ruby evaluates
-        // the argument list (left to right, ahead of the call): in its place among the binds, which
-        // are in source order, and stored in a local the fallback reads back.
+        // A value that is not a pure read (a call, a block, a reader chain) is evaluated once, where
+        // Ruby evaluates the argument list (left to right, ahead of the call): in its place among
+        // the binds, which are in source order, and stored in a local the fallback (and the verify
+        // shadow) reads back. A value used by several binds (a scope parameter used twice) is
+        // evaluated at the first and read at the others; one that no bind uses, or binds out of
+        // the order Ruby evaluates them in, keeps the site Rails'.
         let mut hoists = Vec::new();
-        if !chain.hoisted.is_empty() {
-            let temp = format!("__fut_{key}");
-            for (i, (_, src)) in chain.hoisted.iter().enumerate() {
-                call = call.replace(&format!("{HOIST}[{i}]"), &format!("({temp}[{i}] = ({src}))"));
+        let mut at = 0;
+        for (i, h) in chain.hoisted.iter().enumerate() {
+            if h.span.start < e.span.start || h.span.end > e.span.end {
+                return Err("hoisted value is outside the call site".into());
             }
-            call = format!("({temp} = []; {call})");
-            hoists = chain.hoisted.iter().enumerate().map(|(i, (span, _))| (span.start, span.end, format!("{temp}[{i}]"))).collect();
-            hoists.sort();
+            let temp = format!("__fut_{key}_{i}");
+            let marker = format!("{HOIST}[{i}]");
+            let Some(first) = call.find(&marker) else { return Err("hoisted value is not among the binds".into()) };
+            if first < at {
+                return Err("hoisted values are bound out of source order".into());
+            }
+            let assign = format!("({temp} = ({}))", h.src);
+            let (head, tail) = call.split_at(first + marker.len());
+            call = format!("{}{assign}{}", &head[..first], tail.replace(&marker, &temp));
+            at = first + assign.len();
+            let read = match &h.key {
+                Some(key) => format!("{key}: {temp}"),
+                None => temp,
+            };
+            hoists.push((h.span.start, h.span.end, read));
         }
-        Ok(Site { span: e.span, call, define, hoists })
+        hoists.sort();
+        if hoists.windows(2).any(|w| w[0].1 > w[1].0) {
+            return Err("hoisted values overlap".into());
+        }
+        let captures = std::mem::take(&mut *cx.captured.borrow_mut());
+        Ok(Site { span: e.span, call, define, hoists, captures })
     }
 
     fn source_text(&self, span: Span) -> &str {
@@ -396,9 +434,9 @@ impl<'a> Specializer<'a> {
     fn chain_at(&self, e: &Expr, cx: &Cx) -> Result<Chain, String> {
         match &*e.node {
             ExprNode::Var { id, name } => match cx.locals.get(&(*id, name.clone())) {
-                Some(Some(value)) => self.chain_through_local(value, cx),
+                Some(Some(value)) => self.chain_through_local(value, cx, true),
                 // Assigned on several paths: the assignment reaching this read.
-                Some(None) => self.chain_through_local(cx.flow.reaching(e, *id, name)?, cx),
+                Some(None) => self.chain_through_local(cx.flow.reaching(e, *id, name)?, cx, false),
                 None => Err(format!("`{}` is not assigned exactly once", name.as_str())),
             },
             // `x = if c then Model.where(a: 1) else Model.where(b: 2) end`: the
@@ -469,11 +507,15 @@ impl<'a> Specializer<'a> {
 
     /// The chain a local was assigned. Its values are read where the terminal is, which is
     /// later than where the original chain read them (see `Cx::through_local`).
-    fn chain_through_local(&self, value: &Expr, cx: &Cx) -> Result<Chain, String> {
-        let outer = cx.through_local.get();
+    /// `once`: the local is assigned exactly once in the body, so its assignment is the only code
+    /// that evaluated the values (see `capture`).
+    fn chain_through_local(&self, value: &Expr, cx: &Cx, once: bool) -> Result<Chain, String> {
+        let (outer, outer_once) = (cx.through_local.get(), cx.capturable.get());
         cx.through_local.set(Some(outer.map_or(value.span.end, |o| o.min(value.span.end))));
+        cx.capturable.set(once);
         let chain = self.chain(value, cx);
         cx.through_local.set(outer);
+        cx.capturable.set(outer_once);
         chain
     }
 
@@ -786,7 +828,7 @@ impl<'a> Specializer<'a> {
     /// A scope's body, evaluated with the chain as implicit self and its
     /// parameters bound to the call's arguments. Statements before the
     /// last only build and discard relations, so they are dropped.
-    fn inline(&self, chain: Chain, scope: &Scope, args: &[Expr], cx: &Cx) -> Result<(Chain, Terminal), String> {
+    fn inline(&self, mut chain: Chain, scope: &Scope, args: &[Expr], cx: &Cx) -> Result<(Chain, Terminal), String> {
         if scope.params.len() != args.len() {
             return Err(format!("scope `{}` arity", scope.name.as_str()));
         }
@@ -803,9 +845,9 @@ impl<'a> Specializer<'a> {
         };
         let mut bound = HashMap::new();
         for (p, a) in scope.params.iter().zip(args) {
-            bound.insert(p.name.clone(), self.value(a, cx)?);
+            bound.insert(p.name.clone(), self.bind_value(a, cx, &mut chain, false)?);
         }
-        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None, instance_self: None, through_local: cx.through_local.clone(), terminal: cx.terminal.clone() };
+        let inner = Cx { locals: cx.locals, flow: cx.flow, depth: std::cell::Cell::new(cx.depth.get()), args: bound, self_chain: Some(chain.clone()), class_self: None, instance_self: None, through_local: cx.through_local.clone(), capturable: cx.capturable.clone(), captured: cx.captured, terminal: cx.terminal.clone() };
         let ExprNode::Send { recv, method, args, block: None, .. } = &*body.node else {
             return Err(format!("scope `{}` body is not a call chain", scope.name.as_str()));
         };
@@ -906,11 +948,19 @@ impl<'a> Specializer<'a> {
             // model class, which the call site cannot reproduce.
             _ if cx.self_chain.is_some() => Err("scope body value other than a literal or parameter".into()),
             _ if is_call_site_value(e) => {
-                // Read at the terminal: the same value the chain read when its local was assigned?
-                if let Some(from) = cx.through_local.get()
-                    && !cx.flow.same_value_later(e, from, cx.terminal.get(), &|m| self.is_relation_link(m))
-                {
-                    return Err(format!("`{}` may change between the local's assignment and the call that loads it", emit_expr(e)));
+                // Read at the terminal, later than the chain read it when its local was assigned.
+                if let Some(from) = cx.through_local.get() {
+                    let same = cx.flow.same_value_later(e, from, cx.terminal.get(), &|m| self.is_relation_link(m));
+                    // A pure read of a local nothing writes in between is the same value at both. Any
+                    // other is evaluated once, by the assignment, and read from where it was kept.
+                    if !(is_pure_read(e) && same) {
+                        if let Some(slot) = self.capture(e, cx) {
+                            return Ok(Val::Bind(slot));
+                        }
+                        if !same {
+                            return Err(format!("`{}` may change between the local's assignment and the call that loads it", emit_expr(e)));
+                        }
+                    }
                 }
                 Ok(Val::Bind(self.written(e)?))
             }
@@ -923,25 +973,90 @@ impl<'a> Specializer<'a> {
     /// `Digest.hexdigest(token)`): Ruby evaluates the hash's values when it builds the argument list, in
     /// source order, before the `where` call (and Rails' `where` takes the finished hash), so the call
     /// site may evaluate them first as long as it evaluates each once and the fallback reuses the result
-    /// (`Site::hoists`). Not where the value is read at another time than the chain read it (through a
-    /// local, inside an inlined scope), where it is read only once the owner is known (an association
-    /// root), or on a path chosen by a branch (the fallback's source is shared by every path).
+    /// (`Site::hoists`). Through a local the assignment evaluates it, once, and keeps it (`capture`).
     fn where_value(&self, e: &Expr, cx: &Cx, chain: &mut Chain) -> Result<Val, String> {
+        self.bind_value(e, cx, chain, true)
+    }
+
+    /// A request-time value a bind takes (`widen`: any expression the chain evaluates, not only a
+    /// plain read; see `where_value`). Anything but a pure read of a local, an instance variable, a
+    /// constant or `self` is evaluated once (`hoist`): a method call may have effects, or answer
+    /// differently the second time, and the fallback block (and the verify shadow) must see what the
+    /// binds got. Where it cannot be hoisted (inside a scope body, under a branch, in an owner's
+    /// lambda) a plain read is evaluated at the call site as written.
+    fn bind_value(&self, e: &Expr, cx: &Cx, chain: &mut Chain, widen: bool) -> Result<Val, String> {
         let reason = match self.value(e, cx) {
-            Err(reason) if reason.starts_with("value is ") => reason,
+            Ok(Val::Bind(src)) => {
+                if !is_pure_read(e) && let Some(hoisted) = self.hoist(e, cx, chain) {
+                    return Ok(hoisted);
+                }
+                return Ok(Val::Bind(src));
+            }
+            Err(reason) if widen && reason.starts_with("value is ") => reason,
             other => return other,
         };
+        if cx.through_local.get().is_some() {
+            return self.capture(e, cx).map(Val::Bind).ok_or(reason);
+        }
+        self.hoist(e, cx, chain).ok_or(reason)
+    }
+
+    /// The source of `e` exactly as its span has it, and the key of a value-omitted hash entry
+    /// (`where(shop_id:)`, whose span is `shop_id:` and whose value is the bare name `shop_id`).
+    /// A replacement of the span must cover exactly the source the value was printed from, and a
+    /// heredoc's body would stay where the line is, not follow the value.
+    fn exact_source(&self, e: &Expr) -> Option<(String, Option<String>)> {
+        if e.span.is_synthetic() {
+            return None;
+        }
+        let raw = self.source_text(e.span);
+        if raw.is_empty() || raw != raw.trim() || raw.contains('#') || raw.contains("<<") {
+            return None;
+        }
+        match raw.strip_suffix(':') {
+            Some(name) if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => Some((name.to_string(), Some(name.to_string()))),
+            _ => Some((raw.to_string(), None)),
+        }
+    }
+
+    /// Evaluate `e` once, in its place among the call site's binds (`Site::hoists`). Not where the
+    /// value is read at another time than the chain read it (through a local, inside an inlined
+    /// scope), where it is read only once the owner is known (an association root), or on a path
+    /// chosen by a branch (the fallback's source is shared by every path).
+    fn hoist(&self, e: &Expr, cx: &Cx, chain: &mut Chain) -> Option<Val> {
         if cx.self_chain.is_some() || cx.through_local.get().is_some() || chain.owner.is_some() || !cx.flow.suffix().is_empty() {
-            return Err(reason);
+            return None;
         }
-        let text = self.written(e)?;
-        // The replacement must cover exactly the source the value was printed from, and a heredoc's
-        // body would stay where the line is, not follow the value into the argument array.
-        if text != self.source_text(e.span) || text.contains("<<") {
-            return Err("value source is not exactly its span".into());
+        let (src, key) = self.exact_source(e)?;
+        chain.hoisted.push(Hoist { span: e.span, src, key });
+        Some(Val::Bind(format!("{HOIST}[{}]", chain.hoisted.len() - 1)))
+    }
+
+    /// A value of the chain of a local the assignment evaluates, kept for the terminal. The
+    /// assignment builds the relation (Rails evaluates a `where`'s values when it builds the
+    /// predicate, `PredicateBuilder#build_from_hash` and `WhereClauseFactory#build`, and keeps the
+    /// values in the relation's binds), and the statement reads those values at the terminal: a
+    /// value read there again would be a second evaluation, of something that may by then answer
+    /// differently. The call site reads the local `capture` leaves at the assignment instead, by
+    /// splicing `(slot = (value))` over the value's own span (`Site::captures`). Only for a local
+    /// assigned once, and not on a path chosen by a branch.
+    fn capture(&self, e: &Expr, cx: &Cx) -> Option<String> {
+        if !cx.capturable.get() || cx.self_chain.is_some() || !cx.flow.suffix().is_empty() {
+            return None;
         }
-        chain.hoisted.push((e.span, text));
-        Ok(Val::Bind(format!("{HOIST}[{}]", chain.hoisted.len() - 1)))
+        let (src, key) = self.exact_source(e)?;
+        let slot = format!("__fut_cap_{}", self.key(e.span));
+        let kept = format!("({slot} = ({src}))");
+        let replacement = match key {
+            Some(key) => format!("{key}: {kept}"),
+            None => kept,
+        };
+        let mut captured = cx.captured.borrow_mut();
+        let entry = (e.span.start, e.span.end, replacement);
+        if !captured.contains(&entry) {
+            captured.push(entry);
+        }
+        Some(slot)
     }
 
     /// A `limit`/`first`/`last` count: a literal, else a request-time value.
@@ -953,7 +1068,7 @@ impl<'a> Specializer<'a> {
     fn limit_value(&self, e: &Expr, chain: &mut Chain, cx: &Cx) -> Result<String, String> {
         let v = match &*e.node {
             ExprNode::Const { path } if cx.self_chain.is_some() => Val::Bind(self.scope_const(path)?),
-            _ => self.value(e, cx)?,
+            _ => self.bind_value(e, cx, chain, false)?,
         };
         Ok(match v {
             Val::Static(src) => src,
@@ -1013,6 +1128,10 @@ struct Cx<'b> {
     /// earliest such assignment. A request-time value found there is read later (at the
     /// terminal) than the original chain read it.
     through_local: std::cell::Cell<Option<u32>>,
+    /// The local the walk is inside the value of is assigned exactly once in the body.
+    capturable: std::cell::Cell<bool>,
+    /// Values the site being specialized has the assignments of its locals keep (`capture`).
+    captured: &'b std::cell::RefCell<Vec<(u32, u32, String)>>,
     /// Where the terminal of the site being specialized starts.
     terminal: std::cell::Cell<u32>,
 }
@@ -1158,6 +1277,17 @@ fn static_literal(e: &Expr) -> Option<String> {
             _ => src,
         }
     })
+}
+
+/// A read with no effect, and no answer but the same each time: a local, an instance variable,
+/// a constant, `self`, or those combined with `||`/`&&`.
+fn is_pure_read(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef | ExprNode::Const { .. } => true,
+        ExprNode::Lit { value } => !matches!(value, Literal::Regex { .. }),
+        ExprNode::BoolOp { left, right, .. } => is_pure_read(left) && is_pure_read(right),
+        _ => false,
+    }
 }
 
 /// A request-time value the call site can evaluate again. The call site

@@ -254,7 +254,7 @@ end
         specialize(&app, &mut files).unwrap();
         let controller = file(&files, "app/controllers/messages_controller.rb");
         let init = file(&files, INITIALIZER);
-        assert!(controller.contains("@pinned = Futamura.records(:controllers_messages_controller_5_15, [@room.id]) {"), "{controller}");
+        assert!(controller.contains("@pinned = Futamura.records(:controllers_messages_controller_5_15, [(__fut_controllers_messages_controller_5_15_0 = (@room.id))]) { Message.where(room_id: __fut_controllers_messages_controller_5_15_0, pinned: true)"), "{controller}");
         assert!(init.contains(
             "Message.all.where(room_id: p.bind, pinned: true).order({ created_at: :desc }).send(:ordered_relation).limit(3) }"
         ), "{init}");
@@ -298,8 +298,8 @@ mod single_record_terminals {
         let out = get("app/controllers/stories_controller.rb");
         assert!(init.contains("\"Story\", one: true, via: :where) { |p| Story.all.where(short_id: p.bind).send(:ordered_relation).limit(1) }"), "{init}");
         assert!(init.contains("\"Story\", one: true, via: :find_by) { |p| Story.all.where(short_id: p.bind).limit(1) }"), "{init}");
-        assert!(out.contains("[params[:id].to_s]) { Story.where(short_id: params[:id].to_s).first }"), "{out}");
-        assert!(out.contains("[Futamura.find_by_value(params[:id] || params[:story_id])]) {"), "{out}");
+        assert!(out.contains("[(__fut_controllers_stories_controller_3_14_0 = (params[:id].to_s))]) { Story.where(short_id: __fut_controllers_stories_controller_3_14_0).first }"), "{out}");
+        assert!(out.contains("[Futamura.find_by_value((__fut_controllers_stories_controller_4_13_0 = (params[:id] || params[:story_id])))]) {"), "{out}");
     }
 }
 
@@ -1139,7 +1139,7 @@ mod more_links_and_values {
         let finder = &files.iter().find(|(p, _)| p == "app/services/finder.rb").unwrap().1;
         assert!(finder.contains("Futamura.records(") && finder.contains("[Futamura.find_by_value(Tenant::NAME)]"), "{finder}");
         // A call on a constant runs class code, so it is evaluated once, ahead of the call, and the fallback reads it back.
-        assert!(finder.contains("(__fut_services_finder_6_5 = []; Futamura.records(:services_finder_6_5, [Futamura.find_by_value((__fut_services_finder_6_5[0] = (Tenant.fetch(x))))]) { Tenant.find_by(name: __fut_services_finder_6_5[0]) })"), "{finder}");
+        assert!(finder.contains("Futamura.records(:services_finder_6_5, [Futamura.find_by_value((__fut_services_finder_6_5_0 = (Tenant.fetch(x))))]) { Tenant.find_by(name: __fut_services_finder_6_5_0) }"), "{finder}");
     }
 
     /// core.rb `find_by` (the class method) reads a value that responds to `id`
@@ -1526,7 +1526,9 @@ mod locals_assigned_on_several_paths {
 /// A request-time value is read at the call site, where the terminal is. When the chain goes
 /// through a local (`scope = Item.where(shop_id: shop)` ... `scope.to_a`) that is later than
 /// the `where` ran, so a value that can change in between would be read late and bound
-/// differently from what the original chain used. Such a site stays Rails'.
+/// differently from what the original chain used. The assignment keeps what it evaluated in a
+/// local (`__fut_cap_*`, spliced over the value) and the site reads that, as long as the relation
+/// local is assigned once; a local assigned on several paths keeps such a site Rails'.
 mod bind_timing {
     use std::path::PathBuf;
 
@@ -1536,7 +1538,7 @@ mod bind_timing {
 
     const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.integer \"shop_id\"\n    t.string \"kind\"\n  end\nend\n";
 
-    fn run(body: &str) -> roundhouse::emit::futamura::Report {
+    fn run_files(body: &str) -> (roundhouse::emit::futamura::Report, String) {
         let finder = format!("class Item < ApplicationRecord\n  def self.find_all(shop, kind)\n{body}\n  end\nend\n");
         let files: Vec<(&str, &str)> = vec![
             ("db/schema.rb", SCHEMA),
@@ -1548,7 +1550,13 @@ mod bind_timing {
         let mut app = ingest_app_from_tree(tree).expect("ingest");
         Analyzer::new(&app).analyze(&mut app);
         let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
-        specialize(&app, &mut tree_files).unwrap()
+        let report = specialize(&app, &mut tree_files).unwrap();
+        let item = tree_files.into_iter().find(|(p, _)| p == "app/models/item.rb").unwrap().1;
+        (report, item)
+    }
+
+    fn run(body: &str) -> roundhouse::emit::futamura::Report {
+        run_files(body).0
     }
 
     fn timing_residue(report: &roundhouse::emit::futamura::Report) -> bool {
@@ -1558,8 +1566,9 @@ mod bind_timing {
     #[test]
     fn a_value_nothing_reassigns_is_read_late_harmlessly() {
         // A parameter, or a local written once before the chain, has the same value at the call site.
-        let report = run("    scope = Item.where(shop_id: shop)\n    scope.to_a");
+        let (report, item) = run_files("    scope = Item.where(shop_id: shop)\n    scope.to_a");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(!item.contains("__fut_cap"), "{item}");
         let report = run("    id = shop\n    scope = Item.where(shop_id: id)\n    scope.to_a");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
         // A chain written as one expression reads its values when the call does.
@@ -1568,38 +1577,59 @@ mod bind_timing {
     }
 
     #[test]
-    fn a_local_reassigned_after_the_relation_was_built_is_left_to_rails() {
-        // Rails' chain bound the old `shop`; the call site would bind 7.
-        let report = run("    scope = Item.where(shop_id: shop)\n    shop = 7\n    scope.to_a");
-        assert_eq!(report.specialized.len(), 0);
-        assert!(timing_residue(&report), "{:?}", report.residue);
-        let report = run("    id = 1\n    scope = Item.where(shop_id: id)\n    id = 2\n    scope.to_a");
-        assert_eq!(report.specialized.len(), 0);
-        assert!(timing_residue(&report), "{:?}", report.residue);
-    }
-
-    #[test]
-    fn an_instance_variable_written_in_the_method_is_left_to_rails() {
-        let report = run("    scope = Item.where(shop_id: @shop)\n    scope.to_a");
+    fn a_local_reassigned_after_the_relation_was_built_is_captured_at_the_assignment() {
+        // Rails' chain bound the old `shop`: the assignment keeps it, the site binds the kept value.
+        let (report, item) = run_files("    scope = Item.where(shop_id: shop)\n    shop = 7\n    scope.to_a");
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
-        let report = run("    scope = Item.where(shop_id: @shop)\n    @shop = 7\n    scope.to_a");
-        assert_eq!(report.specialized.len(), 0);
-        assert!(timing_residue(&report), "{:?}", report.residue);
+        assert!(item.contains("scope = Item.where(shop_id: (__fut_cap_models_item_3_33 = (shop)))"), "{item}");
+        assert!(item.contains("Futamura.records(:models_item_5_5, [__fut_cap_models_item_3_33]) { scope.to_a }"), "{item}");
+        let (report, item) = run_files("    id = 1\n    scope = Item.where(shop_id: id)\n    id = 2\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(item.contains("[__fut_cap_models_item_4_33]"), "{item}");
     }
 
     #[test]
-    fn a_call_that_can_change_what_a_value_reads_is_left_to_rails() {
+    fn an_instance_variable_written_in_the_method_is_captured_at_the_assignment() {
+        let (report, item) = run_files("    scope = Item.where(shop_id: @shop)\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(!item.contains("__fut_cap"), "{item}");
+        let (report, item) = run_files("    scope = Item.where(shop_id: @shop)\n    @shop = 7\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(item.contains("scope = Item.where(shop_id: (__fut_cap_models_item_3_33 = (@shop)))"), "{item}");
+    }
+
+    #[test]
+    fn a_value_a_call_may_change_is_captured_at_the_assignment() {
         // Nothing runs between the `where` and the terminal but more links on the relation.
-        let report = run("    scope = Item.where(shop_id: shop.id)\n    scope = scope.where(kind: kind)\n    scope.to_a");
+        let (report, item) = run_files("    scope = Item.where(shop_id: shop.id)\n    scope = scope.where(kind: kind)\n    scope.to_a");
+        // The local is assigned twice, so nothing is kept: the value is read again at the terminal
+        // (nothing but links ran in between, which `Flow::same_value_later` checks).
         assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
-        // Another call may change `shop.id`.
-        let report = run("    scope = Item.where(shop_id: shop.id)\n    shop.reload\n    scope.to_a");
-        assert_eq!(report.specialized.len(), 0);
+        assert!(!item.contains("__fut_cap"), "{item}");
+        // Another call may change `shop.id`; the terminal may run later, in a block, as many times as it is called.
+        for body in [
+            "    scope = Item.where(shop_id: shop.id)\n    shop.reload\n    scope.to_a",
+            "    scope = Item.where(shop_id: shop.id)\n    [1].each { scope.to_a }",
+        ] {
+            let (report, item) = run_files(body);
+            assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+            assert!(item.contains("scope = Item.where(shop_id: (__fut_cap_models_item_3_33 = (shop.id)))"), "{item}");
+            assert!(item.contains("[__fut_cap_models_item_3_33]) {"), "{item}");
+        }
+    }
+
+    #[test]
+    fn a_relation_local_assigned_on_several_paths_is_left_to_rails_when_a_value_may_change() {
+        let report = run("    scope = Item.where(shop_id: shop)\n    scope = scope.where(kind: kind) if kind\n    shop = 7\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 0, "{:?}", report.residue);
         assert!(timing_residue(&report), "{:?}", report.residue);
-        // The terminal runs later, in a block, as many times as the block is called.
-        let report = run("    scope = Item.where(shop_id: shop.id)\n    [1].each { scope.to_a }");
-        assert_eq!(report.specialized.len(), 0);
-        assert!(timing_residue(&report), "{:?}", report.residue);
+    }
+
+    #[test]
+    fn a_value_omitted_hash_entry_through_a_local_keeps_its_key() {
+        let (report, item) = run_files("    scope = Item.where(shop_id:)\n    shop = 7\n    scope.to_a");
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(item.contains("scope = Item.where(shop_id: (__fut_cap_models_item_3_24 = (shop_id)))"), "{item}");
     }
 }
 
@@ -1920,7 +1950,7 @@ end
         assert_eq!(finder.matches("[shop_id, KIND]) {").count(), 2, "{finder}");
         assert!(!finder.contains("Finder::KIND"), "{finder}");
         // A receiver the emitter has no lowering for is printed from the source.
-        assert!(finder.contains("Futamura.find_by_value(model.polymorphic_name)"), "{finder}");
+        assert!(finder.contains("Futamura.find_by_value((__fut_services_lookup_finder_34_7_0 = (model.polymorphic_name)))"), "{finder}");
         assert!(!finder.contains("not supported"), "{finder}");
         // A constant in the block is public and rooted, a literal, or bound; never private and rooted.
         let init = fs::read_to_string(out.join("config/initializers/futamura.rb")).unwrap();
@@ -2528,6 +2558,69 @@ module Lookup
   def self.mixed
     Widget.where(shop_id: stamp, kind: tick(\"K\")).to_a
   end
+
+  # A zero-argument call on the implicit self answers differently each time and records it.
+  def self.bump
+    calls << :bump
+    @bump = (@bump || 0) + 1
+  end
+
+  def self.kind_name
+    calls << :kind_name
+    \"k\"
+  end
+
+  def self.shop_id
+    calls << :shop_id
+    1
+  end
+
+  def self.per_page
+    calls << :per_page
+    2
+  end
+
+  def self.by_bump
+    Widget.where(shop_id: bump).order(:id).to_a
+  end
+
+  def self.by_shorthand
+    Widget.where(shop_id:).order(:id).to_a
+  end
+
+  def self.paged
+    Widget.where(shop_id: 1).order(:id).limit(per_page).to_a
+  end
+
+  def self.with_scope
+    Widget.of_kind(kind_name).order(:id).to_a
+  end
+
+  def self.with_scope_twice
+    Widget.not_kind_named(kind_name).order(:id).to_a
+  end
+
+  def self.with_scope_unused
+    Widget.any_kind(kind_name).order(:id).to_a
+  end
+
+  # The relation is built here, and a value changes before it is loaded: Rails kept the first.
+  def self.captured
+    scope = Widget.where(shop_id: bump).order(:id)
+    bump
+    scope.to_a
+  end
+
+  def self.captured_shorthand
+    scope = Widget.where(shop_id:).order(:id)
+    scope.to_a
+  end
+
+  def self.captured_in_block
+    scope = Widget.where(shop_id: bump).order(:id)
+    bump
+    [1, 2].map { scope.to_a.map(&:name) }
+  end
 end
 ";
 
@@ -2536,7 +2629,7 @@ end
         let out = scratch("hoist-out");
         write(&src, "db/schema.rb", b"ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"kind\"\n    t.integer \"shop_id\"\n  end\nend\n");
         write(&src, "app/models/application_record.rb", b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n");
-        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\nend\n");
+        write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\n  scope :of_kind, ->(kind) { where(kind: kind) }\n  scope :not_kind_named, ->(kind) { where(kind: kind).where.not(name: kind) }\n  scope :any_kind, ->(kind) { where(shop_id: 1) }\nend\n");
         write(&src, "app/services/lookup.rb", lookup.as_bytes());
         let run = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(&src).output().unwrap();
         assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
@@ -2546,25 +2639,54 @@ end
     }
 
     #[test]
-    fn a_call_value_is_evaluated_once_ahead_of_the_call_and_the_fallback_reads_it_back() {
+    fn a_call_value_is_evaluated_once_in_place_among_the_binds_and_the_fallback_reads_it_back() {
         let (out, lookup) = emit(LOOKUP);
-        assert_eq!(lookup.matches("Futamura.records(").count(), 6, "{lookup}");
+        // The scope with an unused parameter keeps its site Rails': Ruby evaluates the argument, the binds would not.
+        assert_eq!(lookup.matches("Futamura.records(").count(), 14, "{lookup}");
         // In argument order, parenthesized so any expression is valid in the array.
-        assert!(lookup.contains("(__fut_services_lookup_14_5 = []; Futamura.records(:services_lookup_14_5, [(__fut_services_lookup_14_5[0] = (tick(name))), (__fut_services_lookup_14_5[1] = (tick(kind)))]) { Widget.where(name: __fut_services_lookup_14_5[0], kind: __fut_services_lookup_14_5[1]).to_a })"), "{lookup}");
-        // A plain read beside a call keeps its own text; only the call is read back.
-        assert!(lookup.contains("Futamura.records(:services_lookup_10_5, [(__fut_services_lookup_10_5[0] = (tick(kind)))]) { Widget.where(shop_id: 1, kind: __fut_services_lookup_10_5[0]).order(:id).to_a }"), "{lookup}");
+        assert!(lookup.contains("Futamura.records(:services_lookup_14_5, [(__fut_services_lookup_14_5_0 = (tick(name))), (__fut_services_lookup_14_5_1 = (tick(kind)))]) { Widget.where(name: __fut_services_lookup_14_5_0, kind: __fut_services_lookup_14_5_1).to_a }"), "{lookup}");
+        // A pure read beside a call keeps its own text; only the call is read back.
+        assert!(lookup.contains("Futamura.records(:services_lookup_10_5, [(__fut_services_lookup_10_5_0 = (tick(kind)))]) { Widget.where(shop_id: 1, kind: __fut_services_lookup_10_5_0).order(:id).to_a }"), "{lookup}");
         assert!(!lookup.contains("{ Widget.where(shop_id: 1, kind: tick(kind))"), "{lookup}");
-        // A plain read before a call stays before it among the binds, as the hash lists them.
-        assert!(lookup.contains("Futamura.records(:services_lookup_35_5, [stamp, (__fut_services_lookup_35_5[0] = (tick(\"K\")))])"), "{lookup}");
+        // A zero-argument call on the implicit self is read back too, in its place among the binds.
+        assert!(lookup.contains("Futamura.records(:services_lookup_35_5, [(__fut_services_lookup_35_5_0 = (stamp)), (__fut_services_lookup_35_5_1 = (tick(\"K\")))])"), "{lookup}");
+        // A value-omitted entry reads back as `key: temp`; a limit is read back like a where value.
+        assert!(lookup.contains("{ Widget.where(shop_id: __fut_services_lookup_64_5_0).order(:id).to_a }"), "{lookup}");
+        assert!(lookup.contains("{ Widget.where(shop_id: 1).order(:id).limit(__fut_services_lookup_68_5_0).to_a }"), "{lookup}");
+        // A scope parameter used twice is evaluated at its first bind and read at the second.
+        assert!(lookup.contains("[(__fut_services_lookup_76_5_0 = (kind_name)), __fut_services_lookup_76_5_0]"), "{lookup}");
+        // A value of a relation local is kept by the local's assignment, and the site binds the kept value.
+        assert!(lookup.contains("scope = Widget.where(shop_id: (__fut_cap_services_lookup_85_35 = (bump))).order(:id)"), "{lookup}");
+        assert!(lookup.contains("scope = Widget.where(shop_id: (__fut_cap_services_lookup_91_26 = (shop_id))).order(:id)"), "{lookup}");
         let _ = fs::remove_dir_all(&out);
     }
 
     #[test]
-    fn a_call_value_through_a_local_is_still_left_to_rails() {
+    fn a_call_value_through_a_local_is_kept_by_the_assignment() {
         let src = "module Lookup\n  def self.late(kind)\n    scope = Widget.where(kind: tick(kind))\n    scope.to_a\n  end\nend\n";
         let (out, lookup) = emit(src);
-        assert_eq!(lookup.matches("Futamura.records(").count(), 0, "{lookup}");
+        assert_eq!(lookup.matches("Futamura.records(").count(), 1, "{lookup}");
+        assert!(lookup.contains("scope = Widget.where(kind: (__fut_cap_services_lookup_3_32 = (tick(kind))))"), "{lookup}");
+        assert!(lookup.contains("[__fut_cap_services_lookup_3_32]) { scope.to_a }"), "{lookup}");
         let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_kept_value_is_spliced_only_with_the_site_that_reads_it() {
+        // The assignment of `scope` sits inside the first site's span (its hoisted value): the kept
+        // value cannot be spliced, so the second site, which would read it, stays Rails' too.
+        let src = "module Lookup\n  def self.inner\n    Widget.where(kind: (scope = Widget.where(shop_id: bump); bump)).to_a\n    scope.to_a\n  end\nend\n";
+        let (out, lookup) = emit(src);
+        assert_eq!(lookup.matches("Futamura.records(").count(), 1, "{lookup}");
+        assert!(!lookup.contains("__fut_cap_"), "{lookup}");
+        assert!(lookup.contains("\n    scope.to_a\n"), "{lookup}");
+        // Two sites over one local share the one kept value.
+        let src = "module Lookup\n  def self.two\n    scope = Widget.where(shop_id: bump)\n    bump\n    [scope.to_a, scope.first]\n  end\nend\n";
+        let (out2, lookup) = emit(src);
+        assert_eq!(lookup.matches("(__fut_cap_services_lookup_3_35 = (bump))").count(), 1, "{lookup}");
+        assert_eq!(lookup.matches("[__fut_cap_services_lookup_3_35]) {").count(), 2, "{lookup}");
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&out2);
     }
 
     #[test]
@@ -2593,6 +2715,19 @@ end
         assert!(normal.contains("first_named=[\"b\"] calls=[\"B\"]\n"), "{normal}");
         assert!(normal.contains("nil_value=[] calls=[nil]\n"), "{normal}");
         assert!(normal.contains("redefined_where=[\"a\", \"b\", \"c\"] calls=[\"K\"]\n"), "{normal}");
+        // A zero-argument call with effects runs once per call, in a normal, a verify and a fallback run.
+        assert!(normal.contains("by_bump=[\"a\", \"b\", \"c\", \"d\"] calls=[:bump]\n"), "{normal}");
+        assert!(normal.contains("by_shorthand=[\"a\", \"b\", \"c\", \"d\"] calls=[:shop_id]\n"), "{normal}");
+        assert!(normal.contains("paged=[\"a\", \"b\"] calls=[:per_page]\n"), "{normal}");
+        assert!(normal.contains("with_scope=[\"a\", \"b\", \"c\", \"e\"] calls=[:kind_name]\n"), "{normal}");
+        assert!(normal.contains("with_scope_twice=[\"a\", \"b\", \"c\", \"e\"] calls=[:kind_name]\n"), "{normal}");
+        assert!(normal.contains("with_scope_unused=[\"a\", \"b\", \"c\", \"d\"] calls=[:kind_name]\n"), "{normal}");
+        // The relation was built before the second `bump`: it holds the first value, and each call ran once.
+        assert!(normal.contains("captured=[\"a\", \"b\", \"c\", \"d\"] calls=[:bump, :bump]\n"), "{normal}");
+        assert!(normal.contains("captured_shorthand=[\"a\", \"b\", \"c\", \"d\"] calls=[:shop_id]\n"), "{normal}");
+        assert!(normal.contains("captured_in_block=[[\"a\", \"b\", \"c\", \"d\"], [\"a\", \"b\", \"c\", \"d\"]] calls=[:bump, :bump]\n"), "{normal}");
+        assert!(normal.contains("fallback_by_bump=[\"a\", \"b\", \"c\", \"d\"] calls=[:bump]\n"), "{normal}");
+        assert!(normal.contains("fallback_captured=[\"a\", \"b\", \"c\", \"d\"] calls=[:bump, :bump]\n"), "{normal}");
         let _ = fs::remove_dir_all(&out);
     }
 }

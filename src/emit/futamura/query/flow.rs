@@ -426,6 +426,8 @@ impl Paths {
                     call: format!("(({cond}) ? {} : {})", then.call, other.call),
                     define: format!("{}\n  {}", then.define, other.define),
                     hoists: Vec::new(),
+                    // Nothing is captured or hoisted under a branch (`Specializer::capture`, `hoist`).
+                    captures: Vec::new(),
                 }
             }
         }

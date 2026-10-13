@@ -29,6 +29,7 @@ Widget.create!(shop_id: 2, kind: "k", name: "e")
 
 def show(name)
   Lookup.calls.clear
+  Lookup.instance_variable_set(:@bump, 0)
   result = Array(yield).map { |r| r.respond_to?(:name) ? r.name : r }
   puts "#{name}=#{result.inspect} calls=#{Lookup.calls.inspect}"
 end
@@ -39,8 +40,19 @@ show("listed") { Lookup.listed(%w[a c]) }
 show("block") { Lookup.listed_with_block([[1, "b"], [2, "c"]]) }
 show("first_named") { Lookup.first_named("B") }
 show("nil_value") { Lookup.by_kind(nil) }
+show("by_bump") { Lookup.by_bump }
+show("by_shorthand") { Lookup.by_shorthand }
+show("paged") { Lookup.paged }
+show("with_scope") { Lookup.with_scope }
+show("with_scope_twice") { Lookup.with_scope_twice }
+show("with_scope_unused") { Lookup.with_scope_unused }
+show("captured") { Lookup.captured }
+show("captured_shorthand") { Lookup.captured_shorthand }
+show("captured_in_block") { Lookup.captured_in_block }
 # `where` redefined on the model: the site runs Rails' chain, which reads the hoisted value.
 Widget.singleton_class.prepend(Module.new { def where(*args) = super })
 show("redefined_where") { Lookup.by_kind("K") }
+show("fallback_by_bump") { Lookup.by_bump }
+show("fallback_captured") { Lookup.captured }
 sites = Futamura::Stats.sites.values
 puts "specialized=#{sites.sum(&:specialized)}"
