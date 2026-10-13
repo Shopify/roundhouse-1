@@ -26,17 +26,25 @@ use crate::ident::Symbol;
 pub const ENCODING_PATH: [&str; 3] = ["ActiveSupport", "JSON", "Encoding"];
 
 pub fn apply_as_json_residue_lowering(app: &mut App) {
+    // Only the PostgreSQL CRuby tree carries the port for every receiver;
+    // any other tree answers a Hash, Array or value read out of one with
+    // `ActiveSupport::JSON.jsonable` (`symbolize_keys`), which Spinel can run.
+    let port_for_containers = app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+    let mut walk = |expr: &mut Expr| walk(expr, port_for_containers);
     super::for_each_hook_body(app, &mut walk);
     super::for_each_test_body(app, &mut walk);
 }
 
-fn walk(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut walk);
-    rewrite_node(expr);
+fn walk(expr: &mut Expr, port_for_containers: bool) {
+    expr.node.for_each_child_mut(&mut |child| walk(child, port_for_containers));
+    rewrite_node(expr, port_for_containers);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr) {
+pub(crate) fn rewrite_node(expr: &mut Expr, port_for_containers: bool) {
     if expr.decisions & OBJECT_AS_JSON == 0 {
+        return;
+    }
+    if !port_for_containers && jsonable_container(expr) {
         return;
     }
     let span = expr.span;
@@ -54,4 +62,14 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     args.insert(0, receiver);
     *parenthesized = true;
     expr.decisions &= !OBJECT_AS_JSON;
+}
+
+/// An `as_json` that `symbolize_keys` answers with `ActiveSupport::JSON.jsonable`.
+fn jsonable_container(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return false };
+    method.as_str() == "as_json"
+        && args.is_empty()
+        && (matches!(r.ty.as_ref(), Some(crate::ty::Ty::Hash { .. } | crate::ty::Ty::Array { .. }))
+            || super::symbolize_keys::is_request_params(r)
+            || super::symbolize_keys::is_open_value(r))
 }
