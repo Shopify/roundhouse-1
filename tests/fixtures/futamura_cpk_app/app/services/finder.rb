@@ -23,4 +23,9 @@ class Finder
   def self.of_order(order_id)
     Line.where(order_id: order_id).order(:id).to_a
   end
+
+  #: (Order) -> untyped
+  def self.crates(order)
+    order.crates.order(:id).to_a
+  end
 end

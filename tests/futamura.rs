@@ -653,7 +653,7 @@ mod default_scope_runtime {
         let run = Command::new("ruby").arg(&probe).arg(&runtime).output().unwrap();
         let out = String::from_utf8_lossy(&run.stdout).to_string();
         assert!(run.status.success(), "{out}\n{}", String::from_utf8_lossy(&run.stderr));
-        assert!(out.contains("thing specialized=2 fallback={\"bind_array\" => 1, \"bind_nil_many\" => 1}"), "{out}");
+        assert!(out.contains("thing specialized=3 fallback={\"bind_array[empty]\" => 1, \"bind_nil_many\" => 1}"), "{out}");
         assert!(out.contains("ranked specialized=0 fallback={\"default_scope_values[RankedThing]\" => 1}"), "{out}");
         assert!(out.contains("scoped specialized=1 fallback={}"), "{out}");
     }
@@ -750,12 +750,13 @@ mod bind_runtime {
         assert!(normal.contains(
             "scalar=integer:1/0 string:2/0 symbol:3/0 true:1/0 false:2/0 date:1/0 time:1/0 zoned:1/0 decimal:1/0\n"
         ), "{normal}");
-        // An Array, a Set (which has no entry in StatementCache.unsupported_value?), a Range, a
+        // A one-element Array is an equality like a scalar (ArrayHandler builds `build(attribute, values.first)`; longer lists are
+        // statements of their own, see `list_binds`). A Set (which has no entry in StatementCache.unsupported_value?), a Range, a
         // Relation and a record are Rails': it expands them into IN, BETWEEN or a subquery, and
         // here finds the same record it would without a statement. nil is its own statement
         // (`IS NULL`), see `a_nil_value_has_a_statement_for_its_pattern`.
         assert!(normal.contains(
-            "collection=array:1/1 set:1/1 range:2/1 endless:2/1 relation:3/1 empty_set:nil/1 record:2/1 nil:nil/0\n"
+            "collection=array:1/0 set:1/1 range:2/1 endless:2/1 relation:3/1 empty_set:nil/1 record:2/1 nil:nil/0\n"
         ), "{normal}");
     }
 
@@ -886,10 +887,12 @@ mod bind_count_runtime {
 
     /// Each line is `name=[[record ids, calls that ran Rails' chain], ...]`.
     #[test]
-    fn a_statement_that_lost_placeholders_runs_rails_chain() {
+    fn an_integer_in_list_keeps_its_placeholders() {
         let Some(normal) = probe("0") else { return };
-        assert!(normal.contains("rank=[[[2], 1], [[1, 2], 1]]\n"), "{normal}");
-        // The same list over a string column keeps its slots: the statement answers.
+        // Arel's HomogeneousIn serializes a placeholder to nil for an integer column and drops it; the statement
+        // keeps the slots (`ListSlot`) and serializes each value itself, so the list over an integer column is
+        // answered by the statement, as the one over a string column is.
+        assert!(normal.contains("rank=[[[2], 0], [[1, 2], 0]]\n"), "{normal}");
         assert!(normal.contains("name=[[[2], 0], [[1, 2], 0]]\n"), "{normal}");
     }
 
@@ -1642,12 +1645,13 @@ mod association_scopes_and_conditions {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
-        for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment"] {
+        for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment", "remarks"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
-        for name in ["remarks", "loaded", "unsaved"] {
+        for name in ["loaded", "unsaved"] {
             assert!(fell_back(name), "{name}\n{normal}");
         }
+        // The association's own condition on a column replaces the default scope's (WhereClause#merge).
         assert!(normal.contains("remarks=[1] "), "{normal}");
         // The reader's own target is not consulted once a link follows it.
         assert!(normal.contains("loaded_chain=[1, 3] ") && normal.contains("unsaved_chain=[1, 3] "), "{normal}");
@@ -1823,7 +1827,7 @@ mod composite_keys_and_scoping_blocks {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
-        for name in ["lines", "lines_other", "gifts", "parcels", "by_sku", "of_order", "scoped_sku", "scoped_sku_other", "scoped_unscoped", "scoped_in", "scoped_assoc_reader_ids"] {
+        for name in ["lines", "lines_other", "gifts", "parcels", "by_sku", "of_order", "scoped_sku", "scoped_sku_other", "scoped_unscoped", "scoped_in", "scoped_assoc_reader_ids", "crates", "crates_other_shop", "lines_new_owner", "lines_keyed_new_owner", "parcels_new_owner"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
         // A scope that orders is not equality conditions alone; an association reader does not
@@ -1834,6 +1838,75 @@ mod composite_keys_and_scoping_blocks {
         // The other key columns are conditions: the rows of another region or shop are not the order's.
         assert!(normal.contains("lines=[1, 2] ") && normal.contains("lines_other=[5] ") && normal.contains("gifts=[2] "), "{normal}");
         assert!(normal.contains("scoped_sku=[1] ") && normal.contains("scoped_unscoped=[4] "), "{normal}");
+        // A default scope's equality on a column the composite key names too is replaced by the association's own
+        // (WhereClause#merge): an order of shop 2 reads its shop-2 crates, not the default scope's shop 1.
+        assert!(normal.contains("crates=[\"a\"] ") && normal.contains("crates_other_shop=[\"b\"] "), "{normal}");
+        // A new owner without its key loads nothing (CollectionAssociation#null_scope?); with its key set it queries.
+        assert!(normal.contains("lines_new_owner=[] ") && normal.contains("lines_keyed_new_owner=[10] ") && normal.contains("parcels_new_owner=[] "), "{normal}");
+        let _ = fs::remove_dir_all(&out);
+    }
+}
+
+/// The run-time half for Array binds (`where(column: ids)`): an IN list whose length is part of the
+/// statement (PredicateBuilder::ArrayHandler, Arel HomogeneousIn), so one statement per length up to
+/// MAX_ARRAY, its values serialized by the column's type as HomogeneousIn#casted_values does. Empty
+/// lists, nil or Range elements, records, too long a list and values the type cannot serialize are
+/// Rails' to run. Real ActiveRecord on SQLite; FUTAMURA_VERIFY=1 compares every specialized result
+/// with Rails' own chain (tests/fixtures/futamura_arrays_app, tests/futamura_arrays_runtime.rb).
+mod list_binds {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn array_binds_are_statements_per_length_and_agree_with_rails_under_verify() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-arrays-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+            .args(["--target", "futamura", "-o"])
+            .arg(&out)
+            .arg(manifest.join("tests/fixtures/futamura_arrays_app"))
+            .output()
+            .unwrap();
+        assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
+        let probe = manifest.join("tests/futamura_arrays_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        // Verify mode counts every call as a fallback: only its results are compared.
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("sprocket_reasons=")).map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        let verified = output("1");
+        let normal = output("0");
+        assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
+        let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
+        let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
+        // A default scope that only preloads is names only: the statement preloads it before the chain's own preloads
+        // (the association is loaded on every record), so those calls are served too.
+        assert!(normal.contains("sprockets_calls spec=3 fall=0\nsprocket_reasons=[]"), "{normal}");
+        assert!(normal.contains("sprockets=[2, 3] loaded=[[true, false], [true, false]]") && normal.contains("sprockets_nested=[2, 3] loaded=[[true, true], [true, true]]"), "{normal}");
+        for name in [
+            "ids1", "ids2", "ids3", "ids4", "ids_missing", "ids_dup", "ids_strings", "shop_ids", "codes", "codes_symbols", "ranks", "stamps", "not_ids",
+            "not_ids1", "unscoped_ids", "first_of", "two_lists", "two_lists_mixed", "gadgets", "nil_and_list",
+        ] {
+            assert!(specialized(name), "{name}\n{normal}");
+        }
+        for name in [
+            "empty", "nil_element", "nil_only", "range_element", "long", "records", "out_of_range", "out_of_range_only", "not_numeric", "set", "nested",
+        ] {
+            assert!(fell_back(name), "{name}\n{normal}");
+        }
+        assert!(normal.contains("ids3=[1, 4, 6] ") && normal.contains("ids_dup=[1, 2] ") && normal.contains("not_ids=[3, 4, 5, 6] "), "{normal}");
+        // A value Rails drops from the list (out of the integer's range) is a list of another length: Rails' own answer.
+        assert!(normal.contains("out_of_range=[1, 2] ") && normal.contains("not_numeric=[1] "), "{normal}");
+        assert!(normal.contains("reasons=[\"bind_array[element]\", \"bind_array[empty]\", \"bind_array[long]\", \"bind_array[nil]\"]"), "{normal}");
         let _ = fs::remove_dir_all(&out);
     }
 }

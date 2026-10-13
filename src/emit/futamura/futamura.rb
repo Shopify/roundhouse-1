@@ -19,7 +19,7 @@
 # records in the same order, with the same associations loaded.
 module Futamura
   Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
-  Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
+  Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, keyword_init: true)
 
   # `StatementCache::Params` that counts the placeholders handed out (`compile` compares the count
   # with the ones the built statement ended up with).
@@ -42,6 +42,8 @@ module Futamura
   NO_NILS = [].freeze
   # The key columns of an owner chain beyond the one the statement was written for (`owner_key_extras`).
   NO_EXTRAS = [].freeze
+  # The `preload` a default scope adds to a chain (`default_shape`).
+  NO_PRELOADS = [].freeze
 
   # A value the call site reads on every call that the statement is built around rather than binds:
   # a constant `limit(LIMIT)` names (read per call, so a test may stub it). Rails' `limit!` does
@@ -54,28 +56,61 @@ module Futamura
   # one placeholder (`unsupported_bind?`), so a call carrying it runs Rails' chain.
   UNBINDABLE = {}.freeze
 
+  # An Array bind is the IN list `where(column: [a, b])` builds (PredicateBuilder::ArrayHandler),
+  # whose length is part of the statement: one statement per length, from 1 to MAX_ARRAY values.
+  NO_LISTS = {}.freeze
+  MAX_ARRAY = 8
+
   # The `params` a chain is built with for a call whose values at some positions are nil: `bind` is
-  # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere.
+  # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere. A position
+  # that is a list (`lists`, position => length) gets that many placeholders in an Array, which
+  # `where(column: [...])` turns into the IN list.
   class NilParams
-    def initialize(params, nils, fixed = NO_FIXED)
+    def initialize(params, nils, fixed = NO_FIXED, lists = NO_LISTS)
       @params = params
       @nils = nils
       @fixed = fixed
+      @lists = lists
       @position = -1
     end
 
     def bind
       @position += 1
       return @fixed[@position] if @fixed.key?(@position)
+      return Array.new(@lists[@position]) { @params.bind } if @lists.key?(@position)
 
       @nils.include?(@position) ? nil : @params.bind
     end
   end
 
+  # What stands for one value of an IN list in a statement. Arel's HomogeneousIn serializes its values with
+  # the column's type when it is visited and drops those the type cannot serialize (`casted_values`), which
+  # for an integer column is every placeholder: the statement would lose its slots. `ListSlot` keeps the
+  # slot and the type, so `records` serializes each value the way HomogeneousIn would (`serialize_slots`).
+  class ListSlot < ActiveRecord::StatementCache::Substitute
+    attr_reader :type
+
+    def initialize(type)
+      @type = type
+    end
+  end
+
+  # HomogeneousIn#casted_values for a list built over placeholders only (a statement under construction;
+  # a list with a real value is Rails' own, untouched).
+  module ListSlots
+    def casted_values
+      return super if values.empty? || !values.all?(ActiveRecord::StatementCache::Substitute)
+
+      type = attribute.type_caster
+      values.map { ListSlot.new(type) }
+    end
+  end
+  Arel::Nodes::HomogeneousIn.prepend(ListSlots)
+
   # What a model's default scopes add to a query, as the columns each
   # compares for equality, the values it compared them to, and the modules
   # they extend the relation with (`extending`).
-  NO_DEFAULTS = [[].freeze, [].freeze, [].freeze].freeze
+  NO_DEFAULTS = [[].freeze, [].freeze, [].freeze, [].freeze].freeze
   # A model whose default scopes are this many times in a row not that
   # simple is left to Rails' chain without evaluating them first, except for
   # one call in OPAQUE_RETRY: a default scope that reads request state may be
@@ -238,6 +273,14 @@ module Futamura
       end
     end
 
+    # Whether a value is a list `where(column: list)` builds an IN list of, one placeholder per
+    # element (statement per length, `MAX_ARRAY`): an Array of scalars. An empty one is `1=0`
+    # (ArrayHandler: `attribute.in([])`), nil is an `IS NULL` branch beside the list, and a Range or
+    # a record is another condition, so those are Rails' to run.
+    def list_bind?(model, value)
+      Array === value && (1..MAX_ARRAY).cover?(value.size) && value.none? { |element| element.nil? || unsupported_bind?(element, model) }
+    end
+
     # Whether `where(column: value)` on `model` builds the same condition for every instance of
     # `klass` whatever the instance is: one `column = <bind>`, the bind a QueryAttribute of the
     # column's type that serializes the value (the same in a StatementCache, which only swaps the
@@ -272,11 +315,46 @@ module Futamura
           nils = nils.dup if nils.equal?(NO_NILS)
           nils << index
           return if nils.size > MAX_NILS
+        elsif list_bind?(model, value)
+          next
         elsif unsupported_bind?(value, model)
           return
         end
       end
       nils.freeze
+    end
+
+    # The lengths of the lists among `binds` by position (`NO_LISTS` for none); `bind_nils` has
+    # checked that each is one `list_bind?` accepts.
+    def bind_lists(binds)
+      lists = NO_LISTS
+      binds.each_with_index do |value, index|
+        next unless Array === value
+
+        lists = {} if lists.equal?(NO_LISTS)
+        lists[index] = value.size
+      end
+      lists.freeze
+    end
+
+    # `values` as the statement's placeholders take them: a list value (`ListSlot`) serialized by the
+    # column's type, as HomogeneousIn#casted_values does when Rails builds the same IN list. Where
+    # Rails would drop a value the type cannot serialize (and so run a list of another length), nil:
+    # the call is Rails' to run.
+    def serialize_slots(types, values)
+      return values unless types
+      return unless types.size == values.size
+
+      values.each_with_index.map do |value, index|
+        type = types[index]
+        next value unless type
+        return unless type.serializable?(value)
+
+        serialized = type.serialize(value)
+        return if serialized.nil?
+
+        serialized
+      end
     end
 
     # `root:` is the `self` of a chain written against an implicit class
@@ -298,9 +376,17 @@ module Futamura
       return fallback.call unless nils
       fixed = fixed_values(binds)
       return fallback.call unless fixed
+      lists = bind_lists(binds)
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
+      # CollectionAssociation#scope is `none` while the owner is new and its key not set
+      # (`null_scope?`): the chain loads nothing, whatever it adds.
+      if owner && owner.new_record? && !owner.association(association).send(:foreign_key_present?)
+        result = statement.one ? nil : []
+        verify(key, result, fallback.call, []) if VERIFY
+        return result
+      end
       extras = owner ? owner_key_extras(owner, association, statement) : NO_EXTRAS
       extra_values = extras.map { |_, column| owner._read_attribute(column) }
       return fallback.call if extra_values.any? { |value| unsupported_bind?(value, model) }
@@ -310,30 +396,33 @@ module Futamura
       # clones it), but not of an association's relation (Association#scope starts from `scope_for_association`).
       if !statement.unscoped && model.current_scope
         return fallback.call if owner
-        columns, defaults, extensions = current_scope_binds(model)
+        columns, defaults, extensions, preloads = current_scope_binds(model)
       else
-        columns, defaults, extensions = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+        columns, defaults, extensions, preloads = statement.unscoped ? NO_DEFAULTS : default_binds(model)
       end
       return fallback.call unless columns
-      # Merging the association's relation into the model's default scope
-      # (Association#scope) replaces a default equality condition on a column
-      # the association constrains; the chain built here keeps both.
-      return fallback.call if owner && (columns.map { |column| Array(column).first } & owned).any?
       if owner && redefined?(model, :unscoped)
         merged = merge_unscoped(model, columns, defaults)
         return fallback.call unless merged
         columns, defaults = merged
-        return fallback.call if (columns.map { |column| Array(column).first } & owned).any?
       end
+      # Merging the association's relation into the model's default scope (Association#scope:
+      # `target_scope.merge!(association_scope)`, WhereClause#merge: `except_predicates(other.extract_attributes)`)
+      # drops every default condition on a column the association constrains; the one the association
+      # has stays. The chain is built over the remaining ones.
+      columns, defaults = without_columns(columns, defaults, owned) if owner && (columns.map { |column| Array(column).first } & owned).any?
       return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
-      binds = defaults + (nils.empty? && fixed.empty? ? binds : binds.reject { |value| value.nil? || Fixed === value }) + extra_values
+      binds = binds.reject { |value| value.nil? || Fixed === value } unless nils.empty? && fixed.empty?
+      binds = binds.flat_map { |value| Array === value ? value : [value] } unless lists.empty?
+      binds = defaults + binds + extra_values
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras]) { compile(statement, connection, columns, extensions, nils, fixed, extras) }
-        compiled && compiled.cache.execute(binds, connection)
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists, preloads]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads) }
+        values = compiled && serialize_slots(compiled.slot_types, binds)
+        values && compiled.cache.execute(values, connection)
       end
-      return fallback.call unless compiled
+      return fallback.call unless compiled && records
 
       if owner
         proxy = owner.association(association)
@@ -353,6 +442,8 @@ module Futamura
       verify(key, result, shadow(model, &fallback), compiled.preload) if VERIFY
       result
     end
+
+    private :bind_lists, :serialize_slots
 
     private
 
@@ -374,7 +465,9 @@ module Futamura
       return :scope_redefined if redefined?(model, :scope_for_association) || (statement.unscoped && redefined?(model, :unscoped))
 
       proxy = owner.association(association)
-      return :owner_new_record if owner.new_record?
+      # A terminal on the proxy of a new owner reads its target (`find_from_target?`); links after the
+      # reader query when the owner's key is set, and load nothing when it is not (`records`).
+      return :owner_new_record if owner.new_record? && !statement.relation
       # A terminal on the proxy itself reads the target; links after the reader query.
       unless statement.relation
         return :target_loaded if proxy.loaded?
@@ -445,7 +538,7 @@ module Futamura
     # the default scopes' are. The class's `unscoped` runs here once per call, as it does for Rails.
     def unscoped_conditions(model)
       shape = default_shape(model, model.send(:relation), model.unscoped)
-      shape if shape && shape[2].empty?
+      shape if shape && shape[2].empty? && shape[3].empty?
     rescue StandardError
       nil
     end
@@ -459,7 +552,12 @@ module Futamura
       return unless shape
 
       unscoped_columns, unscoped_values = shape
-      names = unscoped_columns.map { |column| Array(column).first }
+      kept_columns, kept_values = without_columns(columns, defaults, unscoped_columns.map { |column| Array(column).first })
+      [(kept_columns + unscoped_columns).freeze, kept_values + unscoped_values]
+    end
+
+    # `columns` and `defaults` without the conditions on the columns `names` (by name).
+    def without_columns(columns, defaults, names)
       kept_columns = []
       kept_values = []
       offset = 0
@@ -472,7 +570,7 @@ module Futamura
         kept_columns << column
         kept_values.concat(values)
       end
-      [(kept_columns + unscoped_columns).freeze, kept_values + unscoped_values]
+      [kept_columns.freeze, kept_values]
     end
 
     # What `Model.all`'s default scopes add to a chain right now, for a
@@ -515,12 +613,17 @@ module Futamura
     end
 
     def default_shape(model, base, scoped)
-      return unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+      return unless scoped.values.except(:where, :extending, :preload) == base.values.except(:where, :extending, :preload)
 
       extensions = scoped.extending_values
       return unless extensions.first(base.extending_values.size) == base.extending_values
       extensions = (extensions - base.extending_values).freeze
       return unless extensions.all? { |mod| extension?(mod) }
+
+      preloads = scoped.preload_values
+      return unless preloads.first(base.preload_values.size) == base.preload_values
+      preloads = preloads.drop(base.preload_values.size).freeze
+      return unless preloads.all? { |spec| preload_spec?(spec) }
 
       before = base.where_clause.send(:predicates)
       predicates = scoped.where_clause.send(:predicates)
@@ -535,7 +638,19 @@ module Futamura
         columns << condition[0]
         values.concat(condition[1])
       end
-      [columns.freeze, values, extensions]
+      [columns.freeze, values, extensions, preloads]
+    end
+
+    # Whether a `preload` a default scope adds is names only (`preload(:a, b: :c)`): the same tree at
+    # every call, which `compile` adds in front of the chain's own (query_methods.rb `preload!` appends
+    # to `preload_values`, the default scope's first).
+    def preload_spec?(spec)
+      case spec
+      when Symbol, String then true
+      when Array then spec.all? { |item| preload_spec?(item) }
+      when Hash then spec.all? { |key, value| (Symbol === key || String === key) && preload_spec?(value) }
+      else false
+      end
     end
 
     # The longest list of an `IN` default condition that gets a statement of its own (the
@@ -632,7 +747,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS, lists = NO_LISTS, preloads = NO_PRELOADS)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -647,11 +762,12 @@ module Futamura
       cache = begin
         default_scope_evaluations(evaluated) do
           ActiveRecord::StatementCache.create(connection) do |_|
-            chain_params = nils.empty? && fixed.empty? ? params : NilParams.new(params, nils, fixed)
+            chain_params = nils.empty? && fixed.empty? && lists.empty? ? params : NilParams.new(params, nils, fixed, lists)
             relation = if statement.unscoped
               statement.build.call(chain_params)
             else
               base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
+              base = base.preload(*preloads) if preloads.any?
               base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
               base.scoping { statement.build.call(chain_params) }
             end
@@ -675,7 +791,16 @@ module Futamura
       return false unless (relation.extending_values - extensions).all? { |mod| plain_extension?(mod) }
 
       preload = relation.preload_values + relation.includes_values
-      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value)
+      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value, slot_types: slot_types(cache))
+    end
+
+    # For each placeholder of the statement, the type its IN list serializes it with (`ListSlot`), or
+    # nil; nil for the whole when none is one.
+    def slot_types(cache)
+      bind_map = cache.instance_variable_get(:@bind_map)
+      attributes = bind_map.instance_variable_get(:@bound_attributes)
+      types = bind_map.instance_variable_get(:@indexes).map { |index| (value = attributes[index].value).is_a?(ListSlot) ? value.type : nil }
+      types.any? ? types.freeze : nil
     end
 
     # Runs the block and adds to `evaluated` each model whose default scope Rails built in it
@@ -1085,7 +1210,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return "model_unloaded" unless model.is_a?(Class)
 
           # find_index, not find: the value that is refused is usually an Array.
-          index = binds.index { |value| !value.nil? && !(Futamura::Fixed === value) && Futamura.unsupported_bind?(value, model) }
+          index = binds.index { |value| !value.nil? && !(Futamura::Fixed === value) && !Futamura.list_bind?(model, value) && Futamura.unsupported_bind?(value, model) }
           return "bind_#{kind(binds[index])}" if index
           return "bind_nil_many" if binds.count(&:nil?) > Futamura::MAX_NILS
           return "bind_fixed_not_integer" unless Futamura.fixed_values(binds)
@@ -1115,7 +1240,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         # Futamura.default_shape's checks, in order, naming the first one that refuses (read only).
         def default_shape_failure(model, scoped = model.default_scoped)
           base = model.send(:relation)
-          return "values" unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+          return "values" unless scoped.values.except(:where, :extending, :preload) == base.values.except(:where, :extending, :preload)
+          return "preload" unless (scoped.preload_values - base.preload_values).all? { |spec| Futamura.send(:preload_spec?, spec) }
           return "extending" unless (scoped.extending_values - base.extending_values).all? { |mod| Futamura.send(:extension?, mod) }
 
           before = base.where_clause.send(:predicates)
@@ -1136,7 +1262,9 @@ if ENV["FUTAMURA_STATS"].to_s != ""
 
           case value
           when nil then "nil"
-          when Array then "array"
+          # The list bound to a placeholder per element (`list_bind?`) is refused when empty, long, or with an element
+          # that is nil (an `IS NULL` branch) or not a scalar.
+          when Array then "array[#{value.empty? ? "empty" : value.size > Futamura::MAX_ARRAY ? "long" : value.any?(&:nil?) ? "nil" : "element"}]"
           when Range then "range"
           when ActiveRecord::Base then "record"
           when Set then "set"
