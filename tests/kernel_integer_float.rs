@@ -35,15 +35,27 @@ fn kernel_integer_and_float_execute_in_native_spinel() {
     app().run_spinel(SCRIPT).assert_passes();
 }
 
-/// `Integer(x, exception: false)` answers nil for a failed conversion, so it stays untyped.
+/// `Integer(x, exception: false)` answers nil for a failed conversion, so it
+/// is not typed a plain Integer: it is `Integer?` (`kernel_conversion_ty`,
+/// core `kernel.rbs`), arithmetic on it is flagged as on a nilable, and
+/// `|| 0` makes it an Integer again.
 #[test]
-fn integer_with_exception_false_is_not_typed_integer() {
-    let (_emitted, errors) = emit_and_run::real_blog()
-        .edit(
-            "app/models/article.rb",
-            "  validates :title, presence: true\n",
-            "  validates :title, presence: true\n  def self.parsed(text) = Integer(text, exception: false) + \"x\"\n",
-        )
-        .emit(roundhouse::project::BuildTarget::Ruby);
+fn integer_with_exception_false_is_typed_nilable_not_integer() {
+    let emit = |body: &str| {
+        emit_and_run::real_blog()
+            .edit(
+                "app/models/article.rb",
+                "  validates :title, presence: true\n",
+                &format!("  validates :title, presence: true\n  def self.parsed(text) = {body}\n"),
+            )
+            .emit(roundhouse::project::BuildTarget::Ruby)
+            .1
+    };
+    let errors = emit("Integer(text, exception: false) + \"x\"");
+    assert!(
+        errors.iter().any(|e| e.contains("incompatible operand types: Integer? + String")),
+        "typed as the nilable, not as Integer: {errors:?}"
+    );
+    let errors = emit("(Integer(text, exception: false) || 0) + 1");
     assert!(!errors.iter().any(|e| e.contains("incompatible operand types")), "{errors:?}");
 }
