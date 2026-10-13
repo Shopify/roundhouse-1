@@ -301,6 +301,8 @@ fn validator_rule(
     let mut options = RuleOptions::default();
     let mut allow_given = false;
     let mut allow_nil_given = false;
+    // The literal `allow_nil:` (`nil` is "not given"), which `ValidationRule::Length` carries.
+    let mut allow_nil_flag: Option<bool> = None;
     let mut allow_blank_false = false;
     let mut own: Vec<(&str, &Node<'_>)> = Vec::new();
     // Defaults first, then the validator's own keys over them.
@@ -319,6 +321,7 @@ fn validator_rule(
                 if k == "allow_nil" {
                     allow_nil_given = true;
                     options.allow_nil = b;
+                    allow_nil_flag = v.as_nil_node().is_none().then_some(b);
                 } else {
                     options.allow_blank = b;
                     allow_blank_false = v.as_false_node().is_some();
@@ -358,7 +361,7 @@ fn validator_rule(
         "absence" => Ok(ValidationRule::Absence),
         "length" | "size" => {
             let nil_fails_maximum = allow_given && !options.allow_nil && !options.allow_blank;
-            length_rule(&own, nil_fails_maximum, allow_blank_false, file)?
+            length_rule(&own, nil_fails_maximum, allow_blank_false, allow_nil_flag, file)?
         }
         "inclusion" | "exclusion" => inclusion_rule(key == "exclusion", &own, file)?,
         "numericality" => numericality_rule(&own, file)?,
@@ -418,6 +421,12 @@ fn validator_rule(
         return Ok(None);
     }
     if options == RuleOptions::default() {
+        return Ok(Some(rule));
+    }
+    // `allow_nil: true` alone is what `Length` carries itself (it skips a nil value).
+    if matches!(rule, ValidationRule::Length { allow_nil: Some(true), .. })
+        && options == (RuleOptions { allow_nil: true, ..RuleOptions::default() })
+    {
         return Ok(Some(rule));
     }
     Ok(Some(ValidationRule::Guarded { rule: Box::new(rule), options }))
@@ -945,6 +954,7 @@ fn length_rule(
     own: &[(&str, &Node<'_>)],
     nil_fails_maximum: bool,
     allow_blank_false: bool,
+    allow_nil: Option<bool>,
     file: &str,
 ) -> IngestResult<Result<ValidationRule, String>> {
     let mut bounds: Vec<(LengthOp, RuleValue)> = Vec::new();
@@ -1068,13 +1078,14 @@ fn length_rule(
         })
     };
     let (min, max) = (literal(LengthOp::Minimum), literal(LengthOp::Maximum));
+    // `allow_nil: false` fails a nil value on either bound, which `Length` says itself.
     let simple = messages.is_empty()
-        && !nil_fails_maximum
+        && (!nil_fails_maximum || allow_nil == Some(false))
         && !bounds.iter().any(|(o, _)| *o == LengthOp::Is)
         && min.is_none_or(|m| m.is_some())
         && max.is_none_or(|m| m.is_some());
     if simple {
-        return Ok(Ok(ValidationRule::Length { min: min.flatten(), max: max.flatten(), message: None, allow_nil: None }));
+        return Ok(Ok(ValidationRule::Length { min: min.flatten(), max: max.flatten(), message: None, allow_nil }));
     }
     let checks = [LengthOp::Is, LengthOp::Minimum, LengthOp::Maximum]
         .into_iter()

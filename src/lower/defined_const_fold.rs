@@ -220,7 +220,12 @@ impl Facts {
         }
         for lc in app.library_classes.iter().chain(app.rails_application.iter()) {
             let name = lc.name.0.as_str().to_string();
-            for (c, _) in &lc.constants {
+            for (c, value) in &lc.constants {
+                // A `class << self` constant is the singleton class's: `Owner::NAME`
+                // does not name it (`SINGLETON_CONSTANT_WRITE`).
+                if value.decisions & crate::expr::SINGLETON_CONSTANT_WRITE != 0 {
+                    continue;
+                }
                 tree.insert(format!("{name}::{}", c.as_str()));
             }
             tree.insert(name);

@@ -386,9 +386,10 @@ fn a_wrapper_that_rebinds_or_returns_otherwise_in_any_form_is_refused() {
     assert!(leaked.is_empty(), "accepted (should refuse): {leaked:?}");
 }
 
-/// `for records in ...` writes the outer local; ingest has no `for` node at
-/// all, so the wrapper never reaches the pass-through check: it is an ingest
-/// error (a compile-time refusal), not an accepted override.
+/// `for records in ...` writes the outer local. Ingest reads `for` (as `each`
+/// over the enclosing scope's locals), so the wrapper reaches the
+/// pass-through check, which refuses it: an ingest error (a compile-time
+/// refusal), not an accepted override.
 #[test]
 fn a_for_loop_in_the_wrapper_is_an_ingest_refusal() {
     let wrapper = "def pagy(collection, **vars)\n      pagy, records = super\n      for records in [1]\n        nil\n      end\n      [pagy, records]\n    end";
@@ -403,7 +404,7 @@ fn a_for_loop_in_the_wrapper_is_an_ingest_refusal() {
         ],
     );
     let err = ingest_app_from_tree(files).err().expect("refused").to_string();
-    assert!(err.contains("unsupported expression node"), "{err}");
+    assert!(err.contains("without handing back the `[pagy, records]` pair"), "{err}");
 }
 
 #[test]
