@@ -40,6 +40,8 @@ module Futamura
   # The most nil values one call may carry; each pattern of nil positions is a statement of its own.
   MAX_NILS = 3
   NO_NILS = [].freeze
+  # The key columns of an owner chain beyond the one the statement was written for (`owner_key_extras`).
+  NO_EXTRAS = [].freeze
 
   # A value the call site reads on every call that the statement is built around rather than binds:
   # a constant `limit(LIMIT)` names (read per call, so a test may stub it). Rails' `limit!` does
@@ -299,28 +301,36 @@ module Futamura
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
+      extras = owner ? owner_key_extras(owner, association, statement) : NO_EXTRAS
+      extra_values = extras.map { |_, column| owner._read_attribute(column) }
+      return fallback.call if extra_values.any? { |value| unsupported_bind?(value, model) }
+      owned = extras.empty? ? statement.owner_columns : statement.owner_columns + extras.map(&:first)
 
-      # A `Model.scoping { }` block is part of every `Model.all` inside it.
-      return fallback.call if !statement.unscoped && model.current_scope
-
-      columns, defaults, extensions = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+      # A `Model.scoping { }` block is part of every `Model.all` inside it (Scoping::Named::ClassMethods#all
+      # clones it), but not of an association's relation (Association#scope starts from `scope_for_association`).
+      if !statement.unscoped && model.current_scope
+        return fallback.call if owner
+        columns, defaults, extensions = current_scope_binds(model)
+      else
+        columns, defaults, extensions = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+      end
       return fallback.call unless columns
       # Merging the association's relation into the model's default scope
       # (Association#scope) replaces a default equality condition on a column
       # the association constrains; the chain built here keeps both.
-      return fallback.call if owner && (columns.map { |column| Array(column).first } & statement.owner_columns).any?
+      return fallback.call if owner && (columns.map { |column| Array(column).first } & owned).any?
       if owner && redefined?(model, :unscoped)
         merged = merge_unscoped(model, columns, defaults)
         return fallback.call unless merged
         columns, defaults = merged
-        return fallback.call if (columns.map { |column| Array(column).first } & statement.owner_columns).any?
+        return fallback.call if (columns.map { |column| Array(column).first } & owned).any?
       end
       return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
-      binds = defaults + (nils.empty? && fixed.empty? ? binds : binds.reject { |value| value.nil? || Fixed === value })
+      binds = defaults + (nils.empty? && fixed.empty? ? binds : binds.reject { |value| value.nil? || Fixed === value }) + extra_values
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed]) { compile(statement, connection, columns, extensions, nils, fixed) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras]) { compile(statement, connection, columns, extensions, nils, fixed, extras) }
         compiled && compiled.cache.execute(binds, connection)
       end
       return fallback.call unless compiled
@@ -372,13 +382,59 @@ module Futamura
       end
 
       shape = @owner_chains.compute_if_absent([owner.class, association, statement.owner_keys]) do
-        reflection = owner.class._reflect_on_association(association)
-        primary_key = reflection&.active_record_primary_key
-        !!(reflection && reflection.collection? && !reflection.through_reflection? && reflection.klass.equal?(model) &&
-           primary_key.is_a?(String) && primary_key == owner.class.primary_key &&
-           (statement.owner_keys.nil? || statement.owner_keys == [reflection.foreign_key, reflection.type].compact.map(&:to_s)))
+        owner_chain_shape(owner.class, association, statement, model) || false
       end
       :reflection unless shape
+    end
+
+    # The key pairs `[target column, owner column]` a collection reader compares beyond the one
+    # the statement binds (`NO_EXTRAS` for a single key), once `owner_chain?` held. A composite
+    # key is one equality per column pair, the value read from the owner
+    # (association_scope.rb `last_chain_scope`: `primary_key.zip(foreign_key)`, `owner._read_attribute`);
+    # the statement binds the pair whose owner column is the owner's `primary_key`, the compiled
+    # relation adds the others.
+    def owner_key_extras(owner, association, statement)
+      @owner_chains.fetch([owner.class, association, statement.owner_keys])
+    end
+
+    # `owner_key_extras` for the reflection, or nil when the reader is not the one the statement
+    # was written for: a plain (non-through) collection of the statement's model, whose key pairs
+    # include the owner's scalar primary key against the column the statement names (then the
+    # type column of a polymorphic `as:`, if it names one).
+    def owner_chain_shape(owner_class, association, statement, model)
+      reflection = owner_class._reflect_on_association(association)
+      return unless reflection && reflection.collection? && !reflection.through_reflection? && reflection.klass.equal?(model)
+
+      primary_key = owner_class.primary_key
+      return unless primary_key.is_a?(String)
+
+      owner_columns = Array(reflection.active_record_primary_key)
+      target_columns = Array(reflection.foreign_key)
+      return unless owner_columns.size == target_columns.size && (owner_columns + target_columns).all?(String)
+
+      pairs = target_columns.zip(owner_columns)
+      key = pairs.find { |_, column| column == primary_key }
+      return unless key
+      return unless statement.owner_keys.nil? || statement.owner_keys == [key[0], reflection.type].compact.map(&:to_s)
+
+      extras = pairs - [key]
+      return if statement.owner_keys.nil? && extras.any?
+      return if extras.any? { |column, _| column == reflection.type }
+
+      extras.empty? ? NO_EXTRAS : extras.freeze
+    end
+
+    # What a `Model.scoping { }` relation adds to a chain on `Model` itself (`Model.all` is a clone
+    # of it, so no default scope is added), in `default_binds`' form: its equality conditions on
+    # the model's own columns are bound as default scopes' are. nil for any other relation (a
+    # joined, ordered or limited scope, another class's: `Model.all` merges those) or condition.
+    def current_scope_binds(model)
+      scope = model.current_scope
+      return unless scope.klass.equal?(model)
+
+      default_shape(model, model.send(:relation), scope)
+    rescue StandardError
+      nil
     end
 
     # The conditions of `model.unscoped` where the class redefines it, in `default_shape`'s form,
@@ -576,7 +632,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -599,6 +655,8 @@ module Futamura
               base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
               base.scoping { statement.build.call(chain_params) }
             end
+            extras.each { |column, _| relation = relation.where(column => params.bind) }
+            relation
           end
         end
       rescue NoMemoryError, SignalException, SystemExit
@@ -987,7 +1045,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           failure = owner && Futamura.send(:owner_chain_failure, owner, association, statement, model)
           return "owner_chain_#{failure}" if failure
           return @compile_reasons[key] if @compile_reasons[key]
-          return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope
+          return "scoping_block[#{model.name}]" if !statement.unscoped && model.current_scope && (owner || !Futamura.send(:current_scope_binds, model))
 
           if owner && !statement.unscoped && Futamura.send(:redefined?, model, :unscoped) && !Futamura.send(:unscoped_conditions, model)
             cause = default_shape_failure(model, model.unscoped) rescue "raises"
