@@ -64,12 +64,15 @@ pub(crate) fn rewrite_node(expr: &mut Expr, port_for_containers: bool) {
     expr.decisions &= !OBJECT_AS_JSON;
 }
 
-/// An `as_json` that `symbolize_keys` answers with `ActiveSupport::JSON.jsonable`.
+/// An `as_json` another pass answers off the PostgreSQL tree: `symbolize_keys`
+/// with `ActiveSupport::JSON.jsonable`, or the params class the controller
+/// lowering synthesizes an `as_json` on.
 fn jsonable_container(expr: &Expr) -> bool {
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return false };
     method.as_str() == "as_json"
         && args.is_empty()
         && (matches!(r.ty.as_ref(), Some(crate::ty::Ty::Hash { .. } | crate::ty::Ty::Array { .. }))
             || super::symbolize_keys::is_request_params(r)
-            || super::symbolize_keys::is_open_value(r))
+            || super::symbolize_keys::is_open_value(r)
+            || matches!(r.ty.as_ref(), Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActionController::Parameters"))
 }
