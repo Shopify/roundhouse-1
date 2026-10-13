@@ -1231,17 +1231,27 @@ module Futamura
   #
   # An entry is planned only when every association in its tree is one
   # whose scope can be built once: not `through:`, not a polymorphic
-  # belongs_to, no composite key, no owner-dependent scope, a target with no
-  # default_scope, and a scope that is either absent, defined by Active
-  # Storage or Action Text, or certified static by Roundhouse
-  # (`static_scopes`, from the app's own association declarations). Any
-  # other entry is handed to Rails' Preloader whole.
+  # belongs_to, no composite key, no owner-dependent scope, and a scope that
+  # is either absent, defined by Active Storage or Action Text, or certified
+  # static by Roundhouse (`static_scopes`, from the app's own association
+  # declarations). Any other entry is handed to Rails' Preloader whole
+  # (`refused` names why; FUTAMURA_STATS counts them).
+  #
+  # A target with a default_scope is planned too, but its scope is not built
+  # once: Preloader::Association#build_scope starts from
+  # `klass.scope_for_association` (`default_scoped`), which runs the default
+  # scope's Ruby, so a default scope that reads request state (a tenant) can
+  # differ between calls. A node whose target has one asks the class again at
+  # every call, exactly as the Preloader does once per loader, and loaders
+  # whose queries are then the same still share one (`query_key` holds the
+  # values of that call's scope).
   module Preload
-    Node = Struct.new(:name, :reflection, :children, :spec)
+    Node = Struct.new(:name, :reflection, :children, :spec, :dynamic)
     FRAMEWORK = %r{/(activestorage|actiontext)/}
 
     @plans = Concurrent::Map.new
     @scopes = Concurrent::Map.new
+    @reflection_scopes = Concurrent::Map.new
     @static_scopes = Set.new
 
     class << self
@@ -1255,8 +1265,17 @@ module Futamura
         return if records.empty?
 
         root = records.first.class
-        roots = @plans.compute_if_absent([spec, root]) { plan(spec, root) || false }
-        if !roots || records.any? { |r| !r.instance_of?(root) } || scoped?(roots)
+        roots = @plans.compute_if_absent([spec, root]) { plan(spec, root) }
+        if String === roots
+          refused(roots)
+          return rails(records, spec, strict)
+        end
+        if records.any? { |r| !r.instance_of?(root) }
+          refused("mixed_owner_classes")
+          return rails(records, spec, strict)
+        end
+        if (reason = scoped?(roots))
+          refused(reason)
           return rails(records, spec, strict)
         end
 
@@ -1266,9 +1285,10 @@ module Futamura
           level.each do |node, owners|
             next if owners.empty?
             if owners.all? { |o| o.class._reflect_on_association(node.name).equal?(node.reflection) }
-              loaders << Loader.new(node, owners, scope_for(node.reflection, owners.first.class, strict))
+              loaders << Loader.new(node, owners, scope_for(node, owners.first.class, strict))
             else
               # An STI subclass redeclared the association: Rails' own path.
+              refused("sti_redeclared")
               rails(owners, node.spec, strict)
             end
           end
@@ -1295,6 +1315,9 @@ module Futamura
 
       private
 
+      # Counts a preload entry handed to Rails' Preloader, by reason (FUTAMURA_STATS prepends the counting).
+      def refused(reason); end
+
       def rails(records, spec, strict)
         scope = strict ? ActiveRecord::Relation::StrictLoadingScope : nil
         ActiveRecord::Associations::Preloader.new(records: records, associations: spec, scope: scope).call
@@ -1305,30 +1328,35 @@ module Futamura
         Array.wrap(spec).flat_map { |a| Array(a).flat_map { |parent, child| [[parent.to_sym, child]] } }
       end
 
+      # The nodes of an entry, or the reason (a String) Rails' Preloader keeps it.
       def plan(spec, klass)
         nodes(spec).map do |name, child|
           reflection = klass._reflect_on_association(name)
-          return nil unless plannable?(reflection)
+          reason = refusal(reflection)
+          return reason if reason
 
           children = child ? plan(child, reflection.klass) : []
-          return nil unless children
+          return children if String === children
 
-          Node.new(name, reflection, children, child ? { name => child } : name)
+          target = reflection.klass
+          dynamic = target.default_scopes.any? || Futamura.send(:default_scope_method?, target)
+          Node.new(name, reflection, children, child ? { name => child } : name, dynamic)
         end
       end
 
-      def plannable?(reflection)
-        return false unless reflection
-        return false if reflection.options[:through] || reflection.polymorphic?
-        return false if reflection.scope && reflection.scope.arity != 0
-        return false if reflection.join_primary_key.is_a?(Array) || reflection.join_foreign_key.is_a?(Array)
+      # Why an association cannot be planned (nil when it can).
+      def refusal(reflection)
+        return "no_reflection" unless reflection
+        return "through" if reflection.options[:through]
+        return "polymorphic" if reflection.polymorphic?
+        return "owner_scope" if reflection.scope && reflection.scope.arity != 0
+        return "composite_key" if reflection.join_primary_key.is_a?(Array) || reflection.join_foreign_key.is_a?(Array)
+        return "abstract_target" if reflection.klass.abstract_class?
 
-        klass = reflection.klass
-        return false if klass.abstract_class? || klass.default_scopes.any?
-
-        reflection.scope.nil? ||
+        static = reflection.scope.nil? ||
           FRAMEWORK.match?(scope_source(reflection.scope)) ||
           @static_scopes.include?("#{reflection.active_record.name}##{reflection.name}")
+        "scope_not_static" unless static
       end
 
       # Where a scope lambda was written. Rails' association builder wraps an
@@ -1343,26 +1371,41 @@ module Futamura
       end
 
       # A `Model.scoping { }` block changes scope_for_association, and so does a class that
-      # redefines `unscoped` or `scope_for_association` (the plan builds the scope once).
+      # redefines `unscoped` or `scope_for_association` (the plan builds the scope once). A node
+      # that asks the class at every call (`dynamic`) follows a scoping block as Rails does:
+      # scope_for_association is Rails' own.
       def scoped?(nodes)
-        nodes.any? do |n|
+        nodes.each do |n|
           klass = n.reflection.klass
-          klass.current_scope || Futamura.send(:scope_redefined?, klass) || scoped?(n.children)
+          return "scoping_block" if !n.dynamic && klass.current_scope
+          return "scope_redefined" if Futamura.send(:scope_redefined?, klass)
+
+          reason = scoped?(n.children)
+          return reason if reason
         end
+        nil
       end
 
-      # Preloader::Association#build_scope, built once per association,
-      # owner class and strictness.
-      def scope_for(reflection, model, strict)
-        @scopes.compute_if_absent([reflection, model, strict]) do
-          klass = reflection.klass
-          scope = klass.scope_for_association
-          scope.where!(reflection.type => model.polymorphic_name) if reflection.type && !reflection.through_reflection?
-          reflection_scope = reflection.join_scopes(klass.arel_table, klass.predicate_builder, klass).inject(klass.unscoped, &:merge!)
-          scope.merge!(reflection_scope) unless reflection_scope.empty_scope?
-          scope = scope.strict_loading if strict
-          [scope, scope.values_for_queries]
+      # Preloader::Association#build_scope: built once per association, owner class and
+      # strictness, except for a target with a default scope (built at every call, as the
+      # Preloader builds it).
+      def scope_for(node, model, strict)
+        reflection = node.reflection
+        return build_scope(reflection, model, strict) if node.dynamic
+
+        @scopes.compute_if_absent([reflection, model, strict]) { build_scope(reflection, model, strict) }
+      end
+
+      def build_scope(reflection, model, strict)
+        klass = reflection.klass
+        scope = klass.scope_for_association
+        scope.where!(reflection.type => model.polymorphic_name) if reflection.type && !reflection.through_reflection?
+        reflection_scope = @reflection_scopes.compute_if_absent(reflection) do
+          reflection.join_scopes(klass.arel_table, klass.predicate_builder, klass).inject(klass.unscoped, &:merge!)
         end
+        scope.merge!(reflection_scope) unless reflection_scope.empty_scope?
+        scope = scope.strict_loading if strict
+        [scope, scope.values_for_queries]
       end
 
       # Preloader::Association::LoaderRecords: keys of owners not yet
@@ -1511,10 +1554,11 @@ if ENV["FUTAMURA_STATS"].to_s != ""
       @compile_reasons = {}
       @association_keys = [0, 0.0]
       @defined = []
+      @preload_refusals = Hash.new(0)
       @helpers = Hash.new { |h, name| h[name] = [0, 0.0, 0.0] }
 
       class << self
-        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined, :helpers
+        attr_reader :sites, :compiles, :compile_reasons, :association_keys, :defined, :helpers, :preload_refusals
 
         def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -1630,7 +1674,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         def dump
-          return if @sites.empty? && @defined.empty?
+          return if @sites.empty? && @defined.empty? && @preload_refusals.empty?
 
           rows = @sites.transform_values do |s|
             h = s.to_h
@@ -1639,7 +1683,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           end
           helpers = @helpers.transform_values { |calls, inclusive, self_cpu| { calls: calls, inclusive_cpu: inclusive, self_cpu: self_cpu } }
           File.write(File.join(DIR, "futamura-stats-#{Process.pid}.json"), JSON.generate(
-            pid: Process.pid, defined: @defined, sites: rows, compiles: @compiles,
+            pid: Process.pid, defined: @defined, preload_refusals: @preload_refusals, sites: rows, compiles: @compiles,
             association_key: { calls: @association_keys[0], seconds: @association_keys[1] },
             clock_read_ns: clock_read_ns, ab_uncached: AB_UNCACHED, helpers: helpers
           ))
@@ -1843,6 +1887,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
     end
 
     singleton_class.prepend(Stats::Instrument)
+    # Preload entries Rails' Preloader keeps, by reason (one count per call of an entry).
+    Preload.singleton_class.prepend(Module.new { def refused(reason) = Stats.preload_refusals[reason] += 1 })
     singleton_class.prepend(Stats::Helpers) if Stats::HELPERS
     at_exit { Stats.dump }
   end
