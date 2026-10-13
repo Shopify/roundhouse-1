@@ -6505,11 +6505,14 @@ impl Analyzer {
         })
     }
 
-    /// A method whose every return value is `record.reload`,
-    /// `record.destroy` or `record.destroy!` on a model returns
-    /// `ActiveRecord::Base`. The call itself evaluates to the record
-    /// (Rails returns `self`), so its site types as the receiver's
-    /// model and `record.reload.title` dispatches there. But the
+    /// A method whose every return value is `record.destroy` or
+    /// `record.destroy!` on a model returns `ActiveRecord::Base`. The
+    /// call itself evaluates to the record (Rails returns `self`), so
+    /// its site types as the receiver's model and
+    /// `record.destroy.destroyed?` dispatches there. (`reload` and
+    /// `lock!` are not here: each model carries a self-returning
+    /// forwarder for them, `emit::ruby::library`, so the function
+    /// behind the call is the model's own.) But the
     /// function behind it is the one compiled `Base` method,
     /// `() -> Base` in `runtime/ruby/active_record/base.rbs`, which no
     /// target monomorphizes per model: harvesting the site's type
@@ -6526,7 +6529,7 @@ impl Analyzer {
                 return false;
             };
             let Some(Ty::Class { id, .. }) = &t.ty else { return false };
-            matches!(method.as_str(), "reload" | "destroy" | "destroy!")
+            matches!(method.as_str(), "destroy" | "destroy!")
                 && args.is_empty()
                 && self.classes.get(id).is_some_and(|cls| cls.table.is_some())
         };

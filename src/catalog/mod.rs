@@ -783,9 +783,10 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     // convention: non-bang returns Bool (success/failure); `save!`
     // answers the shared compiled `Base` method's `ActiveRecord::Base`
     // per the sidecar (see below); `destroy`/`destroy!`/`reload`
-    // evaluate to the record itself (Self), and a method returning one
-    // of those calls still declares `ActiveRecord::Base`
-    // (`Analyzer::shared_base_return_ty`).
+    // evaluate to the record itself (Self), and a method returning a
+    // `destroy` call still declares `ActiveRecord::Base`
+    // (`Analyzer::shared_base_return_ty`); `reload` has a per-model
+    // forwarder, so its caller declares the model.
     CatalogedMethod {
         name: "save",
         receiver: ReceiverContext::Instance,
