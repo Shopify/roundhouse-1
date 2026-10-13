@@ -37,6 +37,29 @@ module Futamura
     end
   end
 
+  # The most nil values one call may carry; each pattern of nil positions is a statement of its own.
+  MAX_NILS = 3
+  NO_NILS = [].freeze
+
+  # What `association_key` answers for a condition that is not one key column. A Hash is never
+  # one placeholder (`unsupported_bind?`), so a call carrying it runs Rails' chain.
+  UNBINDABLE = {}.freeze
+
+  # The `params` a chain is built with for a call whose values at some positions are nil: `bind` is
+  # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere.
+  class NilParams
+    def initialize(params, nils)
+      @params = params
+      @nils = nils
+      @position = -1
+    end
+
+    def bind
+      @position += 1
+      @nils.include?(@position) ? nil : @params.bind
+    end
+  end
+
   # What a model's default scopes add to a query, as the columns each
   # compares for equality, the values it compared them to, and the modules
   # they extend the relation with (`extending`).
@@ -61,6 +84,7 @@ module Futamura
   @opaque = Concurrent::Map.new
   @extensions = Concurrent::Map.new
   @owner_chains = Concurrent::Map.new
+  @scalar_classes = Concurrent::Map.new
   VERIFY = ENV["FUTAMURA_VERIFY"] == "1"
 
   class << self
@@ -143,18 +167,18 @@ module Futamura
     # PredicateBuilder::AssociationQueryValue#convert_to_id reads it: the
     # record's primary key column, or the value itself when it has none. A
     # StatementCache takes no record, so the call site passes this instead.
-    # nil (which it refuses, so Rails' own chain runs) for an association
-    # whose condition is not one key column.
+    # UNBINDABLE (which a call refuses, so Rails' own chain runs) for an association
+    # whose condition is not one key column. (nil is a key like another: `IS NULL`.)
     def association_key(model, name, value)
       reflection = model._reflect_on_association(name)
-      return unless reflection&.belongs_to? && !reflection.polymorphic?
+      return UNBINDABLE unless reflection&.belongs_to? && !reflection.polymorphic?
 
       # Where Rails has query constraints (`belongs_to ..., query_constraints:`), the predicate
       # builder reads `query_primary_key` / `query_foreign_key` (AssociationQueryValue), which are
       # composite when the join keys (`join_primary_key` / `join_foreign_key`) are one column.
       primary_key = reflection.respond_to?(:query_primary_key) ? reflection.query_primary_key : reflection.join_primary_key
       foreign_key = reflection.respond_to?(:query_foreign_key) ? reflection.query_foreign_key : reflection.join_foreign_key
-      return if primary_key.is_a?(Array) || foreign_key.is_a?(Array)
+      return UNBINDABLE if primary_key.is_a?(Array) || foreign_key.is_a?(Array)
 
       value.respond_to?(primary_key) ? value.public_send(primary_key) : value
     end
@@ -172,12 +196,54 @@ module Futamura
     # a Relation, a Hash or a record into an IN list, BETWEEN, a subquery, nested conditions or
     # a key (PredicateBuilder handlers), and a StatementCache's own check
     # (`StatementCache.unsupported_value?`) names only some of them, so the scalars are listed
-    # instead. nil is `IS NULL`. A value of any other class is Rails' to bind.
-    def unsupported_bind?(value)
+    # instead. nil is `IS NULL` (see `bind_nils`). A value of a class outside the list is
+    # Rails' to bind, unless `model` is given and the predicate builder treats the class as a
+    # scalar (`scalar_class?`).
+    def unsupported_bind?(value, model = nil)
       case value
       when Integer, String, Symbol, Float, BigDecimal, true, false, Date, Time, ActiveSupport::TimeWithZone then false
-      else true
+      when nil then true
+      else !(model && scalar_class?(model, value.class))
       end
+    end
+
+    # Whether `where(column: value)` on `model` builds the same condition for every instance of
+    # `klass` whatever the instance is: one `column = <bind>`, the bind a QueryAttribute of the
+    # column's type that serializes the value (the same in a StatementCache, which only swaps the
+    # value, `BindMap#bind`). That holds when PredicateBuilder#build finds no reason to look at
+    # the value: it does not respond to `id` (a record's key is read instead), it is not an Arel
+    # node (used as is), and the handler for its class (`register_handler`, matched with `===`)
+    # is the default BasicObject one, not Array/Set (IN), Range (BETWEEN) or Relation (subquery)
+    # or one an app registered. A Hash is expanded by `expand_from_hash` before any handler.
+    # Decided once per model and class.
+    def scalar_class?(model, klass)
+      @scalar_classes.compute_if_absent([model, klass]) do
+        handlers = model.predicate_builder.instance_variable_get(:@handlers)
+        handler = handlers.detect { |type, _| !(Module === type) || klass <= type }
+        !!(handler && handler.first.equal?(BasicObject) &&
+           !(klass <= Hash || klass <= ActiveRecord::Base || klass <= Arel::Nodes::Node || klass <= Arel::Attributes::Attribute ||
+             klass.method_defined?(:id) || klass.private_method_defined?(:id)))
+      end
+    end
+    private :scalar_class?
+
+    # The positions of the nil values among `binds` (`NO_NILS` for none), or nil when a call
+    # cannot be a statement: a value that is not one placeholder (`unsupported_bind?`) or more
+    # than MAX_NILS nils. `where(column: nil)` is `column IS NULL`, not a placeholder (a
+    # QueryAttribute is `nil?` by its value, Arel's visitor reads that), so the statement for a
+    # pattern is built with nil in those positions and binds only the others.
+    def bind_nils(model, binds)
+      nils = NO_NILS
+      binds.each_with_index do |value, index|
+        if value.nil?
+          nils = nils.dup if nils.equal?(NO_NILS)
+          nils << index
+          return if nils.size > MAX_NILS
+        elsif unsupported_bind?(value, model)
+          return
+        end
+      end
+      nils.freeze
     end
 
     # `root:` is the `self` of a chain written against an implicit class
@@ -190,13 +256,13 @@ module Futamura
       return fallback.call if owner && !(ActiveRecord::Base === owner)
 
       binds = binds.call if Proc === binds
-      return fallback.call if binds.any? { |value| unsupported_bind?(value) }
-
       statement = @statements.fetch(key)
       # Named by a String so that defining a statement loads no model: a class
       # body may need run-time state (I18n) a `to_prepare` hook runs too early for.
       model = statement.model
       model = statement.model = Object.const_get(model) if model.is_a?(String)
+      nils = bind_nils(model, binds)
+      return fallback.call unless nils
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
@@ -210,12 +276,12 @@ module Futamura
       # (Association#scope) replaces a default equality condition on a column
       # the association constrains; the chain built here keeps both.
       return fallback.call if owner && (columns.map { |column| Array(column).first } & statement.owner_columns).any?
-      return fallback.call if defaults.any? { |value| unsupported_bind?(value) }
+      return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
-      binds = defaults + binds
+      binds = defaults + (nils.empty? ? binds : binds.reject(&:nil?))
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions]) { compile(statement, connection, columns, extensions) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils]) { compile(statement, connection, columns, extensions, nils) }
         compiled && compiled.cache.execute(binds, connection)
       end
       return fallback.call unless compiled
@@ -357,7 +423,7 @@ module Futamura
 
         list = node.values
         return "list_length" unless (2..MAX_LIST).cover?(list.size)
-        return "list_value" if list.any? { |value| unsupported_bind?(value) }
+        return "list_value" if list.any? { |value| unsupported_bind?(value, model) }
 
         [[attribute.name.to_s, node.type, list.size].freeze, list]
       when Arel::Nodes::Equality, Arel::Nodes::NotEqual
@@ -431,7 +497,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -446,12 +512,13 @@ module Futamura
       cache = begin
         default_scope_evaluations(evaluated) do
           ActiveRecord::StatementCache.create(connection) do |_|
+            chain_params = nils.empty? ? params : NilParams.new(params, nils)
             relation = if statement.unscoped
-              statement.build.call(params)
+              statement.build.call(chain_params)
             else
               base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
               base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
-              base.scoping { statement.build.call(params) }
+              base.scoping { statement.build.call(chain_params) }
             end
           end
         end
@@ -825,13 +892,15 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return "owner_not_record" if owner && !(ActiveRecord::Base === owner)
 
           binds = binds.call if Proc === binds
-          # find_index, not find: the value that is refused is usually nil.
-          index = binds.index { |value| Futamura.unsupported_bind?(value) }
-          return "bind_#{kind(binds[index])}" if index
-
           statement = Futamura.instance_variable_get(:@statements).fetch(key)
           model = statement.model
           return "model_unloaded" unless model.is_a?(Class)
+
+          # find_index, not find: the value that is refused is usually an Array.
+          index = binds.index { |value| !value.nil? && Futamura.unsupported_bind?(value, model) }
+          return "bind_#{kind(binds[index])}" if index
+          return "bind_nil_many" if binds.count(&:nil?) > Futamura::MAX_NILS
+
           return "root_not_model" if root && !root.equal?(model)
           redefined = statement.via && Futamura.send(:redefined_class_method, model, statement.via)
           return "class_method_redefined[#{model.name}.#{redefined}]" if redefined
@@ -870,6 +939,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         end
 
         def kind(value)
+          return "association_key" if value.equal?(Futamura::UNBINDABLE)
+
           case value
           when nil then "nil"
           when Array then "array"

@@ -632,8 +632,8 @@ mod default_scope_runtime {
     }
 
     /// The FUTAMURA_STATS block names why a call ran Rails' chain. A nil bind
-    /// (which a StatementCache refuses) is `bind_nil`, not a statement whose
-    /// model never loaded; a default scope that is not a plain condition says
+    /// (a statement of its own up to MAX_NILS, else `bind_nil_many`) and an Array
+    /// are named, not a statement whose model never loaded; a default scope that is not a plain condition says
     /// which check it failed; and the block's `compile` hook takes the
     /// arguments compile takes. Skipped when ActiveRecord and sqlite3 are not
     /// installed.
@@ -650,7 +650,7 @@ mod default_scope_runtime {
         let run = Command::new("ruby").arg(&probe).arg(&runtime).output().unwrap();
         let out = String::from_utf8_lossy(&run.stdout).to_string();
         assert!(run.status.success(), "{out}\n{}", String::from_utf8_lossy(&run.stderr));
-        assert!(out.contains("thing specialized=1 fallback={\"bind_array\" => 1, \"bind_nil\" => 1}"), "{out}");
+        assert!(out.contains("thing specialized=2 fallback={\"bind_array\" => 1, \"bind_nil_many\" => 1}"), "{out}");
         assert!(out.contains("ranked specialized=0 fallback={\"default_scope_values[RankedThing]\" => 1}"), "{out}");
         assert!(out.contains("scoped specialized=1 fallback={}"), "{out}");
     }
@@ -747,10 +747,11 @@ mod bind_runtime {
             "scalar=integer:1/0 string:2/0 symbol:3/0 true:1/0 false:2/0 date:1/0 time:1/0 zoned:1/0 decimal:1/0\n"
         ), "{normal}");
         // An Array, a Set (which has no entry in StatementCache.unsupported_value?), a Range, a
-        // Relation, a record and nil are Rails': it expands them into IN, BETWEEN, a subquery or
-        // IS NULL, and here finds the same record it would without a statement.
+        // Relation and a record are Rails': it expands them into IN, BETWEEN or a subquery, and
+        // here finds the same record it would without a statement. nil is its own statement
+        // (`IS NULL`), see `a_nil_value_has_a_statement_for_its_pattern`.
         assert!(normal.contains(
-            "collection=array:1/1 set:1/1 range:2/1 endless:2/1 relation:3/1 empty_set:nil/1 record:2/1 nil:nil/1\n"
+            "collection=array:1/1 set:1/1 range:2/1 endless:2/1 relation:3/1 empty_set:nil/1 record:2/1 nil:nil/0\n"
         ), "{normal}");
     }
 
@@ -760,11 +761,36 @@ mod bind_runtime {
         // A composite target has no single key to bind. With query constraints (Rails 8.2) the
         // join keys are one column and the query keys are not: the key is read like the
         // predicate builder reads it (n/a where the Rails in use has no such option).
-        assert!(normal.contains("association=single:1/0 composite_key:nil composite:1/1 constrained_key:"), "{normal}");
+        assert!(normal.contains("association=single:1/0 composite_key:{} composite:1/1 constrained_key:"), "{normal}");
         let line = normal.lines().find(|l| l.starts_with("association=")).unwrap();
-        assert!(line.ends_with("constrained_key:n/a constrained:n/a") || line.ends_with("constrained_key:nil constrained:1/1"), "{line}");
+        assert!(line.ends_with("constrained_key:n/a constrained:n/a") || line.ends_with("constrained_key:{} constrained:1/1"), "{line}");
         // A chain that cannot be built over placeholders is Rails' too, from the first call on.
         assert!(normal.contains("unbuildable=[[2, 1], [3, 1]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_value_object_is_bound_when_the_predicate_builder_treats_it_as_a_scalar() {
+        let Some(normal) = probe("0") else { return };
+        // A class that responds to `to_i` and nothing the predicate builder looks at is one
+        // placeholder (PredicateBuilder#build: no `id`, only the BasicObject handler); a value
+        // with an `id` (read as the key), one with a handler registered for it, and a Hash
+        // (nested conditions) are Rails'.
+        // (A handler can be registered only where the Rails in use leaves a predicate builder unfrozen.)
+        assert!(
+            normal.contains("typed=value_object:3/0 record_key:2/1 handler:1/1 hash:nil/1\n")
+                || normal.contains("typed=value_object:3/0 record_key:2/1 handler:n/a hash:nil/1\n"),
+            "{normal}"
+        );
+    }
+
+    #[test]
+    fn a_nil_value_has_a_statement_for_its_pattern() {
+        let Some(normal) = probe("0") else { return };
+        // `where(c: nil)` is `c IS NULL`: each pattern of nil positions is a statement (no
+        // fallback, and the same record Rails' chain finds); more than MAX_NILS nils is Rails'.
+        assert!(normal.contains(
+            "nil=none:2/0 first:5/0 second:4/0 both:6/0 none_again:3/0 first_again:5/0 missing:nil/0 many:6/1\n"
+        ), "{normal}");
     }
 
     #[test]
@@ -782,7 +808,7 @@ mod bind_runtime {
         // only the records agree, not the number of chains run.
         let records = |s: &str| {
             s.lines()
-                .filter(|l| l.starts_with("scalar=") || l.starts_with("collection="))
+                .filter(|l| ["scalar=", "collection=", "typed=", "nil="].iter().any(|p| l.starts_with(p)))
                 .map(|l| l.split(' ').map(|t| t.rsplit_once('/').map_or(t, |(id, _)| id).to_string()).collect::<Vec<_>>().join(" "))
                 .collect::<Vec<_>>()
         };
