@@ -83,15 +83,6 @@ module ActionDispatch
       end
     end
 
-    # Rails' `request.authorization`: the header, or one of the names a
-    # proxy or rewrite moves it to.
-    def authorization
-      get_header("HTTP_AUTHORIZATION") ||
-        get_header("X-HTTP_AUTHORIZATION") ||
-        get_header("X_HTTP_AUTHORIZATION") ||
-        get_header("REDIRECT_X_HTTP_AUTHORIZATION")
-    end
-
     # Rails' path parameters (the route's captures), kept in the env
     # under its key; writing them drops the merged-parameters cache. Keys
     # are symbolized, as the router's captures are, so a string-keyed
@@ -133,6 +124,8 @@ module ActionDispatch
       @params[key.to_s]
     end
 
+    # Rails' `request.authorization`: the header, or one of the names a
+    # proxy or rewrite moves it to (the shared Headers table).
     def authorization
       ActionDispatch::Http::Headers.authorization(@env)
     end
