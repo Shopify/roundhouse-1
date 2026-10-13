@@ -42,6 +42,8 @@ module Futamura
   NO_NILS = [].freeze
   # The key columns of an owner chain beyond the one the statement was written for (`owner_key_extras`).
   NO_EXTRAS = [].freeze
+  # The `preload` a default scope adds to a chain (`default_shape`).
+  NO_PRELOADS = [].freeze
 
   # A value the call site reads on every call that the statement is built around rather than binds:
   # a constant `limit(LIMIT)` names (read per call, so a test may stub it). Rails' `limit!` does
@@ -108,7 +110,7 @@ module Futamura
   # What a model's default scopes add to a query, as the columns each
   # compares for equality, the values it compared them to, and the modules
   # they extend the relation with (`extending`).
-  NO_DEFAULTS = [[].freeze, [].freeze, [].freeze].freeze
+  NO_DEFAULTS = [[].freeze, [].freeze, [].freeze, [].freeze].freeze
   # A model whose default scopes are this many times in a row not that
   # simple is left to Rails' chain without evaluating them first, except for
   # one call in OPAQUE_RETRY: a default scope that reads request state may be
@@ -387,9 +389,9 @@ module Futamura
       # clones it), but not of an association's relation (Association#scope starts from `scope_for_association`).
       if !statement.unscoped && model.current_scope
         return fallback.call if owner
-        columns, defaults, extensions = current_scope_binds(model)
+        columns, defaults, extensions, preloads = current_scope_binds(model)
       else
-        columns, defaults, extensions = statement.unscoped ? NO_DEFAULTS : default_binds(model)
+        columns, defaults, extensions, preloads = statement.unscoped ? NO_DEFAULTS : default_binds(model)
       end
       return fallback.call unless columns
       # Merging the association's relation into the model's default scope
@@ -409,7 +411,7 @@ module Futamura
       binds = defaults + binds + extra_values
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists) }
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists, preloads]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads) }
         values = compiled && serialize_slots(compiled.slot_types, binds)
         values && compiled.cache.execute(values, connection)
       end
@@ -527,7 +529,7 @@ module Futamura
     # the default scopes' are. The class's `unscoped` runs here once per call, as it does for Rails.
     def unscoped_conditions(model)
       shape = default_shape(model, model.send(:relation), model.unscoped)
-      shape if shape && shape[2].empty?
+      shape if shape && shape[2].empty? && shape[3].empty?
     rescue StandardError
       nil
     end
@@ -597,12 +599,17 @@ module Futamura
     end
 
     def default_shape(model, base, scoped)
-      return unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+      return unless scoped.values.except(:where, :extending, :preload) == base.values.except(:where, :extending, :preload)
 
       extensions = scoped.extending_values
       return unless extensions.first(base.extending_values.size) == base.extending_values
       extensions = (extensions - base.extending_values).freeze
       return unless extensions.all? { |mod| extension?(mod) }
+
+      preloads = scoped.preload_values
+      return unless preloads.first(base.preload_values.size) == base.preload_values
+      preloads = preloads.drop(base.preload_values.size).freeze
+      return unless preloads.all? { |spec| preload_spec?(spec) }
 
       before = base.where_clause.send(:predicates)
       predicates = scoped.where_clause.send(:predicates)
@@ -617,7 +624,19 @@ module Futamura
         columns << condition[0]
         values.concat(condition[1])
       end
-      [columns.freeze, values, extensions]
+      [columns.freeze, values, extensions, preloads]
+    end
+
+    # Whether a `preload` a default scope adds is names only (`preload(:a, b: :c)`): the same tree at
+    # every call, which `compile` adds in front of the chain's own (query_methods.rb `preload!` appends
+    # to `preload_values`, the default scope's first).
+    def preload_spec?(spec)
+      case spec
+      when Symbol, String then true
+      when Array then spec.all? { |item| preload_spec?(item) }
+      when Hash then spec.all? { |key, value| (Symbol === key || String === key) && preload_spec?(value) }
+      else false
+      end
     end
 
     # The longest list of an `IN` default condition that gets a statement of its own (the
@@ -714,7 +733,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS, lists = NO_LISTS)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS, lists = NO_LISTS, preloads = NO_PRELOADS)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -734,6 +753,7 @@ module Futamura
               statement.build.call(chain_params)
             else
               base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
+              base = base.preload(*preloads) if preloads.any?
               base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
               base.scoping { statement.build.call(chain_params) }
             end
@@ -1155,7 +1175,8 @@ if ENV["FUTAMURA_STATS"].to_s != ""
         # Futamura.default_shape's checks, in order, naming the first one that refuses (read only).
         def default_shape_failure(model, scoped = model.default_scoped)
           base = model.send(:relation)
-          return "values" unless scoped.values.except(:where, :extending) == base.values.except(:where, :extending)
+          return "values" unless scoped.values.except(:where, :extending, :preload) == base.values.except(:where, :extending, :preload)
+          return "preload" unless (scoped.preload_values - base.preload_values).all? { |spec| Futamura.send(:preload_spec?, spec) }
           return "extending" unless (scoped.extending_values - base.extending_values).all? { |mod| Futamura.send(:extension?, mod) }
 
           before = base.where_clause.send(:predicates)

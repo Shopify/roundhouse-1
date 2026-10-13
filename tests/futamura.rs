@@ -1876,12 +1876,16 @@ mod list_binds {
             String::from_utf8_lossy(&run.stdout).to_string()
         };
         // Verify mode counts every call as a fallback: only its results are compared.
-        let results = |s: &str| s.lines().map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        let results = |s: &str| s.lines().filter(|l| !l.starts_with("sprocket_reasons=")).map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
         let verified = output("1");
         let normal = output("0");
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
+        // A default scope that only preloads is names only: the statement preloads it before the chain's own preloads
+        // (the association is loaded on every record), so those calls are served too.
+        assert!(normal.contains("sprockets_calls spec=3 fall=0\nsprocket_reasons=[]"), "{normal}");
+        assert!(normal.contains("sprockets=[2, 3] loaded=[[true, false], [true, false]]") && normal.contains("sprockets_nested=[2, 3] loaded=[[true, true], [true, true]]"), "{normal}");
         for name in [
             "ids1", "ids2", "ids3", "ids4", "ids_missing", "ids_dup", "ids_strings", "shop_ids", "codes", "codes_symbols", "ranks", "stamps", "not_ids",
             "not_ids1", "unscoped_ids", "first_of", "two_lists", "two_lists_mixed", "gadgets", "nil_and_list",

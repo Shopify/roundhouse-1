@@ -13,7 +13,7 @@ ENV["FUTAMURA_STATS"] = Dir.mktmpdir
 ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
 ActiveRecord::Schema.verbose = false
 load File.join(dir, "db/schema.rb")
-%w[application_record widget gadget].each { |m| load File.join(dir, "app/models/#{m}.rb") }
+%w[application_record widget gadget sprocket].each { |m| load File.join(dir, "app/models/#{m}.rb") }
 module Rails
   Config = Struct.new(:unused) { def to_prepare(&block) = block.call }
   def self.application = Struct.new(:config).new(Config.new)
@@ -85,3 +85,18 @@ show("nested") { Finder.by_ids([[ids[0], ids[1]]]) }
 show("nil_and_list") { Finder.two_lists([ids[0], ids[1]], nil) }
 reasons = Futamura::Stats.sites.values.flat_map { |s| s.fallback.keys }.map { |r| r[/\Abind_array\[\w+\]/] }.compact.sort.uniq
 puts "reasons=#{reasons.inspect}"
+
+# A default scope that only preloads (`default_scope { preload(:widget) }`): the preload runs before the chain's own,
+# and the statement serves the call with the association loaded, as Rails' chain leaves it.
+widgets.first(3).each_with_index { |w, i| Sprocket.unscoped { Sprocket.create!(widget_id: w.id, code: i.zero? ? "a" : "b") } }
+def loaded(name, records)
+  flags = records.map { |r| [r.association(:widget).loaded?, r.widget&.association(:gadgets)&.loaded?] }
+  puts "#{name}=#{records.map(&:id).inspect} loaded=#{flags.inspect}"
+end
+before = totals
+loaded("sprockets", Finder.sprockets("b"))
+loaded("sprockets_nested", Finder.sprockets_nested("b"))
+loaded("sprockets_listed", Finder.sprockets_listed(%w[a b]))
+after = totals
+puts "sprockets_calls spec=#{after[0] - before[0]} fall=#{after[1] - before[1]}"
+puts "sprocket_reasons=#{Futamura::Stats.sites.select { |k, _| k.to_s.start_with?("services_finder") }.values.flat_map { |s| s.fallback.keys }.grep(/Sprocket/).uniq.inspect}"

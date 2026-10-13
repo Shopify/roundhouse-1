@@ -48,4 +48,19 @@ class Finder
   def self.two_lists(ids, codes)
     Widget.where(id: ids, code: codes).order(:id).to_a
   end
+
+  #: (String) -> untyped
+  def self.sprockets(code)
+    Sprocket.where(code: code).order(:id).to_a
+  end
+
+  #: (String) -> untyped
+  def self.sprockets_nested(code)
+    Sprocket.where(code: code).preload(widget: :gadgets).order(:id).to_a
+  end
+
+  #: (Array[String]) -> untyped
+  def self.sprockets_listed(codes)
+    Sprocket.where(code: codes).order(:id).to_a
+  end
 end
