@@ -50,6 +50,7 @@ const PROBE: &str = r#"class Probe
   def transitive_gem_prefix; defined?(Sidekiq); end
   def gem_outside_catalog_member; defined?(SolidQueue::Weird); end
   def initializer_defined; defined?(Throttle); end
+  def initializer_kept; defined?(Gate); end
   def runtime_provided; defined?(Set); end
   def ivar; defined?(@memo); end
   def local; defined?(thing); end
@@ -77,8 +78,11 @@ fn ingest(lock: Option<&str>) -> roundhouse::App {
             "app/views/widgets/_badge.html.erb",
             "<% if defined? Refer %>referral<% end %><% if defined?(ActiveStorage) %>storage<% end %>",
         ),
-        // Defined by an initializer nothing names, so the tree drops it.
-        ("config/initializers/throttle.rb", "Throttle = Struct.new(:limit)\n"),
+        // Defined by an initializer nothing names, in a branch: ingest
+        // takes only a program-level constant write, so the tree drops it.
+        ("config/initializers/throttle.rb", "if ENV[\"THROTTLE\"]\n  Throttle = Struct.new(:limit)\nend\n"),
+        // A program-level write ingest keeps and the boot defines.
+        ("config/initializers/gate.rb", "Gate = Struct.new(:open)\n"),
     ];
     if let Some(lock) = lock {
         files.push(("Gemfile.lock", lock));
@@ -118,6 +122,14 @@ fn constants_no_locked_gem_can_define_fold_to_false() {
     for name in ["absent_gem", "absent_rooted", "absent_nested"] {
         assert_eq!(b[name], "nil", "{name}");
     }
+}
+
+#[test]
+fn a_kept_initializer_constant_folds_to_true() {
+    // The tree defines it at boot (`initializer_constants`), so the
+    // emitted program has it once loaded.
+    let b = bodies(&ingest(Some(LOCK)));
+    assert_eq!(b["initializer_kept"], "\"constant\"");
 }
 
 #[test]
