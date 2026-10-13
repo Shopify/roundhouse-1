@@ -897,10 +897,31 @@ mod bind_count_runtime {
     }
 
     #[test]
-    fn a_default_scope_evaluated_while_building_is_not_frozen_into_the_statement() {
+    fn a_joined_default_scope_is_bound_at_every_call_not_frozen_into_the_statement() {
         let Some(normal) = probe("0") else { return };
-        // Each call's default scope reads the state at that call: Rails' chain answers all three.
-        assert!(normal.contains("joined=[[[1], 1], [[2], 1], [[1], 1]]\n"), "{normal}");
+        // The joined model's default scope reads the state at each call (Reflection#join_scope runs it
+        // at query time): its value is a placeholder of the statement, so the statement answers all
+        // three calls, each with the records Rails' chain has for that state.
+        assert!(normal.contains("joined=[[[1], 0], [[2], 0], [[1], 0]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn joined_default_scopes_with_lists_aliases_and_a_default_scope_of_the_chain_agree_with_rails() {
+        let Some(normal) = probe("0") else { return };
+        // The joins' placeholders precede the chain's own in the SQL, a list is one placeholder per
+        // element, and one model joined twice binds both ON clauses: every call has Rails' records
+        // for its own state, from the statement alone.
+        assert!(normal.contains("pets=agree true fallbacks 0 distinct 3\n"), "{normal}");
+        assert!(normal.contains("pets_left=agree true fallbacks 0 distinct 2\n"), "{normal}");
+        assert!(normal.contains("pets.ids=[[1, 3, 4, 5], [5], [5], [], [], [1, 3, 4, 5]]\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_joined_default_scope_that_is_other_conditions_than_the_statements_runs_rails_chain() {
+        let Some(normal) = probe("0") else { return };
+        // Inside `Vet.unscoped { }` the join has no default scope (Scoping::Named `scope_for_association`):
+        // the statement was built for another set of conditions, so Rails' chain answers (and finds the unscoped rows).
+        assert!(normal.contains("pets_unscoped=[[1, 2, 3, 4, 5], 1]\n"), "{normal}");
     }
 
     #[test]

@@ -19,23 +19,104 @@
 # records in the same order, with the same associations loaded.
 module Futamura
   Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
-  Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, keyword_init: true)
+  Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, :joined, :order, keyword_init: true)
 
-  # `StatementCache::Params` that counts the placeholders handed out (`compile` compares the count
-  # with the ones the built statement ended up with).
+  # `StatementCache::Params` that keeps the placeholders handed out, in the order they were (`compile`
+  # compares them with the ones the built statement ended up with).
   class CountingParams
-    attr_reader :count
+    attr_reader :created
 
     def initialize(params)
       @params = params
-      @count = 0
+      @created = []
+    end
+
+    def count
+      @created.size
     end
 
     def bind
-      @count += 1
-      @params.bind
+      slot = @params.bind
+      @created << slot
+      slot
     end
   end
+
+  # The placeholder for one value of a default scope that a joined model adds to the ON clause of its
+  # join (`position` counts the values of the model's default conditions in `default_shape`'s order).
+  # The value is the model's own, read at every call (`Futamura.records`), not the statement's.
+  class JoinedSlot < ActiveRecord::StatementCache::Substitute
+    attr_reader :model, :position
+
+    def initialize(model, position)
+      @model = model
+      @position = position
+    end
+  end
+
+  # `params` for `add_default_condition` on a joined model's relation.
+  class JoinedParams
+    def initialize(model)
+      @model = model
+      @position = -1
+    end
+
+    def bind
+      JoinedSlot.new(@model, @position += 1)
+    end
+  end
+
+  # What one build of a statement found out about the models it joins: for each model, the columns
+  # of the default scope the join evaluated (`[]` for none, `Futamura.joined_scope`). A model whose
+  # default scope is more than plain conditions is `refused`, and the statement is not built.
+  class JoinedScopes
+    attr_reader :shapes
+
+    def initialize
+      @shapes = {}
+      @refused = false
+      @shaping = false
+    end
+
+    def refused?
+      @refused
+    end
+
+    def refuse
+      @refused = true
+    end
+
+    # Whether Rails' own evaluation of a default scope is being read for its shape (the TracePoint of
+    # `Futamura.default_scope_evaluations` does not count that one).
+    def shaping?
+      @shaping
+    end
+
+    def shaping
+      @shaping = true
+      yield
+    ensure
+      @shaping = false
+    end
+
+    def record(model, columns)
+      refuse unless @shapes.fetch(model) { @shapes[model] = columns } == columns
+    end
+  end
+
+  # Reflection#join_scope builds the join of an association (JoinDependency, `joins`/`includes`/
+  # `left_joins`) from the target's `scope_for_association`, which runs the target's default scope
+  # at query time. While `compile` builds a statement, `Futamura.joined_scope` answers that
+  # relation with placeholders where the default scope has its values.
+  module JoinScopes
+    def klass_join_scope(table, predicate_builder = nil)
+      joined = Thread.current[:futamura_joined_scopes]
+      return super unless joined
+
+      Futamura.send(:joined_scope, joined, klass, build_scope(table, predicate_builder)) || super
+    end
+  end
+  ActiveRecord::Reflection::AbstractReflection.prepend(JoinScopes)
 
   # The most nil values one call may carry; each pattern of nil positions is a statement of its own.
   MAX_NILS = 3
@@ -88,10 +169,11 @@ module Futamura
   # for an integer column is every placeholder: the statement would lose its slots. `ListSlot` keeps the
   # slot and the type, so `records` serializes each value the way HomogeneousIn would (`serialize_slots`).
   class ListSlot < ActiveRecord::StatementCache::Substitute
-    attr_reader :type
+    attr_reader :type, :origin
 
-    def initialize(type)
+    def initialize(type, origin = nil)
       @type = type
+      @origin = origin
     end
   end
 
@@ -102,7 +184,7 @@ module Futamura
       return super if values.empty? || !values.all?(ActiveRecord::StatementCache::Substitute)
 
       type = attribute.type_caster
-      values.map { ListSlot.new(type) }
+      values.map { |value| ListSlot.new(type, value) }
     end
   end
   Arel::Nodes::HomogeneousIn.prepend(ListSlots)
@@ -419,7 +501,8 @@ module Futamura
       compiled = nil
       records = model.with_connection do |connection|
         compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists, preloads]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists, preloads) }
-        values = compiled && serialize_slots(compiled.slot_types, binds)
+        ordered = compiled && ordered_binds(compiled, binds)
+        values = ordered && serialize_slots(compiled.slot_types, ordered)
         values && compiled.cache.execute(values, connection)
       end
       return fallback.call unless compiled && records
@@ -443,7 +526,51 @@ module Futamura
       result
     end
 
-    private :bind_lists, :serialize_slots
+    # `binds` (the defaults', the chain's, the extra keys') in the order of the statement's
+    # placeholders, with the joined models' default scope values at the places their joins have
+    # them; nil when a joined model's default scope is not the one the statement was built for (other
+    # conditions, or a value that is not one placeholder), which Rails' chain runs.
+    def ordered_binds(compiled, binds)
+      return binds unless compiled.joined
+
+      values = {}
+      compiled.joined.each do |model, columns|
+        shape = joined_shape(model)
+        return unless shape && shape[0] == columns && shape[1].none? { |value| unsupported_bind?(value, model) }
+
+        values[model] = shape[1]
+      end
+      compiled.order.map { |slot| Integer === slot ? binds[slot] : values[slot[0]][slot[1]] }
+    end
+
+    # `default_shape` of what Rails' `scope_for_association` (the scope of a join, called with
+    # `build_scope`'s relation there) adds to `model`'s own relation right now (scoping/named.rb: none
+    # inside `unscoped { }`, else `default_scoped`).
+    def joined_shape(model)
+      base = model.send(:relation)
+      default_shape(model, base, model.scope_for_association(base))
+    rescue StandardError
+      nil
+    end
+
+    # What `model.scope_for_association(relation)` answers while `compile` builds a statement: `relation`
+    # with the default scope's conditions over `JoinedSlot` placeholders, so that the statement is
+    # the same for every value (Reflection#join_scope puts them in the ON clause of the join). nil
+    # when the default scope is not plain conditions (Rails' own is run, and the statement refused).
+    def joined_scope(joined, model, relation)
+      shape = joined.shaping { joined_shape(model) }
+      unless shape && shape[1].none? { |value| unsupported_bind?(value, model) }
+        joined.refuse
+        return
+      end
+
+      columns = shape[0]
+      joined.record(model, columns)
+      params = JoinedParams.new(model)
+      columns.inject(relation) { |scope, column| add_default_condition(scope, column, params) }
+    end
+
+    private :bind_lists, :serialize_slots, :ordered_binds, :joined_shape, :joined_scope
 
     private
 
@@ -759,8 +886,10 @@ module Futamura
       # report raises from a relation extension, is an Exception): any exception but the ones
       # that end the process is a refusal.
       evaluated = []
+      joined = JoinedScopes.new
+      Thread.current[:futamura_joined_scopes] = joined
       cache = begin
-        default_scope_evaluations(evaluated) do
+        default_scope_evaluations(evaluated, joined) do
           ActiveRecord::StatementCache.create(connection) do |_|
             chain_params = nils.empty? && fixed.empty? && lists.empty? ? params : NilParams.new(params, nils, fixed, lists)
             relation = if statement.unscoped
@@ -779,19 +908,31 @@ module Futamura
         raise
       rescue Exception # rubocop:disable Lint/RescueException
         return false
+      ensure
+        Thread.current[:futamura_joined_scopes] = nil
       end
-      # A default scope Rails evaluated while building (the join of an association adds its
-      # target's, Relation#joins -> JoinDependency -> Reflection#join_scope) is Ruby that runs at
-      # query time (it may read request state): its values are in the statement as constants.
-      return false if evaluated.any?
-      return false unless placeholders_bound?(cache, params.count)
+      # A default scope Rails evaluated while building is Ruby that runs at query time (it may read
+      # request state): its values are in the statement as constants. The join of an association adds
+      # its target's (Relation#joins -> JoinDependency -> Reflection#join_scope -> klass_join_scope):
+      # `joined_scope` has those over placeholders, read again at every call (`ordered_binds`). Any other
+      # evaluation, or a joined default scope that is not plain conditions, is Rails' to run.
+      return false if evaluated.any? || joined.refused?
+
+      order = nil
+      if joined.shapes.empty?
+        return false unless placeholders_bound?(cache, params.count)
+      else
+        order = slot_order(cache, params.created, joined.shapes)
+        return false unless order
+      end
       return false if overrides.any?
       return false if relation.eager_loading? || relation.readonly_value
       return false unless builders_are_rails?(statement.model)
       return false unless (relation.extending_values - extensions).all? { |mod| plain_extension?(mod) }
 
       preload = relation.preload_values + relation.includes_values
-      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value, slot_types: slot_types(cache))
+      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value, slot_types: slot_types(cache),
+                    joined: order && joined.shapes.freeze, order: order)
     end
 
     # For each placeholder of the statement, the type its IN list serializes it with (`ListSlot`), or
@@ -803,10 +944,34 @@ module Futamura
       types.any? ? types.freeze : nil
     end
 
+    # For each placeholder of the statement, in the order the statement has them (the order of its
+    # SQL, which `BindMap` fills in with the values given), what its value is: the position among
+    # `created` (the chain's `params.bind` calls, `CountingParams`), or `[model, position]` of a joined
+    # model's default scope value. nil when the statement's placeholders are not exactly those.
+    def slot_order(cache, created, joined)
+      bind_map = cache.instance_variable_get(:@bind_map)
+      return unless bind_map
+
+      attributes = bind_map.instance_variable_get(:@bound_attributes)
+      order = bind_map.instance_variable_get(:@indexes).map do |index|
+        slot = attributes[index].value
+        slot = slot.origin if ListSlot === slot
+        if JoinedSlot === slot
+          return unless joined.key?(slot.model)
+
+          [slot.model, slot.position]
+        else
+          created.index { |candidate| candidate.equal?(slot) } or return
+        end
+      end
+      order if order.grep(Integer).sort == (0...created.size).to_a
+    end
+
     # Runs the block and adds to `evaluated` each model whose default scope Rails built in it
-    # (`build_default_scope`, which answers nil for a model without one).
-    def default_scope_evaluations(evaluated, &block)
-      trace = TracePoint.new(:return) { |point| evaluated << point.self if point.return_value }
+    # (`build_default_scope`, which answers nil for a model without one), except those `joined`
+    # reads the shape of itself.
+    def default_scope_evaluations(evaluated, joined, &block)
+      trace = TracePoint.new(:return) { |point| evaluated << point.self if point.return_value && !joined.shaping? }
       trace.enable(target: ActiveRecord::Scoping::Default::ClassMethods.instance_method(:build_default_scope), target_thread: Thread.current, &block)
     end
 

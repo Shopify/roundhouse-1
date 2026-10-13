@@ -67,3 +67,63 @@ joined = %w[a b a].map do |state|
 end
 puts "joined=#{joined.inspect}"
 puts "joined.ids=#{joined.map(&:first).inspect}"
+
+# Joined models whose default scopes have values (an IN list over an integer column, an equality) that
+# change between calls, joined twice (the second under an alias), under a default scope of the
+# chain's own model. The joins' placeholders come first in the SQL, before the ones the chain
+# creates first (`Futamura.joined_scope`, `ordered_binds`).
+ActiveRecord::Schema.define do
+  create_table(:vets) { |t| t.integer :region; t.boolean :active; t.string :name }
+  create_table(:pets) { |t| t.integer :vet_id; t.integer :backup_id; t.integer :tier; t.string :code }
+end
+$region = 1
+$tier = 1
+class Vet < ApplicationRecord; default_scope { where(region: [$region, 7], active: true) }; end
+class Pet < ApplicationRecord
+  default_scope { where(tier: $tier) }
+  belongs_to :vet
+  belongs_to :backup, class_name: "Vet"
+end
+Vet.unscoped do
+  [[1, true, "a"], [2, true, "b"], [7, true, "c"], [1, false, "d"]].each { |region, active, name| Vet.create!(region: region, active: active, name: name) }
+end
+Pet.unscoped do
+  [[1, 1], [2, 1], [3, 1], [1, 3], [3, 3], [1, 2]].each_with_index do |(vet, backup), i|
+    Pet.create!(vet_id: vet, backup_id: backup, tier: i < 5 ? 1 : 2, code: "x")
+  end
+end
+Futamura.define(:pets, Pet, via: :where) { |p| Pet.all.joins(:vet, :backup).where(code: p.bind) }
+Futamura.define(:pets_left, Pet, via: :where) { |p| Pet.all.where(code: p.bind).left_joins(:vet).where.not(vet_id: p.bind) }
+
+def pets_look(key, plain)
+  before = $fallbacks
+  specialized = Futamura.records(key, key == :pets ? ["x"] : ["x", 99]) { $fallbacks += 1; plain.call.to_a }
+  [specialized.map(&:id), plain.call.map(&:id), $fallbacks - before]
+end
+
+pets = lambda do
+  [[1, 1], [2, 1], [7, 1], [1, 2], [2, 2], [1, 1]].map do |region, tier|
+    $region = region
+    $tier = tier
+    pets_look(:pets, -> { Pet.all.joins(:vet, :backup).where(code: "x") })
+  end
+end
+lefts = lambda do
+  [[1, 1], [2, 1], [1, 2]].map do |region, tier|
+    $region = region
+    $tier = tier
+    pets_look(:pets_left, -> { Pet.all.where(code: "x").left_joins(:vet).where.not(vet_id: 99) })
+  end
+end
+# Each look is [records of the statement, records of Rails' chain, calls that ran Rails' chain].
+{ pets: pets.call, pets_left: lefts.call }.each do |name, looks|
+  # `distinct` is how many different answers the calls had: the values are the call's own.
+  puts "#{name}=agree #{looks.all? { |specialized, plain, _| specialized == plain }} fallbacks #{looks.sum(&:last)} distinct #{looks.map(&:first).uniq.size}"
+end
+# A call whose joined default scope has other conditions than the statement's runs Rails' chain.
+$region = 1
+$tier = 1
+before = $fallbacks
+inside = Vet.unscoped { Futamura.records(:pets, ["x"]) { $fallbacks += 1; Pet.all.joins(:vet, :backup).where(code: "x").to_a } }
+puts "pets_unscoped=#{[inside.map(&:id), $fallbacks - before].inspect}"
+puts "pets.ids=#{pets.call.map(&:first).inspect}"
