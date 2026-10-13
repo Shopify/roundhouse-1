@@ -1976,3 +1976,56 @@ mod verify_runtime {
         assert!(verified.contains("regions=[[\"Country\", 1], [\"Province\", 1]]\n"), "{verified}");
     }
 }
+
+/// `where(column: Klass)`: a Class has no `id`, so the predicate builder builds `column = <bind>`
+/// with it as the value (BasicObjectHandler) and the adapter inlines `Class#to_s` (no prepared
+/// statements) or raises TypeError (prepared statements); a Class that answers `id` is read as the
+/// key; a Relation is a subquery. The probe (`tests/futamura_class_bind_runtime.rb`) runs real
+/// ActiveRecord on SQLite; each field is `<record id>/<calls that ran Rails' chain>`.
+mod class_bind_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str, prepared: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_class_bind_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let run = Command::new("ruby").arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify).env("PREPARED", prepared).output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    #[test]
+    fn a_class_value_is_bound_as_the_class_name_rails_inlines() {
+        let Some(normal) = probe("0", "0") else { return };
+        // STI and polymorphic type columns alike: one placeholder, no fallback, the record Rails finds.
+        assert!(normal.contains("sti=subclass:1/0 namespaced:3/0 base:nil/0 string:1/0\n"), "{normal}");
+        assert!(normal.contains("polymorphic=class:2/0 base:1/0\n"), "{normal}");
+    }
+
+    #[test]
+    fn a_class_that_answers_id_and_a_relation_run_rails_chain() {
+        let Some(normal) = probe("0", "0") else { return };
+        assert!(normal.contains("key=keyed_class:2/1\n"), "{normal}");
+        assert!(normal.contains("relation=subquery:[1, 3]/1\n"), "{normal}");
+    }
+
+    #[test]
+    fn with_prepared_statements_the_statement_raises_what_rails_raises() {
+        let Some(normal) = probe("0", "1") else { return };
+        assert!(normal.contains("sti=subclass:TypeError/0 namespaced:TypeError/0 base:TypeError/0 string:1/0\n"), "{normal}");
+    }
+
+    #[test]
+    fn the_same_calls_agree_with_rails_under_verify() {
+        // Verify raises on a difference, so the probe passing is the check.
+        for prepared in ["0", "1"] {
+            let Some(verified) = probe("1", prepared) else { return };
+            assert!(verified.contains("key=keyed_class:2/1\n"), "{verified}");
+        }
+    }
+}
