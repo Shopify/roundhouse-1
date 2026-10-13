@@ -635,6 +635,11 @@ mod default_scope_runtime {
         // evaluated again within OPAQUE_RETRY calls, and simple again.
         assert!(normal.contains("flip=[true, true, true]"), "{normal}");
         assert!(normal.contains("find_by_id=[\"owned\"]"), "{normal}");
+        // The columns a default scope compares are read at every call (one branch binds `shop_id`, the other
+        // `code`), and a default scope added or removed between calls is seen by the next: the statement
+        // serves all of them and the answers are Rails'.
+        assert!(normal.contains("branch=[1, 1, 1, 1]\nbranch_shop2=[2, 1]\ngrown=[1, 2, 1]"), "{normal}");
+        assert!(!normal.contains("[:branch, :fallback]") && !normal.contains("[:grown, :fallback]"), "{normal}");
         // A class method the class defines itself (a double) is not answered beside: Rails runs it.
         assert!(normal.contains("via=[1, :double, 1, :prepended]") && normal.contains("calls_via=2"), "{normal}");
         // A `scoping`/`unscoped` block is the chain's starting relation (Scoping::Named::ClassMethods#all clones it,
