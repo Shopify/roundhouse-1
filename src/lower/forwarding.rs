@@ -200,7 +200,11 @@ pub(super) fn apply_with_plans(
                         });
                     (Some(args), constructor_splat)
                 }
-                ExprNode::Super { args: Some(args), .. } => (Some(args), false),
+                // `lower::kwsplat` resolves no `super`'s callee.
+                ExprNode::Super { args: Some(args), .. } => {
+                    callee_unresolved = true;
+                    (Some(args), false)
+                }
                 _ => (None, false),
             };
             if let Some(args) = args.filter(|_| !constructor_splat) {
