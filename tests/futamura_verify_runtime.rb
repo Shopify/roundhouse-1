@@ -89,3 +89,9 @@ Futamura.records(:regions, ["x"]) { Region.where(code: "x").preload(place: :coun
   puts "regions=#{places.inspect}"
 end
 puts "fallbacks=#{$fallbacks}"
+
+# The stand-in for the instrumenter offers whatever Rails' own null instrumenter does (newer adapters
+# call `build_handle` on it for the intent log).
+silent = Futamura.singleton_class::Silent
+null = defined?(ActiveSupport::Notifications::NullInstrumenter) ? ActiveSupport::Notifications::NullInstrumenter.public_instance_methods(false) : []
+puts "silent_missing=#{(null - silent.singleton_methods).inspect}"

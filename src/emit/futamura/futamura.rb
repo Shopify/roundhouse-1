@@ -745,10 +745,25 @@ module Futamura
     # loading and transaction events, and the SQL comments QueryLogs adds, which are made before the
     # statement is published. An adapter whose `log` does not read the slot (before Rails 8.2)
     # still publishes the shadow's statements.
+    #
+    # `Silent` is ActiveSupport::Notifications::NullInstrumenter's interface (`instrument`, and
+    # `build_handle` for the intent log, DatabaseStatements#start_intent_log, of newer Rails), which
+    # older ActiveSupport does not have to offer.
     module Silent
+      Handle = Struct.new(:start, :finish)
+      NULL_HANDLE = Handle.new.freeze
+
       def self.instrument(_name, payload = {})
         yield payload if block_given?
       end
+
+      def self.build_handle(_name, _payload)
+        NULL_HANDLE
+      end
+
+      def self.start(_name, _payload); end
+
+      def self.finish(_name, _payload); end
     end
 
     def shadow(model)

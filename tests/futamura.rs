@@ -1873,6 +1873,7 @@ mod verify_runtime {
         // The shadow ran: it did not skip Rails' chain, and it left the instrumenter slot as it found it.
         assert!(!verified.contains("fallbacks=0\n"), "{verified}");
         assert!(verified.contains("slot_restored=true\n"), "{verified}");
+        assert!(verified.contains("silent_missing=[]\n"), "{verified}");
     }
 
     #[test]
