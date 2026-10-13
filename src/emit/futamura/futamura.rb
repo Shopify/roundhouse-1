@@ -1231,7 +1231,8 @@ module Futamura
   #
   # An entry is planned only when every association in its tree is one
   # whose scope can be built once: not `through:`, not a polymorphic
-  # belongs_to, no composite key, no owner-dependent scope, and a scope that
+  # belongs_to, no owner-dependent scope, a composite key (when there is one)
+  # whose two sides are lists of the same length, and a scope that
   # is either absent, defined by Active Storage or Action Text, or certified
   # static by Roundhouse (`static_scopes`, from the app's own association
   # declarations). Any other entry is handed to Rails' Preloader whole
@@ -1350,7 +1351,10 @@ module Futamura
         return "through" if reflection.options[:through]
         return "polymorphic" if reflection.polymorphic?
         return "owner_scope" if reflection.scope && reflection.scope.arity != 0
-        return "composite_key" if reflection.join_primary_key.is_a?(Array) || reflection.join_foreign_key.is_a?(Array)
+        # Preloader::Association reads one key per column on both sides (derive_key); a list against
+        # a scalar, or lists of different lengths, are Rails' to run (and to raise on).
+        primary, foreign = reflection.join_primary_key(reflection.klass), reflection.join_foreign_key
+        return "composite_key" if primary.is_a?(Array) != foreign.is_a?(Array) || (primary.is_a?(Array) && primary.size != foreign.size)
         return "abstract_target" if reflection.klass.abstract_class?
 
         static = reflection.scope.nil? ||
@@ -1427,7 +1431,7 @@ module Futamura
         loaded = if keys.empty?
           []
         else
-          first.scope.where(first.association_key_name => keys).load { |record| loaders.each { |l| l.set_inverse(record) } }.to_a
+          first.scope_for_keys(keys).load { |record| loaders.each { |l| l.set_inverse(record) } }.to_a
         end
         raw = loaded + already.values.flatten
         loaders.each { |loader| loader.load_records(raw) }
@@ -1448,13 +1452,29 @@ module Futamura
         @owner_key_name = @reflection.join_foreign_key
         @query_key = [@klass, @association_key_name, values]
         model = @owners.first.class
-        @convert = @klass.type_for_attribute(@association_key_name).type != model.type_for_attribute(@owner_key_name).type
+        # Preloader::Association#key_conversion_required? compares type_for_attribute of the key names;
+        # for a list of columns that is the default type on both sides, so nothing is converted.
+        @composite = @association_key_name.is_a?(Array)
+        @convert = !@composite && @klass.type_for_attribute(@association_key_name).type != model.type_for_attribute(@owner_key_name).type
+      end
+
+      # Preloader::Association::LoaderQuery#load_records_for_keys: one `where` on the key column, or for
+      # composite keys a hash of column => the set of that column's values (an IN list per column, as
+      # Rails builds it; the owners are matched by the whole key afterwards).
+      def scope_for_keys(keys)
+        return @scope.where(@association_key_name => keys) unless @composite
+
+        constraints = Hash.new { |hash, key| hash[key] = Set.new }
+        keys.each_with_object(constraints) do |values, result|
+          @association_key_name.zip(values) { |name, value| result[name] << value }
+        end
+        @scope.where(constraints)
       end
 
       def owners_by_key
         @owners_by_key ||= @owners.each_with_object({}) do |owner, result|
-          key = convert(owner._read_attribute(@owner_key_name))
-          (result[key] ||= []) << owner if key
+          key = derive_key(owner, @owner_key_name)
+          (result[key] ||= []) << owner if key.is_a?(Array) ? key.all? : key
         end
       end
 
@@ -1467,7 +1487,7 @@ module Futamura
       end
 
       def set_inverse(record)
-        if (owners = owners_by_key[convert(record._read_attribute(@association_key_name))])
+        if (owners = owners_by_key[derive_key(record, @association_key_name)])
           owners.first.association(@reflection.name).set_inverse_instance(record)
         end
       end
@@ -1476,7 +1496,7 @@ module Futamura
         @records_by_owner = {}.compare_by_identity
         @preloaded_records = raw_records.select do |record|
           assigned = false
-          owners_by_key[convert(record._read_attribute(@association_key_name))]&.each do |owner|
+          owners_by_key[derive_key(record, @association_key_name)]&.each do |owner|
             entries = (@records_by_owner[owner] ||= [])
             if @reflection.collection? || entries.empty?
               entries << record
@@ -1502,6 +1522,10 @@ module Futamura
       end
 
       private
+
+      def derive_key(record, key)
+        key.is_a?(Array) ? key.map { |k| convert(record._read_attribute(k)) } : convert(record._read_attribute(key))
+      end
 
       def convert(key)
         @convert ? key.to_s : key
