@@ -991,6 +991,7 @@ pub(super) fn ingest_test_class(
     if teardown_blocks {
         let mut exprs: Vec<Expr> = Vec::new();
         let own = helpers.iter().position(|m| m.name.as_str() == "teardown");
+        let own_def = own.is_some();
         let name_span = match own.map(|i| helpers.remove(i)) {
             Some(m) => {
                 exprs.push(m.body);
@@ -999,6 +1000,27 @@ pub(super) fn ingest_test_class(
             None => Span::synthetic(),
         };
         exprs.extend(teardowns.into_iter().rev());
+        let blocks = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });
+        // With no `def teardown` of its own the method must still reach
+        // TestBase's teardown, which runs `mocha_verify` / the stub-slot
+        // verifies: `begin; blocks; ensure; super(); end`, so `super`
+        // runs even when a block raises. A `def teardown` is the class's
+        // to chain (`analyze::test_teardown` requires it to end in `super`).
+        let body = if own_def {
+            blocks
+        } else {
+            let syn = Span::synthetic();
+            Expr::new(
+                syn,
+                ExprNode::BeginRescue {
+                    body: blocks,
+                    rescues: Vec::new(),
+                    else_branch: None,
+                    ensure: Some(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()), block: None })),
+                    implicit: true,
+                },
+            )
+        };
         helpers.push(MethodDef {
             name_span,
             name: Symbol::from("teardown"),
@@ -1007,7 +1029,7 @@ pub(super) fn ingest_test_class(
             params: Vec::new(),
             unsupported_formals: None,
             has_anonymous_block: false,
-            body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs }),
+            body,
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(name.0.clone()),
