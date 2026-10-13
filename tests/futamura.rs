@@ -689,9 +689,10 @@ mod guards_runtime {
         assert!(normal.contains("scope=[[1, 0], [2, 1], [2, 1]]\nscope_redefined=[[2, 1]]\n"), "{normal}");
         // An association reader: Rails' own, then stubbed on the owner, then redefined by its class.
         assert!(normal.contains("reader=[[1, 0], [nil, 1], [1, 0]]\nreader_overridden=[[nil, 1]]\n"), "{normal}");
-        // Rails reads an association from `klass.unscoped`: redefining it puts a condition in
-        // every read the statement (built from the class's plain relation) does not have.
-        assert!(normal.contains("reader_unscoped_redefined=[[3, 1]]\n"), "{normal}");
+        // Rails reads an association from `klass.unscoped`: a redefinition that adds `where(column: value)`
+        // on request state is bound at run time (the answer follows the value, no fallback), one that
+        // adds an order is Rails' to run, and its condition replaces a default scope's on the same column.
+        assert!(normal.contains("reader_unscoped_redefined=[[3, 0], [4, 0], [3, 0]]\nreader_unscoped_order=[[1, 1]]\nreader_unscoped_default_column=[[2, 0], [1, 0]]\n"), "{normal}");
         // A default scope's `extending` module that defines a name a scope has; a Relation builder
         // patched in by a module prepended to ActiveRecord::Relation.
         assert!(normal.contains("extension_scope=[[1, 1]]"), "{normal}");
