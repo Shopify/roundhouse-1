@@ -505,6 +505,9 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         return;
     }
     let (kind, bare) = details_args.expect("a static field records its type and message");
+    if invalid_type {
+        message.hint = Some(crate::expr::IrHint::InvalidErrorType);
+    }
     let owner = match recv.as_ref().map(|r| &*r.node) {
         Some(ExprNode::Send { recv: owner, .. }) => owner.clone(),
         _ => unreachable!("checked errors reader"),
