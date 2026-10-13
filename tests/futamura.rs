@@ -2013,6 +2013,67 @@ mod verify_runtime {
     }
 }
 
+/// A preload entry whose target has a default scope is planned (the loader's scope is built once
+/// per association otherwise), but the scope is read from the class at every call, as
+/// Preloader::Association#build_scope does (`klass.scope_for_association`): a default scope that
+/// reads state changing between calls (a tenant), returns nil, or adds a `NOT` and an order loads
+/// what Rails loads. An entry Rails keeps (`through:`) is counted by reason under FUTAMURA_STATS.
+/// Real ActiveRecord on SQLite (`tests/futamura_preload_runtime.rb`); under FUTAMURA_VERIFY=1 each
+/// specialized preload is compared to Rails' own Preloader.
+mod preload_runtime {
+    use std::process::Command;
+
+    fn probe(verify: &str, stats: Option<&std::path::Path>) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = root.join("src/emit/futamura/futamura.rb");
+        let probe = root.join("tests/futamura_preload_runtime.rb");
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return None;
+        }
+        let mut run = Command::new("ruby");
+        run.arg(&probe).arg(&runtime).env("FUTAMURA_VERIFY", verify);
+        if let Some(dir) = stats {
+            run.env("FUTAMURA_STATS", dir);
+        }
+        let run = run.output().unwrap();
+        assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        Some(String::from_utf8_lossy(&run.stdout).to_string())
+    }
+
+    #[test]
+    fn a_default_scoped_target_is_planned_and_its_scope_is_read_at_every_call() {
+        let Some(normal) = probe("0", None) else { return };
+        assert!(normal.contains("books[tenant=1]=[\"b0\"] queries=1 tenant_in_sql=true\n"), "{normal}");
+        assert!(normal.contains("books[tenant=2]=[\"b2\"] queries=1 tenant_in_sql=true\n"), "{normal}");
+        assert!(normal.contains("books[tenant=nil]=[\"b0\", \"b1\", \"b2\", \"b3\"] queries=1 tenant_in_sql=false\n"), "{normal}");
+        assert!(normal.contains("nested=[[\"b0\", [\"x\"]]]\n"), "{normal}");
+        // Planned (`true`: the node asks the class again at each call), not handed to Rails whole.
+        assert!(normal.contains("[:books, \"Author\", [[:books, true, []]]]"), "{normal}");
+        assert!(normal.contains("[{books: :tags}, \"Author\", [[:books, true, [:tags]]]]"), "{normal}");
+    }
+
+    #[test]
+    fn the_planned_preloads_agree_with_rails_under_verify() {
+        // Verify raises on a difference, so the probe passing is the check.
+        let Some(verified) = probe("1", None) else { return };
+        assert!(verified.contains("tags=[[1, \"b0\"], [2, nil], [3, nil], [4, nil]]\n"), "{verified}");
+    }
+
+    #[test]
+    fn the_entries_rails_keeps_are_counted_by_reason_only_under_stats() {
+        let dir = std::env::temp_dir().join(format!("futamura-preload-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let counted = probe("0", Some(&dir));
+        let off = probe("0", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (Some(counted), Some(off)) = (counted, off) else { return };
+        assert!(counted.contains("refusals={\"through\" => 1}\n"), "{counted}");
+        assert!(!off.contains("refusals="), "{off}");
+    }
+}
+
 /// `where(column: Klass)`: a Class has no `id`, so the predicate builder builds `column = <bind>`
 /// with it as the value (BasicObjectHandler) and the adapter inlines `Class#to_s` (no prepared
 /// statements) or raises TypeError (prepared statements); a Class that answers `id` is read as the
