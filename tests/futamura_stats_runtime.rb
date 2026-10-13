@@ -29,6 +29,7 @@ Futamura.define(:scoped, "ScopedThing", one: true) { |p| ScopedThing.all.where(c
 Futamura.records(:thing, [nil]) { Thing.where(code: nil).first }
 Futamura.records(:thing, [nil, nil, nil, nil]) { Thing.where(code: nil).first }
 Futamura.records(:thing, [["x"]]) { Thing.where(code: ["x"]).first }
+Futamura.records(:thing, [[]]) { Thing.where(code: []).first }
 Futamura.records(:thing, ["x"]) { Thing.where(code: "x").first }
 Futamura.records(:ranked, ["x"]) { RankedThing.where(code: "x").first }
 Futamura.records(:scoped, ["x"]) { ScopedThing.where(code: "x").first }

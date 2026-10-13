@@ -19,7 +19,7 @@
 # records in the same order, with the same associations loaded.
 module Futamura
   Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
-  Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
+  Compiled = Struct.new(:cache, :preload, :strict_loading, :slot_types, keyword_init: true)
 
   # `StatementCache::Params` that counts the placeholders handed out (`compile` compares the count
   # with the ones the built statement ended up with).
@@ -54,23 +54,56 @@ module Futamura
   # one placeholder (`unsupported_bind?`), so a call carrying it runs Rails' chain.
   UNBINDABLE = {}.freeze
 
+  # An Array bind is the IN list `where(column: [a, b])` builds (PredicateBuilder::ArrayHandler),
+  # whose length is part of the statement: one statement per length, from 1 to MAX_ARRAY values.
+  NO_LISTS = {}.freeze
+  MAX_ARRAY = 8
+
   # The `params` a chain is built with for a call whose values at some positions are nil: `bind` is
-  # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere.
+  # nil there (the chain then has the literal Rails' own would), a placeholder elsewhere. A position
+  # that is a list (`lists`, position => length) gets that many placeholders in an Array, which
+  # `where(column: [...])` turns into the IN list.
   class NilParams
-    def initialize(params, nils, fixed = NO_FIXED)
+    def initialize(params, nils, fixed = NO_FIXED, lists = NO_LISTS)
       @params = params
       @nils = nils
       @fixed = fixed
+      @lists = lists
       @position = -1
     end
 
     def bind
       @position += 1
       return @fixed[@position] if @fixed.key?(@position)
+      return Array.new(@lists[@position]) { @params.bind } if @lists.key?(@position)
 
       @nils.include?(@position) ? nil : @params.bind
     end
   end
+
+  # What stands for one value of an IN list in a statement. Arel's HomogeneousIn serializes its values with
+  # the column's type when it is visited and drops those the type cannot serialize (`casted_values`), which
+  # for an integer column is every placeholder: the statement would lose its slots. `ListSlot` keeps the
+  # slot and the type, so `records` serializes each value the way HomogeneousIn would (`serialize_slots`).
+  class ListSlot < ActiveRecord::StatementCache::Substitute
+    attr_reader :type
+
+    def initialize(type)
+      @type = type
+    end
+  end
+
+  # HomogeneousIn#casted_values for a list built over placeholders only (a statement under construction;
+  # a list with a real value is Rails' own, untouched).
+  module ListSlots
+    def casted_values
+      return super if values.empty? || !values.all?(ActiveRecord::StatementCache::Substitute)
+
+      type = attribute.type_caster
+      values.map { ListSlot.new(type) }
+    end
+  end
+  Arel::Nodes::HomogeneousIn.prepend(ListSlots)
 
   # What a model's default scopes add to a query, as the columns each
   # compares for equality, the values it compared them to, and the modules
@@ -238,6 +271,14 @@ module Futamura
       end
     end
 
+    # Whether a value is a list `where(column: list)` builds an IN list of, one placeholder per
+    # element (statement per length, `MAX_ARRAY`): an Array of scalars. An empty one is `1=0`
+    # (ArrayHandler: `attribute.in([])`), nil is an `IS NULL` branch beside the list, and a Range or
+    # a record is another condition, so those are Rails' to run.
+    def list_bind?(model, value)
+      Array === value && (1..MAX_ARRAY).cover?(value.size) && value.none? { |element| element.nil? || unsupported_bind?(element, model) }
+    end
+
     # Whether `where(column: value)` on `model` builds the same condition for every instance of
     # `klass` whatever the instance is: one `column = <bind>`, the bind a QueryAttribute of the
     # column's type that serializes the value (the same in a StatementCache, which only swaps the
@@ -272,11 +313,46 @@ module Futamura
           nils = nils.dup if nils.equal?(NO_NILS)
           nils << index
           return if nils.size > MAX_NILS
+        elsif list_bind?(model, value)
+          next
         elsif unsupported_bind?(value, model)
           return
         end
       end
       nils.freeze
+    end
+
+    # The lengths of the lists among `binds` by position (`NO_LISTS` for none); `bind_nils` has
+    # checked that each is one `list_bind?` accepts.
+    def bind_lists(binds)
+      lists = NO_LISTS
+      binds.each_with_index do |value, index|
+        next unless Array === value
+
+        lists = {} if lists.equal?(NO_LISTS)
+        lists[index] = value.size
+      end
+      lists.freeze
+    end
+
+    # `values` as the statement's placeholders take them: a list value (`ListSlot`) serialized by the
+    # column's type, as HomogeneousIn#casted_values does when Rails builds the same IN list. Where
+    # Rails would drop a value the type cannot serialize (and so run a list of another length), nil:
+    # the call is Rails' to run.
+    def serialize_slots(types, values)
+      return values unless types
+      return unless types.size == values.size
+
+      values.each_with_index.map do |value, index|
+        type = types[index]
+        next value unless type
+        return unless type.serializable?(value)
+
+        serialized = type.serialize(value)
+        return if serialized.nil?
+
+        serialized
+      end
     end
 
     # `root:` is the `self` of a chain written against an implicit class
@@ -298,6 +374,7 @@ module Futamura
       return fallback.call unless nils
       fixed = fixed_values(binds)
       return fallback.call unless fixed
+      lists = bind_lists(binds)
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
@@ -327,13 +404,16 @@ module Futamura
       end
       return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
-      binds = defaults + (nils.empty? && fixed.empty? ? binds : binds.reject { |value| value.nil? || Fixed === value }) + extra_values
+      binds = binds.reject { |value| value.nil? || Fixed === value } unless nils.empty? && fixed.empty?
+      binds = binds.flat_map { |value| Array === value ? value : [value] } unless lists.empty?
+      binds = defaults + binds + extra_values
       compiled = nil
       records = model.with_connection do |connection|
-        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras]) { compile(statement, connection, columns, extensions, nils, fixed, extras) }
-        compiled && compiled.cache.execute(binds, connection)
+        compiled = @compiled.compute_if_absent([key, connection.prepared_statements, columns, extensions, nils, fixed, extras, lists]) { compile(statement, connection, columns, extensions, nils, fixed, extras, lists) }
+        values = compiled && serialize_slots(compiled.slot_types, binds)
+        values && compiled.cache.execute(values, connection)
       end
-      return fallback.call unless compiled
+      return fallback.call unless compiled && records
 
       if owner
         proxy = owner.association(association)
@@ -353,6 +433,8 @@ module Futamura
       verify(key, result, fallback.call, compiled.preload) if VERIFY
       result
     end
+
+    private :bind_lists, :serialize_slots
 
     private
 
@@ -632,7 +714,7 @@ module Futamura
     # overrides behaves as it does on Rails' `Model.all`; but the statement
     # runs the chain once, so it is refused (`false`) when the chain called
     # such a link at all.
-    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS)
+    def compile(statement, connection, columns, extensions, nils = NO_NILS, fixed = NO_FIXED, extras = NO_EXTRAS, lists = NO_LISTS)
       relation = nil
       overrides = []
       params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
@@ -647,7 +729,7 @@ module Futamura
       cache = begin
         default_scope_evaluations(evaluated) do
           ActiveRecord::StatementCache.create(connection) do |_|
-            chain_params = nils.empty? && fixed.empty? ? params : NilParams.new(params, nils, fixed)
+            chain_params = nils.empty? && fixed.empty? && lists.empty? ? params : NilParams.new(params, nils, fixed, lists)
             relation = if statement.unscoped
               statement.build.call(chain_params)
             else
@@ -675,7 +757,16 @@ module Futamura
       return false unless (relation.extending_values - extensions).all? { |mod| plain_extension?(mod) }
 
       preload = relation.preload_values + relation.includes_values
-      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value)
+      Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value, slot_types: slot_types(cache))
+    end
+
+    # For each placeholder of the statement, the type its IN list serializes it with (`ListSlot`), or
+    # nil; nil for the whole when none is one.
+    def slot_types(cache)
+      bind_map = cache.instance_variable_get(:@bind_map)
+      attributes = bind_map.instance_variable_get(:@bound_attributes)
+      types = bind_map.instance_variable_get(:@indexes).map { |index| (value = attributes[index].value).is_a?(ListSlot) ? value.type : nil }
+      types.any? ? types.freeze : nil
     end
 
     # Runs the block and adds to `evaluated` each model whose default scope Rails built in it
@@ -1034,7 +1125,7 @@ if ENV["FUTAMURA_STATS"].to_s != ""
           return "model_unloaded" unless model.is_a?(Class)
 
           # find_index, not find: the value that is refused is usually an Array.
-          index = binds.index { |value| !value.nil? && !(Futamura::Fixed === value) && Futamura.unsupported_bind?(value, model) }
+          index = binds.index { |value| !value.nil? && !(Futamura::Fixed === value) && !Futamura.list_bind?(model, value) && Futamura.unsupported_bind?(value, model) }
           return "bind_#{kind(binds[index])}" if index
           return "bind_nil_many" if binds.count(&:nil?) > Futamura::MAX_NILS
           return "bind_fixed_not_integer" unless Futamura.fixed_values(binds)
@@ -1085,7 +1176,9 @@ if ENV["FUTAMURA_STATS"].to_s != ""
 
           case value
           when nil then "nil"
-          when Array then "array"
+          # The list bound to a placeholder per element (`list_bind?`) is refused when empty, long, or with an element
+          # that is nil (an `IS NULL` branch) or not a scalar.
+          when Array then "array[#{value.empty? ? "empty" : value.size > Futamura::MAX_ARRAY ? "long" : value.any?(&:nil?) ? "nil" : "element"}]"
           when Range then "range"
           when ActiveRecord::Base then "record"
           when Set then "set"
