@@ -40,10 +40,12 @@ fn locked_external_include_keeps_its_literal_feature_require() {
         .iter()
         .find(|(_, content)| content.contains("class MarkdownRenderer"))
         .expect("emitted MarkdownRenderer");
+    // The autoload shadow guard (`return if … shadowed_file?`) may head the file; the
+    // plugin load still precedes the class definition.
+    let require_at = renderer.1.find("require \"rouge/plugins/redcarpet\"\n");
+    let class_at = renderer.1.find("class MarkdownRenderer");
     assert!(
-        renderer
-            .1
-            .starts_with("require \"rouge/plugins/redcarpet\"\n"),
+        require_at.zip(class_at).is_some_and(|(require, class)| require < class),
         "external plugin load must precede the class definition:\n{}",
         renderer.1
     );
