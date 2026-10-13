@@ -2426,7 +2426,7 @@ fn concurrent_map_types_without_errors() {
     let app = app_from_files(&[
         (
             "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
         ),
         ("db/schema.rb", widget_schema()),
         (
