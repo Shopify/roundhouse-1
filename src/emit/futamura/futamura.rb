@@ -21,6 +21,22 @@ module Futamura
   Statement = Struct.new(:model, :build, :reverse, :one, :unscoped, :owner_keys, :owner_columns, :relation, :via, keyword_init: true)
   Compiled = Struct.new(:cache, :preload, :strict_loading, keyword_init: true)
 
+  # `StatementCache::Params` that counts the placeholders handed out (`compile` compares the count
+  # with the ones the built statement ended up with).
+  class CountingParams
+    attr_reader :count
+
+    def initialize(params)
+      @params = params
+      @count = 0
+    end
+
+    def bind
+      @count += 1
+      @params.bind
+    end
+  end
+
   # What a model's default scopes add to a query, as the columns each
   # compares for equality, the values it compared them to, and the modules
   # they extend the relation with (`extending`).
@@ -418,23 +434,37 @@ module Futamura
     def compile(statement, connection, columns, extensions)
       relation = nil
       overrides = []
+      params = CountingParams.new(ActiveRecord::StatementCache::Params.new)
       # Rails builds the relation over placeholders (StatementCache::Substitute) that stand for
       # values it would read keys, attributes or elements from; a condition that does that (a
       # composite association key, say) raises here, where the chain with real values may not.
-      # Such a chain is Rails' to run, as one it cannot build is.
+      # Such a chain is Rails' to run, as one it cannot build is. What it raises need not be a
+      # StandardError (ActiveSupport::ErrorReporter::UnexpectedError, which a debug-mode error
+      # report raises from a relation extension, is an Exception): any exception but the ones
+      # that end the process is a refusal.
+      evaluated = []
       cache = begin
-        ActiveRecord::StatementCache.create(connection) do |params|
-          relation = if statement.unscoped
-            statement.build.call(params)
-          else
-            base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
-            base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
-            base.scoping { statement.build.call(params) }
+        default_scope_evaluations(evaluated) do
+          ActiveRecord::StatementCache.create(connection) do |_|
+            relation = if statement.unscoped
+              statement.build.call(params)
+            else
+              base = columns.inject(statement.model.send(:relation)) { |scope, column| add_default_condition(scope, column, params) }
+              base = watch_overrides(base.extending(*extensions), extensions, overrides, statement.model) if extensions.any?
+              base.scoping { statement.build.call(params) }
+            end
           end
         end
-      rescue StandardError
+      rescue NoMemoryError, SignalException, SystemExit
+        raise
+      rescue Exception # rubocop:disable Lint/RescueException
         return false
       end
+      # A default scope Rails evaluated while building (the join of an association adds its
+      # target's, Relation#joins -> JoinDependency -> Reflection#join_scope) is Ruby that runs at
+      # query time (it may read request state): its values are in the statement as constants.
+      return false if evaluated.any?
+      return false unless placeholders_bound?(cache, params.count)
       return false if overrides.any?
       return false if relation.eager_loading? || relation.readonly_value
       return false unless builders_are_rails?(statement.model)
@@ -442,6 +472,25 @@ module Futamura
 
       preload = relation.preload_values + relation.includes_values
       Compiled.new(cache: cache, preload: preload, strict_loading: relation.strict_loading_value)
+    end
+
+    # Runs the block and adds to `evaluated` each model whose default scope Rails built in it
+    # (`build_default_scope`, which answers nil for a model without one).
+    def default_scope_evaluations(evaluated, &block)
+      trace = TracePoint.new(:return) { |point| evaluated << point.self if point.return_value }
+      trace.enable(target: ActiveRecord::Scoping::Default::ClassMethods.instance_method(:build_default_scope), target_thread: Thread.current, &block)
+    end
+
+    # Whether the statement kept one placeholder for each `params.bind` the build handed out.
+    # Rails drops a value from the statement when it is not one it can bind: an IN list is built
+    # from the values `type.serialize` returns (HomogeneousIn#casted_values compacts the nils), and
+    # an integer type serializes a placeholder to nil, so the list loses its slots and every
+    # placeholder after it takes the value of the one before (ActiveRecord::StatementCache::BindMap
+    # fills them in order). A statement with fewer or more slots than values would be run with
+    # shifted values, so it is Rails' chain that runs instead.
+    def placeholders_bound?(cache, count)
+      indexes = cache.instance_variable_get(:@bind_map)&.instance_variable_get(:@indexes)
+      indexes.is_a?(Array) && indexes.size == count
     end
 
     # Relation methods a chain's links call. A statement is built once, so a link that something
