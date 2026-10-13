@@ -2,6 +2,10 @@
 
 use roundhouse::analyze::{diagnose, Analyzer, Severity};
 use roundhouse::ingest::ingest_app;
+use roundhouse::project::BuildTarget;
+
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
 
 #[test]
 fn net_http_patch_and_error_classes_check_clean() {
@@ -54,56 +58,37 @@ fn cruby_only_http_header_syntax_error_stays_refused() {
     // Spinel-ledgers via `unavailable_class_module_construct`. Header
     // syntax stays an honest constant gap until Spinel grows it
     // (invariant 6) — Jumpstart Pro still names it in NET_HTTP_ERRORS.
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-net-http-cruby-only-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    for (path, source) in [
-        (
-            "db/schema.rb",
-            "ActiveRecord::Schema[8.1].define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n",
-        ),
-        (
-            "config/routes.rb",
-            "Rails.application.routes.draw do\n  get \"/\", to: \"homes#show\"\nend\n",
-        ),
-        (
-            "app/controllers/application_controller.rb",
-            "class ApplicationController < ActionController::Base\nend\n",
-        ),
-        (
-            "app/clients/application_client.rb",
-            "class ApplicationClient\n  NET_HTTP_ERRORS = [Timeout::Error, Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError]\nend\n",
-        ),
-        (
-            "app/controllers/homes_controller.rb",
-            "class HomesController < ApplicationController\n  def show\n    render plain: ApplicationClient::NET_HTTP_ERRORS.size.to_s\n  end\nend\n",
-        ),
-    ] {
-        let file = root.join(path);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(file, source).unwrap();
-    }
-
-    let mut app = ingest_app(&root).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
-    let diags = diagnose(&app);
-    let errors: Vec<_> = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| d.message.clone())
-        .collect();
+    // The stdlib RBS resolves the constant in analysis, so the refusal is
+    // the target's: the ruby tree loads net/http and carries it, spinel
+    // names it.
+    let app = || {
+        emit_and_run::empty_app()
+            .write(
+                "db/schema.rb",
+                "ActiveRecord::Schema[8.1].define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n",
+            )
+            .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/\", to: \"homes#show\"\nend\n")
+            .write(
+                "app/controllers/application_controller.rb",
+                "class ApplicationController < ActionController::Base\nend\n",
+            )
+            .write(
+                "app/clients/application_client.rb",
+                "class ApplicationClient\n  NET_HTTP_ERRORS = [Timeout::Error, Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError]\nend\n",
+            )
+            .write(
+                "app/controllers/homes_controller.rb",
+                "class HomesController < ApplicationController\n  def show\n    render plain: ApplicationClient::NET_HTTP_ERRORS.size.to_s\n  end\nend\n",
+            )
+    };
+    let (_, errors) = app().emit(BuildTarget::Spinel);
     assert!(
-        !errors.iter().any(|e| e.contains("HTTPBadResponse")),
-        "Net::HTTPBadResponse is registered (main) + Spinel-ledgers:\n{errors:#?}"
+        errors.iter().any(|e| e.contains("Net::HTTPHeaderSyntaxError")),
+        "CRuby-only Net::HTTPHeaderSyntaxError must stay refused on spinel:\n{errors:#?}"
     );
+    let (_, errors) = app().emit(BuildTarget::Ruby);
     assert!(
-        errors.iter().any(|e| e.contains("HTTPHeaderSyntaxError")),
-        "CRuby-only Net::HTTPHeaderSyntaxError must stay refused:\n{errors:#?}"
+        !errors.iter().any(|e| e.contains("HTTPHeaderSyntaxError") || e.contains("HTTPBadResponse")),
+        "the ruby tree carries both net/http constants:\n{errors:#?}"
     );
-    std::fs::remove_dir_all(root).ok();
 }
