@@ -57,9 +57,13 @@ fn array_wrap_folds_one_shape_and_branches_a_union() {
         "the union is folded, not left as a call the ruby emit cannot run; got: {mixed}"
     );
     // An untyped argument may be an Array (Core's SerializationOptions'
-    // `Array.wrap(options[:only])`): one shape would nest it, so the
-    // call stays for the runtime's `Array.wrap`.
-    assert_eq!(emit("Array.wrap(flag)"), "Array.wrap(flag)");
+    // `Array.wrap(options[:only])`): one shape would nest it, so it takes
+    // Rails' three answers as a branch (tests/array_wrap_open_type.rs). This
+    // supersedes the earlier "the call stays for the runtime's `Array.wrap`":
+    // the branch runs on every tree, and differs only for an untyped value
+    // with its own `to_ary`.
+    let open = emit("Array.wrap(flag)");
+    assert!(open.contains("nil?") && open.contains("is_a?(Array)") && !open.contains("Array.wrap"), "an open type branches; got: {open}");
 }
 
 #[test]

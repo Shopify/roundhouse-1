@@ -1341,7 +1341,7 @@ fn validation_rule_to_calls(
                 Expr::new(
                     Span::synthetic(),
                     ExprNode::Send {
-                        recv: None,
+                        recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
                         method: m.clone(),
                         args: Vec::new(),
                         block: None,

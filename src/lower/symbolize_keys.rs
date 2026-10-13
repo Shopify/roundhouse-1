@@ -48,7 +48,7 @@ fn rewrite(expr: &mut Expr) {
 /// (`ActionController::Parameters`), as a Hash, or left untyped
 /// qualifies: one typed otherwise, such as a model's own `params`
 /// String, is some other value.
-fn is_request_params(e: &Expr) -> bool {
+pub(crate) fn is_request_params(e: &Expr) -> bool {
     let typed_as_params = match e.ty.as_ref() {
         None | Some(Ty::Untyped | Ty::Var { .. } | Ty::Hash { .. }) => true,
         Some(Ty::Class { id, .. }) => id.0.as_str() == "ActionController::Parameters",
@@ -72,7 +72,7 @@ fn is_request_params(e: &Expr) -> bool {
 /// receiver (a plain local, an ivar, a helper call that the controller
 /// lowering may still type as a params class) can be a record with its
 /// own `as_json`, which `jsonable` does not model, so it is left alone.
-fn is_open_value(e: &Expr) -> bool {
+pub(crate) fn is_open_value(e: &Expr) -> bool {
     if !matches!(e.ty.as_ref(), None | Some(Ty::Untyped | Ty::Var { .. })) {
         return false;
     }

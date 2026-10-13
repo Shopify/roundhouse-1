@@ -17,7 +17,6 @@ require "stringio"
 require "securerandom"
 require "digest"
 require_relative "action_dispatch/headers"
-require_relative "action_dispatch/request_path_parameters"
 
 module ActionDispatch
   class Request
@@ -26,13 +25,11 @@ module ActionDispatch
     # The body's params alone - see the twin in
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
-    attr_reader :path_parameters
 
     def initialize(env, params = {})
       @env = env
       @params = params
       @request_parameters = {}
-      @path_parameters = RequestPathParameters.new({})
       @session_options = {}
     end
 
@@ -86,17 +83,10 @@ module ActionDispatch
       end
     end
 
-    # Rails' `request.authorization`: the header, or one of the names a
-    # proxy or rewrite moves it to.
-    def authorization
-      get_header("HTTP_AUTHORIZATION") ||
-        get_header("X-HTTP_AUTHORIZATION") ||
-        get_header("X_HTTP_AUTHORIZATION") ||
-        get_header("REDIRECT_X_HTTP_AUTHORIZATION")
-    end
-
     # Rails' path parameters (the route's captures), kept in the env
-    # under its key; writing them drops the merged-parameters cache.
+    # under its key; writing them drops the merged-parameters cache. Keys
+    # are symbolized, as the router's captures are, so a string-keyed
+    # write still reads back by `path_parameters[:name]`.
     PARAMETERS_KEY = "action_dispatch.request.path_parameters"
 
     def path_parameters
@@ -105,7 +95,7 @@ module ActionDispatch
 
     def path_parameters=(parameters)
       delete_header("action_dispatch.request.parameters")
-      set_header(PARAMETERS_KEY, parameters)
+      set_header(PARAMETERS_KEY, parameters.transform_keys(&:to_sym))
     end
 
     # Rails' verb table (ActionDispatch::Request::HTTP_METHODS), which
@@ -134,12 +124,10 @@ module ActionDispatch
       @params[key.to_s]
     end
 
+    # Rails' `request.authorization`: the header, or one of the names a
+    # proxy or rewrite moves it to (the shared Headers table).
     def authorization
       ActionDispatch::Http::Headers.authorization(@env)
-    end
-
-    def path_parameters=(values)
-      @path_parameters = RequestPathParameters.new(values)
     end
 
     def request_method
