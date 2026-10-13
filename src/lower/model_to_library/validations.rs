@@ -220,6 +220,13 @@ fn without_prefix(message: &Expr, prefix: &str) -> Option<Expr> {
             then_branch: without_prefix(then_branch, prefix)?,
             else_branch: without_prefix(else_branch, prefix)?,
         },
+        // The dedupe's `_association_error(message)` answers a copy of its
+        // argument, which the detail keeps as the short message.
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str() == "_association_error" && args.len() == 1 =>
+        {
+            return without_prefix(&args[0], prefix);
+        }
         _ => return None,
     };
     Some(Expr::new(message.span, node))
@@ -577,6 +584,18 @@ pub(crate) fn bind_class_scope(rule: &mut ValidationRule, class: &ClassId) {
 /// `error_tag`) on the trees that record them.
 pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
     tag_error_detail(check, attr, &crate::expr::ErrorDetail::Unknown);
+}
+
+/// `tag_error_attribute` for the association's own `:invalid` error; on a
+/// tree that keeps `error_details` (`details`) it records the type and
+/// pushes the `ErrorDetail` (see [`push_error_details`]).
+pub(crate) fn tag_association_invalid(check: &mut Expr, attr: &Symbol, details: bool) {
+    if details {
+        tag_error_detail(check, attr, &typed_detail("invalid", vec![]));
+        push_error_details(check);
+    } else {
+        tag_error_attribute(check, attr);
+    }
 }
 
 /// `tag_error_attribute`, with the type and options Rails' Error keeps

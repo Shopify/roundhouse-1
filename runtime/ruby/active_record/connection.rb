@@ -1991,6 +1991,9 @@ module ActiveRecord
       previous = @validation_context
       @validation_context = context || (new_record? ? :create : :update)
       @errors = _fresh_errors
+      # A tree that keeps `error_details` (every one but PostgreSQL's)
+      # starts each run with none, as it does the errors.
+      @error_details = [] unless @error_details.nil?
       begin
         ActiveRecord::RuntimeValidations.run(self)
       ensure

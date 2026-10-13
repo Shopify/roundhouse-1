@@ -267,7 +267,11 @@ pub(crate) fn apply(
             for prefix in ["_validate_associated_records_for_", "_autosave_associated_records_for_"] {
                 if let Some(name) = m.name.as_str().strip_prefix(prefix) {
                     let name = Symbol::from(name);
-                    crate::lower::model_to_library::validations::tag_error_attribute(&mut m.body, &name);
+                    // The CRuby tree (PostgreSQL) keeps the detail in the
+                    // runtime's `ErrorAttributes`; every other one carries
+                    // `error_details`.
+                    let details = app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql);
+                    crate::lower::model_to_library::validations::tag_association_invalid(&mut m.body, &name, details);
                 }
             }
             m.enclosing_class = Some(lc.name.0.clone());
