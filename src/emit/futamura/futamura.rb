@@ -1314,11 +1314,13 @@ module Futamura
       end
 
       # A `Model.scoping { }` block changes scope_for_association, and so does a class that
-      # redefines `unscoped` or `scope_for_association` (the plan builds the scope once).
+      # redefines `unscoped` or `scope_for_association` (the plan builds the scope once). A node
+      # that asks the class at every call (`dynamic`) follows a scoping block as Rails does:
+      # scope_for_association is Rails' own.
       def scoped?(nodes)
         nodes.any? do |n|
           klass = n.reflection.klass
-          klass.current_scope || Futamura.send(:scope_redefined?, klass) || scoped?(n.children)
+          (!n.dynamic && klass.current_scope) || Futamura.send(:scope_redefined?, klass) || scoped?(n.children)
         end
       end
 

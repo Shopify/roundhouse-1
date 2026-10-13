@@ -71,6 +71,13 @@ end
   puts "books[tenant=#{tenant.inspect}]=#{loaded.inspect} queries=#{queries.size} tenant_in_sql=#{queries.any? { |q| q.include?("tenant_id") }}"
 end
 
+# Inside `Book.scoping`, the default scope is Rails' (`scope_for_association`) at that call too.
+Current.tenant = 2
+Book.where(title: "b0").scoping do
+  authors, = titles(:authors_books, Author, "ann") { Author.where(name: "ann").preload(:books).to_a }
+  puts "scoping=#{authors.flat_map { |a| a.books.map(&:title) }.inspect}"
+end
+
 # A nested entry whose first level has the default scope.
 Current.tenant = 1
 authors, = titles(:authors_nested, Author, "ann") { Author.where(name: "ann").preload(books: :tags).to_a }

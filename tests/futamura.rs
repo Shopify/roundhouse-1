@@ -2048,6 +2048,8 @@ mod preload_runtime {
         assert!(normal.contains("books[tenant=1]=[\"b0\"] queries=1 tenant_in_sql=true\n"), "{normal}");
         assert!(normal.contains("books[tenant=2]=[\"b2\"] queries=1 tenant_in_sql=true\n"), "{normal}");
         assert!(normal.contains("books[tenant=nil]=[\"b0\", \"b1\", \"b2\", \"b3\"] queries=1 tenant_in_sql=false\n"), "{normal}");
+        // A `scoping` block does not change what the Preloader builds from the class's default scope.
+        assert!(normal.contains("scoping=[\"b2\"]\n"), "{normal}");
         assert!(normal.contains("nested=[[\"b0\", [\"x\"]]]\n"), "{normal}");
         // Planned (`true`: the node asks the class again at each call), not handed to Rails whole.
         assert!(normal.contains("[:books, \"Author\", [[:books, true, []]]]"), "{normal}");
