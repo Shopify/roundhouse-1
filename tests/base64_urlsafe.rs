@@ -116,9 +116,10 @@ print bad.empty? ? "OK" : bad.join("; ")
 /// `strict_decode64` (and `decode64`/`urlsafe_decode64`, which end in it)
 /// against CRuby: every byte value at each padding form, unpadded input,
 /// every alphabet character and a wrapped payload, plus the shim's own
-/// rule that any byte outside the alphabet — padding, newlines, the
-/// URL-safe pair, non-ASCII — is skipped. CRuby's side is `pack("m0")`
-/// and `unpack1("m0")`/`unpack1("m")`, what its Base64 calls: once the
+/// rule that the lax `decode64` skips any byte outside the alphabet —
+/// newlines, the URL-safe pair, non-ASCII — and stops at the first "=",
+/// where `strict_decode64` raises (see the whole-surface test). CRuby's
+/// side is `pack("m0")` and `unpack1("m0")`/`unpack1("m")`, what its Base64 calls: once the
 /// shim is loaded, `::Base64` is the shim, since it reopens that module.
 /// The object count pins how it reads: by byte, not by comparing a
 /// one-character String against each alphabet entry, which on CRuby is
@@ -148,16 +149,17 @@ bad << "alphabet" if Base64.strict_decode64(alphabet).b != alphabet.unpack1("m0"
 wrapped = [all].pack("m")
 bad << "wrapped at 60 columns" if Base64.decode64(wrapped).b != wrapped.unpack1("m")
 # "ABCDEF" with bytes outside the alphabet spliced in, the neighbours of
-# each range among them: all skipped.
+# each range among them: the lax decode skips them, as `unpack1("m")` does
+# (a "=" ends the data there; CRuby answers "A" for the "=" case).
 ["QUJD\nREVG", "QU=JDRE==VG", "QUJ-DR_EVG", "QUJDéREVG", "QUJD\xffREVG", "QU JD\tREVG".b,
  "Q@U[J`D{R:EVG"].each do |s|
-  bad << "stray in #{s.inspect}" if Base64.strict_decode64(s).b != "ABCDEF".b
+  bad << "stray in #{s.inspect}" if Base64.decode64(s).b != s.unpack1("m").b
 end
 # And every one of the 192 byte values outside the alphabet, alone.
 (0..255).each do |b|
-  next if alphabet.bytes.include?(b)
+  next if alphabet.bytes.include?(b) || b == 61  # "=" ends the data, covered above
   s = "QUJD".b + b.chr.b + "REVG".b
-  bad << "byte #{b} not skipped" if Base64.strict_decode64(s).b != "ABCDEF".b
+  bad << "byte #{b} not skipped" if Base64.decode64(s).b != "ABCDEF".b
 end
 enc = ["x" * 3000].pack("m0")
 Base64.strict_decode64(enc)

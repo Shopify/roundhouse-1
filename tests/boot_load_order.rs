@@ -107,6 +107,9 @@ fn the_test_helper_activates_the_locked_bundled_gems_before_its_own_requires() {
             "class CGI\n  VERSION = \"0.4.2\"\n  def self.parse(query)\n    query.split(\"&\").each_with_object({}) { |pair, out| key, value = pair.split(\"=\", 2); (out[key] ||= []) << value }\n  end\nend\n",
         )],
     );
+    // The locked dalli, which boot.rb requires: the locked-external wiring
+    // requires a gem the app's code names where its name is its namespace.
+    gem("dalli", "3.2.9", &[("dalli.rb", "module Dalli\n  VERSION = \"3.2.9\"\nend\n")]);
     // Above any installed mocha, so the helper's unpinned require finds it.
     gem(
         "mocha",

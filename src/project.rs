@@ -12626,13 +12626,12 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     }
     // Spinel supplies the other bundled and ruby-family class values,
     // but recognizes GeneratorError only as a literal rescue name, and
-    // its `packages/net` stops short of net/protocol's `HTTPBadResponse`.
-    if target == "spinel" {
-        return if matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse") {
-            Some("bundled_constant")
-        } else {
-            None
-        };
+    // its `packages/net` stops short of net/protocol's `HTTPBadResponse`
+    // and net/http's `HTTPHeaderSyntaxError` (a CRuby-only constant gap
+    // until Spinel grows it). The names only the CRuby tree supplies
+    // (the SQLite3 adapter's) fall through to their refusal below.
+    if target == "spinel" && matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError") {
+        return Some("bundled_constant");
     }
     if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
         // JRuby, Spinel and Roda ship the same runtime files as CRuby.
@@ -12662,7 +12661,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         "URI::HTTP" | "URI::HTTPS" | "URI::Error" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
         | "SocketError"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
-        | "Net::HTTPSuccess" | "Net::HTTPBadResponse" | "Zlib::DataError" | "OpenSSL::Random"
+        | "Net::HTTPSuccess" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError" | "Zlib::DataError" | "OpenSSL::Random"
         | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
         | "Struct" | "Mutex" | "Fiber" | "Process" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
