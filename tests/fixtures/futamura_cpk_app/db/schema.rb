@@ -15,4 +15,10 @@ ActiveRecord::Schema.define do
     t.integer "shop_id"
     t.integer "region_id"
   end
+  create_table "crates", force: :cascade do |t|
+    t.integer "order_id"
+    t.integer "shop_id"
+    t.integer "region_id"
+    t.string "sku"
+  end
 end

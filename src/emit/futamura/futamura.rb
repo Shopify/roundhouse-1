@@ -380,6 +380,13 @@ module Futamura
       return fallback.call if root && !root.equal?(model)
       return fallback.call if statement.via && redefined_class_method(model, statement.via)
       return fallback.call if owner && !owner_chain?(owner, association, statement, model)
+      # CollectionAssociation#scope is `none` while the owner is new and its key not set
+      # (`null_scope?`): the chain loads nothing, whatever it adds.
+      if owner && owner.new_record? && !owner.association(association).send(:foreign_key_present?)
+        result = statement.one ? nil : []
+        verify(key, result, fallback.call, []) if VERIFY
+        return result
+      end
       extras = owner ? owner_key_extras(owner, association, statement) : NO_EXTRAS
       extra_values = extras.map { |_, column| owner._read_attribute(column) }
       return fallback.call if extra_values.any? { |value| unsupported_bind?(value, model) }
@@ -394,16 +401,16 @@ module Futamura
         columns, defaults, extensions, preloads = statement.unscoped ? NO_DEFAULTS : default_binds(model)
       end
       return fallback.call unless columns
-      # Merging the association's relation into the model's default scope
-      # (Association#scope) replaces a default equality condition on a column
-      # the association constrains; the chain built here keeps both.
-      return fallback.call if owner && (columns.map { |column| Array(column).first } & owned).any?
       if owner && redefined?(model, :unscoped)
         merged = merge_unscoped(model, columns, defaults)
         return fallback.call unless merged
         columns, defaults = merged
-        return fallback.call if (columns.map { |column| Array(column).first } & owned).any?
       end
+      # Merging the association's relation into the model's default scope (Association#scope:
+      # `target_scope.merge!(association_scope)`, WhereClause#merge: `except_predicates(other.extract_attributes)`)
+      # drops every default condition on a column the association constrains; the one the association
+      # has stays. The chain is built over the remaining ones.
+      columns, defaults = without_columns(columns, defaults, owned) if owner && (columns.map { |column| Array(column).first } & owned).any?
       return fallback.call if defaults.any? { |value| unsupported_bind?(value, model) }
 
       binds = binds.reject { |value| value.nil? || Fixed === value } unless nils.empty? && fixed.empty?
@@ -458,7 +465,9 @@ module Futamura
       return :scope_redefined if redefined?(model, :scope_for_association) || (statement.unscoped && redefined?(model, :unscoped))
 
       proxy = owner.association(association)
-      return :owner_new_record if owner.new_record?
+      # A terminal on the proxy of a new owner reads its target (`find_from_target?`); links after the
+      # reader query when the owner's key is set, and load nothing when it is not (`records`).
+      return :owner_new_record if owner.new_record? && !statement.relation
       # A terminal on the proxy itself reads the target; links after the reader query.
       unless statement.relation
         return :target_loaded if proxy.loaded?
@@ -543,7 +552,12 @@ module Futamura
       return unless shape
 
       unscoped_columns, unscoped_values = shape
-      names = unscoped_columns.map { |column| Array(column).first }
+      kept_columns, kept_values = without_columns(columns, defaults, unscoped_columns.map { |column| Array(column).first })
+      [(kept_columns + unscoped_columns).freeze, kept_values + unscoped_values]
+    end
+
+    # `columns` and `defaults` without the conditions on the columns `names` (by name).
+    def without_columns(columns, defaults, names)
       kept_columns = []
       kept_values = []
       offset = 0
@@ -556,7 +570,7 @@ module Futamura
         kept_columns << column
         kept_values.concat(values)
       end
-      [(kept_columns + unscoped_columns).freeze, kept_values + unscoped_values]
+      [kept_columns.freeze, kept_values]
     end
 
     # What `Model.all`'s default scopes add to a chain right now, for a

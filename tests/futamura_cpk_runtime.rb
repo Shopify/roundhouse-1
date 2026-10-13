@@ -12,7 +12,7 @@ ENV["FUTAMURA_STATS"] = Dir.mktmpdir
 ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
 ActiveRecord::Schema.verbose = false
 load File.join(dir, "db/schema.rb")
-%w[application_record order line parcel].each { |m| load File.join(dir, "app/models/#{m}.rb") }
+%w[application_record order line parcel crate].each { |m| load File.join(dir, "app/models/#{m}.rb") }
 module Rails
   Config = Struct.new(:unused) { def to_prepare(&block) = block.call }
   def self.application = Struct.new(:config).new(Config.new)
@@ -25,6 +25,7 @@ load File.join(dir, "app/services/finder.rb")
 # into one equality per pair, association_scope.rb `last_chain_scope`).
 Order._reflect_on_association(:lines).options.merge!(primary_key: %w[region_id id shop_id], foreign_key: %w[region_id order_id shop_id])
 Order._reflect_on_association(:gifts).options.merge!(primary_key: %w[region_id id shop_id], foreign_key: %w[region_id order_id shop_id])
+Order._reflect_on_association(:crates).options.merge!(primary_key: %w[region_id id shop_id], foreign_key: %w[region_id order_id shop_id])
 
 order = Order.create!(shop_id: 1, region_id: 9)
 other = Order.create!(shop_id: 1, region_id: 8)
@@ -66,3 +67,20 @@ show("scoped_assoc_reader_ids") { Line.where(sku: "a").scoping { Finder.by_sku("
 bare = Order.create!(shop_id: 1, region_id: nil)
 Line.unscoped { Line.create!(order_id: bare.id, shop_id: 1, region_id: nil, sku: "d") }
 show("lines_nil_region") { Finder.lines(bare) }
+
+# A default scope's equality on a column the composite key also names (`shop_id`) is replaced by the association's own
+# (Association#scope merges the association scope into the default scope: WhereClause#merge drops the default conditions
+# on the columns the association constrains), so an order of another shop reads its own crates.
+shop_two = Order.create!(shop_id: 2, region_id: 9)
+Crate.unscoped do
+  [[order, 1, 9, "a"], [order, 1, 9, "hidden"], [order, 2, 9, "other shop"], [shop_two, 2, 9, "b"], [shop_two, 2, 9, "hidden"], [shop_two, 1, 9, "wrong shop"]].each do |o, shop, region, sku|
+    Crate.create!(order_id: o.id, shop_id: shop, region_id: region, sku: sku)
+  end
+end
+show("crates") { Finder.crates(order).map(&:sku) }
+show("crates_other_shop") { Finder.crates(shop_two).map(&:sku) }
+# An owner that is new: no query while its key is not set (CollectionAssociation#null_scope? is `none`), the key's rows when it is.
+show("lines_new_owner") { Finder.lines(Order.new(shop_id: 1, region_id: 9)) }
+Line.unscoped { Line.create!(order_id: 500, shop_id: 1, region_id: 9, sku: "orphan") }
+show("lines_keyed_new_owner") { Finder.lines(Order.new(id: 500, shop_id: 1, region_id: 9)) }
+show("parcels_new_owner") { Finder.parcels(Order.new(shop_id: 1, region_id: 9)) }

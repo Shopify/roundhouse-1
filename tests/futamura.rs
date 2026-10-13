@@ -1645,12 +1645,13 @@ mod association_scopes_and_conditions {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
-        for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment"] {
+        for name in ["not_blank", "pinned", "pinned_ordered", "loaded_chain", "unsaved_chain", "first_pinned", "newest", "notes", "same_column", "fragment", "kinds", "kinds_not", "not_fragment", "remarks"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
-        for name in ["remarks", "loaded", "unsaved"] {
+        for name in ["loaded", "unsaved"] {
             assert!(fell_back(name), "{name}\n{normal}");
         }
+        // The association's own condition on a column replaces the default scope's (WhereClause#merge).
         assert!(normal.contains("remarks=[1] "), "{normal}");
         // The reader's own target is not consulted once a link follows it.
         assert!(normal.contains("loaded_chain=[1, 3] ") && normal.contains("unsaved_chain=[1, 3] "), "{normal}");
@@ -1826,7 +1827,7 @@ mod composite_keys_and_scoping_blocks {
         assert_eq!(results(&verified), results(&normal), "{verified}\n{normal}");
         let specialized = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=1 fall=0"));
         let fell_back = |name: &str| normal.lines().any(|l| l.starts_with(&format!("{name}=")) && l.ends_with(" spec=0 fall=1"));
-        for name in ["lines", "lines_other", "gifts", "parcels", "by_sku", "of_order", "scoped_sku", "scoped_sku_other", "scoped_unscoped", "scoped_in", "scoped_assoc_reader_ids"] {
+        for name in ["lines", "lines_other", "gifts", "parcels", "by_sku", "of_order", "scoped_sku", "scoped_sku_other", "scoped_unscoped", "scoped_in", "scoped_assoc_reader_ids", "crates", "crates_other_shop", "lines_new_owner", "lines_keyed_new_owner", "parcels_new_owner"] {
             assert!(specialized(name), "{name}\n{normal}");
         }
         // A scope that orders is not equality conditions alone; an association reader does not
@@ -1837,6 +1838,11 @@ mod composite_keys_and_scoping_blocks {
         // The other key columns are conditions: the rows of another region or shop are not the order's.
         assert!(normal.contains("lines=[1, 2] ") && normal.contains("lines_other=[5] ") && normal.contains("gifts=[2] "), "{normal}");
         assert!(normal.contains("scoped_sku=[1] ") && normal.contains("scoped_unscoped=[4] "), "{normal}");
+        // A default scope's equality on a column the composite key names too is replaced by the association's own
+        // (WhereClause#merge): an order of shop 2 reads its shop-2 crates, not the default scope's shop 1.
+        assert!(normal.contains("crates=[\"a\"] ") && normal.contains("crates_other_shop=[\"b\"] "), "{normal}");
+        // A new owner without its key loads nothing (CollectionAssociation#null_scope?); with its key set it queries.
+        assert!(normal.contains("lines_new_owner=[] ") && normal.contains("lines_keyed_new_owner=[10] ") && normal.contains("parcels_new_owner=[] "), "{normal}");
         let _ = fs::remove_dir_all(&out);
     }
 }

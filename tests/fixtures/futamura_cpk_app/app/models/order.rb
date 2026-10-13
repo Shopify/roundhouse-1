@@ -4,4 +4,5 @@ class Order < ApplicationRecord
   has_many :lines, primary_key: :id, foreign_key: :order_id
   has_many :gifts, -> { where(gift: true).order(:id) }, class_name: "Line", primary_key: :id, foreign_key: :order_id
   has_many :parcels
+  has_many :crates, primary_key: :id, foreign_key: :order_id
 end
