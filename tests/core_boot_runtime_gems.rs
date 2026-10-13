@@ -243,7 +243,9 @@ fn a_git_dependency_of_a_needed_gem_is_activated_before_it() {
     let git_gems = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
     assert!(git_gems.contains("[\"grpc\", \"grpc-d5dd2a32be6b\", \"https://github.com/Shopify/grpc.git\""), "{git_gems}");
     let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
-    assert!(gemfile.contains("gem \"redis\"\n"), "{gemfile}");
+    // The locked-external wiring pins the declaration to the locked version.
+    assert!(gemfile.contains("gem \"redis\", \"= 5.4.0\"\n"), "{gemfile}");
+    assert_eq!(gemfile.matches("gem \"redis\"").count(), 1, "{gemfile}");
 }
 
 /// Essentials' boot path through Rack, Faraday, Trilogy, Sabertooth,
