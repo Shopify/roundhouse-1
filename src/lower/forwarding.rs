@@ -161,7 +161,10 @@ pub(super) fn apply_with_plans(
             // decides there whether the Hash stays positional, expands
             // to keywords or is restored as `**`. Only a call it cannot
             // resolve keeps the source's splat in emitted Ruby: a dynamic
-            // `send`, or a receiver with no class type.
+            // `send`, a receiver with no class type, or a receiverless
+            // call (whose callee may live in a `Class.new` body no class
+            // view holds; `kwsplat::rewrite_self_sends` clears the mark
+            // when it finds the callee takes no keywords).
             let mut callee_unresolved = false;
             let (args, constructor_splat) = match &mut *e.node {
                 ExprNode::Send {
@@ -170,7 +173,7 @@ pub(super) fn apply_with_plans(
                     callee_unresolved = matches!(
                         method.as_str(),
                         "send" | "public_send" | "__send__"
-                    ) || recv.as_ref().is_some_and(|recv| {
+                    ) || recv.as_ref().is_none_or(|recv| {
                         !matches!(recv.ty, Some(crate::ty::Ty::Class { .. }))
                     });
                     let constructor_splat = method.as_str() == "new"
