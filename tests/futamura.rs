@@ -2142,3 +2142,65 @@ mod loaded_targets {
         let _ = fs::remove_dir_all(&out);
     }
 }
+
+/// `first`/`last`/`take` on a collection reader `load_target` when `find_from_target?` holds
+/// (collection_association.rb: a loaded or new-owner proxy, unsaved or changed target records, an
+/// owner that is `strict_loading_all?`, a reflection with `strict_loading: true`): the read then
+/// raises `StrictLoadingViolationError` (Association#find_target) or answers from the target it
+/// sets. The specialized terminal falls back to Rails' read in each of those. The probe
+/// (`tests/futamura_strict_runtime.rb`) runs every terminal the specializer models in every
+/// strict-loading mode and target state on real ActiveRecord (SQLite), through the emitted Finder
+/// and through Rails' own reader on a fresh owner: results or error, loaded flag, target, record
+/// strictness and the number of queries must be the same.
+mod strict_loading_terminals {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futamura_load_app")
+    }
+
+    #[test]
+    fn terminals_on_a_reader_read_as_rails_does_under_every_strict_loading_mode() {
+        let have = Command::new("ruby").args(["-e", "require 'active_record'; require 'sqlite3'; require 'concurrent'"]).output();
+        if !have.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: ruby with activerecord and sqlite3 is not available");
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("roundhouse-futamura-strict-run-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(["--target", "futamura", "-o"]).arg(&out).arg(fixture()).output().unwrap();
+        assert!(emit.status.success(), "{}", String::from_utf8_lossy(&emit.stderr));
+        let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/futamura_strict_runtime.rb");
+        let output = |verify: &str| {
+            let run = Command::new("ruby").arg(&probe).arg(&out).env("FUTAMURA_VERIFY", verify).output().unwrap();
+            assert!(run.status.success(), "verify={verify}\n{}\n{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            String::from_utf8_lossy(&run.stdout).to_string()
+        };
+        let verified = output("1");
+        let normal = output("0");
+        for run in [&verified, &normal] {
+            assert!(!run.contains("same=false"), "{run}");
+            assert_eq!(run.lines().count(), 202, "{run}");
+        }
+        let state = |s: &str| s.lines().map(|l| l.split(" spec=").next().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+        assert_eq!(state(&verified), state(&normal), "{verified}\n{normal}");
+        let raised = "[[\"ActiveRecord::StrictLoadingViolationError\"], false, nil, nil] queries=0 spec=0";
+        // An unloaded target is a query, specialized, when nothing makes the proxy read its target.
+        assert!(normal.contains("first/plain/unloaded same=true [[1], false, nil, [false]] queries=1 spec=1"), "{normal}");
+        assert!(normal.contains("first/strict_n_plus_one/unloaded same=true [[1], false, nil, [true]] queries=1 spec=1"), "{normal}");
+        // `strict_loading_all?` owners and `strict_loading: true` reflections load the target: Rails' read.
+        for terminal in ["first", "last", "take", "first_n", "last_n"] {
+            assert!(normal.contains(&format!("{terminal}/strict_all/unloaded same=true [[\"ActiveRecord::StrictLoadingViolationError\"], false, nil, nil] queries=0 spec=0")), "{terminal}\n{normal}");
+        }
+        for terminal in ["reflection_first", "reflection_last", "reflection_take"] {
+            assert!(normal.contains(&format!("{terminal}/plain/unloaded same=true {raised}")), "{terminal}\n{normal}");
+        }
+        assert!(normal.contains(&format!("first/by_default same=true {raised}")), "{normal}");
+        // A link after the reader is a Relation query, not a read of the target.
+        assert!(normal.contains("find_by/strict_all/unloaded same=true [[2], false, nil, [false]] queries=1 spec=1"), "{normal}");
+        assert!(normal.contains("linked_first/strict_all/unloaded same=true [[1], false, nil, [false]] queries=1 spec=1"), "{normal}");
+        let _ = fs::remove_dir_all(&out);
+    }
+}

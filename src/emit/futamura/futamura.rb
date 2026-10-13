@@ -675,6 +675,11 @@ module Futamura
       unless statement.relation
         return :target_loaded if proxy.loaded?
         return :target_unsaved if proxy.target.any?
+        # `first`/`last`/`take` on the proxy `load_target` when `find_from_target?` holds (an owner
+        # that is strict_loading_all?, a reflection with `strict_loading: true`; collection_proxy.rb
+        # `find_nth_with_limit`, `last`, `take`): the read raises (`find_target`) or answers from the
+        # target it sets, which Rails' own read does.
+        return :find_from_target if proxy.find_from_target?
         # `load_target` raises on a strict-loading owner (Association#find_target); Rails' read does.
         return :strict_loading if statement.loads && proxy.send(:violates_strict_loading?)
       end
