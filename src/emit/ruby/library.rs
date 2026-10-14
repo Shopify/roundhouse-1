@@ -9940,6 +9940,29 @@ pub(super) fn emit_library_class_decl_with_synthesized(
     })
 }
 
+/// `emit_library_class_decl_with_synthesized` for a class that nests
+/// other emitted classes (`kids`, all its descendants): each is written
+/// inside it where the source has it, as `emit_library_classes` does for
+/// an app file, so a body call below a nested class (`query(Query)` under
+/// `class Query`) runs after it. Core's test-file schemas
+/// (`CartPlatformInputBuilderTestSchema`) wrote the call first, in a
+/// reopening above the nested class: "undefined method 'graphql_name' for
+/// class Query".
+pub(super) fn emit_library_class_decl_with_nested(
+    lc: &LibraryClass,
+    kids: &[&LibraryClass],
+    app: &App,
+    out_path: PathBuf,
+    synthesized_siblings: &[(String, String)],
+) -> EmittedFile {
+    let nested = nested_blocks(lc, kids, app, &out_path, None);
+    let placing = NestedPlacement::install(lc, &nested);
+    let mut file = emit_library_class_decl_with_synthesized(lc, app, out_path, synthesized_siblings);
+    let unplaced = placing.finish();
+    splice_nested(std::slice::from_mut(&mut file), lc, &nested, &unplaced);
+    file
+}
+
 /// Render an indented method with named visibility directives that cannot leak
 /// to neighboring definitions. Explicitly public constructor/copy hooks need a
 /// directive too, because Ruby makes those instance methods private by default.
@@ -10836,6 +10859,24 @@ fn emit_library_class_decl_inner(
             })
             .collect()
     };
+    // An include whose `self.included(base)` hook calls class methods of
+    // this class runs after them, as in the source (see
+    // `hooked_include_position`); the rest open the body as before. An
+    // include the source has after a positioned one is written no
+    // earlier than it, so the includes keep their source order, and with
+    // it the class's ancestors.
+    let mut positioned: Vec<(usize, &ClassId)> = Vec::new();
+    for inc in &lc.includes {
+        let floor = positioned.last().map(|(at, _)| *at);
+        if let Some(at) = hooked_include_position(lc, inc, app).max(floor) {
+            positioned.push((at, inc));
+        }
+    }
+    // Includes the source has below a callback registration of the
+    // body's own (`late_includes`): written where the body's statements
+    // reach them (`flush_late`), not at its top, so an include's carried
+    // callbacks register after the body's above it, as Ruby runs them.
+    let late = std::cell::RefCell::new(if railtie { Vec::new() } else { late_includes(lc, app, &positioned) });
     // A replayed `extend M` of the app's own module the source writes
     // above an include goes right before that include
     // (`extends_before_includes`), and leaves the replayed calls.
@@ -10846,7 +10887,7 @@ fn emit_library_class_decl_inner(
         .copied()
         .chain(lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).filter(|_| !ordered_state))
         .collect();
-    let extends_before = if railtie { Vec::new() } else { extends_before_includes(lc, app, &hoistable) };
+    let extends_before = if railtie { Vec::new() } else { extends_before_includes(lc, app, &hoistable, &late.borrow()) };
     let replayed: Vec<&Expr> = replayed
         .into_iter()
         .filter(|c| !extends_before.iter().any(|(_, e)| std::ptr::eq(*e, *c)))
@@ -10951,24 +10992,6 @@ fn emit_library_class_decl_inner(
         })
         .collect();
     let instance_form = extend_self_instance_defs(lc, app, &replayed);
-    // An include whose `self.included(base)` hook calls class methods of
-    // this class runs after them, as in the source (see
-    // `hooked_include_position`); the rest open the body as before. An
-    // include the source has after a positioned one is written no
-    // earlier than it, so the includes keep their source order, and with
-    // it the class's ancestors.
-    let mut positioned: Vec<(usize, &ClassId)> = Vec::new();
-    for inc in &lc.includes {
-        let floor = positioned.last().map(|(at, _)| *at);
-        if let Some(at) = hooked_include_position(lc, inc, app).max(floor) {
-            positioned.push((at, inc));
-        }
-    }
-    // Includes the source has below a callback registration of the
-    // body's own (`late_includes`): written where the body's statements
-    // reach them (`flush_late`), not at its top, so an include's carried
-    // callbacks register after the body's above it, as Ruby runs them.
-    let late = std::cell::RefCell::new(if railtie { Vec::new() } else { late_includes(lc, app, &positioned) });
     let flush_late = |s: &mut String, upto: Option<Span>| {
         let mut late = late.borrow_mut();
         let due = late
@@ -11974,6 +11997,7 @@ fn extends_before_includes<'a, 'e>(
     lc: &'a LibraryClass,
     app: &App,
     replayed: &[&'e Expr],
+    late: &[(Span, &ClassId)],
 ) -> Vec<(&'a ClassId, &'e Expr)> {
     let mut by_file: BTreeMap<u32, Vec<(u32, &'a ClassId)>> = BTreeMap::new();
     let mut out = Vec::new();
@@ -12008,7 +12032,12 @@ fn extends_before_includes<'a, 'e>(
             placed
         });
         let next = includes.iter().filter(|(at, _)| *at > call.span.start).min_by_key(|(at, _)| *at);
-        if let Some((_, inc)) = next {
+        // A late include is written among the replayed calls in source
+        // order (`late_includes`), so the extend stays among them at its
+        // own line: written right before the include it would run after
+        // the class-body calls between the two (Core's `LineItem`: `extend
+        // GraphApi::Model`, then `self.model = ...`, then an include).
+        if let Some((_, inc)) = next.filter(|(_, inc)| !late.iter().any(|(_, l)| l == inc)) {
             out.push((*inc, *call));
         }
     }
