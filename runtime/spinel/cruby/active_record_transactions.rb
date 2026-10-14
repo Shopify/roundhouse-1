@@ -1236,8 +1236,61 @@ module ActiveRecord
       end
   end
 
+  # no_touching.rb (activerecord 8.2.0.alpha): `Model.no_touching { }` makes
+  # `touch` a no-op for the model and its subclasses inside the block,
+  # per execution context. The class stack lives in
+  # ActiveSupport::IsolatedExecutionState. `touch_written` is this
+  # runtime's write-the-row form of `touch` and is held back the same way.
+  module NoTouching
+    module ClassMethods
+      def no_touching(&block)
+        NoTouching.apply_to(self, &block)
+      end
+    end
+
+    class << self
+      def apply_to(klass)
+        klasses.push(klass)
+        yield
+      ensure
+        klasses.pop
+      end
+
+      def applied_to?(klass)
+        klasses.any? { |k| k >= klass }
+      end
+
+      private
+        def klasses
+          if defined?(ActiveSupport::IsolatedExecutionState) && ActiveSupport::IsolatedExecutionState.respond_to?(:[])
+            ActiveSupport::IsolatedExecutionState[:active_record_no_touching_classes] ||= []
+          else
+            Thread.current[:active_record_no_touching_classes] ||= []
+          end
+        end
+    end
+
+    def no_touching(&block)
+      NoTouching.apply_to(self.class, &block)
+    end
+
+    def touch(*, **)
+      super unless no_touching?
+    end
+
+    def touch_written
+      super unless no_touching?
+    end
+
+    def no_touching?
+      NoTouching.applied_to?(self.class)
+    end
+  end
+
   class Base
     prepend Transactions
+    prepend NoTouching
+    extend NoTouching::ClassMethods
 
     class << self
       def run_commit_callbacks_on_first_saved_instances_in_transaction

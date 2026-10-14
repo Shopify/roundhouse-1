@@ -73,6 +73,11 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         }
         names.extend(body_statements(m).filter_map(|e| serialized_column(e, table)).map(|c| c.as_str().to_string()));
         names.extend(body_statements(m).filter_map(|e| decorated_columns(e, table)).flatten().map(|c| c.as_str().to_string()));
+        // An app macro reaching the typed_store gem's `typed_store` (the
+        // model's own direct `typed_store` is lowered statically).
+        for (_, call_names) in macro_calls(m, app, "typed_store", false) {
+            names.extend(call_names.into_iter().take(1));
+        }
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
@@ -80,6 +85,14 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
     }
     for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
         names.extend(lc.unknown_calls.iter().filter_map(|e| sti_serialized_column(e, table)).map(|c| c.as_str().to_string()));
+        // The typed_store gem's `typed_store :col`, run in the subclass (its
+        // body, or a Concern's `included do`), or reached through an app macro
+        // (Core's `redactable_typed_store`): it calls `decorate_attributes`
+        // for the column (activerecord-typedstore extension.rb).
+        let side = ClassSide::of_sti_subclass(lc, model, app);
+        for (_, call_names) in calls_reaching(&side, lc.unknown_calls.iter(), "typed_store", true) {
+            names.extend(call_names.into_iter().take(1));
+        }
     }
     names.extend(defaulted_attributes(model, app).iter().map(|c| c.as_str().to_string()));
     table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())).map(|c| c.name.clone()).collect()

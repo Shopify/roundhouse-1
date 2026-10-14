@@ -4260,6 +4260,30 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
             || node.as_false_node().is_some()
             || node.as_nil_node().is_some()
     }
+    // An expression whose source text means the same where the reflection
+    // table is built: a literal, a constant, or a call on self or a constant
+    // with such arguments (no local variable, no block).
+    fn carried_expression(node: &ruby_prism::Node<'_>) -> bool {
+        if literal(node) || node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
+            return true;
+        }
+        let Some(call) = node.as_call_node() else { return false };
+        if call.block().is_some() {
+            return false;
+        }
+        let receiver_ok = match call.receiver() {
+            None => true,
+            Some(r) => r.as_self_node().is_some() || r.as_constant_read_node().is_some() || r.as_constant_path_node().is_some(),
+        };
+        receiver_ok
+            && call.arguments().iter().flat_map(|a| a.arguments().iter()).all(|arg| {
+                if let Some(hash) = arg.as_keyword_hash_node() {
+                    hash.elements().iter().all(|e| e.as_assoc_node().is_some_and(|a| carried_expression(&a.value())))
+                } else {
+                    carried_expression(&arg)
+                }
+            })
+    }
     fn call_options(call: &ruby_prism::CallNode<'_>) -> (String, Vec<String>) {
         let mut pairs: Vec<String> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
@@ -4267,7 +4291,16 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
             let Some(hash) = arg.as_keyword_hash_node() else { continue };
             for element in hash.elements().iter() {
                 let Some(assoc) = element.as_assoc_node() else {
-                    unsupported.push("a `**` splat".to_string());
+                    // `**native_query_constraints_options(:shop_id)`: a class
+                    // method of the model, evaluated where `reflect_on_association`
+                    // builds its table (self is the model class there, as in the
+                    // class body that declared it).
+                    match element.as_assoc_splat_node().and_then(|s| s.value()) {
+                        Some(value) if carried_expression(&value) => {
+                            pairs.push(format!("**{}", String::from_utf8_lossy(value.location().as_slice())));
+                        }
+                        _ => unsupported.push("a `**` splat".to_string()),
+                    }
                     continue;
                 };
                 let key = assoc.key();

@@ -605,6 +605,33 @@ pub(crate) fn expand_type_aliases_in(
     Expand { alias, class, ancestors, normalize }.ty(ty, scope, 0)
 }
 
+/// `Model::PrivateRelation`, `Model::PrivateAssociationRelation` and
+/// `Model::PrivateCollectionProxy` (Tapioca's DSL classes for a model the
+/// registry indexes) read as the relation over `Model`.
+fn private_relation_types(ty: &Ty, classes: Classes<'_>) -> Ty {
+    let go = |t: &Ty| private_relation_types(t, classes);
+    match ty {
+        Ty::Class { id, args } if args.is_empty() => {
+            let name = id.0.as_str().trim_start_matches("::");
+            let model = name
+                .strip_suffix("::PrivateRelation")
+                .or_else(|| name.strip_suffix("::PrivateAssociationRelation"))
+                .or_else(|| name.strip_suffix("::PrivateCollectionProxy"))
+                .map(|model| ClassId(Symbol::from(model)));
+            match model {
+                Some(model) if classes.contains_key(&model) && !classes.contains_key(id) => Ty::Relation { of: model },
+                _ => ty.clone(),
+            }
+        }
+        Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(go).collect() },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(go(elem)) },
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(go(key)), value: std::sync::Arc::new(go(value)) },
+        Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(go).collect() },
+        Ty::Union { variants } => Ty::Union { variants: variants.iter().map(go).collect() },
+        other => other.clone(),
+    }
+}
+
 /// A parameterized stdlib generic written unqualified: `Set[String]`,
 /// `Range[Integer]`, `Enumerable[T]`, `Enumerator[T]`, `Class[top]`,
 /// `Module[top]`, and `T::Set[X]` read the same way. Sorbet reads such a
@@ -3595,6 +3622,9 @@ impl<'a> BodyTyper<'a> {
                         _ if method.as_str() == "presence_in" && args.len() == 1 && block.is_none() && is_string_array(args[0].ty.as_ref()) => None,
                         _ if method.as_str() == "to_query" && args.is_empty() && block.is_none()
                             && matches!(recv_ty, None | Some(Ty::Var { .. } | Ty::Untyped | Ty::Hash { .. })) => None,
+                        // `Object#acts_like?` is core_ext/object/acts_like, which the
+                        // PostgreSQL tree's time port answers (active_support_time_with_zone.rb).
+                        _ if method.as_str() == "acts_like?" && args.len() == 1 && self.carries_postgresql_base() => None,
                         _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
@@ -4381,7 +4411,12 @@ impl<'a> BodyTyper<'a> {
                     Some(Ty::Class { id: scope, .. }) => expand_type_aliases_by(
                         target_ty,
                         scope.0.as_str(),
-                        &|_, _| None,
+                        // `Alias::SchemaErrors` where `Alias = Gem::Builder`
+                        // names the type alias `Gem::Builder` declares.
+                        &|owner, name| {
+                            let target = self.dealiased_class(owner, "")?;
+                            self.classes().get(&target)?.type_aliases.get(name).cloned()
+                        },
                         &|id, scope| cref_class(id, scope, self.classes())
                             .or_else(|| self.dealiased_class(id, scope))
                             .unwrap_or_else(|| id.clone()),
@@ -4389,6 +4424,10 @@ impl<'a> BodyTyper<'a> {
                     ),
                 _ => target_ty.map_class_ids(&|id| self.dealiased_class(id, "").unwrap_or_else(|| id.clone())),
                 };
+                // Tapioca's per-model `Order::PrivateRelation` (also
+                // `PrivateAssociationRelation`, `PrivateCollectionProxy`) is
+                // the relation over that model.
+                let resolved = private_relation_types(&resolved, self.classes());
                 let missing = std::cell::RefCell::new(Vec::new());
                 // Lowerers also synthesize casts whose identities were proven
                 // against the full app before a reduced view/runtime registry

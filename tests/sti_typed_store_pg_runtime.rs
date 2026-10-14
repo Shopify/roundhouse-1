@@ -232,6 +232,13 @@ fn sti_subclass_store_serialize_and_validations_are_lowered() {
     }
     let credential = std::fs::read_to_string(emitted.join("app/models/credential.rb")).unwrap();
     assert!(credential.contains("def self._retypable_attribute_names"), "credential:\n{credential}");
+    // The typed_store gem's `typed_store :data` (here, through the app macro
+    // a Concern's `included do` calls) runs `decorate_attributes(["data"])`,
+    // which the runtime answers only for a column the compiled accessors
+    // consult a declared type for.
+    let retypable = credential.split("def self._retypable_attribute_names").nth(1).unwrap();
+    let retypable = retypable.split("\n  end").next().unwrap();
+    assert!(retypable.contains("\"data\""), "data is not retypable:\n{credential}");
 }
 
 /// The models natively and emitted, same PostgreSQL.

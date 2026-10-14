@@ -6157,6 +6157,8 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
             // and answered by the port, as are String#to_time/#to_date/#to_datetime.
             "Time.current", "Date.current", "DateTime.current", ".to_fs", ".to_formatted_s", ".rfc2822", ".rfc822",
             ".to_time", ".to_date", ".to_datetime",
+            // Object#acts_like? (core_ext/object/acts_like), a call the port answers.
+            ".acts_like?",
         ],
         at_require_rails: false,
     },
