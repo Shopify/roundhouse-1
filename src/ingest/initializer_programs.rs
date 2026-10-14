@@ -167,6 +167,10 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
     /// Hooks a runtime port lifts by itself (`on_load_hooks::FIRED_HOOKS`
     /// on PostgreSQL): left to that reader.
     pub lifted: &'a [&'a str],
+    /// The gem home and lock the tree's installed gems resolve in: a
+    /// `require` of a file one of them owns is kept, for the emitted
+    /// program to load it as Ruby does.
+    pub gems: Option<(&'a Path, &'a crate::gems::Lockfile)>,
 }
 
 /// The app's load hooks: those the app's own code fires (hook → base),
@@ -920,6 +924,14 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
         // natively (`project::test_load_path_features`).
         if target.is_none()
             && inputs.test_load_path.iter().filter(|root| inputs.vfs.exists(&root.join(&file))).count() == 1
+        {
+            return;
+        }
+        // A file of an installed gem the tree loads natively, which the
+        // gem's entry does not itself require: the emitted `require`
+        // loads it from the gem home.
+        if target.is_none()
+            && inputs.gems.is_some_and(|(home, lock)| super::gem_source_constants::locked_gem_owns(inputs.vfs, home, lock, &feature))
         {
             return;
         }

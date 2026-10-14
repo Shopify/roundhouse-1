@@ -3128,6 +3128,8 @@ end
             .map(|program| super::initializer_programs::relative(dir, Path::new(&program.source)))
             .filter(|rel| !in_gem_source(rel))
             .collect();
+        let gem_home = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref());
+        let gem_lock = app.gem_lock.clone();
         let inputs = super::initializer_programs::Inputs {
             vfs,
             dir,
@@ -3138,6 +3140,7 @@ end
             gem_files: &gem_files,
             lib_programs: &lib_programs,
             lifted: &lifted,
+            gems: gem_home.as_deref().zip(gem_lock.as_ref()),
         };
         super::initializer_programs::collect(&mut app, &inputs, &fired);
         let lifted = super::environments::LiftedConfig {

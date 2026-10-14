@@ -133,6 +133,56 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
     out
 }
 
+/// Whether `feature` is a file of a gem the lock resolves that the emitted
+/// tree loads as an installed gem: not one the app carries, a
+/// Rails-dependent one (the boot refuses its feature), or a ported one.
+/// A `require "<feature>"` the emitted program keeps loads that gem's file
+/// from the gem home, as Bundler's load path does natively. Core's
+/// graphql_open_telemetry.rb initializer requires
+/// `opentelemetry/instrumentation/graphql/tracers/graphql_trace`, a file
+/// opentelemetry-instrumentation-graphql's entry does not load (nothing
+/// autoloads it): with the `require` refused and gone, every schema's
+/// `trace_with(OpenTelemetry::Instrumentation::GraphQL::Tracers::
+/// GraphQLTrace)` raised `uninitialized constant ...::Tracers`.
+pub fn locked_gem_owns<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, feature: &str) -> bool {
+    let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+    if rb.starts_with('/') || rb.contains("..") {
+        return false;
+    }
+    let mut installed = None;
+    lock.specs.iter().map(|(name, _)| name.as_str()).any(|gem| {
+        if lock.is_in_repo(gem)
+            || crate::project::gem_requires_rails(gem).is_some()
+            || crate::project::gem_port_files(gem).is_some()
+            || lock_reaches_rails(lock, gem)
+        {
+            return false;
+        }
+        let Some(version) = lock.version_of(gem) else { return false };
+        let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { return false };
+        let (require_paths, _) = gemspec(vfs, home, &dir, gem, version);
+        require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
+    })
+}
+
+fn lock_reaches_rails(lock: &Lockfile, gem: &str) -> bool {
+    let deps = |gem: &str| lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str).collect::<Vec<_>>();
+    if RAILS_GEMS.contains(&gem) {
+        return true;
+    }
+    let mut seen = BTreeSet::new();
+    let mut stack = deps(gem);
+    while let Some(next) = stack.pop() {
+        if RAILS_GEMS.contains(&next) {
+            return true;
+        }
+        if seen.insert(next) {
+            stack.extend(deps(next));
+        }
+    }
+    false
+}
+
 /// How deep under a require path [`engine_isolated_prefixes`] looks for
 /// an `engine.rb`: Rails' engine generator writes `lib/<name>/engine.rb`
 /// (depth 1), a namespaced one `lib/<org>/<name>/engine.rb`.

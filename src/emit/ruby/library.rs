@@ -9439,6 +9439,16 @@ fn root_shadowed_constants(
             }
         }
     }
+    // The class's own constant is the innermost lexical scope, in the
+    // source as in the emit, and binds the head before any enclosing
+    // namespace's: Core's `Metafields::Lifecycle::Metafield` declares
+    // `module Type` (`private_constant`) and reads `Type::NOTIFY_*` in a
+    // `when`, while `Metafields::Type` is known and has no `NOTIFY_*`.
+    // Rooted, that was `::Type`: uninitialized constant Type.
+    let own_head = format!("{}::{}", scope.own, head.as_str());
+    if known(&own_head) || scope.namespaces.contains(&own_head) {
+        return;
+    }
     // Either the name's OWN segments shadow it (the pre-existing rule:
     // `Views::Stats` referencing `Stats`, `Message::Broadcasts`
     // referencing the runtime's `Broadcasts`) …
