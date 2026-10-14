@@ -197,7 +197,7 @@ fn an_unported_helper_call_refuses_the_include() {
         .edit(
             "app/models/article.rb",
             "  validates :title, presence: true\n",
-            "  validates :title, presence: true\n  include ActionView::Helpers::NumberHelper\n\n  def share = number_to_percentage(12.5)\n",
+            "  validates :title, presence: true\n  include ActionView::Helpers::TextHelper\n\n  def share = highlight(\"share\", \"s\")\n",
         )
         .emit(BuildTarget::Ruby);
     for (file, expected) in [
@@ -205,7 +205,7 @@ fn an_unported_helper_call_refuses_the_include() {
         ("cs/contact.rb", "Cs::Contact extends ActionView::Helpers::DateHelper and calls `relative_time_in_words` through it"),
         ("cs/span_words.rb", "Cs::SpanWords includes ActionView::Helpers::DateHelper and calls `select_year` (in Cs::Range) through it"),
         ("cs/translated.rb", "Cs::Translated includes ActionView::Helpers::TranslationHelper and calls `t` through it"),
-        ("models/article.rb", "Article includes ActionView::Helpers::NumberHelper and calls `number_to_percentage` through it"),
+        ("models/article.rb", "Article includes ActionView::Helpers::TextHelper and calls `highlight` through it"),
     ] {
         assert!(
             errors.iter().any(|e| e.contains(expected) && e.contains("does not port")),
