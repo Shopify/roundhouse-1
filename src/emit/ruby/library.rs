@@ -3620,19 +3620,21 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
                     primary_key.as_ref().map_or_else(|| ":id".to_string(), key)
                 ),
                 Association::HasOne { target, foreign_key, as_interface, scope, .. } => format!(
-                    "HasOneAssociation.new(self, :{}, {:?}, {}, {})",
+                    "HasOneAssociation.new(self, :{}, {:?}, {}, {}{})",
                     name.as_str(),
                     target.0.as_str(),
                     key(foreign_key),
-                    as_interface.is_none() && scope.is_none()
+                    as_interface.is_none() && scope.is_none(),
+                    custom_owner_key(assoc, ", nil, nil, nil, ")
                 ),
                 Association::HasMany { target, foreign_key, through: None, as_interface, scope, .. } => {
                     format!(
-                        "HasManyAssociation.new(self, :{}, {:?}, {}, {})",
+                        "HasManyAssociation.new(self, :{}, {:?}, {}, {}{})",
                         name.as_str(),
                         target.0.as_str(),
                         key(foreign_key),
-                        as_interface.is_none() && scope.is_none()
+                        as_interface.is_none() && scope.is_none(),
+                        custom_owner_key(assoc, ", ")
                     )
                 }
                 Association::HasMany { target, through: Some(_), .. }
@@ -3680,6 +3682,14 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
             lc.methods.push(m);
         }
     }
+}
+
+/// The trailing owner-key argument of an association object, written only
+/// for a declared `primary_key:` other than `id` (the object's default).
+/// `lead` fills the optional arguments between.
+fn custom_owner_key(assoc: &crate::dialect::Association, lead: &str) -> String {
+    crate::lower::assoc_primary_key::custom_primary_key(assoc)
+        .map_or_else(String::new, |k| format!("{lead}:{}", k.as_str()))
 }
 
 /// Ruby-family pre-emit pass: the singular association's builders.
@@ -3760,7 +3770,7 @@ pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app:
                 }
                 Association::HasOne { target, foreign_key, as_interface, scope, dependent, .. } => {
                     format!(
-                        "ActiveRecord::Associations::HasOneAssociation.new(self, :{name}, {:?}, {}, {}, {}, {}, {})",
+                        "ActiveRecord::Associations::HasOneAssociation.new(self, :{name}, {:?}, {}, {}, {}, {}, {}{})",
                         target.0.as_str(),
                         key(foreign_key),
                         as_interface.is_none() && scope.is_none(),
@@ -3777,7 +3787,8 @@ pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app:
                             Dependent::Restrict => ":restrict",
                         },
                         has_one_inverse(app, model, assoc, &declarations.of(app, span).0)
-                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str()))
+                            .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str())),
+                        custom_owner_key(assoc, ", ")
                     )
                 }
                 _ => continue,

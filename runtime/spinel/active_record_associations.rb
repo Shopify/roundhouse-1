@@ -282,8 +282,11 @@ module ActiveRecord
       # association's query matches (on the target for has_many/has_one,
       # on the owner for belongs_to). scopable: `scope` can be built from
       # those two alone (no scope lambda, `as:` or `:through`).
-      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false)
+      # owner_key: the owner column a has_many's or has_one's foreign key
+      # matches (`primary_key:`), `id` for the rest.
+      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, owner_key = :id)
         @owner = owner
+        @owner_key = owner_key
         @name = name
         @klass_name = klass_name
         @foreign_key = foreign_key
@@ -336,7 +339,7 @@ module ActiveRecord
 
       # A has_many's or has_one's key is on the target.
       def scope_condition
-        { @foreign_key => @owner.id }
+        { @foreign_key => @owner.public_send(@owner_key) }
       end
 
       # Rails compares the stale state recorded at load with the
@@ -634,8 +637,8 @@ module ActiveRecord
       # holds the owner's class name; dependent: the declaration's
       # `dependent:`; inverse: the target's belongs_to that points back
       # at the owner (Rails' `reflection.inverse_of`), nil for none.
-      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, as_type = nil, dependent = nil, inverse = nil)
-        super(owner, name, klass_name, foreign_key, scopable)
+      def initialize(owner, name, klass_name = nil, foreign_key = nil, scopable = false, as_type = nil, dependent = nil, inverse = nil, owner_key = :id)
+        super(owner, name, klass_name, foreign_key, scopable, owner_key)
         @as_type = as_type
         @dependent = dependent
         @inverse = inverse
@@ -701,7 +704,7 @@ module ActiveRecord
         end
 
         def set_owner_attributes(record)
-          record.public_send(:"#{@foreign_key}=", @owner.new_record? ? nil : @owner.id)
+          record.public_send(:"#{@foreign_key}=", @owner.new_record? ? nil : @owner.public_send(@owner_key))
           record.public_send(:"#{@as_type}=", @owner.class.name) if @as_type
         end
 

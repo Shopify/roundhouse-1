@@ -308,8 +308,25 @@ module ActionCable
       # nil for a name nothing defined. The caller answers that with
       # `reject_subscription`, which is what Action Cable's client
       # expects for an unknown channel.
+      #
+      # A channel class the app autoloads (`config.eager_load` false:
+      # the tree loads a file on its constant's first reference) has not
+      # run `inherited` until something references it, and a client's
+      # name is that first reference. The name is resolved only through
+      # a constant path, as Rails' `safe_constantize` does, and answers
+      # only what then sits in the registry: a class that descends from
+      # `Channel::Base` and registered itself by being defined.
       def self.lookup(channel_name)
-        REGISTRY[channel_name.to_s]
+        name = channel_name.to_s
+        REGISTRY[name] || autoloaded(name)
+      end
+
+      def self.autoloaded(name)
+        return nil unless name.match?(/\A[A-Z]\w*(::[A-Z]\w*)*\z/)
+        name.split("::").inject(Object) { |scope, part| scope.const_get(part, false) }
+        REGISTRY[name]
+      rescue NameError
+        nil
       end
 
       # `RoomChannel` -> `"room"`; `Turbo::StreamsChannel` ->

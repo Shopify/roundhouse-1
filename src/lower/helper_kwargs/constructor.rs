@@ -25,6 +25,11 @@ pub(super) struct InstanceCallParams {
     /// (`Param::keywords_written_as_keywords`). With none, a constructor
     /// call the CRuby tree leaves as written binds as Ruby's does.
     ruby_family_positional_constructor: Option<String>,
+    /// Classes whose `Dry::Initializer` declarations a refused hierarchy
+    /// (`ingest::dry_initializer`) left as unmodeled calls, and their
+    /// subclasses: no tree carries those declarations, so a constructor call
+    /// on one runs as written only into a class that cannot take it.
+    declarations_dropped: HashSet<String>,
 }
 
 impl InstanceCallParams {
@@ -120,6 +125,29 @@ impl InstanceCallParams {
             ambiguous_names: names.ambiguous_names.clone(),
             model_names: names.model_names.clone(),
             ruby_family_positional_constructor: ruby_family_positional_constructor(app),
+            declarations_dropped: declarations_dropped(app),
+        }
+    }
+}
+
+/// The classes holding Dry::Initializer declarations no tree carries, and
+/// every subclass of one.
+fn declarations_dropped(app: &App) -> HashSet<String> {
+    let mut dropped: HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.unknown_calls.iter().any(crate::ingest::is_initializer_declaration))
+        .map(|lc| lc.name.0.as_str().to_string())
+        .collect();
+    loop {
+        let before = dropped.len();
+        for lc in &app.library_classes {
+            if lc.parent.as_ref().is_some_and(|p| dropped.contains(p.0.as_str())) {
+                dropped.insert(lc.name.0.as_str().to_string());
+            }
+        }
+        if dropped.len() == before {
+            return dropped;
         }
     }
 }
@@ -400,7 +428,7 @@ pub(super) fn refuse_keyword_splats(
     if let Some(reason) =
         constructor_refusal_reason(params, expr.span, id.0.as_str(), class_name, args)
     {
-        refuse_constructor(expr, params, reason, diagnostics);
+        refuse_constructor(expr, params, &class_name.to_string(), reason, diagnostics);
     }
 }
 
@@ -444,19 +472,18 @@ fn rewrite_instance_call(
         return;
     };
     let is_constructor = method.as_str() == "new" && matches!(&*recv.node, ExprNode::Const { .. });
+    // Owned: `refuse_constructor` marks `expr` while the name is read.
+    let id_name = id.0.as_str().to_string();
     let class_id = if is_constructor {
-        params
-            .unqualified_class_ids
-            .get(id.0.as_str())
-            .map_or(id.0.as_str(), String::as_str)
+        params.unqualified_class_ids.get(&id_name).map_or(id_name.as_str(), String::as_str)
     } else {
-        id.0.as_str()
+        id_name.as_str()
     };
     if is_constructor
         && let Some(reason) =
-            constructor_refusal_reason(params, expr.span, id.0.as_str(), class_id, args)
+            constructor_refusal_reason(params, expr.span, &id_name, class_id, args)
     {
-        refuse_constructor(expr, params, reason, diagnostics);
+        refuse_constructor(expr, params, class_id, reason, diagnostics);
         return;
     }
     if is_constructor {
@@ -487,6 +514,7 @@ fn rewrite_instance_call(
             refuse_constructor(
                 expr,
                 params,
+                &class_id.to_string(),
                 "cannot safely move these keywords into initialize's positional slots without changing Ruby argument binding or evaluation semantics",
                 diagnostics,
             );
@@ -519,7 +547,8 @@ pub(super) fn rewrite_custom_new_call(
     let class_id = params
         .unqualified_class_ids
         .get(id.0.as_str())
-        .map_or(id.0.as_str(), String::as_str);
+        .map_or(id.0.as_str(), String::as_str)
+        .to_string();
     let Some(slots) = params
         .custom_new_slots
         .get(&(class_id.to_string(), method.clone()))
@@ -530,6 +559,7 @@ pub(super) fn rewrite_custom_new_call(
         refuse_constructor(
             expr,
             params,
+            &class_id,
             "cannot safely move these keywords into custom `new` positional slots without changing Ruby argument binding or evaluation semantics",
             diagnostics,
         );
@@ -619,11 +649,14 @@ pub(crate) fn runs_as_written(d: &crate::diagnostic::Diagnostic) -> bool {
 fn refuse_constructor(
     expr: &mut Expr,
     params: &InstanceCallParams,
+    class_name: &str,
     detail: &str,
     diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
     let refinement = params.lexical_refinement_calls.contains(&expr.span);
-    let as_written = params.ruby_family_positional_constructor.is_none() && !refinement;
+    let as_written = params.ruby_family_positional_constructor.is_none()
+        && !refinement
+        && !params.declarations_dropped.contains(class_name);
     let detail = match &params.ruby_family_positional_constructor {
         _ if as_written => format!(
             "{detail}; {AS_WRITTEN_NOTE}"

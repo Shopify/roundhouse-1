@@ -26,6 +26,7 @@ pub(crate) mod cattr;
 mod class_configuration;
 pub(crate) mod concern_class_attribute;
 mod dry_initializer;
+pub(crate) use dry_initializer::is_initializer_declaration;
 mod dry_struct;
 mod dry_types;
 pub mod allow_browser;

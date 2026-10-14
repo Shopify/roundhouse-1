@@ -613,7 +613,8 @@ fn singular_builder(e: &Expr) -> Option<String> {
     let Some(crate::expr::IrHint::SingularBuilder { method, synthesized }) = &attrs.hint else { return None };
     let ExprNode::Hash { entries, .. } = &*attrs.node else { return None };
     let owner = match &entries.first()?.1.node.as_ref() {
-        ExprNode::Send { recv: Some(r), method: id, .. } if id.as_str() == "id" => Some(r.clone()),
+        // `<recv>.id`, or `<recv>.<primary_key:>` the association names.
+        ExprNode::Send { recv: Some(r), args, .. } if args.is_empty() => Some(r.clone()),
         _ => None,
     };
     let given: Vec<_> = entries.iter().skip(*synthesized).cloned().collect();

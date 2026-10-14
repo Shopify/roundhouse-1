@@ -326,14 +326,10 @@ fn rewrite_self_sends(expr: &mut Expr, helpers: &HashMap<Symbol, Vec<Param>>, di
     }
     let Some(params) = helpers.get(method) else { return };
     restore_kwrest_splat(args, params);
-    // A receiverless call keeps the source's `**` unless its callee is
-    // found here (`lower::forwarding`): one that takes no keywords takes
-    // the Hash positionally.
-    if params.iter().all(|p| !p.keyword && !p.from_keyword && !p.from_kwrest) {
-        for arg in args.iter_mut() {
-            arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
-        }
-    }
+    // The mark stays even where the callee takes no keywords: the Ruby tree
+    // writes the source's `**h` back, and Ruby hands that callee a copy of
+    // the Hash (`def touch(h, *)` mutating `h` leaves the caller's alone),
+    // where the erased `touch(h)` would alias it.
 }
 
 /// Every instance method an app class declares, plus every controller
