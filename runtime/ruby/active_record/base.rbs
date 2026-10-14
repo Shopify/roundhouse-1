@@ -181,6 +181,11 @@ module ActiveRecord
     def changed?: () -> bool
     def has_changes_to_save?: () -> bool
     def attribute_was: (String name) -> untyped
+    def attribute_change: (String name) -> untyped
+    def attribute_change_to_be_saved: (String name) -> untyped
+    def attribute_in_database: (String name) -> untyped
+    def attribute_previous_change: (String name) -> untyped
+    def attribute_before_last_save: (String name) -> untyped
     def id_previously_changed?: () -> bool
     def previously_new_record?: () -> bool
 

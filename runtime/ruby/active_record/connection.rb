@@ -894,7 +894,7 @@ module ActiveRecord
     # collides, in one statement. Rails routes the single-row form
     # through `upsert_all`; so does this.
     def self.upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
-      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
+      all.upsert(attrs, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
     end
 
     # The predicate of the unique index on `columns` (sorted, joined with
@@ -928,6 +928,13 @@ module ActiveRecord
     # that has timestamps. Returns the affected-row count, the same
     # currency `update_counters` deals in.
     def self.upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
+      all.upsert_all(rows, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
+    end
+
+    # The write behind `Relation#upsert_all`, which Rails reaches from
+    # the model through `all`: a patch prepended on Relation (Core's
+    # GenerateOid allocates the ids there) runs first.
+    def self._upsert_rows(rows, unique_by, on_duplicate, update_only, returning)
       return 0 if rows.length == 0
       if returning
         raise NotImplementedError, "#{name}.upsert_all: RETURNING is not supported"
@@ -975,20 +982,24 @@ module ActiveRecord
     # column's cast type (an enum name, a JSON hash) before it is
     # written. Returns the affected-row count; RETURNING is refused by
     # name, as in `upsert_all`.
+    #
+    # Every form goes through `all`, as in Rails (querying.rb delegates
+    # them to the relation): the Relation's own methods below do the
+    # write, and anything prepended on Relation sees the call first.
     def self.insert_all(rows, unique_by: nil, returning: nil, record_timestamps: nil)
-      _insert_rows(rows, true, unique_by, returning, record_timestamps)
+      all.insert_all(rows, unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
     end
 
     def self.insert_all!(rows, returning: nil, record_timestamps: nil)
-      _insert_rows(rows, false, nil, returning, record_timestamps)
+      all.insert_all!(rows, returning: returning, record_timestamps: record_timestamps)
     end
 
     def self.insert(attrs, unique_by: nil, returning: nil, record_timestamps: nil)
-      _insert_rows([attrs], true, unique_by, returning, record_timestamps)
+      all.insert(attrs, unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
     end
 
     def self.insert!(attrs, returning: nil, record_timestamps: nil)
-      _insert_rows([attrs], false, nil, returning, record_timestamps)
+      all.insert!(attrs, returning: returning, record_timestamps: record_timestamps)
     end
 
     def self._insert_rows(rows, skip_conflicts, unique_by, returning, record_timestamps)
@@ -3400,6 +3411,41 @@ module ActiveRecord
             zone.local_to_utc(value)&.in_time_zone
           end
       end
+    end
+  end
+end
+
+module ActiveRecord
+  # The bulk-write entry points Rails defines on Relation (relation.rb:
+  # `insert_all`, `insert`, `upsert_all`, …), which the model's own
+  # `insert_all` & co. reach through `all` (querying.rb). The write is the
+  # model's (`_insert_rows` / `_upsert_rows`); keeping the entry on
+  # Relation is what lets an application prepend its own wrapper there —
+  # Core's GenerateOid allocates the primary keys that way, and
+  # `Model.insert!` takes it exactly as `Model.insert_all!` does.
+  class Relation
+    def insert_all(rows, unique_by: nil, returning: nil, record_timestamps: nil)
+      @model._insert_rows(rows, true, unique_by, returning, record_timestamps)
+    end
+
+    def insert_all!(rows, returning: nil, record_timestamps: nil)
+      @model._insert_rows(rows, false, nil, returning, record_timestamps)
+    end
+
+    def insert(attrs, unique_by: nil, returning: nil, record_timestamps: nil)
+      insert_all([attrs], unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
+    end
+
+    def insert!(attrs, returning: nil, record_timestamps: nil)
+      insert_all!([attrs], returning: returning, record_timestamps: record_timestamps)
+    end
+
+    def upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
+      @model._upsert_rows(rows, unique_by, on_duplicate, update_only, returning)
+    end
+
+    def upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
+      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
     end
   end
 end

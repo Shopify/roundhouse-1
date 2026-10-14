@@ -4013,6 +4013,18 @@ pub(super) fn class_const(id: &ClassId) -> Expr {
     Expr::new(Span::synthetic(), ExprNode::Const { path })
 }
 
+/// [`class_const`] of an association's target, which ingest resolved to
+/// the class's absolute name (`class_name: "::Theme"` is `Theme`). Marked
+/// a resolved reference so the Ruby emit roots it when a lexical scope
+/// binds the head to another constant (a namespace-only
+/// `OnlineStore::Theme` beside the top-level model).
+pub(crate) fn resolved_class_const(id: &ClassId) -> Expr {
+    let mut e = class_const(id);
+    e.decisions |= crate::expr::RESOLVED_CLASS_REF;
+    e.ty = Some(Ty::Class { id: id.clone(), args: vec![].into() });
+    e
+}
+
 pub(super) fn self_ref() -> Expr {
     Expr::new(Span::synthetic(), ExprNode::SelfRef)
 }

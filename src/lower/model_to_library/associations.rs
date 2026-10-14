@@ -14,7 +14,7 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
 
-use super::{class_const, fn_sig, lit_int, lit_sym, nil_lit, seq, var_ref};
+use super::{class_const, fn_sig, lit_int, lit_sym, nil_lit, resolved_class_const, seq, var_ref};
 
 /// Join recipe for a `has_many :through` collection writer, resolved
 /// against the app's model slice.
@@ -575,7 +575,7 @@ fn synth_has_many_reader(
     let lazy_query = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: Some(class_const(target)),
+            recv: Some(resolved_class_const(target)),
             method: Symbol::from("where"),
             args: where_args,
             block: None,
@@ -1021,7 +1021,7 @@ fn synth_has_one_reader(
     let query = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: Some(class_const(target)),
+            recv: Some(resolved_class_const(target)),
             method: Symbol::from("where"),
             args: where_args,
             block: None,
@@ -1481,7 +1481,7 @@ fn synth_belongs_to_reader(
     let find_by = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: Some(class_const(target)),
+            recv: Some(resolved_class_const(target)),
             method: Symbol::from("find_by"),
             args: vec![Expr::new(
                 Span::synthetic(),
@@ -1561,7 +1561,7 @@ fn synth_polymorphic_reader(
         Expr::new(
             Span::synthetic(),
             ExprNode::Send {
-                recv: Some(class_const(t)),
+                recv: Some(resolved_class_const(t)),
                 method: Symbol::from("find_by"),
                 args: vec![Expr::new(
                     Span::synthetic(),
@@ -2062,7 +2062,7 @@ fn synth_through_sync(
     let where_call = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: Some(class_const(join_class)),
+            recv: Some(resolved_class_const(join_class)),
             method: Symbol::from("where"),
             args: vec![Expr::new(
                 Span::synthetic(),
@@ -2117,7 +2117,7 @@ fn synth_through_sync(
                 value: Expr::new(
                     Span::synthetic(),
                     ExprNode::Send {
-                        recv: Some(class_const(join_class)),
+                        recv: Some(resolved_class_const(join_class)),
                         method: Symbol::from("new"),
                         args: vec![],
                         block: None,

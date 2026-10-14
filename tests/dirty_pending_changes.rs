@@ -148,3 +148,22 @@ fn a_guard_named_by_a_concerns_included_validation_is_synthesized() {
     assert!(src.contains("def about_changed?"), "{src}");
     assert!(src.contains(r#"attribute_changed?("about")"#), "{src}");
 }
+
+/// The VALUE readers (`[was, now]` or nil) are synthesized on demand
+/// too, each delegating to its name-taking runtime Base method with the
+/// String column key. Core's `PriceRule#rollout_audience_resnapshot_required?`
+/// sends `saved_change_to_customer_selection`, which raised NameError.
+#[test]
+fn the_value_readers_are_synthesized_on_demand() {
+    let src = emit_user(
+        "class User < ApplicationRecord\n  def audit\n    [saved_change_to_email, username_change, about_in_database]\n  end\nend\n",
+    );
+    assert!(src.contains("def saved_change_to_email"), "{src}");
+    assert!(src.contains(r#"saved_change_to_attribute("email")"#), "{src}");
+    assert!(src.contains("def username_change"), "{src}");
+    assert!(src.contains(r#"attribute_change("username")"#), "{src}");
+    assert!(src.contains("def about_in_database"), "{src}");
+    assert!(src.contains(r#"attribute_in_database("about")"#), "{src}");
+    // Not named: not synthesized.
+    assert!(!src.contains("def email_previous_change"), "{src}");
+}

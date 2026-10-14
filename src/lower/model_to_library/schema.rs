@@ -167,6 +167,8 @@ pub(super) fn push_schema_methods(
             for (name, runtime, ret) in pending_change_methods(col) {
                 if (demanded.contains(&name) || super::attribute_alias::demanded_as_alias(model, col, &name, demanded))
                     && !super::associations::model_defines_instance_method(model, &name)
+                    // A column named `<other>_change` owns its reader.
+                    && !table.columns.iter().any(|c| c.name == name)
                 {
                     methods.push(synth_column_delegate(owner, col, name, runtime, ret));
                 }
@@ -2336,6 +2338,17 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
         (Symbol::from(format!("{n}_changed?")), "attribute_changed?", Ty::Bool),
         (Symbol::from(format!("will_save_change_to_{n}?")), "attribute_changed?", Ty::Bool),
         (Symbol::from(format!("{n}_was")), "attribute_was", Ty::Untyped),
+        // The VALUE half of both diffs (`[was, now]` or nil), which
+        // Rails defines per attribute beside the predicates: the last
+        // save's (`saved_change_to_<col>`, `<col>_previous_change`,
+        // `<col>_before_last_save`) and the pending one (`<col>_change`,
+        // `<col>_change_to_be_saved`, `<col>_in_database`).
+        (Symbol::from(format!("saved_change_to_{n}")), "saved_change_to_attribute", Ty::Untyped),
+        (Symbol::from(format!("{n}_previous_change")), "attribute_previous_change", Ty::Untyped),
+        (Symbol::from(format!("{n}_before_last_save")), "attribute_before_last_save", Ty::Untyped),
+        (Symbol::from(format!("{n}_change")), "attribute_change", Ty::Untyped),
+        (Symbol::from(format!("{n}_change_to_be_saved")), "attribute_change_to_be_saved", Ty::Untyped),
+        (Symbol::from(format!("{n}_in_database")), "attribute_in_database", Ty::Untyped),
     ]
 }
 

@@ -228,3 +228,42 @@ puts "ALL OK"
     );
     assert!(out.status.success(), "driver exited {:?}", out.status.code());
 }
+
+/// `ActiveJob::Base.logger` (Rails' `cattr_accessor :logger`): job-iteration
+/// reads it as `JobIteration.logger`. It answers `Rails.logger` until one
+/// is assigned, and the instance reader shares the class's.
+#[test]
+fn active_job_base_has_a_class_and_instance_logger() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r##"
+require_relative "runtime/ruby/active_job"
+require_relative "runtime/spinel/thread_state"
+module Rails
+  def self.logger
+    @logger ||= Object.new
+  end
+end
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/active_job_cruby"
+
+raise "default is not Rails.logger" unless ActiveJob::Base.logger.equal?(Rails.logger)
+class SomeJob < ActiveJob::Base; end
+raise "instance reader" unless SomeJob.new.logger.equal?(Rails.logger)
+mine = Object.new
+ActiveJob::Base.logger = mine
+raise "assigned logger" unless ActiveJob::Base.logger.equal?(mine) && SomeJob.logger.equal?(mine)
+raise "instance after assign" unless SomeJob.new.logger.equal?(mine)
+puts "ALL OK"
+"##;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "logger failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
