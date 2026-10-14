@@ -9159,44 +9159,13 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             }
         }
     }
-    // The directory a constant's path is read from must be one Ruby
-    // resolves constant paths under: a Rails autoload root (`app/<x>`,
-    // `app/<x>/concerns`, a Zeitwerk loader's root) or a `lib/` on the
-    // load path. `lib/podding/patches/active_record.rb` names
-    // Podding::Patches::ActiveRecord, not the ActiveRecord it reopens.
-    let loader_roots: std::collections::BTreeSet<&str> = app
-        .zeitwerk_loaders
-        .iter()
-        .map(|l| l.root.strip_prefix(app.root.as_str()).unwrap_or(&l.root).trim_matches('/'))
-        .collect();
-    let autoload_root = |dir: &[&str]| -> bool {
-        let n = dir.len();
-        (n >= 1 && dir[n - 1] == "lib")
-            || (n >= 2 && dir[n - 2] == "app")
-            || (n >= 3 && dir[n - 1] == "concerns" && dir[n - 3] == "app")
-            || loader_roots.contains(dir.join("/").as_str())
-    };
-    // A directory a Zeitwerk loader collapses adds no namespace
-    // (`ingest::zeitwerk`): database_documentation 3.2.0's
-    // `model_metadata/concerns/metadata.rb` names
-    // DatabaseDocumentation::ModelMetadata::Metadata. A source's path is
-    // read for its constant without those directories.
-    let collapsed_dirs: std::collections::BTreeSet<&str> = app
-        .zeitwerk_loaders
-        .iter()
-        .flat_map(|l| l.collapsed.iter())
-        .map(|d| d.strip_prefix(app.root.as_str()).unwrap_or(d).trim_matches('/'))
-        .collect();
-    let constant_path = |path: &str| -> String {
-        let segments: Vec<&str> = path.split('/').collect();
-        segments
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| i + 1 == segments.len() || !collapsed_dirs.contains(segments[..=*i].join("/").as_str()))
-            .map(|(_, segment)| *segment)
-            .collect::<Vec<_>>()
-            .join("/")
-    };
+    // Which directories resolve constant paths, and each source's
+    // constant path (`crate::autoload_roots`, shared with the
+    // `defined?(Const)` fold).
+    let roots = crate::autoload_roots::AutoloadRoots::of(app);
+    let loader_roots = &roots.loader_roots;
+    let autoload_root = |dir: &[&str]| -> bool { roots.is_root(dir) };
+    let constant_path = |path: &str| -> String { roots.constant_path(path) };
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
     let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut in_place_program: BTreeMap<String, String> = BTreeMap::new();
