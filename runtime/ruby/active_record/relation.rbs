@@ -357,9 +357,10 @@ module ActiveRecord
     def escape_list: (Array[untyped] vals) -> String
     def bind_literal: (untyped val) -> String
     def self.inline_sql: (String sql) -> String
-    def self.lift_binds: (String sql) -> Array[String]
+    def self.lift_binds: (String sql, ?bool numbered) -> Array[String]
+    def self.bind_slot: (Array[String] out, bool numbered) -> String
     def self.quote_count: (String text) -> Integer
-    def self.lift_binds_scan: (String sql) -> Array[String]
+    def self.lift_binds_scan: (String sql, ?bool numbered) -> Array[String]
     def self.sql_token_end: (String sql, Integer j, String ch, Integer n) -> Integer
     def self.bind_kind: (String text) -> String
     def order_term: (String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]] p) -> String
