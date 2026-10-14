@@ -63,6 +63,7 @@ const PROBE: &str = r#"class Probe
   def negated; !defined?(ActsAsTenant); end
   def compacted; [:a, (:b if defined?(OmniAuth))].compact; end
   def value_of_true; v = defined?(Widget); v; end
+  def trailing_guard; @on && defined?(Widget) && go; end
 end
 "#;
 
@@ -178,6 +179,8 @@ fn folded_guards_prune_their_dead_branch() {
     assert!(!conj.contains("defined?") && conj.contains("Rails.respond_to?(:logger)"), "{conj}");
     assert_eq!(b["disabled_conjunction"], "nil");
     assert_eq!(b["negated"], "true");
+    // A folded operand stays truthy without a string literal in a condition.
+    assert_eq!(b["trailing_guard"], "@on && true && go");
     assert!(!b["compacted"].contains("OmniAuth") && !b["compacted"].contains(":b"), "{}", b["compacted"]);
 }
 
