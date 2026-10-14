@@ -3955,7 +3955,7 @@ fn keep_carried_body_statements(app: &mut App) {
 }
 
 /// `[…].m …` / `%i[…].m …`: a call whose receiver is a literal list.
-fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
+pub(super) fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
     matches!(&*call.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if matches!(&*r.node, crate::expr::ExprNode::Array { .. }))
 }
 
