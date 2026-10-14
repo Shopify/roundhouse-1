@@ -1,3 +1,4 @@
 module ActiveSupport
-  def self.deep_merge: (Hash[Object, Object] left, Hash[Object, Object] other_hash) -> Hash[Object, Object]
+  def self.deep_merge: (Hash[Object, Object] left, Hash[Object, Object] other_hash) ?{ (Object key, Object this_value, Object other_value) -> Object } -> Hash[Object, Object]
+  def self.deep_merge!: (Hash[Object, Object] left, Hash[Object, Object] other_hash) ?{ (Object key, Object this_value, Object other_value) -> Object } -> Hash[Object, Object]
 end
