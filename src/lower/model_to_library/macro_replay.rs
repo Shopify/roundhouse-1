@@ -302,6 +302,11 @@ pub(crate) struct ClassSide<'a> {
     /// The body locals bound to `self` (`unsafe_self = self #: as
     /// untyped`), by name: a mixin call on one is a mixin call on the class.
     self_aliases: Vec<String>,
+    /// Whether the class, or a model ancestor, includes
+    /// ActiveModel::Attributes and the tree runs it
+    /// (`active_model_model::runs_attributes_at_run_time`), so the class
+    /// side answers `attribute` as the port does.
+    attributes_runtime: bool,
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -525,7 +530,12 @@ impl<'a> ClassSide<'a> {
             schema,
             gem_includes: Vec::new(),
             self_aliases: Vec::new(),
+            attributes_runtime: false,
         };
+        side.attributes_runtime = std::iter::once(owner)
+            .chain(side.chain.iter().map(|m| &m.name))
+            .filter_map(|n| app.models.iter().find(|m| &m.name == n))
+            .any(|m| crate::lower::active_model_model::runs_attributes_at_run_time(app, m));
         for call in &body {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*call.node {
                 if is_self_like(value, &side.self_aliases) {
@@ -577,7 +587,17 @@ impl<'a> ClassSide<'a> {
             return None;
         }
         seen.push(&m.name);
-        m.methods.iter().filter(|d| d.receiver == MethodReceiver::Instance && d.name.as_str() == name).last().or_else(|| {
+        // A concern's `class_methods` block, lowered onto the module as
+        // class methods, is what an including class's body calls.
+        let concern = extends_concern(m);
+        m.methods
+            .iter()
+            .filter(|d| {
+                (d.receiver == MethodReceiver::Instance || (concern && d.receiver == MethodReceiver::Class && !MODULE_HOOKS.contains(&d.name.as_str())))
+                    && d.name.as_str() == name
+            })
+            .last()
+            .or_else(|| {
             m.includes.iter().find_map(|inc| {
                 let inc = inc.0.as_str().trim_start_matches("::");
                 let included = self.app.library_classes.iter().find(|c| c.is_module && c.origin.is_none() && c.name.0.as_str() == inc)?;
@@ -633,7 +653,27 @@ impl<'a> ClassSide<'a> {
     }
 
     fn base_modules(&self) -> &[(&'a LibraryClass, &'a LibraryClass)] {
-        self.base.get_or_init(|| base_include_class_modules(self.app))
+        self.base.get_or_init(|| {
+            let mut modules = base_include_class_modules(self.app);
+            // What a boot initializer's `on_load` block includes into the
+            // class or a model ancestor when its file loads
+            // (`App::autoload_includes`), which is before a subclass body
+            // runs: the same shape as a boot include of the base.
+            let lineage: Vec<&ClassId> = std::iter::once(self.owner).chain(self.chain.iter().map(|m| &m.name)).collect();
+            let included: Vec<ClassId> = self
+                .app
+                .autoload_includes
+                .iter()
+                .filter(|(class, _)| lineage.contains(&class))
+                .map(|(_, module)| module.clone())
+                .collect();
+            for (provider, include) in include_class_modules(self.app, &included) {
+                if !modules.iter().any(|(p, _)| p.name == provider.name) {
+                    modules.push((provider, include));
+                }
+            }
+            modules
+        })
     }
 
     /// The boot include of ActiveRecord::Base that gives class-method
@@ -692,6 +732,21 @@ impl<'a> ClassSide<'a> {
             && self.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
         {
             // The call's own arguments run in the class body.
+            let mut walk = Walk::new(self, method.as_str());
+            let mut aliases = Vec::new();
+            let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
+            return Some(match result {
+                Ok(()) => MacroVerdict::Replay,
+                Err(reason) => MacroVerdict::Refuse(reason),
+            });
+        }
+        // `attribute :name, :type, default: x` on a class that includes the
+        // ActiveModel::Attributes port runs there: its arguments run in
+        // the class body.
+        if method.as_str() == "attribute"
+            && self.attributes_runtime
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        {
             let mut walk = Walk::new(self, method.as_str());
             let mut aliases = Vec::new();
             let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
@@ -814,11 +869,16 @@ impl<'a> ClassSide<'a> {
 /// `ClassMethods`. A constant resolves from the include's namespace
 /// outwards; gem modules count, as the tree carries their source.
 pub(crate) fn base_include_class_modules(app: &crate::App) -> Vec<(&LibraryClass, &LibraryClass)> {
-    if app.framework_base_includes.is_empty() {
+    include_class_modules(app, &app.framework_base_includes)
+}
+
+/// The class-method modules the modules in `included` give their includer
+/// (see [`base_include_class_modules`]), each with the include.
+fn include_class_modules<'a>(app: &'a crate::App, included: &[ClassId]) -> Vec<(&'a LibraryClass, &'a LibraryClass)> {
+    if included.is_empty() {
         return Vec::new();
     }
-    let includes: Vec<&LibraryClass> = app
-        .framework_base_includes
+    let includes: Vec<&LibraryClass> = included
         .iter()
         .filter_map(|id| app.library_classes.iter().find(|c| c.is_module && &c.name == id))
         .collect();
@@ -836,18 +896,19 @@ pub(crate) fn base_include_class_modules(app: &crate::App) -> Vec<(&LibraryClass
         for written in included_hook_extends(m) {
             wanted.push((i, candidates(&written)));
         }
-        let concern = m.unknown_calls.iter().any(|c| {
-            extend_args(c).is_some_and(|args| {
-                args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["ActiveSupport", "Concern"])))
-            })
-        });
-        if concern {
+        if extends_concern(m) {
             wanted.push((i, vec![format!("{}::ClassMethods", m.name.0.as_str())]));
         }
     }
     let mut out: Vec<(&LibraryClass, &LibraryClass)> = Vec::new();
     for (i, names) in wanted {
-        let found = names.iter().find_map(|n| app.library_classes.iter().find(|c| c.is_module && c.name.0.as_str() == n));
+        let found = names
+            .iter()
+            .find_map(|n| app.library_classes.iter().find(|c| c.is_module && c.name.0.as_str() == n))
+            // A concern whose `class_methods` block is lowered onto the
+            // module itself (as class methods, emitted as its
+            // `ClassMethods`) gives them from there.
+            .or_else(|| Some(includes[i]).filter(|m| extends_concern(m) && has_class_macros(m)));
         if let Some(provider) = found {
             if !out.iter().any(|(p, _)| p.name == provider.name) {
                 out.push((provider, includes[i]));
@@ -855,6 +916,20 @@ pub(crate) fn base_include_class_modules(app: &crate::App) -> Vec<(&LibraryClass
         }
     }
     out
+}
+
+/// Does `m` `extend ActiveSupport::Concern`?
+fn extends_concern(m: &LibraryClass) -> bool {
+    m.unknown_calls.iter().any(|c| {
+        extend_args(c).is_some_and(|args| {
+            args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["ActiveSupport", "Concern"])))
+        })
+    })
+}
+
+/// Does `m` define class methods beyond the module hooks (`included`, ...)?
+fn has_class_macros(m: &LibraryClass) -> bool {
+    m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && !MODULE_HOOKS.contains(&d.name.as_str()))
 }
 
 /// The modules `m`'s `self.included(base)` hook extends onto `base`, as
@@ -1139,6 +1214,9 @@ impl<'s, 'a> Walk<'s, 'a> {
         if runtime_registers_at_class_body(name)
             && self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
         {
+            return Ok(());
+        }
+        if name == "attribute" && self.side.attributes_runtime {
             return Ok(());
         }
         if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {

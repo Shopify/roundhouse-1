@@ -252,7 +252,21 @@ pub(super) fn lift_autoload_includes<V: Vfs + ?Sized>(app: &mut App, vfs: &V, bo
         for stmt in program.statements().body().iter() {
             let Some((cpath, param, body)) = autoload_on_load_block(&stmt) else { continue };
             let Some(index) = app.models.iter().position(|m| m.name.0.as_str() == cpath) else { continue };
-            let Some(includes) = receiver_includes(&body, &cpath, param.as_deref(), &known) else { continue };
+            let Some(includes) = receiver_includes(&body, &cpath, param.as_deref(), &known) else {
+                // The block does other work too: it runs at load, as written,
+                // and its includes are the class's from then on.
+                for (_, args) in block_includes(&body, &cpath, param.as_deref(), &known) {
+                    for arg in args {
+                        let Some(path) = constant_path_of(&arg) else { continue };
+                        let module = crate::ident::ClassId(crate::ident::Symbol::from(path.join("::").trim_start_matches("::")));
+                        let class = crate::ident::ClassId(crate::ident::Symbol::from(cpath.as_str()));
+                        if !app.autoload_includes.contains(&(class.clone(), module.clone())) {
+                            app.autoload_includes.push((class, module));
+                        }
+                    }
+                }
+                continue;
+            };
             let mut exprs = Vec::new();
             for (call, args) in &includes {
                 let Ok(args) = args.iter().map(|a| super::expr::ingest_expr(a, &file)).collect::<Result<Vec<_>, _>>() else {
@@ -338,6 +352,21 @@ pub(super) fn rails_autoloader(node: &Node<'_>) -> Option<&'static str> {
         && loaders.block().is_none()
         && loaders.receiver().and_then(|r| constant_path_of(&r)).is_some_and(|p| p.join("::") == "Rails"))
     .then_some(which)
+}
+
+/// The `<recv>.include(M, …)` / `<recv>.send(:include, M, …)` statements of
+/// a block on the constant `cpath` or the block parameter whose modules
+/// are known and read from the top level, whatever else the block does.
+fn block_includes<'pr>(
+    body: &[Node<'pr>],
+    cpath: &str,
+    param: Option<&str>,
+    known: &Known,
+) -> Vec<(CallNode<'pr>, Vec<Node<'pr>>)> {
+    body.iter()
+        .filter_map(|stmt| receiver_includes(std::slice::from_ref(stmt), cpath, param, known))
+        .flatten()
+        .collect()
 }
 
 /// Each statement's call and module arguments, when every statement is

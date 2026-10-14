@@ -10118,6 +10118,24 @@ fn emit_library_class_decl_inner(
         }
         _ => lc,
     };
+    // A boot initializer's `Base.include(Concern)` runs at load, outside
+    // any class body whose include would write the Concern's extends
+    // (`write_include`): they follow the statement here, as
+    // `append_features` extends `Base` (`program_concern_extends`).
+    let with_initializer_extends;
+    let run_initializer = crate::ingest::initializer_programs::RUN_METHOD;
+    let lc = if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == run_initializer) {
+        let mut copy = lc.clone();
+        for m in &mut copy.methods {
+            if m.receiver == MethodReceiver::Class && m.name.as_str() == run_initializer {
+                program_concern_extends(&mut m.body, app);
+            }
+        }
+        with_initializer_extends = copy;
+        &with_initializer_extends
+    } else {
+        lc
+    };
     // A Concern's `class_methods do` defines `ClassMethods` with the
     // block's defs as its instance methods (`App::class_methods_blocks`);
     // the IR's class-side copies on the Concern are that module here.
@@ -16037,10 +16055,14 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
 /// record it dumps. Only constants that name an app module as written
 /// (the statement is at the file's top level) are taken.
 fn program_concern_extends(e: &mut Expr, app: &App) {
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+    // `Base.include(Concern)` (a boot initializer's `on_load` block,
+    // lifted into `run_initializer`) takes its extends on `Base`.
+    if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Const { .. }))
         && method.as_str() == "include"
         && !args.is_empty()
     {
+        let recv = recv.clone();
         let names: Option<Vec<ClassId>> = args
             .iter()
             .map(|a| match &*a.node {
@@ -16059,7 +16081,7 @@ fn program_concern_extends(e: &mut Expr, app: &App) {
             for carrier in carriers {
                 let path = std::iter::once(Symbol::from("")).chain(carrier.0.as_str().split("::").map(Symbol::from)).collect();
                 let arg = Expr::new(span, ExprNode::Const { path });
-                exprs.push(Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }));
+                exprs.push(Expr::new(span, ExprNode::Send { recv: recv.clone(), method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }));
             }
             *e = Expr::new(span, ExprNode::Seq { exprs });
         }

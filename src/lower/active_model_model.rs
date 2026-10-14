@@ -740,3 +740,52 @@ pub(crate) fn validation_call(call: &Expr) -> Option<&str> {
     (!statements.is_empty() && statements.iter().all(|s| validation_call(s).is_some())).then_some(method.as_str())
 }
 
+
+/// The PostgreSQL Ruby-family tree carries ActiveModel::Attributes
+/// (runtime/spinel/cruby/active_model_attributes.rb,
+/// `project::carries_active_model_attributes`) and
+/// ActiveModel::AttributeAssignment (runtime/active_record_core.rb), so a
+/// lowered tableless model that includes either keeps the include: the
+/// analysis drops every `ActiveModel::*` marker include from
+/// `model_includes` (the lowering synthesizes what the others give), but
+/// the declarations a class body or a subclass makes (`attribute :name,
+/// :string, default: x`) and `assign_attributes(attrs)` run against the
+/// ports at run time.
+pub fn keep_attributes_include(lcs: &mut [LibraryClass], app: &App) {
+    if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        for name in ["ActiveModel::Attributes", "ActiveModel::AttributeAssignment"] {
+            let module = ClassId(Symbol::from(name));
+            if !lc.includes.contains(&module) && includes_module(model, name) {
+                lc.includes.push(module);
+            }
+        }
+    }
+}
+
+/// Does `model`'s body `include ActiveModel::Attributes`?
+pub fn includes_attributes(model: &crate::dialect::Model) -> bool {
+    includes_module(model, "ActiveModel::Attributes")
+}
+
+fn includes_module(model: &crate::dialect::Model, name: &str) -> bool {
+    model.body.iter().any(|item| {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+        method.as_str() == "include"
+            && args.iter().any(|a| {
+                matches!(&*a.node, ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(name.split("::")))
+            })
+    })
+}
+
+/// Do the `attribute` declarations of `model`'s subclasses run at run
+/// time, against the ActiveModel::Attributes port the PostgreSQL
+/// Ruby-family tree carries (`keep_attributes_include`)?
+pub fn runs_attributes_at_run_time(app: &App, model: &crate::dialect::Model) -> bool {
+    app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) && includes_attributes(model)
+}

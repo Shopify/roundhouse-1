@@ -445,6 +445,7 @@ pub(crate) fn lowered_model_lcs(
     for lc in &mut lcs {
         relax_from_stmt_handle(lc);
     }
+    crate::lower::active_model_model::keep_attributes_include(&mut lcs, app);
     apply_model_lowering(&mut lcs, app);
     (lcs, params_specs)
 }
