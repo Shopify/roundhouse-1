@@ -584,9 +584,10 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
 /// Signatures runtime/ruby bodies call that live with their source
 /// outside runtime/ruby: active_model_type.rb ships from runtime/spinel,
 /// and connection.rb's attribute API calls its `ActiveRecord::Type`
-/// registry. The RBS inference probe seeds the same file
+/// registry; relation.rb's `Db.adapter_name` read is typed by db.rbs, which
+/// pairs with no .rb here. The RBS inference probe seeds the same files
 /// (`inference_on_spinel_blog_runtime_with_rbs::DEPENDENCY_RBS`).
-const SHARED_RUNTIME_RBS: &[&str] = &["runtime/spinel/active_model_type.rbs"];
+const SHARED_RUNTIME_RBS: &[&str] = &["runtime/spinel/active_model_type.rbs", "runtime/ruby/db.rbs"];
 
 #[test]
 fn every_runtime_method_body_is_fully_typed() {
@@ -1228,7 +1229,15 @@ fn every_runtime_method_body_concretely_typed() {
     // +5, reporters' delta vs this branch's own +190, headers +4, #829 +16,
     // AttachedMany#map +1) = 1657, rounded to 1660. NOT MEASURED in the
     // merge; the integrator records the measured value after building.
-    const CEILING: usize = 1660;
+    //
+    // MEASURED 1737 on 2026-10-14 (om110): the merge's estimate (1660) was
+    // never measured. The typed sweep above now passes, so this reads every
+    // body: connection.rb's `insert_all` / `upsert_all` family (om82/om100),
+    // relation.rb's spawn/bang chain methods (om107), association key
+    // predicates (om92) and Enumerable (om86) carry caller-defined values
+    // (+77 over the estimate). The fixes themselves add two: a Kernel
+    // `to_enum` and a splatted `slice` answer gradual.
+    const CEILING: usize = 1737;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
@@ -1297,4 +1306,56 @@ fn empty_html_opts_emits_string_keyed_maps_on_csharp_and_kotlin() {
         emitted, "mutableMapOf<String, Any?>()",
         "empty untyped hash arg must pin String keys for Kotlin invariance"
     );
+}
+
+/// Array reads a runtime body forwards to its records (`Relation#shuffle`,
+/// `#rotate`, `#rindex`, a splatted `#slice`) and a bare `to_enum` in an
+/// instance method each resolve to a concrete type (or an explicit gradual
+/// one), never an unresolved `Ty::Var`.
+#[test]
+fn array_forwarders_and_bare_to_enum_leave_no_unresolved_var() {
+    let ruby = r#"
+class Bag
+  def shuffled(*args)
+    items.shuffle(*args)
+  end
+
+  def rotated(count = 1)
+    items.rotate(count)
+  end
+
+  def last_index(*args)
+    items.rindex(*args)
+  end
+
+  def sliced(*args)
+    items.slice(*args)
+  end
+
+  def each
+    return to_enum(:each) { items.length } unless block_given?
+    items.each { |x| yield x }
+  end
+
+  def items
+    []
+  end
+end
+"#;
+    let rbs = r#"
+class Bag
+  def shuffled: (*untyped args) -> Array[String]
+  def rotated: (?Integer count) -> Array[String]
+  def last_index: (*untyped args) -> Integer?
+  def sliced: (*untyped args) -> untyped
+  def each: () ?{ (String) -> void } -> untyped
+  def items: () -> Array[String]
+end
+"#;
+    let methods = parse_methods_with_rbs(ruby, rbs).expect("parses and types");
+    let mut untyped: Vec<String> = Vec::new();
+    for m in &methods {
+        collect_untyped(&m.body, m.name.as_str(), &mut untyped);
+    }
+    assert!(untyped.is_empty(), "unresolved sub-expressions: {untyped:#?}");
 }

@@ -360,6 +360,14 @@ module ActiveRecord
       "SQLite"
     end
 
+    # Whether the app has a transaction open, as the Db shim reports it
+    # (the request read snapshot the shims open around a GET does not
+    # count, as Rails has no such thing). `FragmentCache` and
+    # `Relation#create_or_find_by` read it.
+    def transaction_open?
+      Db.transaction_open?
+    end
+
     # Rails `quote`: a full SQL literal, quotes included for strings.
     # `Db.escape_string` already wraps in single quotes (sqlite literal
     # syntax with '' doubling).

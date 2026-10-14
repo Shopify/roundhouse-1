@@ -6,6 +6,17 @@ module ActiveRecord
     attr_accessor :adapter
   end
 
+  # Rails' `ActiveRecord.default_timezone`: the clock a timestamp is
+  # written in, `:utc` unless an app sets `:local`. Core reads it
+  # directly (`ActiveRecord.default_timezone == :utc`).
+  def self.default_timezone
+    @default_timezone || :utc
+  end
+
+  def self.default_timezone=(zone)
+    @default_timezone = zone
+  end
+
   # An enum column assigned by LABEL. Rails' `enum :role, %i[member
   # administrator bot]` lets `user.role = "administrator"` store `1`;
   # the synthesized per-column writers cast to the column's slot type,
@@ -1462,7 +1473,7 @@ module ActiveRecord
     # sets :local). Core calls it with a model receiver
     # (`CheckoutProfile.current_time_from_proper_timezone`), so it is public.
     def self.current_time_from_proper_timezone
-      zone = ActiveRecord.respond_to?(:default_timezone) ? ActiveRecord.default_timezone : :utc
+      zone = ActiveRecord.default_timezone
       zone == :utc ? Time.now.utc : Time.now
     end
 
