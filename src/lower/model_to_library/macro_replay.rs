@@ -652,6 +652,37 @@ impl<'a> ClassSide<'a> {
                     .any(|m| self.app.schema.tables.contains_key(&m.table.0)))
     }
 
+    /// The call's `attributes: [...]` keyword is a literal list naming
+    /// decimal columns only, each on the class's table or an ancestor's,
+    /// on the PostgreSQL tree whose runtime base checks the declared type
+    /// against the column's.
+    fn names_decimal_columns(&self, args: &[Expr]) -> bool {
+        if self.app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+            return false;
+        }
+        let Some(ExprNode::Hash { entries, .. }) = args.last().map(|a| &*a.node) else { return false };
+        let Some((_, list)) = entries
+            .iter()
+            .find(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "attributes"))
+        else {
+            return false;
+        };
+        let ExprNode::Array { elements, .. } = &*list.node else { return false };
+        let columns: Vec<&crate::schema::Column> = std::iter::once(self.owner)
+            .chain(self.chain.iter().map(|m| &m.name))
+            .filter_map(|n| self.app.models.iter().find(|m| &m.name == n))
+            .filter_map(|m| self.app.schema.tables.get(&m.table.0))
+            .flat_map(|t| t.columns.iter())
+            .collect();
+        !elements.is_empty()
+            && elements.iter().all(|e| {
+                let ExprNode::Lit { value: Literal::Sym { value } } = &*e.node else { return false };
+                columns
+                    .iter()
+                    .any(|c| c.name.as_str() == value.as_str() && matches!(c.col_type, crate::schema::ColumnType::Decimal { .. }))
+            })
+    }
+
     fn base_modules(&self) -> &[(&'a LibraryClass, &'a LibraryClass)] {
         self.base.get_or_init(|| {
             let mut modules = base_include_class_modules(self.app);
@@ -755,7 +786,12 @@ impl<'a> ClassSide<'a> {
                 Err(reason) => MacroVerdict::Refuse(reason),
             });
         }
-        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) || is_model_dsl(method.as_str()) {
+        if let Some(verdict) = self.constant_loop_verdict(recv.as_ref(), method.as_str(), args, block.as_ref()) {
+            return Some(verdict);
+        }
+        // `self #: as untyped` (or a local bound to it) as the receiver is
+        // the class too: Core's Sale writes its `money_column` call on one.
+        if !recv.as_ref().is_none_or(|r| is_self_like(r, &self.self_aliases)) || is_model_dsl(method.as_str()) {
             return None;
         }
         let Some((def, module)) = self.class_method(method.as_str()) else {
@@ -774,6 +810,7 @@ impl<'a> ClassSide<'a> {
         let mut walk = Walk::new(self, method.as_str());
         walk.answered = self.claimed.contains(&call.span);
         walk.declares_association = self.declared.contains(&call.span);
+        walk.decimal_attributes = self.names_decimal_columns(args);
         let result = (|| {
             if let Some(m) = module {
                 walk.module_extended(m, method.as_str())?;
@@ -800,6 +837,48 @@ impl<'a> ClassSide<'a> {
     /// receiver stay on the paths that already handle them. `extend`
     /// through a local is the Module protocol's (`object_extend`), not
     /// replayed here.
+    /// `CONSTANT.keys.each do |name| define_method(name) { ... } end` in
+    /// the class body (Core's Sale defines a MoneyBag reader and writer for
+    /// each of `MONEY_AGGREGATES`' keys): Ruby iterates a constant the
+    /// emitted class carries and `define_method` runs there, on the
+    /// PostgreSQL CRuby tree whose emitted class is the one Ruby loads. The
+    /// receiver is a constant read through argument-less methods, the
+    /// block is walked like a macro's body, and what it runs now (not the
+    /// deferred `define_method` bodies) must be answered by the class.
+    fn constant_loop_verdict(
+        &self,
+        recv: Option<&Expr>,
+        method: &str,
+        args: &[Expr],
+        block: Option<&Expr>,
+    ) -> Option<MacroVerdict> {
+        if !matches!(method, "each" | "each_pair" | "each_key" | "each_value") || !args.is_empty() {
+            return None;
+        }
+        let (recv, block) = (recv?, block?);
+        if self.app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+            return None;
+        }
+        // A constant, then argument-less reads of it (`.keys`, `.values`).
+        fn constant_read(e: &Expr) -> bool {
+            match &*e.node {
+                ExprNode::Const { .. } => true,
+                ExprNode::Send { recv: Some(r), args, block: None, .. } if args.is_empty() => constant_read(r),
+                _ => false,
+            }
+        }
+        if !constant_read(recv) {
+            return None;
+        }
+        let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+        let mut walk = Walk::new(self, method);
+        let mut aliases = self.self_aliases.clone();
+        Some(match walk.expr(body, &mut aliases) {
+            Ok(()) => MacroVerdict::Replay,
+            Err(reason) => MacroVerdict::Refuse(reason),
+        })
+    }
+
     fn self_mixin_verdict(
         &self,
         recv: Option<&Expr>,
@@ -1151,6 +1230,17 @@ struct Walk<'s, 'a> {
     answered: bool,
     /// The macro call is one whose `belongs_to` the model compiled.
     declares_association: bool,
+    /// Class methods the walked macros define at run time with a literal
+    /// `define_singleton_method(:name)`: a later call of the walk reaches
+    /// them as Ruby does (Core's `configure_money_bags` defines
+    /// `money_bag_options`, which `money_bags` reads).
+    defined_singletons: Vec<String>,
+    /// The macro call passes `attributes: [...]` naming only decimal
+    /// columns of the compiled table (`money_bags(attributes: [:price])`):
+    /// the `attribute(name, :decimal)` the macro makes for each is the
+    /// type the column already has, which the runtime base accepts as a
+    /// no-op (`Base.attribute`).
+    decimal_attributes: bool,
 }
 
 impl<'s, 'a> Walk<'s, 'a> {
@@ -1165,6 +1255,8 @@ impl<'s, 'a> Walk<'s, 'a> {
             in_progress: Vec::new(),
             answered: false,
             declares_association: false,
+            defined_singletons: Vec::new(),
+            decimal_attributes: false,
         }
     }
 
@@ -1219,11 +1311,29 @@ impl<'s, 'a> Walk<'s, 'a> {
         if name == "attribute" && self.side.attributes_runtime {
             return Ok(());
         }
+        if name == "attribute" && self.decimal_attributes {
+            return Ok(());
+        }
+        // `Object#try` and `Module#silence_redefinition_of_method`: the
+        // PostgreSQL CRuby tree loads ActiveSupport's own before any app
+        // code (runtime/spinel/active_support_tryable.rb, required from
+        // boot.rb; runtime/active_support_redefine_method.rb, which the
+        // class_attribute port requires), so a class is answered them.
+        // Core's `configure_money_bags` reads `try(:money_bag_options) ||
+        // {}` and `money_bags` redefines each reader.
+        if matches!(name, "try" | "try!" | "silence_redefinition_of_method")
+            && self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+        {
+            return Ok(());
+        }
         if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {
             return Err(format!(
                 "{} reaches `{name}`, which the lowered model declares statically from its body, not at class-body run time",
                 self.via()
             ));
+        }
+        if self.defined_singletons.iter().any(|d| d == name) {
+            return Ok(());
         }
         if let Some((def, module)) = self.side.class_method(name) {
             if self.seen.iter().any(|s| s == name) {
@@ -1322,6 +1432,15 @@ impl<'s, 'a> Walk<'s, 'a> {
                     self.self_call(&name)?;
                     if matches!(name.as_str(), "class_eval" | "module_eval" | "instance_eval") {
                         self.eval_strings(args)?;
+                    }
+                    if name == "define_singleton_method" {
+                        match args.first().map(|a| &*a.node) {
+                            Some(ExprNode::Lit { value: Literal::Sym { value } }) => {
+                                self.defined_singletons.push(value.as_str().to_string())
+                            }
+                            Some(ExprNode::Lit { value: Literal::Str { value } }) => self.defined_singletons.push(value.clone()),
+                            _ => {}
+                        }
                     }
                 }
                 let skip_first = on_self && name != method.as_str();
