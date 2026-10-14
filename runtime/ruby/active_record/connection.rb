@@ -3072,6 +3072,14 @@ module ActiveRecord
       else
         list << full
       end
+      # The ErrorDetail a compiled rule's push keeps beside the message:
+      # `errors[:attr]` (error_messages_for) and `to_hash` read these, so
+      # a validator registered at run time must leave them too.
+      details = record.respond_to?(:error_details) ? record.error_details : nil #: untyped
+      if details && defined?(::ActiveRecord::ErrorDetail)
+        detail = ::ActiveRecord::ErrorDetail #: untyped
+        details << detail.new(name.to_s, error.raw_type.to_s, short)
+      end
       error
     end
 

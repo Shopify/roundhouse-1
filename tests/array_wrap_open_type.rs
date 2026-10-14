@@ -33,6 +33,11 @@ const MODEL: &str = r#"class Widget < ApplicationRecord
   def named
     Array.wrap(name.to_s)
   end
+
+  def seen(list)
+    list |= Array.wrap(history)
+    list
+  end
 end
 "#;
 
@@ -94,4 +99,25 @@ fn the_branch_answers_what_rails_answers() {
         String::from_utf8_lossy(&output.stdout).trim(),
         r#"[[{"step" => "b"}], [{"step" => "a"}, {"step" => "b"}], [{"step" => "a"}, {"step" => "b"}]]"#
     );
+}
+
+/// The bind-once branch is a statement sequence; as the value of an
+/// operator assignment it is grouped, or `list |= __array_wrap = history`
+/// ends after the first line and unions the Array with the bare value.
+#[test]
+fn an_operator_assignment_groups_the_wrap() {
+    let src = model(BuildTarget::Ruby);
+    let body = method(&src, "seen");
+    let script = format!(
+        "class Probe\n  attr_accessor :history\n{body}\n  end\nend\n\
+         p [nil, [\"a\"], \"b\"].map {{ |h| w = Probe.new; w.history = h; w.seen([\"a\"]) }}\n"
+    );
+    let output = Command::new("ruby").args(["-e", &script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{script}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#"[["a"], ["a"], ["a", "b"]]"#);
 }

@@ -1,15 +1,17 @@
 //! Refuse an `unscope` the runtime cannot honour.
 //!
-//! The shared `Relation#unscope` implements only `unscope(where: <column>)`
-//! and `unscope(where: [<column>, ...])`. Anything else -- `unscope(:order)`,
-//! `unscope(:where)`, `unscope(where: nil)`, a non-literal target -- is
-//! accepted by analysis (the method resolves) but raises at run time, or
-//! would silently remove nothing. A removed error is a claim the program
-//! runs, so those shapes are an Error here rather than a late surprise.
+//! The shared `Relation#unscope` follows Rails' `unscope!`: the unscoping
+//! symbols (`unscope(:order)`, `unscope(:where)`, `unscope(:left_joins)` ...)
+//! and `unscope(where: <column>)` / `unscope(where: [<column>, ...])`, the
+//! column a symbol, a string (`"table.col"`) or an expression yielding one,
+//! with Rails' `ArgumentError` for anything else it is given. What it cannot
+//! answer is a call with no argument: Rails raises for it, the runtime
+//! would remove nothing. A removed error is a claim the program runs, so
+//! that shape is an Error here rather than a late surprise.
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::expr::{Expr, ExprNode, Literal};
+use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 
 pub fn apply_unscope_check(app: &App) -> Vec<Diagnostic> {
@@ -29,38 +31,24 @@ pub fn apply_unscope_check(app: &App) -> Vec<Diagnostic> {
         let kind = DiagnosticKind::Unsupported {
             target: None,
             construct: Symbol::from("unscope"),
-            detail: "only unscope(where: :column) is supported".into(),
+            detail: "unscope needs an argument".into(),
         };
         out.push(Diagnostic {
             span: *span,
             severity: Diagnostic::default_severity(&kind),
             kind,
-            message: "`unscope` is supported only as `unscope(where: :column)` or \
-                      `unscope(where: [:a, :b])` with literal column names; this form \
-                      would raise or remove nothing at run time"
+            message: "`unscope` with no argument raises in Rails and would remove nothing here; \
+                      name what to unscope (`unscope(:order)`, `unscope(where: :column)`)"
                 .into(),
         });
     }
     out
 }
 
-fn is_column_literal(e: &Expr) -> bool {
-    matches!(
-        &*e.node,
-        ExprNode::Lit { value: Literal::Sym { .. } } | ExprNode::Lit { value: Literal::Str { .. } }
-    )
-}
-
+/// `unscope` with no argument names nothing to unscope. Every other call
+/// is the runtime's to judge: it answers Rails' unscoping symbols and
+/// `where:` columns, and raises Rails' `ArgumentError` for an invalid
+/// symbol, a hash key other than `where:` or another object.
 fn is_supported(args: &[Expr]) -> bool {
-    let [arg] = args else { return false };
-    let ExprNode::Hash { entries, .. } = &*arg.node else { return false };
-    let [(k, v)] = entries.as_slice() else { return false };
-    let is_where = matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "where");
-    if !is_where {
-        return false;
-    }
-    match &*v.node {
-        ExprNode::Array { elements, .. } => elements.iter().all(is_column_literal),
-        _ => is_column_literal(v),
-    }
+    !args.is_empty()
 }

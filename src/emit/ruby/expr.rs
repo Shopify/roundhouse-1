@@ -968,6 +968,14 @@ fn emit_node(n: &ExprNode) -> String {
         // `target += value`, etc. Preserves source short-circuit
         // semantics (and Rails dirty-tracking on `||=`).
         ExprNode::OpAssign { target, op, value } => {
+            // A multi-statement value (`x |= Array.wrap(call)`, whose
+            // bind-once lowering is a Seq) groups, as an Assign's does:
+            // bare, the statement ends after its first line and the
+            // operator reads the bound temporary, not the result.
+            let emit_value = || {
+                let v = emit_expr(value);
+                if is_multi_seq(value) { format!("({v})") } else { v }
+            };
             // `ENV[k] ||= v`: spinel models ENV only as a call receiver,
             // and an op-assign target reads it as a value. Expand to the
             // read-then-write Ruby defines it as.
@@ -977,7 +985,7 @@ fn emit_node(n: &ExprNode) -> String {
                 if matches!(&*index.node, ExprNode::Lit { value: Literal::Str { .. } })
                     && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ENV") {
                     let k = emit_expr(index);
-                    let v = emit_expr(value);
+                    let v = emit_value();
                     let infix = op.as_ruby().trim_end_matches('=');
                     return match infix {
                         "||" | "&&" => format!("(ENV[{k}] {infix} (ENV[{k}] = {v}))"),
@@ -1005,11 +1013,11 @@ fn emit_node(n: &ExprNode) -> String {
                     let infix = op.as_ruby().trim_end_matches('=');
                     return format!(
                         "{r}.{name} = {r}.{name} {infix} {}",
-                        emit_expr(value)
+                        emit_value()
                     );
                 }
             }
-            format!("{} {} {}", emit_lvalue(target), op.as_ruby(), emit_expr(value))
+            format!("{} {} {}", emit_lvalue(target), op.as_ruby(), emit_value())
         }
         ExprNode::Yield { args } => {
             let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();

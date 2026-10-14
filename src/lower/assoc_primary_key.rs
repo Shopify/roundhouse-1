@@ -73,32 +73,33 @@ fn through_chain_custom_key(
         }
     }
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
-    for a in thr_model.associations() {
-        match a {
-            Association::HasMany { target: t, through: None, .. }
-            | Association::HasOne { target: t, .. }
-                if t == target =>
-            {
-                if let Some(k) = custom_primary_key(a) {
-                    return Some(format!(
-                        "`{}#{}` declares `primary_key: :{}`",
-                        thr_model.name.0,
-                        a.name(),
-                        k
-                    ));
-                }
-            }
-            Association::HasMany { target: t, through: Some(thru), .. } if t == target => {
-                if let Some(found) =
-                    through_chain_custom_key(models, thr_model, thru, target, depth + 1)
-                {
-                    return Some(found);
-                }
-            }
-            _ => {}
-        }
+    // Only the association the through chain reads is a hop, the one
+    // `resolve_through_chain` picks: a `belongs_to` to the target
+    // first, else the first plain `has_many` / `has_one`, else the
+    // first nested `through:`. A sibling that also reaches the target
+    // (`has_many :members` next to `has_many :members_by_number,
+    // primary_key: :number`) is not on the chain.
+    if thr_model
+        .associations()
+        .any(|a| matches!(a, Association::BelongsTo { target: t, .. } if t == target))
+    {
+        return None;
     }
-    None
+    let plain = thr_model.associations().find(|a| match a {
+        Association::HasMany { target: t, through: None, .. }
+        | Association::HasOne { target: t, .. } => t == target,
+        _ => false,
+    });
+    if let Some(a) = plain {
+        return custom_primary_key(a).map(|k| {
+            format!("`{}#{}` declares `primary_key: :{}`", thr_model.name.0, a.name(), k)
+        });
+    }
+    let nested = thr_model.associations().find_map(|a| match a {
+        Association::HasMany { target: t, through: Some(thru), .. } if t == target => Some(thru),
+        _ => None,
+    })?;
+    through_chain_custom_key(models, thr_model, nested, target, depth + 1)
 }
 
 /// Why `assoc` cannot be synthesized correctly, when its

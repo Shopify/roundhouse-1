@@ -164,11 +164,24 @@ fn discard_all_is_refused_not_silent() {
 }
 
 #[test]
-fn an_unscope_other_than_where_columns_is_refused() {
-    for call in ["unscope(:order)", "unscope(where: nil)", "unscope(where: some_cols)"] {
+fn an_unscope_without_an_argument_is_refused() {
+    for call in ["unscope"] {
         let src = format!("class Article < ApplicationRecord\n  include Discard::Model\n\n  def self.plain(some_cols = nil)\n    order(:id).{call}\n  end\nend\n");
         let mut app = ingest_app_from_tree(tree(Some(LOCK), SCHEMA, &[("article", &src)])).expect("ingest");
         let errs = errors(&mut app);
         assert!(errs.iter().any(|e| e.contains("unscope")), "{call} accepted silently: {errs:?}");
+    }
+}
+
+#[test]
+fn an_unscope_the_runtime_answers_is_accepted() {
+    // `Relation#unscope` takes Rails' unscoping symbols and `where:` with a
+    // column, a list or an expression yielding one, and raises Rails'
+    // ArgumentError for the rest at run time.
+    for call in ["unscope(:order)", "unscope(:where, :limit)", "unscope(where: some_cols)", "unscope(where: [:id, \"articles.title\"])", "unscope(order: :id)"] {
+        let src = format!("class Article < ApplicationRecord\n  include Discard::Model\n\n  def self.plain(some_cols = nil)\n    order(:id).{call}\n  end\nend\n");
+        let mut app = ingest_app_from_tree(tree(Some(LOCK), SCHEMA, &[("article", &src)])).expect("ingest");
+        let errs = errors(&mut app);
+        assert!(!errs.iter().any(|e| e.contains("unscope")), "{call} refused: {errs:?}");
     }
 }

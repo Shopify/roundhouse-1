@@ -602,6 +602,7 @@ module ActiveRecord
     # `where:` takes the columns whose conditions go, whatever their
     # predicate (equality, IN, NOT …).
     def unscope(*args)
+      raise ArgumentError, "The method .unscope() must contain arguments." if args.empty?
       own_lists
       unload_records
       valid_scopes = UNSCOPING_VALUES #: Array[Symbol]
