@@ -3037,6 +3037,8 @@ end
     super::channel_callbacks::lower_channel_names(&mut app);
     super::on_load_reopen::apply_pending(&mut app);
     let pending_delegates = super::delegate::pending_model_delegates(&app);
+    // Before the splices read the concerns' class sides.
+    super::define_method_loops::expand_class_methods_blocks(&mut app, &sources, &mut concern_class_method_spans);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     super::delegate::lower_spliced_model_delegates(&mut app, &pending_delegates);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
@@ -3959,7 +3961,11 @@ fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
 
 /// `Const.method(...)` in `lc`'s body where `Const`, looked up from
 /// `lc`'s namespace outward, is one of the app's library classes and
-/// `method` a class method it defines.
+/// `method` a class method it defines, or the constant an app module
+/// assigns another constant to (`Metafields::Types` has `Type =
+/// ShopifyMetafields::Types::Type`, a gem's class: Core's
+/// `Metafields::FilterKind` body runs `Types::Type.extend(Classification)`
+/// and `Types::DateType.filter_kind = :date` on them).
 fn app_class_method_call(
     lc: &crate::dialect::LibraryClass,
     call: &crate::expr::Expr,
@@ -3991,6 +3997,21 @@ fn app_class_method_call(
             return at.iter().any(|&i| {
                 app.library_classes[i].methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name == *method)
             });
+        }
+        if let Some((last, holder)) = written.split_last()
+            && !holder.is_empty()
+        {
+            let holder = scope[..depth].iter().chain(holder.iter()).copied().collect::<Vec<_>>().join("::");
+            let aliased = by_name.get(holder.as_str()).is_some_and(|at| {
+                at.iter().any(|&i| {
+                    app.library_classes[i].constants.iter().any(|(name, value)| {
+                        name.as_str() == *last && matches!(&*value.node, crate::expr::ExprNode::Const { .. })
+                    })
+                })
+            });
+            if aliased {
+                return true;
+            }
         }
     }
     false

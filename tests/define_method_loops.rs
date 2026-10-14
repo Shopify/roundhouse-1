@@ -559,7 +559,7 @@ fn a_loop_naming_a_method_no_def_can_spell_matches_native() {
 // ---- Refused statements run natively on the Ruby emit -----------------------
 
 /// Shapes the expansion refuses: a computed name
-/// and a rest + keywords parameter list.
+/// and a body that asks whether a block was given.
 const REFUSED_SHAPES: &str = r##"module Cs
   class Forwarder
     def self.names
@@ -581,6 +581,7 @@ const REFUSED_SHAPES: &str = r##"module Cs
 
     %i[deliver deliver_all].each do |method_name|
       define_method(:"#{method_name}!") do |*args, **kwargs|
+        block_given?
         send(method_name, *args, **kwargs)
       end
     end
@@ -665,11 +666,12 @@ fn a_refused_wrapping_macro_call_runs_natively_on_the_ruby_emit() {
 }
 
 /// A concern's `class_methods do … end` whose loop wraps inherited class
-/// methods with `define_method` and a bare `super`
-/// (`ActiveSupport::Concern#class_methods`). The refused statement is
-/// hoisted out of the block into the concern's body, where `self` is the
-/// wrong object, so it is not written back as is: the emit keeps the named
-/// refusal instead of defining instance methods on the concern.
+/// methods with `define_method` and an explicit-argument `super`
+/// (`ActiveSupport::Concern#class_methods`; Core's
+/// `DeprecatedStiClassMethods`). The statement is evaluated at ingest like
+/// any class body's, but what it defines are class methods of every
+/// includer, so each becomes a `def self.name(*args, **kwargs, &block)`
+/// of the concern, which the concern fold copies onto the includer.
 const CLASS_METHODS_CONCERN: &str = r##"module Cs
   module Noisy
     extend ActiveSupport::Concern
@@ -679,7 +681,7 @@ const CLASS_METHODS_CONCERN: &str = r##"module Cs
     class_methods do
       WRAPPED.each do |method_name|
         define_method(method_name) do |*args, **kwargs, &block|
-          "noisy(#{super(*args, **kwargs, &block)})"
+          "noisy(#{method_name}:#{super(*args, **kwargs, &block)})"
         end
       end
     end
@@ -704,10 +706,106 @@ end
 const CLASS_METHODS_SCRIPT: &str = "p Cs::Person.first_name\np Cs::Person.last_name\n";
 
 #[test]
-fn a_refused_class_methods_loop_stays_a_named_refusal_on_the_ruby_emit() {
+fn a_class_methods_define_method_loop_defines_class_methods_on_the_ruby_emit() {
     let expected = native("class_methods", &format!("{NATIVE_PRELUDE}{CLASS_METHODS_CONCERN}{CLASS_METHODS_SCRIPT}"));
-    assert_eq!(expected.lines().collect::<Vec<_>>(), ["\"noisy(ada)\"", "\"noisy(lovelace)\""], "native control");
+    assert_eq!(
+        expected.lines().collect::<Vec<_>>(),
+        ["\"noisy(first_name:ada)\"", "\"noisy(last_name:lovelace)\""],
+        "native control"
+    );
     let run = emit_and_run::real_blog().write("app/lib/cs/noisy.rb", CLASS_METHODS_CONCERN).run_ruby(CLASS_METHODS_SCRIPT);
+    assert!(run.success, "emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+}
+
+/// The same block over a collection no literal gives is refused, and
+/// the concern's body is the wrong place to write the statement back:
+/// the emit keeps the named refusal instead of defining instance methods.
+const COMPUTED_CLASS_METHODS_CONCERN: &str = r##"module Cs
+  module Computed
+    extend ActiveSupport::Concern
+
+    WRAPPED = %w[first_name last_name].map(&:to_sym).freeze
+
+    class_methods do
+      WRAPPED.each do |method_name|
+        define_method(method_name) { |*args| super(*args) }
+      end
+    end
+  end
+
+  class Includer
+    include Cs::Computed
+  end
+end
+"##;
+
+#[test]
+fn a_refused_class_methods_loop_stays_a_named_refusal_on_the_ruby_emit() {
+    let run = emit_and_run::real_blog().write("app/lib/cs/computed.rb", COMPUTED_CLASS_METHODS_CONCERN).run_ruby("p Cs::Computed\n");
     assert!(!run.success, "the hoisted loop must not run as written:\n{}", run.stdout);
     assert!(run.stderr.contains("define_method_expansion not supported"), "{}", run.stderr);
+}
+
+/// The same block on a concern a model includes (Core's
+/// `Merchandising::Collections::DeprecatedStiClassMethods` on
+/// `SmartCollection` and `CustomCollection`): the wrapped names are
+/// ActiveRecord's own class methods, reached through `super`.
+const MODEL_CLASS_METHODS_CONCERN: &str = r##"module Auditing
+  module Counted
+    extend ActiveSupport::Concern
+
+    WRAPPED = %i[count exists?].freeze
+
+    class_methods do
+      WRAPPED.each do |method_name|
+        define_method(method_name) do |*args, **kwargs, &block|
+          Counted.note(name.to_s, method_name)
+          super(*args, **kwargs, &block)
+        end
+      end
+    end
+
+    class << self
+      def note(class_name, method_name)
+        (@notes ||= []) << "#{class_name}.#{method_name}"
+      end
+
+      attr_reader :notes
+    end
+  end
+end
+"##;
+
+const MODEL_CLASS_METHODS_SCRIPT: &str = r##"Article.create!(title: "one", body: "a body long enough")
+p Article.count
+p Article.exists?
+p Auditing::Counted.notes
+"##;
+
+#[test]
+fn a_class_methods_define_method_loop_reaches_a_model_includer() {
+    let expected = native(
+        "model_class_methods",
+        &format!(
+            "{NATIVE_PRELUDE}\
+             ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
+             ActiveRecord::Schema.verbose = false\n\
+             ActiveRecord::Schema.define {{ create_table(:articles) {{ |t| t.string :title; t.text :body; t.timestamps }} }}\n\
+             {MODEL_CLASS_METHODS_CONCERN}\
+             class Article < ActiveRecord::Base\n  include Auditing::Counted\nend\n\
+             {MODEL_CLASS_METHODS_SCRIPT}"
+        ),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected, ["1", "true", "[\"Article.count\", \"Article.exists?\"]"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/models/auditing/counted.rb", MODEL_CLASS_METHODS_CONCERN)
+        .edit("app/models/article.rb", ARTICLE_FIND, "  validates :body, presence: true, length: { minimum: 10 }\n  include Auditing::Counted\n")
+        .run_ruby(MODEL_CLASS_METHODS_SCRIPT);
+    // `check` still reports the keyword-splat `super` (its ABI is
+    // unverifiable); the emitted Ruby runs it.
+    assert!(run.success, "emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
 }
