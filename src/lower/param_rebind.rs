@@ -126,6 +126,13 @@ fn rewrite_method(body: &mut Expr, params: Vec<Symbol>) {
     if params.is_empty() {
         return;
     }
+    // A bare `super` forwards the parameters' current values by name.
+    // A fresh `__rh_*` local would leave it forwarding the binder the
+    // caller filled (webhooks/topic.rb's `attrs = {…}.merge(attrs)`
+    // then `super` passed the raw YAML hash, not the merged one).
+    if has_zsuper(body) {
+        return;
+    }
     let param_set: HashSet<Symbol> = params.into_iter().collect();
     let mut unsafe_params = HashSet::default();
     collect_unsafe_writes(body, &param_set, &mut unsafe_params, false);
@@ -137,6 +144,15 @@ fn rewrite_method(body: &mut Expr, params: Vec<Symbol>) {
     collect_names(body, &mut used);
     let mut rebound = HashMap::default();
     rewrite(body, &safe, &mut rebound, &used);
+}
+
+fn has_zsuper(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Super { args: None, .. }) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || has_zsuper(c));
+    found
 }
 
 /// A write inside an `If`/`Case`/`CaseMatch` arm, a `While` body, a

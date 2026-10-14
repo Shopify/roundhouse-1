@@ -480,6 +480,31 @@ end
     );
 }
 
+/// A bare `super` forwards the parameter's current value. A fresh
+/// local would leave it passing the caller's original (core's
+/// Webhooks::Topic: `attrs = {…}.merge(attrs)`, `super`).
+#[test]
+fn a_method_with_a_bare_super_keeps_its_parameter_write() {
+    let out = emit_classes(
+        r#"
+class Topic < Base
+  def initialize(attrs = {})
+    attrs = { a: 1 }.merge(attrs)
+    super
+  end
+end
+"#,
+    );
+    assert!(
+        !out.contains("__rh_attrs"),
+        "the zsuper reads the parameter, so it is written, not split:\n{out}"
+    );
+    assert!(
+        assigns_parameter(&out, "attrs"),
+        "the parameter is rebound in place:\n{out}"
+    );
+}
+
 /// A block parameter of the same name shadows; the method's rebind
 /// must not rewrite reads inside the block.
 #[test]

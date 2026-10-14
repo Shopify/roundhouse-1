@@ -824,6 +824,24 @@ pub(super) fn ingest_model_body_items(
         end: stmt.location().end_offset() as u32,
     };
     if let Some(call) = stmt.as_call_node() {
+        // `class_attribute :x, …` — the defs it makes, then the seed
+        // it runs where it stands (`ingest::class_attribute`). Also
+        // `self.class_attribute …` and `T.unsafe(self).class_attribute …`.
+        if let Some(decl) = super::class_attribute::parse(&call, file) {
+            let mut out: Vec<ModelBodyItem> = super::class_attribute::methods(owner, &decl)
+                .into_iter()
+                .map(|method| ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false })
+                .collect();
+            out.extend(super::class_attribute::seeds(&decl).into_iter().map(|expr| ModelBodyItem::ClassBody {
+                expr,
+                leading_comments: Vec::new(),
+                leading_blank_line: false,
+            }));
+            if let Some(first) = out.first_mut() {
+                *first.leading_comments_mut() = leading_comments;
+            }
+            return Ok(out);
+        }
         if call.receiver().is_none() {
             let name = constant_id_str(&call.name()).to_string();
             if name == "with_options" && call.block().is_some_and(|b| b.as_block_node().is_some()) {
@@ -884,23 +902,6 @@ pub(super) fn ingest_model_body_items(
                         span,
                     })
                     .collect());
-            }
-            // `class_attribute :x, …` — the defs it makes, then the seed
-            // it runs where it stands (`ingest::class_attribute`).
-            if let Some(decl) = super::class_attribute::parse(&call, file) {
-                let mut out: Vec<ModelBodyItem> = super::class_attribute::methods(owner, &decl)
-                    .into_iter()
-                    .map(|method| ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false })
-                    .collect();
-                out.extend(super::class_attribute::seeds(&decl).into_iter().map(|expr| ModelBodyItem::ClassBody {
-                    expr,
-                    leading_comments: Vec::new(),
-                    leading_blank_line: false,
-                }));
-                if let Some(first) = out.first_mut() {
-                    *first.leading_comments_mut() = leading_comments;
-                }
-                return Ok(out);
             }
             // `cattr_*` / `mattr_*` — same class-attr expansion library
             // ingest applies. Plain `attr_*` stays Unknown: concern
