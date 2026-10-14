@@ -55,6 +55,7 @@ pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let localized = app.locale_files.first().map(|f| (f.clone(), app.locale_files.len()));
     let port = super::active_model_model::ValidationsPort::of(app);
     let data = LabelData::of(app);
+    let own_errors = OwnErrors::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let owner = owner.cloned();
         let locals = port.locals(body);
@@ -64,6 +65,7 @@ pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
             owner: owner.as_ref(),
             locals: &locals,
             labels: data.at(owner.as_ref()),
+            own_errors: &own_errors,
         };
         rewrite_errors_add(body, &site, &mut diags)
     });
@@ -169,6 +171,63 @@ struct Site<'a> {
     owner: Option<&'a crate::ident::ClassId>,
     locals: &'a super::active_model_model::PortLocals,
     labels: Labels<'a>,
+    own_errors: &'a OwnErrors,
+}
+
+/// The library classes whose `errors` is their own method (asset_cloud's
+/// `AssetCloud::Validations`: `@errors ||= []`), with every class that
+/// includes or inherits one. Their `errors` is not the framework's
+/// accumulator, and nothing defines an `error_details` beside it, so the
+/// lowerings that record details stand off them.
+struct OwnErrors(std::collections::HashSet<crate::ident::ClassId>);
+
+impl OwnErrors {
+    fn of(app: &App) -> Self {
+        let classes: std::collections::HashMap<&crate::ident::ClassId, &crate::dialect::LibraryClass> =
+            app.library_classes.iter().map(|c| (&c.name, c)).collect();
+        let defines = |c: &crate::dialect::LibraryClass| {
+            c.methods.iter().any(|m| {
+                m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "errors" && m.params.is_empty()
+            })
+        };
+        let own = |start: &crate::dialect::LibraryClass| {
+            let mut seen: Vec<&crate::ident::ClassId> = Vec::new();
+            let mut queue = vec![start];
+            while let Some(c) = queue.pop() {
+                if seen.contains(&&c.name) {
+                    continue;
+                }
+                seen.push(&c.name);
+                if defines(c) {
+                    return true;
+                }
+                let parent = c.parent.iter().filter(|_| !c.is_module);
+                for name in c.includes.iter().chain(parent) {
+                    let name = crate::ident::ClassId(Symbol::from(name.0.as_str().trim_start_matches("::")));
+                    queue.extend(classes.get(&name).copied());
+                }
+            }
+            false
+        };
+        OwnErrors(app.library_classes.iter().filter(|c| own(c)).map(|c| c.name.clone()).collect())
+    }
+
+    /// Whether the `errors` read `reader` (`errors`, `self.errors`,
+    /// `record.errors`) is read off such a class: the owner for an
+    /// implicit or `self` receiver, the receiver's class where it is typed.
+    fn reads(&self, reader: &Expr, owner: Option<&crate::ident::ClassId>) -> bool {
+        let ExprNode::Send { recv, .. } = &*reader.node else { return false };
+        let named = |ty: &Ty| matches!(ty, Ty::Class { id, .. } if self.0.contains(id));
+        match recv.as_ref() {
+            None => owner.is_some_and(|o| self.0.contains(o)),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => owner.is_some_and(|o| self.0.contains(o)),
+            Some(r) => match r.ty.as_ref() {
+                Some(Ty::Union { variants }) => variants.iter().any(named),
+                Some(ty) => named(ty),
+                None => false,
+            },
+        }
+    }
 }
 
 fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
@@ -197,6 +256,9 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         if method.as_str() == "clear" && args.is_empty() {
             if let ExprNode::Send { recv: owner, method: em, args: ea, .. } = &*r.node {
                 if em.as_str() == "errors" && ea.is_empty() {
+                    if site.own_errors.reads(r, site.owner) {
+                        return;
+                    }
                     let span = expr.span;
                     let mut owner = owner.clone();
                     let ty = expr.ty.clone();
@@ -244,7 +306,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // is an ordinary method call and stays as written. The framework's
     // `ActiveModel::Errors` is the accumulator and grounds.
     let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { unreachable!() };
-    if r.ty.as_ref().is_some_and(names_own_class) {
+    if r.ty.as_ref().is_some_and(names_own_class) || site.own_errors.reads(r, site.owner) {
         return;
     }
     // A class over the ActiveModel::Validations port (and a module only

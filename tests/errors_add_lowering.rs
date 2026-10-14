@@ -363,3 +363,41 @@ end
     );
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+#[test]
+fn clear_on_a_classs_own_errors_array_stays_as_written() {
+    // asset_cloud's `AssetCloud::Validations` keeps `errors` as its own
+    // `@errors ||= []`, on a class that is no model: nothing defines an
+    // `error_details` beside it, so `errors.clear` is not lowered to also
+    // clear one (the emitted read raised NameError).
+    let (out, diags) = lower_and_emit(
+        r#"
+module AssetCloud
+  module Validations
+    #: () -> Array[String]
+    def errors
+      @errors ||= [] #: Array[String]?
+    end
+
+    #: () -> void
+    def validate
+      errors.clear
+    end
+  end
+end
+
+class Asset
+  include AssetCloud::Validations
+
+  #: () -> void
+  def reset
+    other = Asset.new
+    other.errors.clear
+  end
+end
+"#,
+    );
+    assert!(!out.contains("error_details"), "{out}");
+    assert!(out.contains("errors.clear"), "{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
