@@ -154,26 +154,27 @@ fn an_environment_style_branch_with_a_dropped_write_is_warning_free() {
 }
 
 /// Survey mode's placeholder for a construct ingest could not take — here
-/// a nested multi-write target — before another statement: in a method
+/// bind) — before another statement: in a method
 /// head, a rescue body and a lambda body.
 #[test]
+/// head, a rescue body and a lambda body.
 fn survey_placeholders_before_a_statement_are_not_written() {
     let source = r#"class Probe
   def head(pair)
-    (a, b), c = pair
+    (a, *b), c = pair
     puts c
   end
 
   def rescued(grouped)
     work(grouped)
   rescue StandardError => e
-    (owner_type, owner_id), = grouped
+    (owner_type, *owner_id), = grouped
     report(e)
   end
 
   def deferred(pair)
     -> {
-      (x, y), z = pair
+      (x, *y), z = pair
       build(z)
     }
   end
