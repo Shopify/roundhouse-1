@@ -438,8 +438,10 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     let ExprNode::Send { args, .. } = &mut *expr.node else { return };
     restore_kwrest_splat(args, &params);
     // A callee with no keyword parameter takes the Hash positionally, so
-    // the Ruby emitter must not write the source's `**` back over it.
-    if params.iter().all(|p| !p.keyword) {
+    // the Ruby emitter must not write the source's `**` back over it. A
+    // flattened `**rest` (`from_kwrest`) is not that: the Ruby tree
+    // writes the def back as `**rest`, which only a `**h` call binds.
+    if params.iter().all(|p| !p.keyword && !p.from_kwrest) {
         for arg in args.iter_mut() {
             arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
         }

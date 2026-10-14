@@ -109,6 +109,9 @@ const PROBE: &str = r##"class EnumProbe
     out << "inclusion: #{bad.valid?} #{bad.errors[:status].inspect}"
     missing = Playbook.new
     out << "required: #{missing.valid?} #{missing.errors[:kind].inspect}"
+    stored = Playbook.find(p.id)
+    stored.status = :gone
+    out << "persisted: #{stored.valid?} #{stored.errors[:status].inspect}"
     p.update!(status: :errored)
     out << "symbol write: #{Playbook.find(p.id).status.inspect} #{p.read_attribute(:status).inspect}"
     out
@@ -137,12 +140,13 @@ const FILES: [(&str, &str); 10] = [
     ("app/models/enum_probe.rb", PROBE),
 ];
 
-const EXPECTED: [&str; 6] = [
+const EXPECTED: [&str; 7] = [
     "statuses: [:active, :paused, :errored] [:manual, :auto]",
     "read: :paused :auto",
     "optional: true",
     "inclusion: false [\"is not included in the list\"]",
     "required: false [\"can't be blank\", \"is not included in the list\"]",
+    "persisted: false [\"is not included in the list\"]",
     "symbol write: :errored \"errored\"",
 ];
 
