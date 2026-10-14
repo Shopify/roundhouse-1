@@ -541,6 +541,15 @@ pub struct App {
     /// lift_autoload_includes`); the boot registers each one empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifted_autoload_callbacks: Vec<LiftedAutoloadCallback>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// `(class, module)` for each `<Class>.include(Module)` statement of a
+    /// boot initializer's `Rails.autoloaders.main.on_load("<Class>")` block
+    /// that is not lifted into the class body (the block does other work
+    /// too): the include happens when the loaded class's file finishes
+    /// loading, so the module's class methods are the class's (and its
+    /// subclasses') by the time a subclass body runs
+    /// (`ingest::load_hook_includes::lift_autoload_includes`).
+    pub autoload_includes: Vec<(ClassId, ClassId)>,
     /// Source files whose library-class ingest failed and that ingest
     /// went on without (the isolate-tolerant support-dir walk; in survey
     /// mode, every per-file class ingest): none of their classes,
@@ -1638,6 +1647,7 @@ impl App {
             library_class_reopens: HashMap::default(),
             load_hooks: Vec::new(),
             lifted_autoload_callbacks: Vec::new(),
+            autoload_includes: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),
             file_programs: Vec::new(),

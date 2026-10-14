@@ -4367,9 +4367,11 @@ fn ruby_family_files(
     // `errors.attribute_names` (see the file's header): carried where the
     // emitted code, its tests included, records or reads an error's
     // attribute (`emit::ruby::expr::error_attribute_push`).
+    // The Attributes port's lite `validates` records its messages
+    // through it.
     let carries_error_attributes = files.iter().any(|(path, content)| {
         path.ends_with(".rb") && !path.starts_with("runtime/") && names_constant(content, "ActiveModel::ErrorAttributes")
-    });
+    }) || carries_active_model_attributes(&files);
     if carries_error_attributes {
         files.push((
             "runtime/active_model_errors.rb".to_string(),
@@ -5089,6 +5091,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read ActiveModel::API runtime: {e}"))?;
         files.push(("runtime/active_model_api.rb".into(), api));
     }
+    // ActiveModel::Attributes (activemodel 8.2.0.alpha attributes.rb,
+    // attribute_registration.rb), over the type and attribute ports and
+    // active_record_core.rb's AttributeAssignment, where app code names it.
+    let carries_attributes = carries_active_model_attributes(files);
+    if carries_attributes {
+        let attributes = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_model_attributes.rb")
+            .map_err(|e| format!("read ActiveModel::Attributes runtime: {e}"))?;
+        files.push(("runtime/active_model_attributes.rb".into(), attributes));
+    }
     // ActiveRecord::Base's callback registration called at runtime
     // (`base.before_create(:x)` from a concern's `included` hook) and the
     // chains it runs with the compiled hooks (activerecord 8.2.0.alpha
@@ -5351,6 +5362,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                             "active_record_core",
                         ])
                         .chain(carries_api.then_some("active_model_api"))
+                        .chain(carries_attributes.then_some("active_model_attributes"))
                         .chain([
                             "active_record_callbacks",
                             "active_record_nested_attributes",
@@ -11133,6 +11145,18 @@ module Kernel
     raise first if first
     raise
   end
+
+  # `require_relative` is the `require` of the path beside the calling
+  # file, so a load callback of the loaded constant (Zeitwerk's `on_load`:
+  # a boot initializer's `Task.include(Concern)`) runs when it returns, as
+  # it does when an autoload completes: a subclass file's
+  # `require_relative "task"` ahead of `class Sub < Task` leaves the
+  # parent's includes in place for the subclass body's class macros.
+  # A caller with no file (`ruby -e`) is relative to the working directory.
+  private def require_relative(feature)
+    path = caller_locations(1, 1)&.first&.absolute_path
+    require(File.expand_path(feature, path ? File.dirname(path) : Dir.pwd))
+  end
 end
 "##;
 
@@ -16390,6 +16414,12 @@ fn carries_active_model_api(files: &[(String, String)]) -> bool {
     carries_named(files, &["ActiveModel::API", "ActiveModel::Model"])
 }
 
+/// True where app code names ActiveModel::Attributes, which
+/// runtime/spinel/cruby/active_model_attributes.rb defines.
+fn carries_active_model_attributes(files: &[(String, String)]) -> bool {
+    carries_named(files, &["ActiveModel::Attributes"])
+}
+
 /// True where app code (not the runtime, not a test body) calls a
 /// class-side validation helper (`self.validates(...)`,
 /// `validates_presence_of(...)`): a compiled model's own declarations
@@ -16554,7 +16584,8 @@ fn carries_active_support_messages(files: &[(String, String)]) -> bool {
 /// The namespaces runtime/spinel/active_model_type.rb declares that an
 /// app reaches by name: `ActiveRecord::Type::Integer`,
 /// `ActiveModel::Type::Value`, a `< ActiveRecord::Type::Value` subclass.
-const ACTIVE_MODEL_TYPE_NAMES: &[&str] = &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError"];
+const ACTIVE_MODEL_TYPE_NAMES: &[&str] =
+    &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError", "ActiveModel::Attributes"];
 
 /// The runtime methods that build the port's type objects
 /// (`connection.rb`'s `type_for_attribute` / `attribute_types`, and

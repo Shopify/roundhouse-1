@@ -91,9 +91,18 @@ pub(crate) fn claims(app: &App, lc: &LibraryClass, call: &Expr) -> bool {
     read(call).is_some() && tableless_ancestor(app, lc)
 }
 
+/// The PostgreSQL Ruby-family tree runs a subclass's `attribute` against
+/// the ActiveModel::Attributes port its tableless base includes
+/// (`active_model_model::keep_attributes_include`), so the declaration
+/// is replayed as written (`model_to_library::macro_replay`) with the
+/// port's registry, `attributes` and `attribute_names`, not lowered here.
+fn lowered_here(app: &App, lineage: &Lineage, lc: &LibraryClass) -> bool {
+    model_ancestry(lc, lineage)
+        .is_some_and(|(model, _)| model.parent.is_none() && !crate::lower::active_model_model::runs_attributes_at_run_time(app, model))
+}
+
 fn tableless_ancestor(app: &App, lc: &LibraryClass) -> bool {
-    let lineage = Lineage::new(app);
-    model_ancestry(lc, &lineage).is_some_and(|(model, _)| model.parent.is_none())
+    lowered_here(app, &Lineage::new(app), lc)
 }
 
 pub fn apply_sti_subclass_attributes(app: &mut App) {
@@ -103,7 +112,7 @@ pub fn apply_sti_subclass_attributes(app: &mut App) {
         .iter()
         .enumerate()
         .filter(|(_, lc)| lc.unknown_calls.iter().any(|c| read(c).is_some()))
-        .filter(|(_, lc)| model_ancestry(lc, &lineage).is_some_and(|(model, _)| model.parent.is_none()))
+        .filter(|(_, lc)| lowered_here(app, &lineage, lc))
         .map(|(i, _)| i)
         .collect();
     for index in plans {

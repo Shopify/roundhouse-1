@@ -76,6 +76,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_record_validations.rb", "runtime/active_record_validations.rb"),
     ("runtime/spinel/active_support_string_inquirer.rb", "runtime/active_support_string_inquirer.rb"),
     ("runtime/spinel/cruby/active_record_fixture_set.rb", "runtime/active_record_fixture_set.rb"),
+    ("runtime/spinel/cruby/active_model_attributes.rb", "runtime/active_model_attributes.rb"),
     ("runtime/spinel/cruby/arel.rb", "runtime/arel.rb"),
     ("runtime/spinel/cruby/active_record_arel.rb", "runtime/active_record_arel.rb"),
     // The PostgreSQL CRuby tree only, required by its test helper
