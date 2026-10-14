@@ -115,9 +115,11 @@ fn is_enum_mapping(e: &Expr, mappings: &HashSet<(String, String)>) -> bool {
     let ExprNode::Const { path } = &*c.node else {
         return false;
     };
+    // A rooted `::Model` carries a leading empty segment; it names the same top-level model.
     let model = path
         .iter()
         .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("::");
     args.is_empty() && mappings.contains(&(model, method.as_str().to_string()))
