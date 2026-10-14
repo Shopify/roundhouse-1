@@ -606,9 +606,20 @@ module Rails
     # campfire's tests set `action_dispatch.show_exceptions` to
     # `:rescuable`, and a forgery failure here always renders the 422
     # that setting asks for.
+    #
+    # `action_dispatch.parameter_filter` is the one key read: railties'
+    # `env_config` sets it to `filter_parameters` (precompiled, as
+    # `config.precompile_filter_parameters` is on from `load_defaults`
+    # 7.1, which every app this runtime serves sets), and an app builds
+    # its filter from it at load (Core's `FilterParameters::FILTER =
+    # ActiveSupport::ParameterFilter.new(Rails.application.env_config[
+    # "action_dispatch.parameter_filter"])`). Seeded on the first read,
+    # as Rails memoizes its own, so a test's write to the key stays.
     ENV_CONFIG = {}
 
     def env_config
+      ENV_CONFIG["action_dispatch.parameter_filter"] ||=
+        ActiveSupport::ParameterFilter.precompile_filters(filter_parameters)
       ENV_CONFIG
     end
 

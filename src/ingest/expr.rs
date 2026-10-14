@@ -14,6 +14,24 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+thread_local! {
+    /// Set by `ingest_branch_body` for the one StatementsNode it hands
+    /// to `ingest_expr`; that node reads and clears it on entry.
+    static BRANCH_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ingest the statements of an `if` / `unless` / `when` / `while` arm. A
+/// leading `return` guard there leaves the whole method, not just the
+/// arm, so the guard rewrite in the StatementsNode (which makes the rest
+/// of the block the `else`) does not apply: the code after the arm would
+/// still run. Such a guard stays a `return`.
+fn ingest_branch_body(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
+    BRANCH_BODY.with(|flag| flag.set(node.as_statements_node().is_some()));
+    let out = ingest_expr(node, file);
+    BRANCH_BODY.with(|flag| flag.set(false));
+    out
+}
+
 pub fn ingest_expr(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Survey-mode gate: when active, intercept Err returns and
     // substitute a `Literal::Nil` placeholder so the surrounding
@@ -1527,6 +1545,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_statements_node().is_some() => {
             let stmts = n.as_statements_node().unwrap();
+            let branch_body = BRANCH_BODY.with(|flag| flag.replace(false));
             // The StatementsNode's own location slice is the source for
             // all its children — its bytes let us detect blank-line
             // separators between consecutive stmts without threading the
@@ -1550,7 +1569,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // Triggered by the `return if Article.count > 0`
             // idiom in `db/seeds.rb` (Rails convention for
             // idempotent seed scripts).
-            if body_nodes.len() >= 2 {
+            if body_nodes.len() >= 2 && !branch_body {
                 if let Some(guard_cond_node) = detect_leading_guard(&body_nodes[0]) {
                     let binding = reads_bindings
                         .then(|| super::type_ascription::leading_self_binding(file, body_nodes[0].location().start_offset()))
@@ -1611,14 +1630,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let if_node = n.as_if_node().unwrap();
             let cond = ingest_expr(&if_node.predicate(), file)?;
             let then_branch = match if_node.statements() {
-                Some(s) => ingest_expr(&s.as_node(), file)?,
+                Some(s) => ingest_branch_body(&s.as_node(), file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
             let else_branch = match if_node.subsequent() {
                 Some(sub) => {
                     if let Some(else_node) = sub.as_else_node() {
                         match else_node.statements() {
-                            Some(s) => ingest_expr(&s.as_node(), file)?,
+                            Some(s) => ingest_branch_body(&s.as_node(), file)?,
                             None => Expr::new(
                                 Span::synthetic(),
                                 ExprNode::Seq { exprs: vec![] },
@@ -2196,12 +2215,12 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // In Prism, `unless`'s `statements()` is the "when false" body
             // and `consequent()` (if present) is the `else` body.
             let when_false = match u.statements() {
-                Some(s) => ingest_expr(&s.as_node(), file)?,
+                Some(s) => ingest_branch_body(&s.as_node(), file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
             let when_true = match u.else_clause() {
                 Some(else_node) => match else_node.statements() {
-                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    Some(s) => ingest_branch_body(&s.as_node(), file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 },
                 None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
@@ -2555,7 +2574,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             let cond = ingest_expr(&w.predicate(), file)?;
             let body = match w.statements() {
-                Some(s) => ingest_expr(&s.as_node(), file)?,
+                Some(s) => ingest_branch_body(&s.as_node(), file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
             ExprNode::While { cond, body, until_form: false }
@@ -2570,7 +2589,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             let cond = ingest_expr(&u.predicate(), file)?;
             let body = match u.statements() {
-                Some(s) => ingest_expr(&s.as_node(), file)?,
+                Some(s) => ingest_branch_body(&s.as_node(), file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
             ExprNode::While { cond, body, until_form: true }
@@ -2715,7 +2734,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     message: format!("unsupported case condition (expected when): {cond:?}"),
                 })?;
                 let body = match when.statements() {
-                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    Some(s) => ingest_branch_body(&s.as_node(), file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
                 };
                 let patterns = when.conditions();
@@ -2737,7 +2756,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             if let Some(else_clause) = case.else_clause() {
                 let body = match else_clause.statements() {
-                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    Some(s) => ingest_branch_body(&s.as_node(), file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
                 };
                 arms.push(Arm { pattern: Pattern::Wildcard, guard: None, body });
@@ -2769,7 +2788,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     message: format!("unsupported case/in condition (expected in): {cond:?}"),
                 })?;
                 let body = match in_node.statements() {
-                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    Some(s) => ingest_branch_body(&s.as_node(), file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
                 };
                 let (pattern, guard) = ingest_pattern_with_guard(&in_node.pattern(), file)?;
@@ -2777,7 +2796,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             let else_body = match case.else_clause() {
                 Some(else_clause) => Some(match else_clause.statements() {
-                    Some(s) => ingest_expr(&s.as_node(), file)?,
+                    Some(s) => ingest_branch_body(&s.as_node(), file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
                 }),
                 None => None,

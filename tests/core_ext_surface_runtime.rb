@@ -196,3 +196,17 @@ show("Object#with restores on raise") { x = WithProbe.new; begin; x.with(a: 5) {
 show("Object#with no attributes") { x = WithProbe.new; x.with { |o| o.a } }
 show("Object#with unknown writer") { x = WithProbe.new; begin; x.with(zz: 1) { }; rescue NoMethodError => e; e.class; end }
 show("1.respond_to?(:with)") { [1.respond_to?(:with), nil.respond_to?(:with), :a.respond_to?(:with), "".respond_to?(:with)] }
+
+show("{}.to_query") { {}.to_query }
+show("{b,a}.to_query sorts the pairs") { { b: 1, a: "x y" }.to_query }
+show("to_query namespace") { { name: "David", nationality: "Danish" }.to_query("user") }
+show("to_query nests and arrays") { { a: [1, { b: 2 }], c: { d: "x&y" }, e: nil, f: true }.to_query }
+show("to_query drops empty containers") { { a: [], b: {}, c: 1 }.to_query }
+show("Array#to_query") { %w[Rails coding].to_query("hobbies") }
+show("[].to_query") { [].to_query("hobbies") }
+show("nil.to_query") { nil.to_query("k") }
+show("1.to_query") { 1.to_query("k") }
+show("Object#to_query needs a key") { 1.to_query }
+show("Hash#to_param") { { b: 1, a: 2 }.to_param }
+show("Array#to_param") { [1, "a b", nil, :c].to_param }
+show("nil/true/false.to_param") { [nil.to_param, true.to_param, false.to_param] }

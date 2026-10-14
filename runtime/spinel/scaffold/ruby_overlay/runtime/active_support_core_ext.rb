@@ -1372,3 +1372,75 @@ end
 [NilClass, TrueClass, FalseClass, Integer, Float, Symbol].each do |klass|
   klass.undef_method(:with)
 end
+
+# core_ext/object/to_query.rb: the query-string form of a value, and the
+# `to_param` shapes it rests on. A test helper that builds a stub path
+# with `params.to_query` (the receiver is a Hash a caller passed, which
+# no lowering types) is the Core surface.
+require "cgi/escape"
+require "cgi/util" if RUBY_VERSION < "3.5"
+
+class Object
+  def to_param
+    to_s
+  end
+
+  def to_query(key)
+    "#{CGI.escape(key.to_param)}=#{CGI.escape(to_param.to_s)}"
+  end
+end
+
+class NilClass
+  def to_query(key)
+    CGI.escape(key.to_param)
+  end
+
+  def to_param
+    self
+  end
+end
+
+class TrueClass
+  def to_param
+    self
+  end
+end
+
+class FalseClass
+  def to_param
+    self
+  end
+end
+
+class Array
+  def to_param
+    collect(&:to_param).join "/"
+  end
+
+  def to_query(key)
+    prefix = "#{key}[]"
+
+    if empty?
+      nil.to_query(prefix)
+    else
+      filter_map { |value|
+        next if (value.is_a?(Hash) || value.is_a?(Array)) && value.empty?
+        value.to_query(prefix)
+      }.join "&"
+    end
+  end
+end
+
+class Hash
+  def to_query(namespace = nil)
+    query = filter_map do |key, value|
+      next if (value.is_a?(Hash) || value.is_a?(Array)) && value.empty?
+      value.to_query(namespace ? "#{namespace}[#{key}]" : key)
+    end
+
+    query.sort! unless namespace.to_s.include?("[]")
+    query.join("&")
+  end
+
+  alias_method :to_param, :to_query
+end

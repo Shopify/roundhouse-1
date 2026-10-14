@@ -54,3 +54,10 @@ Rails.event.notify("filter_oracle.observed", payload)
 puts "event payload: #{sink.events.last[:payload].inspect}"
 
 puts "parameter filter: #{ActiveSupport::ParameterFilter.new(ActiveSupport.filter_parameters).filter(payload).inspect}"
+
+# Core builds `FilterParameters::FILTER` from the application's Rack env
+# defaults (railties application.rb: `"action_dispatch.parameter_filter"
+# => filter_parameters`), so that key carries the same list.
+env_filters = Rails.application.env_config["action_dispatch.parameter_filter"]
+puts "env_config filters: #{env_filters.map { |f| describe_filter(f) }.join(" ")}"
+puts "env_config filter: #{ActiveSupport::ParameterFilter.new(env_filters).filter(payload).inspect}"

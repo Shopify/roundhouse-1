@@ -9385,9 +9385,21 @@ fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param) ->
         // whose every caller is a class-body `pre_resolve_access
         // expression: any(...)`, so each such type raised at load.
         (None, Some(Ty::Nil)) => Some(Ty::Untyped),
+        // So does an empty `[]` default. graphql-easy-testing's
+        // `on_mutation(selections: [])` is called from test bodies that
+        // pass a Hash (`selections: { tax_document: [:id] }`) and are not
+        // sites here. Typed `Array`, the `Array.wrap(selections)` below it
+        // folded to the bare value and the Hash reached `selections -
+        // scalar_selections`. An open value takes Rails' `Array.wrap`
+        // branch instead.
+        (None, Some(Ty::Array { .. })) if param.default.as_ref().is_some_and(is_empty_array_literal) => Some(Ty::Untyped),
         (None, Some(d)) => Some(d),
         (None, None) => None,
     }
+}
+
+fn is_empty_array_literal(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Array { elements, .. } if elements.is_empty())
 }
 
 pub(crate) fn controller_includes(controller: &Controller) -> Vec<ClassId> {

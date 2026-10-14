@@ -72,6 +72,29 @@ module ActiveSupport
   class ParameterFilter
     FILTERED = "[FILTERED]"
 
+    # The filters as one Regexp (parameter_filter.rb `precompile_filters`):
+    # Procs and Regexps stay, the String and Symbol patterns become
+    # case-insensitive Regexps unless a Regexp already matches them, and
+    # `Regexp.union` of the lot is appended. Railties hands this list
+    # out as `Rails.application.env_config["action_dispatch.parameter_filter"]`
+    # when `config.precompile_filter_parameters` is on (`load_defaults`
+    # 7.1+).
+    def self.precompile_filters(filters)
+      procs, patterns = filters.partition { |filter| filter.is_a?(Proc) }
+      regexps, patterns = patterns.partition { |filter| filter.is_a?(Regexp) }
+
+      names = patterns.map { |p| p.to_s }
+      names = names.sort_by { |p| [p.count("."), p.size] }
+
+      names.each do |pattern|
+        unless regexps.any? { |r| r.match?(pattern) }
+          regexps << Regexp.new(Regexp.escape(pattern), Regexp::IGNORECASE)
+        end
+      end
+
+      procs << Regexp.union(regexps)
+    end
+
     def initialize(filters = [], mask: FILTERED)
       @mask = mask
       @no_filters = filters.empty?
