@@ -154,10 +154,10 @@ fn an_environment_style_branch_with_a_dropped_write_is_warning_free() {
 }
 
 /// Survey mode's placeholder for a construct ingest could not take — here
+/// a splat inside a nested multi-write target (plain nested targets now
 /// bind) — before another statement: in a method
 /// head, a rescue body and a lambda body.
 #[test]
-/// head, a rescue body and a lambda body.
 fn survey_placeholders_before_a_statement_are_not_written() {
     let source = r#"class Probe
   def head(pair)
