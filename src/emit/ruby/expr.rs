@@ -558,6 +558,31 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         // `include?` and `has_key?` are Rails' aliases of `key?`; the
         // port's module answers Module#include? itself.
         (_, "include?" | "has_key?", _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => Some(read("key?")),
+        // `merge!`, `delete` and `import` change what the accumulator holds,
+        // so the record's `error_details` (`ActiveRecord::ErrorDetail` per
+        // push, which `errors.details` and its reads answer from on a tree
+        // without this port) are rebuilt from it, where the record is a
+        // plain read.
+        (_, "merge!" | "delete" | "import", _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => {
+            let call = read(method.as_str());
+            let owner = match &*recv.node {
+                ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "errors" && args.is_empty() => {
+                    Some("self".to_string())
+                }
+                ExprNode::Send { recv: Some(owner), method, args, .. }
+                    if method.as_str() == "errors"
+                        && args.is_empty()
+                        && matches!(&*owner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef) =>
+                {
+                    Some(emit_expr(owner))
+                }
+                _ => None,
+            };
+            Some(match owner {
+                Some(owner) => format!("ActiveModel::ErrorAttributes.sync({call}, {}, {owner})", emit_expr(recv)),
+                None => call,
+            })
+        }
         (_, _, _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => {
             Some(read(method.as_str()))
         }

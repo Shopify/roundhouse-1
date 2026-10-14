@@ -52,7 +52,7 @@ use crate::dialect::{LibraryClass, MethodReceiver, Model, Validation, Validation
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
 use crate::lower::model_to_library::validations::{
-    push_active_model_validation_surface, validate_method_def, validation_statements_split,
+    push_active_model_validation_surface, push_error_details, validate_method_def, validation_statements_split,
     Declarer, Finder,
 };
 use crate::span::Span;
@@ -294,7 +294,9 @@ pub fn apply_sti_subclass_validations(app: &mut App) {
         };
         let spanned = read.declared.iter().flat_map(|(_, span, vs, _)| vs.iter().map(move |v| (*span, v)));
         // `prepend: true` checks run ahead of the inherited ones.
-        let (front, checks) = validation_statements_split(model, spanned, &declarer);
+        let (mut front, mut checks) = validation_statements_split(model, spanned, &declarer);
+        // Each push also records its `ErrorDetail` beside the message.
+        front.iter_mut().chain(checks.iter_mut()).for_each(|s| push_error_details(s, &model.i18n));
         let claimed: Vec<usize> =
             read.declared.iter().filter(|(_, _, _, modeled)| *modeled).map(|(i, ..)| *i).collect();
         if front.is_empty() && checks.is_empty() && claimed.is_empty() {

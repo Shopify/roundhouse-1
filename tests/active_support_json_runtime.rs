@@ -84,6 +84,10 @@ const REFUSED: &str = r##"class Probe < ApplicationRecord
   def errors_json
     errors.as_json
   end
+
+  def errors_json_full
+    errors.as_json(full_messages: true)
+  end
 end
 
 module ProbeSerializing
@@ -170,7 +174,10 @@ fn active_model_as_json_is_gated_to_its_ports() {
     );
     assert!(!text.contains("ActiveModel::Errors"), "{text}");
     let probe = std::fs::read_to_string(dir.join("emitted-ruby/app/models/probe.rb")).unwrap();
-    assert!(probe.contains("ActiveModel::ErrorAttributes.as_json(errors)"), "{probe}");
+    // The plain read is answered from the record's `error_details` on every
+    // tree (`lower::errors_index`); `as_json(options)` needs the port.
+    assert!(probe.contains("ActiveSupport.errors_to_hash(error_details)"), "{probe}");
+    assert!(probe.contains("ActiveModel::ErrorAttributes.as_json(errors, full_messages: true)"), "{probe}");
     // The strict targets carry neither port.
     let (ok, text) = run(&dir, &["--target", "rust"]);
     assert!(!ok, "rust accepted ActiveModel::Errors#as_json: {text}");
