@@ -319,12 +319,23 @@ fn class_body_statements_run_in_place_as_in_cruby() {
 #[test]
 fn a_strict_target_refuses_each_class_body_statement_by_name() {
     let (_tree, errors) = app().emit(BuildTarget::Spinel);
-    for statement in ["FlowDomain.values.each", "include Extra if", "Wrapped.public_instance_methods(false).each", "Thread.current[:tracing_loaded] = true", "(%i[pong other generated] - %i[none]).each", "if ENV.fetch(\"RH_INLINE\"", "%i[pong other generated].each", "[ :before_store ].each"] {
+    for statement in ["FlowDomain.values.each", "include Extra if", "Wrapped.public_instance_methods(false).each", "Thread.current[:tracing_loaded] = true", "(%i[pong other generated] - %i[none]).each", "if ENV.fetch(\"RH_INLINE\"", "%i[pong other generated].each"] {
         assert!(
             errors.iter().any(|e| e.contains("class body statement") && e.contains(statement)),
             "{statement}: {errors:#?}"
         );
     }
+    // A literal-list loop the static expansion settles (`CallbackLogging`'s
+    // `[:before_store].each { define_method … super }`) is defined as the
+    // methods it makes, not dropped: the strict target has no statement
+    // left to name.
+    let (tree, _) = app().emit(BuildTarget::Spinel);
+    let logging = std::fs::read_to_string(tree.join("app/models/callback_logging.rb")).expect("callback_logging.rb");
+    assert!(logging.contains("def before_store"), "{logging}");
+    assert!(
+        !errors.iter().any(|e| e.contains("class body statement") && e.contains("[ :before_store ].each")),
+        "{errors:#?}"
+    );
 }
 
 /// A literal-list statement the body cannot keep in place (its block

@@ -273,7 +273,7 @@ fn run(
         }
     }
     shadow_replayed(app, &mut library, &inherited);
-    settle_collisions(app, &mut library, Owner::Library);
+    let collided = settle_collisions(app, &mut library, Owner::Library);
     settle_collisions(app, &mut models, Owner::Model);
 
     // Only a refused call reads its class's answer.
@@ -317,7 +317,16 @@ fn run(
                 lc.methods.extend(expansion.methods);
             }
             Err(reason) => {
-                if dropped[i] && !replayed.contains(&(i, j)) {
+                // A loop on a literal list whose names the class defines
+                // elsewhere too (`%i[a b].each { define_method }` above
+                // a `def b` or an `alias_method :a`) is not settled here:
+                // which definition Ruby keeps is the written body's
+                // order. It stays the class-body call it was, which the
+                // Ruby family runs where it stands (CRuby keeps the
+                // later one) and the other targets name as the class
+                // body statement it is.
+                let order_decides = collided.contains(&(i, j)) && super::app::is_literal_list_call(&lc.unknown_calls[j]);
+                if dropped[i] && !replayed.contains(&(i, j)) && !order_decides {
                     refuse(&mut lc.unknown_calls[j], reason);
                 }
             }
@@ -485,7 +494,8 @@ fn settle_collisions(
     app: &App,
     planned: &mut [(usize, usize, Result<Expansion, String>)],
     owner: fn(usize) -> Owner,
-) {
+) -> HashSet<(usize, usize)> {
+    let mut collided = HashSet::default();
     // Keyed by the class's name: a reopened class is several entries.
     let mut counts: HashMap<(String, Symbol, bool), usize> = HashMap::default();
     for (i, _, outcome) in planned.iter() {
@@ -502,7 +512,7 @@ fn settle_collisions(
             }
         }
     }
-    for (i, _, outcome) in planned.iter_mut() {
+    for (i, j, outcome) in planned.iter_mut() {
         let Ok(expansion) = outcome else { continue };
         let taken = existing_names(app, owner(*i));
         let name = owner_name(app, owner(*i)).0.to_string();
@@ -512,6 +522,7 @@ fn settle_collisions(
                 || taken.contains(&(m.name.clone(), class))
         });
         if let Some(m) = clash {
+            collided.insert((*i, *j));
             let side = if m.receiver == MethodReceiver::Class {
                 "class method"
             } else {
@@ -523,6 +534,7 @@ fn settle_collisions(
             ));
         }
     }
+    collided
 }
 
 fn existing_names(app: &App, owner: Owner) -> HashSet<(Symbol, bool)> {

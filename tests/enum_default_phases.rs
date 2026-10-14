@@ -129,12 +129,15 @@ end
 
 #[test]
 fn raw_defaults_and_both_hydration_factories_bypass_enum_assignment_validation() {
+    // `stored_state` reads the column's stored value through Rails'
+    // `read_attribute_before_type_cast`: the model's own `@state` is not
+    // the column's storage (Rails keeps values in `@attributes`).
     emit_and_run::real_blog()
         .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|",
             "create_table \"articles\", force: :cascade do |t|\n    t.integer \"state\", default: 0\n    t.boolean \"flag\", default: true")
         .write("app/models/direct_base.rb", "class DirectBase < ApplicationRecord\n  self.abstract_class = true\n  self.table_name = \"articles\"\n  enum :state, { draft: 0, live: 3 }\nend\n")
         .write("app/models/concerns/local_state.rb", "module LocalState\n  extend ActiveSupport::Concern\n  included { enum :state, { queued: 2, shipped: 7 } }\nend\n")
-        .write("app/models/special_article.rb", "class SpecialArticle < DirectBase\n  self.table_name = \"articles\"\n  include LocalState\n  def stored_state\n    @state\n  end\nend\n")
+        .write("app/models/special_article.rb", "class SpecialArticle < DirectBase\n  self.table_name = \"articles\"\n  include LocalState\n  def stored_state\n    read_attribute_before_type_cast(:state)\n  end\nend\n")
         .edit("app/models/article.rb", "class Article < ApplicationRecord", "class Article < DirectBase")
         .run_ruby(r#"raise "child default should read nil" unless SpecialArticle.new.state.nil?
 raise "parent mapping leaked" unless Article.new.state == "draft"
