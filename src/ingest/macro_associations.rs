@@ -39,6 +39,18 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
             let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else { continue };
             let Some(def) = side.macro_def(method.as_str()) else { continue };
             let Some(forward) = forwarded_to_association(&side, def, 0) else {
+                if postgresql
+                    && fixed_association(&side, def, 0).is_none()
+                    && let Some(literal) = literal_association(&side, def, 0)
+                    && let Some((mut assoc, options)) = literal_association_of(app, expr, &model.name, &literal)
+                {
+                    LITERAL_OPTIONS.with_borrow_mut(|m| m.insert((expr.span.file.0, expr.span.start), options));
+                    if let crate::dialect::Association::BelongsTo { target, .. } = &mut assoc {
+                        super::app::qualify_target(&model.name, target, &models);
+                    }
+                    items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
+                    continue;
+                }
                 if let Some(fixed) = fixed_association(&side, def, 0) {
                     if fixed.kind != "belongs_to" && !postgresql {
                         continue;
@@ -243,6 +255,183 @@ fn forwarded_to_association(
         }
     }
     None
+}
+
+/// A class macro whose helper declares an association of a literal name
+/// with options of its own, not the call's: Core's
+/// `embedded_metafield_accessor`, which runs
+/// `ensure_embedded_metafields_association_defined!(association_options)`,
+/// whose `has_many(:embedded_metafields, -> { where(model_class
+/// .embedded_metafields_conditions) }, class_name: "Metafield", as:
+/// "owner", ..., **association_options)` follows a reflection guard.
+struct LiteralAssociation {
+    /// The `has_many`/`has_one`/`belongs_to` call in the helper.
+    call: Expr,
+    /// Locals the helper binds to the class (`model_class = self`).
+    selves: Vec<Symbol>,
+}
+
+/// The association `def` declares through a receiverless call on `self` with a
+/// literal name, directly or through another macro it calls (four deep).
+/// A helper's own `**splat` of a parameter is the call's override, which
+/// [`literal_association_of`] refuses when the call passes it.
+fn literal_association(
+    side: &crate::lower::model_to_library::macro_replay::ClassSide<'_>,
+    def: &MethodDef,
+    depth: usize,
+) -> Option<LiteralAssociation> {
+    let statements: Vec<&Expr> = match &*def.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&def.body],
+    };
+    let mut selves: Vec<Symbol> = Vec::new();
+    for stmt in statements {
+        match &*stmt.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, value } if is_self(value) => selves.push(name.clone()),
+            ExprNode::Send { recv, method, args, block: None, .. } if recv.as_ref().is_none_or(is_self) => {
+                if matches!(method.as_str(), "belongs_to" | "has_one" | "has_many")
+                    && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }))
+                {
+                    return Some(LiteralAssociation { call: stmt.clone(), selves });
+                }
+                if depth < 4
+                    && let Some(inner) = side.macro_def(method.as_str())
+                    && let Some(found) = literal_association(side, inner, depth + 1)
+                {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The association a [`LiteralAssociation`] declares on `owner`: the helper's call
+/// parsed as written, its scope's class local read as `owner`, its
+/// `**splat` of a parameter dropped (the macro call must not pass that
+/// parameter: `association_options:`), and every other option a literal.
+fn literal_association_of(
+    app: &crate::App,
+    call: &Expr,
+    owner: &crate::ident::ClassId,
+    literal: &LiteralAssociation,
+) -> Option<(crate::dialect::Association, String)> {
+    let macro_source = crate::ide::source(app, call.span.file)?;
+    let macro_parsed = ruby_prism::parse(macro_source.text.as_bytes());
+    let macro_root = macro_parsed.node();
+    let macro_call = super::define_method_loops::node_at(&macro_root, call.span.start as usize, call.span.end as usize, |n| {
+        n.as_call_node().is_some()
+    })?;
+    // The macro call passes only literals the helper does not read.
+    for arg in macro_call.as_call_node()?.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+        if let Some(hash) = arg.as_keyword_hash_node() {
+            for element in hash.elements().iter() {
+                let key = element.as_assoc_node().and_then(|pair| super::util::symbol_value(&pair.key()));
+                if key.is_none_or(|k| k == "association_options") {
+                    return None;
+                }
+            }
+        }
+    }
+    let ExprNode::Send { method, .. } = &*literal.call.node else { return None };
+    let kind = match method.as_str() {
+        "belongs_to" => "belongs_to",
+        "has_one" => "has_one",
+        _ => "has_many",
+    };
+    let helper_source = crate::ide::source(app, literal.call.span.file)?;
+    let helper_parsed = ruby_prism::parse(helper_source.text.as_bytes());
+    let helper_root = helper_parsed.node();
+    let node = super::define_method_loops::node_at(
+        &helper_root,
+        literal.call.span.start as usize,
+        literal.call.span.end as usize,
+        |n| n.as_call_node().is_some(),
+    )?;
+    let node = node.as_call_node()?;
+    let text_of = |n: &ruby_prism::Node<'_>| {
+        let loc = n.location();
+        String::from_utf8_lossy(&helper_source.text.as_bytes()[loc.start_offset()..loc.end_offset()]).into_owned()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut options: Vec<String> = Vec::new();
+    for arg in node.arguments()?.arguments().iter() {
+        if let Some(hash) = arg.as_keyword_hash_node() {
+            for element in hash.elements().iter() {
+                if element.as_assoc_splat_node().is_some() {
+                    continue;
+                }
+                let pair = element.as_assoc_node()?;
+                let key = super::util::symbol_value(&pair.key())?;
+                let value = pair.value();
+                let plain = value.as_symbol_node().is_some()
+                    || value.as_string_node().is_some()
+                    || value.as_true_node().is_some()
+                    || value.as_false_node().is_some()
+                    || value.as_nil_node().is_some()
+                    || value.as_integer_node().is_some();
+                if !plain {
+                    return None;
+                }
+                parts.push(format!("{key}: {}", text_of(&value)));
+                options.push(format!("{key}: {}", text_of(&value)));
+            }
+        } else if let Some(lambda) = arg.as_lambda_node() {
+            let mut text = text_of(&lambda.as_node());
+            for local in &literal.selves {
+                text = replace_word(&text, local.as_str(), owner.0.as_str());
+            }
+            parts.push(text);
+        } else if let Some(name) = arg.as_symbol_node() {
+            parts.push(text_of(&name.as_node()));
+        } else {
+            return None;
+        }
+    }
+    let text = format!("{kind} {}", parts.join(", "));
+    let parsed = ruby_prism::parse(text.as_bytes());
+    let program = parsed.node();
+    let statement = program.as_program_node()?.statements().body().iter().next()?;
+    let assoc = super::model::parse_association(&statement.as_call_node()?, owner, kind, &helper_source.path)?;
+    let hash = if options.is_empty() { "{}".to_string() } else { format!("{{ {} }}", options.join(", ")) };
+    Some((assoc, hash))
+}
+
+thread_local! {
+    /// The options hash literal of each association [`literal_association_of`]
+    /// declared, by its macro call's file and start offset.
+    static LITERAL_OPTIONS: std::cell::RefCell<crate::det::HashMap<(u32, u32), String>> = Default::default();
+}
+
+/// The options a macro call's helper declares its association with
+/// (`{ class_name: "Metafield", as: "owner", ... }`), as the compiled
+/// reflection carries them: the helper's `has_many` never runs at class
+/// load (the reflection guard before it finds the compiled one), so the
+/// reflection must already know them.
+pub(crate) fn literal_declaration_options(span: crate::span::Span) -> Option<String> {
+    LITERAL_OPTIONS.with_borrow(|m| m.get(&(span.file.0, span.start)).cloned())
+}
+
+/// `text` with the identifier `word` replaced by `with`, where it stands
+/// alone.
+fn replace_word(text: &str, word: &str, with: &str) -> String {
+    let ident = |c: char| c == '_' || c.is_ascii_alphanumeric();
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(word) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + word.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        if before.is_none_or(|c| !ident(c)) && after.is_none_or(|c| !ident(c)) {
+            out.push_str(with);
+        } else {
+            out.push_str(word);
+        }
+        rest = &rest[at + word.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `options.delete(:key)`, possibly through `Array(...)` or an inline

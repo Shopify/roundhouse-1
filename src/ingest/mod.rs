@@ -75,7 +75,7 @@ mod base_includes;
 mod load_hook_includes;
 mod model_macros;
 mod define_method_loops;
-mod macro_associations;
+pub(crate) mod macro_associations;
 mod trusted_id_attribute;
 pub(crate) use define_method_loops::REFUSAL_CONSTRUCT as DEFINE_METHOD_REFUSAL;
 pub mod on_load_hooks;
