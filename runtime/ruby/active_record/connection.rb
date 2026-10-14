@@ -1312,6 +1312,14 @@ module ActiveRecord
       if no_default && _compiled_ignored_columns.include?(name) && !_retypable_attribute_names.include?(name)
         return nil
       end
+      # `money_bags` (Core's MultiCurrency::MoneyBagAttribute) declares each
+      # of its attributes `:decimal`, then redefines the reader and writer
+      # over a packer, so the declared type is never consulted: a decimal
+      # column declared `:decimal` is already the compiled type.
+      if type == :decimal && no_default && options.empty? && !_retypable_attribute_names.include?(name) &&
+         schema_column_types[name]&.first == :decimal
+        return nil
+      end
       unless _retypable_attribute_names.include?(name)
         raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
       end

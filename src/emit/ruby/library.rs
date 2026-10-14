@@ -14782,8 +14782,56 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || claimed(c)
                 || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
                 || ruby2_keywords_call(lc, c)
+                || splatted_delegate_call(c)
         })
         .collect()
+}
+
+/// `delegate(*CONST.keys, to: :upstream)`: a `delegate` whose names a
+/// constant's list gives, on the class itself. `ingest::delegate` expands
+/// literal names only, so this one reaches the body as a call; every
+/// Ruby-family tree carries `Module#delegate` (runtime/module_delegate.rb),
+/// which defines the forwarders as the body loads. Replayed as written,
+/// not dropped: Core's `Podding::Redis::PoddedClient` forwards every
+/// `::Redis::Namespace::COMMANDS` key (`evalsha`, which sabertooth's rate
+/// limiter calls) to the pod's client, and with the call dropped the class
+/// answered none of them. Only names read from a constant (or a literal
+/// list) and a literal `to:` / `prefix:` / `allow_nil:`, so the call
+/// reads nothing but what the body has loaded.
+fn splatted_delegate_call(call: &Expr) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+    if method.as_str() != "delegate" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+        return false;
+    }
+    fn names(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Const { .. } | ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(names),
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } => {
+                args.is_empty() && matches!(method.as_str(), "keys" | "values" | "freeze" | "to_a") && names(r)
+            }
+            _ => false,
+        }
+    }
+    let mut splatted = false;
+    let mut target = false;
+    for arg in args {
+        match &*arg.node {
+            ExprNode::Splat { value } if names(value) => splatted = true,
+            ExprNode::Lit { .. } => {}
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return false };
+                    if !matches!(&*v.node, ExprNode::Lit { .. }) {
+                        return false;
+                    }
+                    target |= key.as_str() == "to";
+                }
+            }
+            _ => return false,
+        }
+    }
+    splatted && target
 }
 
 /// `ruby2_keywords :a, :b` naming instance methods the class defines
