@@ -201,7 +201,7 @@ fn sti_name_override_compiles_to_runtime_names() {
     let read = |p: &str| std::fs::read_to_string(emitted.join(p)).unwrap();
     let mobile = read("app/models/auth/mobile_app.rb");
     assert!(
-        mobile.contains("relation.where(type: [Auth::MobileApp.sti_name, Auth::WebApp.sti_name])"),
+        mobile.contains("relation.where!(type: [Auth::MobileApp.sti_name, Auth::WebApp.sti_name])"),
         "{mobile}"
     );
     assert!(mobile.contains("self.type = Auth::MobileApp.sti_name if"), "{mobile}");
@@ -209,7 +209,7 @@ fn sti_name_override_compiles_to_runtime_names() {
     let base = read("app/models/auth/oauth_app.rb");
     assert!(base.contains("find_sti_class(row.type"), "{base}");
     let hold = read("app/models/user_hold.rb");
-    assert!(hold.contains("relation.where(type: UserHold.sti_name)"), "{hold}");
+    assert!(hold.contains("relation.where!(type: UserHold.sti_name)"), "{hold}");
 }
 
 #[test]
