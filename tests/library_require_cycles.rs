@@ -194,3 +194,42 @@ fn the_hook_cycle_eager_loads_without_a_cycle() {
     let run = load_hook_cycle_in(EAGER).run_ruby_env("p Payments.hooks\np Checkouts::Finished.callback?\n", &[RUBYOPT]);
     assert_hook_boots(&run, "[Checkouts::Finished]\ntrue\n");
 }
+
+// (4) A class whose constant reads an object built by another file
+// (`Allocator = AllocatorImpl.new`), where that file's class includes a
+// module nested in the first class. Core's
+// `Checkouts::One::OversellProtection::ReservationsOversellManager`.
+
+const MANAGER: &str = "module Oversell\n  class Manager\n    class Proxy\n      def initialize(allocator)\n        @allocator = allocator\n      end\n\n      def allocate\n        @allocator.allocate\n      end\n    end\n\n    DEFAULT_PROXY = Proxy.new(Oversell::Allocator)\n\n    def proxy\n      DEFAULT_PROXY\n    end\n  end\nend\n";
+const MANAGER_ALLOCATOR_API: &str = "module Oversell\n  class Manager\n    module AllocatorApi\n      def kind\n        :reservations\n      end\n    end\n  end\nend\n";
+const ALLOCATOR: &str = "module Oversell\n  Allocator = AllocatorImpl.new\nend\n";
+const ALLOCATOR_IMPL: &str = "module Oversell\n  class AllocatorImpl\n    include Oversell::Manager::AllocatorApi\n\n    def allocate\n      kind\n    end\n  end\nend\n";
+
+fn manager_allocator(environment: &str) -> emit_and_run::Overlay {
+    strict(environment)
+        .write("app/models/oversell/manager.rb", MANAGER)
+        .write("app/models/oversell/manager/allocator_api.rb", MANAGER_ALLOCATOR_API)
+        .write("app/models/oversell/allocator.rb", ALLOCATOR)
+        .write("app/models/oversell/allocator_impl.rb", ALLOCATOR_IMPL)
+}
+
+#[test]
+fn a_class_whose_constant_reads_an_object_built_from_a_class_including_its_module_loads_without_a_cycle() {
+    let run = manager_allocator(LAZY).run_ruby_env("p Oversell::Manager.new.proxy.allocate\n", &[RUBYOPT]);
+    let manager = read(&run, "app/models/oversell/manager.rb");
+    assert_mutual_boots(&run, ":reservations\n");
+    // The allocator waits until the class exists, so the impl it loads
+    // finds the manager defined.
+    assert!(
+        !manager.lines().take_while(|l| !l.starts_with("module Oversell")).any(|l| l.contains("allocator\"")),
+        "{manager}"
+    );
+}
+
+#[test]
+fn the_manager_allocator_pair_loads_from_the_impl_without_a_cycle() {
+    // Natively the allocator cannot load first (its impl loads the
+    // manager, whose body reads the allocator mid-load): the impl does.
+    let run = manager_allocator(LAZY).run_ruby_env("p Oversell::AllocatorImpl.new.allocate\np Oversell::Manager.new.proxy.allocate\n", &[RUBYOPT]);
+    assert_mutual_boots(&run, ":reservations\n:reservations\n");
+}
