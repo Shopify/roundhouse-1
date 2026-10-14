@@ -4286,10 +4286,12 @@ fn app_has_owner_scope(app: &App) -> bool {
 /// SQL; where it is only known at runtime (a parameter, a `Class#new`
 /// result) `Relation#join_fragment` resolves it from the model's
 /// reflections. Which of the two a call becomes is not known at this
-/// stage, so any such call carries the reflections.
+/// stage, so any such call carries the reflections. `where.missing(:x)` /
+/// `where.associated(:x)` join by name the same way (`Relation#missing`,
+/// `#associated`).
 fn app_joins_by_name(app: &App) -> bool {
     app_sends(app, &|m, args| {
-        matches!(m, "joins" | "left_joins" | "left_outer_joins")
+        matches!(m, "joins" | "left_joins" | "left_outer_joins" | "missing" | "associated")
             && args.first().is_some_and(|a| {
                 !matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })
             })

@@ -41,7 +41,7 @@ fn rewrite(e: &mut Expr) {
 /// too, but always arity-2 in emit/runtime, so it is not a hop here.)
 fn recv_is_relation(e: &Expr) -> bool {
     if matches!(e.ty, Some(Ty::Relation { .. })) {
-        return true;
+        return !materializes_to_array(e);
     }
     match &*e.node {
         ExprNode::Send { recv: Some(inner), method, args, block: None, .. }
@@ -50,6 +50,25 @@ fn recv_is_relation(e: &Expr) -> bool {
             matches!(&*inner.node, ExprNode::Var { .. } | ExprNode::Ivar { .. })
                 || recv_is_relation(inner)
         }
+        _ => false,
+    }
+}
+
+/// A call Rails answers with an Array whatever the receiver: Enumerable's
+/// block methods load a relation's records and return a plain Array
+/// (`relation.reject(&:test?)`, `relation.sort_by { … }`). An analyzer
+/// type of Relation on such a call is the receiver's type carried
+/// through, not what the call answers, and renaming the `first(2)` after
+/// it to `first_n` is a NoMethodError on the Array (Core's
+/// `plans.reject(&:test?).first(2)`). `select` is a builder with
+/// arguments (`select(:id)`) and Enumerable only with a block.
+fn materializes_to_array(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(_), method, args, block, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "select" | "filter" => block.is_some() && args.is_empty(),
+        "reject" | "sort_by" | "map" | "collect" | "flat_map" | "filter_map" | "reverse" | "compact" | "uniq"
+        | "partition" | "group_by" | "take_while" | "drop_while" | "to_a" | "sort" | "shuffle" | "take" | "drop"
+        | "min_by" | "max_by" => true,
         _ => false,
     }
 }
@@ -108,5 +127,85 @@ fn is_count_threshold(e: &Expr) -> bool {
         ExprNode::Lit { value: Literal::Int { value } } => *value >= 0,
         ExprNode::Const { .. } => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::span::Span;
+
+    fn send(recv: Option<Expr>, method: &str, args: Vec<Expr>, block: Option<Expr>, ty: Option<Ty>) -> Expr {
+        let mut e = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv, method: Symbol::from(method), args, block, parenthesized: true },
+        );
+        e.ty = ty;
+        e
+    }
+
+    fn relation() -> Ty {
+        Ty::Relation { of: crate::ident::ClassId(Symbol::from("Plan")) }
+    }
+
+    fn two() -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 2 } })
+    }
+
+    fn block() -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
+    }
+
+    fn base() -> Expr {
+        let mut var = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("plans") },
+        );
+        var.ty = Some(relation());
+        var
+    }
+
+    fn first_two_after(hop: Expr) -> Expr {
+        send(Some(hop), "first", vec![two()], None, None)
+    }
+
+    fn method_of(e: &Expr) -> &str {
+        let ExprNode::Send { method, .. } = &*e.node else { panic!() };
+        method.as_str()
+    }
+
+    #[test]
+    fn first_n_on_a_relation_is_renamed() {
+        let mut e = first_two_after(base());
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "first_n");
+    }
+
+    /// Enumerable's `reject` on a relation answers an Array, whatever the
+    /// analyzer typed the call: its `first(2)` is `Array#first`.
+    #[test]
+    fn first_after_an_enumerable_reject_stays_array_first() {
+        let reject = send(Some(base()), "reject", Vec::new(), Some(block()), Some(relation()));
+        let mut e = first_two_after(reject);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "first");
+    }
+
+    #[test]
+    fn last_after_a_block_select_stays_array_last() {
+        let select = send(Some(base()), "select", Vec::new(), Some(block()), Some(relation()));
+        let mut e = send(Some(select), "last", vec![two()], None, None);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "last");
+    }
+
+    /// `select(:id)` is a builder: still a relation.
+    #[test]
+    fn first_after_a_column_select_is_renamed() {
+        let id = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from("id") } });
+        let select = send(Some(base()), "select", vec![id], None, Some(relation()));
+        let mut e = first_two_after(select);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "first_n");
     }
 }

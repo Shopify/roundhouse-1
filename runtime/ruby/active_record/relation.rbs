@@ -96,6 +96,9 @@ module ActiveRecord
     def model: () -> Base
     def default_scoped?: () -> bool
     def not: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
+    def missing: (*Symbol associations) -> Relation
+    def associated: (*Symbol associations) -> Relation
+    def reflection_key_column: (untyped reflection) -> String
     def excluding: (*untyped records) -> Relation
     def without: (*untyped records) -> Relation
     def or: (Relation other) -> Relation
@@ -163,7 +166,7 @@ module ActiveRecord
     # call site in the corpus is the projection. `filter` below is the
     # same method under Ruby's other name and DOES declare the block
     # shape, so a strict target that needs it has a spelling.
-    def select: (*(String | Symbol) specs) -> Relation
+    def select: (*(String | Symbol) specs) ?{ (Base) -> bool } -> Relation
     def distinct: () -> Relation
     def includes: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
     def preload: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
@@ -238,6 +241,17 @@ module ActiveRecord
     def id_filter: (Array[untyped] records, Array[untyped] ids, bool keep) -> Array[untyped]
     def include?: (Base? record) -> bool
     def each: () { (Base) -> void } -> Relation
+    def []: (*untyped args) -> untyped
+    def slice: (*untyped args) -> untyped
+    def join: (?String? separator) -> String
+    def sample: (*untyped args) -> untyped
+    def shuffle: (*untyped args) -> Array[Base]
+    def reverse: () -> Array[Base]
+    def rotate: (?Integer count) -> Array[Base]
+    def compact: () -> Array[Base]
+    def index: (*untyped args) ?{ (Base) -> bool } -> Integer?
+    def rindex: (*untyped args) ?{ (Base) -> bool } -> Integer?
+    def intersect?: (untyped other) -> bool
     def index_by: () { (Base) -> untyped } -> Hash[untyped, Base]
     def find_each: () { (Base) -> void } -> Relation
     def find_in_batches: () { (Array[Base]) -> void } -> Relation
@@ -266,8 +280,8 @@ module ActiveRecord
     def last: () -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
-    def count: () -> Integer
-    def sum: (String | Symbol expr) -> Float
+    def count: () ?{ (Base) -> bool } -> Integer
+    def sum: (?(String | Symbol | Integer | Float) expr) ?{ (Base) -> untyped } -> Float
     def minimum: (String | Symbol expr) -> untyped
     def maximum: (String | Symbol expr) -> untyped
     private def extreme: (String | Symbol expr, String function) -> untyped
@@ -277,13 +291,13 @@ module ActiveRecord
     private def cast_schema_date: (untyped value) -> untyped
     def group_count: () -> Hash[untyped, Integer]
     def empty?: () -> bool
-    def any?: () -> bool
+    def any?: (*untyped pattern) ?{ (Base) -> bool } -> bool
     def blank?: () -> bool
     def present?: () -> bool
     def presence: () -> Relation?
-    def none?: () -> bool
-    def one?: () -> bool
-    def many?: () -> bool
+    def none?: (*untyped pattern) ?{ (Base) -> bool } -> bool
+    def one?: (*untyped pattern) ?{ (Base) -> bool } -> bool
+    def many?: () ?{ (Base) -> bool } -> bool
     def all?: () { (Base) -> bool } -> bool
     def exists?: (?(Integer | String | Hash[String | Symbol, untyped] | nil | false) condition) -> bool
     def probe_existence: (Integer n) -> Integer
@@ -318,7 +332,7 @@ module ActiveRecord
     def pluck: (*(String | Symbol) cols) -> Array[untyped]
     def pick: (*(String | Symbol) cols) -> untyped
     def ids: () -> Array[Integer]
-    def find: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> untyped
+    def find: (?(Integer | Float | String | Array[Integer | Float | String] | nil) id) ?{ (Base) -> bool } -> untyped
     def find_primary_key: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> (Base | Array[Base])
     def friendly: () -> Relation
     def friendly_find: (?(Integer | Float | String | Array[Integer | Float | String] | nil) id) -> (Base | Array[Base])
