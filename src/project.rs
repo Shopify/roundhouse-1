@@ -8830,7 +8830,11 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
         // ones, and those between the halves of a class body the emitter
         // split around a cycle (`emit_library_class_decl_inner`: close,
         // require what the rest needs, reopen).
-        if indent == 0 && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative ")) {
+        if indent == 0
+            && (trimmed.starts_with("require ")
+                || trimmed.starts_with("require_relative ")
+                || trimmed.starts_with("defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through("))
+        {
             in_file_constant = false;
             continue;
         }
@@ -8858,6 +8862,31 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
             continue;
         }
         lines.push((indent, trimmed));
+    }
+    // A compact constant alias as the file's one statement
+    // (`Pagination::CollectionQuery = Pagination::Admin::CollectionQuery`,
+    // components/merchandising's pagination/collection_query.rb): Zeitwerk
+    // maps the file to the leaf by its path. Loaded at boot instead, it ran
+    // before config/initializers, and CollectionQuery's class body hit
+    // ApiVersioning's unset api_change_class (T.must on nil) at boot.
+    if let [(0, first), rest @ ..] = lines.as_slice() {
+        if let Some((name, value)) = first.split_once(" = ") {
+            let segments: Vec<&str> = name.split("::").collect();
+            let closes = |t: &str| t.starts_with([')', ']', '}']) || t == "end" || t.starts_with("end.");
+            if segments.len() > 1
+                && !value.trim().is_empty()
+                && segments.iter().all(|s| {
+                    s.starts_with(|c: char| c.is_ascii_uppercase()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+                && rest.iter().all(|(i, t)| *i > 0 || closes(t))
+            {
+                if crate::naming::underscore(name) != stem {
+                    return None;
+                }
+                let last = segments.len() - 1;
+                return Some(segments.iter().enumerate().map(|(i, s)| (s.to_string(), i < last)).collect());
+            }
+        }
     }
     // The leading chain: headers at indent 0, 2, 4, … on consecutive lines.
     let mut chain: Vec<(String, bool)> = Vec::new();
@@ -18657,6 +18686,25 @@ mod tests {
         // The file's own constant as an assignment is still its leaf.
         let leaf = "RemoteDomain = DomainSubscription\n";
         assert_eq!(autoload_primary("models/remote_domain", leaf), Some(vec![("RemoteDomain".to_string(), false)]));
+    }
+
+    /// A file holding only a compact constant alias autoloads by its path,
+    /// as Zeitwerk loads it, instead of at boot ahead of config/initializers.
+    /// Core's pagination/collection_query.rb loaded at boot and its target's
+    /// class body read ApiVersioning config the initializer had not set.
+    #[test]
+    fn compact_constant_alias_file_autoloads() {
+        let alias = "require_relative \"admin/collection_query\"\n\nPagination::CollectionQuery = Pagination::Admin::CollectionQuery\n";
+        assert_eq!(
+            autoload_primary("models/pagination/collection_query", alias),
+            Some(vec![("Pagination".to_string(), true), ("CollectionQuery".to_string(), false)])
+        );
+        let through = "defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through(\"models/roundhouse_files/lib/m\", \"models/m\") : require_relative(\"../../roundhouse_files/lib/m\")\nrequire_relative \"../../m/a/b\"\n\nGraphApi::Admin::B = M::A::B\n";
+        assert_eq!(autoload_primary("models/graph_api/admin/b", through).map(|c| c.len()), Some(3));
+        // An alias naming a constant other than the file's path is not its leaf.
+        assert!(autoload_primary("models/pagination/other", alias).is_none());
+        // A second statement after the alias is not one constant.
+        assert!(autoload_primary("models/pagination/collection_query", &format!("{alias}puts 1\n")).is_none());
     }
 
     /// ruby-tlsh, which Bundler cannot autorequire and Core's models
