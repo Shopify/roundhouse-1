@@ -2800,7 +2800,7 @@ fn parse_scope(
     // lobsters' base/recent scopes). Defaults are carried so the
     // lowered class method reproduces the signature; the lowerer
     // inserts the trailing relation parameter before any keywords.
-    // Block/splat scope params still fall through unrecorded.
+    // Block and anonymous-splat scope params still fall through unrecorded.
     let mut params: Vec<crate::dialect::Param> = Vec::new();
     if let Some(pn) = param_node
         .and_then(|p| p.as_block_parameters_node().and_then(|bpn| bpn.parameters()))
@@ -2820,6 +2820,13 @@ fn parse_scope(
                     default,
                 ));
             }
+        }
+        // `->(key, *rest)`: the splat. The lowered class method carries
+        // it, with the relation as a keyword after it (`push_scope_methods`).
+        if let Some(rest) = pn.rest().and_then(|r| r.as_rest_parameter_node())
+            && let Some(name) = rest.name()
+        {
+            params.push(crate::dialect::Param::rest(Symbol::from(constant_id_str(&name))));
         }
         for kw in pn.keywords().iter() {
             if let Some(okw) = kw.as_optional_keyword_parameter_node() {

@@ -78,12 +78,23 @@ pub(super) fn factory_block<'pr>(value: &Node<'pr>) -> Option<(CallNode<'pr>, Bl
         flatten_statements(body).iter().any(|stmt| {
             super::visibility::definition(stmt).is_some()
                 || stmt.as_singleton_class_node().is_some()
+                || self_constant_write(stmt).is_some()
                 || stmt
                     .as_call_node()
                     .is_some_and(|c| c.receiver().is_none() && super::visibility::marker(&c))
         })
     });
     defines.then_some((call, block))
+}
+
+/// `self::NAME = value`: the constant `NAME` of the class the statement
+/// runs on. In a factory's body block that is the generated class, where
+/// a bare `NAME = value` is the enclosing scope's.
+pub(super) fn self_constant_write(stmt: &Node<'_>) -> Option<String> {
+    let write = stmt.as_constant_path_write_node()?;
+    let target = write.target();
+    target.parent()?.as_self_node()?;
+    Some(constant_id_str(&target.name()?).to_string())
 }
 
 /// A `NAME = Struct.new(...) do … end` / `NAME = Data.define(...) do …
@@ -616,7 +627,7 @@ fn factory_body(
         .collect();
     // The constants a `class << self` in the block writes are the
     // class's own (`factory_class_body`).
-    let singleton_written = block.map(singleton_constant_writes).unwrap_or_default();
+    let mut singleton_written = block.map(singleton_constant_writes).unwrap_or_default();
     // Nested in a class or module body, that `class << self` is indexed
     // as the ENCLOSING scope's singleton (Rubydex reads `self` there as
     // the lexical scope, not the block's class), so a read of such a
@@ -629,6 +640,12 @@ fn factory_body(
                  body is not modeled"
             ),
         ));
+    }
+    // `self::NAME = value` writes the generated class as well.
+    if let Some(statements) = block.and_then(|block| block.body()) {
+        singleton_written.extend(
+            flatten_statements(statements).iter().filter_map(self_constant_write).map(Symbol::from),
+        );
     }
     let mut body = super::library_class::factory_class_body(
         block.and_then(|block| block.body()),

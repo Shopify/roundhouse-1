@@ -131,6 +131,13 @@ fn register_factory_classes(
         }
         let Some(info) = classes.get_mut(&class.name) else { continue };
         info.parent = Some(ClassId(Symbol::from(generator)));
+        // The constants its block writes through `self`
+        // (`self::CODES = …`) are the class's own. They are no declaration
+        // of the source index's, so a read (`Message::CODES`) is answered
+        // here, untyped like the members.
+        for (name, _) in &class.constants {
+            info.constants.entry(name.clone()).or_insert(Ty::Untyped);
+        }
         info.class_methods
             .entry(Symbol::from("new"))
             .or_insert_with(|| Ty::Class { id: class.name.clone(), args: Default::default() });

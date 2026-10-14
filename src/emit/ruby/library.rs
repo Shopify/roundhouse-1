@@ -2109,6 +2109,15 @@ fn render_scope_delegate(
     if !delegable_name(&name_sym) {
         return Err("`?`/`!` names take no __scope_ arity mangling".into());
     }
+    // Every declaration takes a splat (`scope :force_index, ->(key, *rest)`):
+    // its `__rel` is a keyword after the splat (`push_scope_methods`), so
+    // there is no arity to detect, and the relation goes to the scope
+    // method itself. The arguments pass as they came, keywords included.
+    if decls.iter().all(|(_, params)| params.iter().any(|p| p.rest && !p.keyword)) {
+        return Ok(format!(
+            "\x20\x20\x20\x20def {name}(*args, **kwargs)\n\x20\x20\x20\x20\x20\x20klass.{name}(*args, **kwargs, __rel: self)\n\x20\x20\x20\x20end\n"
+        ));
+    }
     let mut shapes: Vec<(&crate::ident::ClassId, DelegableShape)> = Vec::new();
     for (model, params) in decls {
         let Some(shape) = DelegableShape::of(params) else {
@@ -13104,7 +13113,10 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
         let Some(r) = recv else { return false };
         if matches!(&*r.node, ExprNode::SelfRef) { return true; }
         let ExprNode::Const { path } = &*r.node else { return false };
-        path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
+        // A rooted spelling (`::A::B`, empty first segment: constant
+        // rooting writes one where a nested namespace shadows the head)
+        // names the class too.
+        path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == class_name
     }
     /// Implicit self, `self`, or the class spelled out.
     fn is_self_or_own_class(recv: &Option<Expr>, class_name: &str) -> bool {
@@ -13134,7 +13146,7 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("::");
-        prefix == class_name
+        prefix.trim_start_matches("::") == class_name
     }
     fn calls_self(expr: &Expr, own: &crate::det::HashSet<&str>, deferred_names: &crate::det::HashSet<String>, class_name: &str) -> bool {
         match &*expr.node {
