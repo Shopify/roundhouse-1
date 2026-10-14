@@ -274,7 +274,30 @@ pub(crate) fn unbind_subclassed_model_new(lcs: &mut [crate::dialect::LibraryClas
     let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
     let private = private_constructors(app);
     let mut subclassed = subclassed_names(app);
-    subclassed.retain(|name| models.contains(name.as_str()) && !private.contains(name));
+    subclassed.retain(|name| !private.contains(name));
+    // A library class's class-side method keeps its owner binding unless a
+    // class overrides the name and calls `super`: that `super` runs the
+    // inherited body with `self` the subclass, so the owner binding would
+    // build the ancestor (`MultiCurrency::MoneyBag.zero` -> `super` ->
+    // `MoneyBag::Variadic.zero` built a `Variadic`, which has no
+    // `presentment_money`). A model's class-side methods are all unbound.
+    let super_names: crate::det::HashSet<String> = lcs
+        .iter()
+        .flat_map(|lc| &lc.methods)
+        .filter(|m| m.receiver == MethodReceiver::Class && calls_super(&m.body))
+        .map(|m| m.name.as_str().to_string())
+        .collect();
+    fn calls_super(expr: &Expr) -> bool {
+        if matches!(&*expr.node, ExprNode::MethodDefExpr { .. }) {
+            return false;
+        }
+        if matches!(&*expr.node, ExprNode::Super { .. }) {
+            return true;
+        }
+        let mut found = false;
+        expr.node.for_each_child(&mut |c| found |= calls_super(c));
+        found
+    }
     fn unbind(expr: &mut Expr, owner: &[Symbol]) {
         if matches!(&*expr.node, ExprNode::MethodDefExpr { .. }) {
             return;
@@ -296,8 +319,12 @@ pub(crate) fn unbind_subclassed_model_new(lcs: &mut [crate::dialect::LibraryClas
             continue;
         }
         let owner: Vec<Symbol> = lc.name.0.as_str().split("::").map(Symbol::from).collect();
+        let is_model = models.contains(lc.name.0.as_str());
         for m in &mut lc.methods {
-            if m.receiver == MethodReceiver::Class && !m.name_span.is_synthetic() {
+            if m.receiver == MethodReceiver::Class
+                && !m.name_span.is_synthetic()
+                && (is_model || super_names.contains(m.name.as_str()))
+            {
                 unbind(&mut m.body, &owner);
             }
         }

@@ -845,7 +845,14 @@ pub(super) fn ingest_model_body_items(
                             break;
                         };
                         let leading = comments.take().unwrap_or_default();
-                        out.extend(ingest_model_body_items(&inner, owner, file, leading, defaults.as_deref_mut())?);
+                        let items = ingest_model_body_items(&inner, owner, file, leading, defaults.as_deref_mut())?;
+                        // A class macro the statement calls stays an
+                        // Unknown item, read as an association later
+                        // from its call; that read needs the merged text.
+                        if items.iter().any(|item| matches!(item, ModelBodyItem::Unknown { .. })) {
+                            MERGED_CALLS.with_borrow_mut(|m| m.insert((super::sources::file_id(file).0, *start as u32), source.clone()));
+                        }
+                        out.extend(items);
                     }
                     if complete {
                         return Ok(out);
@@ -917,6 +924,35 @@ pub(super) fn ingest_model_body_items(
         }
     }
     Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?])
+}
+
+thread_local! {
+    /// The merged copy of a file a `with_options` call's inner statement was
+    /// read from, by file and the statement's start offset, for the ones
+    /// that stay Unknown items.
+    static MERGED_CALLS: std::cell::RefCell<crate::det::HashMap<(u32, u32), Vec<u8>>> = Default::default();
+}
+
+/// The text a `with_options` inner call was read from, options merged;
+/// spans in it are the file's.
+pub(super) fn merged_call_source(file: crate::span::FileId, start: u32) -> Option<Vec<u8>> {
+    MERGED_CALLS.with_borrow(|m| m.get(&(file.0, start)).cloned())
+}
+
+/// Drop the merged copies once the Unknown items are read.
+pub(super) fn forget_merged_calls() {
+    MERGED_CALLS.with_borrow_mut(|m| m.clear());
+}
+
+/// Whether `stmt` is a `with_options` block the model walk expands
+/// ([`with_options_calls`]): its inner calls come back with the outer
+/// options merged.
+pub(super) fn expands_with_options(stmt: &Node<'_>, file: &str) -> bool {
+    let Some(call) = stmt.as_call_node() else { return false };
+    call.receiver().is_none()
+        && constant_id_str(&call.name()) == "with_options"
+        && call.block().is_some_and(|b| b.as_block_node().is_some())
+        && with_options_calls(&call, file).is_some()
 }
 
 /// `with_options inverse_of: :account, foreign_key: :account_id do … end`

@@ -82,6 +82,7 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
     for model in &mut app.models {
         drop_redeclared(&mut model.body);
     }
+    super::model::forget_merged_calls();
     any
 }
 
@@ -114,7 +115,11 @@ fn association_of(
     kind: &str,
 ) -> Option<crate::dialect::Association> {
     let source = crate::ide::source(app, call.span.file)?;
-    let parsed = ruby_prism::parse(source.text.as_bytes());
+    // A call a `with_options` block carries is read from the copy of the
+    // file with the block's options merged in.
+    let merged = super::model::merged_call_source(call.span.file, call.span.start);
+    let text: &[u8] = merged.as_deref().unwrap_or(source.text.as_bytes());
+    let parsed = ruby_prism::parse(text);
     let root = parsed.node();
     let node = super::define_method_loops::node_at(&root, call.span.start as usize, call.span.end as usize, |n| {
         n.as_call_node().is_some()

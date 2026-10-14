@@ -320,3 +320,27 @@ fn a_class_subclassed_at_run_time_keeps_its_bare_new() {
     assert!(src.contains("new(string.to_i)"), "{src}");
     assert!(src.contains("Measured::Measurable.new(0)") || src.contains("Measurable.new(0)"), "the constant is still the owner's:\n{src}");
 }
+
+/// A subclass overriding a class-side constructor and calling `super`
+/// reaches the ancestor's body with `self` the subclass. Bound to the
+/// owner it built the ancestor: Core's `MultiCurrency::MoneyBag.zero`
+/// -> `super` -> `MoneyBag::Variadic.zero` returned a `Variadic`, and
+/// `presentment_money` was undefined on it.
+#[test]
+fn a_class_side_method_a_subclass_reaches_through_super_keeps_its_bare_new() {
+    let files = emitted_files(&[
+        (
+            "app/models/bag.rb",
+            "class Bag\n  def initialize(**attributes)\n    @attributes = attributes\n  end\n\n  def self.zero(**currencies)\n    new(**currencies)\n  end\n\n  def self.other\n    new\n  end\nend\n",
+        ),
+        (
+            "app/models/money_bag.rb",
+            "class MoneyBag < Bag\n  def self.zero(shop_currency: nil)\n    super\n  end\nend\n",
+        ),
+    ]);
+    let base = file_named(&files, "bag.rb");
+    assert!(!base.contains("Bag.new(currencies)"), "bound to the owner, `MoneyBag.zero` builds a Bag:\n{base}");
+    assert!(base.contains("    new(currencies)"), "{base}");
+    // A name no subclass overrides through `super` keeps its owner.
+    assert!(base.contains("Bag.new\n"), "{base}");
+}

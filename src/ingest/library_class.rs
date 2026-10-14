@@ -7075,6 +7075,22 @@ fn includer_guard_classes(cond: &crate::expr::Expr) -> Option<(Vec<String>, bool
     }
 }
 
+/// [`walk_dsl_stmts`] for a concern's `included do`, keeping a
+/// `with_options` block that expands whole: its statements are read with
+/// the outer options merged in (`foreign_key:`, `inverse_of:`, `if:`)
+/// and count as the block's own, so a macro call among them
+/// (`readonly_has_one`, which no lowering reads as an association yet)
+/// is carried into each includer like one written directly.
+fn walk_included_stmts<'pr>(body: ruby_prism::Node<'pr>, file: &str, out: &mut Vec<ruby_prism::Node<'pr>>) {
+    for stmt in flatten_statements(body) {
+        if !super::model::expands_with_options(&stmt, file) {
+            walk_dsl_stmts(stmt, out);
+            continue;
+        }
+        out.push(stmt);
+    }
+}
+
 fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::Node<'pr>>) {
     for stmt in flatten_statements(body) {
         if let Some(call) = stmt.as_call_node() {
@@ -7286,7 +7302,7 @@ fn ingest_concern_hook_items(
             let block_start = items.len();
             let mut unclaimed = false;
             let mut stmts = Vec::new();
-            walk_dsl_stmts(block.body().unwrap(), &mut stmts);
+            walk_included_stmts(block.body().unwrap(), file, &mut stmts);
             // Class-side visibility of the block's own `class_attribute`
             // methods: its statements are expanded onto those methods
             // below rather than carried.
@@ -7394,7 +7410,7 @@ fn ingest_concern_hook_items(
                 });
                 match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
-                        for mut item in parsed {
+                                        for mut item in parsed {
                             match item {
                                 ModelBodyItem::Association { .. }
                                 | ModelBodyItem::Scope { .. }
