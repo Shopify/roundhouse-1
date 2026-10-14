@@ -4662,7 +4662,7 @@ fn ruby_family_files(
     // wraps `with_external_gem_namespaces` for `BuildTarget::Ruby` alone).
     // JRuby must not get Gemfile pins + boot requires without that path.
     if flavor == RubyFlavor::CRuby {
-        apply_locked_external_gem_wiring(&mut files, app);
+        apply_locked_external_gem_wiring(&mut files, app, &gem_sources);
     }
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
@@ -15721,7 +15721,11 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
 /// Carry direct, unmodeled gems that the emitted CRuby app actually names.
 /// The source lockfile is the version authority; source constants are the
 /// demand signal. Remove the scaffold lock so Bundler can resolve those pins.
-fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App) {
+/// A gem `apply_runtime_gem_wiring` already activates (`wired`: lock-gated
+/// and Bundler.require entries) is left to it: it loads the gem where the
+/// app would, after the facades, and an eager boot require ahead of them
+/// ran Core's `courier` before its git Rails or the ports were there.
+fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App, wired: &[String]) {
     let Some(lock) = app.gem_lock.as_ref() else {
         return;
     };
@@ -15732,6 +15736,9 @@ fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App
             // Fail-closed: a GIT-sourced unknown must not be rewritten as a
             // rubygems.org name/version pin.
             if lock.is_from_git(&gem.name) {
+                return false;
+            }
+            if wired.iter().any(|name| *name == gem.name) {
                 return false;
             }
             let namespace = crate::gems::namespace_of(&gem.name);
@@ -15749,10 +15756,15 @@ fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App
     let Some((_, gemfile)) = files.iter_mut().find(|(path, _)| path == "Gemfile") else {
         return;
     };
+    // An app whose boot runs `Bundler.require` names what boot loads in its
+    // Gemfile: the required gems are `wired` above, and a `require: false`
+    // one (Core's dhm, proto, timescan) is the app's to require where it
+    // needs it. Only an app without one takes the eager boot require.
+    let eager = app.bundler_gems.is_empty();
     let mut eager_requires = Vec::new();
     for gem in needed {
         let namespace = crate::gems::namespace_of(&gem.name).to_ascii_lowercase();
-        if namespace == gem.name {
+        if eager && namespace == gem.name {
             eager_requires.push(gem.name.clone());
         }
         let version = gem.version.as_deref();
@@ -15780,7 +15792,13 @@ fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App
             .map(|feature| format!("require {feature:?}\n"))
             .collect::<String>();
         if !requires.is_empty() {
-            boot.insert_str(0, &format!("{requires}\n"));
+            // After the gem facades when the tree carries them: they
+            // activate the lock's git gems (runtime/git_gems.rb), and a
+            // locked gem that depends on one (Core's `courier` on its git
+            // Rails) only resolves once they are.
+            const FACADES: &str = "require_relative \"runtime/gem_facades\"\n";
+            let at = boot.find(FACADES).map_or(0, |i| i + FACADES.len());
+            boot.insert_str(at, &format!("{requires}\n"));
         }
     }
     files.retain(|(path, _)| path != "Gemfile.lock");
