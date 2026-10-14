@@ -651,6 +651,14 @@ impl<'a> BodyTyper<'a> {
         Classes::new(self.classes, self.deps)
     }
 
+    /// `ActionView::Helpers::FormBuilder`, or an app builder (`builder:`)
+    /// descending from it.
+    fn is_form_builder(&self, id: &ClassId) -> bool {
+        const FORM_BUILDER: &str = "ActionView::Helpers::FormBuilder";
+        id.0.as_str() == FORM_BUILDER
+            || cref_ancestors(id.0.as_str(), self.classes()).iter().any(|a| a.0.as_str().trim_start_matches("::") == FORM_BUILDER)
+    }
+
     /// A source constant's inferred value, noted as a read.
     fn typed_constant(&self, declaration: &DeclarationId) -> Option<&'a Ty> {
         if let Some(deps) = self.deps {
@@ -3288,7 +3296,10 @@ impl<'a> BodyTyper<'a> {
                     }
                     return Ty::Str;
                 }
-                if matches!(recv_ty.as_ref(), Some(Ty::Class { args: model, .. }) if !model.is_empty())
+                // Only a form builder's field: any other generic receiver
+                // (`exception_classifiers.select { ... }`) is no form field.
+                if matches!(recv_ty.as_ref(), Some(Ty::Class { id, args: model })
+                        if !model.is_empty() && self.is_form_builder(id))
                     && crate::lower::view::wraps_field_errors(method.as_str())
                     && expr.diagnostic.is_none()
                 {
