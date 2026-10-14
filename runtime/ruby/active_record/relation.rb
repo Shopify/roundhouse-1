@@ -604,11 +604,12 @@ module ActiveRecord
     def unscope(*args)
       own_lists
       unload_records
+      valid_scopes = UNSCOPING_VALUES #: Array[Symbol]
       args.flatten.each do |scope|
         if scope.is_a?(Symbol)
           scope = :left_outer_joins if scope == :left_joins
-          unless UNSCOPING_VALUES.include?(scope)
-            raise ArgumentError, "Called unscope() with invalid unscoping argument ':#{scope}'. Valid arguments are :#{UNSCOPING_VALUES.join(", :")}."
+          unless valid_scopes.include?(scope)
+            raise ArgumentError, "Called unscope() with invalid unscoping argument ':#{scope}'. Valid arguments are :#{valid_scopes.join(", :")}."
           end
           unscope_clause(scope)
         elsif scope.is_a?(Hash)
