@@ -1231,13 +1231,19 @@ fn file_class_new_path_write<'pr>(
 /// left a file statement, no index declared `Measured::Weight` and each
 /// of Core's reads of it was an unknown constant. Only a call that builds
 /// no class itself (a factory block, `Class.new` and a Sorbet alias keep
-/// their own paths).
+/// their own paths), or a constant alias: payments_partners'
+/// inputs/shipping_line_item.rb is the whole program
+/// `PaymentsPartners::Inputs::ShippingLineItem = PaymentsPartners::ShippingLineItem`,
+/// and with the file dropped every read of the alias was `uninitialized
+/// constant PaymentsPartners::Inputs::ShippingLineItem`.
 fn file_call_path_write<'pr>(
     stmt: &ruby_prism::Node<'pr>,
 ) -> Option<(String, ruby_prism::ConstantPathWriteNode<'pr>)> {
     let write = stmt.as_constant_path_write_node()?;
     let value = write.value();
-    value.as_call_node()?;
+    if value.as_call_node().is_none() && value.as_constant_read_node().is_none() && value.as_constant_path_node().is_none() {
+        return None;
+    }
     if super::initializer_constants::is_class_new_declaration(&value)
         || super::factory_class::factory_block(&value).is_some()
         || is_sorbet_type_alias(&value)
