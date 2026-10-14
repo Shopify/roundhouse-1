@@ -12,18 +12,30 @@
 # reads ~24 attributes off the same row without re-parsing per
 # attribute.
 require "yaml"
+require "date"
+begin
+  require "bigdecimal"
+rescue LoadError
+end
 
 module TypedStore
-  @cache_key = nil
-  @cache_val = {}
+  # What a stored settings hash may hold beyond the safe scalars, as a
+  # Rails app's `config.active_record.yaml_column_permitted_classes`
+  # (Core's: Symbol, Time, DateTime, Date, BigDecimal); aliases are what
+  # `YAML.dump` writes for one object held twice.
+  PERMITTED_CLASSES = [Symbol, Time, DateTime, Date, (BigDecimal if defined?(BigDecimal))].compact.freeze
 
+  # The one-entry parse memo, per thread (as thread_state.rb keeps the
+  # shared one): two requests parsing different rows neither evict each
+  # other nor hand each other the wrong hash.
   def self.parse(serialized)
     s = serialized.to_s
-    return @cache_val if s == @cache_key
-    h = s.empty? ? {} : YAML.safe_load(s)
+    cached = Thread.current[:typed_store_val]
+    return cached if cached && s == Thread.current[:typed_store_key]
+    h = s.empty? ? {} : YAML.safe_load(s, permitted_classes: PERMITTED_CLASSES, aliases: true)
     h = {} unless h.is_a?(Hash)
-    @cache_key = s
-    @cache_val = h
+    Thread.current[:typed_store_key] = s
+    Thread.current[:typed_store_val] = h
     h
   end
 
@@ -39,7 +51,7 @@ module TypedStore
   def self.write(serialized, key, value)
     h = parse(serialized).dup
     h[key] = value
-    @cache_key = nil
+    Thread.current[:typed_store_key] = nil
     YAML.dump(h)
   end
 

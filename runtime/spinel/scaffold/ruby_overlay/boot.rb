@@ -208,7 +208,6 @@ require_relative "runtime/action_view_missing_template"
 require_relative "runtime/action_dispatch_request"
 require_relative "runtime/action_controller_session"
 require_relative "runtime/action_controller_json_render"
-require_relative "runtime/typed_store"
 # has_json (ActiveModel::SchematizedJson) virtual-attribute seam — the
 # JSON sibling of the line above. After runtime/json_builder, whose
 # string escaper it uses.
@@ -239,6 +238,11 @@ require_relative "runtime/job_registry"
 # Per-request state per THREAD -- reopens Current, the view slots, the
 # broadcast log, the job queue and the store memo (see the file).
 require_relative "runtime/thread_state"
+# typed_store (YAML-backed, with its own per-thread parse memo) AFTER
+# thread_state, whose spinel flat-line `TypedStore.parse`/`write` it
+# replaces: that parser reads a nested value (`signup:` over indented
+# lines) as nil and writes a Hash as its `to_s`.
+require_relative "runtime/typed_store"
 # A drain thread per serving process, registered by config.ru. After
 # thread_state: it wraps that file's locked queue methods.
 require_relative "runtime/active_job_cruby"
