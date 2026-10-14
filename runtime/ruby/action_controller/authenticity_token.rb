@@ -58,8 +58,12 @@ module ActionController
       xor(decoded[0, 32].to_s, decoded[32, 32].to_s)
     end
 
+    # Not base64 at all (a foreign token, `!!!!`): no bytes, as `unmask` reads
+    # it, so `valid?` refuses it instead of raising.
     def self.decode(encoded)
       Base64.urlsafe_decode64(encoded)
+    rescue ArgumentError
+      ""
     end
 
     def self.xor(a, b)

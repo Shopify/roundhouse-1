@@ -317,7 +317,7 @@ class BaseTest < Minitest::Test
     rel = ActiveRecord::Relation.new(Item).where(title: "o'k")
     log = Db.capture_sql { assert_equal ["o'k"], rel.to_a.map(&:title) }
     assert_equal 1, log.length
-    assert_match(/items\.title = \?/, log[0])
+    assert_match(/items\."title" = \?/, log[0])
     refute_match(/o''k/, log[0])
     assert_equal [], ActiveRecord::Relation.new(Item).where(id: -1).to_a
   end
@@ -327,8 +327,8 @@ class BaseTest < Minitest::Test
   def test_hash_condition_values_inline_outside_reads
     rel = ActiveRecord::Relation.new(Item).where(title: "o'k", id: 7)
     [rel.to_sql, rel.count_sql, rel.exists_sql(1), rel.arel.to_sql].each do |sql|
-      assert_match(/items\.title = 'o''k'/, sql)
-      assert_match(/items\.id = 7/, sql)
+      assert_match(/items\."title" = 'o''k'/, sql)
+      assert_match(/items\."id" = 7/, sql)
       refute sql.include?("\x01"), sql.inspect
     end
   end
