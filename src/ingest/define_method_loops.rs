@@ -1676,7 +1676,11 @@ impl<'a> Scope<'a> {
             Val::Str(s) => Symbol::from(s),
             other => return Err(format!("`{what}` named by {}", other.describe())),
         };
-        if !valid_def_name(&name) {
+        // A name no `def` can spell (Core's `ShopPlan.names` holds
+        // "grandfather-trial") is still a method `define_method` makes: a
+        // model keeps the call, naming it with the evaluated Symbol.
+        let spellable = valid_def_name(&name);
+        if !spellable && (singleton || self.replayed || !matches!(self.owner, Owner::Model(_))) {
             return Err(format!("`{what}` names `{name}`, which no `def` can"));
         }
         let block = call
@@ -1715,6 +1719,22 @@ impl<'a> Scope<'a> {
             formals.push(Param { rest: true, ..Param::keyword(n.clone(), None) });
         }
         let body = close(body)?;
+        if !spellable {
+            if !signature.optionals.is_empty() || !signature.keywords.is_empty() || signature.kwrest.is_some() {
+                return Err(format!(
+                    "`{what}` names `{name}`, which no `def` can, and its block has optional or keyword parameters"
+                ));
+            }
+            let mut call = send.clone();
+            if let ExprNode::Send { args, block: Some(lambda), .. } = &mut *call.node {
+                args[0] = Expr::new(args[0].span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } });
+                if let ExprNode::Lambda { body: lambda_body, .. } = &mut *lambda.node {
+                    *lambda_body = body;
+                }
+            }
+            self.out.residual.push(call);
+            return Ok(());
+        }
         let mut def = MethodDef {
             name: name.clone(),
             receiver: if singleton {

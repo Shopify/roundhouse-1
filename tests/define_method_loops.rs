@@ -507,6 +507,55 @@ fn a_loop_over_a_class_method_answering_a_literal_array_matches_native() {
     assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
 }
 
+/// Core's `ShopPlan.names` holds "grandfather-trial": the loop's
+/// `define_method "#{name}?"` makes a method no `def` can spell. The
+/// model keeps that one as a `define_method` call; the spellable names
+/// still expand to `def`s (ShopBillingSetting#shopify_plus?).
+const HYPHENATED_NAMES: &str = r##"class StatusNames
+  class << self
+    def all
+      [
+        "draft",
+        "frozen",
+        "grandfather-trial",
+      ]
+    end
+  end
+end
+"##;
+
+const HYPHENATED_SCRIPT: &str = r##"a = Article.create!(title: "grandfather-trial", body: "a body long enough")
+p [a.draft?, a.status_frozen?, a.public_send(:"grandfather-trial?")]
+p Article.public_method_defined?(:"grandfather-trial?")
+p Article.public_method_defined?(:draft?)
+"##;
+
+#[test]
+fn a_loop_naming_a_method_no_def_can_spell_matches_native() {
+    let expected = native(
+        "hyphenated_names",
+        &format!(
+            "{NATIVE_PRELUDE}\
+             ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
+             ActiveRecord::Schema.verbose = false\n\
+             ActiveRecord::Schema.define {{ create_table(:articles) {{ |t| t.string :title; t.text :body; t.timestamps }} }}\n\
+             {HYPHENATED_NAMES}\
+             class Article < ActiveRecord::Base\n  validates :title, presence: true\n{ARTICLE_STATUSES}end\n\
+             {HYPHENATED_SCRIPT}"
+        ),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected, ["[false, false, true]", "true", "true"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/models/status_names.rb", HYPHENATED_NAMES)
+        .edit("app/models/article.rb", ARTICLE_FIND, ARTICLE_STATUSES)
+        .run_ruby(HYPHENATED_SCRIPT);
+    run.assert_passes();
+    assert!(!run.errors.iter().any(|e| e.contains("not lowered") || e.contains("not supported")), "{:#?}", run.errors);
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
+}
+
 // ---- Refused statements run natively on the Ruby emit -----------------------
 
 /// Shapes the expansion refuses: a computed name
