@@ -66,10 +66,29 @@ pub(crate) fn seeded_name(expr: &Expr) -> Option<&str> {
     name.as_str().strip_prefix("__class_attr_")
 }
 
-/// Read a receiverless `class_attribute` call. `None` when it is some
-/// other call or a shape the expansion does not model.
+/// Whether `call` runs on the class itself: no receiver, `self`, or
+/// `T.unsafe(self)` (Sorbet's cast, which a typed concern writes where
+/// `self` is the module: hedwig's `included do
+/// T.unsafe(self).class_attribute(:rate_limiting_config, …) end`).
+fn on_self(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(recv) = call.receiver() else { return true };
+    if recv.as_self_node().is_some() {
+        return true;
+    }
+    let Some(cast) = recv.as_call_node() else { return false };
+    constant_id_str(&cast.name()) == "unsafe"
+        && cast.receiver().is_some_and(|r| r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "T"))
+        && cast.arguments().is_some_and(|args| {
+            let mut args = args.arguments().iter();
+            args.next().is_some_and(|a| a.as_self_node().is_some()) && args.next().is_none()
+        })
+}
+
+/// Read a `class_attribute` call on the class (no receiver, `self`, or
+/// `T.unsafe(self)`). `None` when it is some other call or a shape the
+/// expansion does not model.
 pub(crate) fn parse(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<Decl> {
-    if call.receiver().is_some() || constant_id_str(&call.name()) != "class_attribute" || call.block().is_some() {
+    if !on_self(call) || constant_id_str(&call.name()) != "class_attribute" || call.block().is_some() {
         return None;
     }
     let mut names: Vec<Symbol> = Vec::new();

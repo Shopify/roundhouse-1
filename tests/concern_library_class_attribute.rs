@@ -910,3 +910,50 @@ fn a_hook_doing_more_than_extend_still_refuses_the_carry() {
         "{gaps:#?}"
     );
 }
+
+// ---- `T.unsafe(self).class_attribute` --------------------------------------
+
+/// A typed concern writes `T.unsafe(self).class_attribute(…)` in its
+/// `included` block (hedwig's `Hedwig::RateLimiting::Options`, whose class
+/// method `rate_limited` writes `T.unsafe(self).rate_limiting_config =`).
+/// The cast is only for Sorbet: the includer gets the attribute as it does
+/// for the bare call, so the class method's writer exists.
+const LIMITED: &str = r##"module Limited
+  extend ActiveSupport::Concern
+
+  included do
+    T.unsafe(self).class_attribute(:limit_config, default: :none)
+  end
+
+  class_methods do
+    def limited(value)
+      T.unsafe(self).limit_config = value
+    end
+  end
+end
+"##;
+
+#[test]
+fn a_t_unsafe_class_attribute_in_an_included_block_is_the_includers() {
+    let script = "p [Gate.limit_config, Door.limit_config, Gate.new.limit_config]\n\
+                  p [Door.limit_config, Door.new.limit_config]\n\
+                  p Gate.limit_config\n";
+    let run = [
+        ("app/models/concerns/limited.rb", LIMITED),
+        // hedwig's shape: the includer takes a concern that includes `Limited`.
+        (
+            "app/models/concerns/options.rb",
+            "module Options\n  extend ActiveSupport::Concern\n  include Limited\nend\n",
+        ),
+        ("app/models/gate.rb", "class Gate\n  include Options\nend\n"),
+        ("app/models/door.rb", "class Door < Gate\n  limited :five\nend\n"),
+    ]
+    .iter()
+    .fold(emit_and_run::real_blog(), |overlay, (path, source)| {
+        overlay.write(path, source)
+    })
+    .run_ruby(script);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, ["[:none, :five, :none]", "[:five, :five]", ":none"], "{}", run.stdout);
+}
