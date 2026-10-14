@@ -385,8 +385,8 @@ fn sorbet_serialized_members_expand_through_symbol_keys_and_map() {
 /// A model that nests its enum and also declares validations,
 /// associations and callbacks (Core's Contract has dozens) still
 /// expands: those statements record what they are given. Statements
-/// that hand the class to other code (`include`, `tap`, an app macro)
-/// keep the conservative gap.
+/// that hand the class to other code (`tap`, a stored result) keep the
+/// conservative gap; app macros are covered below.
 #[test]
 fn nested_enum_survives_the_models_own_rails_declarations() {
     let nested = format!("{RATING}\n  enum(:state, Rating.values.map(&:serialize).to_h {{ |s| [s.to_sym, s] }})\n");
@@ -395,9 +395,64 @@ fn nested_enum_survives_the_models_own_rails_declarations() {
     let app = ingest_enum(&source, &[]).expect("Rails declarations do not touch the nested enum");
     assert_eq!(app.models[0].enums[&roundhouse::Symbol::from("state")][0],
         ("severe".to_string(), roundhouse::expr::Literal::Str { value: "severe".to_string() }));
-    for exposing in ["include Auditable", "tap { |ns| ns }", "trusted_state :state", "x = validates(:state, presence: true)"] {
+    for exposing in ["tap { |ns| ns }", "x = validates(:state, presence: true)", "x = trusted_state :state", "const_get(:Rating).class_eval { }"] {
         let source = format!("class Ticket < ApplicationRecord\n{nested}  {exposing}\nend\n");
         assert_enum_gap(&source, &[]);
+    }
+}
+
+/// Core's Sales::Subscriptions::Contract runs `extend`, `include`,
+/// `trusted_id_attribute` and `money_column` beside its nested enum. A
+/// class-body macro is not a write to the enum: refuse only constant
+/// writes, reopens and the Module reflection API.
+#[test]
+fn nested_enum_survives_unrelated_class_body_macros_but_not_writes() {
+    use roundhouse::expr::Literal;
+    let nested = format!("{RATING}\n  enum(:state, Rating.values.map(&:serialize).to_h {{ |s| [s.to_sym, s] }})\n");
+    let macros = "  extend(TicketExample)\n  include(Auditable)\n  include Dux::Tracing\n  trusted_id_attribute :id, [Component::TrustedId, Sales::TicketId]\n  trusted_id_attribute(:shop_id)\n  money_column(:price, currency_column: :currency, currency_read_only: true)\n";
+    let (head, tail) = macros.split_at(macros.match_indices('\n').nth(2).unwrap().0 + 1);
+    for (before, after) in [("", macros), (macros, ""), (head, tail)] {
+        let source = format!("class Ticket < ApplicationRecord\n{before}{nested}{after}end\n");
+        let app = ingest_enum(&source, &[]).unwrap_or_else(|e| panic!("macros do not touch the enum: {e:?}"));
+        assert_eq!(app.models[0].enums[&roundhouse::Symbol::from("state")], vec![
+            ("severe".to_string(), Literal::Str { value: "severe".to_string() }),
+            ("mild".to_string(), Literal::Str { value: "mild".to_string() }),
+        ]);
+    }
+    // The same macros do not excuse a real write to the nested enum.
+    for mutation in [
+        "Rating = Class.new", "Rating.const_set(:High, nil)", "Ticket.const_set(:Rating, Class.new)",
+        "remove_const(:Rating)", "const_set(:Rating, Class.new)", "self.const_set(:Rating, nil)",
+        "class_eval { remove_const(:Rating) }", "send(:remove_const, :Rating)",
+        "Rating.class_eval { def serialize; \"wrong\"; end }",
+        "class Rating; enums do; Extra = new(\"other\"); end; end",
+        "Rating::High = nil",
+    ] {
+        let source = format!("class Ticket < ApplicationRecord\n{nested}{macros}  {mutation}\nend\n");
+        assert!(ruby_prism::parse(source.as_bytes()).errors().next().is_none(), "invalid repro: {mutation}");
+        assert_enum_gap(&source, &[]);
+    }
+}
+
+/// Finders and constructors the rest of the app calls on the model class
+/// (`Ticket.find`, `Ticket.where`) do not touch its nested enum; the
+/// reflection API on that class still does, and a module namespace stays
+/// conservative.
+#[test]
+fn nested_enum_survives_app_calls_on_its_class_but_not_reflective_writes() {
+    let nested = format!("{RATING}\n  enum(:state, Rating.values.map(&:serialize).to_h {{ |s| [s.to_sym, s] }})\n");
+    let model = format!("class Ticket < ApplicationRecord\n{nested}end\n");
+    let reads = "Ticket.find(1)\nticket = Ticket.where(state: \"mild\").first\nTicket.create!(state: \"severe\")\nTicket.new.state\nTicket.count\n";
+    for path in ["app/controllers/a.rb", "app/controllers/z.rb", "db/seeds.rb"] {
+        ingest_enum(&model, &[(path, reads)]).unwrap_or_else(|e| panic!("{path}: finders leave the enum alone: {e:?}"));
+    }
+    for mutation in [
+        "Ticket.const_set(:Rating, Class.new)", "Ticket.send(:remove_const, :Rating)",
+        "Ticket.class_eval { remove_const(:Rating) }", "Ticket.const_get(:Rating).define_singleton_method(:values) { [] }",
+        "Ticket.dup::Rating.define_singleton_method(:values) { [] }", "Ticket.tap { |t| t::Rating.class_eval { } }",
+    ] {
+        assert!(ruby_prism::parse(mutation.as_bytes()).errors().next().is_none(), "invalid repro: {mutation}");
+        assert_enum_gap(&model, &[("app/controllers/z.rb", mutation)]);
     }
 }
 

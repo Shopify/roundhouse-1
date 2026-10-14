@@ -165,7 +165,7 @@ impl EnumConstants {
                 .resolve_name(receiver, owners)
                 .is_some_and(|receiver| self.is_sorbet_read(&receiver, method)),
             SurfaceUse::Reference(_) | SurfaceUse::Override => false,
-            SurfaceUse::Call { method, result } => {
+            SurfaceUse::Call { method, result, body_macro } => {
                 let member_owner = name.rsplit_once("::").map(|(owner, _)| owner).unwrap_or("");
                 let class_read = name == "T::Enum"
                     || matches!(self.values.get(name), Some(EnumConstant::Sorbet { .. }));
@@ -200,6 +200,22 @@ impl EnumConstants {
                         // records), so it cannot reach a nested enum.
                         // Not `include`/`extend`, whose hooks receive it.
                         m if is_inert_model_declaration(m) => matches!(result, ValueContext::Discarded),
+                        // Any other statement of the class body is a macro
+                        // (`trusted_id_attribute`, `money_column`, `include`,
+                        // `extend`, ...). Writing to or replacing the nested
+                        // enum takes a constant write (collected as a Write)
+                        // or the Module reflection API below; a macro that
+                        // merely runs does neither.
+                        m if *body_macro && !mutates_or_exposes_namespace(m) => {
+                            matches!(result, ValueContext::Discarded)
+                        }
+                        // The same holds for the finders and constructors the
+                        // rest of the app calls on a class that has a
+                        // superclass (`Contract.find`, `Contract.where`): they
+                        // answer records and relations. A module namespace
+                        // stays conservative, and so does a result that is
+                        // the namespace (`itself`, `freeze` above).
+                        m if self.parents.contains_key(name) && !mutates_or_exposes_namespace(m) => true,
                         _ => false,
                     }
                 }
@@ -248,5 +264,20 @@ fn is_inert_model_declaration(method: &str) -> bool {
             | "after_rollback" | "after_create_commit" | "after_update_commit" | "after_destroy_commit"
             | "after_save_commit" | "after_initialize" | "after_find" | "after_touch"
             | "private" | "public" | "protected" | "private_constant" | "module_function"
+    )
+}
+
+/// Module/Object API that writes or replaces constants, rebinds `self`, or
+/// hands the namespace (and so its nested enums) to other code. A fixed set
+/// of Ruby's reflection API: no application macro name is listed.
+fn mutates_or_exposes_namespace(method: &str) -> bool {
+    matches!(
+        method,
+        "const_set" | "remove_const" | "const_get" | "const_missing" | "constants" | "autoload"
+            | "class_eval" | "module_eval" | "class_exec" | "module_exec" | "instance_eval"
+            | "instance_exec" | "eval" | "send" | "public_send" | "__send__" | "tap" | "then"
+            | "yield_self" | "dup" | "clone" | "define_method" | "define_singleton_method"
+            | "singleton_class" | "ancestors" | "method" | "public_method" | "to_enum"
+            | "enum_for" | "binding" | "instance_variable_get" | "instance_variable_set"
     )
 }

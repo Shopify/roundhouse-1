@@ -45,6 +45,9 @@ enum SurfaceUse {
     Call {
         method: String,
         result: ValueContext,
+        /// A statement of the namespace's own class body (implicit or `self`
+        /// receiver): a macro, whose arguments are classified separately.
+        body_macro: bool,
     },
     EnumBase,
     Inheritance,

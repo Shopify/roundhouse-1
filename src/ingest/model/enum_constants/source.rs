@@ -73,9 +73,9 @@ impl EnumConstants {
                         }) || super::super::enum_declaration(&call).is_some_and(|declaration| {
                             super::super::serialized_enum_receiver(&declaration.mapping).is_some()
                         }));
-                    let path = call
-                        .receiver()
-                        .and_then(|r| EnumConstants::path(&r))
+                    let explicit = call.receiver().and_then(|r| EnumConstants::path(&r));
+                    let body_macro = explicit.is_none() && context::namespace_body(&self.parents);
+                    let path = explicit
                         .or_else(|| {
                             (context::namespace_body(&self.parents)
                                 && (implicit
@@ -89,6 +89,7 @@ impl EnumConstants {
                             context: SurfaceUse::Call {
                                 method: constant_id_str(&call.name()).to_string(),
                                 result: context::value(&self.parents, node),
+                                body_macro,
                             },
                         });
                     }

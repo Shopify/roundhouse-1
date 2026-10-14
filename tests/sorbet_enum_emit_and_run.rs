@@ -220,3 +220,68 @@ raise "predicate lost" unless DeliveryPromise::PromiseProvider.new.external?
         )
         .assert_passes();
 }
+
+/// Core's Sales::Subscriptions::Contract nests its `T::Enum` and runs
+/// `extend`, `include` and app macros (`trusted_id_attribute`,
+/// `money_column`) in the same class body. None of them writes the enum,
+/// so `enum :kind, Kind.values.map(&:serialize)...` still defines its
+/// predicates, scopes and bang writers.
+#[test]
+fn a_nested_enum_keeps_its_predicates_beside_app_macros() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/auditable.rb",
+            "module Auditable\n  extend ActiveSupport::Concern\n\n  def audited?\n    true\n  end\nend\n",
+        )
+        .write(
+            "app/models/concerns/tag_macros.rb",
+            "module TagMacros\n  def tagged_with(*names)\n    tag_names.concat(names)\n  end\n\n  def tag_names\n    @tag_names ||= []\n  end\nend\n",
+        )
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.string \"kind\", default: \"standard\", null: false",
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy",
+            r#"class Article < ApplicationRecord
+  extend(TagMacros)
+  include(Auditable)
+
+  class Kind < T::Enum
+    enums do
+      Ephemeral = new("ephemeral")
+      Standard = new("standard")
+    end
+  end
+  enum(:kind, Kind.values.map(&:serialize).to_h { |s| [s.to_sym, s] })
+
+  tagged_with :title, :body
+
+  has_many :comments, dependent: :destroy"#,
+        )
+        .write(
+            "test/models/article_nested_enum_macros_test.rb",
+            r#"require "test_helper"
+
+class ArticleNestedEnumMacrosTest < ActiveSupport::TestCase
+  test "predicates and writers come from the nested enum beside macros" do
+    assert_equal({"ephemeral" => "ephemeral", "standard" => "standard"}, Article.kinds)
+    assert_equal "ephemeral", Article::Kind::Ephemeral.serialize
+    assert_equal [:title, :body], Article.tag_names
+    article = articles(:one)
+    assert article.audited?
+    assert article.standard?
+    assert_not article.ephemeral?
+    article.ephemeral!
+    assert_equal "ephemeral", ActiveRecord.adapter.find("articles", article.id)["kind"]
+    assert article.reload.ephemeral?
+    assert_equal article.id, Article.ephemeral.first.id
+  end
+end
+"#,
+        )
+        .run_test("test/models/article_nested_enum_macros_test.rb")
+        .assert_passes();
+}
