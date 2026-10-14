@@ -117,7 +117,12 @@ class DiscardsControllerTest < ActionDispatch::IntegrationTest
     assert_not_includes sql, "discarded_at"
     sql = Article.joins(:comments).where(articles: { discarded_at: nil }, comments: { discarded_at: nil }).unscope(where: :discarded_at).to_sql
     assert_not_includes sql, "discarded_at"
-    assert_raises(ArgumentError) { Article.where(discarded_at: nil, title: "x").unscope(where: :discarded_at) }
+    # One hash naming several columns splits, as Rails' where_clause.except does: only the named column goes.
+    sql = Article.where(discarded_at: nil, title: "x").unscope(where: :discarded_at).to_sql
+    assert_not_includes sql, "discarded_at"
+    assert_includes sql, "'x'"
+    assert_equal 0, Article.where(discarded_at: nil, title: "x").unscope(where: :discarded_at).count
+    assert_equal 1, Article.where(discarded_at: nil, title: "Getting Started with Rails").unscope(where: :discarded_at).count
   end
 
   test "association relations take the scopes" do
@@ -131,7 +136,8 @@ class DiscardsControllerTest < ActionDispatch::IntegrationTest
 
   test "kept is NULL-tested, not equality-tested" do
     sql = Article.kept.to_sql
-    assert_includes sql, "discarded_at IS NULL"
+    # Rails quotes the column (`"discarded_at" IS NULL`); an adapter that writes it bare is as right.
+    assert_match(/"?discarded_at"? IS NULL/, sql)
     assert_not_includes sql, "= NULL"
     assert_includes Article.discarded.to_sql, "NOT"
   end
