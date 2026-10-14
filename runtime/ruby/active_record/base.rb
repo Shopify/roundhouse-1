@@ -1428,6 +1428,21 @@ module ActiveRecord
       self[:created_at] = now if creating && cols.include?(:created_at)
     end
 
+    # Rails' ActiveRecord::Timestamp::ClassMethods#current_time_from_proper_timezone:
+    # the clock in `ActiveRecord.default_timezone` (:utc unless an app
+    # sets :local). Core calls it with a model receiver
+    # (`CheckoutProfile.current_time_from_proper_timezone`), so it is public.
+    def self.current_time_from_proper_timezone
+      zone = ActiveRecord.respond_to?(:default_timezone) ? ActiveRecord.default_timezone : :utc
+      zone == :utc ? Time.now.utc : Time.now
+    end
+
+    # The instance form is private in Rails (`self.class.current_time_from_proper_timezone`).
+    def current_time_from_proper_timezone
+      self.class.current_time_from_proper_timezone
+    end
+    private :current_time_from_proper_timezone
+
     def valid?
       @errors = _fresh_errors
       @error_details = []

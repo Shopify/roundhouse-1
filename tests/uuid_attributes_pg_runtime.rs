@@ -140,6 +140,7 @@ const PROBE: &str = r##"class UuidProbe
     out << "where shop_id: #{Product.where(shop_id: shop.id).map(&:title).inspect}"
     out << "exists? id: #{Product.exists?(prod.id)} #{Product.exists?(id: second.id)} #{Product.exists?(0x99)}"
     out << "belongs_to: #{prod.shop.name} #{Product.find(second.id).shop.name}"
+    out << "preload belongs_to: #{Product.includes(:shop).to_a.map { |pr| pr.shop.name }.sort.inspect}"
     out << "has_many: #{shop.products.map(&:title).inspect} #{other.products.count}"
     prod.title = "u"
     out << "update: #{prod.save} #{Product.find(prod.id).title}"
@@ -162,7 +163,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 20] = [
+const EXPECTED: [&str; 21] = [
     "shop id: Integer 4660",
     "assigned uuid string: Integer 22136",
     "generated id: Integer true",
@@ -174,6 +175,7 @@ const EXPECTED: [&str; 20] = [
     r#"where shop_id: ["t"]"#,
     "exists? id: true true false",
     "belongs_to: a b",
+    r#"preload belongs_to: ["a", "b"]"#,
     r#"has_many: ["t"] 1"#,
     "update: true u",
     "update_all where id: v",
@@ -235,6 +237,7 @@ fn uuid_attributes_compile_to_declared_type_calls() {
         r#"Db.escape_string_opt(self.class._attribute_serialize("id", @id))"#,
         r#"WHERE \"id\" = " + Db.escape_string_opt(self.class._attribute_serialize("id", @id))"#,
         "Shop.find_by(id: @shop_id)",
+        r#"Db.escape_string_list(ids.map { |id| Shop._attribute_serialize("id", id) })"#,
         "if @shop_id == nil",
         "  uuid_attributes :id, :shop_id\n",
     ] {

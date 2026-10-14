@@ -19289,6 +19289,14 @@ fn preload_methods_source(model: &crate::dialect::Model, app: &App, subclass_vie
     for (name, kind) in &targets {
         match kind {
             PreloadKind::BelongsTo { fk, target, table, key_list } => {
+                // A string key binds through the target's declared `id`
+                // type, as `find_by(id:)` does: a `model_uuid_attributes`
+                // owner slot holds the integer form of the uuid.
+                let key_binds = if *key_list == "escape_string_list" {
+                    format!("ids.map {{ |id| {target}._attribute_serialize(\"id\", id) }}")
+                } else {
+                    "ids".to_string()
+                };
                 let _ = write!(
                     src,
                     r#"
@@ -19301,7 +19309,7 @@ def self._preload_batch_{name}(records)
   ids.uniq!
   by_id = {{}}
   if ids.length > 0
-    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.id IN (" + Db.{key_list}(ids) + ")").each do |rec|
+    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.id IN (" + Db.{key_list}({key_binds}) + ")").each do |rec|
       by_id[rec.id] = rec
     end
   end
