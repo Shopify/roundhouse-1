@@ -163,6 +163,8 @@ fn tiny_blog_round_trips() {
         current_attribute_classes: vec![],
         carried_included_blocks: vec![],
         included_block_statements: Default::default(),
+        controller_runtime_includes: Default::default(),
+        autoload_includes: Default::default(),
         included_class_attributes: Default::default(),
         lifted_autoload_callbacks: Default::default(),
         boot_native_requires: Vec::new(),
