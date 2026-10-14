@@ -225,3 +225,39 @@ end
         .run_test("test/models/builder_test.rb");
     run.assert_passes();
 }
+
+/// The same chain where the app also reopens the native gem's base
+/// (Core's bluejay reopens `GraphQL::Schema`, which `GraphApi::Schema <
+/// GraphQL::Shopify::Schema` ends in): the reopen is a library class of
+/// the app's with no superclass written, and the walk ends there. The
+/// body still replays: `safe_initialization!` is the native gem's DSL, as
+/// `query` / `mutation` / `use` are graphql's in Core's schemas.
+#[test]
+fn a_class_body_on_a_native_base_the_app_also_reopens_replays() {
+    const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    concurrent-ruby (1.3.8)\n    widget (1.0.0)\n      concurrent-ruby\n\nDEPENDENCIES\n  activesupport\n  concurrent-ruby\n  widget\n";
+    const RBI: &str = "# typed: true\nmodule Concurrent\n  module Synchronization\n    class Object\n      def self.safe_initialization!; end\n      def self.safe_initialization?; end\n    end\n  end\nend\n";
+    const WIDGET: &str = "require \"concurrent\"\nrequire \"widget/box\"\n\nmodule Widget\nend\n";
+    const BOX: &str = "module Widget\n  class Box < Concurrent::Synchronization::Object\n  end\nend\n";
+    const REOPEN: &str = "require \"concurrent\"\n\nmodule Concurrent\n  module Synchronization\n    class Object\n      def self.reopened = :yes\n    end\n  end\nend\n";
+    const APP_BOX: &str = "require \"widget\"\nrequire \"concurrent_reopen\"\n\nclass AppBox < Widget::Box\n  safe_initialization!\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", CARRIED)
+        .write("Gemfile.lock", LOCK)
+        .write("sorbet/rbi/gems/concurrent-ruby@1.3.8.rbi", RBI)
+        .write("vendor/gems/widget-1.0.0/lib/widget.rb", WIDGET)
+        .write("vendor/gems/widget-1.0.0/lib/widget/box.rb", BOX)
+        .write("lib/concurrent_reopen.rb", REOPEN)
+        .write("lib/app_box.rb", APP_BOX)
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/box_test.rb", r#"require "test_helper"
+require "app_box"
+class BoxTest < ActiveSupport::TestCase
+  test "the native gem's class-body DSL ran through the reopened base" do
+    assert_equal true, AppBox.safe_initialization?
+    assert_equal :yes, AppBox.reopened
+  end
+end
+"#)
+        .run_test("test/models/box_test.rb");
+    run.assert_passes();
+}

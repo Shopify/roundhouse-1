@@ -13649,7 +13649,15 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
             return false;
         }
         seen.push(p.0.as_str());
-        parent = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.as_ref());
+        let classes: Vec<&LibraryClass> = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).collect();
+        // An app class that reopens a natively loaded gem's own: Core's
+        // `GraphApi::Schema < GraphQL::Shopify::Schema < GraphQL::Schema`
+        // (bluejay reopens GraphQL::Schema, no superclass written), so
+        // `query` / `mutation` / `use` in a schema body are graphql's DSL.
+        if classes.iter().any(|c| reopens_loaded_gem_class(c, app)) {
+            return true;
+        }
+        parent = classes.into_iter().find_map(|c| c.parent.as_ref());
     }
     false
 }
