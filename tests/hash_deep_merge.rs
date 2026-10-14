@@ -85,40 +85,58 @@ fn emitted_spinel_caller_observes_deep_merge_contract_natively() {
     assert!(!emitted.contains("left.deep_merge(right)"), "{emitted}");
 }
 
+const BLOCK_AND_BANG: &str = r#"class HashDeepMergeForms
+  def self.run
+    left = { a: { b: 1, c: 2 }, n: 1, keep: [1] }
+    right = { a: { b: 3 }, n: 4, keep: [2] }
+    seen = []
+    summed = left.deep_merge(right) { |key, old, new| seen << key; old + new }
+    raise "wrong block merge: #{summed.inspect}" unless summed == { a: { b: 4, c: 2 }, n: 5, keep: [1, 2] }
+    raise "block saw #{seen.inspect}" unless seen == [:b, :n, :keep]
+    raise "block merge mutated the receiver" unless left == { a: { b: 1, c: 2 }, n: 1, keep: [1] }
+    target = { a: { b: 1 } }
+    answered = target.deep_merge!({ a: { c: 2 }, d: 3 })
+    raise "wrong bang merge: #{target.inspect}" unless target == { a: { b: 1, c: 2 }, d: 3 }
+    raise "bang answered a copy" unless answered.equal?(target)
+    nested = { a: { b: { c: 1 } } }
+    nested.deep_merge!({ a: { b: { c: 2 } } }) { |_key, old, new| old + new }
+    raise "wrong nested bang block merge: #{nested.inspect}" unless nested == { a: { b: { c: 3 } } }
+    puts "Hash#deep_merge block and bang contract passed"
+  end
+end
+"#;
+
 #[test]
-fn deep_merge_block_and_bang_forms_remain_unsupported() {
-    for (name, expected_construct, expression) in [
-        (
-            "block",
-            "Hash#deep_merge conflict block",
-            "left.deep_merge(right) { |_key, old, new| new }",
-        ),
-        ("bang", "Hash#deep_merge!", "left.deep_merge!(right)"),
-    ] {
-        let (_, _, diagnostics) = emit_and_run::real_blog()
-            .write(
-                "app/models/hash_deep_merge_unsupported.rb",
-                &format!(
-                    "class HashDeepMergeUnsupported\n  def self.{}\n    left = {{ key: 1 }}\n    right = {{ key: 2 }}\n    {}\n  end\nend\n",
-                    name, expression
-                ),
+fn deep_merge_block_and_bang_forms_run_like_rails() {
+    let run = emit_and_run::real_blog()
+        .write("app/models/hash_deep_merge_forms.rb", BLOCK_AND_BANG)
+        .run_ruby("HashDeepMergeForms.run\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("Hash#deep_merge block and bang contract passed"), "{}", run.stdout);
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/hash_deep_merge_forms.rb"))
+        .expect("emitted HashDeepMergeForms");
+    assert!(emitted.contains("ActiveSupport.deep_merge!(target,"), "{emitted}");
+    assert!(emitted.contains("ActiveSupport.deep_merge(left, right)"), "{emitted}");
+}
+
+#[test]
+fn deep_merge_with_an_untyped_argument_stays_unsupported() {
+    let (_, _, diagnostics) = emit_and_run::real_blog()
+        .write(
+            "app/models/hash_deep_merge_unsupported.rb",
+            "class HashDeepMergeUnsupported\n  def self.run(other)\n    left = { key: 1 }\n    left.deep_merge!(other)\n  end\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .filter(|diagnostic| {
+            matches!(
+                &diagnostic.kind,
+                roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                    if construct.as_str() == "Hash#deep_merge argument"
             )
-            .emit_with_app(roundhouse::project::BuildTarget::Ruby);
-        let errors: Vec<_> = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
-            .filter(|diagnostic| {
-                matches!(
-                    &diagnostic.kind,
-                    roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
-                        if construct.as_str() == expected_construct
-                )
-            })
-            .collect();
-        assert_eq!(
-            errors.len(),
-            1,
-            "{expected_construct} diagnostic identity/count: {diagnostics:#?}"
-        );
-    }
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
 }

@@ -113,7 +113,9 @@ else
     FileUtils.cp(File.join(root, "runtime/spinel/#{name}.rb"), tree)
   end
   # active_support_ext.rb's own require_relative, beside it in the tree.
-  FileUtils.cp(File.join(root, "runtime/ruby/active_support_inflections.rb"), tree)
+  %w[active_support_inflections hash_deep_merge active_support_number_helper active_support_number_helper_mixin].each do |name|
+    FileUtils.cp(File.join(root, "runtime/ruby/#{name}.rb"), tree)
+  end
   require File.join(tree, "active_support_ext")
 end
 
