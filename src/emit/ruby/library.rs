@@ -17844,10 +17844,10 @@ fn require_path_for_body_const(
     // (the innermost scope that has the head segment wins). The file of
     // the longest class prefix of the path under that scope.
     let scopes: Vec<&str> = self_name.match_indices("::").map(|(i, _)| &self_name[..i]).chain(Some(self_name)).collect();
+    // A head that is a namespace only (`Gql` in `Gql::NegotiationError`
+    // under `Checkouts::One::Web`, a module no file declares) is a scope
+    // too: a class below it (`n >= 2`) shows the scope has the head.
     for scope in scopes.into_iter().rev().filter(|scope| !scope.is_empty()) {
-        if !is_model_or_library_class(&format!("{scope}::{first}"), app) {
-            continue;
-        }
         for n in (1..=path.len()).rev() {
             let prefix = format!("{scope}::{}", path[..n].join("::"));
             if is_model_or_library_class(&prefix, app) {
