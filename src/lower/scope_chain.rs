@@ -2422,6 +2422,13 @@ pub struct Ctx<'a> {
     /// hand, and re-rooting that would scope a query the author wrote
     /// unscoped.
     pub self_const_is_implicit: bool,
+    /// The scope body belongs to an ABSTRACT base (a concern's scopes
+    /// included in `ApplicationRecord`): a bare scope call in it runs on
+    /// `self`, the concrete class the scope was reached through, as
+    /// Rails evaluates the lambda with that class's relation as `self`.
+    /// Naming the base would run it on a class that refuses queries
+    /// (Core's `ApplicationRecord.force_index` reaching `connection_ext`).
+    pub scope_self_dispatch: bool,
     /// `Some(model)` when rewriting a model's own CLASS method (a
     /// user-written `def self.x`): a bare `where(...)`/`all` there is an
     /// implicit-self query root (`Keystore.value_for`'s `where(key:
@@ -2548,6 +2555,7 @@ impl Ctx<'_> {
             assoc_class_methods: self.assoc_class_methods,
             scope_body: self.scope_body.clone(),
             self_const_is_implicit: self.self_const_is_implicit,
+            scope_self_dispatch: self.scope_self_dispatch,
             class_self: self.class_self.clone(),
             class_self_is_self: self.class_self_is_self,
             instance_self: self.instance_self.clone(),
@@ -3952,7 +3960,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     let leading = ctx.scope_params(self_model, &method);
                     let keeps = ctx.scope_keeps_relation(self_model, &method);
                     let new_args = thread_rel(args, var_expr(span, rel), leading, span);
-                    *expr = put(span, Some(const_expr(span, self_model)), method, new_args, block, true);
+                    *expr = put(span, Some(if ctx.scope_self_dispatch { syn(span, ExprNode::SelfRef) } else { const_expr(span, self_model) }), method, new_args, block, true);
                     return keeps.then(|| self_model.clone());
                 }
                 // One of the model's own class methods that takes the
@@ -5004,8 +5012,9 @@ pub fn rewrite_scope_body(
     scopes: &ScopeRegistry,
     models: &HashSet<ClassId>,
     assocs: &AssocRegistry,
+    abstract_base: bool,
 ) {
-    rewrite_relation_taking_body(body, self_model, rel_param, scopes, models, assocs, false);
+    rewrite_relation_taking_body(body, self_model, rel_param, scopes, models, assocs, false, abstract_base);
 }
 
 /// The same rewrite for an ASSOCIATION-scoped class method's body, which
@@ -5020,7 +5029,7 @@ pub fn rewrite_assoc_scope_body(
     models: &HashSet<ClassId>,
     assocs: &AssocRegistry,
 ) {
-    rewrite_relation_taking_body(body, self_model, rel_param, scopes, models, assocs, true);
+    rewrite_relation_taking_body(body, self_model, rel_param, scopes, models, assocs, true, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5032,6 +5041,7 @@ fn rewrite_relation_taking_body(
     models: &HashSet<ClassId>,
     assocs: &AssocRegistry,
     self_const_is_implicit: bool,
+    scope_self_dispatch: bool,
 ) {
     // Scope bodies don't consult user-method return types (none
     // exercised there yet), nor the association-scoped class methods
@@ -5051,6 +5061,7 @@ fn rewrite_relation_taking_body(
         assoc_class_methods: &empty_assoc_cm,
         scope_body: Some((self_model.clone(), rel_param.clone())),
         self_const_is_implicit,
+        scope_self_dispatch,
         class_self: None,
         class_self_is_self: false,
         instance_self: None,
@@ -5145,6 +5156,7 @@ pub fn rewrite_call_site_in(
         assoc_class_methods: regs.assoc_class_methods,
         scope_body: None,
         self_const_is_implicit: false,
+        scope_self_dispatch: false,
         class_self: class_self.cloned(),
         class_self_is_self,
         instance_self: instance_self.cloned(),
@@ -5486,6 +5498,7 @@ mod tests {
             assoc_class_methods: empty_assoc_cm(),
             scope_body: None,
             self_const_is_implicit: false,
+            scope_self_dispatch: false,
             class_self: None,
             class_self_is_self: false,
             instance_self: None,
@@ -5839,6 +5852,7 @@ mod tests {
             assoc_class_methods: empty_assoc_cm(),
             scope_body: None,
             self_const_is_implicit: false,
+            scope_self_dispatch: false,
             class_self: None,
             class_self_is_self: false,
             user_returns: empty_returns(),

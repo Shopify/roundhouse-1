@@ -2778,6 +2778,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                         &scopes,
                         &models,
                         &assocs,
+                        model_named.get(&lc.name).is_some_and(|m| crate::lower::model_to_library::markers::is_abstract_class(m)),
                     );
                 }
             }

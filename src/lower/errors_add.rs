@@ -179,10 +179,10 @@ struct Site<'a> {
 /// includes or inherits one. Their `errors` is not the framework's
 /// accumulator, and nothing defines an `error_details` beside it, so the
 /// lowerings that record details stand off them.
-struct OwnErrors(std::collections::HashSet<crate::ident::ClassId>);
+pub(crate) struct OwnErrors(std::collections::HashSet<crate::ident::ClassId>);
 
 impl OwnErrors {
-    fn of(app: &App) -> Self {
+    pub(crate) fn of(app: &App) -> Self {
         let classes: std::collections::HashMap<&crate::ident::ClassId, &crate::dialect::LibraryClass> =
             app.library_classes.iter().map(|c| (&c.name, c)).collect();
         let defines = |c: &crate::dialect::LibraryClass| {
@@ -215,7 +215,7 @@ impl OwnErrors {
     /// Whether the `errors` read `reader` (`errors`, `self.errors`,
     /// `record.errors`) is read off such a class: the owner for an
     /// implicit or `self` receiver, the receiver's class where it is typed.
-    fn reads(&self, reader: &Expr, owner: Option<&crate::ident::ClassId>) -> bool {
+    pub(crate) fn reads(&self, reader: &Expr, owner: Option<&crate::ident::ClassId>) -> bool {
         let ExprNode::Send { recv, .. } = &*reader.node else { return false };
         let named = |ty: &Ty| matches!(ty, Ty::Class { id, .. } if self.0.contains(id));
         match recv.as_ref() {

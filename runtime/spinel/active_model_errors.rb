@@ -211,6 +211,13 @@ module ActiveModel
       objects(errors).any? { |error| error.match?(attribute) }
     end
 
+    # ActiveSupport's `exclude?` on the collection: `!include?(attribute)`,
+    # which the errors-port routing reaches as a call on this module when
+    # the app defines its own `exclude?` and `exclude_predicate` stands off.
+    def self.exclude?(errors, attribute)
+      !key?(errors, attribute)
+    end
+
     # Rails' `of_kind?(attribute, type = :invalid)`: an error of a
     # Symbol type on `attribute`, or a message added as text.
     def self.of_kind?(errors, attribute, type = :invalid)

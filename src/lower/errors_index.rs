@@ -47,22 +47,23 @@ pub fn apply_errors_index_lowering(app: &mut App) -> Vec<Diagnostic> {
     // also record it in the runtime's `ActiveModel::ErrorAttributes`, which
     // answers the reads this pass leaves (`to_hash(true)`, `as_json(options)`).
     let port = super::active_model_model::ValidationsPort::of(app);
+    let own_errors = super::errors_add::OwnErrors::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let locals = port.locals(body);
-        let site = (&port, owner.cloned(), &locals);
+        let site = (&port, owner.cloned(), &locals, &own_errors);
         rewrite(body, &site, &mut diags);
         rewrite_whole_messages(body, &site);
     });
     super::for_each_test_body(app, &mut |body| {
         let locals = port.locals(body);
-        let site = (&port, None, &locals);
+        let site = (&port, None, &locals, &own_errors);
         rewrite(body, &site, &mut diags);
         rewrite_whole_messages(body, &site);
     });
     diags.extend(port.take_notes());
     for view in &mut app.views {
         let locals = port.locals(&view.body);
-        let site = (&port, None, &locals);
+        let site = (&port, None, &locals, &own_errors);
         rewrite(&mut view.body, &site, &mut diags);
         rewrite_whole_messages(&mut view.body, &site);
     }
@@ -157,6 +158,7 @@ type Site<'a> = (
     &'a super::active_model_model::ValidationsPort,
     Option<crate::ident::ClassId>,
     &'a super::active_model_model::PortLocals,
+    &'a super::errors_add::OwnErrors,
 );
 
 /// Whether the `errors` this site reads (`errors[…]`, `errors.messages`
@@ -208,11 +210,41 @@ fn rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
             Reading::Port | Reading::Accumulator => {}
         }
     }
+    if rewrite_own_index(expr, site) {
+        return;
+    }
     rewrite_messages(expr, diags);
     rewrite_index(expr, diags);
     rewrite_include(expr, diags);
     rewrite_to_hash(expr);
     rewrite_render_json(expr);
+}
+
+// A class that holds its own `errors` (a plain `attr_reader :errors` handed
+// a record's, or a port's, collection) has no `error_messages_for`: the read
+// asks the collection it holds, whichever kind that is.
+fn rewrite_own_index(expr: &mut Expr, site: &Site<'_>) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return false };
+    if method.as_str() != "[]" || args.len() != 1 || !is_errors_read(r) || !site.3.reads(r, site.1.as_ref()) {
+        return false;
+    }
+    if sym_lit(&args[0]).is_none() {
+        return false;
+    }
+    let (reader, field) = (r.clone(), args[0].clone());
+    let mut call = send(
+        expr.span,
+        reader,
+        "messages_for",
+        vec![field],
+        Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
+    );
+    if let ExprNode::Send { parenthesized, .. } = &mut *call.node {
+        *parenthesized = true;
+    }
+    call.decisions |= crate::expr::ERRORS_PORT_CALL;
+    *expr = call;
+    true
 }
 
 // Not left to the accumulator: `Array#include?(:title)` answers false for an Array of full messages.

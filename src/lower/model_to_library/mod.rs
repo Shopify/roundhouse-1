@@ -2837,6 +2837,7 @@ pub(crate) fn push_scope_methods(
             scopes,
             models_set,
             assocs,
+            markers::is_abstract_class(model),
         );
 
         // Rails relations are immutable, so every implicit-self root in
@@ -2890,6 +2891,27 @@ pub(crate) fn push_scope_methods(
                 value: spawn_send,
             },
         );
+        // Rails' `_exec_scope` answers `instance_exec(*args, &body) || self`:
+        // a body that ends in nil or false (an `if` that does not hold,
+        // Core's `force_index` off MySQL) is the relation as it stands.
+        if scope_body_may_end_falsy(&body) {
+            let mut fallback = Expr::new(
+                span,
+                ExprNode::Var { id: crate::ident::VarId(0), name: rel_param.clone() },
+            );
+            fallback.ty = Some(Ty::Relation { of: model.name.clone() });
+            let mut either = Expr::new(
+                span,
+                ExprNode::BoolOp {
+                    op: crate::expr::BoolOpKind::Or,
+                    surface: Default::default(),
+                    left: body,
+                    right: fallback,
+                },
+            );
+            either.ty = Some(Ty::Relation { of: model.name.clone() });
+            body = either;
+        }
         body = Expr::new(
             span,
             ExprNode::Seq {
@@ -2914,6 +2936,24 @@ pub(crate) fn push_scope_methods(
             mutates_self: false,
             block_param: None,
         });
+    }
+}
+
+/// Whether a scope body's value can be nil or false by its shape: a
+/// conditional with a missing or falsy branch, a trailing `&&`, a bare
+/// nil. A chain on the relation is always truthy.
+fn scope_body_may_end_falsy(body: &Expr) -> bool {
+    match &*body.node {
+        ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+        ExprNode::Lit { value: crate::expr::Literal::Bool { value: false } } => true,
+        ExprNode::Seq { exprs } => exprs.last().map_or(true, scope_body_may_end_falsy),
+        ExprNode::If { then_branch, else_branch, .. } => {
+            scope_body_may_end_falsy(then_branch) || scope_body_may_end_falsy(else_branch)
+        }
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, .. } => true,
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, right, .. } => scope_body_may_end_falsy(right),
+        ExprNode::Case { .. } => true,
+        _ => false,
     }
 }
 
