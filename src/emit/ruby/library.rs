@@ -14268,7 +14268,7 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
         .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
         .map(|m| &m.name)
         .collect();
-    fn walk(e: &Expr, own: &[&Symbol], app: &App, ok: &mut bool) {
+    fn walk(e: &Expr, own: &[&Symbol], hooked: bool, app: &App, ok: &mut bool) {
         if !*ok {
             return;
         }
@@ -14287,28 +14287,53 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
                 *ok = false;
                 return;
             }
-            if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method) {
+            if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method) && !hooked {
                 *ok = false;
                 return;
             }
             if let Some(r) = recv {
-                walk(r, own, app, ok);
+                walk(r, own, hooked, app, ok);
             }
             for a in args {
-                walk(a, own, app, ok);
+                walk(a, own, hooked, app, ok);
             }
             if let Some(b) = block
                 && !(on_self && method.as_str() == "define_method")
             {
-                walk(b, own, app, ok);
+                walk(b, own, hooked, app, ok);
             }
             return;
         }
-        e.node.for_each_child(&mut |child| walk(child, own, app, ok));
+        e.node.for_each_child(&mut |child| walk(child, own, hooked, app, ok));
     }
+    let hooked = !singleton && includes_app_included_hook(lc, app);
     let mut ok = true;
-    walk(call, &own, app, &mut ok);
+    walk(call, &own, hooked, app, &mut ok);
     ok
+}
+
+/// Whether `lc` includes (through the app's own modules) one whose
+/// `self.included` hook runs as the include is written: the hook may give
+/// the includer class methods the source's body statements call
+/// (`GraphQLEasyTesting.included`'s `base.module_eval { def self.configuration
+/// … }` on a module includer, which Core's `GraphQLTestHelper` calls as
+/// `configuration.tap do |config| … end`). The hook is the app's own code
+/// the tree emits and runs at the include, so the call answers as in Ruby.
+fn includes_app_included_hook(lc: &LibraryClass, app: &App) -> bool {
+    let mut queue: Vec<String> = lc.includes.iter().map(|i| i.0.as_str().trim_start_matches("::").to_string()).collect();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    while let Some(name) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for c in library_classes_named(&name, app) {
+            if c.is_module && c.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "included") {
+                return true;
+            }
+            queue.extend(c.includes.iter().map(|n| n.0.as_str().trim_start_matches("::").to_string()));
+        }
+    }
+    false
 }
 
 /// Whether `require`'s `args` are one literal feature Kernel#require

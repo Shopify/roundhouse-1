@@ -27,6 +27,13 @@
 //! defines on the anonymous class, and `@__class_attr_x = default` sets
 //! on it. Only a block that is nothing but such defs and seeds is
 //! carried; any other block keeps the Concern as it was.
+//!
+//! A carried Concern's `ClassMethods` crosses the same way. The
+//! emitted module keeps no `included` hook to extend the includer with
+//! it, so the anonymous class gets an `extend Concern::ClassMethods`
+//! after the `include`: `error_enum.add_error_code(...)` on the
+//! `Class.new(EnumType) { include ErrorCodeEnum }` class raised
+//! NoMethodError otherwise.
 
 use crate::App;
 use crate::dialect::{MethodDef, ModelBodyItem};
@@ -61,6 +68,36 @@ pub(super) fn expand(app: &mut App) {
     if carriers.is_empty() {
         return;
     }
+    // The carriers whose `ClassMethods` module is an app module.
+    let class_methods: crate::det::HashMap<ClassId, Expr> = carriers
+        .keys()
+        .filter(|id| {
+            let nested = format!("{}::ClassMethods", id.0.as_str());
+            app.library_classes.iter().any(|lc| lc.is_module && lc.name.0.as_str() == nested)
+        })
+        .map(|id| {
+            let path = id.0.as_str().split("::").chain(std::iter::once("ClassMethods")).map(crate::ident::Symbol::from).collect();
+            (id.clone(), Expr::new(crate::span::Span::synthetic(), ExprNode::Const { path }))
+        })
+        .collect();
+    let carriers: crate::det::HashMap<ClassId, Vec<Expr>> = carriers
+        .into_iter()
+        .map(|(id, mut statements)| {
+            if let Some(path) = class_methods.get(&id) {
+                statements.push(Expr::new(
+                    crate::span::Span::synthetic(),
+                    ExprNode::Send {
+                        recv: None,
+                        method: crate::ident::Symbol::from("extend"),
+                        args: vec![path.clone()],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ));
+            }
+            (id, statements)
+        })
+        .collect();
     let mut applied: Vec<ClassId> = Vec::new();
     let mut run = |scope: &str, methods: &mut [MethodDef]| {
         for method in methods {
