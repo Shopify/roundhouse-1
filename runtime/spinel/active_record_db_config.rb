@@ -105,12 +105,6 @@ module ActiveRecord
     end
   end
 
-  class Connection
-    def transaction_open?
-      Db.transaction_open?
-    end
-  end
-
   class Base
     # >>> db-shim-config
     def self.connection_db_config

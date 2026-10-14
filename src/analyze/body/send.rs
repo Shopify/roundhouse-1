@@ -2948,6 +2948,12 @@ fn sub_array_slice(method: &Symbol, args: &[crate::expr::Expr], elem: &Ty) -> Op
     if !matches!(method.as_str(), "[]" | "slice") {
         return None;
     }
+    // A splatted argument list is a lone index, a `(start, length)` pair
+    // or a Range only at run time: the answer is an element or a
+    // sub-array, so name it gradual rather than guess one.
+    if args.iter().any(|a| matches!(*a.node, crate::expr::ExprNode::Splat { .. })) {
+        return Some(Ty::Untyped);
+    }
     let range_index = args.len() == 1
         && matches!(
             args[0].ty.as_ref(),
@@ -3174,6 +3180,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         "flatten" => Ty::Array { elem: std::sync::Arc::new(flatten_elem(elem)) },
         "each" | "reverse_each" | "select" | "filter" | "reject"
         | "sort" | "sort_by" | "reverse" | "compact" | "uniq"
+        // `shuffle` / `rotate` (and their bang forms) answer a same-element
+        // array, whatever the optional `random:` / count arguments.
+        | "shuffle" | "shuffle!" | "rotate" | "rotate!"
         // `drop`/`take` (and their block forms) return a same-element
         // sub-array — the tail of a splat destructuring (`a, *rest =`
         // desugars `rest` to `arr.drop(n)`) among other uses.
@@ -3203,7 +3212,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         "pop" | "shift" | "sample" => Ty::Union {
             variants: vec![elem.clone(), Ty::Nil].into(),
         },
-        "index" | "find_index" => Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() },
+        "index" | "find_index" | "rindex" => Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() },
         // ActiveSupport's `deep_dup` copies the elements too; the shape
         // is the receiver's (`lower::symbolize_keys` grounds it).
         "dup" | "clone" | "deep_dup" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
@@ -3915,6 +3924,11 @@ pub(super) fn universal_method(method: &Symbol) -> Option<Ty> {
         // Kernel#block_given? — bare call inside any method body
         // (`yield x if block_given?` in the runtime's create/create!).
         "block_given?" => Some(Ty::Bool),
+        // Kernel#to_enum / enum_for — a bare call inside an instance method
+        // (`return to_enum(:each) { size } unless block_given?`). The
+        // Enumerator is not modelled, so it is gradual, as the
+        // class-object arm of `object_protocol_method` answers it.
+        "to_enum" | "enum_for" => Some(Ty::Untyped),
         // Kernel#caller_locations — the frames above the caller, as
         // `Thread::Backtrace::Location`s (rbs/core/kernel.rbs), whose
         // readers `registry::stdlib` registers. RBS also says `?` (nil

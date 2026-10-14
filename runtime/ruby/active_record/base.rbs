@@ -51,6 +51,11 @@ module ActiveRecord
   def self.adapter: () -> ActiveRecord::AdapterInterface
   def self.adapter=: (ActiveRecord::AdapterInterface) -> ActiveRecord::AdapterInterface
 
+  # Rails' `ActiveRecord.default_timezone` (:utc unless an app sets :local).
+  self.@default_timezone: Symbol?
+  def self.default_timezone: () -> Symbol
+  def self.default_timezone=: (Symbol zone) -> Symbol
+
   # Enum column assigned by LABEL — see `base.rb`. `labels`/`values`
   # are the declaration's parallel arrays.
   def self.enum_int: (String text, Array[String] labels, Array[Integer] values, Array[String] texts, String attr) -> Integer

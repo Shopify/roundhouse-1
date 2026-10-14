@@ -3183,9 +3183,9 @@ module ActiveRecord
             parts << predicate
             named << [column, predicate]
           else
-            association_key_predicates(reflection, val, note).each do |col, predicate|
-              parts << predicate
-              named << [col, predicate]
+            association_key_predicates(reflection, val, note).each do |pair|
+              parts << pair[1]
+              named << pair
             end
           end
         end
@@ -3221,16 +3221,20 @@ module ActiveRecord
           "#{fk.inspect} takes one record or nil" unless val.nil? || val.is_a?(Base)
         pks = reflection.association_primary_key
         pks = [pks] unless pks.is_a?(Array)
-        return fk.each_with_index.map do |col, i|
-          col = col.to_s
-          [col, column_predicate(col, val.nil? ? nil : val.public_send(pks[i]), note)]
+        out = [] #: Array[[String, String]]
+        i = 0
+        while i < fk.length
+          col = fk[i].to_s
+          out << [col, column_predicate(col, val.nil? ? nil : val.public_send(pks[i]), note)]
+          i += 1
         end
+        return out
       end
       fk = fk.to_s
       return [[fk, column_predicate(fk, val, note)]] unless reflection.polymorphic?
       type = reflection.foreign_type.to_s
       if val.is_a?(Array) || val.is_a?(Relation)
-        groups = {}
+        groups = {} #: Hash[String?, Array[untyped]]
         (val.is_a?(Relation) ? val.to_a : val).each do |record|
           name = record.is_a?(Base) ? record.class.polymorphic_name : nil
           (groups[name] ||= []) << (record.is_a?(Base) ? record.id : record)
