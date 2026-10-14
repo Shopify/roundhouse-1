@@ -32,6 +32,7 @@ mod dry_types;
 pub mod allow_browser;
 pub mod app;
 mod concern_accessors;
+mod controller_concern_blocks;
 mod test_class_concerns;
 mod anonymous_class_concerns;
 pub mod database_manifest;

@@ -47,13 +47,25 @@
 //! Extension` there stays). Any shape not lifted is left as it was: the
 //! initializer scan runs what it can and names the rest at its site
 //! (`initializer_unsupported`).
+//!
+//! A controller fires a hook the same way (Core's `AdminAreaController`
+//! ends with `ActiveSupport.run_load_hooks(:admin_area_controller, self)`
+//! and access_and_auth's initializer includes `IdentityAwareController`
+//! there). Its block is bare `include M` calls, lifted to the end of the
+//! controller body as the class's own includes, and the controller's
+//! lowering writes them (`controller_concern_blocks` replays each
+//! concern's `ClassMethods` and `included` macros after them). The block
+//! may also `require "x"`: a controller body has nowhere to write it, so
+//! the block stays whole at its hook, and only the includes before the
+//! first `require` are lifted (the hook's own `include` of a module the
+//! class already has is a no-op).
 
 use std::path::{Path, PathBuf};
 
 use ruby_prism::{CallNode, Node};
 
 use crate::app::{App, ClassLoadHook};
-use crate::dialect::ModelBodyItem;
+use crate::dialect::{ControllerBodyItem, ModelBodyItem};
 use crate::span::SourceFile;
 use crate::vfs::Vfs;
 
@@ -89,7 +101,40 @@ pub(super) fn lift<V: Vfs + ?Sized>(
             let Some((hook, body)) = on_load_block(&stmt) else { continue };
             let mut fired = sites.iter().filter(|site| site.hook == hook);
             let (Some(site), None) = (fired.next(), fired.next()) else { continue };
-            let Some(includes) = literal_includes(&body, site, &known) else { continue };
+            let is_controller = app.controllers.iter().any(|c| c.name.0.as_str() == site.class);
+            let Some(includes) = literal_includes(&body, site, &known, is_controller) else { continue };
+            if is_controller && !app.models.iter().any(|m| m.name.0.as_str() == site.class) {
+                // A controller body holds no `require` the lowering would
+                // write, so a block with one stays whole and keeps running
+                // at the hook, `require` included; the includes before the
+                // first `require` are lifted too (the hook's own `include`
+                // of a module already included is a no-op). Those after it
+                // name what the `require` loads and wait for the hook.
+                let has_require = includes.iter().any(|call| constant_id_str(&call.name()) == "require");
+                let lifted: Vec<&CallNode> =
+                    includes.iter().take_while(|call| constant_id_str(&call.name()) != "require").collect();
+                if lifted.is_empty() {
+                    continue;
+                }
+                let Ok(exprs) =
+                    lifted.iter().map(|call| super::expr::ingest_expr(&call.as_node(), &file)).collect::<Result<Vec<_>, _>>()
+                else {
+                    continue;
+                };
+                // The controller body's end: the hook fires from the last
+                // statement of the class body, after an earlier hook
+                // block's lifted statements.
+                let controller = app.controllers.iter_mut().find(|c| c.name.0.as_str() == site.class).expect("checked above");
+                controller.body.extend(exprs.into_iter().map(|expr| ControllerBodyItem::Unknown {
+                    expr,
+                    leading_comments: Vec::new(),
+                    leading_blank_line: false,
+                }));
+                if !has_require {
+                    super::initializers::consume_node(&file, &stmt);
+                }
+                continue;
+            }
             let Some(model) = app.models.iter_mut().find(|m| m.name.0.as_str() == site.class) else {
                 // An STI subclass of a model (`RegularUser < User`) is a
                 // library class here; its includes are a list.
@@ -156,7 +201,12 @@ fn on_load_block<'pr>(stmt: &Node<'pr>) -> Option<(String, Vec<Node<'pr>>)> {
 /// of the class firing the hook, each holding only includes, and, when
 /// the hook's base is that class, bare includes naming modules only the
 /// top level resolves; `None` for any other block.
-fn literal_includes<'pr>(body: &[Node<'pr>], site: &ClassLoadHook, known: &Known) -> Option<Vec<CallNode<'pr>>> {
+fn literal_includes<'pr>(
+    body: &[Node<'pr>],
+    site: &ClassLoadHook,
+    known: &Known,
+    requires: bool,
+) -> Option<Vec<CallNode<'pr>>> {
     let mut out = Vec::new();
     for stmt in body {
         if let Some(class) = stmt.as_class_node() {
@@ -167,6 +217,10 @@ fn literal_includes<'pr>(body: &[Node<'pr>], site: &ClassLoadHook, known: &Known
                 out.push(include_call(&inner)?);
             }
         } else if site.base == site.class {
+            if requires && let Some(call) = literal_require(stmt) {
+                out.push(call);
+                continue;
+            }
             let call = include_call(stmt)?;
             let args = call.arguments()?.arguments();
             if !args.iter().all(|arg| constant_path_of(&arg).is_some_and(|path| top_level_only(&path, &site.class, known))) {
@@ -191,6 +245,18 @@ fn top_level_only(path: &[String], class: &str, known: &Known) -> bool {
     let scope: Vec<&str> = class.split("::").collect();
     known.contains(&id(&tail))
         && (1..=scope.len()).all(|depth| !known.contains(&id(&format!("{}::{tail}", scope[..depth].join("::")))))
+}
+
+/// `require "path"` with one string literal: a controller block's
+/// `require "trust_battery/challenge_required_response_handling"` before
+/// the include that needs it keeps its place among the lifted includes.
+fn literal_require<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != "require" {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+    matches!(args.as_slice(), [arg] if arg.as_string_node().is_some()).then_some(call)
 }
 
 /// `include M` / `include M, N` with constant arguments.
