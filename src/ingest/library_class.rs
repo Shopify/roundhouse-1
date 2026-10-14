@@ -4272,6 +4272,17 @@ fn walk_decl_body_in<'pr>(
                 out.constants.push((Symbol::from(path), value));
                 continue;
             }
+            // `self::NAME = value` writes the class the body runs on,
+            // as `NAME = value` does (Core's `Struct.new` body block:
+            // `self::CODES = {...}.freeze`). A factory class writes it
+            // back through `self`.
+            if !force_class_receiver
+                && let Some(name) = super::factory_class::self_constant_write(stmt)
+            {
+                let value = ingest_expr(&write.value(), file)?;
+                out.constants.push((Symbol::from(name), value));
+                continue;
+            }
         }
         // `ZeitwerkLoader.ignore(File.join(__dir__, "tapioca"))`,
         // `ZeitwerkLoader.setup`: applied statically; any other call on

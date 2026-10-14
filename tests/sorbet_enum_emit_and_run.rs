@@ -172,3 +172,51 @@ fn an_override_with_keywords_calling_super_is_refused() {
         .to_string();
     assert!(error.contains("`super` in `try_deserialize`"), "{error}");
 }
+
+/// A `T::Enum` nested in a class, in a namespace that holds a class of its own name
+/// (`DeliveryPromise::DeliveryPromise`): constant rooting spells the
+/// member receivers `::DeliveryPromise::…::IntegrationType.new(...)`, and a
+/// rooted receiver is still the class itself, so its members wait for the
+/// `initialize` below them.
+#[test]
+fn an_enum_nested_in_a_plain_class_defines_initialize_before_its_members() {
+    emit_and_run::real_blog()
+        .write(
+            "app/services/frozen_base.rb",
+            "class FrozenBase\nend\n",
+        )
+        .write(
+            "app/services/delivery_promise.rb",
+            "module DeliveryPromise\n  class DeliveryPromise\n  end\nend\n",
+        )
+        .write(
+            "app/services/promise_provider.rb",
+            r#"module DeliveryPromise
+  class PromiseProvider < FrozenBase
+    class IntegrationType < T::Enum
+      enums do
+        EXTERNAL = new("EXTERNAL")
+        INTERNAL = new("INTERNAL")
+      end
+    end
+
+    def external?
+      integration_type == IntegrationType::EXTERNAL
+    end
+
+    def integration_type
+      IntegrationType.deserialize("EXTERNAL")
+    rescue KeyError
+      nil
+    end
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"raise "member lost" unless DeliveryPromise::PromiseProvider::IntegrationType::EXTERNAL.serialize == "EXTERNAL"
+raise "predicate lost" unless DeliveryPromise::PromiseProvider.new.external?
+"#,
+        )
+        .assert_passes();
+}
