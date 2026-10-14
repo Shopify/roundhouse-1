@@ -326,6 +326,10 @@ fn rewrite_self_sends(expr: &mut Expr, helpers: &HashMap<Symbol, Vec<Param>>, di
     }
     let Some(params) = helpers.get(method) else { return };
     restore_kwrest_splat(args, params);
+    // The mark stays even where the callee takes no keywords: the Ruby tree
+    // writes the source's `**h` back, and Ruby hands that callee a copy of
+    // the Hash (`def touch(h, *)` mutating `h` leaves the caller's alone),
+    // where the erased `touch(h)` would alias it.
 }
 
 /// Every instance method an app class declares, plus every controller
