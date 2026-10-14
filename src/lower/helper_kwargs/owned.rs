@@ -252,7 +252,7 @@ fn flattened_slots(m: &crate::dialect::MethodDef) -> Option<Vec<Slot>> {
     {
         return None;
     }
-    Some(m.params.iter().map(slot_of).collect())
+    Some(super::slots_of(&m.params))
 }
 
 impl OwnerIndex {
@@ -295,13 +295,16 @@ pub(super) fn refuse_library_class_splats(
         e.node.for_each_child(&mut |c| walk(c, owner, side, index, diagnostics));
         let ExprNode::Send { recv, method, args, .. } = &*e.node else { return };
         let Some(side) = owner_side(recv, side) else { return };
-        let refused = match index.lookup(owner, side, method) {
-            Ok(Some(slots)) => super::splat_into_flattened(args, slots),
-            Ok(None) => false,
-            Err(()) => super::carries_splat(args),
+        let (refused, written_back) = match index.lookup(owner, side, method) {
+            Ok(Some(slots)) => (
+                super::splat_into_flattened(args, slots),
+                slots.iter().all(|s| s.written_back),
+            ),
+            Ok(None) => (false, false),
+            Err(()) => (super::carries_splat(args), false),
         };
         if refused {
-            super::refuse(e.span, super::SPLAT_REFUSAL, diagnostics);
+            super::refuse(e.span, &super::splat_refusal(written_back), diagnostics);
         }
     }
     for lc in &app.library_classes {
