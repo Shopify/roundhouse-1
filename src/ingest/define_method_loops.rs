@@ -63,8 +63,9 @@
 //! the evaluator does not know, `super` without arguments, `yield`,
 //! `block_given?`, `binding`, a constant whose lexical binding differs
 //! between the macro's module and the class, parameters other than
-//! required positionals, a rest and keywords (required, or with a
-//! default known statically), a name the class (or another expansion)
+//! required positionals, optionals, a named rest, keywords (required, or
+//! with a default known statically), a named keyword rest and a named
+//! block, a name the class (or another expansion)
 //! already defines, and a library class's non-definition side effects.
 //! The diagnostic is reported where the emitted class drops the
 //! statement; a library class that replays its body (a gem's base) or a
@@ -78,6 +79,13 @@
 //! exception is a statement hoisted out of a Concern's `class_methods`
 //! block (`expr::CLASS_METHODS_BLOCK_STATEMENT`), whose `self` is not the
 //! module body it would be written into; it keeps the named refusal.
+//! A statement of that block that does expand (Core's
+//! `DeprecatedStiClassMethods`, `DEPRECATED_METHODS.each { |name|
+//! define_method(name) { |*args, **kwargs, &block| …; super(*args,
+//! **kwargs, &block) } }`) defines class methods of every includer: each
+//! becomes a class-side method of the concern, expanded before the
+//! concern splice (`expand_class_methods_blocks`) so the splice copies it
+//! onto model includers and the emitted `ClassMethods` carries it.
 //!
 //! INHERITED MACROS. A library class's call to a class macro its app
 //! superclass defines (Core's `Sales::OrderEditing::StagedChanges::Base`
@@ -179,6 +187,41 @@ struct Expansion {
 }
 
 pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
+    run(app, sources, None);
+}
+
+/// The statements a Concern's `class_methods` block hoisted into the
+/// concern's body (`expr::CLASS_METHODS_BLOCK_STATEMENT`), expanded into
+/// class-side methods before the concern splice reads them: each
+/// expanded method's span joins its concern's `methods` and
+/// `block_methods`, so the splice and the emitted `ClassMethods` module
+/// carry it as they carry a `def` written in the block.
+pub(super) fn expand_class_methods_blocks(
+    app: &mut App,
+    sources: &[SourceFile],
+    carriers: &mut [super::library_class::ConcernClassMethodSpans],
+) {
+    for (owner, spans) in run(app, sources, Some(carriers)) {
+        if let Some(carrier) = carriers
+            .iter_mut()
+            .find(|c| c.owner == owner && !c.concern_extensions.is_empty())
+        {
+            carrier.methods.extend(spans.iter().copied());
+            carrier.block_methods.extend(spans);
+        }
+    }
+}
+
+/// `carriers` is `Some` for the early pass over `class_methods` block
+/// statements alone, which answers the names it expanded per concern;
+/// the general pass leaves those statements to it.
+fn run(
+    app: &mut App,
+    sources: &[SourceFile],
+    carriers: Option<&[super::library_class::ConcernClassMethodSpans]>,
+) -> Vec<(ClassId, Vec<Span>)> {
+    let early = carriers.is_some();
+    let mut class_side: Vec<(ClassId, Vec<Span>)> = Vec::new();
     let constants = app_constants(app);
     let mut library: Vec<(usize, usize, Result<Expansion, String>)> = Vec::new();
     // Calls the emitted class replays when they stay: a library class
@@ -197,6 +240,14 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             if call.decisions & crate::expr::BODY_STATEMENT != 0 {
                 continue;
             }
+            // Only a Concern's block is written as its `ClassMethods`.
+            if (call.decisions & crate::expr::CLASS_METHODS_BLOCK_STATEMENT != 0) != early
+                || carriers.is_some_and(|carriers| {
+                    !carriers.iter().any(|c| c.owner == lc.name && !c.concern_extensions.is_empty())
+                })
+            {
+                continue;
+            }
             if let Some((outcome, reach)) =
                 plan(app, &names, sources, &constants, Owner::Library(i), call)
             {
@@ -211,7 +262,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
         }
     }
     let mut models: Vec<(usize, usize, Result<Expansion, String>)> = Vec::new();
-    for (i, model) in app.models.iter().enumerate() {
+    for (i, model) in app.models.iter().enumerate().filter(|_| !early) {
         for (j, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Unknown { expr, .. } = item else {
                 continue;
@@ -259,6 +310,10 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             }
             Ok(expansion) => {
                 lc.unknown_calls.remove(j);
+                if early {
+                    let spans = expansion.methods.iter().map(|m| m.name_span).collect();
+                    class_side.push((lc.name.clone(), spans));
+                }
                 lc.methods.extend(expansion.methods);
             }
             Err(reason) => {
@@ -305,6 +360,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             }
         }
     }
+    class_side
 }
 
 /// Whether the emitted library class drops a class-body statement it
@@ -1114,6 +1170,9 @@ struct Scope<'a> {
     /// over (`passes_over`) instead of refused, and no class-body effect
     /// is carried.
     replayed: bool,
+    /// The statements came from a concern's `class_methods` block: what
+    /// they define are class methods of every includer.
+    class_side: bool,
     out: Expansion,
 }
 
@@ -1125,6 +1184,7 @@ fn plan_eval(
     call: &Expr,
     is_loop: bool,
 ) -> Result<Expansion, String> {
+    let class_side = call.decisions & crate::expr::CLASS_METHODS_BLOCK_STATEMENT != 0;
     let method = match &*call.node {
         ExprNode::Send { method, .. } => method.clone(),
         _ => unreachable!(),
@@ -1156,6 +1216,7 @@ fn plan_eval(
         site_nesting: located.nesting,
         ir: call,
         replayed: false,
+        class_side,
         out: Expansion {
             methods: Vec::new(),
             residual: Vec::new(),
@@ -1224,6 +1285,7 @@ fn plan_macro(
         site_nesting: site.nesting,
         ir: &def.body,
         replayed,
+        class_side: false,
         out: Expansion {
             methods: Vec::new(),
             residual: Vec::new(),
@@ -1664,6 +1726,11 @@ impl<'a> Scope<'a> {
             // replayed call (`App::class_eval_macro_expansions`).
             return Err(format!("`{what}` in a replayed inherited macro"));
         }
+        if singleton && self.class_side {
+            // Its receiver is the concern's `ClassMethods` module, not
+            // the includer.
+            return Err(format!("`{what}` in a `class_methods` block"));
+        }
         let args: Vec<ruby_prism::Node<'_>> = call
             .arguments()
             .map(|a| a.arguments().iter().collect())
@@ -1680,7 +1747,9 @@ impl<'a> Scope<'a> {
         // "grandfather-trial") is still a method `define_method` makes: a
         // model keeps the call, naming it with the evaluated Symbol.
         let spellable = valid_def_name(&name);
-        if !spellable && (singleton || self.replayed || !matches!(self.owner, Owner::Model(_))) {
+        if !spellable
+            && (singleton || self.replayed || self.class_side || !matches!(self.owner, Owner::Model(_)))
+        {
             return Err(format!("`{what}` names `{name}`, which no `def` can"));
         }
         let block = call
@@ -1698,19 +1767,28 @@ impl<'a> Scope<'a> {
         else {
             return Err(format!("the body of `{name}` was not ingested"));
         };
-        let ExprNode::Lambda { body, signature, .. } = &*lambda.node else {
+        let ExprNode::Lambda { body, signature, rest_param, block_param, .. } = &*lambda.node else {
             return Err(format!("the body of `{name}` was not ingested"));
         };
         // The block's optional, keyword and keyword-rest parameters are
         // the method's, as define_method makes them; a default closes
         // over the captured locals as the body does.
-        let names: Vec<Symbol> = params.iter().chain(signature.names()).cloned().collect();
+        let names: Vec<Symbol> = params
+            .iter()
+            .chain(signature.names())
+            .chain(rest_param.iter())
+            .chain(block_param.iter())
+            .cloned()
+            .collect();
         let mut captured = env.clone();
         captured.locals.retain(|(n, _)| !names.contains(n));
         let close = |e: &Expr| self.close_over(e, &captured, &names).map_err(|e| format!("`{name}`: {e}"));
         let mut formals: Vec<Param> = params.iter().cloned().map(Param::positional).collect();
         for (n, default) in &signature.optionals {
             formals.push(Param::with_default(n.clone(), close(default)?));
+        }
+        if let Some(n) = rest_param {
+            formals.push(Param::rest(n.clone()));
         }
         for (n, default) in &signature.keywords {
             formals.push(Param::keyword(n.clone(), default.as_ref().map(close).transpose()?));
@@ -1737,7 +1815,7 @@ impl<'a> Scope<'a> {
         }
         let mut def = MethodDef {
             name: name.clone(),
-            receiver: if singleton {
+            receiver: if singleton || self.class_side {
                 MethodReceiver::Class
             } else {
                 MethodReceiver::Instance
@@ -1754,7 +1832,7 @@ impl<'a> Scope<'a> {
             params: formals,
             unsupported_formals: None,
             has_anonymous_block: false,
-            block_param: None,
+            block_param: block_param.clone().map(Param::positional),
             name_span: super::util::node_span(name_node, &self.source.path),
             body,
             signature: None,
@@ -2260,8 +2338,13 @@ fn define_method_block_params(block: &ruby_prism::BlockNode<'_>) -> Result<Vec<S
     let named_kwrest = list.keyword_rest().is_none_or(|k| {
         k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some())
     });
-    if list.rest().is_some() || list.posts().iter().next().is_some() || list.block().is_some() || !named_kwrest {
-        return Err("block parameters other than required, optional, keyword and named keyword-rest ones".into());
+    let named_rest = list.rest().is_none_or(|r| r.as_rest_parameter_node().is_some_and(|r| r.name().is_some()));
+    let named_block = list.block().is_none_or(|b| b.name().is_some());
+    if !named_rest || !named_block || list.posts().iter().next().is_some() || !named_kwrest {
+        return Err(
+            "block parameters other than required, optional, named rest, keyword, named keyword-rest and named block ones"
+                .into(),
+        );
     }
     let required: Vec<Symbol> = list
         .requireds()
