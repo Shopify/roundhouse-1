@@ -431,7 +431,12 @@ module ActiveSupport
   end
 
   # Not `stringify_keys`: Rails' indifferent hash converts only a Symbol key, and its Hash and Array values all the way down.
+  #
+  # The CRuby overlay carries Rails' own class: built on it, the hash stays
+  # indifferent past a read the lowering cannot type (`Secrets[:mysql]`
+  # returning untyped, then `[:host]` on it).
   def self.indifferent(hash)
+    return ::ActiveSupport::HashWithIndifferentAccess.new(hash) if defined?(::ActiveSupport::HashWithIndifferentAccess)
     out = {}
     return out if hash.nil?
     hash.each { |key, item| out[ActiveSupport.indifferent_key(key)] = ActiveSupport.indifferent_value(item, false) }
