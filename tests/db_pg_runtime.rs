@@ -209,7 +209,7 @@ fn postgres_model_app_with(application_rb: Option<&str>) -> roundhouse::app::App
         ], indexes: vec![], foreign_keys: vec![], virtual_module: None, primary_key_columns: Vec::new(),
     });
     let model = roundhouse::ingest::model::ingest_model(
-        b"class Entry < ActiveRecord::Base\n def self.named(title)\n where(Title: title).count\n end\n def matching\n Entry.where(Title: @Title).count\n end\nend\n",
+        b"class Entry < ActiveRecord::Base\n def self.named(title)\n where(Title: title).count\n end\n def matching\n Entry.where(Title: self.Title).count\n end\nend\n",
         "app/models/entry.rb", &schema, &Default::default(),
     ).expect("ingest model").expect("model");
     app.models = vec![model];

@@ -151,12 +151,14 @@ module ActiveRecord
         super(arel_text(condition), *args)
       end
 
-      def order(*parts)
+      # The in-place body: `order` spawns and calls it, `reorder!` clears
+      # the orders and calls it, and default-scope lowering calls it.
+      def order!(*parts)
         return super unless parts.any? { |part| arel_tree?(part) }
 
         parts.each do |part|
           if arel_tree?(part)
-            order_sql(arel_text(part))
+            order_sql!(arel_text(part))
           else
             super(part)
           end
