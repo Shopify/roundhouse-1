@@ -319,7 +319,7 @@ pub(super) fn push_association_methods(
                 ));
                 let sentinel = fk_sentinel(model, foreign_key);
                 let writer_name = Symbol::from(format!("{}=", name.as_str()));
-                if !model_defines_instance_method(model, &writer_name)
+                if !writer_defined_by_model(model, &writer_name)
                     && !methods
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
@@ -372,7 +372,7 @@ pub(super) fn push_association_methods(
                 // Same for a name an earlier synthesizer claimed (a
                 // column sharing the association's name).
                 let writer_name = Symbol::from(format!("{}=", name.as_str()));
-                if !model_defines_instance_method(model, &writer_name)
+                if !writer_defined_by_model(model, &writer_name)
                     && !methods
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
@@ -413,7 +413,7 @@ pub(super) fn push_association_methods(
                 // unclaimed.
                 let writer_name = Symbol::from(format!("{}=", name.as_str()));
                 if *autosave
-                    && !model_defines_instance_method(model, &writer_name)
+                    && !writer_defined_by_model(model, &writer_name)
                     && !methods
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
@@ -1760,6 +1760,46 @@ fn synth_polymorphic_writer(
 /// True when the model's own body defines an instance method `name` —
 /// the signal that a synthesized association accessor must yield to
 /// the app's definition.
+/// The model's own `def <assoc>=` that answers for the association's
+/// writer. Not on the ruby family when it calls `super`: Rails defines the
+/// association writer in a generated module the def supers into, so the
+/// synthesized writer is still emitted (into GeneratedAttributeMethods,
+/// `super_writer_overrides`) beside the def.
+fn writer_defined_by_model(model: &Model, name: &Symbol) -> bool {
+    model_defines_instance_method(model, name) && !super_writer_overrides(model).contains(name)
+}
+
+/// The association writers (`<name>=` of a belongs_to or has_one) the model
+/// redefines with a body that calls `super`. Ruby family only: the other
+/// targets have no module to hold the generated writer.
+pub(crate) fn super_writer_overrides(model: &Model) -> crate::det::HashSet<Symbol> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut names = crate::det::HashSet::default();
+    if !crate::emit::ruby::native_keywords() {
+        return names;
+    }
+    for item in &model.body {
+        let ModelBodyItem::Association { assoc: Association::BelongsTo { name, .. } | Association::HasOne { name, .. }, .. } = item else {
+            continue;
+        };
+        let writer = Symbol::from(format!("{}=", name.as_str()));
+        let calls_super = model.body.iter().any(|i| {
+            matches!(i, ModelBodyItem::Method { method, .. }
+                if method.name == writer && method.receiver == MethodReceiver::Instance && body_calls_super(&method.body))
+        });
+        if calls_super {
+            names.insert(writer);
+        }
+    }
+    names
+}
+
+fn body_calls_super(expr: &Expr) -> bool {
+    let mut found = matches!(&*expr.node, ExprNode::Super { .. });
+    expr.node.for_each_child(&mut |c| found = found || body_calls_super(c));
+    found
+}
+
 pub(crate) fn model_defines_instance_method(model: &Model, name: &Symbol) -> bool {
     use crate::dialect::ModelBodyItem;
     model.body.iter().any(|item| {

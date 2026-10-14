@@ -2235,12 +2235,14 @@ fn build_methods_for_dialect(
     // GeneratedAttributeMethods module (`emit::ruby::library`), so a
     // model's own `def name=` overrides them and can `super` into them,
     // as in Rails; it rides beside the synthesized accessor here.
-    let generated_attribute_overrides = match schema.tables.get(&model.table.0) {
+    let mut generated_attribute_overrides = match schema.tables.get(&model.table.0) {
         Some(table) if crate::emit::ruby::native_keywords() => {
             generated_attribute_method_names(model, models, table)
         }
         _ => Default::default(),
     };
+    // An association writer the model's own def supers into rides the same way.
+    generated_attribute_overrides.extend(associations::super_writer_overrides(model));
     // Snapshot BEFORE push_user_methods: an association reader or
     // `attr_accessor` pair's PRISTINE synthesized body, for
     // `resolve_model_aliases` below. `push_user_methods` mutates

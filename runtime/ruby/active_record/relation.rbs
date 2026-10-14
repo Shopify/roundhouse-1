@@ -29,8 +29,8 @@ module ActiveRecord
     def unscoped: () -> Relation
     def extending: (*::Module modules) -> Relation
     def build: (?Hash[Symbol, untyped] attrs) -> Base
-    def create: (?Hash[Symbol, untyped] attrs) -> Base
-    def create!: (?Hash[Symbol, untyped] attrs) -> Base
+    def create: (?Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
+    def create!: (?Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
 
     # Rails' Relation#spawn — copy query state onto a fresh Relation so
     # a scope fork cannot mutate its caller's accumulators.
@@ -331,8 +331,11 @@ module ActiveRecord
     def sole: () -> Base
     def find_sole_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base
     def first_or_initialize: () -> Base
-    def find_or_create_by: (Hash[Symbol, untyped] conditions) -> Base
+    def find_or_create_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def create_or_find_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def create_or_find_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def create_or_find_by_existing: (Hash[Symbol, untyped] conditions) -> Base
     def find_or_initialize_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
 
     def to_sql: () -> String

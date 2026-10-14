@@ -148,6 +148,11 @@ module ActiveRecord
     def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped) -> Integer
     def self._conflict_predicate: (String columns) -> String
     def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped) -> Integer
+    def self.insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def self.insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def self.insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def self.insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, untyped returning, bool? record_timestamps) -> Integer
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
     def self.abstract_class: () -> bool?
@@ -218,7 +223,9 @@ module ActiveRecord
     def self.find_by: (Hash[String | Symbol, untyped] conditions) -> Base?
     def self.find_sole_by: (Hash[String | Symbol, untyped] conditions) -> Base
     def self.find_or_initialize_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
-    def self.find_or_create_by: (Hash[Symbol, untyped] conditions) -> Base
+    def self.find_or_create_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def self.create_or_find_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def self.create_or_find_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.sole: () -> Base
     def self.all: () -> Relation
