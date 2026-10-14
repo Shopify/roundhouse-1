@@ -168,3 +168,70 @@ fn an_sti_record_round_trips_under_its_subclass_name() {
     assert!(run.stdout.contains("performed Featured title"), "{}", run.stdout);
     assert!(run.stdout.contains("sti payload passed"), "{}", run.stdout);
 }
+
+const PORT_JOB: &str = r#"class PortJob < ApplicationJob
+  before_perform { |job| puts "before_perform #{job.queue_name}" }
+  discard_on ActiveJob::DeserializationError
+
+  def perform(article, label)
+    puts "performed #{article.title} #{label} id=#{job_id == $enqueued_job_id}"
+  end
+end
+"#;
+
+const PORT_ENQUEUE: &str = r#"  validates :title, presence: true
+
+  def enqueue_port_job
+    PortJob.perform_later(self, "tag")
+  end
+"#;
+
+const PORT_SCRIPT: &str = r#"ActiveJob.register_drain
+article = Article.create!(title: "Queued title", body: "A long enough article body.")
+enqueued = article.enqueue_port_job
+$enqueued_job_id = enqueued.job_id
+raise "nothing queued" unless ActiveJob.pending_count == 1
+# A payload, not a Proc over the enqueued object: the job sees the row.
+Article.find(article.id).update!(title: "Changed title")
+raise "drain ran #{ActiveJob.pending_count}" unless ActiveJob.drain == 1
+
+# A retried job (executions past the first) and a scheduled one keep the Proc.
+retried = PortJob.new(article, "retry")
+retried.executions = 1
+$enqueued_job_id = retried.job_id
+retried.enqueue
+raise "retry not queued" unless ActiveJob.pending_count == 1
+Article.find(article.id).update!(title: "After retry")
+ActiveJob.drain
+
+# A record deleted before the drain: discarded, not run.
+gone = Article.create!(title: "Gone title", body: "Another long enough body.")
+gone.enqueue_port_job
+gone.destroy
+ActiveJob.drain
+puts "port payload passed"
+"#;
+
+/// A job on the ActiveJob::Callbacks port (`before_perform`) is queued
+/// as a payload too, by the port's own `perform_later`: the drain runs it
+/// through `perform_now`, so its chains run, on a job carrying the id the
+/// enqueue gave it. An enqueue a payload cannot carry (a retried
+/// execution) keeps its Proc.
+#[test]
+fn a_callbacks_port_job_queues_a_payload() {
+    let run = emit_and_run::real_blog()
+        .write("app/jobs/port_job.rb", PORT_JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", PORT_ENQUEUE)
+        .run_ruby(PORT_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("before_perform default"), "{}", run.stdout);
+    assert!(run.stdout.contains("performed Changed title tag id=true"), "{}", run.stdout);
+    // The Proc closes over the object it was enqueued with.
+    assert!(run.stdout.contains("performed Queued title retry id=true"), "{}", run.stdout);
+    assert!(!run.stdout.contains("performed Gone title"), "{}", run.stdout);
+    assert!(!run.stderr.contains("PortJob: Error"), "{}", run.stderr);
+    assert!(run.stdout.contains("port payload passed"), "{}", run.stdout);
+    let registry = std::fs::read_to_string(run.emitted.join("runtime/job_registry.rb")).expect("emitted registry");
+    assert!(registry.contains("def self.enqueue_arguments(job_class, arguments, job_id)"), "{registry}");
+    assert!(registry.contains("job.perform_now"), "{registry}");
+}

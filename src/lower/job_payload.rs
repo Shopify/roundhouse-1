@@ -88,6 +88,14 @@ pub struct JobPlan {
     pub params: Vec<JobParam>,
     /// Set when the job keeps its Proc; `params` is then empty.
     pub fallback: Option<JobFallback>,
+    /// The job runs on the ActiveJob::Callbacks port
+    /// (`runtime/spinel/active_job_callbacks.rb`), which supplies its own
+    /// `perform_later`: no generated wrapper carries the enqueue arm, so
+    /// the port's `_raw_enqueue` asks `JobRegistry.enqueue_arguments` to
+    /// write the payload, and the registry's reader runs the job through
+    /// `perform_now` so its callback chains and handlers still run.
+    #[serde(default)]
+    pub port: bool,
 }
 
 impl JobPlan {
@@ -109,8 +117,15 @@ fn suffix(class_name: &str) -> String {
 // ---- Planning --------------------------------------------------------
 
 /// A plan for every job in `wrapped` (the jobs `job_class_side` gave a
-/// synthesized `perform_later`), in name order.
-pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>) -> Vec<JobPlan> {
+/// synthesized `perform_later`, and the jobs on the callbacks port, whose
+/// `perform_later` is the port's), in name order. `port` is the second
+/// kind.
+pub fn plan_jobs(
+    app: &App,
+    jobs: &BTreeSet<String>,
+    wrapped: &BTreeSet<String>,
+    port: &BTreeSet<String>,
+) -> Vec<JobPlan> {
     let sites = call_site_types(app, jobs);
     let unattributed = unattributed_jobs(app, jobs);
     let sti = crate::lower::sti_scope::sti_bases(app);
@@ -128,7 +143,9 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
         let discards = discards_deserialization_error(app, lc);
         let empty = Vec::new();
         let job_sites = sites.get(name).unwrap_or(&empty);
-        let planned = if unattributed.contains(name) || unattributed.contains("*") {
+        let planned = if perform.block_param.is_some() {
+            Err(JobFallback { param: None, reason: "`perform` takes a block".to_string() })
+        } else if unattributed.contains(name) || unattributed.contains("*") {
             Err(JobFallback {
                 param: None,
                 reason: "a `perform_later` call doesn't name the job class, so its argument types are unknown"
@@ -148,6 +165,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
             enqueue_after_commit: enqueues_after_commit(app, lc),
             params,
             fallback,
+            port: port.contains(name),
         });
     }
     plans
@@ -494,6 +512,16 @@ fn is_literal_queue_as(call: &Expr) -> bool {
         && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })
 }
 
+/// A class-body call the payload plan carries on its own (a literal
+/// `queue_as`, `discard_on ActiveJob::DeserializationError`): such a call
+/// alone does not put a job hierarchy on the callbacks port, whose
+/// chains and handlers it does not need.
+pub fn is_plan_modelled_call(call: &Expr) -> bool {
+    is_literal_queue_as(call)
+        || is_discard_on_deserialization(call)
+        || enqueue_after_commit_literal(call).is_some()
+}
+
 /// Whether a class-body call of a job is carried by the payload plan
 /// rather than dropped: a literal `queue_as`, or `discard_on
 /// ActiveJob::DeserializationError`, on a job that has a payload — or on
@@ -545,6 +573,21 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         let own_name = lc.name.0.as_str().to_string();
         let Some(plan) = app.job_plans.iter().find(|p| p.job == own_name) else { continue };
+        if plan.port {
+            // The port's `_raw_enqueue` writes the payload; only the
+            // ledger line for a job that keeps its Proc is written here.
+            if let Some(f) = &plan.fallback {
+                let span = lc
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform"
+                    })
+                    .map_or(lc.parent_span, |m| m.name_span);
+                crate::emit::diagnostics::push(fallback_diagnostic(plan, f, span));
+            }
+            continue;
+        }
         let Some(wrapper) = lc.methods.iter_mut().find(|m| {
             m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "perform_later"
         }) else {
@@ -736,11 +779,19 @@ pub fn registry_source(plans: &[JobPlan]) -> String {
             let elems = format!("{}.map {{ |a| {} }}", rest.name.as_str(), write_expr(&rest.codec, "a"));
             list = if fixed.is_empty() { elems } else { format!("{list} + {elems}") };
         }
-        s.push_str(&format!(
-            "    ActiveJob::Payload.build({}, {}, ActiveJob::Arguments.list({list}))\n",
-            ruby_str(&plan.job),
-            ruby_str(&plan.queue)
-        ));
+        if plan.port {
+            s.push_str(&format!(
+                "    ActiveJob::Payload.build_as({}, job_id, {}, ActiveJob::Arguments.list({list}))\n",
+                ruby_str(&plan.job),
+                ruby_str(&plan.queue)
+            ));
+        } else {
+            s.push_str(&format!(
+                "    ActiveJob::Payload.build({}, {}, ActiveJob::Arguments.list({list}))\n",
+                ruby_str(&plan.job),
+                ruby_str(&plan.queue)
+            ));
+        }
         s.push_str("  end\n\n");
     }
 
@@ -759,7 +810,17 @@ pub fn registry_source(plans: &[JobPlan]) -> String {
                     call_args.push(read_expr(&p.codec, &format!("args, {i}")));
                 }
             }
-            if call_args.is_empty() {
+            if plan.port {
+                // Through `perform_now`, as the Proc a port job queues runs
+                // it: the chains and handlers around `perform` run, on a
+                // job carrying the id the enqueue gave it.
+                if call_args.is_empty() {
+                    s.push_str(&format!("      job = {}.new\n", plan.job));
+                } else {
+                    s.push_str(&format!("      job = {}.new({})\n", plan.job, call_args.join(", ")));
+                }
+                s.push_str("      job.job_id = ActiveJob.payload_job_id\n      job.perform_now\n");
+            } else if call_args.is_empty() {
                 s.push_str(&format!("      {}.new.perform\n", plan.job));
             } else {
                 s.push_str(&format!("      {}.new.perform({})\n", plan.job, call_args.join(", ")));
@@ -780,6 +841,44 @@ pub fn registry_source(plans: &[JobPlan]) -> String {
         s.push_str(&format!("    {}\n", names.join(" || ")));
     }
     s.push_str("  end\n");
+
+    // The port's enqueue entry: for each port job, the arguments the job
+    // was enqueued with, checked against its plan's codecs, written as a
+    // payload and queued. Answers false for any other job or arguments
+    // the plan does not cover, which then queue as a Proc.
+    let port: Vec<&&JobPlan> = payload.iter().filter(|p| p.port).collect();
+    if !port.is_empty() {
+        s.push_str("\n  def self.enqueue_arguments(job_class, arguments, job_id)\n    case job_class\n");
+        for plan in &port {
+            s.push_str(&format!("    when {}\n", ruby_str(&plan.job)));
+            let rest = plan.params.iter().find(|p| p.rest);
+            let fixed = plan.params.iter().filter(|p| !p.rest).count();
+            let mut checks: Vec<String> = vec![if rest.is_some() {
+                format!("arguments.length >= {fixed}")
+            } else {
+                format!("arguments.length == {fixed}")
+            }];
+            let mut writer_args: Vec<String> = Vec::new();
+            for (i, p) in plan.params.iter().enumerate() {
+                if p.rest {
+                    checks.push(format!("arguments[{i}..].all? {{ |a| {} }}", valid_expr(&p.codec, "a")));
+                    writer_args.push(format!("arguments[{i}..]"));
+                } else {
+                    checks.push(valid_expr(&p.codec, &format!("arguments[{i}]")));
+                    writer_args.push(format!("arguments[{i}]"));
+                }
+            }
+            writer_args.push("job_id".to_string());
+            s.push_str(&format!("      return false unless {}\n", checks.join(" && ")));
+            s.push_str(&format!(
+                "      ActiveJob.{}({}({}))\n      true\n",
+                if plan.enqueue_after_commit { "enqueue_payload_after_commit" } else { "enqueue_payload" },
+                format!("payload_{}", plan.suffix()),
+                writer_args.join(", ")
+            ));
+        }
+        s.push_str("    else\n      false\n    end\n  end\n");
+    }
 
     // One locator per record model a payload job reads, and a list
     // reader where a rest or Array parameter reads several.
@@ -832,16 +931,34 @@ pub fn registry_source(plans: &[JobPlan]) -> String {
 /// parameter is a plain one here: `perform_later(*comments)` hands the
 /// writer `comments`, the Array it collected, not its elements.
 fn writer_params(plan: &JobPlan) -> String {
-    if plan.params.is_empty() {
+    let mut names: Vec<String> = plan.params.iter().map(|p| p.name.as_str().to_string()).collect();
+    // A port job's payload carries the id its enqueue gave the job.
+    if plan.port {
+        names.push("job_id".to_string());
+    }
+    if names.is_empty() {
         return String::new();
     }
-    let list = plan
-        .params
-        .iter()
-        .map(|p| p.name.as_str().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("({list})")
+    format!("({})", names.join(", "))
+}
+
+/// Whether the value `v`, an argument a port job was enqueued with, is
+/// one its codec writes. A record needs an id: an unsaved one has no
+/// GlobalID, and queues as a Proc.
+fn valid_expr(codec: &Codec, v: &str) -> String {
+    match codec {
+        Codec::Bool => format!("({v} == true || {v} == false)"),
+        Codec::Int => format!("{v}.is_a?(Integer)"),
+        Codec::Float => format!("{v}.is_a?(Float)"),
+        Codec::Str => format!("{v}.is_a?(String)"),
+        Codec::Sym => format!("{v}.is_a?(Symbol)"),
+        Codec::Time => format!("{v}.is_a?(Time)"),
+        Codec::Record { model, .. } => format!("({v}.is_a?({model}) && !{v}.id.nil?)"),
+        Codec::NullableRecord { model, .. } => {
+            format!("({v}.nil? || ({v}.is_a?({model}) && !{v}.id.nil?))")
+        }
+        Codec::Array(inner) => format!("({v}.is_a?(Array) && {v}.all? {{ |e| {} }})", valid_expr(inner, "e")),
+    }
 }
 
 fn ruby_str(s: &str) -> String {

@@ -748,7 +748,7 @@ module ActiveJob
         ActiveJob.record_performed(name)
         if !ActiveJob.enqueue_only
           if ActiveJob.drain_registered
-            ActiveJob.enqueue(work)
+            ActiveJob.enqueue(work) unless enqueue_payload_for(name)
           else
             work.call
           end
@@ -756,6 +756,22 @@ module ActiveJob
           ActiveJob.hold(name, work)
         end
         self.successfully_enqueued = true
+      end
+
+      # The payload the generated `JobRegistry` writes for this job
+      # (`lower::job_payload`) in place of the Proc, when the job has a
+      # plan, its arguments are the ones the plan's codecs write, and
+      # nothing about the enqueue is beyond a fresh payload: a retry's
+      # executions, a priority, a schedule or a queue `set` chose are
+      # not in it. The drain then runs the job through `perform_now`
+      # (the registry's arm), as the Proc does. Answers whether it queued.
+      def enqueue_payload_for(name)
+        return false unless defined?(::JobRegistry) && ::JobRegistry.respond_to?(:enqueue_arguments)
+        return false unless executions == 0 && @priority.nil? && scheduled_at.nil?
+        # The queue the instance the drain builds resolves; a `set(queue:)`
+        # or an enqueue callback that moved this job is not in the payload.
+        return false unless queue_name == self.class.new(*arguments).queue_name
+        ::JobRegistry.enqueue_arguments(name, arguments, job_id)
       end
   end
 

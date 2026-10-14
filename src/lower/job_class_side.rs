@@ -225,7 +225,13 @@ fn adopt_callbacks_port(app: &mut App, jobs: &BTreeSet<String>) -> BTreeSet<Stri
     };
     let mut tops: BTreeSet<String> = BTreeSet::new();
     for lc in app.library_classes.iter().filter(|lc| jobs.contains(lc.name.0.as_str())) {
-        let registers = lc.unknown_calls.iter().any(is_callbacks_port_call)
+        // A literal `queue_as` or `discard_on ActiveJob::DeserializationError`
+        // is carried by the job's payload plan (`lower::job_payload`)
+        // and needs no chain: alone, it keeps the job on the wrappers.
+        let registers = lc
+            .unknown_calls
+            .iter()
+            .any(|c| is_callbacks_port_call(c) && !super::job_payload::is_plan_modelled_call(c))
             || app.included_block_statements.get(&lc.name).is_some_and(|s| !s.is_empty())
             || lc.includes.iter().any(hooked);
         if registers {
@@ -687,10 +693,14 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 
         if wrappers.iter().any(|w| w.name.as_str() == "perform_later") {
             payload_jobs.insert(lc.name.0.as_str().to_string());
+        } else if port && !is_worker {
+            // The port's `perform_later` is the port's own; its
+            // `_raw_enqueue` writes the payload this plan describes.
+            payload_jobs.insert(lc.name.0.as_str().to_string());
         }
         lc.methods.extend(wrappers);
     }
-    app.job_plans = super::job_payload::plan_jobs(app, &jobs, &payload_jobs);
+    app.job_plans = super::job_payload::plan_jobs(app, &jobs, &payload_jobs, &on_port);
     diags
 }
 

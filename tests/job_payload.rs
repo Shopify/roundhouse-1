@@ -334,3 +334,51 @@ fn the_rest_reader_calls_only_runtime_readers() {
         );
     }
 }
+
+/// A job whose hierarchy registers a callback runs on the ActiveJob::
+/// Callbacks port, which supplies its own `perform_later`. It is planned
+/// like any other job, and the registry carries the port's entry
+/// (`enqueue_arguments`) and an arm that runs it through `perform_now`.
+#[test]
+fn a_callbacks_port_job_is_planned_and_registered() {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        ),
+        (
+            "app/models/user.rb",
+            "class User < ApplicationRecord\n  def greet\n    GreetJob.perform_later(self, \"hi\")\n  end\nend\n",
+        ),
+        (
+            "app/jobs/application_job.rb",
+            "class ApplicationJob < ActiveJob::Base\n  before_perform { |job| nil }\nend\n",
+        ),
+        (
+            "app/jobs/greet_job.rb",
+            "class GreetJob < ApplicationJob\n  queue_as :greetings\n\n  def perform(user, word)\n    nil\n  end\nend\n",
+        ),
+    ]))
+    .expect("ingest job app");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let greet = plan(&app, "GreetJob");
+    assert!(greet.port && greet.is_payload(), "{greet:#?}");
+    assert_eq!(greet.queue, "greetings");
+
+    let job = emitted(&app, "greet_job.rb");
+    assert!(!job.contains("def self.perform_later"), "the port's perform_later stays:\n{job}");
+
+    let src = registry_source(&app.job_plans);
+    assert!(src.contains("def self.payload_greet_job(user, word, job_id)"), "{src}");
+    assert!(src.contains(r#"ActiveJob::Payload.build_as("GreetJob", job_id, "greetings""#), "{src}");
+    assert!(
+        src.contains("return false unless arguments.length == 2 && (arguments[0].is_a?(User) && !arguments[0].id.nil?) && arguments[1].is_a?(String)"),
+        "arguments the plan's codecs do not write keep the Proc:\n{src}"
+    );
+    assert!(src.contains("ActiveJob.enqueue_payload(payload_greet_job(arguments[0], arguments[1], job_id))"), "{src}");
+    assert!(
+        src.contains("      job = GreetJob.new(locate_user_at(args, 0), ActiveJob::Arguments.str_at(args, 1))\n      job.job_id = ActiveJob.payload_job_id\n      job.perform_now\n"),
+        "{src}"
+    );
+}

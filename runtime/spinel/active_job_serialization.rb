@@ -277,8 +277,14 @@ module ActiveJob
     # app that changes either is a known gap). `job_id` is a fresh v4
     # UUID, as `SecureRandom.uuid` gives Rails.
     def self.build(job_class, queue_name, arguments_json)
+      build_as(job_class, SecureRandom.uuid, queue_name, arguments_json)
+    end
+
+    # `build` for a job that already has its id (a job on the callbacks
+    # port, whose instance carries the one its enqueue callbacks saw).
+    def self.build_as(job_class, job_id, queue_name, arguments_json)
       "{\"job_class\":" + Arguments.str(job_class) +
-        ",\"job_id\":" + Arguments.str(SecureRandom.uuid) +
+        ",\"job_id\":" + Arguments.str(job_id) +
         ",\"provider_job_id\":null" +
         ",\"queue_name\":" + Arguments.str(queue_name) +
         ",\"priority\":null" +

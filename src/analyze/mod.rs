@@ -8652,7 +8652,23 @@ fn build_sourced_filter_chain(
 /// or `after_create_commit -> { … }` — on the shape
 /// `model_to_library::block_callback_shape` accepts and lowers to a method.
 fn block_callback_body(expr: &Expr) -> Option<&Expr> {
-    let (callback, _, _) = crate::lower::model_to_library::block_callback_shape(expr)?;
+    let callback = match crate::lower::model_to_library::block_callback_shape(expr) {
+        Some((callback, _, _)) => callback,
+        // The transaction hooks' block forms (`after_create_commit -> {
+        // room.receive(self) }`) are `transaction_callbacks`', which
+        // splices them into a method the same way.
+        None => {
+            let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else { return None };
+            if !crate::lower::model_to_library::transaction_callbacks::is_transaction_hook(method.as_str()) {
+                return None;
+            }
+            match (block.as_ref(), &args[..]) {
+                (Some(b), _) => b,
+                (None, [first, ..]) if matches!(&*first.node, ExprNode::Lambda { .. }) => first,
+                _ => return None,
+            }
+        }
+    };
     match &*callback.node {
         ExprNode::Lambda { body, .. } => Some(body),
         _ => None,

@@ -93,6 +93,12 @@ module ActiveJob
     nil
   end
 
+  # The id of the payload `perform_payload` is running: the job a
+  # callbacks-port arm of `JobRegistry.perform` builds carries it.
+  def self.payload_job_id
+    Thread.current[:aj_payload_job_id].to_s
+  end
+
   # The drain's payload arm (`ActiveJob.drain` in the shared runtime and
   # its locked twin in thread_state.rb). REPLACES the shared default,
   # which knows no jobs: a later definition wins, on spinel as on CRuby.
@@ -105,6 +111,7 @@ module ActiveJob
   def self.perform_payload(json)
     job = JSON.parse(json)
     name = job["job_class"].to_s
+    Thread.current[:aj_payload_job_id] = job["job_id"].to_s
     begin
       ran = JobRegistry.perform(name, job["arguments"])
       warn "[job] no job class " + name + " for a queued payload" unless ran
