@@ -842,6 +842,13 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
     for r in crate::lower::flatten_routes(app) {
         routed.entry(r.controller).or_default().insert(r.action);
     }
+    // An action a controller test requests is dispatched
+    // (`ActionController::TestCase#process`) whether or not a route is
+    // ingested for it: Core's routes are not, and without this none of
+    // its controllers would get the dispatcher that runs their filters.
+    for (controller, action) in crate::lower::controller_test_actions(app) {
+        routed.entry(controller).or_default().insert(action);
+    }
     let route_ids = crate::lower::routes::helper_id_segments(app);
     crate::lower::lower_controllers_with_arel_views_assocs_and_routes(
         &app.controllers,
@@ -2575,6 +2582,9 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], reset: &TestReset, minitest:
     if minitest {
         boot.push_str(MINITEST_TEST_CASES);
     }
+    if minitest {
+        boot.push_str(ACTION_CONTROLLER_TEST_CASE);
+    }
     boot.push_str(
         "# The app's whole boot chain, in its curated order: the runtime,\n\
          # config/schema, config/routes, app/models, app/views. boot.rb\n\
@@ -2753,6 +2763,11 @@ fn fixture_set_rows(app: &App, fixture_lcs: &[LibraryClass]) -> Vec<FixtureSetRo
 /// had no `assertions`, and the second raised NameError.
 /// `ActiveSupport::TestCase` is `TestBase` itself, the class emitted
 /// test classes descend from for it (`emitted_test_parent`).
+/// `ActionController::TestCase::Behavior#process` and its helpers, the
+/// request half of the controller case `MINITEST_TEST_CASES` declares.
+const ACTION_CONTROLLER_TEST_CASE: &str =
+    include_str!("../../runtime/spinel/test/action_controller_test_case.rb");
+
 pub(crate) const MINITEST_TEST_CASES: &str = "\
 # Rails' test base classes, before the app's files reopen them: TestBase
 # (defined below) is ActiveSupport::TestCase, and ActionController::
@@ -2805,8 +2820,10 @@ module ActionController
     # ActionController::TestCase::Behavior (actionpack 8.2
     # test_case.rb): the controller, request and response a test's setup
     # and helpers read, built by the first setup callback. DIVERGENCE,
-    # stated: there is no ActionDispatch::TestResponse, so `response` is
-    # nil, and `process` (get/post/...) is refused by name.
+    # stated: `response` is nil until a request has run, and `process`
+    # (get/post/...), `assigns`, `flash` and `cookies` are the
+    # request half, runtime/spinel/test/action_controller_test_case.rb,
+    # spliced in after this.
     module Behavior
       CONTROLLERS_ROOT = File.expand_path('../app/controllers', __dir__)
 
@@ -2872,14 +2889,6 @@ module ActionController
             end
           end
         end
-      end
-
-      def process(action, **)
-        raise NotImplementedError, \"roundhouse: ActionController::TestCase#process (#{action}): controller tests' requests are not ported\"
-      end
-
-      %i[get post patch put delete head].each do |verb|
-        define_method(verb) { |action, **options| process(action, **options) }
       end
 
       def setup_controller_request_and_response

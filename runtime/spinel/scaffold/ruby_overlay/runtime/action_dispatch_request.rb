@@ -553,6 +553,25 @@ end
 module ActionController
   class Base
     attr_accessor :request
+
+    # Rails' controller-test `recycle!` (actionpack
+    # action_controller/test_case.rb): the response this controller is
+    # (it IS its own response here) back to a fresh one, so a second
+    # request in one test starts from status 200 and an empty body. The
+    # request's inputs are the caller's to assign.
+    def recycle!
+      @status = 200
+      @body = +""
+      @location = nil
+      @content_type = "text/html; charset=utf-8"
+      @content_type_explicit = false
+      @headers = ActionController::HeaderStore.new
+      @performed = false
+      @head_response = false
+      @cache_control = ActionController::CacheControlStore.new
+      @cookies = nil
+      nil
+    end
   end
 
   # Per-request context reachable from module-function helpers. Rails

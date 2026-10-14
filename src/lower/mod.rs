@@ -40,6 +40,7 @@ pub mod importmap_to_library;
 pub mod jbuilder_to_library;
 pub mod library_extras;
 pub mod model_to_library;
+pub mod controller_test_actions;
 pub mod routes;
 pub mod routes_to_library;
 pub mod segment_pattern;
@@ -1650,6 +1651,7 @@ pub use fixtures::{
     LoweredFixtureValue,
 };
 pub use persistence::{lower_persistence, BelongsToCheck, DependentChild, LoweredPersistence};
+pub use controller_test_actions::controller_test_actions;
 pub use routes::{flatten_routes, standard_resource_actions, FlatRoute};
 pub use validations::{lower_validations, Check, InclusionValue, LoweredValidation};
 pub use view::{
