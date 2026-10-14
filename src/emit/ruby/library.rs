@@ -14390,7 +14390,8 @@ const ANY_CLASS_SELF_CALLS: &[&str] = &[
 /// `self`) is one any class answers ([`ANY_CLASS_SELF_CALLS`]) or a
 /// class method `lc` defines. A `define_method` block is a method body,
 /// run later on an instance, so its calls are not the class's. A block
-/// that rebinds `self` (`instance_eval`, `class_exec`, …) is not read.
+/// that rebinds `self` (`instance_eval`, `class_exec`, …) on the class
+/// itself is not read; on another object it is that object's.
 fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
     // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
     // singleton class, which the class's own class methods do not answer.
@@ -14413,11 +14414,26 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
             if on_self && method.as_str() == "require" && block.is_none() && requires_library(args, app) {
                 return;
             }
-            if matches!(
+            let rebinds = matches!(
                 method.as_str(),
                 "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec"
-            ) {
+            );
+            if rebinds && on_self {
                 *ok = false;
+                return;
+            }
+            // `other.instance_exec do … end` rebinds `self` to another
+            // object: the block's calls are its, not the class's (Core's
+            // GraphQLTestHelper `test_case_config.test_case.instance_exec`
+            // inside the `configuration.tap` lambdas). The receiver and
+            // arguments are still read.
+            if rebinds {
+                if let Some(r) = recv {
+                    walk(r, own, hooked, app, ok);
+                }
+                for a in args {
+                    walk(a, own, hooked, app, ok);
+                }
                 return;
             }
             if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method) && !hooked {
