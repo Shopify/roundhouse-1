@@ -162,7 +162,7 @@ fn forwarded_to_association(
     if !middle.iter().all(|p| (p.keyword || p.from_keyword) && !p.rest) {
         return None;
     }
-    let bound: Vec<Symbol> = middle.iter().map(|p| p.name.clone()).collect();
+    let mut bound: Vec<Symbol> = middle.iter().map(|p| p.name.clone()).collect();
     let optional_nil = matches!(second.default.as_ref().map(|d| &*d.node), Some(ExprNode::Lit { value: Literal::Nil }));
     if second.keyword || !(second.rest || optional_nil) {
         return None;
@@ -178,6 +178,13 @@ fn forwarded_to_association(
         match &*stmt.node {
             ExprNode::Assign { target: LValue::Var { name, .. }, value } if is_self(value) => {
                 selves.push(name.clone());
+            }
+            // `query_constraints = options.delete(:query_constraints)`
+            // (Core's `has_many_with_query_constraints`): the call's own
+            // keyword, which the association is parsed from, as with a
+            // keyword parameter.
+            ExprNode::Assign { target: LValue::Var { name, .. }, value } if takes_call_option(value, &options.name, &bound) => {
+                bound.push(name.clone());
             }
             ExprNode::Assign { target: LValue::Var { name, .. }, value } if !second.rest => {
                 if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*value.node {
@@ -236,6 +243,22 @@ fn forwarded_to_association(
         }
     }
     None
+}
+
+/// `options.delete(:key)`, possibly through `Array(...)` or an inline
+/// cast or a local already bound this way: the call's own keyword.
+fn takes_call_option(expr: &Expr, options: &Symbol, bound: &[Symbol]) -> bool {
+    match &*expr.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "delete" => {
+            is_var(r, options) && matches!(args.as_slice(), [key] if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } }))
+        }
+        ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "Array" => {
+            matches!(args.as_slice(), [inner] if takes_call_option(inner, options, bound))
+        }
+        ExprNode::Var { name, .. } => bound.contains(name),
+        ExprNode::Cast { value, .. } => takes_call_option(value, options, bound),
+        _ => false,
+    }
 }
 
 /// What a class macro does to its keyword options on the way to the

@@ -321,7 +321,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
     } else {
         super::route_url_options::helper_path_params(app)
     };
-    let enum_map = super::enum_symbols::enum_columns(app);
+    let enum_map = super::enum_symbols::Maps::of(app);
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);
@@ -392,7 +392,7 @@ fn rewrite_mid_node(
     helpers: &crate::det::HashSet<String>,
     path_params: &crate::det::HashMap<String, Vec<String>>,
     position_path: bool,
-    enum_map: &super::enum_symbols::EnumMap,
+    enum_map: &super::enum_symbols::Maps,
     json_map: &super::has_json::HasJsonColumns,
     sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,

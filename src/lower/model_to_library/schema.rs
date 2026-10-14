@@ -1939,9 +1939,22 @@ fn hydrate_new_args(model: &Model) -> Vec<Expr> {
 /// being built: it skips `after_initialize` (the factory fires it once
 /// the columns are set) and the declared `attribute ..., default:`
 /// values (`declared_default_assign`), which Rails evaluates only for a
-/// new record — a loaded one never calls a Proc default.
+/// new record — a loaded one never calls a Proc default. Also skips
+/// `assign_attributes(attrs)`, which a model that overrides it would run
+/// on the empty shell: Core's ProductVariant read `shop` there, before
+/// `shop_id` was loaded, and cached nil for the life of the record.
 fn constructs_with_hydrate_attrs(model: &Model) -> bool {
-    model_declares_after_initialize(model) || !model.defaulted_attributes.is_empty()
+    model_declares_after_initialize(model)
+        || !model.defaulted_attributes.is_empty()
+        || model_defines_assign_attributes(model)
+}
+
+fn model_defines_assign_attributes(model: &Model) -> bool {
+    use crate::dialect::ModelBodyItem;
+    model.body.iter().any(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "assign_attributes" && method.receiver == MethodReceiver::Instance)
+    })
 }
 
 fn synth_from_row(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {

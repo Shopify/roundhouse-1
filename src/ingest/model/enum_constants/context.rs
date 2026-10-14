@@ -28,8 +28,17 @@ pub(super) fn namespace_body(ancestors: &[Node<'_>]) -> bool {
         })
 }
 
+/// `map(&:serialize)`.
+fn serialized_map(call: &ruby_prism::CallNode<'_>) -> bool {
+    constant_id_str(&call.name()) == "map"
+        && call.arguments().is_none()
+        && call.block().and_then(|b| b.as_block_argument_node()).and_then(|b| b.expression()).and_then(|e| e.as_symbol_node()).is_some_and(|symbol| {
+            symbol.unescaped() == b"serialize"
+        })
+}
+
 pub(super) fn value(ancestors: &[Node<'_>], node: &Node<'_>) -> ValueContext {
-    for parent in ancestors.iter().rev() {
+    for (depth, parent) in ancestors.iter().rev().enumerate() {
         match parent {
             Node::CallNode { .. } => {
                 let call = parent.as_call_node().unwrap();
@@ -52,7 +61,14 @@ pub(super) fn value(ancestors: &[Node<'_>], node: &Node<'_>) -> ValueContext {
                         || (r.as_self_node().is_some() && namespace_body(ancestors))
                 }) {
                     ValueContext::Receiver
-                } else if super::super::serialized_enum_receiver(parent).is_some() {
+                } else if super::super::serialized_enum_receiver(parent).is_some()
+                    // `values.map(&:serialize).to_h { ... }`: the values call
+                    // sits under the `map`, whose own parent is the pair.
+                    || (serialized_map(&call)
+                        && ancestors.len().checked_sub(depth + 2).and_then(|at| ancestors.get(at)).is_some_and(|outer| {
+                            super::super::serialized_enum_receiver(outer).is_some()
+                        }))
+                {
                     ValueContext::SerializedPair
                 } else {
                     ValueContext::Chained

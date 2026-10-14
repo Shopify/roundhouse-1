@@ -44,8 +44,25 @@ const ATTR_METHODS: &[&str] = &[
 
 pub(crate) type EnumMap = crate::det::HashMap<String, crate::det::HashMap<String, Literal>>;
 
+/// The mappings a rewrite consults: by column across the app, and each
+/// model's own for a call whose receiver chain names the model.
+pub(crate) struct Maps {
+    columns: EnumMap,
+    by_model: crate::det::HashMap<String, EnumMap>,
+}
+
+impl Maps {
+    pub(crate) fn of(app: &App) -> Self {
+        Maps { columns: enum_columns(app), by_model: enum_columns_by_model(app) }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.by_model.is_empty()
+    }
+}
+
 pub fn apply_enum_symbol_lowering(app: &mut App) {
-    let map = enum_columns(app);
+    let map = Maps::of(app);
     if map.is_empty() {
         return;
     }
@@ -62,6 +79,52 @@ pub fn apply_enum_symbol_lowering(app: &mut App) {
         }
         for m in &mut tm.helpers {
             rewrite(&mut m.body, &map);
+        }
+    }
+}
+
+/// model name → (column → (label → stored value)): what a query rooted
+/// at the model constant (`Rollout.where(status: :active)`) means for a
+/// column that other models map differently, which [`enum_columns`]
+/// leaves out.
+fn enum_columns_by_model(app: &App) -> crate::det::HashMap<String, EnumMap> {
+    let mut out: crate::det::HashMap<String, EnumMap> = Default::default();
+    for model in &app.models {
+        if model.enums.is_empty() {
+            continue;
+        }
+        let columns = model
+            .enums
+            .iter()
+            .map(|(column, labels)| (column.as_str().to_string(), labels.iter().cloned().collect()))
+            .collect();
+        out.insert(model.name.0.as_str().to_string(), columns);
+    }
+    out
+}
+
+/// The model a call chain starts at: `Rollout` in
+/// `Rollout.select(:id).where(...)` (a chain of receivers ending in a
+/// constant that names a model, exactly or as the last segments of its
+/// namespaced name when only one model has them).
+fn chain_model<'m>(recv: Option<&Expr>, by_model: &'m crate::det::HashMap<String, EnumMap>) -> Option<&'m EnumMap> {
+    let mut at = recv?;
+    loop {
+        match &*at.node {
+            ExprNode::Send { recv: Some(next), .. } => at = next,
+            ExprNode::Const { path } => {
+                let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                if let Some(found) = by_model.get(&name) {
+                    return Some(found);
+                }
+                let tail = format!("::{name}");
+                let mut matches = by_model.iter().filter(|(model, _)| model.ends_with(&tail));
+                return match (matches.next(), matches.next()) {
+                    (Some((_, found)), None) => Some(found),
+                    _ => None,
+                };
+            }
+            _ => return None,
         }
     }
 }
@@ -114,25 +177,26 @@ fn literal_eq(a: &Literal, b: &Literal) -> bool {
     }
 }
 
-fn rewrite(expr: &mut Expr, map: &EnumMap) {
+fn rewrite(expr: &mut Expr, map: &Maps) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, map));
     rewrite_node(expr, map);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, map: &EnumMap) {
-    let ExprNode::Send { method, args, .. } = &mut *expr.node else {
+pub(crate) fn rewrite_node(expr: &mut Expr, map: &Maps) {
+    let ExprNode::Send { recv, method, args, .. } = &mut *expr.node else {
         return;
     };
     if !ATTR_METHODS.contains(&method.as_str()) {
         return;
     }
+    let own = chain_model(recv.as_ref(), &map.by_model);
     for arg in args.iter_mut() {
         let ExprNode::Hash { entries, .. } = &mut *arg.node else { continue };
         for (key, value) in entries.iter_mut() {
             let ExprNode::Lit { value: Literal::Sym { value: col } } = &*key.node else {
                 continue;
             };
-            let Some(mapping) = map.get(col.as_str()) else { continue };
+            let Some(mapping) = own.and_then(|m| m.get(col.as_str())).or_else(|| map.columns.get(col.as_str())) else { continue };
             rewrite_value(value, mapping);
         }
     }
