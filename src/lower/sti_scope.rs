@@ -934,7 +934,7 @@ fn rewrite(
 }
 
 /// Ruby family: each STI subclass's `_apply_type_condition(relation)`,
-/// `relation.where(type: ["Dog", "Puppy"])`, which the runtime
+/// `relation.where!(type: ["Dog", "Puppy"])`, which the runtime
 /// `Relation#initialize` applies to every relation on the class (Rails'
 /// `type_condition`). A relation seeded on `self` in a class method
 /// then reads the receiving class's rows: `Animal.recent` reached as
@@ -971,7 +971,8 @@ pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClas
             span,
             ExprNode::Send {
                 recv: Some(Expr::new(span, ExprNode::Var { id: VarId(0), name: relation.clone() })),
-                method: Symbol::from("where"),
+                // In place: `Relation#initialize` does not read the value.
+                method: Symbol::from("where!"),
                 args: vec![condition],
                 block: None,
                 parenthesized: true,

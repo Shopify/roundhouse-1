@@ -199,7 +199,12 @@ module ActiveRecord
     # kept as the association assignment it is (`new(service: record)`);
     # `create_with(nil)` resets them.
     def create_with(attrs)
+      spawn.create_with!(attrs)
+    end
+
+    def create_with!(attrs)
       own_lists
+      unload_records
       @create_with = attrs.nil? ? {} : @create_with.merge(attrs.to_h.transform_keys(&:to_sym))
       self
     end
@@ -215,6 +220,11 @@ module ActiveRecord
     # so an override's `super` reaches the Relation method. A model's
     # `default_scope { extending(Mod) }` puts it on every relation.
     def extending(*modules)
+      spawn.extending!(*modules)
+    end
+
+    def extending!(*modules)
+      unload_records
       modules.each { |mod| self.extend(mod) }
       self
     end
@@ -278,11 +288,14 @@ module ActiveRecord
     end
 
     # Rails' `Relation#spawn`: a new relation that shares this one's
-    # query state but not its accumulator arrays. Chain methods still
-    # mutate in place; scopes call `spawn` on entry so a fork like
-    # campfire's sidebar (`visible.with_direct_rooms` beside
-    # `visible.with_ordered_room.without_direct_rooms`) does not let
-    # one branch's joins/orders/wheres pollute the other.
+    # query state but not its accumulator arrays. Every public chain
+    # method (`where`, `order`, `limit`, `merge`, …) answers a spawn with
+    # the change applied and leaves its receiver as it was, as Rails does,
+    # so a relation reused as a base (`a = base.where(x); b = base.where(y)`)
+    # is not polluted by either branch. The in-place bodies are the bang
+    # forms (`where!`, `order!`, `limit!`, …), which the relation's own
+    # construction (default scope, type condition) and terminals use on a
+    # relation they own.
     #
     # Copy-on-write: `clone` already shares the list objects. Mark both
     # sides shared and copy the lists on the first mutating chain method
@@ -358,6 +371,10 @@ module ActiveRecord
     # from it. lobsters walks a comment's ancestors this way on the reply
     # page (`Comment#parents`).
     def with_recursive(ctes)
+      spawn.with_recursive!(ctes)
+    end
+
+    def with_recursive!(ctes)
       own_lists
       unload_records
       ctes.each do |name, parts|
@@ -375,6 +392,10 @@ module ActiveRecord
     # table. The String form only: Rails also takes a relation (a
     # subquery) there, which no corpus call writes.
     def from(source)
+      spawn.from!(source)
+    end
+
+    def from!(source)
       unload_records
       @from = source
       self
@@ -383,6 +404,13 @@ module ActiveRecord
     # `where(hash)` / `where("raw sql")` / `where("a = ? AND b = ?", x, y)`
     # / `where(["a IN (?)", values])` (Rails' sanitize_sql_array form).
     def where(condition = nil, *args)
+      # `where` with no condition is Rails' WhereChain (`where.not(…)`,
+      # `where.missing(…)`): the hop after it spawns.
+      return self if condition.nil? && args.empty?
+      spawn.where!(condition, *args)
+    end
+
+    def where!(condition = nil, *args)
       add_condition(condition, args, false, true)
       self
     end
@@ -392,6 +420,10 @@ module ActiveRecord
     # association seed uses this so the FK is recorded even when the
     # ordinary `where` path would refuse it as non-seedable.
     def where_scope(condition)
+      spawn.where_scope!(condition)
+    end
+
+    def where_scope!(condition)
       @scope_attributes = condition
       add_condition(condition, [], false)
       self
@@ -406,6 +438,10 @@ module ActiveRecord
     # `where.not(...)` is lowered to `not(...)` on the relation: negate the
     # condition back onto this relation. Negated predicates never seed.
     def not(condition = nil, *args)
+      spawn.not!(condition, *args)
+    end
+
+    def not!(condition = nil, *args)
       add_condition(condition, args, true)
       self
     end
@@ -416,9 +452,13 @@ module ActiveRecord
     # the hop lands on this method. A LEFT OUTER JOIN to the association
     # and a NULL key on its table, as Rails writes it.
     def missing(*associations)
+      spawn.missing!(*associations)
+    end
+
+    def missing!(*associations)
       associations.each do |name|
         reflection = reflect_join_hop(@model, name)
-        left_outer_joins(name)
+        left_outer_joins!(name)
         push_where("(#{reflection.klass._table_sql}.#{reflection_key_column(reflection)} IS NULL)")
       end
       self
@@ -427,9 +467,13 @@ module ActiveRecord
     # `where.associated(:assoc)` — WhereChain#associated: rows with an
     # associated record. An INNER JOIN and a non-NULL key on its table.
     def associated(*associations)
+      spawn.associated!(*associations)
+    end
+
+    def associated!(*associations)
       associations.each do |name|
         reflection = reflect_join_hop(@model, name)
-        joins(name)
+        joins!(name)
         push_where("NOT (#{reflection.klass._table_sql}.#{reflection_key_column(reflection)} IS NULL)")
       end
       self
@@ -456,6 +500,12 @@ module ActiveRecord
     # branch, and wrapped in an array it would reach the IN-list branch
     # and escape a Relation object into the SQL text.
     def excluding(*records)
+      return self if records.length == 1 && records[0].is_a?(Array) && records[0].empty?
+      return self if records.empty?
+      spawn.excluding!(*records)
+    end
+
+    def excluding!(*records)
       val = records.length == 1 ? records[0] : records
       own_lists
       unload_records
@@ -485,6 +535,10 @@ module ActiveRecord
       # (including both-null) leaves the receiver.
       return other.spawn if @null && !other.null_relation?
       return self if other.null_relation?
+      spawn.or!(other)
+    end
+
+    def or!(other)
       unload_records
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
@@ -500,6 +554,10 @@ module ActiveRecord
     # requires structurally compatible relations; as for `or`, the
     # receiver's structural clauses are kept.
     def and(other)
+      spawn.and!(other)
+    end
+
+    def and!(other)
       own_lists
       unload_records
       other.where_clauses.each { |w| push_where(w) }
@@ -574,11 +632,21 @@ module ActiveRecord
     # order, the same order SQLite hands back for tied keys -- and a
     # page sorted here matches one sorted by the database byte for byte.
     def order(*parts)
+      spawn.order!(*parts)
+    end
+
+    def order!(*parts)
       own_lists
       terms = parts.map { |p| order_term(p) }
       terms.each { |t| @orders << t }
       loaded = @records
       return self if loaded.nil?
+      # A page (LIMIT / OFFSET) is not the relation's rows: another order
+      # picks other rows, so the database answers.
+      if !@limit.nil? || !@offset.nil?
+        unload_records
+        return self
+      end
       # An explicit copy rather than `dup`: built by pushes, the copy has
       # the records array's own type where a `dup` of a nilable read does
       # not, and it is assigned back into `@records` below. An index loop
@@ -590,7 +658,8 @@ module ActiveRecord
         sorted << loaded[i]
         i += 1
       end
-      if sort_in_place!(sorted, terms)
+      # Every term, earlier ones first: `order(:a).order(:b)` is `ORDER BY a, b`.
+      if sort_in_place!(sorted, @orders)
         @records = sorted
       else
         unload_records
@@ -605,6 +674,10 @@ module ActiveRecord
     # call; the bare String `order` still validates. A loaded relation
     # reads again rather than guess at a fragment's sort.
     def order_sql(fragment)
+      spawn.order_sql!(fragment)
+    end
+
+    def order_sql!(fragment)
       own_lists
       @orders << fragment
       unload_records
@@ -612,8 +685,12 @@ module ActiveRecord
     end
 
     def reorder_sql(fragment)
+      spawn.reorder_sql!(fragment)
+    end
+
+    def reorder_sql!(fragment)
       @orders = []
-      order_sql(fragment)
+      order_sql!(fragment)
     end
 
     # Rails requires at least one argument to the public `reorder` API.
@@ -630,8 +707,13 @@ module ActiveRecord
     # `order` when the records are already loaded.
     def reorder(*parts)
       raise ArgumentError, "The method .reorder() must contain arguments." if parts.empty?
+      spawn.reorder!(*parts)
+    end
+
+    def reorder!(*parts)
+      raise ArgumentError, "The method .reorder() must contain arguments." if parts.empty?
       @orders = []
-      order(*parts)
+      order!(*parts)
     end
 
     # `lock` / `lock(false)` / `lock("FOR SHARE")` — the row-locking
@@ -639,6 +721,10 @@ module ActiveRecord
     # the clause as written, true or nil is `FOR UPDATE`, anything else
     # removes it; arel's visitor writes it after LIMIT and OFFSET).
     def lock(locks = true)
+      spawn.lock!(locks)
+    end
+
+    def lock!(locks = true)
       @records = nil
       @lock = if locks.is_a?(String)
         locks
@@ -661,6 +747,11 @@ module ActiveRecord
     # `where:` takes the columns whose conditions go, whatever their
     # predicate (equality, IN, NOT …).
     def unscope(*args)
+      raise ArgumentError, "The method .unscope() must contain arguments." if args.empty?
+      spawn.unscope!(*args)
+    end
+
+    def unscope!(*args)
       raise ArgumentError, "The method .unscope() must contain arguments." if args.empty?
       own_lists
       unload_records
@@ -780,39 +871,9 @@ module ActiveRecord
     end
     private :unscope_column_name
 
-    # Rails' mutating spellings. This Relation's chain methods already
-    # mutate in place and return self, so the bang forms are the same
-    # operation under a second name (bodies duplicated rather than
-    # splat-forwarded — strict targets inline, not forward, rest args).
-    def where!(condition = nil, *args)
-      add_condition(condition, args, false, true)
-      self
-    end
-
-    def order!(*parts)
-      own_lists
-      terms = parts.map { |p| order_term(p) }
-      terms.each { |t| @orders << t }
-      loaded = @records
-      return self if loaded.nil?
-      # An explicit copy rather than `dup`: built by pushes, the copy has
-      # the records array's own type where a `dup` of a nilable read does
-      # not, and it is assigned back into `@records` below. An index loop
-      # rather than `each`, whose block parameter the typer cannot derive
-      # from a receiver it only knows as nilable.
-      sorted = []
-      i = 0
-      while i < loaded.length
-        sorted << loaded[i]
-        i += 1
-      end
-      if sort_in_place!(sorted, terms)
-        @records = sorted
-      else
-        unload_records
-      end
-      self
-    end
+    # `where!` / `order!` and the other bang forms sit beside their
+    # non-bang spellings: the bang form is the in-place body and answers
+    # self, the plain one spawns first.
 
     # Sort `sorted` (a copy of the loaded records) by `terms` in place;
     # true when every term was a bare column, false when one was not --
@@ -940,6 +1001,10 @@ module ActiveRecord
     # not an integer) and `offset` is `build_arel`'s `to_i`. nil clears
     # either, as in Rails.
     def limit(n)
+      spawn.limit!(n)
+    end
+
+    def limit!(n)
       unload_records
       # Split rather than `n.nil? ? nil : sql_limit(n)`: Spinel cannot
       # unify nil with Integer in a conditional expression.
@@ -952,6 +1017,10 @@ module ActiveRecord
     end
 
     def offset(n)
+      spawn.offset!(n)
+    end
+
+    def offset!(n)
       unload_records
       if n.nil?
         @offset = nil
@@ -979,8 +1048,7 @@ module ActiveRecord
       per_page = Rails.application.pagination_default_per_page
       n = num.to_s.to_i
       n = 1 if n < 1
-      limit(per_page)
-      offset((n - 1) * per_page)
+      spawn.limit!(per_page).offset!((n - 1) * per_page)
     end
 
     # Same builder as `page` under the `paginate` spelling. A
@@ -1000,8 +1068,7 @@ module ActiveRecord
       n = text.to_i
       return limit(0) if n == 0
       page_now = current_page
-      limit(n)
-      offset((page_now - 1) * n)
+      spawn.limit!(n).offset!((page_now - 1) * n)
     end
 
     def limit_value
@@ -1067,6 +1134,10 @@ module ActiveRecord
     end
 
     def group(*parts)
+      spawn.group!(*parts)
+    end
+
+    def group!(*parts)
       own_lists
       unload_records
       # Symbols qualify against this relation's table (Rails renders
@@ -1081,6 +1152,10 @@ module ActiveRecord
     end
 
     def having(condition, *args)
+      spawn.having!(condition, *args)
+    end
+
+    def having!(condition, *args)
       own_lists
       unload_records
       @havings << substitute_binds(condition.to_s, args)
@@ -1110,6 +1185,10 @@ module ActiveRecord
     # where appending both made SQLite reject every column of the joined
     # table as ambiguous.
     def joins(spec)
+      spawn.joins!(spec)
+    end
+
+    def joins!(spec)
       own_lists
       unload_records
       frag = join_fragment(spec)
@@ -1118,6 +1197,10 @@ module ActiveRecord
     end
 
     def left_outer_joins(spec)
+      spawn.left_outer_joins!(spec)
+    end
+
+    def left_outer_joins!(spec)
       own_lists
       unload_records
       frag = join_fragment(spec, "LEFT OUTER JOIN")
@@ -1255,6 +1338,11 @@ module ActiveRecord
     def select(*specs, &block)
       return filter(&block) if block
       raise ArgumentError, "select: no columns (a block form reached the projection)" if specs.empty?
+      spawn.select!(*specs)
+    end
+
+    def select!(*specs)
+      raise ArgumentError, "select: no columns (a block form reached the projection)" if specs.empty?
       unload_records
       cols = []
       specs.each do |spec|
@@ -1265,6 +1353,10 @@ module ActiveRecord
     end
 
     def distinct
+      spawn.distinct!
+    end
+
+    def distinct!
       unload_records
       @distinct = true
       self
@@ -1275,6 +1367,10 @@ module ActiveRecord
     # ReadOnlyRecord. Core's `readonly_has_many` scopes its association
     # with it (`build_readonly_scope`).
     def readonly(value = true)
+      spawn.readonly!(value)
+    end
+
+    def readonly!(value = true)
       @records = nil
       @readonly = value
       self
@@ -1287,6 +1383,10 @@ module ActiveRecord
     # into the `_preload_<assoc>` caches). Models without a synthesized
     # override inherit Base's no-op and stay lazy (correct, just N+1).
     def includes(*names)
+      spawn.includes!(*names)
+    end
+
+    def includes!(*names)
       own_lists
       unload_records
       names.each { |n| @includes << n }
@@ -1294,6 +1394,10 @@ module ActiveRecord
     end
 
     def preload(*names)
+      spawn.preload!(*names)
+    end
+
+    def preload!(*names)
       own_lists
       unload_records
       names.each { |n| @includes << n }
@@ -1320,6 +1424,10 @@ module ActiveRecord
     end
 
     def eager_load(*names)
+      spawn.eager_load!(*names)
+    end
+
+    def eager_load!(*names)
       own_lists
       unload_records
       names.each { |n| check_eager_loadable(@model, n) }
@@ -1359,6 +1467,10 @@ module ActiveRecord
     # `merge(other)` — fold another relation's WHEREs in. v1 handles the
     # common case (merging a same-table scope's conditions).
     def merge(other)
+      spawn.merge!(other)
+    end
+
+    def merge!(other)
       own_lists
       unload_records
       other.where_clauses.each do |w|
@@ -1383,6 +1495,10 @@ module ActiveRecord
     end
 
     def none
+      spawn.none!
+    end
+
+    def none!
       own_lists
       unload_records
       push_where("(1 = 0)", true)
@@ -2060,7 +2176,7 @@ module ActiveRecord
       scoped = spawn
       projection = "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
       projection = "#{@select_sql}, #{projection}" if @havings.length > 0 && !@select_sql.nil?
-      scoped.select(projection)
+      scoped.select!(projection)
       scoped.clear_ordering
       rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)
       return nil if rows.length == 0
@@ -2083,7 +2199,7 @@ module ActiveRecord
       selects << "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
       scoped = spawn
       selects.unshift(@select_sql) if @havings.length > 0 && !@select_sql.nil?
-      scoped.select(selects.join(", "))
+      scoped.select!(selects.join(", "))
       scoped.clear_ordering
       rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)
       grouped = {}
@@ -2560,6 +2676,10 @@ module ActiveRecord
     # declared `friendly_id` (lower::friendly_id) has the class-side
     # configuration `friendly_find` reads; any other raises there.
     def friendly
+      spawn.friendly!
+    end
+
+    def friendly!
       @friendly = true
       self
     end
@@ -2927,8 +3047,10 @@ module ActiveRecord
       sql = "#{sql} ORDER BY #{@orders.join(", ")}" if @orders.length > 0
       if !@limit.nil?
         sql = "#{sql} LIMIT #{@limit}"
-      elsif !@offset.nil?
-        # SQLite needs LIMIT even for offset-only pagination.
+      elsif !@offset.nil? && Db.respond_to?(:adapter_name) && Db.adapter_name == "sqlite3"
+        # SQLite needs LIMIT even for offset-only pagination; PostgreSQL
+        # (the CRuby tree's Db answers no adapter_name) rejects a negative
+        # one and takes a bare OFFSET, as Rails writes it.
         sql = "#{sql} LIMIT -1"
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?

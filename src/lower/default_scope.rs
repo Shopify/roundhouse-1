@@ -10,8 +10,10 @@
 //! `ActiveRecord::Relation.new(Model)` (the compiled roots, the
 //! association reads, the class finders) calls the model's
 //! `_apply_default_scope(relation)`, which this pass emits as the
-//! scope's chain on the relation. The relation chain methods mutate in
-//! place and return self, so the chain needs no spawn and its value is
+//! scope's chain on the relation. The relation's plain chain methods
+//! spawn (Rails' immutable relations), so the chain is written with
+//! their in-place bang forms (`where!`, `not!`, `order!`, …), which
+//! mutate the relation under construction and answer it; the value is
 //! not read. `Base` answers the identity for every other model, and
 //! `_default_scoped?` lets the class finders that read the table
 //! through the adapter (`count`, `find`, `exists?`, `last`,
@@ -296,7 +298,7 @@ fn push_chain_methods(methods: &mut Vec<MethodDef>, name: &ClassId, chains: &[Ve
     for links in chains {
         let mut call = rel();
         for link in links {
-            call = send(Some(call), link.method, link.args.clone());
+            call = send(Some(call), &format!("{}!", link.method), link.args.clone());
         }
         stmts.push(call);
     }
