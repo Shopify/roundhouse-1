@@ -1802,6 +1802,11 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).unscope(*args)
     end
 
+    # `Model.create_with(attrs)`: querying.rb delegates it to `all`.
+    def self.create_with(attrs)
+      ActiveRecord::Relation.new(self).create_with(attrs)
+    end
+
     # `Model.and(other)` / `Model.or(other)`: querying.rb delegates both
     # to `all`.
     def self.and(other)

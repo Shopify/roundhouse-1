@@ -261,7 +261,7 @@ module ActiveRecord
               if target_record
                 existing_record = target_record
               else
-                target << existing_record
+                ActiveRecord::Associations::Association.push_target(target, existing_record)
               end
               assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy])
             end

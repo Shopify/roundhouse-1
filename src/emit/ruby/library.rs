@@ -3544,9 +3544,36 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
             *value = wrap(records);
         }
     }
-    exprs.push(wrap(syn(ExprNode::Ivar { name: cache })));
+    exprs.push(wrap(syn(ExprNode::Ivar { name: cache.clone() })));
     if let Some(rel) = scope {
         push_association_scope(lc, name, rel);
+    }
+    // `<name>_target` (Rails' `owner.<name>.target`, the records held
+    // without a load) answers the Array under the proxy, which a caller
+    // appends to without saving (`target << record`); the proxy's own
+    // `<<` saves.
+    let target_name = Symbol::from(format!("{}_target", name.as_str()));
+    if let Some(m) = lc.methods.iter_mut().find(|m| m.name == target_name && m.receiver == MethodReceiver::Instance) {
+        let sp = m.body.span;
+        m.body = Expr::new(
+            sp,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    sp,
+                    ExprNode::Const {
+                        path: vec![
+                            Symbol::from("ActiveRecord"),
+                            Symbol::from("Associations"),
+                            Symbol::from("CollectionProxy"),
+                        ],
+                    },
+                )),
+                method: Symbol::from("target_of"),
+                args: vec![Expr::new(sp, ExprNode::Ivar { name: cache })],
+                block: None,
+                parenthesized: true,
+            },
+        );
     }
 }
 
@@ -4034,6 +4061,7 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
     if !lcs.iter().any(|lc| lc.methods.iter().any(generated))
         && !app_calls_method(app, "reflect_on_association")
         && !app_joins_by_name(app)
+        && !app_has_association_key_condition(app)
         && !(app_has_owner_scope(app) && app_calls_method(app, "eager_load"))
         && !app_calls_method(app, "accepts_nested_attributes_for")
     {
@@ -4295,6 +4323,49 @@ fn app_joins_by_name(app: &App) -> bool {
             && args.first().is_some_and(|a| {
                 !matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })
             })
+    })
+}
+
+/// Some emit-bound body, view or test hands a finder a hash with a key that
+/// names a `belongs_to` (`where(service: record)`,
+/// `shop.tax_codes.find_or_create_by(code:, service: record)`). Where the
+/// receiver's model is known `lower::assoc_attr_key` and `scope_chain` write
+/// the foreign key; the rest reach `Relation#hash_conditions`, which expands
+/// the key from the model's reflections.
+fn app_has_association_key_condition(app: &App) -> bool {
+    use crate::dialect::Association;
+    let names: crate::det::HashSet<&str> = app
+        .models
+        .iter()
+        .flat_map(|m| m.associations())
+        .filter_map(|a| match a {
+            Association::BelongsTo { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    app_sends(app, &|m, args| {
+        matches!(
+            m,
+            "where"
+                | "not"
+                | "find_by"
+                | "find_by!"
+                | "find_sole_by"
+                | "exists?"
+                | "find_or_create_by"
+                | "find_or_create_by!"
+                | "find_or_initialize_by"
+                | "create_or_find_by"
+                | "create_or_find_by!"
+                | "create_with"
+        ) && args.iter().any(|a| {
+            matches!(&*a.node, ExprNode::Hash { entries, .. }
+                if entries.iter().any(|(k, _)| matches!(&*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } } if names.contains(value.as_str()))))
+        })
     })
 }
 
