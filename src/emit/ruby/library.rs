@@ -14798,6 +14798,12 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
 /// answered none of them. Only names read from a constant (or a literal
 /// list) and a literal `to:` / `prefix:` / `allow_nil:`, so the call
 /// reads nothing but what the body has loaded.
+///
+/// So is a `delegate` with `private:`, which `ingest::delegate` does not
+/// expand (it would drop the visibility): Core's `Markets::ShopScope::Cached`
+/// `delegate :schema_key, to: :class, private: true`, whose instance
+/// `market_definitions` calls `schema_key` and failed with no such method
+/// once the call was dropped.
 fn splatted_delegate_call(call: &Expr) -> bool {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
     if method.as_str() != "delegate" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
@@ -14815,6 +14821,7 @@ fn splatted_delegate_call(call: &Expr) -> bool {
     }
     let mut splatted = false;
     let mut target = false;
+    let mut private = false;
     for arg in args {
         match &*arg.node {
             ExprNode::Splat { value } if names(value) => splatted = true,
@@ -14826,12 +14833,13 @@ fn splatted_delegate_call(call: &Expr) -> bool {
                         return false;
                     }
                     target |= key.as_str() == "to";
+                    private |= key.as_str() == "private";
                 }
             }
             _ => return false,
         }
     }
-    splatted && target
+    (splatted || private) && target
 }
 
 /// `ruby2_keywords :a, :b` naming instance methods the class defines
