@@ -12160,6 +12160,14 @@ fn hooked_mixin_position(lc: &LibraryClass, inc: &ClassId, app: &App, hook: &str
         e.node.for_each_child(&mut |c| walk(c, base, called, named));
     }
     walk(&hook.body, &base, &mut called, &mut named);
+    // A hook that lists the base's methods (`base.public_instance_methods(false)`,
+    // Core's `ApiEnforcement.prepended` checking every declared API method
+    // is defined) sees only what the class body has defined by then, so it
+    // waits for the last method.
+    let reflective = ["public_instance_methods", "instance_methods", "private_instance_methods", "protected_instance_methods"];
+    if called.iter().any(|m| reflective.contains(&m.as_str())) && !lc.methods.is_empty() {
+        return Some(lc.methods.len());
+    }
     lc.methods
         .iter()
         .rposition(|m| (m.receiver == MethodReceiver::Class && called.contains(&m.name)) || named.contains(&m.name))
