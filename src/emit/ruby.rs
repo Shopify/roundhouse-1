@@ -1644,15 +1644,26 @@ pub fn emit_with_assertions(
             // and its `name` is the source's.
             if !lowered.inner_classes.is_empty() {
                 let mut companion_block = String::new();
+                // An inner class nested in another (`TestSchema::Query`)
+                // is written inside it, where the source has it.
+                let nested_in = |outer: &str, inner: &str| inner.len() > outer.len() + 2 && inner.starts_with(outer) && inner[outer.len()..].starts_with("::");
                 for inner in &lowered.inner_classes {
                     let inner_rb_path = PathBuf::from("test")
                         .join(format!("{}_inner.rb", test_file_stem(inner.name.0.as_str())));
-                    let inner_emitted = library::emit_library_class_decl_with_synthesized(
-                        inner,
-                        app,
-                        inner_rb_path.clone(),
-                        &fixture_siblings,
-                    );
+                    if lowered.inner_classes.iter().any(|o| nested_in(o.name.0.as_str(), inner.name.0.as_str())) {
+                        files.push(library::emit_rbs_sidecar(inner, app, &inner_rb_path));
+                        continue;
+                    }
+                    let kids: Vec<&crate::dialect::LibraryClass> = lowered
+                        .inner_classes
+                        .iter()
+                        .filter(|k| nested_in(inner.name.0.as_str(), k.name.0.as_str()))
+                        .collect();
+                    let inner_emitted = if kids.is_empty() {
+                        library::emit_library_class_decl_with_synthesized(inner, app, inner_rb_path.clone(), &fixture_siblings)
+                    } else {
+                        library::emit_library_class_decl_with_nested(inner, &kids, app, inner_rb_path.clone(), &fixture_siblings)
+                    };
                     companion_block.push_str(&strip_require_headers(&inner_emitted.content));
                     companion_block.push('\n');
                     // RBS sidecar for the inner class. Its `.rb` body is
