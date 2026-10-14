@@ -19241,7 +19241,9 @@ fn expr_mentions_includes(expr: &Expr) -> bool {
 enum PreloadKind {
     /// (fk column on the owner, target class, target table, the `Db`
     /// helper that renders the target's key list for `IN (...)`)
-    BelongsTo { fk: String, target: String, table: String, key_list: &'static str },
+    /// `pk` is the target column the foreign key matches (`primary_key:`
+    /// or `id`).
+    BelongsTo { fk: String, pk: String, target: String, table: String, key_list: &'static str },
     /// (fk column on the target, target class)
     HasMany { fk: String, owner_key: String, target: String },
     /// `has_one` — same FK-on-target batch as has_many, installing one
@@ -19289,6 +19291,9 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 let Some(target_model) = app.models.iter().find(|m| &m.name == target) else {
                     continue;
                 };
+                // `belongs_to primary_key:` names the target column the
+                // foreign key matches; the batch must query and index by it.
+                let pk = assoc.owner_key();
                 // A uuid / string key is a quoted literal in `IN (...)`;
                 // the integer helper would `to_i` it to its leading
                 // digits and find nothing (cf. #310 for `Relation#ids`).
@@ -19296,7 +19301,13 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     .schema
                     .tables
                     .get(&target_model.table.0)
-                    .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+                    .and_then(|t| {
+                        if pk.as_str() == "id" {
+                            t.columns.iter().find(|c| c.primary_key)
+                        } else {
+                            t.columns.iter().find(|c| c.name.as_str() == pk.as_str())
+                        }
+                    })
                     .is_some_and(|c| {
                         matches!(
                             c.col_type,
@@ -19309,6 +19320,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     name.as_str().to_string(),
                     PreloadKind::BelongsTo {
                         fk: foreign_key.as_str().to_string(),
+                        pk: pk.as_str().to_string(),
                         target: target.0.as_str().to_string(),
                         table: target_model.table.0.as_str().to_string(),
                         key_list: if string_key { "escape_string_list" } else { "escape_int_list" },
@@ -19494,12 +19506,14 @@ fn preload_methods_source(model: &crate::dialect::Model, app: &App, subclass_vie
     // Batch loaders + belongs_to cache setters.
     for (name, kind) in &targets {
         match kind {
-            PreloadKind::BelongsTo { fk, target, table, key_list } => {
-                // A string key binds through the target's declared `id`
-                // type, as `find_by(id:)` does: a `model_uuid_attributes`
-                // owner slot holds the integer form of the uuid.
+            PreloadKind::BelongsTo { fk, pk, target, table, key_list } => {
+                // A string key binds through the declared type of the
+                // column it matches, as `find_by(<pk>:)` does: a
+                // `model_uuid_attributes` owner slot holds the integer
+                // form of the uuid, while a `primary_key: :uuid` column
+                // holds the uuid itself.
                 let key_binds = if *key_list == "escape_string_list" {
-                    format!("ids.map {{ |id| {target}._attribute_serialize(\"id\", id) }}")
+                    format!("ids.map {{ |id| {target}._attribute_serialize(\"{pk}\", id) }}")
                 } else {
                     "ids".to_string()
                 };
@@ -19515,8 +19529,8 @@ def self._preload_batch_{name}(records)
   ids.uniq!
   by_id = {{}}
   if ids.length > 0
-    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.id IN (" + Db.{key_list}({key_binds}) + ")").each do |rec|
-      by_id[rec.id] = rec
+    {target}._hydrate_all("SELECT " + {target}._columns_sql + " FROM {table} WHERE {table}.{pk} IN (" + Db.{key_list}({key_binds}) + ")").each do |rec|
+      by_id[rec.{pk}] = rec
     end
   end
   records.each do |r|

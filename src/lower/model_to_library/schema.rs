@@ -481,7 +481,18 @@ pub(super) fn push_schema_methods(
         .as_ref()
         .filter(|_| model.composite_primary_key.is_empty() && !has_id_column)
         .and_then(|pk| table.columns.iter().find(|c| c.name == *pk));
-    if let Some(key) = declared_key.or_else(|| table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id")) {
+    // A model that declares `self.primary_key = :id` over a table that has
+    // an `id` column keys on it, whatever the table's PRIMARY KEY
+    // constraint names (Core's MerchantSubscriptions::CoreGeneral2::Price
+    // keeps a uuid-as-integer `id` beside a `PRIMARY KEY (uuid)`): `id`
+    // is the column's own accessor, not an alias of the constraint's key.
+    let declares_id_key = has_id_column
+        && model.composite_primary_key.is_empty()
+        && model.primary_key.as_ref().is_some_and(|pk| pk.as_str() == "id");
+    let key = declared_key
+        .or_else(|| table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id"))
+        .filter(|_| !declares_id_key);
+    if let Some(key) = key {
         methods.push(synth_key_alias_reader(owner, key));
         methods.push(synth_key_alias_writer(owner, key));
     }

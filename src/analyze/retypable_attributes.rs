@@ -504,7 +504,10 @@ pub(crate) fn decorated_columns(expr: &Expr, table: &crate::schema::Table) -> Op
 
 /// The spans of the body calls the stamped columns answer, every
 /// argument a literal: the model's own app class macro calls that reach
-/// `attribute` naming only `retypable_attributes`, or `query_constraints`
+/// `attribute` naming only `retypable_attributes` (or columns the model
+/// ignores: Core's `model_uuid_attributes` lists a column
+/// `ignored_columns` has since dropped, which the runtime's `attribute`
+/// accepts without a type), or `query_constraints`
 /// naming the compiled list. Such a call runs as written at class load
 /// (the inherited-macro replay).
 ///
@@ -540,7 +543,10 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
     for (call, names) in calls_reaching(&side, body.iter().copied(), "attribute", false) {
         if (literal_call(call) || computes_names(&side, call))
             && !names.is_empty()
-            && names.iter().all(|n| model.retypable_attributes.iter().any(|c| c.as_str() == n))
+            && names.iter().all(|n| {
+                model.retypable_attributes.iter().any(|c| c.as_str() == n)
+                    || model.ignored_columns.iter().any(|c| c == n)
+            })
         {
             out.push(call.span);
         }

@@ -1292,6 +1292,15 @@ module ActiveRecord
     # never reads the attribute (nor saves) still costs one call.
     def self.attribute(name, type = nil, default: (no_default = true), **options)
       name = name.to_s
+      # An ignored column has left the compiled table: Rails keeps the
+      # call as a virtual attribute, which the compiled model has no
+      # accessor for, so a type-only declaration has nothing to retype
+      # (Core's `model_uuid_attributes` names such columns). A default
+      # would still be consulted by nothing, so it raises like any
+      # other unconsulted declaration.
+      if no_default && _compiled_ignored_columns.include?(name) && !_retypable_attribute_names.include?(name)
+        return nil
+      end
       unless _retypable_attribute_names.include?(name)
         raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
       end
