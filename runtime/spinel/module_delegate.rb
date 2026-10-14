@@ -40,9 +40,9 @@ class Module
         # `__send__`, not `public_send`: Rails delegates to private readers
         # routinely, and platform_agent's `user_agent` IS private. An
         # instance-variable target (`to: :@members`, Inflections'
+        # Uncountables) reads the variable, as Rails' generated
         # `_ = @members` does. `__send__` and Kernel's ivar reader, so a
         # BasicObject receiver (a blocker proxy) delegates too.
-        # `_ = @members` does.
         target = to.to_s.start_with?("@") ? ::Kernel.instance_method(:instance_variable_get).bind_call(self, to) : __send__(to)
         if target.nil? && allow_nil
           nil
