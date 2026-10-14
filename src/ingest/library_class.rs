@@ -2431,14 +2431,23 @@ fn admit_nameless_rest(methods: &mut [MethodDef]) {
 /// default). An implicit `super` keeps no binding of its own: it is the
 /// IR's argument-less `Super`, which the CRuby tree writes as written.
 fn source_passes_rest_on(def: &ruby_prism::DefNode<'_>) -> bool {
-    struct Uses(bool);
+    struct Uses(bool, bool);
     impl<'pr> ruby_prism::Visit<'pr> for Uses {
+        // A nested `def` binds its own parameters: its bare `*` passes on
+        // its own rest, not this def's.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if std::mem::replace(&mut self.1, true) {
+                return;
+            }
+            ruby_prism::visit_def_node(self, node);
+        }
+
         fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
             self.0 |= node.expression().is_none();
             ruby_prism::visit_splat_node(self, node);
         }
     }
-    let mut uses = Uses(false);
+    let mut uses = Uses(false, false);
     ruby_prism::Visit::visit(&mut uses, &def.as_node());
     uses.0
 }
