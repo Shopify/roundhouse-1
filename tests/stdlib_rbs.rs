@@ -250,16 +250,21 @@ fn jruby_admits_them() {
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
-/// No other runtime defines `URI::HTTPS`, so those trees refuse it by
-/// name rather than emit a reference to nothing.
+/// No other runtime defines `URI::HTTPS` or `Encoding::UTF_8` as values,
+/// so those trees refuse them by name rather than emit a reference to
+/// nothing. (`Shellwords` is not among them: the flat runtime walk
+/// carries its module to every target, `runtime/shellwords_spinel.rb`.)
 #[test]
 fn another_runtime_refuses_them_by_name() {
     let _serial = serial();
     for target in [BuildTarget::Crystal, BuildTarget::Typescript] {
         let (_, errors) = links_app().emit(target);
-        for name in ["URI::HTTPS", "Shellwords"] {
-            let needle = format!("{name} is CRuby's own");
-            assert!(errors.iter().any(|e| e.contains(&needle)), "{target:?} {name}: {errors:#?}");
+        let lower = format!("{target:?}").to_lowercase();
+        for needle in [
+            format!("URI::HTTPS is not available as a class/module value on {lower}"),
+            "Encoding::UTF_8 is CRuby's own".to_string(),
+        ] {
+            assert!(errors.iter().any(|e| e.contains(&needle)), "{target:?} {needle}: {errors:#?}");
         }
     }
 }
