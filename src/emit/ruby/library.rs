@@ -10588,7 +10588,10 @@ fn emit_library_class_decl_inner(
     // that include it, each of which requires it at the top of its file.
     let in_body: Vec<String> = if super::expr::native_keywords() {
         let cycles = load_cycle_components(app);
-        let own = cycles.get(&self_anchor);
+        // A namespace constant's own file stays a plain autoloadable
+        // file (`autoload_primary`): its requires wait on their
+        // constants (`require_line`) rather than move into a body.
+        let own = cycles.get(&self_anchor).filter(|_| !is_constant_file_anchor(&self_anchor, app));
         requires
             .iter()
             .filter(|r| !header_requires.contains(*r))
@@ -18291,6 +18294,16 @@ fn runs_requires_below_its_class(owner: &str, app: &App) -> bool {
     })
 }
 
+/// Whether `anchor` is the file of a namespace constant the source wrote in a
+/// file of its own (`constant_file`).
+fn is_constant_file_anchor(anchor: &str, app: &App) -> bool {
+    app.library_classes.iter().any(|lc| {
+        lc.constants.iter().any(|(constant, _)| {
+            constant_file(lc.name.0.as_str(), constant.as_str(), app).is_some_and(|stem| anchor == format!("app/models/{stem}"))
+        })
+    })
+}
+
 /// The library class files (`require_guard_owners`) in a load-time
 /// require cycle, each mapped to its cycle: the strongly connected
 /// components of more than one file, over what each class reads while
@@ -18304,6 +18317,17 @@ fn runs_requires_below_its_class(owner: &str, app: &App) -> bool {
 fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
     let build = || {
         let files = require_guard_owners(app);
+        // A namespace constant the source wrote in a file of its own is a
+        // file of the tree too (`constant_file`), with no class of its
+        // own: the constant's value is read where that file loads.
+        let mut known: BTreeSet<String> = files.keys().cloned().collect();
+        for lc in &app.library_classes {
+            for (constant, _) in &lc.constants {
+                if let Some(stem) = constant_file(lc.name.0.as_str(), constant.as_str(), app) {
+                    known.insert(format!("app/models/{stem}"));
+                }
+            }
+        }
         let mut ids: HashMap<String, usize> = HashMap::default();
         let mut anchors: Vec<String> = Vec::new();
         let mut edges: Vec<BTreeSet<usize>> = Vec::new();
@@ -18332,8 +18356,18 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
             for call in &lc.unknown_calls {
                 walk_load_time_paths(call, &mut paths, &mut later);
             }
-            for (_, value) in &lc.constants {
-                walk_load_time_paths(value, &mut paths, &mut later);
+            // What a constant in a file of its own reads belongs to that
+            // file (`apart`), which reopens the namespace around it.
+            let mut apart: Vec<(String, BTreeSet<Vec<String>>)> = Vec::new();
+            for (constant, value) in &lc.constants {
+                match constant_file(name, constant.as_str(), app) {
+                    Some(stem) => {
+                        let mut own: BTreeSet<Vec<String>> = BTreeSet::new();
+                        walk_load_time_paths(value, &mut own, &mut later);
+                        apart.push((format!("app/models/{stem}"), own));
+                    }
+                    None => walk_load_time_paths(value, &mut paths, &mut later),
+                }
             }
             for init in &lc.class_ivar_initializers {
                 walk_load_time_paths(init, &mut paths, &mut later);
@@ -18353,12 +18387,19 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
             // runs that namespace's autoload when its file has not run.
             let segments = split(&lc.name);
             paths.extend((1..segments.len()).map(|n| segments[..n].to_vec()));
-            for path in namespace_prefixed(&paths) {
-                let Some(to) = require_path_for_body_const(&path, app, name) else { continue };
-                if to != from && files.contains_key(&to) {
-                    let from_id = node(&from, &mut ids, &mut edges);
-                    let to_id = node(&to, &mut ids, &mut edges);
-                    edges[from_id].insert(to_id);
+            let namespaces: BTreeSet<Vec<String>> = (1..=segments.len()).map(|n| segments[..n].to_vec()).collect();
+            apart.push((from.clone(), paths));
+            for (anchor, mut paths) in apart {
+                if anchor != from {
+                    paths.extend(namespaces.iter().cloned());
+                }
+                for path in namespace_prefixed(&paths) {
+                    let Some(to) = require_path_for_body_const(&path, app, name) else { continue };
+                    if to != anchor && known.contains(&to) {
+                        let from_id = node(&anchor, &mut ids, &mut edges);
+                        let to_id = node(&to, &mut ids, &mut edges);
+                        edges[from_id].insert(to_id);
+                    }
                 }
             }
         }
@@ -18384,7 +18425,7 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
             paths.extend((1..segments.len()).map(|n| segments[..n].to_vec()));
             for path in namespace_prefixed(&paths) {
                 let Some(to) = require_path_for_body_const(&path, app, name) else { continue };
-                if to != from && files.contains_key(&to) {
+                if to != from && known.contains(&to) {
                     let from_id = node(&from, &mut ids, &mut edges);
                     let to_id = node(&to, &mut ids, &mut edges);
                     edges[from_id].insert(to_id);
