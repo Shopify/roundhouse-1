@@ -45,8 +45,9 @@ end
 root = File.expand_path("..", __dir__)
 case ARGV.first
 when "native"
-  RailsOracle.activate("activesupport", "activemodel")
+  RailsOracle.activate("activesupport", "activemodel", "activerecord")
   require "active_model"
+  require "active_record"
   # Touch the autoloads the tree loads eagerly.
   ActiveModel::Attribute
   ActiveModel::Type::Integer
@@ -231,3 +232,27 @@ show "YAML.dump", yaml
 loaded = YAML.load(yaml, permitted_classes: ["ActiveModel::Attribute::WithCastValue"])
 show "YAML.load", [state(loaded), loaded.value]
 attempt("YAML.load not permitted") { YAML.load(yaml) }
+
+# ActiveRecord::Relation::QueryAttribute: the bind attribute a VALUES row
+# or a predicate wraps a value in (the port leaves out the statement cache's
+# Substitute, which nothing here builds).
+Q = ActiveRecord::Relation::QueryAttribute
+show "QueryAttribute superclass", Q.superclass.name
+show "QueryAttribute public methods", Q.public_instance_methods(false).sort
+show "QueryAttribute private methods", Q.private_instance_methods(false).sort
+query = Q.new("x", "1", integer)
+show "QueryAttribute state", state(query)
+show "QueryAttribute value", query.value
+show "QueryAttribute value_for_database", query.value_for_database
+show "QueryAttribute nil?", [query.nil?, Q.new("x", nil, integer).nil?]
+show "QueryAttribute infinite?", [query.infinite?, Q.new("x", Float::INFINITY, T::Float.new).infinite?]
+show "QueryAttribute unboundable?", [query.unboundable?, Q.new("x", 2**70, integer).unboundable?, Q.new("x", -(2**70), integer).unboundable?]
+show "QueryAttribute with_cast_value", state(query.with_cast_value(5))
+show "QueryAttribute with_cast_value value_for_database", query.with_cast_value(5).value_for_database
+show "QueryAttribute changed?", query.changed?
+# A mutable type's raw value is copied (Object#deep_dup) unless frozen, so a
+# later edit of the caller's string does not reach the bind.
+raw = +"abc"
+mutable_query = Q.new("s", raw, T::String.new)
+raw << "d"
+show "QueryAttribute mutable raw value", [mutable_query.value_before_type_cast, mutable_query.value_for_database, T::String.new.mutable?]
