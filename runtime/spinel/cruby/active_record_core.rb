@@ -381,7 +381,7 @@ module ActiveRecord
         constant = begin
           Object.const_get(candidate)
         rescue NameError => e
-          raise unless e.name.to_s == candidate.split("::").last
+          raise unless e.name.to_s == candidate || candidate.split("::").include?(e.name.to_s)
           next
         end
         return constant if candidate == constant.to_s
