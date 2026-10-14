@@ -17864,7 +17864,18 @@ fn require_path_for_body_const(
         .map(|n| path[..n].join("::"))
         .find(|prefix| prefix.contains("::") && is_model_or_library_class(prefix, app))
         .unwrap_or_else(|| joined.clone());
-    if holder != self_name && is_model_or_library_class(&holder, app) {
+    // Unless an enclosing scope has the head itself: Ruby's lexical lookup
+    // finds `ActiveKafka::Format` for a bare `Format` inside `module
+    // ActiveKafka` before the top-level `::Format` (the common-validators
+    // gem's), so the scope loop below resolves it, not this one.
+    let lexically_shadowed = !path.first().is_some_and(|f| f.contains("::"))
+        && self_name
+            .match_indices("::")
+            .map(|(i, _)| &self_name[..i])
+            .chain(Some(self_name))
+            .filter(|scope| !scope.is_empty())
+            .any(|scope| is_model_or_library_class(&format!("{scope}::{first}"), app));
+    if !lexically_shadowed && holder != self_name && is_model_or_library_class(&holder, app) {
         // The file that DEFINES it, which for a nested class is its
         // parent's — and when that is the file being emitted, there is
         // nothing to require: the class is already in it.
