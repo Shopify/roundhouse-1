@@ -16,6 +16,17 @@ mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+/// Ingest installs the app's `extensions:` as process-global gem facts
+/// (`extensions::install`), so tests that ingest in one process must not
+/// overlap: another test's app (listing no extensions) would replace the
+/// gem facts this test's ingest is reading.
+static INGEST: Mutex<()> = Mutex::new(());
+
+fn ingest_exclusive() -> MutexGuard<'static, ()> {
+    INGEST.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const RESPONSE: &str = r#"module QueryLayer
   class Response
@@ -163,6 +174,7 @@ fn native() -> String {
 
 #[test]
 fn included_dsl_calls_run_on_a_plain_includer_as_native() {
+    let _ingest = ingest_exclusive();
     let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
     for (path, text) in FILES {
         app = app.write(path, text);
@@ -195,6 +207,7 @@ fn included_dsl_calls_run_on_a_plain_includer_as_native() {
 /// own `class_attribute :limit, default: 1` resets it, as in Ruby.
 #[test]
 fn a_call_and_a_class_attribute_seed_keep_the_block_order() {
+    let _ingest = ingest_exclusive();
     let concern = "module Seeding\n  extend ActiveSupport::Concern\n\n  included do\n    configure(2)\n    class_attribute :limit, default: 1\n    configure_more(3)\n  end\nend\n";
     let base = "class Configurable\n  class_attribute :limit, default: 0\n  class_attribute :more, default: 0\n\n  def self.configure(value)\n    self.limit = value\n  end\n\n  def self.configure_more(value)\n    self.more = limit + value\n  end\nend\n";
     let includer = "class Configured < Configurable\n  include Seeding\nend\n";
@@ -228,6 +241,7 @@ fn a_call_and_a_class_attribute_seed_keep_the_block_order() {
 /// plain class may not have on this runtime) is still refused by name.
 #[test]
 fn a_call_to_no_app_class_method_stays_refused() {
+    let _ingest = ingest_exclusive();
     let concern = "module Tracking\n  extend ActiveSupport::Concern\n\n  included do\n    track_everything :x\n  end\nend\n";
     let includer = "class Tracked\n  include Tracking\nend\n";
     let tree = [
@@ -252,6 +266,7 @@ fn a_call_to_no_app_class_method_stays_refused() {
 /// includer after its `include`, not dropped.
 #[test]
 fn a_call_a_gem_superclass_answers_is_replayed() {
+    let _ingest = ingest_exclusive();
     const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    query_layer (0.1.27)\n\nDEPENDENCIES\n  activesupport\n  query_layer (= 0.1.27)\n";
     const RBI: &str = "# typed: true\n\nmodule QueryLayer; end\n\nclass QueryLayer::Response\n  class << self\n    def field(name, batch_load: T.unsafe(nil), delegate_subfields: T.unsafe(nil), **kwargs); end\n  end\nend\n";
     let concern = "module Aggregating\n  extend ActiveSupport::Concern\n\n  included do\n    field(:sales_aggregate, depends_on: [:id], batch_load: true)\n  end\nend\n";
