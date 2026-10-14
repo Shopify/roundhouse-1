@@ -41,8 +41,10 @@ module ActiveRecord
     # under this relation's scope (`Order.where(…).by_state` calling a
     # `def self.by_state`; `name`, `table_name` and any other class
     # method answered from an `extending` module, whose methods run with
-    # the relation as `self`). Only what the model answers publicly
-    # (`respond_to?`) is forwarded, so a typo is still a NoMethodError.
+    # the relation as `self`; a module prepended on the Relation, such as
+    # Core's `GenerateOid::ActiveRecordInsertPatch` asking `oid_enabled?`).
+    # Only what the model answers publicly (`respond_to?`) is forwarded,
+    # so a typo is still a NoMethodError.
     # CRuby-only: the shared relation has no `method_missing`.
     def method_missing(method, *args, **kwargs, &block)
       model = @model
@@ -86,23 +88,4 @@ module ActiveRecord
     end
   end
   Relation.prepend(RelationSelectBlock)
-end
-
-module ActiveRecord
-  # Rails' ClassSpecificRelation (relation/delegation.rb): a name the
-  # relation does not define, but the model class does, runs on the class
-  # with the relation as its scope. A module prepended on the Relation
-  # (Core's `GenerateOid::ActiveRecordInsertPatch` asks `oid_enabled?`)
-  # reads the class's own methods this way. Anything the class does not
-  # answer is still a NoMethodError.
-  class Relation
-    def method_missing(name, *args, **kwargs, &block)
-      return super unless @model.respond_to?(name)
-      scoping { @model.public_send(name, *args, **kwargs, &block) }
-    end
-
-    def respond_to_missing?(name, include_private = false)
-      @model.respond_to?(name) || super
-    end
-  end
 end
