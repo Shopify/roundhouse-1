@@ -419,6 +419,17 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node else {
         return;
     };
+    // `Job.enqueue(**h)` reaches the CLASS side. `sigs.methods` holds
+    // instance methods only, so neither the typed lookup nor the
+    // by-name fallback can describe the callee: an unrelated instance
+    // `enqueue(item)` elsewhere in the app would be taken for it, and
+    // its no-keyword shape would clear the `**` that the class method
+    // (`def self.enqueue(shop_id:, …, **rest)`) needs. `new` is the one
+    // class-side send that resolves to an instance method.
+    if matches!(&*recv.node, ExprNode::Const { .. }) && method.as_str() != "new" {
+        return;
+    }
+    let by_name = !matches!(recv.ty.as_ref(), Some(Ty::Class { .. }));
     let params = match recv.ty.as_ref() {
         Some(ty @ Ty::Class { .. }) => callee_params(ty, method, sigs),
         // A receiver with no class type (a block parameter over an
@@ -444,7 +455,13 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     // Nor is a flattened keyword (`from_keyword`): `def merge(type: nil,
     // owner: nil)` is written back as keywords, so `key.merge(**opts)`
     // must keep its `**`.
-    if params.iter().all(|p| !p.keyword && !p.from_keyword && !p.from_kwrest) {
+    //
+    // Not on the by-name guess: an untyped receiver (`klass.enqueue(**h)`)
+    // may be any class, and a class-side or keyword-taking method that
+    // shares the name needs the `**`. Ruby binds `**h` into a callee
+    // without keywords as a positional Hash anyway, so keeping it is the
+    // source's own call.
+    if !by_name && params.iter().all(|p| !p.keyword && !p.from_keyword && !p.from_kwrest) {
         for arg in args.iter_mut() {
             arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
         }
