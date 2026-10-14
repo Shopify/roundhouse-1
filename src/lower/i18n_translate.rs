@@ -10,8 +10,10 @@
 //! (`raise_on_missing_translations`, read per environment at ingest).
 //! Anything else (a dynamic key, `locale:`, a missing key with only key
 //! defaults, a setting not readable at compile time) is an error in
-//! analyze; only what `parse` and `Catalog::resolve` accept is typed,
-//! and only that folds.
+//! analyze, except an `I18n.t` on the PostgreSQL CRuby tree that loads
+//! the i18n gem (`App::carries_i18n_gem`): there it stays the gem's call,
+//! answered at run time from the app's loaded locale files. Only what
+//! `parse` and `Catalog::resolve` accept folds.
 
 use crate::app::App;
 use crate::expr::{Arm, Expr, ExprNode, InterpPart, LValue, Literal, Pattern};
@@ -303,7 +305,7 @@ fn rewrite(expr: &mut Expr, catalog: &Catalog, in_view: bool, view: Option<&str>
     };
 }
 
-/// `__k = I18n.normalize_key("<scoped prefix>#{…}")`, then a `case` over
+/// `__k = I18n.normalize_translation_key("<scoped prefix>#{…}")`, then a `case` over
 /// every key it can reach, each arm folded as that literal key. In a
 /// template every arm is escaped or html-safe already, and the whole is
 /// marked raw, since arms differ in which they are.
@@ -327,7 +329,7 @@ fn dynamic_fold(
     }));
     let assign = Expr::new(span, ExprNode::Assign {
         target: LValue::Var { id: VarId(0), name: local.clone() },
-        value: typed(const_send(span, "I18n", "normalize_key", vec![key_text])),
+        value: typed(const_send(span, "I18n", "normalize_translation_key", vec![key_text])),
     });
     let shown = |(folded, html): (Expr, bool)| match (in_view, html) {
         (true, false) => typed(Expr::new(span, ExprNode::Send {

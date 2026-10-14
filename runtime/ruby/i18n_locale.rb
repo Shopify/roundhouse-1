@@ -29,7 +29,7 @@ module I18n
 
   # A run-time key as `I18n.normalize_keys` reads it: dot-separated,
   # empty segments dropped (`"a..b."` is `a.b`).
-  def self.normalize_key(key)
+  def self.normalize_translation_key(key)
     out = []
     key.split(".").each { |part| out << part unless part.empty? }
     out.join(".")

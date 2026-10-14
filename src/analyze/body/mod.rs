@@ -642,6 +642,9 @@ pub struct BodyTyper<'a> {
     gem_sources: Option<std::sync::Arc<crate::gem_boundary::GemSourceConstants>>,
     /// The app's translations; Rails' English when absent.
     i18n: Option<&'a crate::i18n::Catalog>,
+    /// The tree loads the real i18n gem (`App::carries_i18n_gem`): an
+    /// `I18n.t` the catalog cannot fold stays a run-time call.
+    i18n_gem: bool,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -1021,6 +1024,7 @@ impl<'a> BodyTyper<'a> {
             load_hook_bases: None,
             gem_sources: None,
             i18n: None,
+            i18n_gem: false,
         }
     }
 
@@ -1047,6 +1051,12 @@ impl<'a> BodyTyper<'a> {
     /// The app's locale catalog, for `human_attribute_name` and the like.
     pub(crate) fn with_i18n(mut self, catalog: &'a crate::i18n::Catalog) -> Self {
         self.i18n = Some(catalog);
+        self
+    }
+
+    /// `I18n.t` calls the catalog cannot fold run against the i18n gem.
+    pub(crate) fn with_i18n_gem(mut self, loaded: bool) -> Self {
+        self.i18n_gem = loaded;
         self
     }
 
@@ -3286,8 +3296,13 @@ impl<'a> BodyTyper<'a> {
                 if let Some(resolved) = crate::lower::i18n_translate::resolves(
                     catalog, recv.as_ref(), method.as_str(), args, block.as_ref(), ctx.in_view, ctx.view_name.as_ref().map(|v| v.as_str()),
                 ) {
+                    // The gem answers an `I18n.t` the catalog cannot fold (a
+                    // run-time key or scope, `locale:`, a key set too wide to
+                    // branch over); a template's bare `t` is the view helper's.
+                    let on_i18n = matches!(recv.as_ref().map(|r| &*r.node),
+                        Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "I18n");
                     if let Err(reason) = resolved {
-                        if expr.diagnostic.is_none() {
+                        if expr.diagnostic.is_none() && !(self.i18n_gem && on_i18n) {
                             expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                                 target: None,
                                 construct: Symbol::from("I18n"),

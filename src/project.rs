@@ -5041,11 +5041,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         // gem's `I18n.locale` for good, so the anchor loads the gem.
         for (path, content) in files.iter_mut() {
             if path == "runtime/i18n_locale.rb" {
-                *content = "# The i18n gem, as active_support/i18n.rb loads it — see\n\
-                            # `project::apply_postgres_bootstrap`. The stand-in at\n\
-                            # runtime/ruby/i18n_locale.rb is for trees without the gem.\n\
-                            require_relative \"active_support_i18n\"\n"
-                    .to_string();
+                // The helpers a folded `I18n.t` calls follow the gem's require.
+                let helpers = crate::runtime_files::read_to_string("runtime/spinel/i18n_translation_helpers.rb")
+                    .map_err(|e| format!("read I18n helpers runtime: {e}"))?;
+                *content = format!(
+                    "# The i18n gem, as active_support/i18n.rb loads it — see\n\
+                     # `project::apply_postgres_bootstrap` — and the helpers a folded\n\
+                     # `I18n.t` calls. The stand-in at runtime/ruby/i18n_locale.rb is\n\
+                     # for trees without the gem.\n\
+                     require_relative \"active_support_i18n\"\n\n{helpers}"
+                );
             }
         }
     }

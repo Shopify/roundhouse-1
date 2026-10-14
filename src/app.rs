@@ -1456,6 +1456,15 @@ impl App {
         self.database_yml.is_some() && self.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
     }
 
+    /// Whether the CRuby tree loads the real i18n gem (project.rs
+    /// `apply_postgres_bootstrap`: PostgreSQL primary, `i18n` in the
+    /// lockfile), so an `I18n.t` it cannot fold at compile time runs
+    /// against the gem and the app's loaded locale files.
+    pub fn carries_i18n_gem(&self) -> bool {
+        self.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            && self.gem_lock.as_ref().is_some_and(|lock| lock.specs.iter().any(|(name, _)| name == "i18n"))
+    }
+
     /// The adapter the primary database is compiled for: the manifest's
     /// primary, else `config/database.yml`'s declared compile target;
     /// `None` keeps the single-database (sqlite3) selection.

@@ -162,6 +162,8 @@ pub struct Analyzer {
     load_hook_bases: std::collections::BTreeMap<String, ClassId>,
     /// The app's translations, for `t` / `I18n.t` (see `crate::i18n`).
     i18n: crate::i18n::Catalog,
+    /// The tree loads the real i18n gem (`App::carries_i18n_gem`).
+    i18n_gem: bool,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
     ///
@@ -1573,6 +1575,7 @@ impl Analyzer {
                 .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
                 .collect(),
             i18n: app.i18n.clone(),
+            i18n_gem: app.carries_i18n_gem(),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
             gem_sources: std::sync::Arc::new(app.gem_boundary.source_constants.clone()),
@@ -1603,6 +1606,7 @@ impl Analyzer {
             .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
             .with_i18n(&self.i18n)
+            .with_i18n_gem(self.i18n_gem)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories)
             .with_gem_sources(self.gem_sources.clone());
