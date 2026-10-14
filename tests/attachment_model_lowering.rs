@@ -128,7 +128,7 @@ end
         "on_load include must splice has_many_attached onto Doc:\n{src}"
     );
     assert!(
-        src.contains("def email\n    self.author.email\n  end"),
+        src.contains("def email(...)\n    author.email(...)\n  end"),
         "a delegate added by the late on_load concern splice must be expanded:\n{src}"
     );
 }
