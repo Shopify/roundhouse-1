@@ -42,38 +42,29 @@ use crate::ty::Ty;
 /// recognizable `errors[…]` sites left dynamic, with the reason.
 pub fn apply_errors_index_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    // A PostgreSQL app's one tree is CRuby's, which keeps each message's
-    // attribute in the runtime's `ActiveModel::ErrorAttributes` (read at
-    // emit); every other tree keeps `error_details` on the record.
-    if app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) {
-        let port = super::active_model_model::ValidationsPort::of(app);
-        let data = super::errors_add::LabelData::of(app);
-        super::for_each_owned_hook_body(app, &mut |owner, body| {
-            let locals = port.locals(body);
-            let site = (&port, owner.cloned(), &locals, data.at(owner));
-            cruby_rewrite(body, &site, &mut diags);
-            ledger_messages(body, &site, &mut diags);
-        });
-        super::for_each_test_body(app, &mut |body| {
-            let locals = port.locals(body);
-            let site = (&port, None, &locals, data.at(None));
-            cruby_rewrite(body, &site, &mut diags);
-            ledger_messages(body, &site, &mut diags);
-        });
-        diags.extend(port.take_notes());
-        return diags;
-    }
-    super::for_each_owned_hook_body(app, &mut |_, body| {
-        rewrite(body, &mut diags);
-        rewrite_whole_messages(body);
+    // Every tree keeps each message's attribute in an `error_details` list
+    // on the record, which the reads below ask; the CRuby and JRuby trees
+    // also record it in the runtime's `ActiveModel::ErrorAttributes`, which
+    // answers the reads this pass leaves (`to_hash(true)`, `as_json(options)`).
+    let port = super::active_model_model::ValidationsPort::of(app);
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let locals = port.locals(body);
+        let site = (&port, owner.cloned(), &locals);
+        rewrite(body, &site, &mut diags);
+        rewrite_whole_messages(body, &site);
     });
     super::for_each_test_body(app, &mut |body| {
-        rewrite(body, &mut diags);
-        rewrite_whole_messages(body);
+        let locals = port.locals(body);
+        let site = (&port, None, &locals);
+        rewrite(body, &site, &mut diags);
+        rewrite_whole_messages(body, &site);
     });
+    diags.extend(port.take_notes());
     for view in &mut app.views {
-        rewrite(&mut view.body, &mut diags);
-        rewrite_whole_messages(&mut view.body);
+        let locals = port.locals(&view.body);
+        let site = (&port, None, &locals);
+        rewrite(&mut view.body, &site, &mut diags);
+        rewrite_whole_messages(&mut view.body, &site);
     }
     diags
 }
@@ -161,13 +152,11 @@ fn rewrite_messages(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     }
 }
 
-/// The ActiveModel::Validations port's classes, the body's owner, and the
-/// labels the owner's i18n names attributes by.
+/// The ActiveModel::Validations port's classes, and the body's owner.
 type Site<'a> = (
     &'a super::active_model_model::ValidationsPort,
     Option<crate::ident::ClassId>,
     &'a super::active_model_model::PortLocals,
-    super::errors_add::Labels<'a>,
 );
 
 /// Whether the `errors` this site reads (`errors[…]`, `errors.messages`
@@ -204,8 +193,8 @@ fn grounded_errors(expr: &Expr) -> Option<(&Expr, &'static str)> {
     Some((errors, "errors.messages"))
 }
 
-fn cruby_rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
-    expr.node.for_each_child_mut(&mut |c| cruby_rewrite(c, site, diags));
+fn rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, site, diags));
     if on_port(expr, site) {
         return;
     }
@@ -219,111 +208,6 @@ fn cruby_rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) 
             Reading::Port | Reading::Accumulator => {}
         }
     }
-    cruby_rewrite_messages(expr, &site.3, diags);
-    cruby_rewrite_index(expr, &site.3, diags);
-}
-
-fn ledger_messages(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
-    if is_messages_read(expr) && !on_port(expr, site) {
-        diags.push(crate::lower::residue_diagnostic(
-            "errors_index",
-            "errors.messages",
-            expr.span,
-            "whole_hash",
-            "`errors.messages` grounds only as `[]`, `key?`, `blank?`/`empty?` or `present?`/`any?`; the error \
-             accumulator keeps no attribute column to build the Hash from, which the CRuby and JRuby trees \
-             record (`ActiveModel::ErrorAttributes.messages`) and every other tree refuses"
-                .to_string(),
-        ));
-    }
-    expr.node.for_each_child_mut(&mut |c| ledger_messages(c, site, diags));
-}
-
-// Not a Hash: the accumulator is the Array of full messages, so each `messages` question is asked of it directly.
-fn cruby_rewrite_messages(expr: &mut Expr, labels: &super::errors_add::Labels, diags: &mut Vec<Diagnostic>) {
-    let span = expr.span;
-    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node else { return };
-    if !is_messages_read(r) {
-        return;
-    }
-    let ExprNode::Send { recv: Some(errors), .. } = &*r.node else { return };
-    let accumulator = errors.clone();
-    let replacement = match (method.as_str(), args.as_slice()) {
-        ("[]", [_]) => {
-            *r = accumulator;
-            None
-        }
-        ("key?" | "has_key?" | "include?" | "member?", [field]) => {
-            let field = field.clone();
-            let mut index = send(span, accumulator, "[]", vec![field], Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
-            cruby_rewrite_index(&mut index, labels, diags);
-            Some(send(span, index, "any?", vec![], Ty::Bool))
-        }
-        ("blank?" | "empty?", []) => Some(send(span, accumulator, "empty?", vec![], Ty::Bool)),
-        ("present?" | "any?", []) => Some(send(span, accumulator, "any?", vec![], Ty::Bool)),
-        _ => None,
-    };
-    if let Some(new) = replacement {
-        *expr = new;
-    }
-}
-
-fn cruby_rewrite_index(expr: &mut Expr, labels: &super::errors_add::Labels, diags: &mut Vec<Diagnostic>) {
-    let matches_shape = matches!(
-        &*expr.node,
-        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
-            if method.as_str() == "[]" && args.len() == 1 && is_errors_read(r)
-    );
-    if !matches_shape {
-        return;
-    }
-    let field = match &*expr.node {
-        ExprNode::Send { args, .. } => match &*args[0].node {
-            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
-            _ => None,
-        },
-        _ => unreachable!(),
-    };
-    let Some(field) = field else {
-        diags.push(residue(expr, "dynamic field"));
-        return;
-    };
-    if field.as_str() == "base" {
-        diags.push(residue(expr, ":base carries no humanized prefix"));
-        return;
-    }
-    let ExprNode::Send { recv: Some(reader), .. } = &*expr.node else { unreachable!() };
-    let Some(prefix_text) = labels.message_prefix(reader, field.as_str()).filter(|p| !p.is_empty()) else {
-        diags.push(residue(expr, "errors.format does not put the field before the message"));
-        return;
-    };
-    let span = expr.span;
-    let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
-    let ExprNode::Send { recv, .. } = node else { unreachable!() };
-    let accumulator = recv.expect("checked Some above");
-    let prefix = Expr::new(
-        span,
-        ExprNode::Lit { value: Literal::Str { value: prefix_text } },
-    );
-    // Stamp the result: this pass runs *after* analyze, and the
-    // post-lowering `diagnose` walk reads stamped types without
-    // re-dispatching, so an unstamped synthesis false-positives a
-    // `send_dispatch_failed`.
-    expr.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
-    *expr.node = ExprNode::Send {
-        recv: Some(Expr::new(
-            span,
-            ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
-        )),
-        method: Symbol::from("errors_for"),
-        args: vec![accumulator, prefix],
-        block: None,
-        parenthesized: true,
-    };
-}
-
-fn rewrite(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, diags));
     rewrite_messages(expr, diags);
     rewrite_index(expr, diags);
     rewrite_include(expr, diags);
@@ -362,9 +246,9 @@ fn rewrite_include(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
 }
 
 /// What the per-field rewrites leave of `errors.messages` is the Hash itself.
-fn rewrite_whole_messages(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_whole_messages(c));
-    if !is_messages_read(expr) {
+fn rewrite_whole_messages(expr: &mut Expr, site: &Site<'_>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_whole_messages(c, site));
+    if !is_messages_read(expr) || on_port(expr, site) {
         return;
     }
     let ExprNode::Send { recv: Some(reader), .. } = &*expr.node else { unreachable!("a messages read") };

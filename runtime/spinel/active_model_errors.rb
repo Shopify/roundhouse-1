@@ -434,6 +434,26 @@ module ActiveModel
                        "was not recorded by the push that added it")
     end
 
+    # `value`, once `merge!`, `delete` or `import` changed `errors`: the
+    # `owner`'s `error_details` (the ActiveRecord::ErrorDetail each push
+    # kept beside the messages) are rebuilt from what the Array still
+    # holds, so `details` and the reads over it answer for the messages
+    # that remain. A record whose type or short message is not known has
+    # no detail, as its push had none.
+    def self.sync(value, errors, owner)
+      return value unless errors.is_a?(Array) && defined?(::ActiveRecord::ErrorDetail) && owner.respond_to?(:error_details)
+      details = []
+      each_record(errors) do |_message, pair|
+        next unless pair
+        short = pair[2]
+        type = pair[3]
+        next if short.equal?(UNSPLIT) || type.equal?(UNKNOWN)
+        details << ::ActiveRecord::ErrorDetail.new(pair[0].to_s, type.to_s, short)
+      end
+      owner.error_details.replace(details)
+      value
+    end
+
     # The records kept on an accumulator, created on first use.
     def self.pairs_of(errors)
       pairs = errors.instance_variable_get(PAIRS)

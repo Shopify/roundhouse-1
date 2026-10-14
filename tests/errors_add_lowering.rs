@@ -297,8 +297,9 @@ end
 }
 
 #[test]
-fn a_record_that_is_not_a_plain_read_stays_residue() {
-    // The message and its error are two pushes; a receiver call would run once per push.
+fn a_record_that_is_not_a_plain_read_is_read_once() {
+    // The message and its error are two pushes; the record is read into a
+    // local first, so a receiver call runs once, not once per push.
     let (out, diags) = lower_and_emit(
         r#"
 class Draft
@@ -309,9 +310,11 @@ class Draft
 end
 "#,
     );
-    assert!(out.contains(r#"Draft.latest.errors.add(:title, "is odd")"#), "{out}");
-    assert!(out.contains("Draft.latest.errors.clear"), "{out}");
-    assert_eq!(diags.len(), 2, "{diags:?}");
+    assert_eq!(out.matches("Draft.latest").count(), 2, "one read per statement:\n{out}");
+    assert!(out.contains("error_record = Draft.latest\n    error_record.errors << \"Title is odd\""), "{out}");
+    assert!(out.contains(r#"error_record.error_details << ActiveRecord::ErrorDetail.new("title", "is odd", "is odd")"#), "{out}");
+    assert!(out.contains("error_record.error_details.clear\n    error_record.errors.clear"), "{out}");
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -338,8 +341,9 @@ end
 }
 
 #[test]
-fn a_message_that_is_not_a_plain_read_stays_residue() {
-    // The full text and the record each read the message; a call would run twice.
+fn a_message_that_is_not_a_plain_read_is_evaluated_once() {
+    // The full text and the record each read the message; a call is read
+    // into a local so it runs once.
     let (out, diags) = lower_and_emit(
         r#"
 class Draft
@@ -350,7 +354,12 @@ class Draft
 end
 "#,
     );
-    assert!(out.contains("errors.add(:title, reason_for(record))"), "{out}");
-    assert!(out.contains("errors.add(:body, next_message)"), "{out}");
-    assert_eq!(diags.len(), 2, "{diags:?}");
+    assert_eq!(out.matches("reason_for(record)").count(), 1, "{out}");
+    assert_eq!(out.matches("next_message").count(), 1, "{out}");
+    assert!(out.contains("error_message = reason_for(record)\n    errors << \"Title #{error_message}\""), "{out}");
+    assert!(
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", error_message, error_message)"#),
+        "{out}"
+    );
+    assert!(diags.is_empty(), "{diags:?}");
 }

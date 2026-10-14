@@ -91,7 +91,15 @@ end
     );
     assert!(!src.contains("include ActiveModel::Model"), "{src}");
     assert!(src.contains("def valid?"), "{src}");
-    assert!(src.contains("self.errors << \"Href can't be blank\" if @href.nil?"), "{src}");
+    // Rails' blank test on an untyped attribute, and the push beside the
+    // ErrorDetail Rails keeps for it (what `errors.details` answers from).
+    assert!(src.contains("if @href.nil? || @href.is_a?(String) && (@href || \"\").empty?"), "{src}");
+    assert!(
+        src.contains(
+            "self.errors << \"Href can't be blank\"\n      self.error_details << ActiveRecord::ErrorDetail.new(\"href\", \"blank\", \"can't be blank\")"
+        ),
+        "{src}"
+    );
     assert!(src.contains("def initialize(attrs = {})"), "{src}");
     assert!(residue.is_empty(), "{residue:?}");
 }

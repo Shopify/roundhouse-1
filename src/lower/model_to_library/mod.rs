@@ -2187,10 +2187,9 @@ fn build_methods_for_dialect(
         self::composite_key::rekey(&mut methods, model, table);
     }
 
-    // The CRuby tree (PostgreSQL) keeps each error's detail in the runtime's
-    // `ErrorAttributes`; every other tree carries it as `error_details`.
-    let details = dialect != crate::lower::arel::SqlDialect::Postgres;
-    push_validate_method(&mut methods, model, models, errors_readers, details);
+    // Every tree carries each error's detail as `error_details`; the CRuby
+    // and JRuby trees record it in the runtime's `ErrorAttributes` too.
+    push_validate_method(&mut methods, model, models, errors_readers, true);
     push_association_methods(&mut methods, model, models);
     self::macro_associations::push_reflection_methods(&mut methods, model, models);
     push_dependent_destroy(&mut methods, model);

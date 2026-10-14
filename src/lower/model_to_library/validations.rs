@@ -122,7 +122,7 @@ pub(super) fn push_validate_method(
 
     stmts.extend(secure_password_checks(model));
     if details {
-        stmts.iter_mut().for_each(push_error_details);
+        stmts.iter_mut().for_each(|s| push_error_details(s, &model.i18n));
     }
 
     if stmts.is_empty() {
@@ -176,56 +176,100 @@ fn belongs_to_lookup_pk(models: &[Model], target: &ClassId, declared: Option<&Sy
 /// tagged `errors << "<Attr> msg"` into that push and the detail's. The
 /// detail records the type and the short message, so a push whose type
 /// or short message the lowering did not record is left as it was.
-fn push_error_details(e: &mut Expr) {
-    e.node.for_each_child_mut(&mut |c| push_error_details(c));
+pub(crate) fn push_error_details(e: &mut Expr, i18n: &crate::i18n::ModelI18n) {
+    // An `errors.add` the errors-add pass lowered already pushes its detail
+    // (its message push keeps the hint), so a second pass leaves it be.
+    if is_attributed_pair(e) {
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| push_error_details(c, i18n));
     let Some(crate::expr::IrHint::ErrorAttribute(tag)) = &e.hint else { return };
     if !is_errors_push(e) {
         return;
     }
-    let crate::expr::ErrorDetail::Type { name, .. } = &tag.detail else { return };
-    let crate::expr::ErrorShort::After(prefix) = &tag.short else { return };
     let ExprNode::Send { args, .. } = &*e.node else { return };
-    let Some(bare) = without_prefix(&args[0], prefix) else { return };
+    // The text the model's `errors.format` puts around the message, which
+    // the short message is left without.
+    let (before, after) = affixes(i18n, tag.attribute.as_str());
+    let Some(bare) = without_affixes(&args[0], &before, &after) else { return };
     let span = e.span;
-    let kind = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: name.as_str().to_string() } });
+    // Rails' type for a String message is the message itself.
+    let kind = match &tag.detail {
+        crate::expr::ErrorDetail::Type { name, .. } => {
+            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: name.as_str().to_string() } })
+        }
+        crate::expr::ErrorDetail::Message => bare.clone(),
+        crate::expr::ErrorDetail::Unknown => return,
+    };
     let attribute = tag.attribute.clone();
-    let mut push = e.clone();
-    push.hint = None;
+    // The push keeps its hint: the CRuby and JRuby trees record it too.
+    let push = e.clone();
     *e = crate::lower::errors_add::attributed_push(push, None, attribute.as_str(), kind, bare, span);
 }
 
-/// `message` without its leading `prefix` (the humanized attribute), as
-/// the short message Rails' Error keeps.
-fn without_prefix(message: &Expr, prefix: &str) -> Option<Expr> {
-    if prefix.is_empty() {
+/// `errors << msg; error_details << ErrorDetail.new(..)`, the pair
+/// `lower::errors_add::attributed_push` builds.
+fn is_attributed_pair(e: &Expr) -> bool {
+    let ExprNode::Seq { exprs } = &*e.node else { return false };
+    let [push, detail] = exprs.as_slice() else { return false };
+    let ExprNode::Send { recv: Some(reader), method, .. } = &*detail.node else { return false };
+    let ExprNode::Send { method: reader_method, args, .. } = &*reader.node else { return false };
+    is_errors_push(push) && method.as_str() == "<<" && reader_method.as_str() == "error_details" && args.is_empty()
+}
+
+/// The text `errors.format` puts before and after the message of an error
+/// on `attribute` (`"Title "` and `""` for Rails' `%{attribute} %{message}`,
+/// `""` and `" (Title)"` for `%{message} (%{attribute})`); the message
+/// alone on `:base`.
+fn affixes(i18n: &crate::i18n::ModelI18n, attribute: &str) -> (String, String) {
+    if attribute == "base" {
+        return (String::new(), String::new());
+    }
+    let format = i18n.errors_format().replace("%{attribute}", &i18n.human_attribute_name(attribute));
+    match format.split_once("%{message}") {
+        Some((before, after)) if !after.contains("%{message}") => (before.to_string(), after.to_string()),
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// `message` without the text `errors.format` put around it (`before`
+/// and `after`), as the short message Rails' Error keeps. `None` where
+/// the message does not show them as written.
+fn without_affixes(message: &Expr, before: &str, after: &str) -> Option<Expr> {
+    if before.is_empty() && after.is_empty() {
         return Some(message.clone());
     }
     let node = match &*message.node {
-        ExprNode::Lit { value: Literal::Str { value } } => {
-            ExprNode::Lit { value: Literal::Str { value: value.strip_prefix(prefix)?.to_string() } }
-        }
+        ExprNode::Lit { value: Literal::Str { value } } => ExprNode::Lit {
+            value: Literal::Str { value: value.strip_prefix(before)?.strip_suffix(after)?.to_string() },
+        },
         ExprNode::StringInterp { parts } => {
-            let Some(InterpPart::Text { value }) = parts.first() else { return None };
-            let rest = value.strip_prefix(prefix)?;
             let mut parts = parts.clone();
-            if rest.is_empty() {
-                parts.remove(0);
-            } else {
-                parts[0] = InterpPart::Text { value: rest.to_string() };
+            if !before.is_empty() {
+                let Some(InterpPart::Text { value }) = parts.first() else { return None };
+                let rest = value.strip_prefix(before)?.to_string();
+                parts[0] = InterpPart::Text { value: rest };
             }
+            if !after.is_empty() {
+                let Some(InterpPart::Text { value }) = parts.last() else { return None };
+                let rest = value.strip_suffix(after)?.to_string();
+                let last = parts.len() - 1;
+                parts[last] = InterpPart::Text { value: rest };
+            }
+            parts.retain(|p| !matches!(p, InterpPart::Text { value } if value.is_empty()));
             ExprNode::StringInterp { parts }
         }
         ExprNode::If { cond, then_branch, else_branch } => ExprNode::If {
             cond: cond.clone(),
-            then_branch: without_prefix(then_branch, prefix)?,
-            else_branch: without_prefix(else_branch, prefix)?,
+            then_branch: without_affixes(then_branch, before, after)?,
+            else_branch: without_affixes(else_branch, before, after)?,
         },
         // The dedupe's `_association_error(message)` answers a copy of its
         // argument, which the detail keeps as the short message.
         ExprNode::Send { recv: None, method, args, block: None, .. }
             if method.as_str() == "_association_error" && args.len() == 1 =>
         {
-            return without_prefix(&args[0], prefix);
+            return without_affixes(&args[0], before, after);
         }
         _ => return None,
     };
@@ -589,13 +633,9 @@ pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
 /// `tag_error_attribute` for the association's own `:invalid` error; on a
 /// tree that keeps `error_details` (`details`) it records the type and
 /// pushes the `ErrorDetail` (see [`push_error_details`]).
-pub(crate) fn tag_association_invalid(check: &mut Expr, attr: &Symbol, details: bool) {
-    if details {
-        tag_error_detail(check, attr, &typed_detail("invalid", vec![]));
-        push_error_details(check);
-    } else {
-        tag_error_attribute(check, attr);
-    }
+pub(crate) fn tag_association_invalid(check: &mut Expr, attr: &Symbol, i18n: &crate::i18n::ModelI18n) {
+    tag_error_detail(check, attr, &typed_detail("invalid", vec![]));
+    push_error_details(check, i18n);
 }
 
 /// `tag_error_attribute`, with the type and options Rails' Error keeps
@@ -765,7 +805,7 @@ fn declares_before_validation(model: &Model) -> bool {
 /// `valid?` + `errors` mirroring the runtime Base implementations,
 /// for `include ActiveModel::Validations` classes with no superclass.
 pub(crate) fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Model) {
-    push_active_model_validation_surface_for(methods, model, ErrorsReaders::CreatedOnFirstRead, false)
+    push_active_model_validation_surface_for(methods, model, ErrorsReaders::CreatedOnFirstRead, true)
 }
 
 /// `details`: the tree records each error's `ErrorDetail` in an
@@ -3098,12 +3138,28 @@ mod tests {
         // error's type and short message in `error_details`.
         let a = attr();
         let mut expr = inline_presence_check(&a, None, &ivar(&a), &plain(&a));
-        push_error_details(&mut expr);
+        push_error_details(&mut expr, &crate::i18n::ModelI18n::default());
         let dbg = format!("{expr:?}");
         assert!(dbg.contains("error_details") && dbg.contains("ErrorDetail"), "no detail pushed: {dbg}");
         assert!(dbg.contains("\"blank\"") && dbg.contains("\"can't be blank\""), "type or short message missing: {dbg}");
-        assert!(!dbg.contains("ErrorAttribute"), "the hint stays only on the CRuby tree: {dbg}");
+        // The hint stays: the CRuby and JRuby trees record the push in `ErrorAttributes` too.
+        assert!(dbg.contains("ErrorAttribute"), "the push lost its hint: {dbg}");
         assert_eq!(collect_error_messages(&expr), vec!["Title can't be blank"]);
+    }
+
+    #[test]
+    fn a_push_that_already_pushed_its_detail_is_left_be() {
+        // `errors.add` (`lower::errors_add`) pushes the detail with its message
+        // and keeps the hint, so the pass over a body that holds one must not
+        // record the error a second time.
+        let a = attr();
+        let mut expr = inline_presence_check(&a, None, &ivar(&a), &plain(&a));
+        let i18n = crate::i18n::ModelI18n::default();
+        push_error_details(&mut expr, &i18n);
+        let once = format!("{expr:?}");
+        push_error_details(&mut expr, &i18n);
+        assert_eq!(format!("{expr:?}"), once, "a second pass pushed the detail again");
+        assert_eq!(once.matches("\"error_details\"").count(), 1, "{once}");
     }
 
     #[test]

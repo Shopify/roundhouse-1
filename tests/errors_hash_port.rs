@@ -270,36 +270,42 @@ fn an_authored_test_reads_them() {
     assert!(run.stdout.contains("PostTest: 1 tests passed"), "{}", run.stdout);
 }
 
-/// A message pushed without its attribute is refused by the reads,
-/// never keyed under a guess; `attribute_names` passes it over.
+/// A message pushed without its attribute (Rails' collection has no `<<`)
+/// is never keyed under a guess: `to_hash` answers from the records each
+/// push kept beside the messages (`error_details`), so it names none for
+/// it. (The ErrorAttributes route raised naming the message; the records
+/// the other trees answer from cannot see a push that kept none.)
 #[test]
-fn an_unrecorded_message_is_refused() {
+fn an_unrecorded_message_is_not_keyed() {
     let run = app()
         .write(
             "app/models/stray.rb",
             "class Stray\n  def self.lines\n    post = Post.new(title: \"\")\n    post.valid?\n    post.errors << \"Hand written\"\n    \
-             begin\n      post.errors.to_hash\n    rescue RuntimeError => e\n      e.message\n    end\n  end\nend\n",
+             post.errors.to_hash\n  end\nend\n",
         )
         .run_ruby("puts Stray.lines");
     run.assert_passes();
-    assert_eq!(
-        run.stdout.trim(),
-        "roundhouse: ActiveModel::Errors#to_hash: \"Hand written\" was added without its attribute \
-         (a push the errors lowering did not record), so it cannot be keyed",
-    );
+    assert_eq!(run.stdout.trim(), r#"{title: ["can't be blank"]}"#);
 }
 
-/// Spinel emits no port and says so for each read.
+/// Spinel emits no port and says so for each read the records beside the
+/// messages cannot answer: `to_hash(true)` and `as_json(options)` (their
+/// plain forms, and `messages`, are answered from `error_details`, as the
+/// grounded `errors.details` is: `lower::errors_index`).
 #[test]
 fn spinel_refuses_the_reads() {
     let (dir, errors) = app().emit(BuildTarget::Spinel);
-    for read in ["ActiveModel::Errors#to_hash", "ActiveModel::Errors#as_json", "ActiveModel::Errors#messages"] {
+    for read in ["ActiveModel::Errors#to_hash", "ActiveModel::Errors#as_json"] {
         assert!(
             errors.iter().any(|e| e.contains(read)
                 && e.contains("declared by the Ruby-family runtime (runtime/active_model_errors.rb), which spinel does not emit")),
             "spinel {read}: {errors:#?}"
         );
     }
+    assert!(
+        !errors.iter().any(|e| e.contains("ActiveModel::Errors#messages")),
+        "`messages` is answered from error_details on spinel: {errors:#?}"
+    );
     assert!(!dir.join("runtime/active_model_errors.rb").exists());
 }
 

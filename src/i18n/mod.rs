@@ -544,9 +544,14 @@ impl ModelI18n {
 
     /// The message for an error of `kind` on `attr`, without the attribute, as parts.
     pub fn error(&self, attr: &str, kind: &str, opts: &ErrorOpts) -> Vec<Part> {
-        self.catalog()
-            .error_message(self.scope(), &self.keys, attr, kind, opts)
+        self.try_error(attr, kind, opts)
             .unwrap_or_else(|| vec![Part::Text(format!("translation missing: {}.errors.messages.{kind}", self.catalog().locale))])
+    }
+
+    /// `error`, or `None` when no catalog entry words `kind` (without the
+    /// `count:` a plural entry needs).
+    pub fn try_error(&self, attr: &str, kind: &str, opts: &ErrorOpts) -> Option<Vec<Part>> {
+        self.catalog().error_message(self.scope(), &self.keys, attr, kind, opts)
     }
 
     /// The full message for an error of `kind` on `attr`, as parts.

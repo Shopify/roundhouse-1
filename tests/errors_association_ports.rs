@@ -345,35 +345,39 @@ fn an_authored_test_reads_both() {
     assert!(run.stdout.contains("PostTest: 2 tests passed"), "{}", run.stdout);
 }
 
-/// The PostgreSQL CRuby tree carries the same two ports.
+/// The PostgreSQL CRuby tree carries the association port. `attribute_names`
+/// is answered from the record's `error_details` on every tree
+/// (`lower::errors_index`), so the ErrorAttributes port is not carried for it.
 #[test]
-fn the_postgresql_tree_carries_both_ports() {
+fn the_postgresql_tree_carries_the_association_port() {
     let (dir, errors) = app()
         .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
         .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_e2e_errors_association\n")
         .emit(BuildTarget::Ruby);
     let errors: Vec<_> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
     assert!(errors.is_empty(), "{errors:#?}");
-    for file in ["runtime/active_model_errors.rb", "runtime/active_record_associations.rb"] {
-        assert!(dir.join(file).is_file(), "{file} is carried");
-    }
+    assert!(dir.join("runtime/active_record_associations.rb").is_file(), "runtime/active_record_associations.rb is carried");
+    assert!(!dir.join("runtime/active_model_errors.rb").exists(), "attribute_names needs no ErrorAttributes port");
     let probe = std::fs::read_to_string(dir.join("app/models/ports_probe.rb")).unwrap();
-    assert!(probe.contains("ActiveModel::ErrorAttributes.attribute_names(post.errors)"), "{probe}");
+    assert!(probe.contains("ActiveSupport.errors_attribute_names(post.error_details)"), "{probe}");
 }
 
-/// Spinel emits neither port and says so for each read.
+/// Spinel emits neither port. It says so for `association`; the plain
+/// `attribute_names` is answered from the record's `error_details`
+/// (`lower::errors_index`), as `errors.details` is, so it is not refused.
 #[test]
 fn spinel_refuses_both_reads() {
     let (dir, errors) = app().emit(BuildTarget::Spinel);
-    for (read, file) in [
-        ("ActiveModel::Errors#attribute_names", "runtime/active_model_errors.rb"),
-        ("#association", "runtime/active_record_associations.rb"),
-    ] {
-        let expected = format!("declared by the Ruby-family runtime ({file}), which spinel does not emit");
-        assert!(
-            errors.iter().any(|e| e.contains(read) && e.contains(&expected)),
-            "spinel {read}: {errors:#?}"
-        );
+    let expected = "declared by the Ruby-family runtime (runtime/active_record_associations.rb), which spinel does not emit";
+    assert!(
+        errors.iter().any(|e| e.contains("#association") && e.contains(expected)),
+        "spinel #association: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("ActiveModel::Errors#attribute_names")),
+        "`attribute_names` is answered from error_details on spinel: {errors:#?}"
+    );
+    for file in ["runtime/active_model_errors.rb", "runtime/active_record_associations.rb"] {
         assert!(!dir.join(file).exists(), "{file} stays off the spinel tree");
     }
 }
