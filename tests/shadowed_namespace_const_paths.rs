@@ -41,7 +41,7 @@ end
 #[test]
 fn a_framework_superclass_is_rooted_when_a_sibling_namespace_shadows_its_head() {
     // The sibling `Ledger::ActiveSupport` is loaded before the file that
-    // writes `ActiveSupport::HashWithIndifferentAccess` in a class header
+    // writes `ActiveSupport::Duration` in a class header
     // (Ruby binds the superclass at that point: natively the sibling's
     // file loads later; the emitted tree's boot loads every model file).
     let run = emit_and_run::empty_app()
@@ -52,7 +52,7 @@ fn a_framework_superclass_is_rooted_when_a_sibling_namespace_shadows_its_head() 
         )
         .write(
             "lib/ledger/table.rb",
-            "class Ledger\n  class Table < ActiveSupport::HashWithIndifferentAccess\n    def self.kind = :table\n  end\nend\n",
+            "class Ledger\n  class Table < ActiveSupport::Duration\n    def self.kind = :table\n  end\nend\n",
         )
         .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
         .write("test/table_test.rb", r#"require "test_helper"
@@ -60,7 +60,7 @@ require "ledger/active_support/serializer"
 require "ledger/table"
 class TableTest < ActiveSupport::TestCase
   test "a framework superclass written under a shadowing sibling namespace binds the top-level constant" do
-    assert_equal [:table, ::ActiveSupport::HashWithIndifferentAccess], [Ledger::Table.kind, Ledger::Table.superclass]
+    assert_equal [:table, ::ActiveSupport::Duration], [Ledger::Table.kind, Ledger::Table.superclass]
   end
 end
 "#)

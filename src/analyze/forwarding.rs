@@ -979,6 +979,9 @@ fn destination<'a>(
                         constant_names_class(r, id).then_some(id)
                     }
                     (_, Some(Ty::Class { id, .. })) => Some(id),
+                    // `@memo ||= new` on the class side: the class itself, which the
+                    // reader check below admits only while nothing descends from it.
+                    (_, Some(Ty::SelfInstance)) => context.map(|(owner, _)| owner),
                     _ => None,
                 },
             };

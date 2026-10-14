@@ -194,10 +194,15 @@ end
         )),
         "optioned mattr must synthesize a class reader"
     );
+    // The default is a seed the class body runs where it stands (the
+    // native class variable `@@renderer`), not a `class_attr_defaults` entry.
     assert!(
-        md.class_attr_defaults.contains_key(&roundhouse::Symbol::from("renderer")),
-        "default: must seed class_attr_defaults, got {:?}",
-        md.class_attr_defaults.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+        md.body.iter().any(|item| matches!(
+            item,
+            roundhouse::dialect::ModelBodyItem::ClassBody { expr, .. } if format!("{expr:?}").contains("renderer")
+        )),
+        "default: must seed the class variable in the body, got {:?}",
+        md.body.iter().map(|i| format!("{i:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>()
     );
 }
 

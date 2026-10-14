@@ -2,7 +2,7 @@
 
 # ActiveModel's attribute types and the ActiveRecord::Type names over them,
 # ported from activemodel / activerecord 8.2.0.alpha (Shopify/rails
-# 5813559f, the version Core pins) for the CRuby and JRuby
+# 5eb8c4c45bee, the version Core pins) for the CRuby and JRuby
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
 # Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime,
@@ -634,7 +634,8 @@ module Type
           when ::Integer
             value
           when ::String
-            str = value.bytesize > _limit * 4 ? value.byteslice(0, _limit * 4) : value
+            max_bytesize = max_cast_bytesize
+            str = value.bytesize > max_bytesize ? value.byteslice(0, max_bytesize) : value
             str.to_i rescue nil
           else
             value.to_i rescue nil
@@ -652,9 +653,18 @@ module Type
         def _limit
           limit || DEFAULT_LIMIT
         end
+
+        # Only the first bytes of a string are cast, to bound the work done by
+        # +to_i+ on very long input.
+        def max_cast_bytesize
+          _limit * 4
+        end
     end
 
     class BigInteger < Integer
+      MAX_PRECISION = 1000 # :nodoc:
+      private_constant :MAX_PRECISION
+
       def serialize(value) # :nodoc:
         case value
         when ::Integer
@@ -683,6 +693,15 @@ module Type
       private
         def max_value
           ::Float::INFINITY
+        end
+
+        # Values are not limited to +limit+ bytes, so bound the cast by the
+        # precision (number of digits) instead. Without a precision, fall back
+        # to the largest precision databases accept for a numeric column
+        # (1000 digits on PostgreSQL). Twice the precision leaves room for a
+        # sign or a short slug suffix.
+        def max_cast_bytesize
+          (precision || MAX_PRECISION) * 2
         end
     end
 

@@ -637,7 +637,9 @@ pub(crate) const AS_WRITTEN_NOTE: &str = "the CRuby tree, which writes flattened
 /// an error only for the targets that keep the flattened keywords positional.
 pub(crate) fn runs_as_written(d: &crate::diagnostic::Diagnostic) -> bool {
     matches!(&d.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, detail, .. }
-        if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS && detail.ends_with(AS_WRITTEN_NOTE))
+        if (construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
+            || construct.as_str() == super::FLATTENED_KEYWORD_ARGUMENTS)
+            && detail.ends_with(AS_WRITTEN_NOTE))
 }
 
 /// The refusal holds on every target that keeps ingest's flattened

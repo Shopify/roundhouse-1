@@ -88,16 +88,17 @@ pub(crate) fn is_open_value(e: &Expr) -> bool {
 
 pub(crate) fn rewrite_node(expr: &mut Expr) {
     let replacement = match &mut *expr.node {
-        // A typed, no-block Hash#deep_merge call is routed through the
-        // shared helper because Spinel cannot dispatch this ActiveSupport
-        // core extension on its native Hash representation.
+        // A typed Hash#deep_merge / deep_merge! call (with or without a
+        // conflict block) is routed through the shared helper because
+        // Spinel cannot dispatch this ActiveSupport core extension on its
+        // native Hash representation.
         ExprNode::Send {
             recv: Some(receiver),
             method,
             args,
-            block: None,
+            block,
             ..
-        } if method.as_str() == "deep_merge"
+        } if matches!(method.as_str(), "deep_merge" | "deep_merge!")
             && args.len() == 1
             && matches!(receiver.ty.as_ref(), Some(Ty::Hash { .. }))
             && matches!(args[0].ty.as_ref(), Some(Ty::Hash { .. })) =>
@@ -111,9 +112,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
                             path: vec![crate::ident::Symbol::from("ActiveSupport")],
                         },
                     )),
-                    method: crate::ident::Symbol::from("deep_merge"),
+                    method: method.clone(),
                     args: vec![receiver.clone(), args[0].clone()],
-                    block: None,
+                    block: block.clone(),
                     parenthesized: true,
                 },
             );
@@ -205,9 +206,29 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         {
             // `Result#first` answers `Hash[String, _]?`; a nil there
             // raises on either spelling, so the nilable form counts.
+            //
+            // `first` / `last` answer the row for no count and an Array of
+            // rows for one (`Result#first(n)`), under one RBS return type:
+            // the argument-less call is the row.
+            fn flat<'t>(ty: &'t Ty, out: &mut Vec<&'t Ty>) {
+                match ty {
+                    Ty::Union { variants } => variants.iter().for_each(|v| flat(v, out)),
+                    other => out.push(other),
+                }
+            }
+            let bare_edge_read = matches!(
+                &*r.node,
+                ExprNode::Send { method, args, .. }
+                    if matches!(method.as_str(), "first" | "last") && args.is_empty()
+            );
             let hash_ty = match r.ty.as_ref() {
-                Some(Ty::Union { variants }) => {
-                    let non_nil: Vec<&Ty> = variants.iter().filter(|v| **v != Ty::Nil).collect();
+                Some(union @ Ty::Union { .. }) => {
+                    let mut all = Vec::new();
+                    flat(union, &mut all);
+                    let mut non_nil: Vec<&Ty> = all.into_iter().filter(|v| **v != Ty::Nil).collect();
+                    if bare_edge_read && non_nil.len() > 1 {
+                        non_nil.retain(|v| matches!(v, Ty::Hash { .. }));
+                    }
                     if non_nil.len() == 1 { Some(non_nil[0]) } else { None }
                 }
                 other => other,

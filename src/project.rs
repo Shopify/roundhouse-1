@@ -16796,7 +16796,7 @@ fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, Strin
     write_bundled_require_lines(&mut files);
     // Only the Ruby family reaches here.
     let mut written = crate::det::HashSet::default();
-    for (i, require_line) in require_gaps(&files, &cruby_stdlib_requires()) {
+    for (i, require_line) in require_gaps_from(&files, &cruby_stdlib_requires(), false) {
         // Several constants of one library (`Net::HTTP`, `Net::HTTPOK`)
         // can name the same feature in one file.
         if written.insert((i, require_line.clone())) {
@@ -16969,8 +16969,13 @@ fn bundled_require_gaps(files: &[(String, String)]) -> Vec<(usize, String)> {
 /// constant). The rest of that table is interpreter core and needs no
 /// require. `Bundler` is `rbs/supplement.rbs`'s, which the generated
 /// table below does not probe.
-const CRUBY_STDLIB_REQUIRES: [(&str, &str); 4] =
-    [("Bundler", "bundler"), ("FileUtils", "fileutils"), ("Timeout", "timeout"), ("YAML", "yaml")];
+const CRUBY_STDLIB_REQUIRES: [(&str, &str); 5] = [
+    ("Bundler", "bundler"),
+    ("FileUtils", "fileutils"),
+    ("Shellwords", "shellwords"),
+    ("Timeout", "timeout"),
+    ("YAML", "yaml"),
+];
 
 /// `CRUBY_STDLIB_REQUIRES`, then every row of Ruby's signatures' table
 /// (`rbs/requires.tsv`, each probed on the pinned interpreter) that
@@ -16986,6 +16991,19 @@ fn cruby_stdlib_requires() -> Vec<(&'static str, &'static str)> {
 }
 
 fn require_gaps(files: &[(String, String)], table: &[(&str, &str)]) -> Vec<(usize, String)> {
+    require_gaps_from(files, table, true)
+}
+
+/// `require_gaps`; `spinel_shims_define` says whether a spinel-only shim
+/// (`runtime/<name>_spinel.rb`) counts as the program defining the
+/// constant itself. It does for spinel, whose shim stands in for the
+/// library; the Ruby family carries the shim too, and still needs the
+/// stdlib feature the shim only partly stands in for.
+fn require_gaps_from(
+    files: &[(String, String)],
+    table: &[(&str, &str)],
+    spinel_shims_define: bool,
+) -> Vec<(usize, String)> {
     let mut gaps = Vec::new();
     for (konst, feature) in table {
         let require_line = format!("require {feature:?}");
@@ -16997,7 +17015,10 @@ fn require_gaps(files: &[(String, String)], table: &[(&str, &str)]) -> Vec<(usiz
         // `packages/net`, keeping the package's classes), and every
         // other file naming the constant still needs the require.
         if files.iter().any(|(p, c)| {
-            p.ends_with(".rb") && defines_constant(c, konst) && !requires_feature(c, &require_line)
+            p.ends_with(".rb")
+                && (spinel_shims_define || !p.ends_with("_spinel.rb"))
+                && defines_constant(c, konst)
+                && !requires_feature(c, &require_line)
         }) {
             continue;
         }

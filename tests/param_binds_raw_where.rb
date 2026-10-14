@@ -18,11 +18,11 @@ Db.with_connection do
   having = ActiveRecord::Relation.new(Item).group(:id).having("items.name = ? AND items.id = ?", "what?", 2)
   raise "HAVING substitution changed" unless having.load_records.length == 1
 
-  # Keep main's adapter treatment of Arrays, not the draft's IN-list expansion.
+  # An Array bind is Rails' IN list: its escaped elements joined by ", ", NULL when empty.
   list = ActiveRecord::Relation.new(Item).where("items.id IN (?) AND items.parent_id = ?", [1, 2], 1)
-  raise "Array escaping changed" unless list.to_sql.include?("items.id IN ('[1, 2]') AND items.parent_id = 1")
+  raise "Array escaping changed" unless list.to_sql.include?("items.id IN (1, 2) AND items.parent_id = 1")
   empty = ActiveRecord::Relation.new(Item).where("items.id IN (?)", [])
-  raise "empty Array escaping changed" unless empty.to_sql.include?("items.id IN ('[]')")
+  raise "empty Array escaping changed" unless empty.to_sql.include?("items.id IN (NULL)")
   hashed = ActiveRecord::Relation.new(Item).where(id: [1, 3])
   raise "hash IN changed" unless hashed.count == 2
 

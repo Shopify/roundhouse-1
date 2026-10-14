@@ -37,16 +37,17 @@ class Module
     methods.each do |method|
       name = :"#{location}#{method}"
       define_method(name) do |*args, **kwargs, &block|
-        # `send`, not `public_send`: Rails delegates to private readers
+        # `__send__`, not `public_send`: Rails delegates to private readers
         # routinely, and platform_agent's `user_agent` IS private. An
         # instance-variable target (`to: :@members`, Inflections'
         # Uncountables) reads the variable, as Rails' generated
-        # `_ = @members` does.
-        target = to.to_s.start_with?("@") ? instance_variable_get(to) : send(to)
+        # `_ = @members` does. `__send__` and Kernel's ivar reader, so a
+        # BasicObject receiver (a blocker proxy) delegates too.
+        target = to.to_s.start_with?("@") ? ::Kernel.instance_method(:instance_variable_get).bind_call(self, to) : __send__(to)
         if target.nil? && allow_nil
           nil
         else
-          target.send(method, *args, **kwargs, &block)
+          target.__send__(method, *args, **kwargs, &block)
         end
       end
       send(:private, name) if private

@@ -155,7 +155,7 @@ fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> 
             {
                 continue;
             }
-            params.insert(key, m.params.iter().map(slot_of).collect());
+            params.insert(key, slots_of(&m.params));
         }
     }
     params
@@ -277,7 +277,7 @@ fn refuse_typed_splats(
     if let Some(slots) = slots
         && splat_into_flattened(args, slots)
     {
-        refuse(e.span, SPLAT_REFUSAL, diagnostics);
+        refuse(e.span, &splat_refusal(false), diagnostics);
     }
 }
 
@@ -301,6 +301,16 @@ fn splat_into_flattened(args: &[Expr], slots: &[Slot]) -> bool {
 }
 
 const SPLAT_REFUSAL: &str = "a `**` splat into optional keywords that are positional slots: which slots its keys fill is only known at run time";
+
+/// The splat refusal; where the Ruby family writes every flattened keyword
+/// back it is the one a CRuby tree runs as written ([`constructor::runs_as_written`]).
+fn splat_refusal(written_back: bool) -> String {
+    if written_back {
+        format!("{SPLAT_REFUSAL}; {}", constructor::AS_WRITTEN_NOTE)
+    } else {
+        SPLAT_REFUSAL.to_string()
+    }
+}
 
 const SEND_METHODS: &[&str] = &["send", "public_send", "__send__"];
 
@@ -412,6 +422,10 @@ struct Slot {
     default: Option<Expr>,
     from_keyword: bool,
     from_kwrest: bool,
+    /// The Ruby family writes this slot's method back as keywords
+    /// (`Param::keywords_written_as_keywords`), so a `**` splat into it binds
+    /// as Ruby does there.
+    written_back: bool,
 }
 
 fn slot_of(p: &crate::dialect::Param) -> Slot {
@@ -420,7 +434,15 @@ fn slot_of(p: &crate::dialect::Param) -> Slot {
         default: p.default.clone(),
         from_keyword: p.from_keyword,
         from_kwrest: p.from_kwrest,
+        written_back: false,
     }
+}
+
+/// A method's slots, each knowing whether the Ruby family writes the
+/// method's keywords back.
+fn slots_of(params: &[crate::dialect::Param]) -> Vec<Slot> {
+    let written_back = crate::dialect::Param::keywords_written_as_keywords(params);
+    params.iter().map(|p| Slot { written_back, ..slot_of(p) }).collect()
 }
 
 /// Helper name → its parameter slots, in declaration order.

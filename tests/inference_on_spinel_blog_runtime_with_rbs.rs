@@ -494,11 +494,8 @@ fn ingest_runtime_classes() -> Vec<(String, LibraryClass)> {
 fn qualified_runtime_signatures_seed_contexts_and_results() {
     let (registry, sigs, _) = build_class_registry();
     let classes = ingest_runtime_classes();
-    let row = Ty::Hash {
-        key: std::sync::Arc::new(Ty::Str),
-        value: std::sync::Arc::new(Ty::Untyped),
-    };
-    let rows = Ty::Array { elem: std::sync::Arc::new(row) };
+    // The constructor takes Rails' shape too: positional rows.
+    let rows = Ty::Array { elem: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }) };
     for (class, method, name, expected) in [
         ("ActiveRecord::Result", "initialize", "rows", rows.clone()),
         ("ActiveRecord::Connection", "quote_string", "str", Ty::Str),
@@ -529,8 +526,7 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
             },
         );
         typer.analyze_expr(&mut probes[0].methods[0].body, &ctx);
-        // `rows` answers Rails' shape, each row an Array of its values;
-        // the constructor above still takes the row hashes.
+        // `rows` answers Rails' shape, each row an Array of its values.
         assert_eq!(
             probes[0].methods[0].body.ty,
             Some(Ty::Array { elem: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }) }),

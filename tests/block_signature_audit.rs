@@ -149,21 +149,23 @@ fn ruby_family_emit_keeps_every_ingested_block_signature() {
     }
 }
 
-/// A block-form lifecycle hook whose block takes optional or keyword
-/// parameters cannot be spliced into the parameterless hook method; it
-/// was dropped with no diagnostic once the signature was carried.
+/// A block-form lifecycle hook whose block takes a required keyword
+/// cannot be spliced into the parameterless hook method (Rails never
+/// passes it); it was dropped with no diagnostic once the signature was
+/// carried. An optional keyword takes its default (the optional-keyword
+/// shape was refused before 98e999ace).
 #[test]
 fn a_hook_block_with_a_signature_is_refused_by_name() {
     let (_emitted, errors) = emit_and_run::real_blog()
         .edit(
             "app/models/article.rb",
             "  validates :title, presence: true\n",
-            "  before_save { |record, touch: false| record }\n\n  validates :title, presence: true\n",
+            "  before_save { |record, touch:| record }\n\n  validates :title, presence: true\n",
         )
         .emit(BuildTarget::Ruby);
     assert!(
         errors.iter().any(|e| e.contains("block_callback_signature")
-            && e.contains("`before_save { |…| … }` on `Article` takes `touch`")),
+            && e.contains("`before_save { |…| … }` on `Article` takes the required keyword `touch:`")),
         "{errors:#?}"
     );
 }

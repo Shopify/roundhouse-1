@@ -440,11 +440,25 @@ pub(super) fn scan_constructor_mutations(
                 context.modules_with_mutating_hooks,
             );
             let mutates_callback_receiver = callback_receiver.is_some_and(|callback_receiver| {
-                recv.as_ref()
-                    .is_some_and(|recv| receiver_uses_callback(recv, callback_receiver))
-                    || args
+                // `base.extend(Mod)` in an `included` hook (the vanilla
+                // `ClassMethods` bridge) is the mixin edit
+                // `mutates_constructor_lookup_method` judges by the module
+                // it names: a known module with no custom `new` or lookup
+                // hook leaves the includer's constructor lookup alone.
+                let mixin_edit_on_callback = matches!(method.as_str(), "extend" | "include" | "prepend")
+                    && recv.as_ref().is_some_and(
+                        |recv| matches!(&*recv.node, ExprNode::Var { name, .. } if name == callback_receiver),
+                    )
+                    && !args
                         .iter()
-                        .any(|arg| contains_callback(arg, callback_receiver))
+                        .any(|arg| contains_callback(arg, callback_receiver));
+                !mixin_edit_on_callback
+                    && (recv
+                        .as_ref()
+                        .is_some_and(|recv| receiver_uses_callback(recv, callback_receiver))
+                        || args
+                            .iter()
+                            .any(|arg| contains_callback(arg, callback_receiver)))
             });
             if mutates_lookup || mutates_callback_receiver {
                 match recv.as_ref().map(|recv| &*recv.node) {
@@ -454,6 +468,21 @@ pub(super) fn scan_constructor_mutations(
                     Some(ExprNode::Var { name, .. })
                         if owner_is_class_receiver
                             && callback_receiver.is_some_and(|target| target == name) =>
+                    {
+                        result.owner_mutated = true;
+                    }
+                    // A call inside `class << self` is recorded on its
+                    // implicit receiver, `singleton_class` (ingest), which
+                    // is the owner's class side as a bare call is.
+                    Some(ExprNode::Send {
+                        recv: None,
+                        method,
+                        args,
+                        ..
+                    }) if owner_is_class_receiver
+                        && mutates_lookup
+                        && method.as_str() == "singleton_class"
+                        && args.is_empty() =>
                     {
                         result.owner_mutated = true;
                     }

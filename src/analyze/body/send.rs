@@ -3427,21 +3427,32 @@ pub(super) fn hash_method(
             key: std::sync::Arc::new(key.clone()),
             value: std::sync::Arc::new(value.clone()),
         },
-        // The supported Rails subset is the non-mutating, one-argument,
-        // no-block form. Keep block conflicts and `deep_merge!` unresolved
-        // rather than claiming semantics the shared runtime does not provide.
-        "deep_merge" if args.len() == 1 && block_ret.is_none() => {
-            match args[0].ty.as_ref() {
-                Some(Ty::Hash {
-                    key: other_key,
-                    value: other_value,
-                }) => Ty::Hash {
+        // One typed Hash argument, with or without a conflict block. The
+        // non-mutating form answers a Hash of the union of both; the
+        // mutating form answers its own receiver.
+        "deep_merge!" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Hash { .. }) => Ty::Hash {
+                key: std::sync::Arc::new(key.clone()),
+                value: std::sync::Arc::new(value.clone()),
+            },
+            _ => unknown(),
+        },
+        "deep_merge" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Hash {
+                key: other_key,
+                value: other_value,
+            }) => {
+                let mut merged_value = union_of(value.clone(), (**other_value).clone());
+                if let Some(block_ret) = block_ret {
+                    merged_value = union_of(merged_value, block_ret.clone());
+                }
+                Ty::Hash {
                     key: std::sync::Arc::new(union_of(key.clone(), (**other_key).clone())),
-                    value: std::sync::Arc::new(union_of(value.clone(), (**other_value).clone())),
-                },
-                _ => unknown(),
+                    value: std::sync::Arc::new(merged_value),
+                }
             }
-        }
+            _ => unknown(),
+        },
         // `Hash#to_h` is identity (returns self when called without a
         // block; with a block, transforms entries — same shape).
         // Common in controller bodies: `params.expect(...).to_h` to
