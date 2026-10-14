@@ -290,15 +290,16 @@ pub(super) fn refuse_library_class_splats(
         owner: &str,
         side: Side,
         index: &OwnerIndex,
+        kwrest: Option<&Symbol>,
         diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
     ) {
-        e.node.for_each_child(&mut |c| walk(c, owner, side, index, diagnostics));
+        e.node.for_each_child(&mut |c| walk(c, owner, side, index, kwrest, diagnostics));
         let ExprNode::Send { recv, method, args, .. } = &*e.node else { return };
         let Some(side) = owner_side(recv, side) else { return };
         let (refused, written_back) = match index.lookup(owner, side, method) {
             Ok(Some(slots)) => (
                 super::splat_into_flattened(args, slots),
-                slots.iter().all(|s| s.written_back),
+                slots.iter().all(|s| s.written_back) && forwards_own_kwrest(args, kwrest),
             ),
             Ok(None) => (false, false),
             Err(()) => (super::carries_splat(args), false),
@@ -310,7 +311,8 @@ pub(super) fn refuse_library_class_splats(
     for lc in &app.library_classes {
         let owner = lc.name.0.as_str();
         for m in &lc.methods {
-            walk(&m.body, owner, Side::from(m.receiver), index, diagnostics);
+            let kwrest = m.params.iter().find(|p| p.keyword && p.rest).map(|p| &p.name);
+            walk(&m.body, owner, Side::from(m.receiver), index, kwrest, diagnostics);
         }
     }
 }
@@ -421,4 +423,18 @@ pub(super) fn refuse_send(
             diagnostics,
         );
     }
+}
+
+/// Every `**` a call passes is the enclosing method's own keyword-rest (or
+/// the anonymous forward of it): a bundle that is already keywords, which
+/// the Ruby family keeps as written.
+fn forwards_own_kwrest(args: &[Expr], kwrest: Option<&Symbol>) -> bool {
+    args.iter().all(|arg| match &*arg.node {
+        ExprNode::KeywordSplat { value } => {
+            matches!(&*value.node, ExprNode::Var { name, .. } if Some(name) == kwrest)
+        }
+        ExprNode::ForwardKeywords => true,
+        ExprNode::ForwardKeywordsWithPairs { .. } => false,
+        _ => true,
+    })
 }

@@ -277,7 +277,7 @@ fn refuse_typed_splats(
     if let Some(slots) = slots
         && splat_into_flattened(args, slots)
     {
-        refuse(e.span, &splat_refusal(slots.iter().all(|s| s.written_back)), diagnostics);
+        refuse(e.span, &splat_refusal(false), diagnostics);
     }
 }
 
