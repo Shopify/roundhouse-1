@@ -238,3 +238,59 @@ fn only_unconditional_requires_load_a_framework() {
     assert!(loaded_frameworks("require \"rails/all\"\nclass {\n").is_none());
     assert!(loaded_frameworks("require \"rails/all\"\nrequire some_path\n").is_none());
 }
+
+/// A name declared only in files the program loads through an explicit
+/// `require` is not there for `defined?` until that require runs: Core's
+/// `WithProductionJobQueue` (lib/platform/testing/with_production_job_queue.rb,
+/// no autoload root maps the file to that name) was folded to `"constant"`
+/// and raised NameError where native answers nil.
+#[test]
+fn names_only_an_explicit_require_loads_keep_their_defined() {
+    const PROBE: &str = "class Probe
+  def support_module; defined?(WithQueue); end
+  def lib_off_path; defined?(WithProductionJobQueue); end
+  def lib_off_path_guard; defined?(WithProductionJobQueue) && self.class < WithProductionJobQueue; end
+  def namespace_of_unloaded; defined?(Other::Deep); end
+  def unloaded_nested; defined?(Other::Deep::Misnamed); end
+  def implicit_namespace; defined?(Platform::Testing); end
+  def autoloaded_in_namespace; defined?(Platform::Testing::Helper); end
+  def model; defined?(Gadget); end
+  def lib_autoloaded; defined?(Outer); end
+  def lib_autoloaded_nested; defined?(Outer::Inner); end
+  def concern; defined?(Trackable); end
+  def boot_constant; defined?(Booted); end
+end
+";
+    let files: Vec<(&str, &str)> = vec![
+        ("config/application.rb", APPLICATION),
+        ("lib/probe.rb", PROBE),
+        // Required by whoever uses it; `lib/support/` names Support::WithQueue.
+        ("lib/support/with_queue.rb", "module WithQueue\nend\n"),
+        // Under `lib/`, but the path names Platform::Testing::..., not this.
+        ("lib/platform/testing/with_production_job_queue.rb", "module WithProductionJobQueue\nend\n"),
+        ("lib/platform/testing/helper.rb", "module Platform\n  module Testing\n    module Helper\n    end\n  end\nend\n"),
+        // Declares a name its path does not map to: only a require loads it,
+        // and the namespaces it implies exist only then.
+        ("lib/other/deep/thing.rb", "module Other\n  module Deep\n    module Misnamed\n    end\n  end\nend\n"),
+        // Autoloadable: app/** and a lib/ file whose path names the constant.
+        ("app/models/gadget.rb", "class Gadget\nend\n"),
+        ("app/models/concerns/trackable.rb", "module Trackable\nend\n"),
+        ("lib/outer.rb", "module Outer\n  class Inner\n  end\nend\n"),
+        // Loaded at boot.
+        ("config/initializers/booted.rb", "Booted = Struct.new(:on)\n"),
+        ("Gemfile.lock", LOCK),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::lower::defined_const_fold::apply_defined_const_fold(&mut app);
+    let b = bodies(&app);
+    assert_eq!(b["support_module"], "defined?(WithQueue)");
+    assert_eq!(b["lib_off_path"], "defined?(WithProductionJobQueue)");
+    assert_eq!(b["lib_off_path_guard"], "defined?(WithProductionJobQueue) && self.class < WithProductionJobQueue");
+    assert_eq!(b["namespace_of_unloaded"], "defined?(Other::Deep)");
+    assert_eq!(b["unloaded_nested"], "defined?(Other::Deep::Misnamed)");
+    for name in ["implicit_namespace", "autoloaded_in_namespace", "model", "lib_autoloaded", "lib_autoloaded_nested", "concern", "boot_constant"] {
+        assert_eq!(b[name], "\"constant\"", "{name}");
+    }
+}

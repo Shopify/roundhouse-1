@@ -201,6 +201,12 @@ struct Facts {
     /// Every ingested class/module/constant, fully qualified, plus every
     /// namespace prefix of one.
     tree_and_prefixes: HashSet<String>,
+    /// The subset of `tree_and_prefixes` the emitted program has whenever
+    /// app code runs: leaves out a name whose only declarations are in
+    /// files the program loads through an explicit `require` (test
+    /// support, a `lib/` file no autoload root maps to the name), and the
+    /// namespaces only such a name implies. See [`not_autoloaded`].
+    loaded: HashSet<String>,
     /// Every `::`-segment of any tree name.
     segments: HashSet<String>,
     frameworks: Option<Vec<String>>,
@@ -230,9 +236,13 @@ impl Facts {
             }
             tree.insert(name);
         }
+        let unloaded: HashSet<String> = not_autoloaded(app).into_iter().collect();
         let mut tree_and_prefixes = tree.clone();
+        let mut loaded: HashSet<String> = HashSet::new();
         let mut segments = HashSet::new();
         for name in &tree {
+            // A name nested in an unloaded one is unloaded with it.
+            let is_loaded = !name.match_indices("::").map(|(at, _)| &name[..at]).chain([name.as_str()]).any(|p| unloaded.contains(p));
             let mut acc = String::new();
             for seg in name.split("::") {
                 if !acc.is_empty() {
@@ -240,11 +250,15 @@ impl Facts {
                 }
                 acc.push_str(seg);
                 tree_and_prefixes.insert(acc.clone());
+                if is_loaded {
+                    loaded.insert(acc.clone());
+                }
                 segments.insert(seg.to_string());
             }
         }
         Facts {
             tree_and_prefixes,
+            loaded,
             segments,
             frameworks: app.loaded_frameworks.clone(),
             lock: app.gem_lock.clone(),
@@ -279,7 +293,9 @@ impl Facts {
         // constant initializer) can precede the definition, so its
         // answer depends on load order, not on the name existing: leave
         // it. Method bodies, lambdas and templates run after load.
-        let in_tree = |name: &str| !load_time && self.tree_and_prefixes.contains(name);
+        // Nor is one whose file only an explicit `require` loads
+        // (`loaded`): the emitted program has it when that require runs.
+        let in_tree = |name: &str| !load_time && self.loaded.contains(name);
         // The innermost scope that binds the head decides the lookup.
         let bound_scope = scopes
             .iter()
@@ -382,6 +398,57 @@ impl Facts {
             })
         })
     }
+}
+
+/// The ingested library classes and modules the emitted program does NOT
+/// have by itself: every file declaring one is neither autoloadable (no
+/// autoload root maps the file's path to the name or to a namespace
+/// prefix of it, so the autoload index has no entry for it) nor loaded at
+/// boot (`config/`, a boot `require`). Such a file runs only where some
+/// other file `require`s it (a test's support file, a `lib/` file outside
+/// the autoload roots), so `defined?(Const)` is nil until then and must
+/// stay a runtime question. A class the ingest did not record a declaring
+/// file for (initializer holders, app models, controllers) counts as
+/// loaded. The autoload decision is `autoload_roots::AutoloadRoots`'s, the
+/// one `project::apply_models_autoload` uses for the index.
+fn not_autoloaded(app: &App) -> Vec<String> {
+    let roots = crate::autoload_roots::AutoloadRoots::of(app);
+    let boot: HashSet<&str> = app
+        .boot_loads
+        .iter()
+        .map(|l| roots.rel(&l.source))
+        .chain(app.initializer_files.iter().map(|f| roots.rel(f)))
+        .collect();
+    let at_boot = |source: &str| {
+        let rel = roots.rel(source);
+        rel.starts_with("config/") || boot.contains(rel)
+    };
+    let managed = |source: &str, name: &str| {
+        if at_boot(source) {
+            return true;
+        }
+        // The file is the autoload of the name, or of a namespace it
+        // declares the name in (`module A; class B` in a.rb).
+        let mut prefix = String::new();
+        name.split("::").any(|seg| {
+            if !prefix.is_empty() {
+                prefix.push_str("::");
+            }
+            prefix.push_str(seg);
+            roots.source_names(source, &crate::naming::underscore(&prefix))
+        })
+    };
+    let mut declared: crate::det::HashMap<&str, bool> = crate::det::HashMap::default();
+    for (source, names) in &app.library_class_files {
+        for name in names {
+            let name = name.0.as_str();
+            let ok = managed(source, name);
+            *declared.entry(name).or_insert(false) |= ok;
+        }
+    }
+    let mut out: Vec<String> = declared.into_iter().filter(|(_, ok)| !ok).map(|(n, _)| n.to_string()).collect();
+    out.sort();
+    out
 }
 
 /// The expression roots that run while the tree loads, by address (the
