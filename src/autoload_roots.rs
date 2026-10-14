@@ -38,7 +38,17 @@ impl<'a> AutoloadRoots<'a> {
     /// Podding::Patches::ActiveRecord, not the ActiveRecord it reopens.
     pub fn is_root(&self, dir: &[&str]) -> bool {
         let n = dir.len();
-        (n >= 1 && dir[n - 1] == "lib")
+        (n >= 1 && dir[n - 1] == "lib") || self.is_autoload_root(dir)
+    }
+
+    /// [`is_root`](Self::is_root) without a component's or engine's own
+    /// `lib/` (`components/x/lib`) on the load path: a file there is found
+    /// by a `require`, and only an autoload root makes its constant
+    /// defined before anything requires it. The app's top-level `lib/`
+    /// stays one (`config.autoload_lib`).
+    pub fn is_autoload_root(&self, dir: &[&str]) -> bool {
+        let n = dir.len();
+        dir == ["lib"]
             || (n >= 2 && dir[n - 2] == "app")
             || (n >= 3 && dir[n - 1] == "concerns" && dir[n - 3] == "app")
             || self.loader_roots.contains(dir.join("/").as_str())
@@ -66,7 +76,10 @@ impl<'a> AutoloadRoots<'a> {
     /// Does an autoload root map `source` to the constant `underscored`
     /// (`a/b/c` for `A::B::C`), compared as Zeitwerk's camelize would,
     /// without underscores and case (`organizations_api.rb` for
-    /// OrganizationsAPI)?
+    /// OrganizationsAPI)? An engine's `lib/` on the load path is no autoload
+    /// root: Core's essentials `lib/verdict/evaluation_tracker.rb` is
+    /// defined only once the to_prepare hook requires it, which is why
+    /// `CapturesEventReporterContext#initialize` asks `defined?` first.
     pub fn source_names(&self, source: &str, underscored: &str) -> bool {
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
         let rel = self.rel(source);
@@ -77,6 +90,6 @@ impl<'a> AutoloadRoots<'a> {
             return false;
         }
         let (dir, named) = segments.split_at(segments.len() - depth);
-        fold(&named.join("/")) == fold(underscored) && self.is_root(dir)
+        fold(&named.join("/")) == fold(underscored) && self.is_autoload_root(dir)
     }
 }
