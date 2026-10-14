@@ -1780,7 +1780,13 @@ module ActiveRecord
     # they drive a Relation or `_adapter_*` directly. A String or an
     # Array (`where(["state IN (?)", values])`, state_machines' `with_*`
     # scopes) is Relation#where's SQL form.
-    def self.where(conditions, *args)
+    #
+    # With no argument, Rails answers a `WhereChain` (`Model.where.not(…)`,
+    # `Model.where.missing(:assoc)`); here the fresh relation is that
+    # chain, `Relation#where` and `#not` being what `where` answers on a
+    # relation already.
+    def self.where(conditions = nil, *args)
+      return ActiveRecord::Relation.new(self).where if conditions.nil? && args.empty?
       return ActiveRecord::Relation.new(self).where(conditions, *args) if conditions.is_a?(String) || conditions.is_a?(Array)
       ActiveRecord::Relation.new(self).where(conditions.to_h)
     end

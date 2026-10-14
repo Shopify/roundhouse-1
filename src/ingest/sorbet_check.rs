@@ -1073,6 +1073,7 @@ pub(crate) fn erase_generic_applications(app: &mut crate::App) {
         false
     };
     let mut generic: crate::det::HashSet<String> = known.iter().filter(|name| applies_self(name)).cloned().collect();
+    define_generic_application(app, &declared);
     if generic.is_empty() {
         return;
     }
@@ -1150,6 +1151,46 @@ pub(crate) fn erase_generic_applications(app: &mut crate::App) {
                 f(initializer);
             }
         }
+    }
+}
+
+/// The `T::Generic#[]` the dropped `extend T::Generic` provided, defined
+/// on each emitted class or module that declared it and has no class-side
+/// `[]` of its own: `def self.[](*types); self; end`. The tree's own code
+/// no longer applies a generic (above), but a gem that loads real
+/// sorbet-runtime still does in its `sig` blocks, against the emitted
+/// module (shopify_metafields' `::Shopify::Adt::Result[T.attached_class,
+/// ...]`, run when the gem's `Type.coerce` is defined).
+fn define_generic_application(app: &mut crate::App, declared: &crate::det::HashSet<String>) {
+    for lc in &mut app.library_classes {
+        if !declared.contains(lc.name.0.as_str()) {
+            continue;
+        }
+        let has_index = lc
+            .methods
+            .iter()
+            .any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "[]");
+        if has_index {
+            continue;
+        }
+        let span = crate::span::Span::synthetic();
+        lc.methods.push(crate::dialect::MethodDef {
+            name_span: span.clone(),
+            name: Symbol::from("[]"),
+            receiver: crate::dialect::MethodReceiver::Class,
+            visibility: crate::dialect::MethodVisibility::Public,
+            params: vec![crate::dialect::Param::rest(Symbol::from("types"))],
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: Expr::new(span, ExprNode::SelfRef),
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(lc.name.0.clone()),
+            kind: crate::dialect::AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
     }
 }
 

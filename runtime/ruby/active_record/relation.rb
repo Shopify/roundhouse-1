@@ -58,6 +58,15 @@ module ActiveRecord
   # returns this same object, mutated), and a stale cache there would
   # serve the pre-refinement rows.
   class Relation
+    # Rails' Relation includes Enumerable and iterates its loaded records
+    # (`each` below), so every Enumerable method it does not name itself
+    # (`filter_map`, `reject`, `flat_map`, `each_with_index`, `min_by`,
+    # `zip`, `tally`, …) answers over the records, as a loaded Array
+    # would. The methods written out in this class keep their relation
+    # meaning (`select(:id)`, `count`, `sum(:col)`, `first`, `find(id)`,
+    # `include?`) and take the Enumerable form only when given a block.
+    include Enumerable
+
     # `default_scoped` false is `Model.unscoped`: the class's
     # `default_scope` (Base#_apply_default_scope) is not applied.
     def initialize(model, default_scoped = true)
@@ -384,6 +393,39 @@ module ActiveRecord
     def not(condition = nil, *args)
       add_condition(condition, args, true)
       self
+    end
+
+    # `where.missing(:assoc)` — WhereChain#missing: rows with no
+    # associated record. `where` with no condition answers the relation
+    # itself (the chain methods, `not` above among them, live here), so
+    # the hop lands on this method. A LEFT OUTER JOIN to the association
+    # and a NULL key on its table, as Rails writes it.
+    def missing(*associations)
+      associations.each do |name|
+        reflection = reflect_join_hop(@model, name)
+        left_outer_joins(name)
+        push_where("(#{reflection.klass._table_sql}.#{reflection_key_column(reflection)} IS NULL)")
+      end
+      self
+    end
+
+    # `where.associated(:assoc)` — WhereChain#associated: rows with an
+    # associated record. An INNER JOIN and a non-NULL key on its table.
+    def associated(*associations)
+      associations.each do |name|
+        reflection = reflect_join_hop(@model, name)
+        joins(name)
+        push_where("NOT (#{reflection.klass._table_sql}.#{reflection_key_column(reflection)} IS NULL)")
+      end
+      self
+    end
+
+    # The column `missing` / `associated` test for NULL: the target's
+    # primary key (the association primary key of a belongs_to).
+    def reflection_key_column(reflection)
+      key = reflection.belongs_to? ? reflection.association_primary_key : reflection.klass.primary_key
+      key = key.first if key.is_a?(Array)
+      key.to_s
     end
 
     # Rails' `excluding(…)` — everything in this relation except what is
@@ -1195,7 +1237,8 @@ module ActiveRecord
     # mode (`@select_sql` an EMPTY string, so the next hop emitted
     # `SELECT  FROM memberships …`) was silent until something forced
     # the query. Raise instead.
-    def select(*specs)
+    def select(*specs, &block)
+      return filter(&block) if block
       raise ArgumentError, "select: no columns (a block form reached the projection)" if specs.empty?
       unload_records
       cols = []
@@ -1575,7 +1618,56 @@ module ActiveRecord
       records
     end
 
+    # The Array methods Rails' ActiveRecord::Delegation hands to the
+    # loaded records (`delegate :join, :[], :sample, :reverse, :rotate,
+    # :compact, :shuffle, :slice, :index, :rindex, :intersect?, … to:
+    # :records`), over the same `loaded_records` the block forms read.
+    def [](*args)
+      loaded_records[*args]
+    end
+
+    def slice(*args)
+      loaded_records.slice(*args)
+    end
+
+    def join(separator = $,)
+      loaded_records.join(separator)
+    end
+
+    def sample(*args)
+      loaded_records.sample(*args)
+    end
+
+    def shuffle(*args)
+      loaded_records.shuffle(*args)
+    end
+
+    def reverse
+      loaded_records.reverse
+    end
+
+    def rotate(count = 1)
+      loaded_records.rotate(count)
+    end
+
+    def compact
+      loaded_records.compact
+    end
+
+    def index(*args, &block)
+      loaded_records.index(*args, &block)
+    end
+
+    def rindex(*args, &block)
+      loaded_records.rindex(*args, &block)
+    end
+
+    def intersect?(other)
+      loaded_records.intersect?(other.to_a)
+    end
+
     def each
+      return to_enum(:each) { loaded_records.length } unless block_given?
       records = loaded_records
       i = 0
       n = records.length
@@ -1907,7 +1999,8 @@ module ActiveRecord
       limit
     end
 
-    def count
+    def count(&block)
+      return loaded_records.count(&block) if block
       return 0 if @null
       rows = ActiveRecord.adapter.select_rows(bound_count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
@@ -1917,7 +2010,11 @@ module ActiveRecord
     # Returns Float: both corpus consumers are float arithmetic
     # (lobsters' hotness math); an Integer-column caller would want
     # column typing here, ledgered when one appears.
-    def sum(expr)
+    def sum(expr = nil, &block)
+      # Rails: with a block the argument is the initial value and the sum
+      # is Enumerable's over the records; without one it names the column.
+      return loaded_records.sum(expr.nil? ? 0 : expr, &block) if block
+      raise ArgumentError, "sum: a column name or a block" if expr.nil?
       return 0.0 if @null
       term = expr.is_a?(Symbol) ? "#{@table}.#{expr}" : expr.to_s
       sql = "SELECT COALESCE(SUM(#{term}), 0) AS n FROM #{@table}"
@@ -2094,7 +2191,8 @@ module ActiveRecord
       r.nil? ? !exists? : r.length == 0
     end
 
-    def any?
+    def any?(*pattern, &block)
+      return loaded_records.any?(*pattern, &block) if block || !pattern.empty?
       return false if @null
       r = @records
       r.nil? ? exists? : r.length > 0
@@ -2115,19 +2213,22 @@ module ActiveRecord
     end
 
     # Enumerable#none? without a block is empty? (uses the loaded cache).
-    def none?
+    def none?(*pattern, &block)
+      return loaded_records.none?(*pattern, &block) if block || !pattern.empty?
       empty?
     end
 
     # Exactly one row. Unloaded: SELECT 1 LIMIT 2. No block form.
-    def one?
+    def one?(*pattern, &block)
+      return loaded_records.one?(*pattern, &block) if block || !pattern.empty?
       r = @records
       return r.length == 1 unless r.nil?
       probe_existence(2) == 1
     end
 
     # More than one row. Unloaded: SELECT 1 LIMIT 2.
-    def many?
+    def many?(&block)
+      return loaded_records.count(&block) > 1 if block
       r = @records
       return r.length > 1 unless r.nil?
       probe_existence(2) > 1
@@ -2427,7 +2528,8 @@ module ActiveRecord
     # wheres here are SQL text with the values already filled in, so
     # the suffix could not match. An unscoped relation's message is
     # exactly Rails'.
-    def find(id)
+    def find(id = nil, &block)
+      return loaded_records.find(&block) if block
       if @model.composite_primary_key?
         raise NotImplementedError, "roundhouse: find on a relation of #{@model.name}, whose primary key is composite, is not supported"
       end
