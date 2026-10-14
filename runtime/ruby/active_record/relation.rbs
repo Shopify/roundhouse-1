@@ -84,6 +84,7 @@ module ActiveRecord
     # it from the bare `{}` in `initialize`, which carries no element
     # type — the same trap `Base`'s `@errors` documents.
     @scope_attributes: Hash[Symbol, untyped]
+    @create_with: Hash[Symbol, untyped]
     @wheres: Array[String]
     @where_parts: Hash[String, Array[Array[String]]]
     @where_null: Array[bool]
@@ -187,6 +188,7 @@ module ActiveRecord
     def readonly: (?bool value) -> Relation
     def schema_group_column: (String group) -> untyped
     def scope_for_create: () -> Hash[String, untyped]
+    def create_with: (untyped attrs) -> Relation
     def unscope: (*untyped args) -> Relation
     def unscope_clause: (untyped scope) -> untyped
     def unscope_column_name: (String name) -> String
@@ -363,6 +365,8 @@ module ActiveRecord
     def distinct_count_columns: () -> String
     def exists_sql: (Integer n) -> String
     def hash_conditions: (Hash[String | Symbol, untyped] hash, ?bool note) -> String
+    def association_key_reflection: (String column) -> untyped
+    def association_key_predicates: (untyped reflection, untyped val, bool note) -> Array[[String, String]]
     def column_predicate: (String col, Relation | Array[untyped] | Base | String | Integer | Float | bool | nil val, ?bool note) -> String
     def note_equality: (String? own, String | Integer | Float | bool | nil val) -> nil
     def bound_exists_sql: (Integer n) -> String

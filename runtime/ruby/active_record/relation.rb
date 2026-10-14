@@ -92,6 +92,7 @@ module ActiveRecord
       @null = false
       @records = nil
       @scope_attributes = {}
+      @create_with = {}
       # Parallel to `@wheres`: true when that clause forced NullRelation
       # (`none` / empty IN). Unscope clears `@null` only when none remain —
       # never by scanning SQL text (a value like title "1=0" must not stick).
@@ -184,10 +185,23 @@ module ActiveRecord
     end
 
     # Rails' `scope_for_create`: the equality-only `where_values_hash`
-    # (IN lists left out, as in Rails). `create_with` is not supported,
-    # so there are no extra values to merge.
+    # (IN lists left out, as in Rails) with the `create_with` values
+    # over it.
     def scope_for_create
-      where_values_hash
+      out = where_values_hash
+      @create_with.each { |col, val| out[col.to_s] = val }
+      out
+    end
+
+    # Rails' `create_with(attrs)`: attributes a record built through this
+    # relation starts with, winning over the `where` equalities and
+    # losing to the attributes the caller gives. A `belongs_to` name is
+    # kept as the association assignment it is (`new(service: record)`);
+    # `create_with(nil)` resets them.
+    def create_with(attrs)
+      own_lists
+      @create_with = attrs.nil? ? {} : @create_with.merge(attrs.to_h.transform_keys(&:to_sym))
+      self
     end
 
     # Rails' `Relation#unscoped`: the model's relation with nothing
@@ -214,7 +228,8 @@ module ActiveRecord
     # `new`, and `scope_chain` builds a typed relation's through the
     # model.
     def build(attrs = {})
-      merged = @scope_attributes.empty? ? attrs : @scope_attributes.merge(attrs)
+      seed = scope_attributes
+      merged = seed.empty? ? attrs : seed.merge(attrs)
       return @model.new(merged) if @default_scoped
       @model.unscoped { @model.new(merged) }
     end
@@ -385,7 +400,7 @@ module ActiveRecord
     # Rails' `scope_for_create`: the attributes a record built through
     # this relation starts with. Empty for a relation nobody scoped.
     def scope_attributes
-      @scope_attributes
+      @create_with.empty? ? @scope_attributes : @scope_attributes.merge(@create_with)
     end
 
     # `where.not(...)` is lowered to `not(...)` on the relation: negate the
@@ -3040,13 +3055,72 @@ module ActiveRecord
         else
           # An alias names its column (`where(subdomain:)`).
           column = @model._attribute_name(key.to_s)
-          predicate = column_predicate(column, val, note)
-          parts << predicate
-          named << [column, predicate]
+          reflection = association_key_reflection(column)
+          if reflection.nil?
+            predicate = column_predicate(column, val, note)
+            parts << predicate
+            named << [column, predicate]
+          else
+            association_key_predicates(reflection, val, note).each do |col, predicate|
+              parts << predicate
+              named << [col, predicate]
+            end
+          end
         end
       end
       @hash_parts = named
       parts.join(" AND ")
+    end
+
+    # The `belongs_to` a condition key NAMES, when it is not a column of
+    # this model: Rails' predicate builder expands `where(service: record)`
+    # to the foreign key (`service_id = record.id`) and, polymorphic, the
+    # type column as well (`expand_from_hash`, `table.associated_with?`),
+    # through the model's reflections. nil for a column, a name no
+    # association has, and a model that answers no reflections.
+    def association_key_reflection(column)
+      return nil if column.include?(".") || @model.schema_columns.include?(column.to_sym)
+      return nil unless @model.respond_to?(:reflect_on_association)
+      reflection = @model.reflect_on_association(column.to_sym)
+      return nil if reflection.nil? || !reflection.respond_to?(:belongs_to?) || !reflection.belongs_to?
+      reflection
+    end
+
+    # `[column, predicate]` per column the association key expands to.
+    # A polymorphic key names its type too (the record's
+    # `polymorphic_name`; one OR group per type for a list of records).
+    # A composite foreign key takes one record (its key columns zipped
+    # with the association's primary key); a list of them is named as
+    # unsupported rather than answered wrong.
+    def association_key_predicates(reflection, val, note)
+      fk = reflection.foreign_key
+      if fk.is_a?(Array)
+        raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite foreign key " \
+          "#{fk.inspect} takes one record or nil" unless val.nil? || val.is_a?(Base)
+        pks = reflection.association_primary_key
+        pks = [pks] unless pks.is_a?(Array)
+        return fk.each_with_index.map do |col, i|
+          col = col.to_s
+          [col, column_predicate(col, val.nil? ? nil : val.public_send(pks[i]), note)]
+        end
+      end
+      fk = fk.to_s
+      return [[fk, column_predicate(fk, val, note)]] unless reflection.polymorphic?
+      type = reflection.foreign_type.to_s
+      if val.is_a?(Array) || val.is_a?(Relation)
+        groups = {}
+        (val.is_a?(Relation) ? val.to_a : val).each do |record|
+          name = record.is_a?(Base) ? record.class.polymorphic_name : nil
+          (groups[name] ||= []) << (record.is_a?(Base) ? record.id : record)
+        end
+        return [[fk, "1=0"]] if groups.empty?
+        ors = groups.map do |name, ids|
+          "(#{column_predicate(type, name)} AND #{column_predicate(fk, ids)})"
+        end
+        return [[fk, ors.length == 1 ? ors[0] : "(#{ors.join(" OR ")})"]]
+      end
+      name = val.is_a?(Base) ? val.class.polymorphic_name : nil
+      [[type, column_predicate(type, name, note)], [fk, column_predicate(fk, val, note)]]
     end
 
     # Unqualified columns are qualified with this relation's own table

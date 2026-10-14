@@ -82,9 +82,15 @@ module ActiveRecord
             records = []
             owner.instance_variable_set(:"@#{name}_cache", records)
           end
-          records << record unless records.any? { |r| r.equal?(record) }
+          push_target(records, record) unless records.any? { |r| r.equal?(record) }
         end
         record
+      end
+
+      # A record added to a target the way Rails' `add_to_target` adds it:
+      # held, not saved. The proxy's own `<<` is `concat`, which saves.
+      def self.push_target(records, record)
+        records.is_a?(CollectionProxy) ? records._push_target(record) : records << record
       end
 
       # `owner.<name> << record` / `.push(record, …)`, which the
@@ -105,12 +111,12 @@ module ActiveRecord
         owner._await_preload if owner.respond_to?(:_await_preload)
         target = owner.public_send(name)
         unless owner.instance_variable_get(:"@#{name}_loaded") == true && owner.respond_to?(:_insert_record)
-          records.each { |record| target << record }
+          records.each { |record| push_target(target, record) }
           return target
         end
         add = lambda do |record|
           owner._set_inverse_instance(name, record) if owner.respond_to?(:_set_inverse_instance)
-          target << record unless target.any? { |r| r.equal?(record) }
+          push_target(target, record) unless target.any? { |r| r.equal?(record) }
         end
         if owner.new_record?
           records.each { |record| add.call(record) }
@@ -481,13 +487,17 @@ module ActiveRecord
       # A collection's target is an Array before anything loads, so a
       # caller may append to it (`association(:events).target << event`)
       # and read it back.
+      #
+      # Rails' target is the Array under the proxy, which holds what is
+      # appended without saving it; the proxy itself, as the owner's
+      # cache, saves on `<<`. So a proxy answers its `target` view.
       def target
         records = super
         if records.nil?
           records = []
           @owner.instance_variable_set(@cache_ivar, records)
         end
-        records
+        records.is_a?(CollectionProxy) ? records.target : records
       end
 
       def reset
@@ -547,7 +557,7 @@ module ActiveRecord
         if inverse.is_a?(CollectionAssociation)
           if inverse.loaded?
             records = inverse.target
-            records << @owner unless records.any? { |r| r.equal?(@owner) }
+            Association.push_target(records, @owner) unless records.any? { |r| r.equal?(@owner) }
           end
         else
           inverse.inversed_from(@owner)
@@ -794,8 +804,9 @@ module ActiveRecord
     # `loaded?` (always: the reader loads), and any other Relation
     # method, which runs on the scope. Array's own methods keep Array's meaning, which for a
     # loaded proxy is Rails' (`first`, `size`, `each`, `include?`);
-    # `<<` / `push` stay Array's (the lowering writes a statically seen
-    # `owner.items << record` as `Association.concat`).
+    # `<<` / `push` / `concat` are Rails' `concat` (`Association.concat`),
+    # which the lowering also writes for a statically seen
+    # `owner.items << record`.
     class CollectionProxy < Array
       # The reader's records as the proxy, stored as the owner's target.
       def self.wrap(owner, name, records)
@@ -803,6 +814,11 @@ module ActiveRecord
         proxy = new(owner, name, records || [])
         owner.instance_variable_set(:"@#{name}_cache", proxy)
         proxy
+      end
+
+      # The records of a collection cache as the Array under any proxy.
+      def self.target_of(records)
+        records.is_a?(CollectionProxy) ? records.target : records
       end
 
       attr_reader :proxy_owner, :proxy_name
@@ -813,8 +829,67 @@ module ActiveRecord
         @proxy_name = name
       end
 
+      ARRAY_PUSH = Array.instance_method(:<<)
+      ARRAY_REPLACE = Array.instance_method(:replace)
+
       def proxy_association
         @proxy_owner.association(@proxy_name)
+      end
+
+      # The record held, not saved (Rails' `add_to_target`).
+      def _push_target(record)
+        ARRAY_PUSH.bind_call(self, record)
+      end
+
+      def _replace_target(records)
+        ARRAY_REPLACE.bind_call(self, records)
+      end
+
+      # `owner.items << record` / `push` / `append` / `concat(records)`:
+      # Rails' CollectionProxy#concat, which saves the record at once on
+      # a saved owner (under its key, in one transaction) and keeps it
+      # for the owner's save on a new one. The lowering writes a
+      # statically seen `owner.items << record` as `Association.concat`;
+      # this is the same for a receiver it could not name (an ambiguous
+      # association name, a local, a block parameter). Answers the proxy.
+      def <<(record)
+        Association.concat(@proxy_owner, @proxy_name, record)
+        self
+      end
+
+      def push(*records)
+        Association.concat(@proxy_owner, @proxy_name, *records)
+        self
+      end
+      alias_method :append, :push
+
+      def concat(*records)
+        Association.concat(@proxy_owner, @proxy_name, *records)
+        self
+      end
+
+      # Rails' `target`: the Array under the proxy, which a caller may
+      # change without saving anything (`association(:items).target <<
+      # item`). A copy that writes every change back to the proxy.
+      def target
+        TargetArray.new(self)
+      end
+
+      class TargetArray < Array
+        def initialize(proxy)
+          super(proxy)
+          @proxy = proxy
+        end
+
+        %i[<< push append concat unshift prepend insert delete delete_at delete_if reject! select! filter! keep_if
+           map! collect! compact! uniq! sort! sort_by! reverse! shuffle! rotate! flatten! pop shift clear replace
+           fill slice! []=].each do |mutator|
+          define_method(mutator) do |*args, **kwargs, &block|
+            result = super(*args, **kwargs, &block)
+            @proxy._replace_target(self)
+            result.equal?(self) ? self : result
+          end
+        end
       end
 
       def loaded?

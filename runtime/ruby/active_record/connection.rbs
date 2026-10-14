@@ -234,6 +234,7 @@ module ActiveRecord
     def self._scoped_reads?: () -> bool
     def self.lock: (?(String | bool)? locks) -> Relation
     def self.unscope: (*untyped args) -> Relation
+    def self.create_with: (untyped attrs) -> Relation
     def self.and: (Relation other) -> Relation
     def self.or: (Relation other) -> Relation
     def self.current_scope: (?bool skip_inherited_scope) -> untyped
