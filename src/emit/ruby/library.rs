@@ -11241,6 +11241,7 @@ fn emit_library_class_decl_inner(
     }
     // The eager constants written so far, by index.
     let written: std::cell::RefCell<BTreeSet<usize>> = std::cell::RefCell::new(BTreeSet::new());
+    let call_spans: Vec<crate::span::Span> = replayed.iter().map(|call| call.span).collect();
     let render_constants = |s: &mut String, which: &[usize]| {
         // A nested class the source has above this point, below an
         // earlier constant (`NestedPlacement`). One another file of the
@@ -11250,6 +11251,10 @@ fn emit_library_class_decl_inner(
         // collocated_enforcement.rb writes `WHITELISTED_GEM_NAMES` and
         // then `module CollocatedEnforcement`, which client.rb's
         // `extend CollocatedEnforcement` (after its require) reads.
+        // Not before a call that file's body makes above the class
+        // (`const_set(:Connection, ...)` then `class Connection`, Core's
+        // graph_api/storefront/product/connection.rb): the call runs
+        // after the constants, and the class reopens what it built.
         let place_above = |s: &mut String, at: crate::span::Span| {
             if at != crate::span::Span::synthetic() {
                 let written = written.borrow();
@@ -11260,6 +11265,8 @@ fn emit_library_class_decl_inner(
                     eager.iter().all(|&i| {
                         let value = lc.constants[i].1.span;
                         value.file != kid.file || value.start >= kid.start || written.contains(&i)
+                    }) && !call_spans.iter().any(|call| {
+                        *call != crate::span::Span::synthetic() && call.file == kid.file && call.start < kid.start
                     })
                 });
             }
@@ -11580,7 +11587,7 @@ fn emit_library_class_decl_inner(
         let text = if railtie {
             super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
         } else {
-            super::emit_expr(effect)
+            idempotent_const_set(effect).unwrap_or_else(|| super::emit_expr(effect))
         };
         let (pad, text) = if railtie {
             writeln!(s, "{body_pad}run_body_statement({:?}) do", statement_site(app, effect.span)).unwrap();
@@ -13852,6 +13859,9 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
     if reopens_loaded_gem_class(lc, app) {
         return true;
     }
+    if built_by_const_set(lc, app) {
+        return true;
+    }
     if lc.is_module {
         return !is_concern_body(lc) && includes_loaded_gem_module(lc, app, &mut Vec::new());
     }
@@ -13878,6 +13888,30 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
         parent = classes.into_iter().find_map(|c| c.parent.as_ref());
     }
     false
+}
+
+/// A nested class its enclosing class's body builds with `const_set(:Leaf,
+/// ...)` before this reopening (`const_set(:Connection,
+/// GraphApi::Relay::Connection.for(Product))` then `class Connection`,
+/// Core's graph_api/storefront/product/connection.rb): the class is the
+/// built one, so its ancestors are whatever the call made, and its DSL
+/// calls (`field :filters`) run on them. Replayed as written, as a body
+/// over a base we do not model.
+fn built_by_const_set(lc: &LibraryClass, app: &App) -> bool {
+    if lc.is_module || lc.parent.is_some() {
+        return false;
+    }
+    let Some((owner, leaf)) = lc.name.0.as_str().rsplit_once("::") else { return false };
+    library_classes_named(owner, app).iter().any(|owner| {
+        owner.unknown_calls.iter().any(|call| {
+            let ExprNode::Send { recv, method, args, .. } = &*call.node else { return false };
+            method.as_str() == "const_set"
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && args.first().is_some_and(|name| {
+                    matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == leaf)
+                })
+        })
+    })
 }
 
 /// The spans of the body statements the app's classes carry
@@ -14785,6 +14819,30 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || splatted_delegate_call(c)
         })
         .collect()
+}
+
+/// `const_set(:Name, value)` as a class-body statement, written so it sets
+/// the constant unless it already holds that very object. Core's
+/// graph_api/storefront/product/connection.rb is `const_set(:Connection,
+/// GraphApi::Relay::Connection.for(Product))`, and `for` sets
+/// `Product::Connection` itself. Zeitwerk loads that file while
+/// `Product::Connection` is an autoload in progress, where Ruby takes the
+/// second set quietly; the tree has the file's body in Product's own, no
+/// autoload under way, so the repeat is "already initialized constant"
+/// (a StrictWarning offense). A different object is still assigned, with
+/// the warning Ruby gives for it.
+fn idempotent_const_set(call: &Expr) -> Option<String> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+    if method.as_str() != "const_set" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+        return None;
+    }
+    let [name, value] = args.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: constant } } = &*name.node else { return None };
+    let value = super::emit_expr(value);
+    let constant = constant.as_str();
+    Some(format!(
+        "__const_set_value = {value}\nconst_set(:{constant}, __const_set_value) unless const_defined?(:{constant}, false) && const_get(:{constant}, false).equal?(__const_set_value)"
+    ))
 }
 
 /// `delegate(*CONST.keys, to: :upstream)`: a `delegate` whose names a

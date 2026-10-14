@@ -18705,6 +18705,20 @@ mod tests {
         assert!(autoload_primary("models/pagination/other", alias).is_none());
         // A second statement after the alias is not one constant.
         assert!(autoload_primary("models/pagination/collection_query", &format!("{alias}puts 1\n")).is_none());
+        // The guard om96 writes when the alias target lives under a
+        // namespace that may itself autoload (`unless Object.autoload?(...)
+        // || defined?(...)`) is a leading require too: Core's
+        // payments_partners/inputs/shipping_line_item.rb loaded at boot and
+        // its tests hit the NameError for the constant instead.
+        let guarded = "require_relative \"../shipping_line_item\" unless Object.autoload?(:PaymentsPartners, false) || defined?(::PaymentsPartners::ShippingLineItem)\n\nPaymentsPartners::Inputs::ShippingLineItem = PaymentsPartners::ShippingLineItem\n";
+        assert_eq!(
+            autoload_primary("models/payments_partners/inputs/shipping_line_item", guarded),
+            Some(vec![
+                ("PaymentsPartners".to_string(), true),
+                ("Inputs".to_string(), true),
+                ("ShippingLineItem".to_string(), false),
+            ])
+        );
     }
 
     /// ruby-tlsh, which Bundler cannot autorequire and Core's models

@@ -2793,24 +2793,28 @@ end
 # puts on `ActiveSupport::TestCase` itself: `test \"name\" do … end` in a
 # class body, run as the body loads (a loop over a collection, a class
 # method that declares tests), defines `test_<name, whitespace as _>`.
-module RoundhouseTestDeclarative
-  def test(name, &block)
-    test_name = \"test_#{name.gsub(/\\s+/, '_')}\".to_sym
-    defined = method_defined?(test_name)
-    raise \"#{test_name} is already defined in #{self}\" if defined
+module ActiveSupport
+  module Testing
+    module Declarative
+      def test(name, &block)
+        test_name = \"test_#{name.gsub(/\\s+/, '_')}\".to_sym
+        defined = method_defined?(test_name)
+        raise \"#{test_name} is already defined in #{self}\" if defined
 
-    if block
-      define_method(test_name, &block)
-    else
-      define_method(test_name) do
-        flunk \"No implementation provided for #{name}\"
+        if block
+          define_method(test_name, &block)
+        else
+          define_method(test_name) do
+            flunk \"No implementation provided for #{name}\"
+          end
+        end
       end
     end
   end
 end
 class TestBase
   extend RoundhouseEarlyTestCallbacks
-  extend RoundhouseTestDeclarative
+  extend ActiveSupport::Testing::Declarative
 end
 module ActiveSupport
   TestCase = ::TestBase

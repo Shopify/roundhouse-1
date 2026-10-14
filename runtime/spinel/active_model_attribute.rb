@@ -308,3 +308,73 @@ module ActiveModel
       private_constant :FromDatabase, :FromUser, :Null, :Uninitialized, :WithCastValue
   end
 end
+
+# ActiveRecord::Relation::QueryAttribute (activerecord 8.2.0.alpha,
+# lib/active_record/relation/query_attribute.rb): the attribute a bind
+# value is wrapped in. Core builds one per column of a VALUES row
+# (`InventoryItemVariant.product_variant_pairs_join`), which the Arel
+# visitors bind through `visit_ActiveModel_Attribute`. Difference:
+# `StatementCache::Substitute` is not ported (no prepared statement cache),
+# so a value is never one.
+module ActiveRecord
+  class Relation
+    class QueryAttribute < ActiveModel::Attribute # :nodoc:
+      def initialize(...)
+        super
+
+        # The query attribute value may be mutated before we actually "compile" the query.
+        # To avoid that if the type uses a serializer we eagerly compute the value for database
+        if @type.serialized?
+          value_for_database
+        elsif @type.mutable? # If the type is simply mutable, we deep_dup it.
+          unless @value_before_type_cast.frozen?
+            @value_before_type_cast = @value_before_type_cast.deep_dup
+          end
+        end
+      end
+
+      def type_cast(value)
+        value
+      end
+
+      def value_for_database
+        @value_for_database = _value_for_database unless defined?(@value_for_database)
+        @value_for_database
+      end
+
+      def with_cast_value(value)
+        QueryAttribute.new(name, value, type)
+      end
+
+      def nil?
+        value_before_type_cast.nil? ||
+          (type.respond_to?(:subtype) || type.respond_to?(:normalizer)) && serializable? && value_for_database.nil?
+      end
+
+      def infinite?
+        infinity?(value_before_type_cast) || serializable? && infinity?(value_for_database)
+      end
+
+      def unboundable?
+        unless defined?(@_unboundable)
+          serializable? { |value| @_unboundable = value <=> 0 } && @_unboundable = nil
+        end
+        @_unboundable
+      end
+
+      def ==(other)
+        super && value_for_database == other.value_for_database
+      end
+      alias eql? ==
+
+      def hash
+        [self.class, name, value_for_database, type].hash
+      end
+
+      private
+        def infinity?(value)
+          value.respond_to?(:infinite?) && value.infinite?
+        end
+    end
+  end
+end

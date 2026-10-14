@@ -31,6 +31,9 @@ fn attributes_answer_like_activemodel() {
         "direct ActiveModel::Attribute::FromDatabase: raised NameError: private constant ActiveModel::Attribute::FromDatabase referenced",
         "from_database value: 1",
         "with_value_from_user changed?: [true, false]",
+        "QueryAttribute superclass: \"ActiveModel::Attribute\"",
+        "QueryAttribute value_for_database: 1",
+        "QueryAttribute unboundable?: [nil, 1, -1]",
         "null with_value_from_user: raised ActiveModel::MissingAttributeError: can't write unknown attribute `n`",
     ] {
         assert!(stdout.contains(seen), "missing observation {seen:?}\n{stdout}");
