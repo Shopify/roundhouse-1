@@ -125,7 +125,8 @@ fn file_level_statements_conditional_definitions_and_a_file_level_return_run_as_
     let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).expect("app/models.rb");
     // Loaded where they are required, not at boot.
     for file in ["extras", "extra_one", "never"] {
-        assert!(!models.contains(&format!("\"models/roundhouse_files/lib/registry/{file}\"")), "{models}");
+        // A boot require line; the autoload table below names them too, to load them on demand.
+        assert!(!models.contains(&format!("  \"models/roundhouse_files/lib/registry/{file}\",\n")), "{models}");
     }
     assert!(models.contains("  \"models/roundhouse_files/lib/registry/iso\",\n"), "{models}");
     let iso = std::fs::read_to_string(run.emitted.join("app/models/roundhouse_files/lib/registry/iso.rb")).expect("iso program");
