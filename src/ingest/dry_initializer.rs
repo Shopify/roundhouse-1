@@ -334,7 +334,9 @@ fn extends_initializer(call: &Expr) -> bool {
         if method.as_str() == "extend" && args.len() == 1 && is_const(&args[0], "Dry::Initializer"))
 }
 
-fn is_initializer_declaration(call: &Expr) -> bool {
+/// A `extend Dry::Initializer` or `param`/`option` call: the declarations a
+/// refused hierarchy keeps as unmodeled calls and no tree carries.
+pub(crate) fn is_initializer_declaration(call: &Expr) -> bool {
     extends_initializer(call)
         || matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
             if matches!(method.as_str(), "param" | "option"))
