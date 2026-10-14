@@ -2051,8 +2051,9 @@ impl<'a> BodyTyper<'a> {
                 } else {
                     ty
                 };
-                // Not a class the emitted program has: the indifferent hash is a plain Hash there, so only its `new` is supported.
+                // Not a class every emitted program has: the indifferent hash is a plain Hash there, so only its `new` is supported. The CRuby tree carries Rails' class (the `ruby_overlay` core ext), so there a bare read runs as written (a class handed to a codec factory, `is_a?`, `when`); `project` refuses it on every other tree.
                 if matches!(&ty, Ty::Class { id, args } if args.is_empty() && id.0.as_str() == crate::analyze::indifferent::CLASS) {
+                    expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
                     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
                         construct: Symbol::from("constant"),
