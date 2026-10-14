@@ -2029,18 +2029,47 @@ fn serialized_enum_receiver<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
     let statements = flatten_statements(block.body()?);
     let [statement] = statements.as_slice() else { return None };
     let pair = statement.as_array_node()?;
-    if pair.elements().iter().count() != 2 || pair.elements().iter().any(|element| {
-        let Some(call) = element.as_call_node() else { return true };
-        constant_id_str(&call.name()) != "serialize" || call.arguments().is_some()
-            || call.block().is_some() || !call.receiver().and_then(|r| r.as_local_variable_read_node())
+    let elements: Vec<_> = pair.elements().iter().collect();
+    let [key, value] = elements.as_slice() else { return None };
+    // `values.map(&:serialize).to_h { |s| [s.to_sym, s] }`: the block
+    // receives the serialized strings, so the parameter itself is the
+    // label. Otherwise it receives members and reads `s.serialize`.
+    let receiver = call.receiver()?;
+    let (values, serialized_param) = match receiver.as_call_node() {
+        Some(map) if constant_id_str(&map.name()) == "map" => {
+            let argument = map.block()?.as_block_argument_node()?;
+            let symbol = argument.expression()?.as_symbol_node()?;
+            if map.arguments().is_some() || symbol_value(&symbol.as_node()).as_deref() != Some("serialize") {
+                return None;
+            }
+            (map.receiver()?, true)
+        }
+        _ => (receiver, false),
+    };
+    let reads_serialized = |node: &Node<'pr>| -> bool {
+        if serialized_param {
+            return node.as_local_variable_read_node()
+                .is_some_and(|read| constant_id_str(&read.name()) == constant_id_str(&name));
+        }
+        let Some(call) = node.as_call_node() else { return false };
+        constant_id_str(&call.name()) == "serialize" && call.arguments().is_none()
+            && call.block().is_none() && call.receiver().and_then(|r| r.as_local_variable_read_node())
                 .is_some_and(|read| constant_id_str(&read.name()) == constant_id_str(&name))
-    }) {
+    };
+    // A symbol key is the same label: `[s.serialize.to_sym, s.serialize]`.
+    let unsymbolized = key.as_call_node().filter(|call| {
+        constant_id_str(&call.name()) == "to_sym" && call.arguments().is_none() && call.block().is_none()
+    }).map(|call| call.receiver());
+    let key_reads = match &unsymbolized {
+        Some(inner) => inner.as_ref().is_some_and(|inner| reads_serialized(inner)),
+        None => reads_serialized(key),
+    };
+    if !key_reads || !reads_serialized(value) {
         return None;
     }
-    let receiver = call.receiver()?;
-    let values = receiver.as_call_node()?;
-    (constant_id_str(&values.name()) == "values"
-        && values.arguments().is_none() && values.block().is_none()).then_some(receiver)
+    let values_call = values.as_call_node()?;
+    (constant_id_str(&values_call.name()) == "values"
+        && values_call.arguments().is_none() && values_call.block().is_none()).then_some(values)
 }
 
 /// A mapping whose labels fold to the same string (`ROLE_B =>

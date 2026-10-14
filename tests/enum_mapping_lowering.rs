@@ -168,3 +168,58 @@ fn a_childs_direct_or_concern_enum_map_wins_over_its_base() {
         }
     }
 }
+
+/// `status` maps differently in two models, so no column-wide rewrite is
+/// safe; a query rooted at a model constant still means that model's
+/// mapping (Optimization::RolloutRecord's `where(status: [:active,
+/// :scheduled])` reached PostgreSQL as `status IN ('active',
+/// 'scheduled')` against an integer column).
+#[test]
+fn a_where_rooted_at_a_model_uses_that_models_mapping_for_a_conflicted_column() {
+    let tree = [
+        ("db/schema.rb", SCHEMA.to_string()),
+        (
+            "app/models/trade.rb",
+            "class Trade < ApplicationRecord\n  enum :status, { pending: 0, active: 4, scheduled: 5 }\n\n  \
+             def self.live(shop_id)\n    where(shop_id: shop_id).where(status: :pending)\n  end\n\n  \
+             def self.probe\n    Trade.where(status: [:active, :scheduled]).to_a\n  end\nend\n"
+                .to_string(),
+        ),
+        (
+            "app/models/other.rb",
+            "class Other < ApplicationRecord\n  self.table_name = \"trades\"\n  enum :status, { active: 1, scheduled: 2 }\nend\n"
+                .to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(path, source)| (std::path::PathBuf::from(path), source.into_bytes()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let out = emit_lowered_models(&app).into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n");
+    assert!(out.contains("Relation.new(Trade).where({ status: [4, 5] })"), "{out}");
+}
+
+/// A model that overrides `assign_attributes` must not have it run on the
+/// empty shell a hydration factory builds: Core's ProductVariant read
+/// `shop` there before `shop_id` was loaded and cached nil, so a fixture
+/// variant's `shop.tax_codes` was `nil.tax_codes`.
+#[test]
+fn hydration_skips_an_overridden_assign_attributes_on_the_empty_shell() {
+    let tree = [
+        ("db/schema.rb", SCHEMA.to_string()),
+        (
+            "app/models/trade.rb",
+            "class Trade < ApplicationRecord\n  def assign_attributes(attributes)\n    super\n  end\nend\n".to_string(),
+        ),
+        ("app/models/plain.rb", "class Plain < ApplicationRecord\n  self.table_name = \"trades\"\nend\n".to_string()),
+    ]
+    .into_iter()
+    .map(|(path, source)| (std::path::PathBuf::from(path), source.into_bytes()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let out = emit_lowered_models(&app).into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n");
+    assert!(out.contains("instance = Trade.new(ActiveRecord::Base::HYDRATE_ATTRS)"), "{out}");
+    assert!(out.contains("instance = Plain.new\n"), "{out}");
+}

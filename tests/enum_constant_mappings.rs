@@ -361,6 +361,46 @@ fn sorbet_mapping_refuses_dynamic_duplicate_and_reassigned_members() {
     }
 }
 
+/// Core's Sales::Subscriptions::Contract spells the identity mapping with
+/// symbol keys and through `map(&:serialize)`; `standard?` and the other
+/// predicates came from it.
+#[test]
+fn sorbet_serialized_members_expand_through_symbol_keys_and_map() {
+    use roundhouse::expr::Literal;
+    for expression in [
+        "Rating.values.map(&:serialize).to_h { |s| [s.to_sym, s] }",
+        "Rating.values.map(&:serialize).to_h { |s| [s, s] }.freeze",
+        "Rating.values.to_h { |s| [s.serialize.to_sym, s.serialize] }",
+    ] {
+        let source = format!("class Ticket < ApplicationRecord\n  enum :state, {expression}\nend\n");
+        let app = ingest_enum(&source, &[("app/services/z_rating.rb", RATING)])
+            .unwrap_or_else(|e| panic!("{expression}: {e:?}"));
+        assert_eq!(app.models[0].enums[&roundhouse::Symbol::from("state")], vec![
+            ("severe".to_string(), Literal::Str { value: "severe".to_string() }),
+            ("mild".to_string(), Literal::Str { value: "mild".to_string() }),
+        ], "{expression}");
+    }
+}
+
+/// A model that nests its enum and also declares validations,
+/// associations and callbacks (Core's Contract has dozens) still
+/// expands: those statements record what they are given. Statements
+/// that hand the class to other code (`include`, `tap`, an app macro)
+/// keep the conservative gap.
+#[test]
+fn nested_enum_survives_the_models_own_rails_declarations() {
+    let nested = format!("{RATING}\n  enum(:state, Rating.values.map(&:serialize).to_h {{ |s| [s.to_sym, s] }})\n");
+    let declarations = "  validates(:state, presence: true, if: :severe?)\n  belongs_to :owner, optional: true\n  has_many :notes\n  scope :open_ones, -> { where(state: \"mild\") }\n  before_save :tidy\n  private\n";
+    let source = format!("class Ticket < ApplicationRecord\n{nested}{declarations}end\n");
+    let app = ingest_enum(&source, &[]).expect("Rails declarations do not touch the nested enum");
+    assert_eq!(app.models[0].enums[&roundhouse::Symbol::from("state")][0],
+        ("severe".to_string(), roundhouse::expr::Literal::Str { value: "severe".to_string() }));
+    for exposing in ["include Auditable", "tap { |ns| ns }", "trusted_state :state", "x = validates(:state, presence: true)"] {
+        let source = format!("class Ticket < ApplicationRecord\n{nested}  {exposing}\nend\n");
+        assert_enum_gap(&source, &[]);
+    }
+}
+
 #[test]
 fn sorbet_mapping_refuses_nonidentity_or_dynamic_enumeration() {
     for expression in [
@@ -384,6 +424,13 @@ fn sorbet_mapping_refuses_nonidentity_or_dynamic_enumeration() {
         "Rating.values.to_h { |v| [v.serialize, v.serialize] }.index_by(&:to_s)",
         "Rating.values.to_h { |v| [v.serialize, v.serialize] }.map { |v| [v, v.to_s] }.to_h",
         "Rating.values.to_h { |v| [v.serialize, v.serialize] }.freeze.index_with(&:itself)",
+        "Rating.values.map(&:name).to_h { |s| [s.to_sym, s] }",
+        "Rating.values.map(&:serialize).to_h { |s| [s.to_sym, s.to_sym] }",
+        "Rating.values.map(&:serialize).to_h { |s| [s.to_s, s] }",
+        "Rating.values.map(&:serialize).to_h { |s| [s.to_sym, other] }",
+        "Rating.values.map(&:serialize) { mutate }.to_h { |s| [s.to_sym, s] }",
+        "Rating.values.map(1, &:serialize).to_h { |s| [s.to_sym, s] }",
+        "Rating.values.map { |v| v.serialize }.to_h { |s| [s.to_sym, s] }",
     ] {
         let model = format!("class Ticket < ApplicationRecord\n  VALUES = %w[decoy]\n  enum :state, {expression}\nend\n");
         assert_enum_gap(&model, &[("app/services/rating.rb", RATING)]);

@@ -193,6 +193,13 @@ impl EnumConstants {
                         }
                         "name" | "to_s" | "inspect" | "hash" | "frozen?" | "==" | "eql?"
                         | "equal?" => true,
+                        // A statement of the model's own body that runs
+                        // one of ActiveRecord's declarations: it hands the
+                        // namespace to no code of the app (callbacks,
+                        // scopes and validator blocks run later, on
+                        // records), so it cannot reach a nested enum.
+                        // Not `include`/`extend`, whose hooks receive it.
+                        m if is_inert_model_declaration(m) => matches!(result, ValueContext::Discarded),
                         _ => false,
                     }
                 }
@@ -218,4 +225,28 @@ impl EnumConstants {
                 "serialize" | "to_s" | "inspect" | "hash" | "==" | "eql?" | "equal?"
             )
     }
+}
+
+/// The declarations ActiveRecord's class body offers that only record
+/// what they are given (a fixed set of Rails' API, not a denylist of
+/// reflection): validations, associations, callbacks, scopes, attribute
+/// readers.
+fn is_inert_model_declaration(method: &str) -> bool {
+    matches!(
+        method,
+        "validates" | "validate" | "validates_presence_of" | "validates_length_of" | "validates_numericality_of"
+            | "validates_inclusion_of" | "validates_exclusion_of" | "validates_format_of" | "validates_uniqueness_of"
+            | "validates_associated" | "validates_with" | "validates_each" | "validates_acceptance_of"
+            | "validates_confirmation_of" | "validates_absence_of" | "validates_comparison_of"
+            | "belongs_to" | "has_many" | "has_one" | "has_and_belongs_to_many" | "scope" | "default_scope"
+            | "attribute" | "enum" | "delegate" | "alias_attribute" | "attr_readonly" | "attr_accessor"
+            | "attr_reader" | "attr_writer" | "serialize" | "store" | "store_accessor" | "normalizes"
+            | "encrypts" | "accepts_nested_attributes_for" | "has_secure_password" | "has_secure_token"
+            | "before_validation" | "after_validation" | "before_save" | "around_save" | "after_save"
+            | "before_create" | "around_create" | "after_create" | "before_update" | "around_update"
+            | "after_update" | "before_destroy" | "around_destroy" | "after_destroy" | "after_commit"
+            | "after_rollback" | "after_create_commit" | "after_update_commit" | "after_destroy_commit"
+            | "after_save_commit" | "after_initialize" | "after_find" | "after_touch"
+            | "private" | "public" | "protected" | "private_constant" | "module_function"
+    )
 }
