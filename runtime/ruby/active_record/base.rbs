@@ -333,6 +333,12 @@ module ActiveRecord
     # callers ignore the result.
     def fill_timestamps: (bool creating) -> void
 
+    # Rails' Timestamp#current_time_from_proper_timezone: the clock in
+    # `ActiveRecord.default_timezone`. The class form is public, the
+    # instance form private.
+    def self.current_time_from_proper_timezone: () -> Time
+    def current_time_from_proper_timezone: () -> Time
+
     def valid?: () -> bool
 
     # Equality protocol intentionally not defined here — see comment
