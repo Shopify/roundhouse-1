@@ -1451,4 +1451,12 @@ module Db
 
     values.map { |value| value.is_a?(String) ? escape_string(value) : Integer(value).to_s }.join(", ")
   end
+
+  # The same batch over string keys (a uuid primary key), as db_pg.rb
+  # has it: each key a quoted literal, never `to_i`'d.
+  def self.escape_string_list(values)
+    return "NULL" if values.empty?
+
+    values.map { |value| escape_string(value.to_s) }.join(", ")
+  end
 end
