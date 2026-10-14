@@ -792,6 +792,17 @@ pub(crate) fn lowered_controller_lcs_with_layout(app: &App) -> Vec<LibraryClass>
     library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     library::apply_layout_lowering(&mut lcs, app);
+    // The includes whose `included do` macros the class runs
+    // (`ingest::controller_concern_blocks`).
+    for lc in &mut lcs {
+        if let Some(includes) = app.controller_runtime_includes.get(&lc.name) {
+            for id in includes {
+                if !lc.includes.contains(id) {
+                    lc.includes.push(id.clone());
+                }
+            }
+        }
+    }
     lcs
 }
 

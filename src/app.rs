@@ -856,6 +856,11 @@ pub struct App {
     /// the same order against the include hooks and the class's own body.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub included_block_statements: HashMap<ClassId, Vec<(ClassId, crate::expr::Expr)>>,
+    /// The `include`s a controller's lowered class writes, each a Concern
+    /// whose `included do` statements `included_block_statements` carries
+    /// for the controller (`ingest::controller_concern_blocks`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub controller_runtime_includes: HashMap<ClassId, Vec<ClassId>>,
     /// The `class_attribute`s a Concern's `included do` gives a plain
     /// includer, keyed by the includer, each group with the direct include
     /// it runs after, as `included_block_statements` has it
@@ -1671,6 +1676,7 @@ impl App {
             singleton_scoped_classes: Vec::new(),
             library_class_declarations: Vec::new(),
             included_block_statements: HashMap::default(),
+            controller_runtime_includes: HashMap::default(),
             included_class_attributes: HashMap::default(),
             render_edges: HashMap::default(),
             view_feeders: HashMap::default(),
