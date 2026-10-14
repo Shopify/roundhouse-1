@@ -14904,7 +14904,24 @@ fn names_own_method_above(lc: &LibraryClass, call: &Expr) -> bool {
     args.iter().any(|arg| match &*arg.node {
         ExprNode::Hash { entries, kwargs: true } => entries.iter().any(|(_, value)| names_def_above(value)),
         _ => names_def_above(arg),
-    })
+    }) || aliases_def_above(call, &names_def_above)
+}
+
+/// Whether `call`, written whole, runs an `alias_method` naming (by a
+/// symbol argument, `names_def_above`) a def of its class the source has
+/// above it: Core's `ADMINISTRATIVE_COMMANDS.each do |method, _|
+/// alias_method method, :unsupported_command! end` below the `def`.
+fn aliases_def_above(call: &Expr, names_def_above: &dyn Fn(&Expr) -> bool) -> bool {
+    let mut found = false;
+    if let ExprNode::Send { recv, method, args, .. } = &*call.node
+        && method.as_str() == "alias_method"
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && args.iter().skip(1).any(names_def_above)
+    {
+        found = true;
+    }
+    call.node.for_each_child(&mut |child| found = found || aliases_def_above(child, names_def_above));
+    found
 }
 
 /// `lc`'s body `prepend M, ...` calls whose every module is an app

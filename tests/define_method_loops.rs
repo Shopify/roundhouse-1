@@ -809,3 +809,80 @@ fn a_class_methods_define_method_loop_reaches_a_model_includer() {
     let actual: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
 }
+
+/// Core's `Podding::Redis::NamespacedClient`: a library class under a
+/// gem-like base whose constants name the commands. A `define_method` loop
+/// over a computed collection (calling `super`) and an `alias_method` loop
+/// over a later-defined method both stay in place, in source order, on
+/// the Ruby emit: hoisting the alias loop above the `def` it aliases is a
+/// NameError when the class loads.
+const NAMESPACED_BASE: &str = r##"module Gemlab
+  class Client
+    COMMANDS = { get: 1, set: 2, flushall: 3, keys: 4 }.freeze
+    ADMINISTRATIVE_COMMANDS = { flushall: 1 }.freeze
+
+    def initialize(ns)
+      @ns = ns
+    end
+
+    def get(key) = "get:#{@ns}:#{key}"
+    def set(key, value = nil) = "set:#{@ns}:#{key}=#{value}"
+    def keys(*args, &block) = ["keys:#{@ns}", args, block&.call]
+    def flushall = "flushed"
+  end
+end
+"##;
+
+const NAMESPACED_CLIENT: &str = r###"module Cs
+  class NamespacedClient < ::Gemlab::Client
+    def initialize(ns, type:)
+      @type = type
+      super(ns)
+    end
+
+    (COMMANDS.keys - ADMINISTRATIVE_COMMANDS.keys).each do |command|
+      define_method(command) do |*args, &block|
+        "[#{@type}] " + super(*args, &block).to_s
+      end
+    end
+
+    def unsupported_command!(...)
+      raise NoMethodError, "##{__callee__} commands aren't supported"
+    end
+
+    ADMINISTRATIVE_COMMANDS.each do |method, _|
+      alias_method method, :unsupported_command!
+    end
+  end
+end
+"###;
+
+const NAMESPACED_SCRIPT: &str = r##"c = Cs::NamespacedClient.new("n", type: :cache)
+p c.get("a")
+p c.set("a", 1)
+p c.keys(1, 2) { :blk }.to_s
+begin
+  c.flushall
+rescue NoMethodError => e
+  p e.message
+end
+"##;
+
+#[test]
+fn a_define_method_loop_and_an_alias_loop_keep_source_order_on_the_ruby_emit() {
+    let expected = native(
+        "namespaced_client",
+        &format!("{NAMESPACED_BASE}{NAMESPACED_CLIENT}{NAMESPACED_SCRIPT}"),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(expected.len(), 4, "native control: {expected:?}");
+    let gem = std::env::temp_dir().join(format!("rh_namespaced_client_gem_{}.rb", std::process::id()));
+    std::fs::write(&gem, NAMESPACED_BASE).unwrap();
+    let run = emit_and_run::real_blog()
+        .write("app/lib/cs/namespaced_client.rb", NAMESPACED_CLIENT)
+        .run_ruby_env(NAMESPACED_SCRIPT, &[("RUBYOPT", &format!("-r{}", gem.display()))]);
+    std::fs::remove_file(&gem).unwrap();
+    assert!(run.success, "emitted program failed:\n{}\n{}", run.stdout, run.stderr);
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from native line for line");
+}
