@@ -2043,6 +2043,9 @@ struct SorbetStructMember {
     /// `factory: -> { … }`'s body, which Ruby evaluates per call just
     /// as sorbet evaluates the factory per instance.
     default: Option<Expr>,
+    /// The type is `T.nilable(…)`: sorbet makes such a prop optional,
+    /// and an omitted one is nil.
+    nilable: bool,
 }
 
 /// `T::Struct` and its variants in superclass position. `T::Struct` is
@@ -2082,9 +2085,18 @@ fn sorbet_struct_members(body: Option<ruby_prism::Node<'_>>, file: &str) -> Vec<
         }) else {
             continue;
         };
-        // The type is the second argument and belongs to the analyzer,
-        // not to the emit: `ingest::sorbet_sig` has already read it.
-        let _ty = args.next();
+        // The type belongs to the analyzer, not to the emit:
+        // `ingest::sorbet_sig` has already read it. Only whether it is
+        // `T.nilable(…)` matters here, because that makes the keyword
+        // optional.
+        let nilable = args.next().is_some_and(|ty| {
+            ty.as_call_node().is_some_and(|c| {
+                c.name().as_slice() == b"nilable"
+                    && c.receiver()
+                        .and_then(|r| constant_path_of(&r))
+                        .is_some_and(|path| path == vec!["T".to_string()])
+            })
+        });
         let mut default = None;
         for arg in args {
             let Some(hash) = arg.as_keyword_hash_node() else { continue };
@@ -2108,7 +2120,7 @@ fn sorbet_struct_members(body: Option<ruby_prism::Node<'_>>, file: &str) -> Vec<
                 }
             }
         }
-        members.push(SorbetStructMember { name, writable, default });
+        members.push(SorbetStructMember { name, writable, default, nilable });
     }
     members
 }
@@ -2132,13 +2144,24 @@ fn synth_sorbet_struct_methods(
             methods.push(synth_attr_writer(owner, &member.name, MethodReceiver::Instance));
         }
     }
-    let params: Vec<Param> = members
+    let hash_prologue = if with_constructor { struct_hash_prologue(members) } else { None };
+    let params: Vec<Param> = hash_prologue
         .iter()
-        .map(|m| Param::keyword(m.name.clone(), m.default.clone()))
-        .collect();
-    let assigns: Vec<Expr> = members
-        .iter()
+        .map(|_| Param::with_default(Symbol::from(STRUCT_HASH_PARAM), Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })))
+        .chain(members.iter()
         .map(|m| {
+            // A `T.nilable` prop with no default is optional and nil
+            // when omitted, as sorbet's generated constructor has it.
+            let default = m.default.clone().or_else(|| {
+                m.nilable
+                    .then(|| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }))
+            });
+            Param::keyword(m.name.clone(), default)
+        }))
+        .collect();
+    let assigns: Vec<Expr> = hash_prologue
+        .into_iter()
+        .chain(members.iter().map(|m| {
             Expr::new(
                 Span::synthetic(),
                 ExprNode::Assign {
@@ -2149,7 +2172,7 @@ fn synth_sorbet_struct_methods(
                     ),
                 },
             )
-        })
+        }))
         .collect();
     // A base that STAYS brings its own constructor. `T::Struct` is
     // lowered away, so the class would have none — but a gem base
@@ -2182,6 +2205,37 @@ fn synth_sorbet_struct_methods(
         methods.push(synth_struct_equality(owner, members));
     }
     methods
+}
+
+/// sorbet's `T::Struct#initialize(hash = {})` takes the props as one
+/// positional Hash as well as keywords, and Core builds one from a
+/// config Hash (`Webhooks::RequiredAccess.new(access)`). The keyword
+/// constructor rejects that as `given 1, expected 0`.
+///
+/// Where every prop is optional (nilable or defaulted) the constructor
+/// also takes a leading optional Hash and each prop reads from it first.
+/// A struct with a required prop keeps keywords only: a Hash cannot be
+/// told apart from missing keywords there without a `new` override, and
+/// a class that declares `new` stops being typed as its own instance.
+const STRUCT_HASH_PARAM: &str = "attributes_hash";
+
+fn struct_hash_prologue(members: &[SorbetStructMember]) -> Option<Expr> {
+    if members.is_empty() || !members.iter().all(|m| m.default.is_some() || m.nilable) {
+        return None;
+    }
+    let mut source = format!(
+        "unless {STRUCT_HASH_PARAM}.nil?\n  {STRUCT_HASH_PARAM} = {STRUCT_HASH_PARAM}.to_h.transform_keys(&:to_sym)\n"
+    );
+    for member in members {
+        let name = member.name.as_str();
+        source.push_str(&format!("  {name} = {STRUCT_HASH_PARAM}.fetch(:{name}, {name})\n"));
+    }
+    source.push_str("end\n");
+    let parsed = ruby_prism::parse(source.as_bytes());
+    let node = parsed.node();
+    let program = node.as_program_node()?;
+    let stmt = program.statements().body().iter().next()?;
+    ingest_expr(&stmt, "(sorbet struct)").ok()
 }
 
 /// `include T::Struct::ActsAsComparable` gives a struct value equality.
@@ -7867,8 +7921,15 @@ fn struct_member_from_expr(call: &Expr) -> Option<SorbetStructMember> {
         ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
         _ => return None,
     };
-    // The type is the second argument and belongs to the analyzer.
-    let _ty = args.next();
+    // The type belongs to the analyzer; only `T.nilable(…)` matters here.
+    let nilable = args.next().is_some_and(|ty| {
+        matches!(
+            &*ty.node,
+            ExprNode::Send { recv: Some(r), method, .. }
+                if method.as_str() == "nilable"
+                    && matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "T")
+        )
+    });
     let mut default = None;
     for arg in args {
         let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
@@ -7896,7 +7957,7 @@ fn struct_member_from_expr(call: &Expr) -> Option<SorbetStructMember> {
             }
         }
     }
-    Some(SorbetStructMember { name, writable, default })
+    Some(SorbetStructMember { name, writable, default, nilable })
 }
 
 /// A library class's superclass as Ruby binds it, when it is a class the
