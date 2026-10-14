@@ -441,7 +441,10 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     // the Ruby emitter must not write the source's `**` back over it. A
     // flattened `**rest` (`from_kwrest`) is not that: the Ruby tree
     // writes the def back as `**rest`, which only a `**h` call binds.
-    if params.iter().all(|p| !p.keyword && !p.from_kwrest) {
+    // Nor is a flattened keyword (`from_keyword`): `def merge(type: nil,
+    // owner: nil)` is written back as keywords, so `key.merge(**opts)`
+    // must keep its `**`.
+    if params.iter().all(|p| !p.keyword && !p.from_keyword && !p.from_kwrest) {
         for arg in args.iter_mut() {
             arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
         }
