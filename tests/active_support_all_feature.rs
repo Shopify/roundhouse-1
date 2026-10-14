@@ -66,13 +66,13 @@ module ProbeGem
     rescue NotImplementedError => e
       e.message
     end
-    named = [-> { 3.months }, -> { Time.now.beginning_of_day }, -> { "x".months }].map do |call|
+    named = [-> { 3.multiple_of?(3) }, -> { Time.now.plus_with_duration(1) }, -> { "x".multiple_of?(3) }].map do |call|
       call.call
       :answered
     rescue NoMethodError => e
       e.message.lines.map(&:chomp)
     end
-    { refused: refused, named: named, rescued: (3.months rescue :rescued), respond_to: [3.respond_to?(:months), {}.respond_to?(:to_xml)] }
+    { refused: refused, named: named, rescued: (3.multiple_of?(3) rescue :rescued), respond_to: [3.respond_to?(:multiple_of?), {}.respond_to?(:to_xml)] }
   end
 end
 "#;
@@ -157,9 +157,9 @@ fn what_active_support_all_does_not_port_refuses_by_name() {
         )
     };
     let line = format!(
-        "named: [{}, {}, [\"undefined method 'months' for an instance of String\"]]\n",
-        named("undefined method 'months' for an instance of Integer", "Integer#months", "active_support/core_ext/integer/time"),
-        named("undefined method 'beginning_of_day' for an instance of Time", "Time#beginning_of_day", "active_support/core_ext/time/calculations"),
+        "named: [{}, {}, [\"undefined method 'multiple_of?' for an instance of String\"]]\n",
+        named("undefined method 'multiple_of?' for an instance of Integer", "Integer#multiple_of?", "active_support/core_ext/integer/multiple"),
+        named("undefined method 'plus_with_duration' for an instance of Time", "Time#plus_with_duration", "active_support/core_ext/time/calculations"),
     );
     assert!(out.contains(&line), "missing {line:?}:\n{out}");
     assert!(out.contains("rescued: :rescued\n"), "{out}");
