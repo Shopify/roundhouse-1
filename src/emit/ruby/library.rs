@@ -4090,7 +4090,10 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             let ModelBodyItem::Association { assoc, span, .. } = item else { continue };
             let name = assoc.name().as_str();
             let (options, mut unsupported) = if !span.is_synthetic() && macro_declared.contains(span) {
-                ("nil".to_string(), Vec::new())
+                // A macro whose helper declares the association itself
+                // never runs its `has_many` at class load, so the
+                // reflection carries the helper's options from the start.
+                (crate::ingest::macro_associations::literal_declaration_options(*span).unwrap_or_else(|| "nil".to_string()), Vec::new())
             } else {
                 declarations.of(app, *span)
             };
