@@ -363,6 +363,17 @@ class BaseTest < Minitest::Test
     assert_equal 2, out.length
   end
 
+  # A numbered driver (PostgreSQL) takes `$n` for each lifted mark, on
+  # the split path and on the scan path; a `?` that was already there is
+  # not a mark.
+  def test_lift_binds_numbered_writes_dollar_placeholders
+    out = ActiveRecord::Relation.lift_binds("SELECT 1 WHERE j ? 'k' AND id = \x017\x02 AND n = \x01'x'\x02", true)
+    assert_equal "SELECT 1 WHERE j ? 'k' AND id = $1 AND n = $2", out[0]
+    assert_equal %w[i 7 s x], out[2..]
+    out = ActiveRecord::Relation.lift_binds("SELECT 1 -- ?\nWHERE id = \x017\x02 AND n = \x01'x'\x02", true)
+    assert_equal "SELECT 1 -- ?\nWHERE id = $1 AND n = $2", out[0]
+  end
+
   # `--` / `/*` inside a double-quoted identifier are identifier text,
   # not comments. Leaving them as comments swallowed later marks and
   # made prepare_marked ↔ prepare recurse until SystemStackError

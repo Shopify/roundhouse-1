@@ -3124,12 +3124,16 @@ module ActiveRecord
     # every hydrating read) — the scan path must still honor them so a
     # `--` or `/*` inside `"…"` is not treated as a comment that
     # swallows later marks (sql_identifiers InjectionPurchase).
-    def self.lift_binds(sql)
+    #
+    # `numbered` writes PostgreSQL's `$1`, `$2`, … where `?` stands, for
+    # a driver whose placeholders are numbered; a `?` that was already
+    # in the text (a literal, a JSON operator) is never touched.
+    def self.lift_binds(sql, numbered = false)
       # Fast path: split at the marks, and know each mark sits outside a
       # string literal because the text before it holds an even number
       # of quotes (a literal opens and closes with one, and doubles any
       # inside). Comments, an odd count or a torn mark take the scan.
-      return lift_binds_scan(sql) if sql.include?("--") || sql.include?("/*")
+      return lift_binds_scan(sql, numbered) if sql.include?("--") || sql.include?("/*")
       pieces = sql.split("\x01", -1)
       out = ["", ""]
       head = pieces[0].to_s
@@ -3140,14 +3144,14 @@ module ActiveRecord
       while i < pieces.length
         piece = pieces[i].to_s
         close = piece.index("\x02")
-        return lift_binds_scan(sql) if close.nil? || quotes % 2 == 1
+        return lift_binds_scan(sql, numbered) if close.nil? || quotes % 2 == 1
         text = piece[0, close].to_s
         rest = piece[close + 1, piece.length - close - 1].to_s
         kind = bind_kind(text)
         if kind == ""
           bound << text
         else
-          bound << "?"
+          bound << bind_slot(out, numbered)
           out << kind
           out << (kind == "s" ? text[1, text.length - 2].to_s.gsub("''", "'") : text)
         end
@@ -3162,6 +3166,12 @@ module ActiveRecord
       out
     end
 
+    # The placeholder for the next bind `out` will hold.
+    def self.bind_slot(out, numbered)
+      return "?" unless numbered
+      "$" + ((out.length - 2) / 2 + 1).to_s
+    end
+
     def self.quote_count(text)
       n = 0
       at = text.index("'")
@@ -3174,7 +3184,7 @@ module ActiveRecord
 
     # The general lift: a scan that copies string literals, quoted
     # identifiers and comments whole.
-    def self.lift_binds_scan(sql)
+    def self.lift_binds_scan(sql, numbered = false)
       out = ["", ""]
       bound = []
       inline = []
@@ -3215,7 +3225,7 @@ module ActiveRecord
           if kind == ""
             bound << text
           else
-            bound << "?"
+            bound << bind_slot(out, numbered)
             out << kind
             out << (kind == "s" ? text[1, text.length - 2].to_s.gsub("''", "'") : text)
           end

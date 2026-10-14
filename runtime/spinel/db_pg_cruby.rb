@@ -925,6 +925,7 @@ module Db
 
   # `name` is the `sql.active_record` event's (Rails' `execute(sql, name)`).
   def self.exec(sql, name = "SQL")
+    sql = unmark(sql)
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
@@ -939,6 +940,7 @@ module Db
   # The lowerer appends a typed RETURNING key, so trigger side effects or
   # unrelated sequences cannot affect the returned insert identity.
   def self.insert_returning_int(sql)
+    sql = unmark(sql)
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
@@ -1071,11 +1073,41 @@ module Db
 
   # Each handle owns its result, even for nested identical SQL. Server-side
   # prepared statements belong to the connection and have a bounded cache.
+  #
+  # A Relation read arrives with its hash-condition values marked
+  # (`Relation#bind_literal`); `lift_marked` answers the shape with `$n`
+  # placeholders and the values as binds, as Rails binds them, so the
+  # statement cache shares the shape and the query log shows `$1`.
   def self.prepare(sql, cacheable: false)
     adapter = current_adapter
-    { adapter: adapter, sql: sql, binds: [], result: nil, row: nil, pos: 0, closed: false,
+    sql, binds = lift_marked(sql)
+    { adapter: adapter, sql: sql, binds: binds, result: nil, row: nil, pos: 0, closed: false,
       owner: [Thread.current, Fiber.current], database: context[:name],
       lease: adapter.instance_variable_get(:@rh_pg_lease), cacheable: cacheable }
+  end
+
+  # `[sql, binds]` for a statement a Relation marked for binding: the
+  # marks become `$n` and each lifted value a bind (integers as Integer,
+  # strings unquoted). Text without a mark is unchanged. A \x01 left
+  # inside a string literal is data, never a mark (`lift_binds` copies
+  # literals whole), so the lifted text is not scanned again.
+  def self.lift_marked(sql)
+    return [sql, []] unless sql.include?("\x01")
+    lifted = ActiveRecord::Relation.lift_binds(sql, true)
+    binds = []
+    i = 2
+    while i < lifted.length
+      binds << (lifted[i] == "i" ? lifted[i + 1].to_i : lifted[i + 1])
+      i += 2
+    end
+    [lifted[0].to_s, binds]
+  end
+
+  # A write runs with its values written in, as the SQLite lane does: the
+  # marks are dropped, not lifted.
+  def self.unmark(sql)
+    return sql unless sql.include?("\x01")
+    ActiveRecord::Relation.inline_sql(sql)
   end
 
   # A lowered read whose SQL shape varies with which nullable binds are
