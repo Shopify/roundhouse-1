@@ -452,6 +452,8 @@ pub(crate) fn lowered_model_lcs(
 /// Keep their implementations in place: sharing does not require moving
 /// unrelated controller, view and library transformations.
 pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
+    // A model's lifecycle hook runs the one an ancestor defines first.
+    library::chain_inherited_lifecycle_hooks(lcs, app);
     // Ruby-family scope lowering: synthesize model scope methods +
     // normalize scope chains before rendering (no-op for scope-free apps).
     library::apply_scope_lowering(&mut lcs, app);

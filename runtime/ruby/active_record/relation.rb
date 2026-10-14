@@ -210,14 +210,16 @@ module ActiveRecord
       @model.unscoped { @model.new(merged) }
     end
 
-    def create(attrs = {})
+    def create(attrs = {}, &block)
       record = build(attrs)
+      block.call(record) if block
       record.save
       record
     end
 
-    def create!(attrs = {})
+    def create!(attrs = {}, &block)
       record = build(attrs)
+      block.call(record) if block
       raise RecordInvalid, record unless record.save
       record
     end
@@ -2709,13 +2711,43 @@ module ActiveRecord
     # Reading `scope_attributes` AFTER the find is safe: `find_by`
     # appends to `@wheres`, and only `where_scope` ever writes the
     # create-seed slot.
-    def find_or_create_by(conditions)
+    def find_or_create_by(conditions, &block)
       record = find_by(conditions)
       return record if !record.nil?
       created = @model.new(scope_attributes.merge(conditions))
+      block.call(created) if block
       created.save
       created
     end
+
+    # Rails' `create_or_find_by`: `transaction(requires_new: true) {
+    # create(attributes, &block) }`, and when the INSERT trips a unique
+    # index (RecordNotUnique, the savepoint rolled back) the row someone
+    # else created: `find_by!(attributes)`, locked (`lock.find_by!`) when
+    # a transaction is open around the call. The savepoint is what lets
+    # the surrounding PostgreSQL transaction survive the failed INSERT.
+    def create_or_find_by(conditions, &block)
+      @model.transaction(requires_new: true) { create(conditions, &block) }
+    rescue RecordNotUnique
+      create_or_find_by_existing(conditions)
+    end
+
+    # `create_or_find_by!`: as above with `create!`, so an invalid record
+    # raises RecordInvalid instead of coming back unsaved.
+    def create_or_find_by!(conditions, &block)
+      @model.transaction(requires_new: true) { create!(conditions, &block) }
+    rescue RecordNotUnique
+      create_or_find_by_existing(conditions)
+    end
+
+    def create_or_find_by_existing(conditions)
+      if @model.connection.transaction_open?
+        where(conditions).lock.find_by!(conditions)
+      else
+        find_by!(conditions)
+      end
+    end
+    private :create_or_find_by_existing
 
     # Rails' `find_or_create_by!`: `find_by(attributes) ||
     # create!(attributes, &block)`.

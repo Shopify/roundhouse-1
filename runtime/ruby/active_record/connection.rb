@@ -964,6 +964,79 @@ module ActiveRecord
       ActiveRecord.adapter.changes
     end
 
+    # `Model.insert_all(rows, …)` / `insert_all!` / `insert` / `insert!`
+    # (insert_all.rb): one INSERT for every row, no validations or
+    # callbacks. The bang forms raise RecordNotUnique on a duplicate; the
+    # others add `ON CONFLICT DO NOTHING` (on `unique_by:` when given), so
+    # a conflicting row is skipped. `insert`/`insert!` are the single-row
+    # forms of the same. Every row must carry the same keys; created_at
+    # and updated_at the model has and the row lacks are stamped, as
+    # Rails does under `record_timestamps`. A value goes through its
+    # column's cast type (an enum name, a JSON hash) before it is
+    # written. Returns the affected-row count; RETURNING is refused by
+    # name, as in `upsert_all`.
+    def self.insert_all(rows, unique_by: nil, returning: nil, record_timestamps: nil)
+      _insert_rows(rows, true, unique_by, returning, record_timestamps)
+    end
+
+    def self.insert_all!(rows, returning: nil, record_timestamps: nil)
+      _insert_rows(rows, false, nil, returning, record_timestamps)
+    end
+
+    def self.insert(attrs, unique_by: nil, returning: nil, record_timestamps: nil)
+      _insert_rows([attrs], true, unique_by, returning, record_timestamps)
+    end
+
+    def self.insert!(attrs, returning: nil, record_timestamps: nil)
+      _insert_rows([attrs], false, nil, returning, record_timestamps)
+    end
+
+    def self._insert_rows(rows, skip_conflicts, unique_by, returning, record_timestamps)
+      return 0 if rows.length == 0
+      if returning
+        raise NotImplementedError, "#{name}.insert_all: RETURNING is not supported"
+      end
+
+      keys = rows[0].keys.map { |c| c.to_s }
+      rows.each do |row|
+        unless row.keys.map { |c| c.to_s }.sort == keys.sort
+          raise ArgumentError, "All objects being inserted must have the same keys"
+        end
+      end
+
+      stamp = record_timestamps.nil? ? self.record_timestamps : record_timestamps
+      now = stamp ? ActiveSupport.db_now : nil
+      known = schema_columns.map { |c| c.to_s }
+      cols = keys.dup
+      if stamp
+        ["created_at", "updated_at"].each do |c|
+          cols.push(c) if known.include?(c) && !cols.include?(c)
+        end
+      end
+
+      tuples = rows.map do |row|
+        values = cols.map do |c|
+          given = row.key?(c) ? c : (row.key?(c.to_sym) ? c.to_sym : nil)
+          if given.nil?
+            ActiveRecord.adapter.escape_value(now)
+          else
+            raw = row[given]
+            ActiveRecord.adapter.escape_value(known.include?(c) ? type_for_attribute(c).serialize(raw) : raw)
+          end
+        end
+        "(" + values.join(", ") + ")"
+      end
+
+      conflict = ""
+      if skip_conflicts
+        target = unique_by.nil? ? nil : (unique_by.is_a?(Array) ? unique_by : [unique_by]).map { |c| c.to_s }
+        conflict = target.nil? ? " ON CONFLICT DO NOTHING" : " ON CONFLICT (#{target.join(", ")}) DO NOTHING"
+      end
+      sql = "INSERT INTO #{table_name} (#{cols.join(", ")}) VALUES #{tuples.join(", ")}#{conflict}"
+      ActiveRecord.adapter.execute_ddl(sql)
+      ActiveRecord.adapter.changes
+    end
+
     # `self.record_timestamps=` — Rails class-attribute toggling auto
     # timestamp stamping around a bulk write. `fill_timestamps` always
     # stamps (the toggle only matters on write paths); accept and ignore
@@ -1750,8 +1823,16 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).find_or_initialize_by(conditions.to_h, &block)
     end
 
-    def self.find_or_create_by(conditions)
-      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h)
+    def self.find_or_create_by(conditions, &block)
+      ActiveRecord::Relation.new(self).find_or_create_by(conditions.to_h, &block)
+    end
+
+    def self.create_or_find_by(conditions, &block)
+      ActiveRecord::Relation.new(self).create_or_find_by(conditions.to_h, &block)
+    end
+
+    def self.create_or_find_by!(conditions, &block)
+      ActiveRecord::Relation.new(self).create_or_find_by!(conditions.to_h, &block)
     end
 
     def self.find_or_create_by!(conditions, &block)

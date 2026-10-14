@@ -66,6 +66,74 @@ pub(super) fn preserve_record_receiver_returns(lcs: &mut [LibraryClass], app: &A
     }
 }
 
+/// A model's synthesized lifecycle hook (`def before_create`, the fold of
+/// its callbacks) starts with `super()` when a class above it defines the
+/// same hook, as Rails' callback chain runs the inherited callbacks first.
+/// Core's ApplicationRecord includes GenerateOid, whose `before_create`
+/// allocates the record's id: a model with a `before_create` of its own
+/// replaced it, and inserted a NULL primary key. A hook that already calls
+/// `super` (a subclass's view, `push_subclass_model_methods`) is left as is.
+pub(super) fn chain_inherited_lifecycle_hooks(lcs: &mut [LibraryClass], app: &App) {
+    use crate::lower::model_to_library::markers::BLOCK_CALLBACK_HOOKS;
+    let models: HashMap<ClassId, ()> = app.models.iter().map(|m| (m.name.clone(), ())).collect();
+    let classes: HashMap<ClassId, ()> = lcs.iter().map(|lc| (lc.name.clone(), ())).collect();
+    let parents: HashMap<ClassId, Option<ClassId>> = lcs
+        .iter()
+        .map(|lc| {
+            let parent = lc.parent.as_ref().and_then(|p| crate::analyze::lexical_class(p, lc.name.0.as_str(), &classes));
+            (lc.name.clone(), parent)
+        })
+        .collect();
+    let hooks: HashMap<ClassId, Vec<Symbol>> = lcs
+        .iter()
+        .map(|lc| {
+            let own = lc
+                .methods
+                .iter()
+                .filter(|m| m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.name_span.is_synthetic())
+                .filter(|m| BLOCK_CALLBACK_HOOKS.contains(&m.name.as_str()) || m.name.as_str() == "after_touch")
+                .map(|m| m.name.clone())
+                .collect();
+            (lc.name.clone(), own)
+        })
+        .collect();
+    for lc in lcs.iter_mut() {
+        if !models.contains_key(&lc.name) {
+            continue;
+        }
+        let inherited = |hook: &Symbol| {
+            let mut cursor = parents.get(&lc.name).cloned().flatten();
+            for _ in 0..32 {
+                let Some(name) = cursor else { return false };
+                if hooks.get(&name).is_some_and(|h| h.contains(hook)) {
+                    return true;
+                }
+                cursor = parents.get(&name).cloned().flatten();
+            }
+            false
+        };
+        for m in lc.methods.iter_mut() {
+            if m.receiver != MethodReceiver::Instance
+                || !m.params.is_empty()
+                || !m.name_span.is_synthetic()
+                || !(BLOCK_CALLBACK_HOOKS.contains(&m.name.as_str()) || m.name.as_str() == "after_touch")
+                || contains_super(&m.body)
+                || !inherited(&m.name)
+            {
+                continue;
+            }
+            let sup = Expr::new(Span::synthetic(), ExprNode::Super { args: Some(Vec::new()), block: None });
+            let own = match &*m.body.node {
+                ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![m.body.clone()],
+            };
+            let mut stmts = vec![sup];
+            stmts.extend(own);
+            m.body = Expr::new(m.body.span, ExprNode::Seq { exprs: stmts });
+        }
+    }
+}
+
 /// Source overrides, including those on ApplicationRecord or a mixin,
 /// may return a different object. Do not interpose a self-returning wrapper.
 fn record_return_overridden(app: &App, classes: &HashMap<ClassId, ()>, class: &ClassId, method: &str) -> bool {
@@ -12042,6 +12110,8 @@ fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryC
     // The reader of an association a class macro declares, which the
     // reader its `class_eval` writes supers into.
     names.extend(crate::lower::model_to_library::macro_associations::declared_readers(model));
+    // The association writer a def of the model supers into.
+    names.extend(crate::lower::model_to_library::associations::super_writer_overrides(model));
     let generated = |m: &MethodDef| {
         m.receiver == MethodReceiver::Instance
             && m.name_span.is_synthetic()
