@@ -1206,6 +1206,35 @@ module ActiveRecord
       changes[name]
     end
 
+    # The `[was, now]` readers behind `<col>_change`,
+    # `<col>_change_to_be_saved`, `<col>_in_database`,
+    # `<col>_previous_change` and `<col>_before_last_save`: the same
+    # empty-diff answers, each ending in a read of a bound Hash.
+    def attribute_change(name)
+      changes = changes_to_save
+      changes[name]
+    end
+
+    def attribute_change_to_be_saved(name)
+      changes = changes_to_save
+      changes[name]
+    end
+
+    def attribute_in_database(name)
+      changes = changes_to_save
+      changes[name]
+    end
+
+    def attribute_previous_change(name)
+      changes = saved_changes
+      changes[name]
+    end
+
+    def attribute_before_last_save(name)
+      changes = saved_changes
+      changes[name]
+    end
+
     # `id` never appears in the subclass `attributes` hash, so the
     # created-vs-updated question is answered by the save path itself
     # rather than the snapshot diff.

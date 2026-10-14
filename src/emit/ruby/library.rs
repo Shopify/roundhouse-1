@@ -9430,7 +9430,8 @@ fn root_shadowed_constants(
         if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
             let resolved = id.0.as_str();
             for prefix in scope.innermost_first() {
-                if known(&format!("{prefix}::{}", head.as_str())) {
+                let bound = format!("{prefix}::{}", head.as_str());
+                if known(&bound) || scope.namespaces.contains(&bound) {
                     if format!("{prefix}::{joined}") != resolved {
                         *path = resolved.split("::").map(Symbol::from).collect();
                         path[0] = Symbol::from(format!("::{}", path[0].as_str()));

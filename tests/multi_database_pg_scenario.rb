@@ -112,6 +112,17 @@ out "preventing writes flag", ActiveRecord::Base.while_preventing_writes { [Post
 out "preventing writes raw", outcome { ActiveRecord::Base.while_preventing_writes { Dog.connection.execute("DELETE FROM dogs") } }
 out "after refusals", [Post.count, Dog.count]
 
+# The insert family is the model's own pool's write, as `create!` is: a
+# Dog row lands on animals (not the ambient primary), and the reading
+# role refuses it.
+Dog.insert!({ name: "ins" })
+Dog.insert_all([{ name: "ia1" }, { name: "ia2" }])
+Dog.insert({ name: "ins2" })
+out "insert family", [Dog.count, db_of(Dog), Dog.connection.execute("SELECT name FROM dogs ORDER BY id").to_a.map { |r| r["name"] }]
+out "reading insert!", outcome { ActiveRecord::Base.connected_to(role: :reading) { Dog.insert!({ name: "no" }) } }
+out "reading insert_all", outcome { ActiveRecord::Base.connected_to(role: :reading) { Dog.insert_all([{ name: "no" }]) } }
+out "after insert family", [Post.count, Dog.count]
+
 out "concrete connected_to", outcome { Dog.connected_to(role: :reading) { 1 } }
 out "unknown role", outcome { ActiveRecord::Base.connected_to(role: :nope) { Post.count } }
 out "no role or shard", outcome { ActiveRecord::Base.connected_to { 1 } }

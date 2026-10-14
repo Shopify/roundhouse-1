@@ -398,7 +398,37 @@ pub fn emit_expr(e: &Expr) -> String {
         // Unindented: a heredoc's lines are whitespace-significant.
         return format!("class << self\n{}\nend", emit_node(&e.node).trim_end());
     }
+    if e.decisions & crate::expr::RESOLVED_CLASS_REF != 0
+        && let ExprNode::Const { path } = &*e.node
+        && let Some(crate::ty::Ty::Class { id, .. }) = &e.ty
+        && let Some(rooted) = rooted_resolved_head(path, id.0.as_str())
+    {
+        return rooted;
+    }
     emit_node(&e.node)
+}
+
+/// A bare constant (`Theme`) the analysis resolved to `resolved`, read
+/// where an enclosing namespace of the emit declares a constant of that
+/// name: Ruby binds the head through the lexical scopes first, so the
+/// bare spelling reads `OnlineStore::Theme` unless that is what it
+/// resolved to. A lowering that writes a resolved association target
+/// (`belongs_to class_name: "::Theme"` → `Theme`) means the absolute
+/// class; spelled `::Theme`, it stays that one.
+fn rooted_resolved_head(path: &[crate::Symbol], resolved: &str) -> Option<String> {
+    let [head] = path else { return None };
+    let head = head.as_str();
+    if head.is_empty() || head.starts_with("::") {
+        return None;
+    }
+    LEXICAL_SCOPE.with(|c| {
+        let c = c.borrow();
+        let (scopes, paths) = c.as_ref()?;
+        (1..=scopes.len()).rev().find_map(|i| {
+            let binds = format!("{}::{head}", scopes[..i].join("::"));
+            paths.contains(&binds).then(|| (binds != resolved).then(|| format!("::{resolved}")))
+        })?
+    })
 }
 
 /// A String `blank?` that `lower::blank` grounded as `r.strip.empty?`,

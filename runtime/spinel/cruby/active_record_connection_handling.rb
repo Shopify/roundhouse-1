@@ -1393,7 +1393,8 @@ module ActiveRecord
   module ConnectionRouting
     CLASS_METHODS = %i[
       _adapter_find_by_id _adapter_all _adapter_last _adapter_count _adapter_any? _adapter_exists_by_id?
-      _adapter_truncate find_by where delete_all transaction update_counters upsert_all insert_all _hydrate_all
+      _adapter_truncate find_by where delete_all transaction update_counters upsert upsert_all insert insert! insert_all
+      insert_all! _insert_rows _hydrate_all
     ].freeze
     INSTANCE_METHODS = %i[_adapter_insert _adapter_update _adapter_delete _adapter_reload].freeze
     RELATION_METHODS = %i[

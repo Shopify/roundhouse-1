@@ -72,3 +72,27 @@ module ActiveJob
     end
   end
 end
+
+module ActiveJob
+  class Base
+    # `ActiveJob::Base.logger` / `#logger` (active_job/logging.rb's
+    # `cattr_accessor :logger`): one logger shared by every job class.
+    # Rails' railtie points it at `Rails.logger`; until something assigns
+    # one, the reader answers that, as a gem that calls
+    # `ActiveJob::Base.logger` (job-iteration's `JobIteration.logger`)
+    # expects.
+    @@logger = nil
+
+    def self.logger
+      @@logger || Rails.logger
+    end
+
+    def self.logger=(value)
+      @@logger = value
+    end
+
+    def logger
+      self.class.logger
+    end
+  end
+end

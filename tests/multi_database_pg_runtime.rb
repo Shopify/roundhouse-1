@@ -109,7 +109,7 @@ failures << "storage:\n  native:  #{native[3].to_json}\n  emitted: #{emitted[3].
 # What both must show, so two identical wrong answers still fail.
 expected_storage = {
   "primary" => { "posts" => ["hello"], "dogs" => [] },
-  "animals" => { "posts" => [], "dogs" => ["rex", "kept"] },
+  "animals" => { "posts" => [], "dogs" => ["rex", "kept", "ins", "ia1", "ia2", "ins2"] },
 }
 failures << "native storage #{native[3].to_json}" unless native[3] == expected_storage
 answers = native[0].to_h

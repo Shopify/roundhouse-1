@@ -1308,7 +1308,7 @@ fn model_from_stmt(owner: &ClassId, stmt: &Symbol) -> Expr {
     Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: Some(class_const(owner)),
+            recv: Some(crate::lower::model_to_library::resolved_class_const(owner)),
             method: Symbol::from("from_stmt"),
             args: vec![var_ref(stmt)],
             block: None,

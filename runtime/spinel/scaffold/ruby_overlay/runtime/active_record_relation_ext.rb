@@ -87,3 +87,22 @@ module ActiveRecord
   end
   Relation.prepend(RelationSelectBlock)
 end
+
+module ActiveRecord
+  # Rails' ClassSpecificRelation (relation/delegation.rb): a name the
+  # relation does not define, but the model class does, runs on the class
+  # with the relation as its scope. A module prepended on the Relation
+  # (Core's `GenerateOid::ActiveRecordInsertPatch` asks `oid_enabled?`)
+  # reads the class's own methods this way. Anything the class does not
+  # answer is still a NoMethodError.
+  class Relation
+    def method_missing(name, *args, **kwargs, &block)
+      return super unless @model.respond_to?(name)
+      scoping { @model.public_send(name, *args, **kwargs, &block) }
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      @model.respond_to?(name) || super
+    end
+  end
+end
