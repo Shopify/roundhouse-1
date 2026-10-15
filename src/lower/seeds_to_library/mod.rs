@@ -257,6 +257,19 @@ fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model], rooted: bool
     if matches!(&*parent_expr.node, ExprNode::Const { .. }) {
         return None;
     }
+    // A parent that is no model of the app has no associations to
+    // guess: a test class reading its own helper
+    // (`saved_search_class.create!`, a shared-tests method returning the
+    // model class under test) is a method call, not a child built through
+    // an undeclared has_many `:saved_search_class` of the test. The
+    // guess below is for the models the caller listed; no list (the
+    // seeds' and controllers' callers) keeps it for every parent.
+    if declared.is_none()
+        && !models.is_empty()
+        && !models.iter().any(|m| m.name.0.as_str() == parent_class)
+    {
+        return None;
+    }
     // An undeclared reader the owner DEFINES as a plain method
     // (`Theme#files` returning an `AssetCloud::ThemeFiles`) is not an
     // association whose target the name can be guessed from: leave the
