@@ -8,6 +8,7 @@ module ActionView
       def t: (String | Symbol | Array[String | Symbol] key, **untyped options) -> untyped
       def localize: (untyped object, **untyped options) -> String
       def l: (untyped object, **untyped options) -> String
+      private def html_safe_translation_key?: (String | Symbol | Array[String | Symbol] key) -> bool
     end
   end
 end

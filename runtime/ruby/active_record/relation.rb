@@ -229,9 +229,16 @@ module ActiveRecord
 
     def extending!(*modules, &block)
       unload_records
-      modules << Module.new(&block) if block
-      modules.flatten!
-      extend(*modules) unless modules.empty?
+      flat = [] #: Array[Module]
+      modules.each do |entry|
+        if entry.is_a?(Array)
+          entry.each { |inner| flat << inner }
+        else
+          flat << entry
+        end
+      end
+      flat << Module.new(&block) if block
+      extend(*flat) unless flat.empty?
       self
     end
 

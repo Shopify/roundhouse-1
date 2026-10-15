@@ -1922,13 +1922,68 @@ module ActiveRecord
     # QueryLayer, where `model` is a class-valued reader). Without them
     # `select` reaches Kernel#select, private, and the rest are undefined.
     # Each builds the relation `all` builds, so the default scope applies.
-    %i[
-      select group order reorder limit offset joins left_joins left_outer_joins
-      includes preload eager_load distinct having from extending
-    ].each do |name|
-      define_singleton_method(name) do |*args, &block|
-        ActiveRecord::Relation.new(self).public_send(name, *args, &block)
-      end
+    def self.select(*args, &block)
+      ActiveRecord::Relation.new(self).select(*args, &block)
+    end
+
+    def self.group(*args, &block)
+      ActiveRecord::Relation.new(self).group(*args, &block)
+    end
+
+    def self.order(*args, &block)
+      ActiveRecord::Relation.new(self).order(*args, &block)
+    end
+
+    def self.reorder(*args, &block)
+      ActiveRecord::Relation.new(self).reorder(*args, &block)
+    end
+
+    def self.limit(*args, &block)
+      ActiveRecord::Relation.new(self).limit(*args, &block)
+    end
+
+    def self.offset(*args, &block)
+      ActiveRecord::Relation.new(self).offset(*args, &block)
+    end
+
+    def self.joins(*args, &block)
+      ActiveRecord::Relation.new(self).joins(*args, &block)
+    end
+
+    def self.left_joins(*args, &block)
+      ActiveRecord::Relation.new(self).left_joins(*args, &block)
+    end
+
+    def self.left_outer_joins(*args, &block)
+      ActiveRecord::Relation.new(self).left_outer_joins(*args, &block)
+    end
+
+    def self.includes(*args, &block)
+      ActiveRecord::Relation.new(self).includes(*args, &block)
+    end
+
+    def self.preload(*args, &block)
+      ActiveRecord::Relation.new(self).preload(*args, &block)
+    end
+
+    def self.eager_load(*args, &block)
+      ActiveRecord::Relation.new(self).eager_load(*args, &block)
+    end
+
+    def self.distinct(*args, &block)
+      ActiveRecord::Relation.new(self).distinct(*args, &block)
+    end
+
+    def self.having(*args, &block)
+      ActiveRecord::Relation.new(self).having(*args, &block)
+    end
+
+    def self.from(*args, &block)
+      ActiveRecord::Relation.new(self).from(*args, &block)
+    end
+
+    def self.extending(*args, &block)
+      ActiveRecord::Relation.new(self).extending(*args, &block)
     end
 
     # Rails-shape `all` fallback, same story as `where` above: a lazy
