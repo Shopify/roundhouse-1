@@ -33,7 +33,9 @@
 #   (lower::sti_scope).
 # - A column a partial `select` left out (`_note_unloaded`) raises
 #   ActiveModel::MissingAttributeError when read, as Rails' reader does
-#   (attribute_methods/read.rb), until `reload` reads the whole row.
+#   (attribute_methods/read.rb), until `reload` reads the whole row. A
+#   select alias (`SUM(x) AS total`) is read by `[]` and its own reader. `id`
+#   answers nil instead (PrimaryKey#id passes `_read_attribute` no block).
 #   Rails then saves only the changed columns; the emitted UPDATE writes
 #   every column, so saving such a record raises NotImplementedError
 #   rather than writing NULL over the columns it never read.
@@ -53,10 +55,15 @@ module ActiveRecord # :nodoc:
   module UnloadedAttributes
     def _note_unloaded(row)
       super
+      _note_select_aliases(row)
       unloaded = @__unloaded_columns
       return nil if unloaded.nil?
       unloaded.each do |col|
         define_singleton_method(col) do
+          # Rails' `id` reads the primary key without the raising block the
+          # generated column readers pass, so a row that left it out
+          # (`Sale.group(...).select(:currency, sum_expr)`) answers nil.
+          return nil if col.to_s == "id" && @__unloaded_columns&.include?(col)
           if @__unloaded_columns&.include?(col)
             raise ActiveModel::MissingAttributeError, "missing attribute '#{col}' for #{self.class.name}"
           end
@@ -76,7 +83,34 @@ module ActiveRecord # :nodoc:
 
     def reload(*)
       @__unloaded_columns = nil
+      @__select_aliases = nil
       super
+    end
+
+    private
+
+    # A projection can name more than the table's columns
+    # (`select("SUM(pages) AS total")`): Rails keeps those values as the
+    # record's attributes, read by `record["total"]`, `record.total` and
+    # `has_attribute?`. The emitted model's `instantiate` keeps only its
+    # columns, so the row's other keys are kept here.
+    def _note_select_aliases(row)
+      columns = self.class.schema_columns.map(&:to_s)
+      aliases = row.reject { |name, _| columns.include?(name.to_s) }
+      return nil if aliases.empty?
+      aliases = aliases.transform_keys(&:to_s)
+      @__select_aliases = aliases
+      aliases.each_key do |name|
+        define_singleton_method(name) { @__select_aliases&.key?(name) ? @__select_aliases[name] : super() }
+      end
+      define_singleton_method(:[]) do |name|
+        key = name.to_s
+        @__select_aliases&.key?(key) ? @__select_aliases[key] : super(name)
+      end
+      define_singleton_method(:has_attribute?) do |name|
+        @__select_aliases&.key?(name.to_s) || super(name)
+      end
+      nil
     end
   end
 
