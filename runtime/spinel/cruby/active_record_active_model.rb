@@ -128,6 +128,24 @@ module ActiveRecord # :nodoc:
       def inheritance_column=(value)
         @__inheritance_column = value.to_s
       end
+
+      # reflection.rb `class_attribute :has_many_inversing, instance_accessor:
+      # false, default: false`, which Core's `load_defaults(8.1)` turns on:
+      # this class's value, else its superclass's, else true. An app's
+      # loader reads it to decide whether to set a has_many inverse.
+      def has_many_inversing
+        if instance_variable_defined?(:@__has_many_inversing)
+          @__has_many_inversing
+        elsif superclass.respond_to?(:has_many_inversing)
+          superclass.has_many_inversing
+        else
+          true
+        end
+      end
+
+      def has_many_inversing=(value)
+        @__has_many_inversing = value
+      end
     end
 
     # Returns this record's primary key value wrapped in an array if one is
@@ -165,6 +183,12 @@ module ActiveRecord # :nodoc:
     # reading a foreign key column). The validations ports ask
     # `respond_to?(:read_attribute)` and read the same value.
     def read_attribute(attr_name)
+      self[attr_name]
+    end
+
+    # attribute_methods/read.rb `_read_attribute`: what `read_attribute`
+    # answers, without the alias lookup (a gem's private reader).
+    def _read_attribute(attr_name)
       self[attr_name]
     end
   end

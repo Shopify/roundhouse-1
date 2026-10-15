@@ -1352,17 +1352,6 @@ end
 # time the reader answers. The emitted app reopens this module for the
 # gem's VERSION.
 module ArTransactionChanges
-  def transaction_changed_attributes
-    baseline = @_transaction_changes_kept ? @_transaction_changes_baseline : @__last_saved_attributes
-    changed = HashWithIndifferentAccess.new
-    changed["id"] = nil if @_transaction_changes_created
-    _attribute_snapshot.each do |name, value|
-      before = baseline.nil? ? nil : baseline[name]
-      changed[name] = _transaction_change_value(name, before) unless before == value
-    end
-    changed
-  end
-
   def __track_saved_changes(was_new)
     unless @_transaction_changes_kept
       @_transaction_changes_baseline = @__last_saved_attributes
@@ -1403,4 +1392,101 @@ module ArTransactionChanges
       return value unless type.respond_to?(:type) && type.type == :datetime
       ActiveSupport.present_db(ActiveSupport.parse_db_time(value))
     end
+
+  # What the gem's own source, when the app carries it (Core does: its
+  # module body reopens this one), would shadow or read past: the
+  # runtime's reader answers (the gem's records writes through
+  # `_write_attribute`, which a compiled model's writers do not call),
+  # folding in what the gem did note (`attribute_will_change!` and
+  # `write_attribute` on this record, into the store its own methods see
+  # through the same reader); and the gem's private readers find
+  # the record's attribute, as Rails' `@attributes[name]` answers, in a
+  # view bound to the record (RecordAttributeSet).
+  module RuntimeSurface
+    def transaction_changed_attributes
+      # The gem's own bookkeeping (`attribute_will_change!`,
+      # `_store_transaction_changed_attributes`) reads and writes its
+      # store through this reader, as in the gem.
+      return (@transaction_changed_attributes ||= {}) if @_transaction_changes_noting
+      baseline = @_transaction_changes_kept ? @_transaction_changes_baseline : @__last_saved_attributes
+      changed = HashWithIndifferentAccess.new
+      changed["id"] = nil if @_transaction_changes_created
+      _attribute_snapshot.each do |name, value|
+        before = baseline.nil? ? nil : baseline[name]
+        changed[name] = _transaction_change_value(name, before) unless before == value
+      end
+      noted = @transaction_changed_attributes
+      noted.each { |name, value| changed[name] = value unless changed.key?(name) } unless noted.nil?
+      changed
+    end
+
+    def attribute_will_change!(attr_name)
+      _noting_transaction_changes { super }
+    end
+
+    private
+      def _noting_transaction_changes
+        outer = @_transaction_changes_noting
+        @_transaction_changes_noting = true
+        yield
+      ensure
+        @_transaction_changes_noting = outer
+      end
+
+      def _store_transaction_changed_attributes(attr_name, &block)
+        _noting_transaction_changes { super }
+      end
+
+      def _read_attribute_for_transaction(attr_name)
+        _bind_attribute_set
+        super
+      end
+
+      def _deserialize_transaction_change_value(attr_name, value)
+        _bind_attribute_set
+        super
+      end
+
+      def _bind_attribute_set
+        set = @attributes
+        @attributes = ActiveRecord::RecordAttributeSet.new(self) unless set.is_a?(ActiveRecord::RecordAttributeSet) && set.record.equal?(self)
+      end
+  end
+  prepend RuntimeSurface
+end
+
+module ActiveRecord
+  # `@attributes` as the gem and Rails' dirty code read it, over a
+  # compiled model that keeps its columns in slots: `[name]` answers the
+  # attribute with the column's type, the value as the app last assigned
+  # it (`came_from_user?`, so `value_before_type_cast` is serialized
+  # through the type, as Rails does for an assigned attribute) and the
+  # value cast. A name the model has no column for answers a null
+  # attribute.
+  class RecordAttributeSet # :nodoc:
+    attr_reader :record
+
+    def initialize(record)
+      @record = record
+    end
+
+    def [](name)
+      name = name.to_s
+      type = begin
+        @record.class.type_for_attribute(name)
+      rescue NotImplementedError
+        nil
+      end
+      return ActiveModel::Attribute.null(name) if type.nil?
+      ActiveModel::Attribute.from_user(name, @record[name], type)
+    end
+
+    def key?(name)
+      @record.has_attribute?(name)
+    end
+
+    def keys
+      @record.attribute_names
+    end
+  end
 end

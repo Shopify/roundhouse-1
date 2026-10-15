@@ -1424,6 +1424,20 @@ fn push_symbol_callback(
         return;
     }
     let hook_name = hook_method_name(cb.hook);
+    // `before_validation :generate_uuid` where `def generate_uuid; self.uuid
+    // ||= SecureRandom.uuid; end`: the same `||=` the block form rewrites
+    // (`push_block_callback`), over a method the callback names. Rails'
+    // new-record string attribute is nil; this storage's is "".
+    for target in &cb.targets {
+        if let Some(def) = methods
+            .iter_mut()
+            .find(|m| m.name == *target && m.receiver == MethodReceiver::Instance)
+        {
+            rewrite_column_or_assign(&mut def.body, model);
+            let span = def.body.span;
+            def.body.inherit_span(span);
+        }
+    }
     let self_call = |name: &Symbol| {
         Expr::new(
             span,

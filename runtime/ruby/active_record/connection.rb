@@ -1986,6 +1986,12 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).extending(*args, &block)
     end
 
+    # QueryMethods#readonly on the class (`Model.readonly.find(id)`): the
+    # records the relation loads raise ReadOnlyRecord on save.
+    def self.readonly(value = true)
+      ActiveRecord::Relation.new(self).readonly(value)
+    end
+
     # Rails-shape `all` fallback, same story as `where` above: a lazy
     # Relation so refiner chains the lowerers left dynamic
     # (`Category.all.order("category asc, tags.tag asc")…` on lobsters'
@@ -2268,14 +2274,14 @@ module ActiveRecord
       changes["id"] = [nil, id] if was_new && !id.nil?
       _merge_forced_changes(changes, current)
       @__last_saved_attributes = current
-      @saved_changes = changes
+      @saved_changes = _indifferent_changes(changes)
       @id_previously_changed = was_new
       @__forced_changes = nil
       nil
     end
 
     def saved_changes
-      @saved_changes || {}
+      @saved_changes || _indifferent_changes({})
     end
 
     # ActiveModel::Dirty#previous_changes is `mutations_before_last_save
@@ -2575,7 +2581,16 @@ module ActiveRecord
         changes[key] = [prev, value] if prev != value
       end
       _merge_forced_changes(changes, _attribute_snapshot)
-      changes
+      _indifferent_changes(changes)
+    end
+
+    # `changes` and `saved_changes` are HashWithIndifferentAccess
+    # (ActiveModel::Dirty), so `saved_changes[:settings]` finds the
+    # "settings" pair; a tree without ActiveSupport's class keeps the
+    # String-keyed Hash.
+    def _indifferent_changes(changes)
+      return changes unless defined?(ActiveSupport::HashWithIndifferentAccess)
+      ActiveSupport::HashWithIndifferentAccess.new(changes)
     end
 
     # ActiveModel::Dirty#attribute_will_change!: the attribute counts as

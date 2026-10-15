@@ -228,3 +228,65 @@ fn ar_transaction_changes_match_native_rails_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted, native, "emitted");
 }
+
+/// The gem's own source, as Core's emitted tree carries it (its module
+/// body reopens the runtime's): its private readers (`_read_attribute_for_transaction`,
+/// `_deserialize_transaction_change_value`) read `@attributes[name]`
+/// and `_read_attribute`, which a compiled model keeps no attribute set
+/// for. `attribute_will_change!` (Core's `settings_will_change!`) and
+/// `write_attribute` reach them.
+const GEM_SOURCE: &str = include_str!("support/ar_transaction_changes_gem.rb");
+
+const WILL_CHANGE_PROBE: &str = r##"class WillChangeProbe
+  def self.lines
+    out = []
+    w = Widget.create!(name: "x", count: 1)
+    ChangeLog.take
+    Widget.transaction do
+      w.name_will_change!
+      out << "noted: #{w.changes_text}"
+    end
+    out << "commit: #{ChangeLog.take}"
+    w.update!(name: "y")
+    out << "saved changes by symbol: #{w.saved_changes[:name].inspect} #{w.saved_changes.class}"
+    out << "changes by symbol: #{w.changes[:name].inspect} #{w.changes.class}"
+    ChangeLog.take
+    w.write_attribute(:name, "z")
+    out << "written: #{w.changes_text}"
+    out
+  end
+end
+"##;
+
+const WILL_CHANGE_EXPECTED: [&str; 5] = [
+    "noted: name=\"x\"",
+    "commit: ",
+    "saved changes by symbol: [\"x\", \"y\"] ActiveSupport::HashWithIndifferentAccess",
+    "changes by symbol: nil ActiveSupport::HashWithIndifferentAccess",
+    "written: name=\"y\"",
+];
+
+#[test]
+#[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn the_carried_gem_source_runs_on_a_compiled_record_as_native_rails_does() {
+    let app = overlay()
+        .write("app/models/ar_transaction_changes.rb", GEM_SOURCE)
+        .write("app/models/will_change_probe.rb", WILL_CHANGE_PROBE);
+    let (emitted, errors) = app.emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let mut native_files = FILES.to_vec();
+    native_files.push(("lib/native_gems.rb", NATIVE_GEMS));
+    native_files.push(("app/models/will_change_probe.rb", WILL_CHANGE_PROBE));
+    let mut loads = LOADS.to_vec();
+    loads.push("app/models/will_change_probe");
+    let (native, emitted) = pg_probe::native_and_emitted(
+        "ar-transaction-changes-gem-source",
+        &native_files,
+        &emitted,
+        "rh_e2e_ar_transaction_changes_gem",
+        "WillChangeProbe",
+        &loads,
+    );
+    assert_eq!(native, WILL_CHANGE_EXPECTED, "native");
+    assert_eq!(emitted, native, "emitted");
+}
