@@ -15476,9 +15476,36 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
             a.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
         }) || extended.iter().any(|m| module_defines(m, name, app, &mut Vec::new()))
     };
+    // A `with_options(optional: true) do attribute(:x, :string) end`
+    // whose block (no parameter: its calls reach the OptionMerger, which
+    // merges the options into each) holds only such macros runs as
+    // written, on the option merger the validations port carries (an app class
+    // includes ActiveModel::Validations, which carries the port). Core's
+    // Customers::RedactCustomerInput declares its optional attributes so.
+    let merged_macros = |call: &Expr| {
+        let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return false };
+        let ExprNode::Lambda { params, rest_param: None, extra_params, body, .. } = &*block.node else { return false };
+        let statements: &[Expr] = match &*body.node {
+            ExprNode::Seq { exprs } => exprs,
+            _ => std::slice::from_ref(body),
+        };
+        method.as_str() == "with_options"
+            && args.len() == 1
+            && params.is_empty()
+            && extra_params.is_empty()
+            && !statements.is_empty()
+            && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            && app.library_classes.iter().any(|c| includes_active_model_validations(c, app))
+            && statements.iter().all(|s| {
+                matches!(&*s.node, ExprNode::Send { recv: None, method, .. } if inherited(method.as_str()))
+            })
+    };
     lc.unknown_calls
         .iter()
         .filter(|call| {
+            if merged_macros(call) {
+                return true;
+            }
             let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
             let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
             on_self && (inherited(method.as_str()) || app_module_extend(lc, call, app).is_some())
