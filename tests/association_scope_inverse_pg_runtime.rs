@@ -140,6 +140,17 @@ const PROBE: &str = r##"class ScopeProbe
     badge_held.association(:holder).set_inverse_instance(badge_owner)
     out << "explicit inverse_of: #{badge_owner.association(:badge).loaded?} #{badge_owner.badge.equal?(badge_held)}"
 
+    # has_one and has_many: public too (Core's ModelCaching sets a
+    # prefetched target through them).
+    fetched = Profile.find(profile.id)
+    profile_owner = Shop.find(shop.id)
+    profile_owner.association(:profile).target = fetched
+    out << "has_one set_inverse_instance: #{profile_owner.association(:profile).set_inverse_instance(fetched).equal?(fetched)} #{fetched.association(:shop).loaded?} #{fetched.shop.equal?(profile_owner)}"
+    note = Note.find_by!(body: "n1")
+    note_owner = Item.find(b.id)
+    note_owner.association(:notes).target = [note]
+    out << "has_many set_inverse_instance: #{note_owner.association(:notes).set_inverse_instance(note).equal?(note)} #{note.association(:item).loaded?} #{note.item.equal?(note_owner)}"
+
     nobody = Item.find(b.id)
     nobody.association(:shop).set_inverse_instance(owner)
     out << "no inverse: #{owner.association(:items).loaded?}"
@@ -150,7 +161,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 13] = [
+const EXPECTED: [&str; 15] = [
     r#"scoped has_many: ["b", "a"]"#,
     "scoped has_many klass: Item",
     "scoped has_many order: true",
@@ -163,6 +174,8 @@ const EXPECTED: [&str; 13] = [
     "set_inverse_instance: true",
     "inverse after: true true",
     "explicit inverse_of: true true",
+    "has_one set_inverse_instance: true true true",
+    "has_many set_inverse_instance: true true true",
     "no inverse: false",
 ];
 
