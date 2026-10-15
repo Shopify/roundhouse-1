@@ -323,6 +323,7 @@ module ActiveRecord
     def self._hydrate_all: (String sql) -> Array[Base]
     def update_attribute: (Symbol name, untyped value) -> bool
     def valid?: (?Symbol? context) -> bool
+    def _valid_with_caller_hooks?: (?untyped context) -> bool
     def validation_context: () -> Symbol?
     def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool

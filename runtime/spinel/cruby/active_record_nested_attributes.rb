@@ -330,7 +330,7 @@ module ActiveRecord
       def _nested_association_valid?(name, record)
         return true if record.destroyed? || record.marked_for_destruction?
         context = _nested_custom_context? ? @validation_context : nil
-        valid = record.valid?(context)
+        valid = record._valid_with_caller_hooks?(context)
         _nested_import_errors(name, record) unless valid
         valid
       end

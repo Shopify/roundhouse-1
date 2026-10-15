@@ -2259,9 +2259,9 @@ module ActiveRecord
         # ActiveModel::Validations::Callbacks wraps the run, so a bare
         # `valid?` (Core's Metafields::BulkUpsert validating before it
         # writes) assigns what `before_validation` derives, as `save` does.
-        before_validation
+        before_validation unless @_validation_hooks_off
         ActiveRecord::RuntimeValidations.run(self)
-        after_validation
+        after_validation unless @_validation_hooks_off
       ensure
         @validation_context = previous
       end
@@ -2272,6 +2272,17 @@ module ActiveRecord
       @validation_context
     end
 
+    # `valid?` for a caller that runs `before_validation` /
+    # `after_validation` itself: `save`, a runtime callback chain, a
+    # parent validating its nested child.
+    def _valid_with_caller_hooks?(context = nil)
+      previous = @_validation_hooks_off
+      @_validation_hooks_off = true
+      valid?(context)
+    ensure
+      @_validation_hooks_off = previous
+    end
+
     # ActiveModel::Validations#validates_with: run the validators on
     # this record now (a validate method calling it, as Core's
     # RuntimeValidations#instance_validator does).
@@ -2280,7 +2291,9 @@ module ActiveRecord
     end
 
     def save(context: nil)
-      ok = valid?(context)
+      before_validation
+      ok = _valid_with_caller_hooks?(context)
+      after_validation
       return false unless ok
 
       save_after_validation
