@@ -15734,3 +15734,27 @@ puts "PASS friendly oracle"
 mod acts_as_votable;
 
 
+
+/// A model's `delegate :published?, to: :kind` over a reader that wraps
+/// its string in a StringInquirer is the delegated predicate: the Ruby
+/// family's `(...)` forwarder calls `kind.published?(...)`, which folds to
+/// the comparison as the bare `kind.published?` does (Core's
+/// `ApiClient#auto_redirect?` raised NoMethodError on the String).
+#[test]
+fn a_delegated_inquirer_predicate_answers_the_comparison() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord",
+            "class Article < ApplicationRecord\n  #: -> ActiveSupport::StringInquirer\n  def kind\n    ActiveSupport::StringInquirer.new(title.to_s)\n  end\n\n  delegate :published?, :draft?, to: :kind",
+        )
+        .run_ruby(
+            r#"
+a = Article.new(title: "published", body: "b")
+raise "delegated predicate missed" unless a.published?
+raise "delegated predicate answers true for everything" if a.draft?
+raise "second label missed" unless Article.new(title: "draft", body: "b").draft?
+"#,
+        )
+        .assert_passes();
+}

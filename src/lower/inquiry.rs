@@ -69,6 +69,16 @@ pub fn apply_inquiry_lowering(app: &mut App) {
         reach: Reach::collect(app),
     };
     super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, &facts, owner));
+    // The Ruby family's `(...)` delegate forwarders are written from these
+    // maps, not from a body above: `kind.auto_redirect?(...)` folds like
+    // the zero-argument forwarder the strict targets get.
+    for forwarders in [&mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders] {
+        for (owner, methods) in forwarders.iter_mut() {
+            for method in methods {
+                rewrite(&mut method.body, &facts, Some(&*owner));
+            }
+        }
+    }
     for view in &mut app.views {
         rewrite(&mut view.body, &facts, None);
     }
@@ -213,7 +223,7 @@ fn rewrite(expr: &mut Expr, facts: &Facts, owner: Option<&crate::ident::ClassId>
     // `inquirers` first — the rewrite destroys the evidence — applied
     // one level in.
     if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node {
-        if args.is_empty() {
+        if takes_no_arguments(args) {
             if let Some(label) = method.as_str().strip_suffix('?') {
                 if !label.is_empty() && !facts.app_string_methods.contains(method) {
                     if let Some(inner) = crate::analyze::inquiry::inquirer_value(recv) {
@@ -238,7 +248,7 @@ fn rewrite(expr: &mut Expr, facts: &Facts, owner: Option<&crate::ident::ClassId>
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
         return;
     };
-    if !args.is_empty() {
+    if !takes_no_arguments(args) {
         return;
     }
 
@@ -264,6 +274,19 @@ fn rewrite(expr: &mut Expr, facts: &Facts, owner: Option<&crate::ident::ClassId>
     let recv = recv.clone();
     let span = expr.span;
     *expr = eq_label(span, recv, label);
+}
+
+/// A predicate call with no arguments, or only a forwarded `(...)`: the
+/// inquirer's `method_missing(name, ...)` takes and ignores whatever it is
+/// given, so a `delegate :auto_redirect?, to: :kind` forwarder
+/// (`def auto_redirect?(...) = kind.auto_redirect?(...)`) folds the same
+/// way as the bare predicate.
+fn takes_no_arguments(args: &[Expr]) -> bool {
+    match args {
+        [] => true,
+        [only] => matches!(&*only.node, ExprNode::ForwardArgs),
+        _ => false,
+    }
 }
 
 /// Can the call `<call_recv>.<method>` reach an inquirer-returning
