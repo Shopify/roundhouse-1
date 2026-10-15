@@ -7,7 +7,7 @@
 //! a list (`TYPES = %w[ Page Section Picture ]`, `types: Leafable::TYPES`).
 //! Unresolvable or non-class-name constants fail closed. Documented
 //! options (`foreign_key`, `foreign_type`, `primary_key`,
-//! `dependent: :destroy`, plus `optional`/`touch`/`default` forwarded
+//! `dependent: :destroy`, `inverse_of`, plus `optional`/`touch`/`default` forwarded
 //! to `belongs_to`) are honored; other `dependent:` values and
 //! unmodeled belongs_to kwargs (`class_name`, `autosave`, …) stay
 //! unexpanded so the unsupported ledger remains honest.
@@ -143,6 +143,16 @@ fn parse_declaration(
                     };
                     dependent = super::model::dependent_from_sym(&s);
                     if dependent.is_none() {
+                        return Ok(None);
+                    }
+                }
+                // `inverse_of: :cost_adjustments` names the owner-side
+                // has_many. Plain `belongs_to` reads and drops it too
+                // (`Association::BelongsTo` carries no inverse; the
+                // has_many side's `as:` declaration drives the link), so
+                // it is accepted here when it is a symbol/string name.
+                "inverse_of" => {
+                    if symbol_or_string_value(&value).is_none() {
                         return Ok(None);
                     }
                 }

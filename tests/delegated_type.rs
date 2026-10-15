@@ -623,3 +623,82 @@ puts "delegated_type foreign_key foreign_type primary_key passed"
         .assert_passes();
 }
 
+
+/// Core's `Inventory::CostAdjustment` shape: `types:` is a frozen array
+/// built from another constant, with `inverse_of:` / `primary_key:` /
+/// `foreign_key:` spelled out. `inverse_of:` is accepted by plain
+/// `belongs_to`, so it must not make the declaration fail closed.
+#[test]
+fn inverse_of_and_nested_types_constant_ingest() {
+    let app = entry_app(
+        "  KIND_MESSAGE = \"Message\"\n  TYPES = [\n    KIND_MESSAGE,\n  ].freeze\n  delegated_type :entryable,\n    types: TYPES,\n    inverse_of: :entries,\n    primary_key: :id,\n    foreign_key: :entryable_id\n",
+    );
+    let inst = instance_names(&app, "Entry");
+    for name in ["message?", "message", "entryable_class", "entryable_name"] {
+        assert!(inst.iter().any(|n| n == name), "{name} missing from {inst:?}");
+    }
+    let entry = app.models.iter().find(|m| m.name.0.as_str() == "Entry").unwrap();
+    let assoc = entry.associations().next().expect("belongs_to");
+    let Association::BelongsTo { name, polymorphic, .. } = assoc else {
+        panic!("{assoc:?}");
+    };
+    assert_eq!(name.as_str(), "entryable");
+    assert!(polymorphic);
+}
+
+/// A non-literal `inverse_of:` stays unexpanded (nothing in the corpus).
+#[test]
+fn dynamic_inverse_of_stays_unexpanded() {
+    let app = entry_app(
+        "  delegated_type :entryable, types: %w[ Message ], inverse_of: some_name\n",
+    );
+    let inst = instance_names(&app, "Entry");
+    assert!(!inst.iter().any(|n| n == "message?"), "{inst:?}");
+}
+
+#[test]
+fn emitted_inverse_of_nested_constant_namespaced_runs() {
+    runtime_app()
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "inventory_cost_adjustments", force: :cascade do |t|
+    t.string "adjustable_type"
+    t.integer "adjustable_id"
+    t.integer "amount"
+  end
+  create_table "inventory_shipments", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/inventory/cost_adjustment.rb",
+            "module Inventory\n  class CostAdjustment < ApplicationRecord\n    self.table_name = \"inventory_cost_adjustments\"\n    ADJUSTABLE_TYPE_SHIPMENT = \"Inventory::Shipment\"\n    ADJUSTABLE_TYPES = [\n      ADJUSTABLE_TYPE_SHIPMENT,\n    ].freeze\n\n    delegated_type :adjustable,\n      types: ADJUSTABLE_TYPES,\n      inverse_of: :cost_adjustments,\n      primary_key: :id,\n      foreign_key: :adjustable_id\n\n    validates :adjustable, presence: true\n  end\nend\n",
+        )
+        .write(
+            "app/models/inventory/shipment.rb",
+            "module Inventory\n  class Shipment < ApplicationRecord\n    self.table_name = \"inventory_shipments\"\n    has_many :cost_adjustments, class_name: \"Inventory::CostAdjustment\", as: :adjustable, inverse_of: :adjustable\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"
+s = Inventory::Shipment.create!(name: "ship")
+adj = Inventory::CostAdjustment.create!(adjustable: s, amount: 5)
+raise "association" unless Inventory::CostAdjustment.reflect_on_association(:adjustable)
+raise "reader" unless adj.adjustable == s
+raise "predicate" unless adj.inventory_shipment?
+raise "typed reader" unless adj.inventory_shipment == s
+raise "typed id" unless adj.inventory_shipment_id == s.id
+raise "class" unless adj.adjustable_class == Inventory::Shipment
+raise "name" unless adj.adjustable_name == "inventory_shipment"
+raise "types" unless Inventory::CostAdjustment.adjustable_types == ["Inventory::Shipment"]
+raise "scope" unless Inventory::CostAdjustment.inventory_shipments.where(id: adj.id).exists?
+raise "inverse" unless s.cost_adjustments.to_a == [adj]
+bad = Inventory::CostAdjustment.new(amount: 1)
+raise "presence" if bad.valid?
+puts "delegated_type inverse_of nested constant passed"
+"#,
+        )
+        .assert_passes();
+}
