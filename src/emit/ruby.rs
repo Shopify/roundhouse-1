@@ -474,6 +474,9 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // A validation reads an attribute through its reader, which a module
     // the model includes may redefine.
     crate::lower::validation_readers::apply(lcs, app);
+    // A custom validator named by key is the class Rails finds through the
+    // model's ancestors (`ActiveModel::Validations::HttpUriValidator`).
+    crate::lower::validator_constants::apply(lcs, app);
     // belongs_to writers are synthesized by the shared model lowering
     // (lower::model_to_library::associations), alongside the readers.
     // App-helper resolution: bare `avatar_img(...)` → `ApplicationHelper.
