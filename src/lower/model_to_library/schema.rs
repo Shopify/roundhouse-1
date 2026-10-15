@@ -2349,6 +2349,9 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
         (Symbol::from(format!("{n}_change")), "attribute_change", Ty::Untyped),
         (Symbol::from(format!("{n}_change_to_be_saved")), "attribute_change_to_be_saved", Ty::Untyped),
         (Symbol::from(format!("{n}_in_database")), "attribute_in_database", Ty::Untyped),
+        // `<col>_will_change!`: force the pending change a mutated-in-place
+        // value does not show (Core's `settings_will_change!`).
+        (Symbol::from(format!("{n}_will_change!")), "attribute_will_change!", Ty::Untyped),
     ]
 }
 

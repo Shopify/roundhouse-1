@@ -3725,13 +3725,20 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
                         .map_or_else(|| format!(":{}_type", name.as_str()), key),
                     primary_key.as_ref().map_or_else(|| ":id".to_string(), key)
                 ),
-                Association::HasOne { target, foreign_key, as_interface, scope, .. } => format!(
-                    "HasOneAssociation.new(self, :{}, {:?}, {}, {}{})",
+                Association::HasOne { target, foreign_key, as_interface, scope, dependent, .. } => format!(
+                    "HasOneAssociation.new(self, :{}, {:?}, {}, {}, {}, {}, {}{})",
                     name.as_str(),
                     target.0.as_str(),
                     key(foreign_key),
                     as_interface.is_none() && scope.is_none(),
-                    custom_owner_key(assoc, ", nil, nil, nil, ")
+                    as_interface.as_ref().map_or_else(|| "nil".to_string(), |i| format!(":{}_type", i.as_str())),
+                    has_one_dependent(dependent),
+                    // The inverse the target's belongs_to answers, so
+                    // `set_inverse_instance` (Core's ModelCaching calls
+                    // it on a prefetched target) holds the owner.
+                    has_one_inverse(app, model, assoc, &declarations.of(app, span).0)
+                        .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str())),
+                    custom_owner_key(assoc, ", ")
                 ),
                 Association::HasMany { target, foreign_key, through: None, as_interface, scope, .. } => {
                     format!(
@@ -3793,6 +3800,20 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
 /// The trailing owner-key argument of an association object, written only
 /// for a declared `primary_key:` other than `id` (the object's default).
 /// `lead` fills the optional arguments between.
+/// A has_one's `dependent:` as the association object's argument.
+fn has_one_dependent(dependent: &crate::dialect::Dependent) -> &'static str {
+    use crate::dialect::Dependent;
+    match dependent {
+        Dependent::None => "nil",
+        Dependent::Destroy => ":destroy",
+        Dependent::DestroyAsync => ":destroy_async",
+        Dependent::Delete => ":delete",
+        Dependent::DeleteAll => ":delete_all",
+        Dependent::Nullify => ":nullify",
+        Dependent::Restrict => ":restrict",
+    }
+}
+
 fn custom_owner_key(assoc: &crate::dialect::Association, lead: &str) -> String {
     crate::lower::assoc_primary_key::custom_primary_key(assoc)
         .map_or_else(String::new, |k| format!("{lead}:{}", k.as_str()))
@@ -3817,7 +3838,7 @@ fn custom_owner_key(assoc: &crate::dialect::Association, lead: &str) -> String {
 /// carry no extra methods; a model's own definition wins. CRuby and
 /// JRuby only: the object reads the record's ivars by computed name.
 pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app: &App) {
-    use crate::dialect::{Association, Dependent};
+    use crate::dialect::Association;
 
     if !super::expr::native_keywords() {
         return;
@@ -3883,15 +3904,7 @@ pub(crate) fn apply_singular_association_builders(lcs: &mut [LibraryClass], app:
                         as_interface
                             .as_ref()
                             .map_or_else(|| "nil".to_string(), |i| format!(":{}_type", i.as_str())),
-                        match dependent {
-                            Dependent::None => "nil",
-                            Dependent::Destroy => ":destroy",
-                            Dependent::DestroyAsync => ":destroy_async",
-                            Dependent::Delete => ":delete",
-                            Dependent::DeleteAll => ":delete_all",
-                            Dependent::Nullify => ":nullify",
-                            Dependent::Restrict => ":restrict",
-                        },
+                        has_one_dependent(dependent),
                         has_one_inverse(app, model, assoc, &declarations.of(app, span).0)
                             .map_or_else(|| "nil".to_string(), |i| format!(":{}", i.as_str())),
                         custom_owner_key(assoc, ", ")

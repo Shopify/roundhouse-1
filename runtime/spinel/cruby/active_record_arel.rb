@@ -277,7 +277,18 @@ module ActiveRecord
       def arel_text(value)
         return value unless arel_tree?(value)
 
-        ActiveRecord::Base.with_connection { |connection| connection.visitor.compile(value) }
+        # relation.rb `to_sql`: the tree's binds (a QueryAttribute in a
+        # VALUES row, a BindParam) are substituted as quoted literals,
+        # since the Relation holds this as text and lifts the literals to
+        # its own numbered binds when it runs. Compiled with the plain
+        # collector their `$n` placeholders would number from 1 again
+        # inside the Relation's own binds.
+        ActiveRecord::Base.with_connection do |connection|
+          collector = Arel::Collectors::SubstituteBinds.new(
+            ActiveRecord::ConnectionAdapters::ArelConnection.new(connection), Arel::Collectors::SQLString.new
+          )
+          connection.visitor.compile(value, collector)
+        end
       end
 
       def arel_join_spec(spec)

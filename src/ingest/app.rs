@@ -1501,6 +1501,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             });
         }
         transaction_callbacks_in_order = txn.in_order;
+        app.belongs_to_required_skips_unchanged_foreign_key = belongs_to_skips_unchanged_foreign_key(&source);
         // Only a setting that differs from the framework default is
         // synthesized; the runtime falls back to the default otherwise.
         let mut overrides = String::new();
@@ -14026,6 +14027,39 @@ fn extract_active_support_cache_config(source: &[u8]) -> (Option<String>, Option
         }
     }
     (format, digest)
+}
+
+/// `ActiveRecord.belongs_to_required_validates_foreign_key` as
+/// config/application.rb leaves it, answered as "is it off": the
+/// framework default is on, `load_defaults` 7.1 and later turn it off,
+/// and a later `config.active_record.belongs_to_required_validates_
+/// foreign_key = true|false` wins. A value other than a literal boolean
+/// leaves the default in place.
+fn belongs_to_skips_unchanged_foreign_key(source: &[u8]) -> bool {
+    let source = String::from_utf8_lossy(source);
+    let mut validates = true;
+    for line in source.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("config.load_defaults") {
+            let v = rest.trim().trim_start_matches('(').trim_end_matches(')').trim().trim_matches(['"', '\'']);
+            if v.parse::<f64>().is_ok_and(|version| version >= 7.1) {
+                validates = false;
+            }
+        } else if let Some(value) = t
+            .strip_prefix("config.active_record.belongs_to_required_validates_foreign_key")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+        {
+            match value.split('#').next().unwrap_or("").trim() {
+                "true" => validates = true,
+                "false" => validates = false,
+                _ => {}
+            }
+        }
+    }
+    !validates
 }
 
 /// The Active Record settings the transaction callbacks read, as

@@ -165,6 +165,23 @@ pub(super) fn push_validate_method(
 /// by: the declaration's `primary_key:` when it is not the target's own
 /// key (`primary_key: "uuid"`), else `None` (the plain `exists?(@fk)`).
 fn belongs_to_lookup_pk(models: &[Model], target: &ClassId, declared: Option<&Symbol>) -> Option<Symbol> {
+    // A target keyed on a column list (`self.primary_key = [..]`) answers
+    // `exists?` for a key tuple, so a declared `primary_key: :id` is a
+    // column to ask by, whatever the target's `primary_key` symbol reads.
+    if let Some(declared) = declared {
+        let mut at = models.iter().find(|m| &m.name == target);
+        let mut hops = 0;
+        while let Some(m) = at.filter(|_| hops < 32) {
+            if !m.composite_primary_key.is_empty() {
+                return Some(declared.clone());
+            }
+            if m.primary_key.is_some() {
+                break;
+            }
+            hops += 1;
+            at = m.parent.as_ref().and_then(|p| models.iter().find(|x| &x.name == p));
+        }
+    }
     let assoc_pk = crate::lower::scope_chain::association_primary_key(models, target, declared);
     let own_pk = crate::lower::scope_chain::association_primary_key(models, target, None);
     (assoc_pk != own_pk).then_some(assoc_pk)

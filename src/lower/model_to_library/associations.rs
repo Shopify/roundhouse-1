@@ -377,7 +377,14 @@ pub(super) fn push_association_methods(
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
                 {
-                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel));
+                    // A target keyed on a column list answers `id` with the
+                    // key tuple and its `id` column as `id_value`
+                    // (`composite_key::rekey`); the foreign key holds the
+                    // column, as Rails' `_read_attribute(primary_key)` reads.
+                    let composite_target =
+                        models.iter().any(|m| &m.name == target && !m.composite_primary_key.is_empty());
+                    let written_pk = if composite_target && assoc_pk.as_str() == "id" { Symbol::from("id_value") } else { assoc_pk.clone() };
+                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &written_pk, sentinel));
                 }
                 push_singular_loaded_reader(methods, model, owner, name);
             }

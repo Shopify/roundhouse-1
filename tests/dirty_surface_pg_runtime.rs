@@ -59,6 +59,14 @@ const WIDGET: &str = r##"class Widget < ApplicationRecord
     ChangeLog.add("before[#{pending}]")
   end
 
+  def force_name
+    name_will_change!
+  end
+
+  def id_saved?
+    saved_change_to_id?
+  end
+
   def log_after_save
     ChangeLog.add("after_save[#{saved}]")
   end
@@ -92,8 +100,10 @@ const PROBE: &str = r##"class DirtySurfaceProbe
     w.count = 1
     w.save!
     out << "create: #{ChangeLog.take}"
+    out << "saved_change_to_id after create: #{w.id_saved?} #{w.saved_change_to_id.inspect == [nil, w.id].inspect}"
     w.update!(name: "b")
     out << "update name: #{ChangeLog.take}"
+    out << "saved_change_to_id after update: #{w.id_saved?} #{w.saved_change_to_id.inspect}"
     w.update!(count: 2)
     out << "update count: #{ChangeLog.take}"
     w = Widget.find(w.id)
@@ -116,6 +126,13 @@ const PROBE: &str = r##"class DirtySurfaceProbe
     out << "after reload: name=#{w.name} any=#{w.saved_changes?} changed=#{w.changed.inspect}"
     w.save!
     out << "unchanged save: any=#{w.saved_changes?} prev_was=#{w.attribute_previously_was(:name)}"
+    w.force_name
+    out << "will_change!: changed=#{w.changed.inspect} to_save=#{w.changes_to_save.inspect}"
+    ChangeLog.take
+    w.save!
+    out << "forced save: any=#{w.saved_changes?} name=#{w.saved_change_to_attribute?(:name)} pair=#{w.saved_change_to_attribute(:name).inspect} changed=#{w.changed.inspect}"
+    w.save!
+    out << "forced mark dropped: any=#{w.saved_changes?} changed=#{w.changed.inspect}"
     out
   end
 end
@@ -147,9 +164,11 @@ fn overlay() -> emit_and_run::Overlay {
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 16] = [
     "create: before[will=true to_save=true names=count/name name_to_be_saved=[nil, \"a\"] in_db=nil from_nil=true to_a=true to_z=false] after_save[any=true name=true before=nil pair=[nil, \"a\"] prev_was=nil prev_changed=true from_to=false from_x=false count=false] commit[any=true name=true before=nil pair=[nil, \"a\"] prev_was=nil prev_changed=true from_to=false from_x=false count=false]",
+    "saved_change_to_id after create: true true",
     "update name: before[will=true to_save=true names=name name_to_be_saved=[\"a\", \"b\"] in_db=\"a\" from_nil=false to_a=false to_z=false] after_save[any=true name=true before=\"a\" pair=[\"a\", \"b\"] prev_was=\"a\" prev_changed=true from_to=true from_x=false count=false] commit[any=true name=true before=\"a\" pair=[\"a\", \"b\"] prev_was=\"a\" prev_changed=true from_to=true from_x=false count=false]",
+    "saved_change_to_id after update: false nil",
     "update count: before[will=false to_save=true names=count name_to_be_saved=nil in_db=\"b\" from_nil=false to_a=false to_z=false] after_save[any=true name=false before=\"b\" pair=nil prev_was=\"b\" prev_changed=false from_to=false from_x=false count=true] commit[any=true name=false before=\"b\" pair=nil prev_was=\"b\" prev_changed=false from_to=false from_x=false count=true]",
     "reloaded: any=false to_save=false name=false",
     "dirty: changed=[\"name\"] changes={\"name\" => [\"b\", \"c\"]} attrs={\"name\" => \"b\"}",
@@ -159,6 +178,9 @@ const EXPECTED: [&str; 11] = [
     "cleared: changed=[]",
     "after reload: name=e any=false changed=[]",
     "unchanged save: any=false prev_was=e",
+    "will_change!: changed=[\"name\"] to_save={\"name\" => [\"e\", \"e\"]}",
+    "forced save: any=true name=true pair=[\"e\", \"e\"] changed=[]",
+    "forced mark dropped: any=false changed=[]",
 ];
 
 #[test]

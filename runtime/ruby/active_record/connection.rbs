@@ -230,6 +230,22 @@ module ActiveRecord
     def self.create_or_find_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.sole: () -> Base
+    def self.select: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.group: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.order: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.reorder: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.limit: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.offset: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.left_joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.left_outer_joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.includes: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.preload: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.eager_load: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.distinct: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.having: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.from: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.extending: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.all: () -> Relation
     def self._hook_attribute_type: (untyped name, untyped cast_type) -> untyped
     def self._create_time_zone_conversion_attribute?: (untyped name, untyped cast_type) -> bool
@@ -336,6 +352,8 @@ module ActiveRecord
     def clear_attribute_changes: (Array[String | Symbol] attr_names) -> untyped
     def clear_attribute_change: (String | Symbol attr_name) -> nil
     def changes_applied: () -> nil
+    def attribute_will_change!: (String | Symbol attr_name) -> nil
+    def _merge_forced_changes: (Hash[String, untyped] changes, Hash[String, untyped] current) -> Hash[String, untyped]
     def _dirty_changed?: (Hash[String, untyped] changes, String | Symbol attr_name, Hash[Symbol, untyped] options) -> bool
     def _dirty_cast: (String attr_name, untyped value) -> untyped
     # Validations declared at run time (RuntimeValidations below).

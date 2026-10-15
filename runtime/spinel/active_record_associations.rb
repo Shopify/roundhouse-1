@@ -469,6 +469,15 @@ module ActiveRecord
     end
 
     class CollectionAssociation < Association
+      # Rails' `set_inverse_instance(record)`: the record holds the owner
+      # through its inverse belongs_to, where the owner model names one
+      # (`_set_inverse_instance`, as `Collection.created` asks). Public,
+      # as Core's ModelCaching calls it on each prefetched record.
+      def set_inverse_instance(record)
+        @owner._set_inverse_instance(@name, record) if !record.nil? && @owner.respond_to?(:_set_inverse_instance)
+        record
+      end
+
       # Rails' CollectionAssociation#scope: an owner that is not saved
       # has no records (`null_scope?`).
       def scope
@@ -678,6 +687,17 @@ module ActiveRecord
         self.target = record
       end
 
+      # The record holds the owner through its inverse belongs_to
+      # (Rails' `set_inverse_instance`, public in association.rb: Core's
+      # ModelCaching calls it on a prefetched target), in the ivars the
+      # emitted belongs_to reader keeps.
+      def set_inverse_instance(record)
+        return record if @inverse.nil? || record.nil?
+        record.instance_variable_set(:"@#{@inverse}_cache", @owner)
+        record.instance_variable_set(:"@#{@inverse}_loaded", true)
+        record
+      end
+
       private
         # has_one_association.rb `_create_record`: the owner must be saved.
         def _create_record(attributes, raise_error, &block)
@@ -721,16 +741,6 @@ module ActiveRecord
         def nullify_owner_attributes(record)
           record.public_send(:"#{@foreign_key}=", nil)
           record.public_send(:"#{@as_type}=", nil) if @as_type
-        end
-
-        # The record holds the owner through its inverse belongs_to
-        # (Rails' `set_inverse_instance`), in the ivars the emitted
-        # belongs_to reader keeps.
-        def set_inverse_instance(record)
-          return record if @inverse.nil? || record.nil?
-          record.instance_variable_set(:"@#{@inverse}_cache", @owner)
-          record.instance_variable_set(:"@#{@inverse}_loaded", true)
-          record
         end
 
         # has_one_association.rb `remove_target!`.

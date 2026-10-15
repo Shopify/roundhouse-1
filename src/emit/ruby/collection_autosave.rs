@@ -705,10 +705,12 @@ fn accept_held_required_targets(
     let Some(model) = app.models.iter().find(|m| m.name == lc.name).or_else(|| subclass_views.get(&lc.name)) else {
         return;
     };
-    let required: Vec<(Span, Symbol)> = model
+    let required: Vec<(Span, Symbol, Symbol)> = model
         .spanned_associations()
         .filter_map(|(span, a)| match a {
-            Association::BelongsTo { name, optional: false, polymorphic: false, .. } => Some((span, name.clone())),
+            Association::BelongsTo { name, foreign_key, optional: false, polymorphic: false, .. } => {
+                Some((span, name.clone(), foreign_key.clone()))
+            }
             _ => None,
         })
         .collect();
@@ -723,14 +725,22 @@ fn accept_held_required_targets(
         return;
     };
     let ExprNode::Seq { exprs } = &mut *validate.body.node else { return };
-    for (span, name) in required {
+    for (span, name, foreign_key) in required {
         let message = format!("{} must exist", crate::lower::model_to_library::validations::humanize(name.as_str()));
         let Some(stmt) = exprs.iter_mut().find(|e| e.span == span && pushes_message(e, &message)) else {
             continue;
         };
         let n = name.as_str();
+        // With `belongs_to_required_validates_foreign_key` off, Rails asks
+        // for the record only when the key is nil or changed.
+        let unchanged_key_skipped = if app.belongs_to_required_skips_unchanged_foreign_key {
+            let fk = foreign_key.as_str();
+            format!(" && (@{fk}.nil? || attribute_changed?(\"{fk}\"))")
+        } else {
+            String::new()
+        };
         let not_held = crate::runtime_src::parse_methods(&format!(
-            "def __not_held\n  @{n}_loaded != true || @{n}_cache.nil?\nend\n"
+            "def __not_held\n  (@{n}_loaded != true || @{n}_cache.nil?){unchanged_key_skipped}\nend\n"
         ))
         .ok()
         .and_then(|mut ms| ms.pop())

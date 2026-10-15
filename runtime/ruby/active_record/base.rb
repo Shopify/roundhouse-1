@@ -1201,6 +1201,12 @@ module ActiveRecord
       changes.key?(name)
     end
 
+    # ActiveModel::Dirty#attribute_will_change!: nothing is tracked on
+    # the strict lanes (see `changes_to_save`).
+    def attribute_will_change!(name)
+      nil
+    end
+
     # Rails' `changed?` / `has_changes_to_save?`: any column pending.
     # campfire's `RecordCache` snapshots only records with none.
     def changed?
@@ -1251,6 +1257,20 @@ module ActiveRecord
     # rather than the snapshot diff.
     def id_previously_changed?
       @id_previously_changed
+    end
+
+    # `saved_change_to_id?` / `saved_change_to_id`: the per-attribute
+    # readers Rails defines for every column, the primary key included
+    # (Core's SessionTokens asks `return if saved_change_to_id?`). The
+    # synthesized per-column family skips `id`, so Base answers it: a
+    # create's saved_changes carry "id" => [nil, id], an update's never.
+    def saved_change_to_id?
+      @id_previously_changed
+    end
+
+    def saved_change_to_id
+      changes = saved_changes
+      changes["id"]
     end
 
     # Rails' `previously_new_record?` — the last save was the INSERT.

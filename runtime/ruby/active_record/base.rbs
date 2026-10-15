@@ -183,6 +183,7 @@ module ActiveRecord
     def saved_change_to_attribute: (Symbol name) -> untyped
     def changes_to_save: () -> Hash[String, untyped]
     def attribute_changed?: (String name) -> bool
+    def attribute_will_change!: (String name) -> nil
     def changed?: () -> bool
     def has_changes_to_save?: () -> bool
     def attribute_was: (String name) -> untyped
@@ -192,6 +193,8 @@ module ActiveRecord
     def attribute_previous_change: (String name) -> untyped
     def attribute_before_last_save: (String name) -> untyped
     def id_previously_changed?: () -> bool
+    def saved_change_to_id?: () -> bool
+    def saved_change_to_id: () -> untyped
     def previously_new_record?: () -> bool
 
     # Per-model DOM prefix (`"article"`, `"comment"`). Used by

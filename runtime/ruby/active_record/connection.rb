@@ -1896,6 +1896,21 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).sole
     end
 
+    # The rest of the query surface Rails delegates to `all`
+    # (querying.rb): `Model.select(…)` and kin on a class a lowering
+    # could not resolve (`model.select(*needed_columns(query))` in Core's
+    # QueryLayer, where `model` is a class-valued reader). Without them
+    # `select` reaches Kernel#select, private, and the rest are undefined.
+    # Each builds the relation `all` builds, so the default scope applies.
+    %i[
+      select group order reorder limit offset joins left_joins left_outer_joins
+      includes preload eager_load distinct having from extending
+    ].each do |name|
+      define_singleton_method(name) do |*args, &block|
+        ActiveRecord::Relation.new(self).public_send(name, *args, &block)
+      end
+    end
+
     # Rails-shape `all` fallback, same story as `where` above: a lazy
     # Relation so refiner chains the lowerers left dynamic
     # (`Category.all.order("category asc, tags.tag asc")…` on lobsters'
@@ -2176,9 +2191,11 @@ module ActiveRecord
       # A create writes the id too (Rails' `_create_record`: saved_changes
       # has "id" => [nil, id]); the attribute snapshot leaves it out.
       changes["id"] = [nil, id] if was_new && !id.nil?
+      _merge_forced_changes(changes, current)
       @__last_saved_attributes = current
       @saved_changes = changes
       @id_previously_changed = was_new
+      @__forced_changes = nil
       nil
     end
 
@@ -2326,6 +2343,7 @@ module ActiveRecord
       changes = changes_to_save
       @__last_saved_attributes = _attribute_snapshot
       @saved_changes = changes
+      @__forced_changes = nil
       nil
     end
 
@@ -2480,6 +2498,33 @@ module ActiveRecord
       _attribute_snapshot.each do |key, value|
         prev = previous.nil? ? nil : previous[key]
         changes[key] = [prev, value] if prev != value
+      end
+      _merge_forced_changes(changes, _attribute_snapshot)
+      changes
+    end
+
+    # ActiveModel::Dirty#attribute_will_change!: the attribute counts as
+    # changed from now on, even when its value still equals the
+    # baseline (a typed store mutated in place, which Core's
+    # `settings_will_change! if settings_changed?` marks), until the
+    # next save or `changes_applied` drops the mark. The original is the
+    # value now, as `forced_change` takes it, unless the attribute is
+    # already pending (then its own original stands).
+    def attribute_will_change!(attr_name)
+      attr_name = attr_name.to_s
+      snapshot = _attribute_snapshot
+      return nil unless snapshot.key?(attr_name)
+      forced = (@__forced_changes ||= {})
+      forced[attr_name] = snapshot[attr_name] unless forced.key?(attr_name)
+      nil
+    end
+
+    # Adds the forced attributes that no diff reports: `[original, now]`.
+    def _merge_forced_changes(changes, current)
+      forced = @__forced_changes
+      return changes if forced.nil?
+      forced.each do |key, original|
+        changes[key] = [original, current[key]] unless changes.key?(key)
       end
       changes
     end

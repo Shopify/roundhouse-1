@@ -471,6 +471,9 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     library::apply_sti_hydration(&mut lcs, app);
     // A plain (non-STI) model subclass loads as itself.
     crate::lower::sti_scope::apply_plain_subclass_hydration(&mut lcs, app);
+    // A validation reads an attribute through its reader, which a module
+    // the model includes may redefine.
+    crate::lower::validation_readers::apply(lcs, app);
     // belongs_to writers are synthesized by the shared model lowering
     // (lower::model_to_library::associations), alongside the readers.
     // App-helper resolution: bare `avatar_img(...)` → `ApplicationHelper.
