@@ -62,3 +62,42 @@ fn a_loop_calling_the_superclasss_macro_runs_in_the_emitted_body() {
         "[[:root, nil, {}], [:a, String, {asset_class: \"x\"}], [:b, String, {asset_class: \"y\"}], [:a, nil, \"x\"], [:b, nil, \"y\"], [:c, nil, \"z\"]]\n"
     );
 }
+
+/// A `delegate` forwarder takes its macro's span but the emitted class
+/// writes it after the defs; with `delegate` above the loop and a `def`
+/// below it (ZippedThemeFiles' `delegate :path, :prefix, :shop, to:
+/// :theme` and `def initialize`), the unsorted defs once made the loop
+/// unplaceable and it was dropped with no diagnostic.
+const DELEGATING: &str = r#"class Delegating < Registry
+  attr_reader :theme
+
+  delegate :path, to: :theme
+
+  register :root
+
+  %i[a b].each do |name|
+    register name, String
+  end
+
+  def initialize(theme)
+    @theme = theme
+  end
+end
+"#;
+
+#[test]
+fn a_delegate_above_the_loop_does_not_drop_it() {
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/registry.rb", BASE)
+            .write("app/models/delegating.rb", DELEGATING)
+    };
+    let (dir, _) = app().emit(BuildTarget::Ruby);
+    let src = std::fs::read_to_string(dir.join("app/models/delegating.rb")).expect("emitted delegating.rb");
+    assert!(src.contains("%i[a b].each do |name|"), "the loop is dropped:\n{src}");
+    let run = app().run_ruby(
+        "p Delegating.registered\nclass Box; def path; \"/p\"; end; end\np Delegating.new(Box.new).path\n",
+    );
+    run.assert_passes();
+    assert_eq!(run.stdout, "[[:root, nil, {}], [:a, String, {}], [:b, String, {}]]\n\"/p\"\n");
+}

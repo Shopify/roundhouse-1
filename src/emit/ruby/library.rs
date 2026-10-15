@@ -14202,7 +14202,26 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Opt
     // An alias copy carries its original's body span; it takes effect
     // where its `alias_method` stands (its name span too).
     let mut defs: Vec<(usize, Span)> = Vec::new();
+    // A `delegate` forwarder takes the span of its macro but the emitted
+    // class writes it after the defs, so it has no place in the source
+    // order of the rest. It runs nothing as it is defined: a statement
+    // that does not name it (or ask the class what it defines) reads
+    // nothing the forwarder's place decides. Core's `AssetCloud::
+    // ZippedThemeFiles` has `delegate :path, :prefix, :shop, to: :theme`
+    // above the `bucket` loop and `def initialize` below it.
+    let forwarder_sites = app.delegate_forwarder_sites.get(&lc.name);
+    let forwarder_names: Vec<&Symbol> = lc
+        .methods
+        .iter()
+        .filter(|m| m.receiver == MethodReceiver::Instance)
+        .filter(|m| forwarder_sites.into_iter().flatten().any(|(name, at)| *name == m.name && *at == m.name_span))
+        .map(|m| &m.name)
+        .collect();
+    let skips_forwarders = !forwarder_names.is_empty() && !mentions_method_names(call, &forwarder_names);
     for (i, m) in lc.methods.iter().enumerate() {
+        if skips_forwarders && forwarder_names.contains(&&m.name) && m.receiver == MethodReceiver::Instance {
+            continue;
+        }
         let copied_at: Vec<Span> = lc
             .method_aliases
             .iter()
@@ -14371,6 +14390,27 @@ fn only_defines(call: &Expr) -> bool {
         }
     }
     walk(call)
+}
+
+/// Whether `expr` names one of `names` as a literal symbol or string, or
+/// asks the class what it defines (`method_defined?`, `instance_method`):
+/// what a method written elsewhere in the class could change.
+fn mentions_method_names(expr: &Expr, names: &[&Symbol]) -> bool {
+    let hit = match &*expr.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => names.iter().any(|n| n.as_str() == value.as_str()),
+        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => names.iter().any(|n| n.as_str() == value.as_str()),
+        ExprNode::Send { method, .. } => {
+            let m = method.as_str();
+            m.ends_with("method_defined?") || m.ends_with("instance_method") || m.ends_with("instance_methods")
+        }
+        _ => false,
+    };
+    if hit {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found = found || mentions_method_names(child, names));
+    found
 }
 
 /// Whether `statement`, which only defines methods (`only_defines`),
