@@ -2419,7 +2419,18 @@ fn without_keyword_fills(args: &[Expr]) -> std::borrow::Cow<'_, [Expr]> {
 
 /// `::File` is stored with an empty first segment. Joining that as
 /// `::File` keeps the rooted spelling; a relative path stays `A::B`.
+/// A lowering names a class by its qualified name as one segment
+/// (`AppVersions::Systems::Repositories::PersistenceRecords::Release`);
+/// it is the same path, and gets the same rooting where a constant in
+/// scope shadows its first segment.
 fn emit_const_path(path: &[crate::Symbol]) -> String {
+    if let [only] = path
+        && only.as_str().contains("::")
+        && !only.as_str().starts_with("::")
+    {
+        let split: Vec<crate::Symbol> = only.as_str().split("::").map(crate::Symbol::from).collect();
+        return emit_const_path(&split);
+    }
     if path.len() > 1 && path.first().is_some_and(|s| !s.as_str().is_empty()) {
         let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         let rooted = LEXICAL_SCOPE.with(|c| {
