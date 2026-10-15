@@ -161,6 +161,80 @@ pub(super) fn push_validate_method(
     }
 }
 
+/// ActiveModel's public `validate(context = nil)` is `valid?(context)`:
+/// the synthesized `validate` here runs the checks, which `valid?` calls
+/// with no argument, so a call that names a context (Core's
+/// `validator.validate(record.validation_context)`, `nil` included) goes
+/// to `valid?` and answers its Boolean. The checks stay the no-argument
+/// form subclasses extend through `super`.
+fn take_explicit_validation_context(methods: &mut [MethodDef], model: &Model, span: Span) {
+    let Some(validate) = methods.iter_mut().find(|m| {
+        m.receiver == MethodReceiver::Instance
+            && m.name.as_str() == "validate"
+            && m.params.is_empty()
+            && m.name_span.is_synthetic()
+    }) else {
+        return;
+    };
+    let context = Symbol::from("context");
+    let empty = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(local_read(&context)),
+            method: Symbol::from("empty?"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let contexts = uses_validation_context(model);
+    let forward = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("valid?"),
+            args: if contexts {
+                vec![Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(local_read(&context)),
+                        method: Symbol::from("first"),
+                        args: Vec::new(),
+                        block: None,
+                        parenthesized: false,
+                    },
+                )]
+            } else {
+                Vec::new()
+            },
+            block: None,
+            parenthesized: contexts,
+        },
+    );
+    let checks = validate.body.clone();
+    validate.body = Expr::new(span, ExprNode::If { cond: empty, then_branch: checks, else_branch: forward });
+    validate.params = vec![crate::dialect::Param {
+        name: context.clone(),
+        default: None,
+        keyword: false,
+        rest: true,
+        forwarding: false,
+        from_keyword: false,
+        from_kwrest: false,
+    }];
+    validate.signature = Some(Ty::Fn {
+        params: vec![crate::ty::Param {
+            name: context,
+            ty: Ty::Array { elem: Ty::Untyped.into() }.into(),
+            kind: crate::ty::ParamKind::Rest,
+        }]
+        .into(),
+        block: None,
+        ret: std::sync::Arc::new(Ty::Untyped),
+        effects: crate::effect::EffectSet::pure(),
+    });
+}
+
 /// The column a required `belongs_to`'s existence check asks the target
 /// by: the declaration's `primary_key:` when it is not the target's own
 /// key (`primary_key: "uuid"`), else `None` (the plain `exists?(@fk)`).
@@ -1100,6 +1174,9 @@ fn push_active_model_validation_surface_for(
             mutates_self: true,
             block_param: None,
         });
+    }
+    if !defines("valid?") {
+        take_explicit_validation_context(methods, model, span);
     }
     if uses_validation_context(model) && !defines("validation_context") {
         methods.push(MethodDef {

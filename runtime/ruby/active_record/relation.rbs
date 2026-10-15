@@ -65,6 +65,7 @@ module ActiveRecord
     @includes: Array[Symbol | Hash[Symbol, Symbol]]
 
     @from: String?
+    @annotations: Array[String]
     @ctes: Array[String]
     @shared_lists: bool
     @friendly: bool
@@ -76,8 +77,10 @@ module ActiveRecord
     def hash_has_empty_in?: (Hash[untyped, untyped]) -> bool
     def with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
     def with_recursive!: (Hash[Symbol, Array[Relation]] ctes) -> Relation
-    def from: (String source) -> Relation
-    def from!: (String source) -> Relation
+    def from: (String | Relation source, ?(String | Symbol)? subquery_name) -> Relation
+    def annotate: (*untyped comments) -> Relation
+    def annotate!: (*untyped comments) -> Relation
+    def from!: (String | Relation source, ?(String | Symbol)? subquery_name) -> Relation
     def cte_prefix: () -> String
     def from_source: () -> String
 

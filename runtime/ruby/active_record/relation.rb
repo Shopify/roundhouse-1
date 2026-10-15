@@ -99,6 +99,7 @@ module ActiveRecord
       @where_null = []
       @opaque_wheres = false
       @from = nil
+      @annotations = []
       @ctes = []
       @shared_lists = false
       @friendly = false
@@ -389,15 +390,37 @@ module ActiveRecord
     end
 
     # `from("parents")` — the FROM source, in place of this model's own
-    # table. The String form only: Rails also takes a relation (a
-    # subquery) there, which no corpus call writes.
-    def from(source)
-      spawn.from!(source)
+    # table. A Relation is Rails' subquery form (`from(rel, :alias)`,
+    # relation/query_methods.rb `build_from`): its SELECT in parentheses
+    # under `subquery_name`, "subquery" when none is given. The name
+    # applies to a Relation only; any other source is written as given.
+    def from(source, subquery_name = nil)
+      spawn.from!(source, subquery_name)
     end
 
-    def from!(source)
+    # `annotate("comment")` — SQL comments appended to the query
+    # (query_methods.rb `annotate!`, `sanitize_as_sql_comment`: the
+    # comment's own `/* */` delimiters are dropped and any inside it
+    # broken up). The list is replaced, never mutated, so a spawned copy
+    # shares it safely.
+    def annotate(*args)
+      spawn.annotate!(*args)
+    end
+
+    def annotate!(*args)
       unload_records
-      @from = source
+      comments = args.map { |c| c.to_s.gsub(%r{\A\s*/\*\+?\s?|\s?\*/\s*\z}, "").gsub("*/", "* /").gsub("/*", "/ *") }
+      @annotations = @annotations + comments
+      self
+    end
+
+    def from!(source, subquery_name = nil)
+      unload_records
+      @from = if source.is_a?(Relation)
+        "(#{source.bound_sql}) #{subquery_name.nil? ? "subquery" : subquery_name.to_s}"
+      else
+        source
+      end
       self
     end
 
@@ -812,6 +835,7 @@ module ActiveRecord
       when :joins, :left_outer_joins then @joins = []
       when :includes, :eager_load, :preload then @includes = []
       when :from then @from = nil
+      when :annotate then @annotations = []
       when :readonly then @readonly = false
       when :having then @havings = []
       when :with then @ctes = []
@@ -3055,6 +3079,7 @@ module ActiveRecord
       end
       sql = "#{sql} OFFSET #{@offset}" unless @offset.nil?
       sql = "#{sql} #{@lock}" unless @lock.nil?
+      @annotations.each { |comment| sql = "#{sql} /* #{comment} */" }
       sql
     end
 
