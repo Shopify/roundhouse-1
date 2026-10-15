@@ -34,12 +34,12 @@ module ActionView
         end
         translation
       end
-      alias_method :t, :translate
+      alias t translate
 
       def localize(object, **options)
         I18n.localize(object, **options)
       end
-      alias_method :l, :localize
+      alias l localize
 
       private
 
@@ -48,7 +48,7 @@ module ActionView
       end
 
       def missing_translation(key, options)
-        keys = I18n.normalize_keys(options[:locale] || I18n.locale, key, options[:scope])
+        keys = I18n.normalize_keys(options[:locale] || I18n.locale, key, options[:scope]) #: Array[Symbol]
         title = +"translation missing: #{keys.join(".")}"
         options.each do |name, value|
           unless name == :scope || name == :locale || name == :raise || name == :default

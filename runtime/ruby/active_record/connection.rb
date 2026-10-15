@@ -460,7 +460,7 @@ module ActiveRecord
       return sql if binds.empty?
       values = binds.map { |b| b.respond_to?(:value_for_database) ? b.value_for_database : b }
       if sql.match?(/\$\d+/)
-        sql.gsub(/\$(\d+)/) { quote(values[Regexp.last_match(1).to_i - 1]) }
+        sql.gsub(/\$\d+/) { |m| quote(values[m.delete('$').to_i - 1]) }
       else
         Base.sanitize_sql([sql] + values)
       end
@@ -2596,7 +2596,7 @@ module ActiveRecord
 
     # Adds the forced attributes that no diff reports: `[original, now]`.
     def _merge_forced_changes(changes, current)
-      forced = @__forced_changes
+      forced = @__forced_changes #: Hash[String, untyped]?
       return changes if forced.nil?
       forced.each do |key, original|
         changes[key] = [original, current[key]] unless changes.key?(key)
