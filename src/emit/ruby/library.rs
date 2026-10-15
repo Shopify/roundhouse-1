@@ -14167,6 +14167,26 @@ fn singleton_answered_by_app(lc: &LibraryClass, call: &Expr, app: &App) -> bool 
     true
 }
 
+/// The index just past the last of `lc`'s methods without a source
+/// span that `call`, an `alias_method`, copies (`alias_method
+/// :discount_code, :price_rule_discount_code` below the
+/// `belongs_to :price_rule_discount_code`), or `None` for any other call.
+fn alias_of_generated_method(lc: &LibraryClass, call: &Expr) -> Option<usize> {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "alias_method" {
+        return None;
+    }
+    let Some(ExprNode::Lit { value: Literal::Sym { value: original } }) = args.get(1).map(|a| &*a.node) else {
+        return None;
+    };
+    lc.methods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.name == *original && m.name_span.is_synthetic())
+        .map(|(i, _)| i + 1)
+        .max()
+}
+
 /// Where a carried body statement is written: `Some(None)` among the
 /// body's other replayed calls, before the defs (no def of this file is
 /// above it in the source); `Some(Some(k))` just before `lc.methods[k]`
@@ -14208,6 +14228,14 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr, app: &App) -> Option<Opt
     // An `attr_accessor`'s reader and writer share its span: one place.
     if !defs.windows(2).all(|w| w[0].1.start <= w[1].1.start) {
         return None;
+    }
+    // `alias_method :a, :b` of a method the model generates (a
+    // `belongs_to` reader, a column writer: no span in the source, the
+    // `b` Rails defines in a generated module as the macro runs) goes
+    // after the last such method, which the emitted class defines among
+    // its defs.
+    if let Some(at) = alias_of_generated_method(lc, call) {
+        return Some(Some(at));
     }
     if !defs.iter().any(|(_, span)| above(*span)) {
         return Some(None);

@@ -537,6 +537,69 @@ pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Symbol
     out
 }
 
+/// `attribute :name, :type, default: <literal>` declarations of a model
+/// whose table has no column `name`: typed virtual attributes that read
+/// their default until one is assigned (Core's `attribute
+/// :force_condition_uniqueness_check, :boolean, default: false`). A
+/// column's own declaration, a default that is not a literal (a lambda,
+/// a constant) and further options stay unclaimed.
+pub(crate) fn virtual_default_attribute_decls(model: &Model) -> Vec<(Symbol, Symbol, Expr)> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if let Some(decl) = virtual_default_attribute_decl(expr)
+            && !model.attributes.fields.contains_key(&decl.0)
+        {
+            out.push(decl);
+        }
+    }
+    out
+}
+
+/// `(name, type, default)` of `attribute :name, :type, default: <literal>`
+/// or the untyped `attribute :name, default: -> { [] }` (type `value`,
+/// Rails' untyped `ValueType`). A lambda default is its body: a literal,
+/// or an array/hash of literals (what `-> { [] }` / `-> { {} }` answer).
+pub(crate) fn virtual_default_attribute_decl(expr: &Expr) -> Option<(Symbol, Symbol, Expr)> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "attribute" || !(2..=3).contains(&args.len()) {
+        return None;
+    }
+    let ExprNode::Lit { value: Literal::Sym { value: name } } = &*args[0].node else { return None };
+    let ty = if args.len() == 3 {
+        let ExprNode::Lit { value: Literal::Sym { value: ty } } = &*args[1].node else { return None };
+        ty.clone()
+    } else {
+        Symbol::from("value")
+    };
+    let ExprNode::Hash { entries, .. } = &*args[args.len() - 1].node else { return None };
+    let [(key, default)] = entries.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
+    if key.as_str() != "default" {
+        return None;
+    }
+    fn plain(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { value } => matches!(
+                value,
+                Literal::Bool { .. } | Literal::Int { .. } | Literal::Float { .. } | Literal::Str { .. } | Literal::Sym { .. } | Literal::Nil
+            ),
+            ExprNode::Array { elements, .. } => elements.iter().all(plain),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| plain(k) && plain(v)),
+            _ => false,
+        }
+    }
+    match &*default.node {
+        ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+            if params.is_empty() && extra_params.is_empty() && plain(body) =>
+        {
+            Some((name.clone(), ty, body.clone()))
+        }
+        ExprNode::Lit { .. } if args.len() == 3 && plain(default) => Some((name.clone(), ty, default.clone())),
+        _ => None,
+    }
+}
+
 /// `attribute :name, :type` — typed virtual attributes (lobsters'
 /// `attribute :mod_note, :boolean` on Message, `:is_unread` on the
 /// SQL-view-backed ReplyingComment). Reader is a typed ivar read;
@@ -551,10 +614,15 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
     if is_primary_abstract_class(model) {
         return;
     }
-    for (name, ty_sym) in attribute_api_decls(&model.body) {
+    let decls = attribute_api_decls(&model.body)
+        .into_iter()
+        .map(|(name, ty)| (name, ty, None))
+        .chain(virtual_default_attribute_decls(model).into_iter().map(|(name, ty, default)| (name, ty, Some(default))));
+    for (name, ty_sym, default) in decls {
         let is_bool = ty_sym.as_str() == "boolean";
         let setter = Symbol::from(format!("{}=", name.as_str()));
         if !methods.iter().any(|m| m.name == name) {
+            let ivar = || Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() });
             methods.push(MethodDef {
                 visibility: crate::dialect::MethodVisibility::Public,
                 unsupported_formals: None,
@@ -563,13 +631,31 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 name: name.clone(),
                 receiver: MethodReceiver::Instance,
                 params: Vec::new(),
-                body: if is_bool {
-                    with_ty(
-                        Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() }),
-                        Ty::Bool,
+                body: if let Some(default) = default {
+                    // The default stands until the attribute is assigned
+                    // (an explicit nil stays nil). A collection default is
+                    // stored on first read, so `movement_ids << 1` sticks
+                    // as it does on Rails' cached default.
+                    let default = if matches!(&*default.node, ExprNode::Array { .. } | ExprNode::Hash { .. }) {
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Assign { target: LValue::Ivar { name: name.clone() }, value: default },
+                        )
+                    } else {
+                        default
+                    };
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::If {
+                            cond: Expr::new(Span::synthetic(), ExprNode::Defined { operand: ivar() }),
+                            then_branch: ivar(),
+                            else_branch: default,
+                        },
                     )
+                } else if is_bool {
+                    with_ty(ivar(), Ty::Bool)
                 } else {
-                    Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() })
+                    ivar()
                 },
                 signature: if is_bool {
                     Some(super::fn_sig(vec![], Ty::Bool))

@@ -3043,8 +3043,16 @@ fn assoc_owner_seed(
     // each rung carries the OWNER it resolved through so the check can
     // ask about that exact declaration; the by-NAME rung has no owner
     // and is checked against every declarer.
-    let by_name = ctx.in_model_body()
-        || next.is_none_or(|(method, args, block)| !reader_array_answers(method.as_str(), args, block));
+    //
+    // A bare reader of the body's own class (`repositories` of Core's
+    // `Apps::Models::Extensions::Management::Create`, a SmartProperties
+    // property holding the `Repositories` module) is the class's own
+    // method, not a record the by-name guess can read `id` from: outside a
+    // model body that rung does not take it.
+    let own_reader = matches!(&*owner.node, ExprNode::Send { recv: None, .. }) && !ctx.in_model_body();
+    let by_name = !own_reader
+        && (ctx.in_model_body()
+            || next.is_none_or(|(method, args, block)| !reader_array_answers(method.as_str(), args, block)));
     resolve_assoc_read(owner, aname, ctx.models, ctx.assocs, ctx.plain_subclasses, by_name)
         .filter(|(owner_model, _, _)| !ctx.assocs.is_unseedable(owner_model.as_ref(), aname))
         .map(|(owner_model, target, fk)| {

@@ -1201,6 +1201,14 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
                     continue;
                 }
             }
+            // `attribute :name, :type, default: <literal>` of a name the
+            // table has no column for: the same virtual attribute, its
+            // reader answering the default until assigned.
+            if self::markers::virtual_default_attribute_decls(model).iter().any(|(n, ..)| {
+                self::markers::virtual_default_attribute_decl(expr).is_some_and(|(decl, ..)| decl == *n)
+            }) {
+                continue;
+            }
         }
         // `primary_abstract_class` — claimed by markers.rs.
         if name == "primary_abstract_class" {
@@ -1892,6 +1900,9 @@ pub fn writable_field_set(
         writable.insert(attr);
     }
     for (name, _ty) in self::markers::attribute_api_decls(&model.body) {
+        writable.insert(name);
+    }
+    for (name, ..) in self::markers::virtual_default_attribute_decls(model) {
         writable.insert(name);
     }
     // `has_rich_text :body` synthesizes `body=`, so `permit(:body)` is

@@ -611,7 +611,7 @@ module ActiveRecord
       # Validations#valid? clears the errors before the chain runs.
       @errors = _fresh_errors
       begin
-        ok = _callback_chain_run(:validation) { valid?(context) }
+        ok = _callback_chain_run(:validation) { _valid_with_caller_hooks?(context) }
       ensure
         @validation_context = previous
       end

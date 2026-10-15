@@ -323,6 +323,7 @@ module ActiveRecord
     def self._hydrate_all: (String sql) -> Array[Base]
     def update_attribute: (Symbol name, untyped value) -> bool
     def valid?: (?Symbol? context) -> bool
+    def _valid_with_caller_hooks?: (?untyped context) -> bool
     def validation_context: () -> Symbol?
     def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool
@@ -479,9 +480,9 @@ module ActiveRecord
   class Relation
     @model: Base
     def insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
     def insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
     def upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
   end

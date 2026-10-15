@@ -3791,6 +3791,8 @@ module ActiveRecord
         # syntax error), which `where.not` negates to match everything.
         return "1=0" if ids.empty?
         "#{qcol} IN (#{escape_list(ids)})"
+      elsif val.is_a?(Range)
+        range_predicate(qcol, val, typed, tcol)
       elsif val.nil?
         note_equality(own, nil) if note
         "#{qcol} IS NULL"
@@ -3805,6 +3807,33 @@ module ActiveRecord
       else
         note_equality(own, val) if note
         "#{qcol} = #{bind_literal(tcol.nil? ? val : typed._attribute_for_database(tcol, val))}"
+      end
+    end
+
+    # predicate_builder/range_handler.rb: a Range value bounds the column
+    # (`where(created_at: from...to)`): `BETWEEN` for an inclusive range,
+    # `>=` and `<` for an exclusive end, one side alone for a beginless or
+    # endless range (or an infinite bound), nothing at all for both.
+    def range_predicate(qcol, range, typed, tcol)
+      bound = lambda do |x|
+        x = nil if x.is_a?(Float) && x.infinite?
+        x
+      end
+      lo = bound.call(range.begin)
+      hi = bound.call(range.end)
+      literal = lambda do |x|
+        bind_literal(tcol.nil? ? x : typed._attribute_for_database(tcol, x))
+      end
+      if lo.nil? && hi.nil?
+        "1=1"
+      elsif lo.nil?
+        "#{qcol} #{range.exclude_end? ? "<" : "<="} #{literal.call(hi)}"
+      elsif hi.nil?
+        "#{qcol} >= #{literal.call(lo)}"
+      elsif range.exclude_end?
+        "(#{qcol} >= #{literal.call(lo)} AND #{qcol} < #{literal.call(hi)})"
+      else
+        "#{qcol} BETWEEN #{literal.call(lo)} AND #{literal.call(hi)}"
       end
     end
 

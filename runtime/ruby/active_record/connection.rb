@@ -1050,16 +1050,18 @@ module ActiveRecord
       all.insert_all(rows, unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
     end
 
-    def self.insert_all!(rows, returning: nil, record_timestamps: nil)
-      all.insert_all!(rows, returning: returning, record_timestamps: record_timestamps)
+    # `unique_by:` is accepted and unused, as Rails' `on_duplicate: :raise`
+    # never resolves a conflict target (Core's bulk metafield insert passes it).
+    def self.insert_all!(rows, returning: nil, unique_by: nil, record_timestamps: nil)
+      all.insert_all!(rows, returning: returning, unique_by: unique_by, record_timestamps: record_timestamps)
     end
 
     def self.insert(attrs, unique_by: nil, returning: nil, record_timestamps: nil)
       all.insert(attrs, unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
     end
 
-    def self.insert!(attrs, returning: nil, record_timestamps: nil)
-      all.insert!(attrs, returning: returning, record_timestamps: record_timestamps)
+    def self.insert!(attrs, returning: nil, unique_by: nil, record_timestamps: nil)
+      all.insert!(attrs, returning: returning, unique_by: unique_by, record_timestamps: record_timestamps)
     end
 
     def self._insert_rows(rows, skip_conflicts, unique_by, returning, record_timestamps)
@@ -1068,9 +1070,12 @@ module ActiveRecord
         raise NotImplementedError, "#{name}.insert_all: RETURNING is not supported"
       end
 
-      keys = rows[0].keys.map { |c| c.to_s }
+      # Rails stringifies the keys: `{"id" => nil}` from `attributes` and a
+      # `:id` a primary-key allocator (Core's GenerateOid) adds are one column.
+      rows = rows.map { |row| row.to_h { |k, v| [k.to_s, v] } }
+      keys = rows[0].keys
       rows.each do |row|
-        unless row.keys.map { |c| c.to_s }.sort == keys.sort
+        unless row.keys.sort == keys.sort
           raise ArgumentError, "All objects being inserted must have the same keys"
         end
       end
@@ -2251,7 +2256,12 @@ module ActiveRecord
       # starts each run with none, as it does the errors.
       @error_details = [] unless @error_details.nil?
       begin
+        # ActiveModel::Validations::Callbacks wraps the run, so a bare
+        # `valid?` (Core's Metafields::BulkUpsert validating before it
+        # writes) assigns what `before_validation` derives, as `save` does.
+        before_validation unless @_validation_hooks_off
         ActiveRecord::RuntimeValidations.run(self)
+        after_validation unless @_validation_hooks_off
       ensure
         @validation_context = previous
       end
@@ -2260,6 +2270,17 @@ module ActiveRecord
 
     def validation_context
       @validation_context
+    end
+
+    # `valid?` for a caller that runs `before_validation` /
+    # `after_validation` itself: `save`, a runtime callback chain, a
+    # parent validating its nested child.
+    def _valid_with_caller_hooks?(context = nil)
+      previous = @_validation_hooks_off
+      @_validation_hooks_off = true
+      valid?(context)
+    ensure
+      @_validation_hooks_off = previous
     end
 
     # ActiveModel::Validations#validates_with: run the validators on
@@ -2271,7 +2292,7 @@ module ActiveRecord
 
     def save(context: nil)
       before_validation
-      ok = valid?(context)
+      ok = _valid_with_caller_hooks?(context)
       after_validation
       return false unless ok
 
@@ -3635,7 +3656,7 @@ module ActiveRecord
       @model._insert_rows(rows, true, unique_by, returning, record_timestamps)
     end
 
-    def insert_all!(rows, returning: nil, record_timestamps: nil)
+    def insert_all!(rows, returning: nil, unique_by: nil, record_timestamps: nil)
       @model._insert_rows(rows, false, nil, returning, record_timestamps)
     end
 
@@ -3643,8 +3664,8 @@ module ActiveRecord
       insert_all([attrs], unique_by: unique_by, returning: returning, record_timestamps: record_timestamps)
     end
 
-    def insert!(attrs, returning: nil, record_timestamps: nil)
-      insert_all!([attrs], returning: returning, record_timestamps: record_timestamps)
+    def insert!(attrs, returning: nil, unique_by: nil, record_timestamps: nil)
+      insert_all!([attrs], returning: returning, unique_by: unique_by, record_timestamps: record_timestamps)
     end
 
     def upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
