@@ -9472,7 +9472,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let listing: Vec<String> = app.sources.iter().map(|source| source.path.clone()).collect();
         app.sources
             .iter()
-            .filter(|source| required_gem_file(&source.path) && source.text.contains("autoload") && source.text.contains("Dir"))
+            .filter(|source| required_gem_file(&source.path) && source.text.contains("autoload"))
             .flat_map(|source| crate::ingest::autoload_glob::file_autoloads(&source.text, &source.path, &listing))
             .collect()
     };
