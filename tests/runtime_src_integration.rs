@@ -1246,7 +1246,14 @@ fn every_runtime_method_body_concretely_typed() {
     // the i18n gem answers `normalize_keys` untyped, cast to
     // `Array[Symbol]`, and `**options` is caller-defined). The per-file
     // split was not diffed against om110.
-    const CEILING: usize = 1760;
+    // MEASURED 1790 on 2026-10-15 (merge of om121-om124 at 6efe96fcd): +30
+    // gradual sites in the bodies those branches added: relation.rb's
+    // nested-table / tuple `where` predicates and `includes` eager joins
+    // (condition Hash values and reflections are untyped, as in Rails),
+    // cruby/active_record_transactions.rb's transaction-changes port, and
+    // the `_indifferent_changes` / class `readonly` additions to
+    // connection.rb. The per-file split was not diffed.
+    const CEILING: usize = 1790;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

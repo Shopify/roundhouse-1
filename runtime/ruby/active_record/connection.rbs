@@ -244,6 +244,7 @@ module ActiveRecord
     def self.preload: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.eager_load: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.distinct: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.readonly: (?bool value) -> Relation
     def self.having: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.from: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.extending: (*untyped args) ?{ (untyped) -> untyped } -> Relation
@@ -346,6 +347,7 @@ module ActiveRecord
     def changed_attribute_names_to_save: () -> Array[String]
     def changed: () -> Array[String]
     def changes: () -> Hash[String, untyped]
+    def _indifferent_changes: (Hash[String, untyped] changes) -> Hash[String, untyped]
     def changed_attributes: () -> Hash[String, untyped]
     def attributes_in_database: () -> Hash[String, untyped]
     def restore_attributes: (?Array[String | Symbol] attr_names) -> untyped
