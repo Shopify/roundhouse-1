@@ -118,6 +118,10 @@ require_relative "runtime/action_view_translation_helper"
 require_relative "runtime/action_view_form_builder_extras"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+# `ActiveRecord::Store` (`store`, `store_accessor`, `stored_attributes`),
+# which the activerecord-typedstore gem's `typed_store` ends in. Dynamic
+# Ruby (define_method), so ruby lane only.
+require_relative "runtime/active_record_store"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"

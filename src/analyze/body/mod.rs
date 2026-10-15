@@ -5585,6 +5585,7 @@ mod runtime_base {
     const OVERLAY: &str = "runtime/spinel/scaffold/ruby_overlay/runtime/";
     const OVERLAY_FILES: &[&str] = &[
         "active_record_bang.rb",
+        "active_record_store.rb",
         "active_record_serialization.rb",
         "active_record_relation_ext.rb",
         "active_record_postgresql_adapter.rb",

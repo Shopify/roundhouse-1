@@ -26,6 +26,9 @@ const STRUCTURE: &str = r#"CREATE TABLE items (
     gift_card boolean DEFAULT false,
     featured boolean DEFAULT true NOT NULL,
     qty integer DEFAULT 5 NOT NULL,
+    owner_type_int integer NOT NULL,
+    weight bigint NOT NULL,
+    batch_id bigint NOT NULL DEFAULT 0,
     delta integer DEFAULT -1,
     price numeric(21,3) DEFAULT 0.0,
     CONSTRAINT items_pkey PRIMARY KEY (id)
@@ -65,14 +68,25 @@ const PROBE: &str = r##"class DefaultsProbe
     out << "gift_card: #{item.gift_card.inspect}"
     out << "featured: #{item.featured.inspect}"
     out << "qty: #{item.qty.inspect}"
+    out << "owner_type_int: #{item.owner_type_int.inspect}"
+    out << "weight: #{item.weight.inspect}"
+    out << "batch_id: #{item.batch_id.inspect}"
+    out << "owner_type_int fallback: #{(item.owner_type_int || 7).inspect}"
     out << "delta: #{item.delta.inspect}"
     out << "price: #{item.price.to_s}"
     out << "valid: #{item.valid?} #{item.errors.full_messages.inspect}"
-    given = Item.new(label: "tag", qty: 2, gift_card: true)
-    out << "given: #{given.label.inspect} #{given.qty.inspect} #{given.gift_card.inspect} #{given.valid?}"
-    saved = Item.create!(label: "kept", body: "text")
+    given = Item.new(label: "tag", qty: 2, gift_card: true, owner_type_int: 3)
+    out << "given: #{given.label.inspect} #{given.qty.inspect} #{given.gift_card.inspect} #{given.owner_type_int.inspect} #{given.valid?}"
+    saved = Item.create!(label: "kept", body: "text", owner_type_int: 4, weight: 9)
     loaded = Item.find(saved.id)
-    out << "loaded: #{loaded.label.inspect} #{loaded.gift_card.inspect} #{loaded.qty.inspect} #{loaded.delta.inspect}"
+    out << "loaded: #{loaded.label.inspect} #{loaded.gift_card.inspect} #{loaded.qty.inspect} #{loaded.delta.inspect} #{loaded.owner_type_int.inspect} #{loaded.weight.inspect} #{loaded.batch_id.inspect}"
+    refused = begin
+      Item.create!(label: "x", body: "y")
+      "saved"
+    rescue ActiveRecord::NotNullViolation
+      "NotNullViolation"
+    end
+    out << "refused: #{refused}"
     out
   end
 end
@@ -87,11 +101,16 @@ const EXPECTED: &[&str] = &[
     "gift_card: false",
     "featured: true",
     "qty: 5",
+    "owner_type_int: nil",
+    "weight: nil",
+    "batch_id: 0",
+    "owner_type_int fallback: 7",
     "delta: -1",
     "price: 0.0",
     "valid: false [\"Label can't be blank\"]",
-    "given: \"tag\" 2 true true",
-    "loaded: \"kept\" false 5 -1",
+    "given: \"tag\" 2 true 3 true",
+    "loaded: \"kept\" false 5 -1 4 9 0",
+    "refused: NotNullViolation",
 ];
 
 const FILES: [(&str, &str); 7] = [

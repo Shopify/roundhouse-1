@@ -768,6 +768,11 @@ impl Analyzer {
             // `serialize :col, coder: …` — the column reads back as the
             // coder's object, not the storage text.
             register_serialized_columns(&model.body, &mut cls.instance_methods);
+            // `store_accessor :col, :key` — ActiveRecord::Store's accessors
+            // and dirty readers over the column's Hash, defined at load.
+            if let Some(table) = app.schema.tables.get(&model.table.0) {
+                register_store_accessors(&model.body, table, &mut cls.instance_methods);
+            }
             register_attribute_macros(&model.body, &mut cls.instance_methods);
             // `attribute :name, :type` virtual attributes (ActiveModel) —
             // backed by something other than a schema column, so absent
@@ -10609,6 +10614,28 @@ fn register_has_json(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) 
             methods
                 .entry(Symbol::from(format!("{}=", flat.as_str())))
                 .or_insert(ty);
+        }
+    }
+}
+
+/// The methods `store_accessor :col, :key` defines at load
+/// (`accessor_prefix` / `accessor_suffix` applied): reader and writer, and
+/// the per-key dirty readers ActiveRecord::Store adds. The value is the
+/// column Hash's, so gradual.
+fn register_store_accessors(body: &[ModelBodyItem], table: &crate::schema::Table, methods: &mut HashMap<Symbol, Ty>) {
+    for item in body {
+        let (ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. }) = item else { continue };
+        let Some((_, keys)) = crate::analyze::retypable_attributes::store_accessor_decl(expr, table) else { continue };
+        for key in keys {
+            // The stored value is the column Hash's, whatever it holds.
+            methods.insert(Symbol::from(key.clone()), Ty::Untyped);
+            methods.insert(Symbol::from(format!("{key}=")), Ty::Untyped);
+            for dirty in ["_change", "_was", "_before_last_save"] {
+                methods.insert(Symbol::from(format!("{key}{dirty}")), Ty::Untyped);
+            }
+            methods.insert(Symbol::from(format!("{key}_changed?")), Ty::Bool);
+            methods.insert(Symbol::from(format!("saved_change_to_{key}?")), Ty::Bool);
+            methods.insert(Symbol::from(format!("saved_change_to_{key}")), Ty::Untyped);
         }
     }
 }

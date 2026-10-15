@@ -43,7 +43,18 @@ class Module
         # Uncountables) reads the variable, as Rails' generated
         # `_ = @members` does. `__send__` and Kernel's ivar reader, so a
         # BasicObject receiver (a blocker proxy) delegates too.
-        target = to.to_s.start_with?("@") ? ::Kernel.instance_method(:instance_variable_get).bind_call(self, to) : __send__(to)
+        # An expression (`to: 'self.class'`, `to: "Foo::BAR"`, as
+        # activerecord-typedstore's TypedHash gives) is evaluated on the
+        # receiver, as Rails' generated `_ = self.class` does.
+        target_name = to.to_s
+        target =
+          if target_name.start_with?("@")
+            ::Kernel.instance_method(:instance_variable_get).bind_call(self, to)
+          elsif target_name.match?(/\A[A-Za-z_]\w*[?!]?\z/) && !target_name.match?(/\A[A-Z]/)
+            __send__(to)
+          else
+            instance_eval(target_name)
+          end
         if target.nil? && allow_nil
           nil
         else

@@ -495,6 +495,63 @@ fn serialized_column_with(expr: &Expr, table: &crate::schema::Table, json: bool)
         .then(|| column.name.clone())
 }
 
+/// A direct `store_accessor :col, :key, ...[, prefix: x][, suffix: y]` body
+/// statement over a column of `table`, every argument a literal:
+/// ActiveRecord::Store defines `<key>`, `<key>=` and the dirty readers over
+/// the column's Hash at load, through the column's type
+/// (`type_for_attribute(col).accessor`). The column and the accessor names
+/// (affixes applied, as Rails' `accessor_prefix` / `accessor_suffix` do).
+/// The call is claimed (it runs as written, for the runtime's
+/// `store_accessor`) when the model also retypes the column, a
+/// `serialize` with an app coder or the like: only a declared type answers
+/// `accessor`.
+pub(crate) fn store_accessor_decl(expr: &Expr, table: &crate::schema::Table) -> Option<(Symbol, Vec<String>)> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "store_accessor" || !on_self(recv) {
+        return None;
+    }
+    let (positional, options) = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { kwargs: true, .. }) => (rest, Some(last)),
+        _ => (args.as_slice(), None),
+    };
+    let (store, keys) = positional.split_first()?;
+    if !literal_only(store) || !keys.iter().all(literal_only) {
+        return None;
+    }
+    let mut store_names = Vec::new();
+    literal_names(store, &mut store_names);
+    let [store_name] = store_names.as_slice() else { return None };
+    let column = table.columns.iter().find(|c| c.name.as_str() == store_name)?;
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    if let Some(options) = options {
+        let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+        for (key, value) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
+            let affix = match &*value.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+                ExprNode::Lit { value: Literal::Bool { value: true } } => Some(store_name.clone()),
+                ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => None,
+                _ => return None,
+            };
+            match key.as_str() {
+                "prefix" => prefix = affix.map(|a| format!("{a}_")).unwrap_or_default(),
+                "suffix" => suffix = affix.map(|a| format!("_{a}")).unwrap_or_default(),
+                _ => return None,
+            }
+        }
+    }
+    let mut names = Vec::new();
+    keys.iter().for_each(|k| literal_names(k, &mut names));
+    Some((column.name.clone(), names.into_iter().map(|k| format!("{prefix}{k}{suffix}")).collect()))
+}
+
+/// [`store_accessor_decl`] over a column the model retypes.
+pub(crate) fn claimed_store_accessor(model: &Model, expr: &Expr, table: &crate::schema::Table) -> bool {
+    store_accessor_decl(expr, table).is_some_and(|(column, _)| model.retypable_attributes.contains(&column))
+}
+
 /// A direct `decorate_attributes([:col, ...]) { |name, type| ... }` body
 /// statement naming columns of `table`, every name a literal: Rails
 /// (attribute_registration.rb) replaces each named attribute's type with
@@ -556,6 +613,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         out.extend(body_statements(model).filter(|e| decorated_columns(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| alias_attribute_decl(e, table).is_some()).map(|e| e.span));
+        out.extend(body_statements(model).filter(|e| claimed_store_accessor(model, e, table)).map(|e| e.span));
         let side = ClassSide::of(model, app);
         out.extend(body_statements(model).filter(|e| macro_alias_pairs(&side, e, table).is_some()).map(|e| e.span));
         for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
