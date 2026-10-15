@@ -233,6 +233,8 @@ module ActiveRecord
     def persisted?: () -> bool
     def new_record?: () -> bool
     def destroyed?: () -> bool
+    @_already_called: Hash[Symbol, bool]?
+    def _association_walk_in_progress?: () -> bool
     # Side-effecting bang method; return value isn't meaningful.
     # `void` keeps TS from requiring an explicit `return ...;` for
     # the trailing assignment.

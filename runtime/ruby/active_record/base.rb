@@ -779,6 +779,20 @@ module ActiveRecord
       @destroyed
     end
 
+    # Whether one of this record's association validate/save walks
+    # (autosave_association.rb `define_non_cyclic_method`, whose
+    # `@_already_called` marks a running call) is on the stack. A
+    # belongs_to's save of its unsaved target is Rails' before_save and
+    # never runs from a validation of the target's records; the lowering
+    # asks this before saving the target from `before_validation`.
+    def _association_walk_in_progress?
+      calls = @_already_called
+      return false if calls.nil?
+      running = false
+      calls.each_value { |on| running = true if on }
+      running
+    end
+
     # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
     # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def mark_persisted!

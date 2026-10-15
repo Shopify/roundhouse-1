@@ -4976,7 +4976,8 @@ fn sti_class_dispatch(base_new: Expr, type_read: &Expr, args: &[Expr], span: Spa
 ///
 /// def _autosave_creator
 ///   if @creator_loaded && !@creator_cache.nil? && !@creator_cache.destroyed?
-///     @creator_cache.save if @creator_cache.new_record?
+///     @creator_cache.save if @creator_cache.new_record? &&
+///       !@creator_cache._association_walk_in_progress?
 ///     @creator_id = @creator_cache.id   # the `primary_key:`, `id` by default
 ///   end
 /// end
@@ -5227,7 +5228,14 @@ fn autosave_method(
         then_branch: syn(ExprNode::Seq {
             exprs: vec![
                 syn(ExprNode::If {
-                    cond: send(cache(), "new_record?"),
+                    // Not while the target is walking its own association
+                    // validation or save (`_association_walk_in_progress?`):
+                    // Rails saves a belongs_to in before_save, so
+                    // validating the owner's records never saves the owner.
+                    cond: and(
+                        send(cache(), "new_record?"),
+                        send(send(cache(), "_association_walk_in_progress?"), "!"),
+                    ),
                     then_branch: send(cache(), "save"),
                     else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
                 }),

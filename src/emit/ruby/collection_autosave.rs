@@ -453,7 +453,7 @@ fn validate_records_source(c: &Collection) -> String {
         Some(inverse) => {
             let i = inverse.as_str();
             format!(
-                "  records.each {{ |record| record.{i} = self unless record.instance_variable_get(:@{i}_loaded) == true }}\n"
+                "    records.each {{ |record| record.{i} = self unless record.instance_variable_get(:@{i}_loaded) == true }}\n"
             )
         }
         None => String::new(),
@@ -461,14 +461,21 @@ fn validate_records_source(c: &Collection) -> String {
     format!(
         r#"def _validate_associated_records_for_{n}
   return nil unless @{n}_loaded == true
-  context = validation_context
-  custom = !(context.nil? || context == :create || context == :update)
-  records = @{n}_cache
-  records = records.select {{ |record| record.new_record? }} unless new_record? || custom
-{inverse}  context = nil unless custom
-  valid = records.map {{ |record| record.destroyed? || record.valid?(context) }}
-  if valid.include?(false)
-    errors << _association_error({message:?})
+  @_already_called ||= {{}}
+  return nil if @_already_called[:validate_associated_records_for_{n}]
+  begin
+    @_already_called[:validate_associated_records_for_{n}] = true
+    context = validation_context
+    custom = !(context.nil? || context == :create || context == :update)
+    records = @{n}_cache
+    records = records.select {{ |record| record.new_record? }} unless new_record? || custom
+{inverse}    context = nil unless custom
+    valid = records.map {{ |record| record.destroyed? || record.valid?(context) }}
+    if valid.include?(false)
+      errors << _association_error({message:?})
+    end
+  ensure
+    @_already_called[:validate_associated_records_for_{n}] = false
   end
   nil
 end
