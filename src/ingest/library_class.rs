@@ -3114,7 +3114,18 @@ fn discarded_kind(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
         | N::LocalVariableOrWriteNode { .. }
         | N::LocalVariableAndWriteNode { .. } => "a local variable operator write",
         N::YieldNode { .. } | N::SuperNode { .. } | N::ForwardingSuperNode { .. } => "a `yield` or `super`",
+        N::ArrayNode { .. } if lists_constants(node) => "a list of constants",
         _ => return None,
+    })
+}
+
+/// Whether a literal list statement names constants (`[::Domain,
+/// ::OpenSrsDomain]`): evaluating it loads each one, the only effect it
+/// has. Core's DomainType lists a class and its subclasses before it
+/// reads `::Domain.descendants`, which sees only the loaded ones.
+fn lists_constants(node: &ruby_prism::Node<'_>) -> bool {
+    node.as_array_node().is_some_and(|list| {
+        list.elements().iter().any(|e| e.as_constant_read_node().is_some() || e.as_constant_path_node().is_some())
     })
 }
 
@@ -3138,6 +3149,7 @@ fn statement_kind_carried(node: &ruby_prism::Node<'_>) -> bool {
             | N::GlobalVariableOrWriteNode { .. }
             | N::GlobalVariableOperatorWriteNode { .. }
             | N::GlobalVariableAndWriteNode { .. }
+            | N::ArrayNode { .. }
     )
 }
 
