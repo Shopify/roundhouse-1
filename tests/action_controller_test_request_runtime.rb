@@ -89,6 +89,13 @@ show("ad default method", r.request_method)
 show("ad default remote ip", r.remote_ip)
 show("ad default agent", r.user_agent)
 show("ad cookie hash", r.get_header("rack.request.cookie_hash").class.name)
+show("ad cookies empty", r.cookies.to_h)
+r.cookies["shared"] = "CODE10"
+show("ad cookies write", r.cookies.to_h)
+parsed = ActionDispatch::TestRequest.create("HTTP_COOKIE" => "a=1; b=x%20y,c=3; a=dup; e")
+parsed.delete_header("rack.request.cookie_hash")
+show("ad cookies parsed", parsed.cookies.to_h)
+show("ad cookies memoized", parsed.cookies.equal?(parsed.cookies))
 r.host = "shop.example.com"
 r.request_method = "post"
 r.path = "/en/collections"
