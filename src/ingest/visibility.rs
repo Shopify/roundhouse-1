@@ -146,6 +146,21 @@ pub(super) fn conditional_accessor<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr
     .then_some(call)
 }
 
+/// A receiverless `class_eval <<-RUBY` / `module_eval` of a literal
+/// (heredoc) string, which in a load-time conditional's branch defines
+/// the methods its text holds when the branch runs
+/// (`class_eval_macro::literal_class_eval_methods`).
+pub(super) fn literal_class_eval(stmt: &Node<'_>) -> bool {
+    let Some(call) = stmt.as_call_node() else { return false };
+    call.block().is_none()
+        && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+        && matches!(constant_id_str(&call.name()), "class_eval" | "module_eval")
+        && call.arguments().is_some_and(|args| {
+            let args: Vec<_> = args.arguments().iter().collect();
+            (1..=3).contains(&args.len()) && args[0].as_string_node().is_some()
+        })
+}
+
 /// A `class` or `module` statement. In a load-time conditional's branch
 /// it declares only when the branch runs (`ConditionalArm::declarations`).
 pub(super) fn is_declaration(stmt: &Node<'_>) -> bool {
@@ -855,6 +870,18 @@ impl Visibility {
                 if let Some(call) = conditional_accessor(stmt) {
                     self.alternatives.insert(offset, self.branch_path(statement, arm));
                     self.declare(&call, offset, class_side, default, file)?;
+                    continue;
+                }
+                // Its methods are public (a string `class_eval` has a
+                // visibility scope of its own) and are named by the
+                // library walk, which reads the text.
+                if literal_class_eval(stmt) {
+                    if class_side {
+                        return Err(Self::unsupported(
+                            file,
+                            "a `class_eval` of a string in a load-time conditional inside `class << self` is not modeled",
+                        ));
+                    }
                     continue;
                 }
                 let Some(def) = definition(stmt) else {

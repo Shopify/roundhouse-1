@@ -46,6 +46,45 @@ use crate::ident::{ClassId, Symbol};
 
 use super::library_class::ConcernClassMethodSpans;
 
+/// What both passes read: the class-side catalog, the emitted names a
+/// statement can resolve to, and what each module includes.
+struct Setup {
+    class_side: HashMap<ClassId, (Vec<crate::dialect::MethodDef>, HashSet<Symbol>)>,
+    defined: HashSet<String>,
+    module_includes: HashMap<ClassId, Vec<ClassId>>,
+    carried: HashSet<ClassId>,
+}
+
+impl Setup {
+    fn new(app: &App, carriers: &[ConcernClassMethodSpans], framework_shadows: &HashSet<ClassId>) -> Self {
+        let class_side = super::app::concern_class_method_catalog(&app.library_classes, carriers);
+        let mut defined: HashSet<String> = HashSet::default();
+        for lc in &app.library_classes {
+            defined.insert(lc.name.0.as_str().to_string());
+            for (name, _) in &lc.constants {
+                defined.insert(format!("{}::{}", lc.name.0.as_str(), name.as_str()));
+            }
+        }
+        defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
+        let module_includes: HashMap<ClassId, Vec<ClassId>> =
+            app.library_classes.iter().map(|lc| (lc.name.clone(), lc.includes.clone())).collect();
+        // A `class_attribute` in a block `concern_class_attribute::expand`
+        // carries is its; every other one runs here, as the macro.
+        let carried = super::concern_class_attribute::admitted_carriers(app, carriers, framework_shadows, false);
+        Setup { class_side, defined, module_includes, carried }
+    }
+
+    fn walk<'a>(&'a self, app: &'a App) -> Walk<'a> {
+        Walk {
+            app,
+            class_side: &self.class_side,
+            defined: &self.defined,
+            module_includes: &self.module_includes,
+            carried: &self.carried,
+        }
+    }
+}
+
 pub(super) fn carry(
     app: &mut App,
     carriers: &[ConcernClassMethodSpans],
@@ -54,27 +93,8 @@ pub(super) fn carry(
     if app.concern_model_items.is_empty() || app.controllers.is_empty() {
         return;
     }
-    let class_side = super::app::concern_class_method_catalog(&app.library_classes, carriers);
-    let mut defined: HashSet<String> = HashSet::default();
-    for lc in &app.library_classes {
-        defined.insert(lc.name.0.as_str().to_string());
-        for (name, _) in &lc.constants {
-            defined.insert(format!("{}::{}", lc.name.0.as_str(), name.as_str()));
-        }
-    }
-    defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
-    let module_includes: HashMap<ClassId, Vec<ClassId>> =
-        app.library_classes.iter().map(|lc| (lc.name.clone(), lc.includes.clone())).collect();
-    // A `class_attribute` in a block `concern_class_attribute::expand`
-    // carries is its; every other one runs here, as the macro.
-    let carried = super::concern_class_attribute::admitted_carriers(app, carriers, framework_shadows, false);
-    let walk = Walk {
-        app: &*app,
-        class_side: &class_side,
-        defined: &defined,
-        module_includes: &module_includes,
-        carried: &carried,
-    };
+    let setup = Setup::new(app, carriers, framework_shadows);
+    let walk = setup.walk(app);
 
     // Each controller's own `include`s (a `prepend` is no include), and
     // every Concern its chain reaches.
@@ -125,6 +145,95 @@ pub(super) fn carry(
     for (name, includes, statements) in planned {
         app.controller_runtime_includes.insert(name.clone(), includes);
         app.included_block_statements.entry(name).or_default().extend(statements);
+    }
+}
+
+/// A controller's own call of a class macro a Concern it (or a superclass
+/// controller) includes defines, run when its class body loads:
+///
+/// ```ruby
+/// class Admin::AccountsController < AdminAreaController
+///   allow_same_origin_frames only: [:index]   # ClickjackingProtection::ClassMethods
+/// end
+/// ```
+///
+/// Filter macros are expanded into the filter chain, and a macro of a
+/// Concern `concern_class_attribute::expand` carries is already a class
+/// body write; what is left as an unrecognized call here was dropped, so
+/// every subclass kept its parent's settings. The call is written back as
+/// the class-body statement it is (`ClassIvarInit`, the item those two use
+/// for the same thing), after the `extend` of the Concern's `ClassMethods`
+/// that makes it resolve. A name Rails itself defines on a controller, or
+/// one another lowering consumes, is not replayed.
+pub(super) fn replay_subclass_macros(
+    app: &mut App,
+    carriers: &[ConcernClassMethodSpans],
+    framework_shadows: &HashSet<ClassId>,
+) {
+    if app.concern_model_items.is_empty() || app.controllers.is_empty() {
+        return;
+    }
+    let setup = Setup::new(app, carriers, framework_shadows);
+    if setup.class_side.is_empty() {
+        return;
+    }
+    let walk = setup.walk(app);
+    let mut reached: HashMap<ClassId, HashSet<ClassId>> = HashMap::default();
+    for controller in &app.controllers {
+        let mut seen = HashSet::default();
+        for id in own_includes(&controller.body) {
+            walk.reach(&id, &mut seen);
+        }
+        reached.insert(controller.name.clone(), seen);
+    }
+    let parents: HashMap<&ClassId, &ClassId> =
+        app.controllers.iter().filter_map(|c| Some((&c.name, c.parent.as_ref()?))).collect();
+
+    // Each controller's callable macros: name to the module defining it.
+    let mut callable: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::default();
+    for controller in &app.controllers {
+        let mut modules: Vec<&ClassId> = Vec::new();
+        let mut at = Some(&controller.name);
+        for _ in 0..32 {
+            let Some(name) = at.take() else { break };
+            modules.extend(reached.get(name).into_iter().flatten());
+            at = parents.get(name).copied();
+        }
+        let mut macros: HashMap<Symbol, ClassId> = HashMap::default();
+        for module in modules {
+            if !walk.has_class_methods_module(module) {
+                continue;
+            }
+            if let Some((methods, _)) = setup.class_side.get(module) {
+                for method in methods {
+                    macros.insert(method.name.clone(), module.clone());
+                }
+            }
+        }
+        if !macros.is_empty() {
+            callable.insert(controller.name.clone(), macros);
+        }
+    }
+    drop(walk);
+
+    for controller in &mut app.controllers {
+        let Some(macros) = callable.get(&controller.name) else { continue };
+        for item in &mut controller.body {
+            let ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else { continue };
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
+            if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
+                || super::app::CONSUMED_CONTROLLER_MACROS.contains(&method.as_str())
+            {
+                continue;
+            }
+            let Some(carrier) = macros.get(method) else { continue };
+            *item = ControllerBodyItem::ClassIvarInit {
+                expr: expr.clone(),
+                carrier: carrier.clone(),
+                leading_comments: std::mem::take(leading_comments),
+                leading_blank_line: *leading_blank_line,
+            };
+        }
     }
 }
 
