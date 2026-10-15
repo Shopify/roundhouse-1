@@ -919,6 +919,15 @@ pub struct App {
     /// Read by `lower::controller_to_library::params_wrapper`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap_parameters_by_default: bool,
+    /// `ActiveRecord.belongs_to_required_validates_foreign_key` is off:
+    /// `config.load_defaults` 7.1 or later sets it false, and an explicit
+    /// `config.active_record.belongs_to_required_validates_foreign_key =`
+    /// wins. A required `belongs_to` then asks for its record only when
+    /// the key is nil or changed, so a row whose key points nowhere (a
+    /// fixture's dangling label) still updates. Rails' own default is on.
+    /// Read by `emit::ruby::collection_autosave`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub belongs_to_required_skips_unchanged_foreign_key: bool,
     /// Rubydex answers for `sources`, resolved while ingest finished.
     /// The analyzer resolves the sources itself when this is absent.
     #[serde(skip)]
@@ -1693,6 +1702,7 @@ impl App {
             controller_resolutions: HashMap::default(),
             sources: Vec::new(),
             wrap_parameters_by_default: false,
+            belongs_to_required_skips_unchanged_foreign_key: false,
             const_resolver: Default::default(),
             dropped_files: Vec::new(),
             sorbet_type_aliases: Vec::new(),

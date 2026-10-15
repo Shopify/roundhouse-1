@@ -241,6 +241,7 @@ fn tiny_blog_round_trips() {
         controller_resolutions: roundhouse::det::HashMap::default(),
         sources: vec![],
         wrap_parameters_by_default: false,
+        belongs_to_required_skips_unchanged_foreign_key: false,
         // Derived from `sources` and `serde(skip)`, like `binary_assets`.
         const_resolver: Default::default(),
         // Survey-mode ingest record, `serde(skip)`: never round-trips.
