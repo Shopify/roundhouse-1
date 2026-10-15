@@ -447,6 +447,8 @@ module ActiveRecord
     def eager_joinable?: (untyped owner, untyped reflection, Symbol name) -> bool
     def load_eager_records: (EagerPlan plan) -> Array[Base]
     def qualify_eager_order: (String term) -> String
+    def limited_eager_ids: () -> Array[String]
+    def order_sql_terms: () -> Array[String]
     def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
     def nested_table: (String | Symbol key) -> [String, untyped]
     def associated_model_by_table: (String name) -> untyped

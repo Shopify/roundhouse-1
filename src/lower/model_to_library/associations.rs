@@ -1801,6 +1801,54 @@ pub(crate) fn super_writer_overrides(model: &Model) -> crate::det::HashSet<Symbo
     names
 }
 
+/// The association readers a class-body statement the compiler does not
+/// model names by symbol (`disable_filtering_for_associations([:reference])`,
+/// which `define_method`s a reader that calls `super`), and the
+/// `<name>_ignoring_soft_deletion` reader beside it. Rails defines a
+/// reader in a generated module, so a `define_method` of the same name
+/// supers into it whatever the order; Ruby family only, where the
+/// synthesized reader is emitted into GeneratedAttributeMethods
+/// (`generated_attribute_methods`) instead of the class.
+pub(crate) fn super_reader_overrides(model: &Model) -> crate::det::HashSet<Symbol> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut names = crate::det::HashSet::default();
+    if !crate::emit::ruby::native_keywords() {
+        return names;
+    }
+    let mut named: Vec<Symbol> = Vec::new();
+    for item in &model.body {
+        if let ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } = item {
+            collect_symbol_literals(expr, &mut named);
+        }
+    }
+    if named.is_empty() {
+        return names;
+    }
+    let declared = |name: &Symbol| {
+        model.body.iter().any(|i| {
+            matches!(i, ModelBodyItem::Association { assoc: Association::BelongsTo { name: n, .. } | Association::HasOne { name: n, .. }, .. }
+                if n == name)
+        })
+    };
+    for name in named {
+        let soft = Symbol::from(format!("{}_ignoring_soft_deletion", name.as_str()));
+        if declared(&name) {
+            names.insert(name);
+            if declared(&soft) {
+                names.insert(soft);
+            }
+        }
+    }
+    names
+}
+
+fn collect_symbol_literals(expr: &Expr, out: &mut Vec<Symbol>) {
+    if let ExprNode::Lit { value: Literal::Sym { value } } = &*expr.node {
+        out.push(value.clone());
+    }
+    expr.node.for_each_child(&mut |c| collect_symbol_literals(c, out));
+}
+
 fn body_calls_super(expr: &Expr) -> bool {
     let mut found = matches!(&*expr.node, ExprNode::Super { .. });
     expr.node.for_each_child(&mut |c| found = found || body_calls_super(c));
@@ -2217,8 +2265,44 @@ pub(super) fn push_dependent_destroy(methods: &mut Vec<MethodDef>, model: &Model
     for (span, assoc) in model.spanned_associations() {
         if let Association::HasMany { name, dependent, .. } = assoc {
             if matches!(dependent, Dependent::Destroy) {
-                // assoc_name.each { |c| c.destroy }
-                let iter_body = Expr::new(
+                // assoc_name.each { |c|
+                //   c.destroyed_by_association = self.class.reflect_on_association(:assoc_name)
+                //   c.destroy
+                // }
+                // Rails' has_many `handle_dependency` marks each record
+                // `destroyed_by_association` (the reflection) before its
+                // destroy runs, which the model's own `destroy` and
+                // callbacks may read.
+                let reflection = Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Send {
+                                recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                                method: Symbol::from("class"),
+                                args: Vec::new(),
+                                block: None,
+                                parenthesized: false,
+                            },
+                        )),
+                        method: Symbol::from("reflect_on_association"),
+                        args: vec![lit_sym(name.clone())],
+                        block: None,
+                        parenthesized: true,
+                    },
+                );
+                let mark = Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(var_ref(Symbol::from("c"))),
+                        method: Symbol::from("destroyed_by_association="),
+                        args: vec![reflection],
+                        block: None,
+                        parenthesized: false,
+                    },
+                );
+                let destroy_call = Expr::new(
                     Span::synthetic(),
                     ExprNode::Send {
                         recv: Some(var_ref(Symbol::from("c"))),
@@ -2228,6 +2312,7 @@ pub(super) fn push_dependent_destroy(methods: &mut Vec<MethodDef>, model: &Model
                         parenthesized: false,
                     },
                 );
+                let iter_body = seq(vec![mark, destroy_call]);
                 let block = Expr::new(
                     Span::synthetic(),
                     ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(), rest_param: None,

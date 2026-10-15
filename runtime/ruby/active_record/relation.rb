@@ -1593,9 +1593,17 @@ module ActiveRecord
     # survived the WHERE, de-duplicated per parent. The records themselves
     # load by key, and the `_preload_<name>` setters seat them.
     def load_eager_records(plan)
-      if !@limit.nil? || !@offset.nil?
-        if plan.nodes.any? { |n| n.collection? }
-          raise NotImplementedError, "roundhouse: eager_load of a collection with limit/offset needs Rails' distinct-id pre-query, which is not resolved at runtime"
+      # A page of the base rows through a collection JOIN: the JOIN
+      # multiplies the rows, so LIMIT / OFFSET apply to the distinct base
+      # ids a pre-query picks (Rails' JoinDependency `limited_ids_for`),
+      # and the joined load then keeps those ids and no page.
+      restrict = nil #: String?
+      if (!@limit.nil? || !@offset.nil?) && plan.nodes.any? { |n| n.collection? }
+        ids = limited_eager_ids
+        restrict = if ids.empty?
+          "1=0"
+        else
+          "#{@table}.#{@model.primary_key} IN (#{ids.join(", ")})"
         end
       end
       cols = ["#{@table}.#{@model.primary_key} AS rh_eager_0"]
@@ -1603,11 +1611,22 @@ module ActiveRecord
       # Rails qualifies a bare `order(:id)` with the table, which the JOINs
       # make necessary; the terms are kept as written elsewhere.
       written = @orders
+      written_wheres = @wheres
+      written_limit = @limit
+      written_offset = @offset
       @orders = written.map { |term| qualify_eager_order(term) }
+      unless restrict.nil?
+        @wheres = written_wheres + [restrict]
+        @limit = nil
+        @offset = nil
+      end
       begin
         sql = select_sql_with(cols.join(", "))
       ensure
         @orders = written
+        @wheres = written_wheres
+        @limit = written_limit
+        @offset = written_offset
       end
       rows = ActiveRecord.adapter.select_rows(sql)
       base_keys = [] #: Array[String]
@@ -1680,6 +1699,46 @@ module ActiveRecord
       records
     end
 
+    # `SELECT DISTINCT <table>.<pk>, <order exprs> ... ORDER BY ... LIMIT
+    # OFFSET` over the relation's JOINs and conditions: the base ids of
+    # the page, in order, as SQL literals. The order expressions are selected too, as
+    # PostgreSQL requires of a DISTINCT query (Rails' `columns_for_distinct`).
+    def limited_eager_ids
+      cols = ["#{@table}.#{@model.primary_key} AS rh_limited_0"]
+      terms = @orders.map { |term| qualify_eager_order(term) }
+      terms.each_with_index do |term, i|
+        cols << "#{term.sub(/\s+(?:ASC|DESC)(?:\s+NULLS\s+(?:FIRST|LAST))?\z/i, "")} AS rh_limited_#{i + 1}"
+      end
+      written = @orders
+      written_select = @select_sql
+      written_distinct = @distinct
+      @orders = terms
+      @select_sql = nil
+      @distinct = true
+      begin
+        sql = select_sql_with(cols.join(", "))
+      ensure
+        @orders = written
+        @select_sql = written_select
+        @distinct = written_distinct
+      end
+      ids = [] #: Array[String]
+      ActiveRecord.adapter.select_rows(sql).each { |row| ids << ActiveRecord.adapter.escape_value(row["rh_limited_0"]) }
+      ids
+    end
+
+    # The order terms as SQL: with JOINs a bare column of this model
+    # (`order(:id)`) is qualified by the table, as Rails writes every
+    # attribute order, since both tables may have it.
+    def order_sql_terms
+      return @orders if @joins.empty?
+      @orders.map do |term|
+        name = term.split(" ", 2)[0].to_s.delete('"')
+        bare = term.match?(/\A"?[A-Za-z_][A-Za-z0-9_]*"?(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?\z/i)
+        bare && @model.schema_columns.include?(name.to_sym) ? "#{@table}.#{term}" : term
+      end
+    end
+
     # `id` / `"id" DESC` -> `<table>.id` / `<table>."id" DESC`; anything
     # else (a qualified column, an expression) is the author's SQL.
     def qualify_eager_order(term)
@@ -1749,7 +1808,11 @@ module ActiveRecord
       specs.each do |spec|
         cols << (spec.is_a?(Symbol) ? "#{@table}.#{spec}" : spec.to_s)
       end
-      @select_sql = cols.join(", ")
+      # Rails' `select_values |= fields`: a later `select` adds to the
+      # projection (`.select(:id).left_joins(:x).select(sum_expr)`).
+      added = cols.join(", ")
+      prior = @select_sql
+      @select_sql = prior.nil? || prior.empty? ? added : "#{prior}, #{added}"
       self
     end
 
@@ -3452,7 +3515,7 @@ module ActiveRecord
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} GROUP BY #{@groups.join(", ")}" if @groups.length > 0
       sql = "#{sql} HAVING #{@havings.join(" AND ")}" if @havings.length > 0
-      sql = "#{sql} ORDER BY #{@orders.join(", ")}" if @orders.length > 0
+      sql = "#{sql} ORDER BY #{order_sql_terms.join(", ")}" if @orders.length > 0
       if !@limit.nil?
         sql = "#{sql} LIMIT #{@limit}"
       elsif !@offset.nil? && Db.respond_to?(:adapter_name) && Db.adapter_name == "sqlite3"

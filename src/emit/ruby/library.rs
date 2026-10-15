@@ -3670,7 +3670,7 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
 
     apply_association_reflections(lcs, app);
-    if !super::expr::native_keywords() || !app_calls_association(app) {
+    if !super::expr::native_keywords() || !(app_calls_association(app) || app_has_has_one(app)) {
         return;
     }
     let mut declarations = DeclarationOptions::default();
@@ -3790,6 +3790,65 @@ pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
         }
         let methods = crate::runtime_src::parse_methods(&src)
             .unwrap_or_else(|e| panic!("apply_association_reader: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            lc.methods.push(m);
+        }
+    }
+}
+
+/// A model that declares enums maps an enum label given to a
+/// where/update_all condition (`where(status: :active)`) to its stored
+/// value, as Rails' EnumType serializes it, ahead of the declared-type
+/// serialization of `Base._attribute_for_database`:
+///
+/// ```ruby
+/// def self._attribute_for_database(name, value)
+///   if value.is_a?(Symbol) || value.is_a?(String)
+///     case name
+///     when "status" then value = { "draft" => 0, "active" => 3 }.fetch(value.to_s, value)
+///     end
+///   end
+///   super(name, value)
+/// end
+/// ```
+///
+/// The compiler maps a literal label itself where it sees the relation's
+/// model; this serves the relation it cannot attribute to one (a method
+/// typed as a bare `ActiveRecord::Relation`, a column name several models
+/// give different enums). CRuby/JRuby with the PostgreSQL runtime only.
+pub(crate) fn apply_enum_database_values(lcs: &mut [LibraryClass], app: &App) {
+    use crate::expr::Literal;
+
+    if !super::expr::native_keywords() || !app.carries_postgresql_runtime() {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "_attribute_for_database") {
+            continue;
+        }
+        let mut arms = String::new();
+        for (column, mapping) in &model.enums {
+            let pairs: Option<Vec<String>> = mapping
+                .iter()
+                .map(|(label, value)| match value {
+                    Literal::Int { value } => Some(format!("{label:?} => {value}")),
+                    Literal::Str { value } => Some(format!("{label:?} => {value:?}")),
+                    _ => None,
+                })
+                .collect();
+            let Some(pairs) = pairs else { continue };
+            let _ = writeln!(arms, "    when {:?} then value = {{ {} }}.fetch(value.to_s, value)", column.as_str(), pairs.join(", "));
+        }
+        if arms.is_empty() {
+            continue;
+        }
+        let src = format!(
+            "def self._attribute_for_database(name, value)\n  if value.is_a?(Symbol) || value.is_a?(String)\n    case name\n{arms}    end\n  end\n  super(name, value)\nend\n"
+        );
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("apply_enum_database_values: generated source failed to parse: {e}\n{src}"));
         for mut m in methods {
             m.enclosing_class = Some(lc.name.0.clone());
             lc.methods.push(m);
@@ -4078,6 +4137,7 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
         && !app_has_association_key_condition(app)
         && !(app_has_owner_scope(app) && app_calls_method(app, "eager_load"))
         && !app_calls_method(app, "accepts_nested_attributes_for")
+        && !app_has_collection_association(app)
     {
         return;
     }
@@ -4352,6 +4412,23 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
 /// Some emit-bound body, view or test sends `method`.
 fn app_calls_method(app: &App, method: &str) -> bool {
     app_sends(app, &|m, _| m == method)
+}
+
+/// Some model declares a `has_many` or `has_one`. The reader's
+/// `CollectionProxy#destroy` / `#delete` / `#replace`, the `has_one`
+/// writer and the `dependent: :destroy` cascade (which marks each
+/// record `destroyed_by_association`) read the reflection (`dependent`,
+/// foreign key, type), whether or not the app spells the call.
+fn app_has_collection_association(app: &App) -> bool {
+    use crate::dialect::Association;
+    app.models.iter().flat_map(|m| m.associations()).any(|a| matches!(a, Association::HasMany { .. } | Association::HasOne { .. }))
+}
+
+/// Some model declares a `has_one`: its generated writer replaces the
+/// target through the association object (`association(:name).replace`).
+fn app_has_has_one(app: &App) -> bool {
+    use crate::dialect::Association;
+    app.models.iter().flat_map(|m| m.associations()).any(|a| matches!(a, Association::HasOne { .. }))
 }
 
 /// Some association's scope takes the owner (`->(owner) { ... }`).
@@ -12369,6 +12446,8 @@ fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryC
     names.extend(crate::lower::model_to_library::macro_associations::declared_readers(model));
     // The association writer a def of the model supers into.
     names.extend(crate::lower::model_to_library::associations::super_writer_overrides(model));
+    // The association reader a `define_method` of the model supers into.
+    names.extend(crate::lower::model_to_library::associations::super_reader_overrides(model));
     let generated = |m: &MethodDef| {
         m.receiver == MethodReceiver::Instance
             && m.name_span.is_synthetic()

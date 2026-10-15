@@ -247,6 +247,16 @@ module ActiveRecord
       @readonly = true
     end
 
+    # The has_many reflection whose `dependent: :destroy` is destroying
+    # this record, nil otherwise (Rails' AutosaveAssociation).
+    def destroyed_by_association
+      @destroyed_by_association
+    end
+
+    def destroyed_by_association=(reflection)
+      @destroyed_by_association = reflection
+    end
+
     # Initialize an empty model object from +coder+.
     def init_with(coder, &block)
       coder = LegacyYamlAdapter.convert(coder)
@@ -476,6 +486,7 @@ module ActiveRecord
         @options = normalize_options(options)
         @unsupported = []
         @class_name = nil
+        @klass = nil
         self
       end
 
@@ -506,8 +517,14 @@ module ActiveRecord
         @foreign_key
       end
 
+      # A declared `class_name:` (`"::Country"` written under a namespace
+      # that has its own `Country`) wins over the name the compiler
+      # derived from the association's name.
       def klass
-        @klass ||= Reflection.compute_type(@active_record&.name, @target)
+        @klass ||= begin
+          declared = _roundhouse_options_known? ? @options[:class_name] : nil
+          Reflection.compute_type(@active_record&.name, declared.nil? ? @target : declared)
+        end
       end
 
       # reflection.rb's `active_record_primary_key`: the owner's key the

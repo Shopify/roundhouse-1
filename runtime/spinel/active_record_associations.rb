@@ -980,6 +980,30 @@ module ActiveRecord
         deleted
       end
 
+      # Rails' CollectionAssociation#destroy: each record (an id finds
+      # its record through the association first) is destroyed, in one
+      # transaction when any is saved, and leaves the owner's target.
+      # Answers the records, as Rails does.
+      def destroy(*records)
+        records = records.flatten
+        if @proxy_owner.respond_to?(:association) && proxy_association.is_a?(HasManyThroughAssociation)
+          raise NotImplementedError, "roundhouse: #{@proxy_owner.class.name}##{@proxy_name}.destroy is not ported for a :through association"
+        end
+        records = scope.find(records) if records.any? { |record| record.is_a?(Integer) || record.is_a?(String) }
+        return records if records.empty?
+        existing = records.reject(&:new_record?)
+        if existing.empty?
+          _drop_from_target(records)
+        else
+          Association.within_transaction do
+            existing.each(&:destroy!)
+            _drop_from_target(records)
+            true
+          end
+        end
+        records
+      end
+
       # The association read again, as Rails' `proxy.reload`.
       def reload
         @proxy_owner.instance_variable_set(:"@#{@proxy_name}_loaded", false)
@@ -1007,7 +1031,98 @@ module ActiveRecord
         super
       end
 
+      # Rails' CollectionAssociation#delete: the records leave the
+      # association as the declaration's `dependent:` says (destroyed,
+      # deleted, or, with none, their foreign key nulled) and leave the
+      # owner's target. Answers the records. A `:through` association
+      # keeps Array's in-memory `delete`.
+      ARRAY_DELETE = Array.instance_method(:delete)
+      def delete(*records)
+        if @proxy_owner.respond_to?(:association) && proxy_association.is_a?(HasManyThroughAssociation)
+          return ARRAY_DELETE.bind_call(self, *records)
+        end
+        records = records.flatten
+        records = scope.find(records) if records.any? { |record| record.is_a?(Integer) || record.is_a?(String) }
+        return records if records.empty?
+        existing = records.reject(&:new_record?)
+        if existing.empty?
+          _drop_from_target(records)
+        else
+          Association.within_transaction do
+            _delete_records(existing)
+            _drop_from_target(records)
+            true
+          end
+        end
+        records
+      end
+
+      # Rails' CollectionAssociation#replace (`owner.items = [...]`): the
+      # records not in `other` are deleted, the ones not held are
+      # concatenated (saved at once on a saved owner), in one transaction.
+      # A record that does not save puts the target back and raises
+      # RecordNotSaved.
+      def replace(other)
+        other = other.to_a
+        original = Array.new(self)
+        if @proxy_owner.new_record?
+          _replace_records(other, original)
+        else
+          # Records both hold: the caller's instance is the one kept.
+          other.each do |record|
+            at = index { |held| held == record }
+            _replace_target_at(at, record) unless at.nil?
+          end
+          if other != original
+            Association.within_transaction do
+              _replace_records(other, original)
+              true
+            end
+          end
+        end
+        self
+      end
+
       private
+        # `@target -= records`: the records leave what the owner holds.
+        def _drop_from_target(records)
+          delete_if { |held| records.any? { |gone| gone.equal?(held) || gone == held } }
+        end
+
+        def _replace_target_at(at, record)
+          ARRAY_REPLACE.bind_call(self, map.with_index { |held, i| i == at ? record : held })
+        end
+
+        # has_many_association.rb `delete_records`: `:destroy` destroys
+        # each record, `:delete_all` deletes the rows, and any other
+        # `dependent:` (none, `:nullify`) nulls the foreign key (and the
+        # `as:` type) in the rows and the records held.
+        def _delete_records(existing)
+          reflection = @proxy_owner.class.reflect_on_association(@proxy_name)
+          dependent = reflection.options[:dependent]
+          case dependent
+          when :destroy
+            existing.each(&:destroy!)
+          when :delete_all
+            existing.each(&:delete)
+          else
+            columns = { reflection.foreign_key.to_s => nil } #: Hash[String, untyped]
+            columns[reflection.type] = nil if reflection.type
+            existing.each { |record| record.update_columns(columns) }
+          end
+        end
+
+        def _replace_records(new_target, original)
+          gone = reject { |held| new_target.any? { |kept| kept.equal?(held) || kept == held } }
+          delete(*gone) unless gone.empty?
+          added = new_target.reject { |record| any? { |held| held.equal?(record) || held == record } }
+          Association.concat(@proxy_owner, @proxy_name, *added) unless added.empty?
+          unless @proxy_owner.new_record? || added.all?(&:persisted?)
+            ARRAY_REPLACE.bind_call(self, original)
+            raise ActiveRecord::RecordNotSaved.new("Failed to replace #{@proxy_name} because one or more of the new records could not be saved.", @proxy_owner)
+          end
+        end
+
         def _create_record(attributes, raise_error, &block)
           if attributes.is_a?(Array)
             return attributes.map { |attrs| _create_record(attrs, raise_error, &block) }

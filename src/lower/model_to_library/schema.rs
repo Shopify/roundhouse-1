@@ -149,29 +149,31 @@ pub(super) fn push_schema_methods(
             methods.push(synth_column_dirty_pred(owner, col, prev_changed_name(col)));
             methods.push(synth_column_dirty_pred(owner, col, saved_change_name(col)));
             methods.push(synth_column_prev_was(owner, col));
-            // The BEFORE-save half: `<col>_changed?`,
-            // `will_save_change_to_<col>?` and `<col>_was`, read by
-            // validations and before_* hooks. Each delegates to the
-            // runtime Base's `changes_to_save` readers, the same split
-            // the saved-change family above takes. A model's own `def`
-            // of the name wins (a synthesized method would drop it).
-            //
-            // DEMAND-GATED, unlike the saved-change family: synthesized
-            // only when some model body names it (see
-            // `model_body_names`). Three methods per column on every
-            // model is a surface each strict emitter would otherwise
-            // have to learn (rust's hand-written model impl, go's
-            // call-form list), for an answer that is the constant
-            // false/nil on those lanes anyway.
-            let demanded = demanded.get_or_insert_with(|| demanded_names(models));
-            for (name, runtime, ret) in pending_change_methods(col) {
-                if (demanded.contains(&name) || super::attribute_alias::demanded_as_alias(model, col, &name, demanded))
-                    && !super::associations::model_defines_instance_method(model, &name)
-                    // A column named `<other>_change` owns its reader.
-                    && !table.columns.iter().any(|c| c.name == name)
-                {
-                    methods.push(synth_column_delegate(owner, col, name, runtime, ret));
-                }
+        }
+        // The BEFORE-save half: `<col>_changed?`,
+        // `will_save_change_to_<col>?` and `<col>_was`, read by
+        // validations and before_* hooks. Each delegates to the
+        // runtime Base's `changes_to_save` readers, the same split
+        // the saved-change family above takes. A model's own `def`
+        // of the name wins (a synthesized method would drop it). The
+        // primary key has them too (`id_changed?` in Core's
+        // `resource_publications_changed?`).
+        //
+        // DEMAND-GATED, unlike the saved-change family: synthesized
+        // only when some model body names it (see
+        // `model_body_names`). Three methods per column on every
+        // model is a surface each strict emitter would otherwise
+        // have to learn (rust's hand-written model impl, go's
+        // call-form list), for an answer that is the constant
+        // false/nil on those lanes anyway.
+        let demanded = demanded.get_or_insert_with(|| demanded_names(models));
+        for (name, runtime, ret) in pending_change_methods(col) {
+            if (demanded.contains(&name) || super::attribute_alias::demanded_as_alias(model, col, &name, demanded))
+                && !super::associations::model_defines_instance_method(model, &name)
+                // A column named `<other>_change` owns its reader.
+                && !table.columns.iter().any(|c| c.name == name)
+            {
+                methods.push(synth_column_delegate(owner, col, name, runtime, ret));
             }
         }
     }

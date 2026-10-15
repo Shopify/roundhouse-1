@@ -408,7 +408,7 @@ module ActiveRecord
               ite = unique_records
 
               instances_to_run_callbacks_on = records.each_with_object({}) do |record, candidates|
-                candidates[record._transaction_record_key] = record
+                candidates[_record_key(record)] = record
               end
 
               run_action_on_records(ite, instances_to_run_callbacks_on) do |record, should_run_callbacks|
@@ -467,11 +467,28 @@ module ActiveRecord
           records.uniq(&:__id__)
         end
 
+        # A record handed to `add_transaction_record` need not be a model:
+        # a duck with `committed!` (Platform::Callbacks' after-commit duck)
+        # answers the public `trigger_transactional_callbacks?` and has no
+        # identity key of its own, so it is its own candidate key (Rails'
+        # `candidates[record]`).
+        def _trigger_callbacks?(record)
+          if record.respond_to?(:_trigger_transactional_callbacks?)
+            record._trigger_transactional_callbacks?
+          else
+            record.trigger_transactional_callbacks?
+          end
+        end
+
+        def _record_key(record)
+          record.respond_to?(:_transaction_record_key) ? record._transaction_record_key : record
+        end
+
         # A candidate is looked up by the record's identity (Rails' `==`/
         # `hash`: class and id, the object itself before it has one).
         def run_action_on_records(records, instances_to_run_callbacks_on)
           while record = records.shift
-            should_run_callbacks = record.__id__ == instances_to_run_callbacks_on[record._transaction_record_key].__id__
+            should_run_callbacks = record.__id__ == instances_to_run_callbacks_on[_record_key(record)].__id__
 
             yield record, should_run_callbacks
           end
@@ -479,9 +496,9 @@ module ActiveRecord
 
         def prepare_instances_to_run_callbacks_on(records)
           records.each_with_object({}) do |record, candidates|
-            next unless record._trigger_transactional_callbacks?
+            next unless _trigger_callbacks?(record)
 
-            key = record._transaction_record_key
+            key = _record_key(record)
             earlier_saved_candidate = candidates[key]
 
             next if earlier_saved_candidate && record.class.run_commit_callbacks_on_first_saved_instances_in_transaction

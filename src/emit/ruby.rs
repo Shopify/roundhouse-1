@@ -564,6 +564,9 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // settle (no-op unless the app calls `association`). Before
     // `lazy_model_state`, which renames the cache reads it finds.
     library::apply_association_reader(&mut lcs, app);
+    // The stored value of an enum label for a condition on a relation
+    // whose model the compiler could not see (`Model.enum_database_value`).
+    library::apply_enum_database_values(&mut lcs, app);
     // `build_<name>` / `create_<name>` / `reload_<name>` / `reset_<name>` of
     // the singular associations the app calls, run on the association object.
     library::apply_singular_association_builders(&mut lcs, app);

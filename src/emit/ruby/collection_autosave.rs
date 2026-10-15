@@ -215,6 +215,11 @@ pub(crate) fn apply(
         let owner_type = base_class_name(app, model);
         let mut src = String::new();
         for c in &collections {
+            if !defines(lc, &format!("{}=", c.name.as_str())) {
+                src.push_str(&collection_writer_source(&c.name));
+            }
+        }
+        for c in &collections {
             if c.validate {
                 src.push_str(&validate_records_source(c));
             }
@@ -222,6 +227,11 @@ pub(crate) fn apply(
             if !defines(lc, &entry_point(&c.name)) {
                 let inner = format!("_autosave_associated_records_for_{}(@new_record_before_save == true)", c.name.as_str());
                 src.push_str(&entry_point_source(&c.name, &inner));
+            }
+        }
+        for s in singles.iter().filter(|s| !s.autosave) {
+            if !defines(lc, &format!("{}=", s.name.as_str())) {
+                src.push_str(&single_writer_source(&s.name));
             }
         }
         for s in &singles {
@@ -599,6 +609,20 @@ fn rename_bare_calls(expr: &mut Expr, from: &str, to: &str) {
 /// Whether the model defines the no-argument instance method `name`.
 fn defines(lc: &LibraryClass, name: &str) -> bool {
     lc.methods.iter().any(|m| m.name.as_str() == name && m.receiver == MethodReceiver::Instance)
+}
+
+/// Rails' collection writer (`order.tax_lines = records`): the
+/// association's `replace` (the proxy's, in the runtime).
+fn collection_writer_source(name: &Symbol) -> String {
+    format!("def {n}=(other)\n  self.{n}.replace(other)\n  other\nend\n", n = name.as_str())
+}
+
+/// Rails' has_one writer (`order.checkout = record`): the association's
+/// `replace`, which removes the held record as the `dependent:` says and
+/// saves the new one at once on a saved owner (a new owner's save saves
+/// it, `save_has_one_association`).
+fn single_writer_source(name: &Symbol) -> String {
+    format!("def {n}=(value)\n  association(:{n}).replace(value)\n  value\nend\n", n = name.as_str())
 }
 
 /// Rails' `define_non_cyclic_method`: the public entry point
