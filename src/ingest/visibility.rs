@@ -1282,6 +1282,21 @@ impl Visibility {
                 self.values.extend(block_body.values);
                 continue;
             }
+            // graphql-ruby's `definition_methods do … end` module_evals its
+            // block on a module of its own that the interface extends: its
+            // `def`s and `private` are that module's, with the visibility
+            // starting public, and the block is kept as written. Walk it as
+            // a scope of its own so its markers neither leak out nor refuse
+            // the interface (`GraphApi::Admin::DiscountApplication`).
+            if !class_side
+                && name == "definition_methods"
+                && call.arguments().is_none()
+                && let Some(block) = call.block().and_then(|b| b.as_block_node())
+            {
+                let mut block_body = Self { scope: "a `definition_methods` block", ..Self::default() };
+                block_body.walk(block.body(), false, file, None)?;
+                continue;
+            }
             // Only collector-owned candidates have a replacement refusal gate:
             // their unclaimed block context is diagnosed per includer. Do not
             // exempt candidate-free blocks or singleton/class-method carriers.
