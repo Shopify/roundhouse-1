@@ -167,3 +167,16 @@ fn the_value_readers_are_synthesized_on_demand() {
     // Not named: not synthesized.
     assert!(!src.contains("def email_previous_change"), "{src}");
 }
+
+/// `<col>_will_change!` is synthesized on demand and delegates to the
+/// runtime's name-taking `attribute_will_change!` (Core's
+/// `settings_will_change! if settings_changed?` raised NoMethodError).
+#[test]
+fn will_change_bang_is_synthesized_on_demand() {
+    let src = emit_user(
+        "class User < ApplicationRecord\n  def touch_about\n    about_will_change! if about_changed?\n  end\nend\n",
+    );
+    assert!(src.contains("def about_will_change!"), "{src}");
+    assert!(src.contains(r#"attribute_will_change!("about")"#), "{src}");
+    assert!(!src.contains("def username_will_change!"), "{src}");
+}
