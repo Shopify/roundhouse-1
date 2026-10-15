@@ -9376,6 +9376,20 @@ pub(crate) fn apply_constant_rooting(
         )
         .collect();
     let known = |n: &str| class_names.contains(n);
+    // The value constants alone (`MatchType = Collections::CollectionSource::
+    // MatchType`): a read through one is resolved when it runs, by the value
+    // it holds, so the names under it are no declarations to look for.
+    let value_constants: crate::det::HashSet<String> = app
+        .library_classes
+        .iter()
+        .chain(lcs.iter())
+        .flat_map(|c| c.constants.iter().map(move |(k, _)| format!("{}::{}", c.name.0.as_str(), k.as_str())))
+        .filter(|n| {
+            !app.models.iter().any(|m| m.name.0.as_str() == n)
+                && !app.library_classes.iter().any(|c| c.name.0.as_str() == n)
+                && !lcs.iter().any(|c| c.name.0.as_str() == n)
+        })
+        .collect();
     // A namespace-only module (`module Outer::Web::Plan` holding nested
     // classes) has no entry of its own but still binds its name for
     // lexical lookup, so every proper prefix of a known name counts.
@@ -9418,7 +9432,7 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
-        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes, namespaces: &namespaces };
+        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes, namespaces: &namespaces, value_constants: &value_constants };
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, &shadowing, &scope, &known);
         }
@@ -9442,6 +9456,8 @@ struct LexicalScope<'a> {
     prefixes: &'a [String],
     /// Names that exist only as the namespace of a known class.
     namespaces: &'a crate::det::HashSet<String>,
+    /// Full names of the value constants, which are no class or module.
+    value_constants: &'a crate::det::HashSet<String>,
 }
 
 impl LexicalScope<'_> {
@@ -9524,7 +9540,15 @@ fn root_shadowed_constants(
             let head_path = format!("{p}::{}", head.as_str());
             known(&head_path) || scope.namespaces.contains(&head_path)
         })
-        .is_some_and(|p| !known(&format!("{p}::{joined}")));
+        .is_some_and(|p| {
+            // `Cond::MatchType::ANY` where `Cond` holds `MatchType = Source::
+            // MatchType`: the read passes through that value constant, so
+            // the name under it was never a declaration of `p`.
+            let segments: Vec<&str> = joined.split("::").collect();
+            let through_value = (1..segments.len())
+                .any(|k| scope.value_constants.contains(&format!("{p}::{}", segments[..k].join("::"))));
+            !known(&format!("{p}::{joined}")) && !through_value
+        });
     if !by_own_segment && !by_enclosing {
         return;
     }
@@ -14517,12 +14541,33 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
     // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
     // singleton class, which the class's own class methods do not answer.
     let singleton = call.decisions & crate::expr::SINGLETON_BODY != 0;
-    let own: Vec<&Symbol> = lc
+    let mut own: Vec<&Symbol> = lc
         .methods
         .iter()
         .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
         .map(|m| &m.name)
         .collect();
+    // The class methods of the app's own superclasses are inherited
+    // (`AssetCloud::ZippedThemeFiles`' body calls `bucket` and
+    // `asset_extensions`, which the compiled asset_cloud gem's
+    // `AssetCloud::Base` defines): emitted code answers them as in Ruby.
+    // The chain stops at a class the app does not define, whose class
+    // methods a runtime base may or may not give.
+    if !singleton {
+        let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
+        let mut parent = lc.parent.as_ref();
+        while let Some(p) = parent {
+            let name = p.0.as_str().trim_start_matches("::");
+            if seen.contains(&name) || is_model_named(name, app) {
+                break;
+            }
+            let classes = library_classes_named(name, app);
+            let Some(class) = classes.iter().find(|c| !c.is_module) else { break };
+            seen.push(name);
+            own.extend(class.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).map(|m| &m.name));
+            parent = class.parent.as_ref();
+        }
+    }
     fn walk(e: &Expr, own: &[&Symbol], hooked: bool, app: &App, ok: &mut bool) {
         if !*ok {
             return;

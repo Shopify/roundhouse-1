@@ -5479,6 +5479,38 @@ fn frozen_string_literal(node: &ruby_prism::Node<'_>) -> Option<String> {
     (frozen && text(node, &mut out).is_some()).then_some(out)
 }
 
+/// Whether a class-body lambda's code means the same wherever its
+/// literal is written: it reads no `self`, instance variable or `yield`,
+/// calls no method on an implicit receiver (other than the Kernel ones
+/// that answer alike on any object) and has no `super`.
+fn self_free_lambda(lambda: &Expr) -> bool {
+    const KERNEL: &[&str] = &["raise", "fail", "lambda", "proc", "format", "sprintf", "Integer", "Float", "String", "Array", "Hash", "puts", "p", "loop"];
+    fn walk(e: &Expr, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        match &*e.node {
+            ExprNode::SelfRef | ExprNode::Ivar { .. } | ExprNode::Yield { .. } | ExprNode::Super { .. } => {
+                *ok = false;
+                return;
+            }
+            ExprNode::Send { recv: None, method, .. } if !KERNEL.contains(&method.as_str()) => {
+                *ok = false;
+                return;
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |child| walk(child, ok));
+    }
+    let mut ok = match &*lambda.node {
+        ExprNode::Lambda { .. } => true,
+        ExprNode::Send { recv: None, method, block: Some(_), .. } => matches!(method.as_str(), "lambda" | "proc"),
+        _ => false,
+    };
+    walk(lambda, &mut ok);
+    ok
+}
+
 /// Replace each read of a body local in `expr` by its value (see
 /// [`BodyLocal`]). A block that rebinds the name as a parameter shadows
 /// it for its body.
@@ -5519,7 +5551,13 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
                     Ok(value) => value,
                     Err(why) => return Err(opaque(l, why)),
                 };
-                if l.lambda {
+                // A lambda that reads neither `self` nor an instance
+                // variable, calls no method of `self` and yields nothing
+                // is the same object of code wherever the literal stands
+                // (`post_resolve_access(&tax_document_post_resolve_access)`,
+                // `field :body, string` with `string = -> { Filter }`): read
+                // in place, as a literal, it needs no scope of the body.
+                if l.lambda && !self_free_lambda(value) {
                     return Err(sited(IngestError::Unsupported {
                         file: file.into(),
                         message: format!(

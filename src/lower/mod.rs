@@ -54,6 +54,7 @@ pub mod as_json_residue;
 mod as_json_record;
 pub mod active_model_model;
 pub mod validation_readers;
+pub mod validator_constants;
 pub mod enumerable_ext;
 mod fused;
 pub mod time_calendar;

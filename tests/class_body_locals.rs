@@ -123,7 +123,9 @@ fn an_observable_local_is_refused_by_name() {
             "class-body local `scale` is a lambda that closes over `base`",
         ),
         (
-            "module Podish\n  module Registry\n    build = ->(x) { x }\n    BUILDERS = [build]\n  end\nend\n",
+            // A lambda that calls a method of `self` is not the same code where
+            // it is read (a lambda that reads no `self` is: `class_body_lambda_local_read_as_value`).
+            "module Podish\n  module Registry\n    build = ->(x) { name + x }\n    BUILDERS = [build]\n  end\nend\n",
             "class-body lambda `build` is read other than as the receiver of `.call`",
         ),
         (
