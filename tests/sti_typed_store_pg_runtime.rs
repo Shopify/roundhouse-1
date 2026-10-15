@@ -20,6 +20,7 @@ const STRUCTURE: &str = r#"CREATE TABLE credentials (
     name character varying,
     data text,
     sensitive_data text,
+    extra_data text,
     CONSTRAINT credentials_pkey PRIMARY KEY (id)
 );
 "#;
@@ -101,6 +102,31 @@ const REDACTABLE_STORE: &str = r#"module RedactableStore
 end
 "#;
 
+/// Core's Payments::Vault::Instrument::Shared shape: a Concern that
+/// includes the macro's Concern, which the model then includes.
+const SHARED_STORE: &str = r#"module SharedStore
+  extend ActiveSupport::Concern
+  include RedactableStore
+end
+
+module SharedStoreBody
+  extend ActiveSupport::Concern
+
+  included do
+    redactable_typed_store :extra_data do |s|
+      s.string :body_card_id
+    end
+  end
+end
+"#;
+
+/// Core's Instrument::Shop::CreditCard shape: the macro called in the
+/// subclass body itself.
+const BODY_CARD_CREDENTIAL: &str = r#"class BodyCardCredential < Credential
+  include SharedStoreBody
+end
+"#;
+
 /// Core's VGSCard / PaypalBillingAgreement shape, `presence: false` included.
 const VAULT_CARD: &str = r#"module VaultCard
   extend ActiveSupport::Concern
@@ -138,6 +164,8 @@ const PROBE: &str = r##"class StiStoreProbe
     t.token = "tok"
     t.save!
     out << "token: #{Credential.find(t.id).token.inspect} #{TokenCredential.find(t.id).sensitive_data.inspect}"
+    b = BodyCardCredential.create!(name: "b", body_card_id: "body-1")
+    out << "body: #{Credential.find(b.id).body_card_id.inspect} #{BodyCardCredential.redactable_typed_stores.inspect}"
     c = CardCredential.create!(name: "c", card_id: "card-1")
     out << "card: #{Credential.find(c.id).card_id.inspect} #{c.valid?} #{CardCredential.redactable_typed_stores.inspect} #{AgreementCredential.redactable_typed_stores.inspect}"
     out << "base: #{Credential.new.respond_to?(:token)} #{(begin; Credential.new.billing_agreement_id; rescue NotImplementedError; $!.class; end)}"
@@ -152,31 +180,34 @@ const TYPED_STORE_GEM: &str = "gem \"activerecord-typedstore\"\nrequire \"active
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 7] = [
+const EXPECTED: [&str; 8] = [
     r#"new: "B-1" 0 {} true"#,
     r#"found: AgreementCredential "B-1" 3 {"k" => 1}"#,
     r#"invalid: false ["Name can't be blank"]"#,
     r#"token invalid: false ["Token can't be blank"] true"#,
     r#"token: "tok" {}"#,
+    r#"body: "body-1" {extra_data: {body_card_id: :string}}"#,
     r#"card: "card-1" true {data: {card_id: :string}} nil"#,
     "base: false NotImplementedError",
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 10] = [
+const LOADS: [&str; 12] = [
     "native/typed_store_gem",
     "app/models/application_record",
     "app/models/redactable_store",
+    "app/models/shared_store",
     "app/models/credential",
     "app/models/shared_agreement",
     "app/models/agreement_credential",
     "app/models/token_credential",
     "app/models/vault_card",
     "app/models/card_credential",
+    "app/models/body_card_credential",
     "app/models/sti_store_probe",
 ];
 
-const FILES: [(&str, &str); 14] = [
+const FILES: [(&str, &str); 16] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -189,6 +220,8 @@ const FILES: [(&str, &str); 14] = [
     ("app/models/redactable_store.rb", REDACTABLE_STORE),
     ("app/models/vault_card.rb", VAULT_CARD),
     ("app/models/card_credential.rb", CARD_CREDENTIAL),
+    ("app/models/shared_store.rb", SHARED_STORE),
+    ("app/models/body_card_credential.rb", BODY_CARD_CREDENTIAL),
     ("app/models/sti_store_probe.rb", PROBE),
     ("native/typed_store_gem.rb", TYPED_STORE_GEM),
 ];
@@ -239,6 +272,7 @@ fn sti_subclass_store_serialize_and_validations_are_lowered() {
     let retypable = credential.split("def self._retypable_attribute_names").nth(1).unwrap();
     let retypable = retypable.split("\n  end").next().unwrap();
     assert!(retypable.contains("\"data\""), "data is not retypable:\n{credential}");
+    assert!(retypable.contains("\"extra_data\""), "extra_data is not retypable:\n{credential}");
 }
 
 /// The models natively and emitted, same PostgreSQL.
