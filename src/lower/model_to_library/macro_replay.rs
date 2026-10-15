@@ -771,6 +771,24 @@ impl<'a> ClassSide<'a> {
                 Err(reason) => MacroVerdict::Refuse(reason),
             });
         }
+        // The identifications gem's `has_token(*columns, prefix: "")`, when
+        // the boot requires the gem: its railtie includes `ModelExtension`
+        // into ActiveRecord::Base (`on_load(:active_record)`), so the call
+        // runs there and sets the class's `token_prefix` and `before_create`
+        // hook. Dropped, `generate_token_for` reads a nil prefix
+        // (`nil + SecureRandom.hex`).
+        if method.as_str() == "has_token"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && self.app.bundler_gems.iter().any(|g| g.name == "identifications")
+        {
+            let mut walk = Walk::new(self, method.as_str());
+            let mut aliases = Vec::new();
+            let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
+            return Some(match result {
+                Ok(()) => MacroVerdict::Replay,
+                Err(reason) => MacroVerdict::Refuse(reason),
+            });
+        }
         // `attribute :name, :type, default: x` on a class that includes the
         // ActiveModel::Attributes port runs there: its arguments run in
         // the class body.
