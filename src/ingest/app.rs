@@ -2567,6 +2567,8 @@ end
         &model_bases,
         &enum_constants,
         &mut concern_enums,
+        &table_prefixes,
+        &base_prefixes,
     )?;
     let have: crate::det::HashSet<String> = loaded.iter().map(|(_, tm)| tm.name.0.to_string()).collect();
     for (file, class) in test_mixins.unreached_includers(&|name| have.contains(name)) {
@@ -4147,6 +4149,8 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
     model_bases: &super::library_class::ModelBases,
     enum_constants: &super::model::EnumConstants,
     concern_enums: &mut Vec<(crate::ident::ClassId, Vec<ConcernEnumDecl>)>,
+    table_prefixes: &super::model::TablePrefixes,
+    base_prefixes: &super::model::TablePrefixes,
 ) -> IngestResult<()> {
     let already: crate::det::HashSet<String> = app.library_class_files.iter().map(|(source, _)| source.clone()).collect();
     // Not files the boot loads: a test-support file is on the test load
@@ -4171,11 +4175,19 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
         } else {
             source
         };
-        if super::library_class::has_active_record_base(&source, model_bases) {
-            let message = "test-support file not carried: it declares an ActiveRecord model, \
-                           and a model under a test path is not ingested as one";
-            test_mixins.note_uncarried(&path_str, message.to_string());
-            unwrap_or_record::<()>(Err(IngestError::Unsupported { file: path_str.clone(), message: message.to_string() }))?;
+        if !super::model::active_record_class_offsets(&source, model_bases).is_empty() {
+            match carry_support_models(
+                app, &source, &path_str, table_prefixes, base_prefixes, enum_constants, model_bases, concern_enums,
+            ) {
+                Ok(names) => carried_classes.push((entry.clone(), names)),
+                Err(err) => {
+                    test_mixins.note_uncarried(&path_str, err.to_string());
+                    unwrap_or_record::<()>(Err(err))?;
+                }
+            }
+            if let Some(program) = app.file_programs.last_mut().filter(|p| p.source == path_str) {
+                resolve_test_load_path_requires(vfs, entry, load_roots, &mut program.items);
+            }
             continue;
         }
         let (ingested, deferred) = super::inherited_alias::capturing(|| {
@@ -4224,6 +4236,77 @@ fn carry_test_support_files<V: Vfs + ?Sized>(
             .map(|(entry, names)| (entry.display().to_string(), names)),
     );
     Ok(())
+}
+
+/// The ActiveRecord models a test-support file declares, ingested as
+/// the models of the app are: each is a `Model` (its table, the schema's
+/// columns for it, its associations and callbacks), and what else the
+/// file declares (the namespace modules, the classes nested in a model,
+/// plain classes beside them) is carried as library classes. Core's
+/// `Markets::Platform::ResponderTestHelper` holds three dummy models
+/// (`TestModel < ApplicationRecord; self.table_name = "catalogs"`) beside
+/// the responder types that name them, which an initializer's test-env
+/// `on_load` hook requires. The file's features load all the emitted files
+/// ([`project::test_load_path_features`]), so a test file's `require`
+/// defines them as the native one does; nothing creates a table at
+/// load, the models read the tables the schema has.
+///
+/// The names of the classes carried, or the first refusal: one model that
+/// cannot be ingested leaves the file uncarried, named, as a half-carried
+/// file would load with some of its models missing.
+#[allow(clippy::too_many_arguments)]
+fn carry_support_models(
+    app: &mut App,
+    source: &[u8],
+    path_str: &str,
+    table_prefixes: &super::model::TablePrefixes,
+    base_prefixes: &super::model::TablePrefixes,
+    enum_constants: &super::model::EnumConstants,
+    model_bases: &super::library_class::ModelBases,
+    concern_enums: &mut Vec<(crate::ident::ClassId, Vec<ConcernEnumDecl>)>,
+) -> IngestResult<Vec<crate::ident::ClassId>> {
+    let mut models: Vec<crate::dialect::Model> = Vec::new();
+    for at in super::model::active_record_class_offsets(source, model_bases) {
+        match super::model::ingest_model_class_at(
+            source, path_str, &app.schema, table_prefixes, base_prefixes, enum_constants, model_bases, Some(at),
+        )? {
+            Some(model) => models.push(model),
+            None => {
+                return Err(IngestError::Unsupported {
+                    file: path_str.to_string(),
+                    message: "test-support file not carried: a class descending from ActiveRecord is not read as a model"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    let outers: Vec<crate::ident::ClassId> = models.iter().map(|m| m.name.clone()).collect();
+    let classes = ingest_library_classes_beside_models(source, path_str, &outers)?;
+    let nested = beside_models(&outers, classes, model_bases);
+    let mut names: Vec<crate::ident::ClassId> = nested.iter().map(|c| c.name.clone()).collect();
+    names.extend(outers.iter().cloned());
+    for (id, name) in ingest_concern_included_redefs(source, path_str) {
+        app.concern_included_redefs.entry(id).or_default().push(name);
+    }
+    let kept = |id: &crate::ident::ClassId| nested.iter().any(|class| class.name == *id);
+    let (concern_items, concern_enum_decls, concern_guarded) =
+        ingest_concern_model_items_with_constants(source, path_str, enum_constants);
+    append_concern_items(app, concern_items, concern_guarded, kept);
+    app.concern_prepended_items.extend(
+        ingest_concern_prepended_items(source, path_str, enum_constants).into_iter().filter(|(id, _)| kept(id)),
+    );
+    concern_enums.extend(concern_enum_decls.into_iter().filter(|(id, _)| kept(id)));
+    // The file's own top level (its `require`s, what it runs) and the
+    // loading of each class by name, as a library file's program has.
+    let carried: crate::det::HashSet<&str> = names.iter().map(|n| n.0.as_str()).collect();
+    if let Some(program) = super::library_class::file_program_of(source, path_str, &carried) {
+        report_not_carried(source, &program.items, app);
+        app.file_programs.push(program);
+    }
+    app.models.extend(models);
+    app.library_classes.extend(nested);
+    super::on_load_reopen::ingest_on_load_reopens(source, path_str, app);
+    Ok(names)
 }
 
 /// A test-support file's `require "support/helpers/x"`: the feature, on
@@ -10380,13 +10463,22 @@ fn ingest_library_classes_beside_model(
     path: &str,
     outer: &crate::ident::ClassId,
 ) -> IngestResult<Vec<crate::dialect::LibraryClass>> {
+    ingest_library_classes_beside_models(source, path, std::slice::from_ref(outer))
+}
+
+/// [`ingest_library_classes_beside_model`] for a file of several models.
+fn ingest_library_classes_beside_models(
+    source: &[u8],
+    path: &str,
+    outers: &[crate::ident::ClassId],
+) -> IngestResult<Vec<crate::dialect::LibraryClass>> {
     let (classes, deferred) =
         super::inherited_alias::capturing(|| ingest_library_classes(source, path));
     let classes = classes?;
     let foreign = deferred.iter().find(|site| {
         !classes
             .iter()
-            .any(|lc| lc.name == *outer && lc.unknown_calls.iter().any(|call| call.span == **site))
+            .any(|lc| outers.contains(&lc.name) && lc.unknown_calls.iter().any(|call| call.span == **site))
     });
     if let Some(site) = foreign {
         let err = super::inherited_alias::refusal(path);
@@ -10429,6 +10521,17 @@ fn beside_model(
     classes: Vec<crate::dialect::LibraryClass>,
     bases: &super::library_class::ModelBases,
 ) -> Vec<crate::dialect::LibraryClass> {
+    beside_models(std::slice::from_ref(outer), classes, bases)
+}
+
+/// [`beside_model`] for a file that declares several models (all of them
+/// ingested as models, `outers`): what each nests is kept, and the
+/// modules each is written in; another model of the file is not.
+fn beside_models(
+    outers: &[crate::ident::ClassId],
+    classes: Vec<crate::dialect::LibraryClass>,
+    bases: &super::library_class::ModelBases,
+) -> Vec<crate::dialect::LibraryClass> {
     let model_shaped = |c: &crate::dialect::LibraryClass| {
         if c.is_module {
             return false;
@@ -10448,21 +10551,27 @@ fn beside_model(
     };
     let other_models: Vec<String> = classes
         .iter()
-        .filter(|c| c.name != *outer && model_shaped(c))
+        .filter(|c| !outers.contains(&c.name) && model_shaped(c))
         .map(|c| c.name.0.as_str().to_string())
         .collect();
-    let outer_name = outer.0.as_str();
-    without_conditional_declarations_of(outer, classes)
+    let mut classes = classes;
+    for outer in outers {
+        classes = without_conditional_declarations_of(outer, classes);
+    }
+    classes
         .into_iter()
         .filter(|c| {
             let name = c.name.0.as_str();
-            if name == outer_name {
+            if outers.iter().any(|outer| outer.0.as_str() == name) {
                 return false;
             }
-            // What the model nests is kept whatever it is; of the
+            // What a model nests is kept whatever it is; of the
             // namespaces it is written in, the modules.
-            let is_ancestor = outer_name.strip_prefix(name).is_some_and(|rest| rest.starts_with("::"));
-            let is_nested = name.strip_prefix(outer_name).is_some_and(|rest| rest.starts_with("::"));
+            let nested_in = |outer: &str| name.strip_prefix(outer).is_some_and(|rest| rest.starts_with("::"));
+            let is_ancestor = outers.iter().any(|outer| {
+                outer.0.as_str().strip_prefix(name).is_some_and(|rest| rest.starts_with("::"))
+            });
+            let is_nested = outers.iter().any(|outer| nested_in(outer.0.as_str()));
             if is_nested {
                 return true;
             }

@@ -417,15 +417,22 @@ fn file_guard_offset(root: &ruby_prism::Node<'_>) -> Option<usize> {
 /// autoloader's. A file-level `A::B = Class.new(C)` is a declaration
 /// (`file_class_new_path_write`), not a statement.
 pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) -> Option<crate::app::FileProgram> {
+    let carried: HashSet<&str> = classes.iter().map(|c| c.name.0.as_str()).collect();
+    file_program_of(source, file, &carried)
+}
+
+/// [`file_program`] for the names of the classes carried, which need not
+/// all be library classes: a test-support file's models are `Model`s
+/// whose emitted files its program loads by name as well.
+pub(super) fn file_program_of(source: &[u8], file: &str, carried: &HashSet<&str>) -> Option<crate::app::FileProgram> {
     use crate::app::ProgramItem;
     let result = super::prism::parse(source, file);
     let root = result.node();
     let program = root.as_program_node()?;
     let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
-    let carried: HashSet<&str> = classes.iter().map(|c| c.name.0.as_str()).collect();
     let mut items = Vec::new();
     let mut guarded = false;
-    program_items(source, &statements, file, &carried, false, &mut guarded, &mut items);
+    program_items(source, &statements, file, carried, false, &mut guarded, &mut items);
     let runs = |item: &ProgramItem| !matches!(item, ProgramItem::Declared(_) | ProgramItem::Require { .. });
     let requires = |item: &ProgramItem| matches!(item, ProgramItem::Require { .. });
     (items.iter().any(runs) || items.iter().any(requires))
