@@ -294,3 +294,62 @@ fn an_includer_of_a_hooked_module_loads_first() {
     let run = hooked_module_app().run_ruby_env("p Shelves::Plain.preloads\np Shelf.kinds.keys\n", &[RUBYOPT]);
     assert_quiet(&run, "{owner: :owner}\n[:plain]\n");
 }
+
+/// Core's Merchandising::GraphApi::Admin::MediaPresentationSettings
+/// shape: an interface module inside a namespace that shadows a
+/// top-level one (`Merchandising::GraphApi` over `::GraphApi`). It names
+/// its orphan implementers (rooted) in its body, and each implementer
+/// writes `implements GraphApi::Admin::MediaPresentationSettings`, which
+/// Ruby resolves lexically to the nested namespace's module.
+fn shadowed_interface_app() -> emit_and_run::Overlay {
+    base()
+        .write(
+            "app/graphql/graph_api.rb",
+            "module GraphApi\n  module Admin\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/graph_api/object_type.rb",
+            "module GraphApi\n  class ObjectType\n    def self.implements(int)\n      raise \"#{int} cannot be implemented since it's not an interface\" unless int.respond_to?(:interface?)\n\n      (@interfaces ||= []) << int\n    end\n\n    def self.interfaces\n      @interfaces\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/graph_api/interface_type.rb",
+            "module GraphApi\n  module InterfaceType\n    def self.included(child)\n      child.extend(ClassMethods)\n    end\n\n    module ClassMethods\n      def interface?\n        true\n      end\n\n      def orphan_types(*types)\n        @orphans = types\n      end\n\n      def orphans\n        @orphans\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/graph_api/orphan_dsl.rb",
+            "module GraphApi\n  module OrphanDsl\n    def orphan_types(*types)\n      @orphans = types\n    end\n\n    def orphans\n      @orphans\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/merch/graph_api/admin/media_settings.rb",
+            "module Merch\n  module GraphApi\n    module Admin\n      module MediaSettings\n        include ::GraphApi::InterfaceType\n        extend ::GraphApi::OrphanDsl\n        orphan_types(::Merch::GraphApi::Admin::ImageSettings, ::Merch::GraphApi::Admin::ModelSettings)\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/merch/graph_api/admin/image_settings.rb",
+            "require \"set\"\n\nmodule Merch\n  module GraphApi\n    module Admin\n      class ImageSettings < ::GraphApi::ObjectType\n        implements GraphApi::Admin::MediaSettings\n      end\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/graphql/merch/graph_api/admin/model_settings.rb",
+            "require \"set\"\n\nmodule Merch\n  module GraphApi\n    module Admin\n      class ModelSettings < ::GraphApi::ObjectType\n        implements GraphApi::Admin::MediaSettings\n      end\n    end\n  end\nend\n",
+        )
+}
+
+#[test]
+fn an_interface_loads_its_orphan_implementers_below_its_module_header() {
+    let run = shadowed_interface_app().run_ruby_env(
+        "p Merch::GraphApi::Admin::MediaSettings.orphans.map(&:name)\np Merch::GraphApi::Admin::ImageSettings.interfaces\n",
+        &[RUBYOPT],
+    );
+    assert_quiet(
+        &run,
+        "[\"Merch::GraphApi::Admin::ImageSettings\", \"Merch::GraphApi::Admin::ModelSettings\"]\n[Merch::GraphApi::Admin::MediaSettings]\n",
+    );
+}
+
+#[test]
+fn an_orphan_implementer_loads_its_interface_first() {
+    let run = shadowed_interface_app().run_ruby_env(
+        "p Merch::GraphApi::Admin::ImageSettings.interfaces\np Merch::GraphApi::Admin::MediaSettings.orphans.size\n",
+        &[RUBYOPT],
+    );
+    assert_quiet(&run, "[Merch::GraphApi::Admin::MediaSettings]\n2\n");
+}
