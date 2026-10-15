@@ -12821,6 +12821,8 @@ struct NameIndex {
     authored_requires: std::cell::OnceCell<std::rc::Rc<HashMap<String, Vec<usize>>>>,
     /// `load_cycle_components`, on first use.
     load_cycles: std::cell::OnceCell<std::rc::Rc<HashMap<String, usize>>>,
+    /// `constant_file_anchors`, on first use.
+    constant_file_anchors: std::cell::OnceCell<std::rc::Rc<BTreeSet<String>>>,
 }
 
 thread_local! {
@@ -12856,6 +12858,7 @@ impl NameIndex {
             require_guards: std::cell::OnceCell::new(),
             authored_requires: std::cell::OnceCell::new(),
             load_cycles: std::cell::OnceCell::new(),
+            constant_file_anchors: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -18482,11 +18485,28 @@ fn runs_requires_below_its_class(owner: &str, app: &App) -> bool {
 /// Whether `anchor` is the file of a namespace constant the source wrote in a
 /// file of its own (`constant_file`).
 fn is_constant_file_anchor(anchor: &str, app: &App) -> bool {
-    app.library_classes.iter().any(|lc| {
-        lc.constants.iter().any(|(constant, _)| {
-            constant_file(lc.name.0.as_str(), constant.as_str(), app).is_some_and(|stem| anchor == format!("app/models/{stem}"))
-        })
-    })
+    constant_file_anchors(app).contains(anchor)
+}
+
+/// Every `app/models/<stem>` a namespace constant's own file is written to
+/// (`constant_file`). Built once per app: asked per class declaration, a
+/// scan of every class's constants made the Core emit quadratic.
+fn constant_file_anchors(app: &App) -> std::rc::Rc<BTreeSet<String>> {
+    let build = || {
+        let mut out = BTreeSet::new();
+        for lc in &app.library_classes {
+            for (constant, _) in &lc.constants {
+                if let Some(stem) = constant_file(lc.name.0.as_str(), constant.as_str(), app) {
+                    out.insert(format!("app/models/{stem}"));
+                }
+            }
+        }
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.constant_file_anchors.get_or_init(build).clone(),
+        None => build(),
+    }
 }
 
 /// The library class files (`require_guard_owners`) in a load-time
@@ -18506,13 +18526,7 @@ fn load_cycle_components(app: &App) -> std::rc::Rc<HashMap<String, usize>> {
         // file of the tree too (`constant_file`), with no class of its
         // own: the constant's value is read where that file loads.
         let mut known: BTreeSet<String> = files.keys().cloned().collect();
-        for lc in &app.library_classes {
-            for (constant, _) in &lc.constants {
-                if let Some(stem) = constant_file(lc.name.0.as_str(), constant.as_str(), app) {
-                    known.insert(format!("app/models/{stem}"));
-                }
-            }
-        }
+        known.extend(constant_file_anchors(app).iter().cloned());
         let mut ids: HashMap<String, usize> = HashMap::default();
         let mut anchors: Vec<String> = Vec::new();
         let mut edges: Vec<BTreeSet<usize>> = Vec::new();
