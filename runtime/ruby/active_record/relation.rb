@@ -301,9 +301,20 @@ module ActiveRecord
     def build(attrs = {})
       seed = scope_attributes
       merged = seed.empty? ? attrs : seed.merge(attrs)
-      return @model.new(merged) if @default_scoped
+      return @model.new(merged) if @default_scoped && !default_scope_attribute_unscoped?(merged)
       @model.unscoped { @model.new(merged) }
     end
+
+    # A default scope's `where` value the relation no longer carries
+    # (`unscope(where: :island)`, an `all_islands` scope): Rails' new
+    # record takes only the relation's own where values, but the model's
+    # `initialize` seeds the class's default attributes under any
+    # default scoping, so the record is built without it.
+    def default_scope_attribute_unscoped?(attrs)
+      return false unless @model._default_scope_applies?
+      @model._default_scope_attributes.any? { |name, _| !attrs.key?(name) && !attrs.key?(name.to_s) }
+    end
+    private :default_scope_attribute_unscoped?
 
     def create(attrs = {}, &block)
       record = build(attrs)

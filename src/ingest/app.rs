@@ -4685,6 +4685,9 @@ fn splice_concerns_into_models_named(
                         .map(move |item| {
                             rehome_carried(rehome_default_fk(item, id, model_name), id, model_name, &class_attributes, defined)
                         })
+                        // `included do if cond; default_scope ...; end end`:
+                        // the scopes the branches declare, gated on `cond`.
+                        .flat_map(crate::lower::default_scope::expand_conditional)
                         .collect::<Vec<_>>()
                 })
                 .collect();

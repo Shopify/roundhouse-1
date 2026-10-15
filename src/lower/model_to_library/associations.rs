@@ -1680,6 +1680,7 @@ fn synth_polymorphic_writer(
     //     case value
     //     when Comment then @notifiable_type = "Comment"
     //     when Message then @notifiable_type = "Message"
+    //     else @notifiable_type = value.class.polymorphic_name
     //     end
     //   end
     // end
@@ -1725,9 +1726,32 @@ fn synth_polymorphic_writer(
             parenthesized: false,
         },
     );
+    // A record of a class no `as:` names (Core's `PriceRule::ItemEntitlement`
+    // `belongs_to :item, polymorphic: true` takes Product, ProductVariant and
+    // Collection, of which only SellingPlanGroupResource declares `as: :item`)
+    // stores what Rails does, its `polymorphic_name`: the type half is NOT NULL.
+    let other_class = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var_ref(value.clone())),
+                    method: Symbol::from("class"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )),
+            method: Symbol::from("polymorphic_name"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
     let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
         assign(&type_col, lit_str(t.0.as_str()))
-    }, None);
+    }, Some(assign(&type_col, other_class)));
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::If {

@@ -65,6 +65,20 @@ struct Link {
     args: Vec<Expr>,
 }
 
+/// One `default_scope` declaration: its chain, and the load-time
+/// condition it was declared under (`__when:`, below) when a concern's
+/// `included do if cond; default_scope ...; end end` put one around it.
+#[derive(Clone, Debug)]
+struct Chain {
+    links: Vec<Link>,
+    guard: Option<Expr>,
+}
+
+/// The option a conditional default scope carries
+/// ([`expand_conditional`]): not a Rails option, an internal marker the
+/// concern splice writes for `default_scope ... if cond`.
+const WHEN_OPTION: &str = "__when";
+
 /// Whether a model-body statement is a `default_scope` this pass
 /// reproduces (`model_to_library::MODEL_STATEMENT_CLAIMS`).
 pub(crate) fn claims(expr: &Expr) -> bool {
@@ -75,6 +89,122 @@ pub(crate) fn claims(expr: &Expr) -> bool {
 /// active }`), the claim `model_to_library::claimed_in_model` asks.
 pub(crate) fn claims_in(model: &Model, expr: &Expr) -> bool {
     declaration(expr, Some(model)).is_some()
+}
+
+/// A concern's `included do if cond; default_scope ...; scope :x, ...
+/// else scope :x, ... end end`, which `Rails.configuration.platform_
+/// essentials.yugabyte_testing?` makes Core's `GlobalDb::ShopIslandScoped`:
+/// the includer's class body runs the branch its condition picks, once.
+///
+/// The condition is Ruby the emitted tree evaluates, so the branches are
+/// kept and gated on it at run time rather than folded here. A branch
+/// that declares only `default_scope`s and parameterless `scope`s is
+/// rewritten into the items the model lowering already claims: each
+/// `default_scope` gets the [`WHEN_OPTION`] marker (the condition, or its
+/// negation under `else`), and each scope both arms declare becomes one
+/// `Scope` whose body is `if cond; then_body; else; else_body; end`. A
+/// scope only one arm declares has no meaning in the other, and any other
+/// statement is not modelled: the item is returned unchanged for the
+/// named refusal.
+pub(crate) fn expand_conditional(item: ModelBodyItem) -> Vec<ModelBodyItem> {
+    let ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = &item else { return vec![item] };
+    let ExprNode::If { cond, then_branch, else_branch } = &*expr.node else { return vec![item] };
+    fn statements(branch: &Expr) -> Vec<&Expr> {
+        match &*branch.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            ExprNode::Lit { value: Literal::Nil } => Vec::new(),
+            _ => vec![branch],
+        }
+    }
+    enum Declared<'a> {
+        DefaultScope(&'a Expr),
+        Scope { name: Symbol, body: &'a Expr },
+    }
+    fn declared(stmt: &Expr) -> Option<Declared<'_>> {
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*stmt.node else { return None };
+        match (method.as_str(), args.as_slice()) {
+            ("default_scope", _) => declaration(stmt, None).map(|_| Declared::DefaultScope(stmt)),
+            ("scope", [name, body]) => {
+                let ExprNode::Lit { value: Literal::Sym { value } } = &*name.node else { return None };
+                Some(Declared::Scope { name: value.clone(), body: lambda_arg(body)? })
+            }
+            _ => None,
+        }
+    }
+    let then_stmts: Option<Vec<Declared<'_>>> = statements(then_branch).into_iter().map(declared).collect();
+    let else_stmts: Option<Vec<Declared<'_>>> = statements(else_branch).into_iter().map(declared).collect();
+    let (Some(then_stmts), Some(else_stmts)) = (then_stmts, else_stmts) else { return vec![item] };
+    if then_stmts.is_empty() && else_stmts.is_empty() {
+        return vec![item];
+    }
+    // Every scope in an arm has its twin in the other.
+    fn scope_bodies<'a>(stmts: &[Declared<'a>], name: &Symbol) -> Option<&'a Expr> {
+        stmts.iter().find_map(|d| match d {
+            Declared::Scope { name: n, body } if n == name => Some(*body),
+            _ => None,
+        })
+    }
+    let mut scope_names: Vec<&Symbol> = Vec::new();
+    for d in then_stmts.iter().chain(&else_stmts) {
+        if let Declared::Scope { name, .. } = d
+            && !scope_names.contains(&name)
+        {
+            scope_names.push(name);
+        }
+    }
+    if scope_names.iter().any(|n| scope_bodies(&then_stmts, n).is_none() || scope_bodies(&else_stmts, n).is_none()) {
+        return vec![item];
+    }
+
+    let item_of = |expr: Expr| ModelBodyItem::Unknown {
+        expr,
+        leading_comments: leading_comments.clone(),
+        leading_blank_line: *leading_blank_line,
+    };
+    let negated = || send(Some(cond.clone()), "!", vec![]);
+    let guarded = |stmt: &Expr, guard: Expr| {
+        let ExprNode::Send { recv, method, args, block, parenthesized } = &*stmt.node else { unreachable!("a default_scope") };
+        let mut args = args.clone();
+        let when = (synthetic(ExprNode::Lit { value: Literal::Sym { value: Symbol::from(WHEN_OPTION) } }), guard);
+        match args.last_mut().map(|a| &mut *a.node) {
+            Some(ExprNode::Hash { entries, .. }) => entries.push(when),
+            _ => args.push(synthetic(ExprNode::Hash { entries: vec![when], kwargs: true })),
+        }
+        Expr::new(
+            stmt.span,
+            ExprNode::Send { recv: recv.clone(), method: method.clone(), args, block: block.clone(), parenthesized: *parenthesized },
+        )
+    };
+    let mut out = Vec::new();
+    for d in &then_stmts {
+        if let Declared::DefaultScope(stmt) = d {
+            out.push(item_of(guarded(stmt, cond.clone())));
+        }
+    }
+    for d in &else_stmts {
+        if let Declared::DefaultScope(stmt) = d {
+            out.push(item_of(guarded(stmt, negated())));
+        }
+    }
+    for name in scope_names {
+        let (then_body, else_body) = (
+            scope_bodies(&then_stmts, name).expect("checked"),
+            scope_bodies(&else_stmts, name).expect("checked"),
+        );
+        out.push(ModelBodyItem::Scope {
+            scope: crate::dialect::Scope {
+                name: name.clone(),
+                params: Vec::new(),
+                body: Expr::new(
+                    expr.span,
+                    ExprNode::If { cond: cond.clone(), then_branch: then_body.clone(), else_branch: else_body.clone() },
+                ),
+            },
+            leading_comments: leading_comments.clone(),
+            leading_blank_line: *leading_blank_line,
+        });
+    }
+    out
 }
 
 /// Whether `model` itself declares a reproduced default scope.
@@ -104,7 +234,7 @@ pub(crate) fn subclass_declares(lc: &LibraryClass) -> bool {
 }
 
 /// The reproduced default scopes `model` declares, in body order.
-fn chains(model: &Model) -> Vec<Vec<Link>> {
+fn chains(model: &Model) -> Vec<Chain> {
     model
         .body
         .iter()
@@ -116,27 +246,39 @@ fn chains(model: &Model) -> Vec<Vec<Link>> {
 }
 
 /// `default_scope { chain }`, `default_scope -> { chain }` or
-/// `default_scope lambda { chain }`, and nothing else. `model` resolves
-/// the chain's calls of its scopes.
-fn declaration(expr: &Expr, model: Option<&Model>) -> Option<Vec<Link>> {
+/// `default_scope lambda { chain }`, and nothing else, with the options
+/// Rails documents that change no relation this port builds
+/// (`all_queries:` widens the scope to UPDATE/DELETE statements, which
+/// the instance writers key by primary key) and the [`WHEN_OPTION`]
+/// marker. `model` resolves the chain's calls of its scopes.
+fn declaration(expr: &Expr, model: Option<&Model>) -> Option<Chain> {
     let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else { return None };
     if method.as_str() != "default_scope" {
         return None;
     }
-    let body = match (args.as_slice(), block) {
-        ([], Some(block)) => lambda_body(block)?,
-        ([arg], None) => lambda_body(arg).or_else(|| match &*arg.node {
-            ExprNode::Send { recv: None, method, args, block: Some(block), .. }
-                if method.as_str() == "lambda" && args.is_empty() =>
-            {
-                lambda_body(block)
+    let (args, options) = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { .. }) => (rest, Some(last)),
+        _ => (args.as_slice(), None),
+    };
+    let mut guard = None;
+    if let Some(options) = options {
+        let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+        for (key, value) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
+            match key.as_str() {
+                "all_queries" if matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } }) => {}
+                WHEN_OPTION => guard = Some(value.clone()),
+                _ => return None,
             }
-            _ => None,
-        })?,
+        }
+    }
+    let body = match (args, block) {
+        ([], Some(block)) => lambda_body(block)?,
+        ([arg], None) => lambda_arg(arg)?,
         _ => return None,
     };
     let links = chain(single(body), model, 0)?;
-    (!links.is_empty()).then_some(links)
+    (!links.is_empty()).then_some(Chain { links, guard })
 }
 
 /// A one-statement body's statement.
@@ -158,6 +300,18 @@ fn scope_links(model: Option<&Model>, name: &str, depth: u8) -> Option<Vec<Link>
         return None;
     }
     chain(single(&scope.body), model, depth + 1).filter(|links| !links.is_empty())
+}
+
+/// The body of a parameterless `-> { }` or `lambda { }`.
+fn lambda_arg(arg: &Expr) -> Option<&Expr> {
+    lambda_body(arg).or_else(|| match &*arg.node {
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if method.as_str() == "lambda" && args.is_empty() =>
+        {
+            lambda_body(block)
+        }
+        _ => None,
+    })
 }
 
 fn lambda_body(expr: &Expr) -> Option<&Expr> {
@@ -219,9 +373,9 @@ fn chain(expr: &Expr, model: Option<&Model>, depth: u8) -> Option<Vec<Link>> {
 /// The `where` equalities a new record takes: symbol keys of a `where`
 /// hash, a later scope's value winning. Array and range values (an IN or
 /// a BETWEEN) are not assigned.
-fn scope_attributes(chains: &[Vec<Link>]) -> Vec<(Expr, Expr)> {
+fn scope_attributes<'a>(chains: impl Iterator<Item = &'a Chain>) -> Vec<(Expr, Expr)> {
     let mut out: Vec<(Expr, Expr)> = Vec::new();
-    for link in chains.iter().flatten() {
+    for link in chains.flat_map(|c| &c.links) {
         if link.method != "where" {
             continue;
         }
@@ -267,6 +421,32 @@ fn class_method(model: &ClassId, name: &str, params: Vec<Param>, body: Expr) -> 
     }
 }
 
+/// The class method that answers a guarded chain's condition: the
+/// model's `included do if cond` ran once at load in Rails, so the
+/// first answer is kept (`@x = (cond) ? true : false if @x.nil?`).
+fn guard_method(model: &ClassId, name: &str, cond: &Expr) -> MethodDef {
+    let ivar = || synthetic(ExprNode::Ivar { name: Symbol::from(name) });
+    let truth = synthetic(ExprNode::If {
+        cond: cond.clone(),
+        then_branch: synthetic(ExprNode::Lit { value: Literal::Bool { value: true } }),
+        else_branch: synthetic(ExprNode::Lit { value: Literal::Bool { value: false } }),
+    });
+    let store = synthetic(ExprNode::Assign { target: crate::expr::LValue::Ivar { name: Symbol::from(name) }, value: truth });
+    let first = synthetic(ExprNode::If {
+        cond: send(Some(ivar()), "nil?", vec![]),
+        then_branch: store,
+        else_branch: synthetic(ExprNode::Lit { value: Literal::Nil }),
+    });
+    class_method(model, name, vec![], synthetic(ExprNode::Seq { exprs: vec![first, ivar()] }))
+}
+
+/// `_default_scope_guard_<model>_<n>`: unique per declaring model and
+/// declaration, since a subclass's own guard must not shadow its parent's.
+fn guard_method_name(model: &ClassId, index: usize) -> String {
+    let model: String = model.0.as_str().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+    format!("_default_scope_guard_{model}_{index}")
+}
+
 /// The default-scoped model's class methods (Ruby-emit seam, beside the
 /// scope methods): `_default_scoped?`, `_apply_default_scope(relation)`
 /// and `_default_scope_attributes`, each after its parent's (`super`),
@@ -280,27 +460,65 @@ pub(crate) fn push_methods(methods: &mut Vec<MethodDef>, model: &Model) {
 /// `super` is its model's: Rails applies the parent's default scope,
 /// then the subclass's own.
 pub(crate) fn push_subclass_methods(lc: &mut LibraryClass) {
-    let chains: Vec<Vec<Link>> = lc.unknown_calls.iter().filter_map(|e| declaration(e, None)).collect();
+    let chains: Vec<Chain> = lc.unknown_calls.iter().filter_map(|e| declaration(e, None)).collect();
     let name = lc.name.clone();
     push_chain_methods(&mut lc.methods, &name, &chains);
 }
 
-fn push_chain_methods(methods: &mut Vec<MethodDef>, name: &ClassId, chains: &[Vec<Link>]) {
+fn push_chain_methods(methods: &mut Vec<MethodDef>, name: &ClassId, chains: &[Chain]) {
     if chains.is_empty() {
         return;
     }
     let relation = Symbol::from("relation");
     let rel = || synthetic(ExprNode::Var { id: VarId(0), name: relation.clone() });
 
-    methods.push(class_method(name, "_default_scoped?", vec![], synthetic(ExprNode::Lit { value: Literal::Bool { value: true } })));
+    // A guarded chain's condition is a class method per declaration,
+    // evaluated once like Rails' class-body `if` (`guard_method`).
+    let guard_names: Vec<Option<String>> = chains
+        .iter()
+        .enumerate()
+        .map(|(i, c)| c.guard.as_ref().map(|_| guard_method_name(name, i)))
+        .collect();
+    let guard_call = |i: usize| send(None, guard_names[i].as_deref().expect("guarded chain"), vec![]);
+    for (i, chain) in chains.iter().enumerate() {
+        if let Some(guard) = &chain.guard {
+            methods.push(guard_method(name, guard_names[i].as_deref().expect("guarded chain"), guard));
+        }
+    }
+
+    // Applies when any chain does: an unguarded one always, a guarded
+    // one when its condition held.
+    let applies = if chains.iter().any(|c| c.guard.is_none()) {
+        synthetic(ExprNode::Lit { value: Literal::Bool { value: true } })
+    } else {
+        let parent = synthetic(ExprNode::Super { args: None, block: None });
+        let mut any = parent;
+        for i in 0..chains.len() {
+            any = synthetic(ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: any,
+                right: guard_call(i),
+            });
+        }
+        any
+    };
+    methods.push(class_method(name, "_default_scoped?", vec![], applies));
 
     let mut stmts = vec![synthetic(ExprNode::Super { args: Some(vec![rel()]), block: None })];
-    for links in chains {
+    for (i, chain) in chains.iter().enumerate() {
         let mut call = rel();
-        for link in links {
+        for link in &chain.links {
             call = send(Some(call), &format!("{}!", link.method), link.args.clone());
         }
-        stmts.push(call);
+        stmts.push(match chain.guard {
+            None => call,
+            Some(_) => synthetic(ExprNode::If {
+                cond: guard_call(i),
+                then_branch: call,
+                else_branch: synthetic(ExprNode::Lit { value: Literal::Nil }),
+            }),
+        });
     }
     stmts.push(rel());
     methods.push(class_method(
@@ -310,11 +528,36 @@ fn push_chain_methods(methods: &mut Vec<MethodDef>, name: &ClassId, chains: &[Ve
         synthetic(ExprNode::Seq { exprs: stmts }),
     ));
 
-    let attributes = scope_attributes(chains);
-    if !attributes.is_empty() {
-        let parent = synthetic(ExprNode::Super { args: None, block: None });
+    // The seeded attributes, in declaration order: a run of unguarded
+    // chains is one `merge`, a guarded chain its own (its hash only when
+    // its condition holds).
+    let mut merged = synthetic(ExprNode::Super { args: None, block: None });
+    let mut any_attributes = false;
+    let mut i = 0;
+    while i < chains.len() {
+        let (group, guard) = match chains[i].guard {
+            Some(_) => (i..i + 1, Some(i)),
+            None => (i..chains[i..].iter().position(|c| c.guard.is_some()).map_or(chains.len(), |p| i + p), None),
+        };
+        i = group.end;
+        let attributes = scope_attributes(chains[group].iter());
+        if attributes.is_empty() {
+            continue;
+        }
+        any_attributes = true;
         let hash = synthetic(ExprNode::Hash { entries: attributes, kwargs: false });
-        methods.push(class_method(name, "_default_scope_attributes", vec![], send(Some(parent), "merge", vec![hash])));
+        let hash = match guard {
+            None => hash,
+            Some(g) => synthetic(ExprNode::If {
+                cond: guard_call(g),
+                then_branch: hash,
+                else_branch: synthetic(ExprNode::Hash { entries: vec![], kwargs: false }),
+            }),
+        };
+        merged = send(Some(merged), "merge", vec![hash]);
+    }
+    if any_attributes {
+        methods.push(class_method(name, "_default_scope_attributes", vec![], merged));
     }
 
     // `Model.delete_all` is the scoped DELETE under a default scope.
