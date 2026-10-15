@@ -139,6 +139,9 @@ fn accept_string_name(m: &mut MethodDef) {
 /// `def self.schema_column_types; { "id" => [:integer, 8], … }; end`.
 fn schema_column_types(model: &Model, table: &Table, adapter: Option<&DatabaseAdapter>) -> MethodDef {
     let mut declared: Vec<(Symbol, Symbol)> = crate::lower::model_to_library::markers::attribute_api_decls(&model.body);
+    declared.extend(
+        crate::lower::model_to_library::markers::virtual_default_attribute_decls(model).into_iter().map(|(n, ty, _)| (n, ty)),
+    );
     let mut entries: Vec<(Expr, Expr)> = Vec::new();
     for col in &table.columns {
         // `attribute :col, :type` replaces the column's type (Rails'
