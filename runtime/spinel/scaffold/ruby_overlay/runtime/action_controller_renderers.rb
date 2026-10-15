@@ -24,7 +24,6 @@
 # `render json:`; a controller reaching a renderer through the options
 # hash calls `render_to_body(options)`.
 require "set"
-require_relative "base"
 
 module ActionController
   module Renderers
@@ -36,8 +35,10 @@ module ActionController
       # parent's until it calls `use_renderers`.
       def _renderers
         return @_renderers if defined?(@_renderers)
-        if superclass.respond_to?(:_renderers)
-          superclass._renderers
+        me = self #: untyped
+        parent = me.superclass #: untyped
+        if parent.respond_to?(:_renderers)
+          parent._renderers
         else
           ActionController::Renderers::RENDERERS
         end
@@ -48,7 +49,7 @@ module ActionController
       end
 
       def use_renderers(*args)
-        renderers = _renderers + args
+        renderers = _renderers + args #: Set[Symbol]
         self._renderers = renderers.freeze
       end
       alias use_renderer use_renderers
@@ -65,7 +66,8 @@ module ActionController
     end
 
     def _render_to_body_with_renderer(options)
-      renderers = self.class.respond_to?(:_renderers) ? self.class._renderers : RENDERERS
+      ctl = self.class #: untyped
+      renderers = (ctl.respond_to?(:_renderers) ? ctl._renderers : RENDERERS) #: Set[Symbol]
       renderers.each do |name|
         if options.key?(name)
           _process_options(options)

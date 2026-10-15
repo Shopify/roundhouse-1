@@ -128,6 +128,11 @@ require_relative "runtime/active_record_sqlite3_adapter"
 require_relative "config/schema"
 require_relative "runtime/action_dispatch"
 require_relative "runtime/action_controller"
+# `ActionController::Renderers`: the `render json:`/`xml:`/`js:` registry
+# and `use_renderers`, which a gem such as active_model_serializers
+# includes and overrides (`_render_with_renderer_json`). Base includes
+# `Renderers::All`. Dynamic Ruby (define_method, send), so ruby lane only.
+require_relative "runtime/action_controller_renderers"
 # Replace the portable character walk only after loading the shared policy.
 require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.

@@ -1072,7 +1072,11 @@ module ActiveRecord
 
       # Rails stringifies the keys: `{"id" => nil}` from `attributes` and a
       # `:id` a primary-key allocator (Core's GenerateOid) adds are one column.
-      rows = rows.map { |row| row.to_h { |k, v| [k.to_s, v] } }
+      rows = rows.map do |row|
+        h = {} #: Hash[String, untyped]
+        row.each { |k, v| h[k.to_s] = v }
+        h
+      end
       keys = rows[0].keys
       rows.each do |row|
         unless row.keys.sort == keys.sort
@@ -2278,9 +2282,11 @@ module ActiveRecord
     def _valid_with_caller_hooks?(context = nil)
       previous = @_validation_hooks_off
       @_validation_hooks_off = true
-      valid?(context)
-    ensure
-      @_validation_hooks_off = previous
+      begin
+        valid?(context)
+      ensure
+        @_validation_hooks_off = previous
+      end
     end
 
     # ActiveModel::Validations#validates_with: run the validators on
@@ -2347,8 +2353,9 @@ module ActiveRecord
     # (`lower::typed_store`).
     def _typed_store_changes(changes)
       return changes unless defined?(::TypedStore) && ::TypedStore.respond_to?(:snapshot)
-      klass = self.class
-      cols = klass.instance_variable_get(:@__typed_store_view_columns)
+      klass = self.class #: untyped
+      store = ::TypedStore #: untyped
+      cols = klass.instance_variable_get(:@__typed_store_view_columns) #: Array[String]?
       if cols.nil?
         cols = klass.schema_columns.map { |c| c.to_s }.select { |c| klass.private_method_defined?(:"__rh_#{c}_keys") }
         klass.instance_variable_set(:@__typed_store_view_columns, cols)
@@ -2356,7 +2363,7 @@ module ActiveRecord
       cols.each do |col|
         pair = changes[col]
         next if pair.nil?
-        changes[col] = [::TypedStore.snapshot(self, col, pair[0]), ::TypedStore.snapshot(self, col, pair[1])]
+        changes[col] = [store.snapshot(self, col, pair[0]), store.snapshot(self, col, pair[1])]
       end
       changes
     end

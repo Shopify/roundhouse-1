@@ -1258,7 +1258,13 @@ fn every_runtime_method_body_concretely_typed() {
     // `load_eager_records`): reflections are untyped, as in Rails, and the
     // joined rows' key values are caller-defined column values; the local
     // tables around them are ascribed so the typed sweep stays clean.
-    const CEILING: usize = 1920;
+    // MEASURED 1985 on 2026-10-15 (merge of om129-om131 onto e19a8ab91): +65
+    // in connection.rb / relation.rb bodies om130-om131 added (Range
+    // predicates via `range_bound` / `range_literal`, virtual attributes,
+    // stringified insert rows, typed_store saved_changes with an untyped
+    // class and store, composite nested keys). om129's Renderers port is
+    // dynamic Ruby and lives in the ruby overlay, outside this gate.
+    const CEILING: usize = 1985;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

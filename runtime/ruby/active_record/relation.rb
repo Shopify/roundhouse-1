@@ -3815,26 +3815,30 @@ module ActiveRecord
     # `>=` and `<` for an exclusive end, one side alone for a beginless or
     # endless range (or an infinite bound), nothing at all for both.
     def range_predicate(qcol, range, typed, tcol)
-      bound = lambda do |x|
-        x = nil if x.is_a?(Float) && x.infinite?
-        x
-      end
-      lo = bound.call(range.begin)
-      hi = bound.call(range.end)
-      literal = lambda do |x|
-        bind_literal(tcol.nil? ? x : typed._attribute_for_database(tcol, x))
-      end
+      lo = range_bound(range.begin)
+      hi = range_bound(range.end)
       if lo.nil? && hi.nil?
         "1=1"
       elsif lo.nil?
-        "#{qcol} #{range.exclude_end? ? "<" : "<="} #{literal.call(hi)}"
+        "#{qcol} #{range.exclude_end? ? "<" : "<="} #{range_literal(hi, typed, tcol)}"
       elsif hi.nil?
-        "#{qcol} >= #{literal.call(lo)}"
+        "#{qcol} >= #{range_literal(lo, typed, tcol)}"
       elsif range.exclude_end?
-        "(#{qcol} >= #{literal.call(lo)} AND #{qcol} < #{literal.call(hi)})"
+        "(#{qcol} >= #{range_literal(lo, typed, tcol)} AND #{qcol} < #{range_literal(hi, typed, tcol)})"
       else
-        "#{qcol} BETWEEN #{literal.call(lo)} AND #{literal.call(hi)}"
+        "#{qcol} BETWEEN #{range_literal(lo, typed, tcol)} AND #{range_literal(hi, typed, tcol)}"
       end
+    end
+
+    # An infinite Float bound is an open end (`1..Float::INFINITY`).
+    def range_bound(x)
+      return nil if x.is_a?(Float) && x.infinite?
+      x
+    end
+
+    # A range bound as SQL, cast by the column's declared type when known.
+    def range_literal(x, typed, tcol)
+      bind_literal(tcol.nil? ? x : typed._attribute_for_database(tcol, x))
     end
 
     # Rails' `scope_for_create` reads a relation's `where` equalities on
