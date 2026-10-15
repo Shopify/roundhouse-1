@@ -2326,7 +2326,8 @@ fn ancestor_chain<'a>(controller: &Controller, all: &'a [Controller]) -> Vec<&'a
 
 /// Framework macros in a controller body that lowering consumes (or that
 /// register no filter): their `Unknown` item says nothing about a
-/// run-time filter.
+/// run-time filter. `ingest::app::CONSUMED_CONTROLLER_MACROS` (`allow_browser`,
+/// `stale_when_importmap_changes`, …) is excluded the same way.
 const NON_FILTER_BODY_MACROS: &[&str] = &[
     "rescue_from", "helper_method", "helper", "delegate", "attr_reader", "attr_writer",
     "attr_accessor", "alias_method", "undef_method", "include", "extend", "prepend", "private",
@@ -2360,6 +2361,7 @@ fn chain_has_runtime_macro_calls(controller: &Controller, all: &[Controller]) ->
             };
             let ExprNode::Send { recv: None, method, .. } = &*expr.node else { return false };
             !NON_FILTER_BODY_MACROS.contains(&method.as_str())
+                && !crate::ingest::app::CONSUMED_CONTROLLER_MACROS.contains(&method.as_str())
                 && crate::ingest::controller::lambda_filter_target(expr).is_none()
         })
     })

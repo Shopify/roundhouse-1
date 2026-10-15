@@ -152,6 +152,8 @@ module ActionController
       def _register_runtime_filter(kind, names, block, prepend)
         names = names.dup
         options = names.last.is_a?(Hash) ? names.pop : {}
+        # `before_action :a, prepend: true` is `prepend_before_action :a`.
+        prepend ||= options[:prepend] ? true : false
         only = RuntimeFilters.symbols(options[:only])
         except = RuntimeFilters.symbols(options[:except])
         if_conds = Array(options[:if])

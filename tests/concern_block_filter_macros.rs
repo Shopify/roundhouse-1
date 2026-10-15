@@ -222,6 +222,16 @@ fn a_macro_body_mixing_a_symbol_and_a_block_filter_keeps_declaration_order() {
 // ---------------------------------------------------------------------
 // Refusals — the gap stays, and the macro call stays whole
 // ---------------------------------------------------------------------
+//
+// A refused macro call is not dropped and not guessed at: it stays whole
+// and `replay_subclass_macros` writes it back as the class-body statement
+// it is (`ClassIvarInit`), which the emitted class runs when it loads.
+// Ruby then binds the arguments and resolves the macro, and the macro
+// registers its filters in the run-time registry, so the call is applied
+// once, never also lowered into the preamble (a `Filter` item would be
+// the static expansion; the assertions below keep that absent).
+// `tests/refused_filter_macro_replay_pg_runtime.rs` runs these shapes
+// against native Rails on PostgreSQL.
 
 fn assert_refused(macro_body: &str, call: &str) {
     let (app, gaps) = build(macro_body, call, "");
@@ -232,9 +242,9 @@ fn assert_refused(macro_body: &str, call: &str) {
     );
     let c = widgets_controller(&app);
     assert!(
-        c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { expr, .. }
+        c.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "stamp_header"))),
-        "a refused macro call must stay whole: {:?}",
+        "a refused macro call must stay whole, replayed as a class-body statement: {:?}",
         c.body
     );
     assert!(
@@ -645,6 +655,7 @@ fn a_positional_and_keyword_mix_binds_sunset_by_name_and_passes_if_through() {
     );
 }
 
+/// The call is replayed as written: Ruby, not the static binder, decides what an omitted required keyword means when the class loads.
 #[test]
 fn a_missing_required_keyword_is_refused() {
     let concern = r#"module SunsetConcern
@@ -686,9 +697,9 @@ end
     );
     let c = widgets_controller(&app);
     assert!(
-        c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { expr, .. }
+        c.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "retire_endpoint"))),
-        "a refused macro call must stay whole: {:?}",
+        "a refused macro call must stay whole, replayed as a class-body statement: {:?}",
         c.body
     );
     assert!(
@@ -698,6 +709,7 @@ end
     );
 }
 
+/// The call is replayed as written: Ruby, not the static binder, decides what an unknown keyword means when the class loads.
 #[test]
 fn an_unknown_keyword_with_no_kwrest_is_refused() {
     let concern = r#"module SunsetConcern
@@ -739,9 +751,9 @@ end
     );
     let c = widgets_controller(&app);
     assert!(
-        c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { expr, .. }
+        c.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "retire_endpoint"))),
-        "a refused macro call must stay whole: {:?}",
+        "a refused macro call must stay whole, replayed as a class-body statement: {:?}",
         c.body
     );
 }
@@ -758,9 +770,9 @@ fn a_positional_splat_this_binder_cannot_model_is_refused() {
     );
     let c = widgets_controller(&app);
     assert!(
-        c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { expr, .. }
+        c.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "retire_endpoint"))),
-        "a refused macro call must stay whole: {:?}",
+        "a refused macro call must stay whole, replayed as a class-body statement: {:?}",
         c.body
     );
 }

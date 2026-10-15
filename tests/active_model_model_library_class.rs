@@ -91,12 +91,21 @@ end
     );
     assert!(!src.contains("include ActiveModel::Model"), "{src}");
     assert!(src.contains("def valid?"), "{src}");
-    // Rails' blank test on an untyped attribute, and the push beside the
-    // ErrorDetail Rails keeps for it (what `errors.details` answers from).
-    assert!(src.contains("if @href.nil? || @href.is_a?(String) && (@href || \"\").empty?"), "{src}");
+    // Rails' blank test on an untyped attribute (nil, an empty String, an
+    // empty Array: `[].blank?` is true, so the Array arm is Rails'), and
+    // the push beside the ErrorDetail Rails keeps for it (what
+    // `errors.details` answers from). The check sits in `validate`'s
+    // context-less branch; given a context it re-enters `valid?`, which
+    // runs the same unconditional validations.
     assert!(
         src.contains(
-            "self.errors << \"Href can't be blank\"\n      self.error_details << ActiveRecord::ErrorDetail.new(\"href\", \"blank\", \"can't be blank\")"
+            "if @href.nil? || @href.is_a?(String) && (@href || \"\").empty? || @href.is_a?(Array) && (@href || \"\").empty?"
+        ),
+        "{src}"
+    );
+    assert!(
+        src.contains(
+            "self.errors << \"Href can't be blank\"\n        self.error_details << ActiveRecord::ErrorDetail.new(\"href\", \"blank\", \"can't be blank\")"
         ),
         "{src}"
     );

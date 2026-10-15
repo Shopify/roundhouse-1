@@ -198,6 +198,9 @@ fn the_options_hash_binds_the_call_s_trailing_keywords_with_no_kwargs_declared()
     );
 }
 
+// A refused macro call stays whole and is replayed as the class-body
+// statement it is (`ClassIvarInit`; see concern_block_filter_macros.rs),
+// not lowered into the preamble.
 // ---------------------------------------------------------------------
 // Refused: a `block` misuse the shared `around_block_filter` already
 // refuses for a hand-written around_action refuses the WHOLE macro the
@@ -236,9 +239,9 @@ fn a_continuation_called_with_arguments_is_refused_with_one_gap() {
     );
     let c = widgets_controller(&app);
     assert!(
-        c.body.iter().any(|item| matches!(item, ControllerBodyItem::Unknown { expr, .. }
+        c.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "override_quota_headers"))),
-        "a refused macro call must stay whole: {:?}",
+        "a refused macro call must stay whole, replayed as a class-body statement: {:?}",
         c.body
     );
     assert!(

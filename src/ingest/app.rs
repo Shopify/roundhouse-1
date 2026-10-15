@@ -6355,7 +6355,7 @@ fn qualify_model_class_method_ar_calls(app: &mut App) {
 /// markers. (`protect_from_forgery` / `skip_forgery_protection` are not
 /// here: `parse_filter_call` types the forms that are modeled, and one
 /// left in the body — `with: :null_session`, say — is a real gap.)
-pub(super) const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
+pub(crate) const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
     "include",
     "extend",
     "layout",

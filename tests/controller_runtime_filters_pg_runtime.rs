@@ -393,3 +393,27 @@ fn the_dispatcher_consults_the_registry_only_for_a_controller_with_a_macro() {
     assert!(plain.contains("def process_action"), "{plain}");
     assert!(!plain.contains("run_prepended_filters") && !plain.contains("run_around_filters"), "{plain}");
 }
+
+/// A framework macro ingest consumes (`allow_browser`,
+/// `stale_when_importmap_changes`: a generated ApplicationController's
+/// own) is no class-body macro that registers filters, so its
+/// controllers keep the plain dispatcher (and the Rust/TypeScript
+/// targets, which have no registry, lower them as before).
+#[test]
+fn a_consumed_framework_macro_does_not_ask_for_the_registry() {
+    let app = overlay()
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  allow_browser versions: :modern\n  stale_when_importmap_changes\nend\n",
+        )
+        .write(
+            "app/controllers/plain_controller.rb",
+            "class PlainController < ApplicationController\n  before_action :gate, only: :index\n\n  def index\n    render json: {}\n  end\n\n  private\n\n  def gate\n    head :forbidden\n  end\nend\n",
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  resources :plain, only: [:index]\nend\n");
+    let (emitted, errors) = app.emit(BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let plain = std::fs::read_to_string(emitted.join("app/controllers/plain_controller.rb")).expect("plain");
+    assert!(plain.contains("def process_action"), "{plain}");
+    assert!(!plain.contains("run_prepended_filters") && !plain.contains("run_around_filters"), "{plain}");
+}

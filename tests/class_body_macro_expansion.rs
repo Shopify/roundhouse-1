@@ -260,6 +260,7 @@ end
     );
 }
 
+/// Two included Concerns define `allow_unauthenticated_access`; which one the nested call reaches is Ruby's method resolution at run time (the later include wins), so nothing is inlined statically and the call is replayed as the class-body statement (`ClassIvarInit`) the emitted class runs. `tests/refused_filter_macro_replay_pg_runtime.rs` checks the shadowing shape against native Rails.
 #[test]
 fn a_nested_filter_macro_is_not_inlined_when_an_included_concern_overrides_it() {
     let tree = [
@@ -306,12 +307,13 @@ end
     assert!(filters(&app).is_empty(), "refusal must not inline either policy: {:?}", filters(&app));
     assert!(app.controllers[0].body.iter().any(|item| matches!(
         item,
-        ControllerBodyItem::Unknown { expr, .. }
+        ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
                 if method.as_str() == "require_unauthenticated_access")
     )));
 }
 
+/// The parent's `def self.allow_unauthenticated_access` shadows the concern's, so the concern's skip must not be inlined; the call is replayed as the class-body statement (`ClassIvarInit`), where Ruby dispatches to the parent's override. `tests/refused_filter_macro_replay_pg_runtime.rs` runs this shadowing against native Rails.
 #[test]
 fn a_parent_controller_class_method_can_shadow_a_nested_filter_macro() {
     let application_controller = r#"
@@ -347,12 +349,13 @@ end
         .expect("ThingsController ingested");
     assert!(controller.body.iter().any(|item| matches!(
         item,
-        ControllerBodyItem::Unknown { expr, .. }
+        ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
                 if method.as_str() == "require_unauthenticated_access")
     )));
 }
 
+/// Static expansion is capped, so an over-budget macro is refused with no partial `Filter`s; the call is then replayed as a class-body statement (`ClassIvarInit`) and registers its filters when the class loads, as in Rails.
 #[test]
 fn nested_filter_macro_expansion_has_a_total_work_budget() {
     let mut methods = String::from("def macro_0\n before_action :authenticate\nend\n");
@@ -379,7 +382,7 @@ fn nested_filter_macro_expansion_has_a_total_work_budget() {
     assert!(filters(&app).is_empty(), "refusal must not partially expand");
     assert!(app.controllers[0].body.iter().any(|item| matches!(
         item,
-        ControllerBodyItem::Unknown { expr, .. }
+        ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
                 if method.as_str() == "macro_14")
     )));
@@ -447,6 +450,7 @@ fn a_reopened_filter_macro_uses_its_latest_definition() {
     assert_eq!(skipped, ["replacement_authentication"]);
 }
 
+/// The gap keeps its identity and the whole body is refused (no `Filter` for only the callback); the call is replayed as a class-body statement (`ClassIvarInit`), so the macro runs whole when the class loads.
 #[test]
 fn unsupported_filter_macro_keeps_its_inventory_identity_and_whole_body() {
     use roundhouse::ingest::survey;
@@ -490,7 +494,7 @@ end
     assert!(filters(&app).is_empty(), "must not expand only the callback");
     assert!(app.controllers[0].body.iter().any(|item| matches!(
         item,
-        ControllerBodyItem::Unknown { expr, .. }
+        ControllerBodyItem::ClassIvarInit { expr, .. }
             if matches!(&*expr.node, roundhouse::expr::ExprNode::Send { method, .. }
                 if method.as_str() == "require_unauthenticated_access")
     )));
