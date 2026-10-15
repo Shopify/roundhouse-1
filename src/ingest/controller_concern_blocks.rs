@@ -46,7 +46,11 @@ use crate::ident::{ClassId, Symbol};
 
 use super::library_class::ConcernClassMethodSpans;
 
-pub(super) fn carry(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
+pub(super) fn carry(
+    app: &mut App,
+    carriers: &[ConcernClassMethodSpans],
+    framework_shadows: &HashSet<ClassId>,
+) {
     if app.concern_model_items.is_empty() || app.controllers.is_empty() {
         return;
     }
@@ -61,7 +65,16 @@ pub(super) fn carry(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
     defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
     let module_includes: HashMap<ClassId, Vec<ClassId>> =
         app.library_classes.iter().map(|lc| (lc.name.clone(), lc.includes.clone())).collect();
-    let walk = Walk { app: &*app, class_side: &class_side, defined: &defined, module_includes: &module_includes };
+    // A `class_attribute` in a block `concern_class_attribute::expand`
+    // carries is its; every other one runs here, as the macro.
+    let carried = super::concern_class_attribute::admitted_carriers(app, carriers, framework_shadows, false);
+    let walk = Walk {
+        app: &*app,
+        class_side: &class_side,
+        defined: &defined,
+        module_includes: &module_includes,
+        carried: &carried,
+    };
 
     // Each controller's own `include`s (a `prepend` is no include), and
     // every Concern its chain reaches.
@@ -142,6 +155,7 @@ struct Walk<'a> {
     class_side: &'a HashMap<ClassId, (Vec<crate::dialect::MethodDef>, HashSet<Symbol>)>,
     defined: &'a HashSet<String>,
     module_includes: &'a HashMap<ClassId, Vec<ClassId>>,
+    carried: &'a HashSet<ClassId>,
 }
 
 impl Walk<'_> {
@@ -163,6 +177,32 @@ impl Walk<'_> {
             .iter()
             .flat_map(|item| super::concern_accessors::included_modules(item, concern, self.defined))
             .collect()
+    }
+
+    /// The `class_attribute` statements of `concern`'s `included do`
+    /// blocks, as written.
+    fn block_class_attributes(&self, concern: &ClassId) -> Vec<Expr> {
+        let mut out = Vec::new();
+        for lc in self.app.library_classes.iter().filter(|lc| &lc.name == concern) {
+            for call in &lc.unknown_calls {
+                let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else {
+                    continue;
+                };
+                if method.as_str() != "included" || !args.is_empty() {
+                    continue;
+                }
+                let ExprNode::Lambda { body, .. } = &*block.node else { continue };
+                let statements: Vec<&Expr> = match &*body.node {
+                    ExprNode::Seq { exprs } => exprs.iter().collect(),
+                    _ => vec![body],
+                };
+                out.extend(statements.into_iter().filter(|stmt| {
+                    matches!(&*stmt.node, ExprNode::Send { recv: None, method, block: None, .. }
+                        if method.as_str() == "class_attribute")
+                }).cloned());
+            }
+        }
+        out
     }
 
     /// Every module `id` brings in: its Concern dependencies, itself, and
@@ -218,6 +258,21 @@ impl Walk<'_> {
             }
         }
         let class_attributes: &[Symbol] = &[];
+        // `class_attribute :x, default: …` of a Concern nothing carries:
+        // the runtime macro declares it on the includer, as `included do`
+        // does in Rails (Core's `ApiVersioningConcern`, reached through
+        // `LoginProtection`). Ahead of the block's other statements, which
+        // read what it declares.
+        if !self.carried.contains(id) {
+            for expr in self.block_class_attributes(id) {
+                let item = ModelBodyItem::Unknown { expr, leading_comments: vec![], leading_blank_line: false };
+                if let ModelBodyItem::Unknown { expr, .. } =
+                    super::app::rehome_carried(item, id, id, class_attributes, self.defined)
+                {
+                    out.push(expr);
+                }
+            }
+        }
         for item in self.items(id) {
             let included = super::concern_accessors::included_modules(item, id, self.defined);
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
