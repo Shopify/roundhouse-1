@@ -186,8 +186,14 @@ impl OwnErrors {
         let classes: std::collections::HashMap<&crate::ident::ClassId, &crate::dialect::LibraryClass> =
             app.library_classes.iter().map(|c| (&c.name, c)).collect();
         let defines = |c: &crate::dialect::LibraryClass| {
+            // A source-written `errors` only: the accumulator the model
+            // lowering synthesizes for a tableless model (synthetic name
+            // span) IS the framework's, and its `add` grounds.
             c.methods.iter().any(|m| {
-                m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "errors" && m.params.is_empty()
+                m.receiver == crate::dialect::MethodReceiver::Instance
+                    && m.name.as_str() == "errors"
+                    && m.params.is_empty()
+                    && !m.name_span.is_synthetic()
             })
         };
         let own = |start: &crate::dialect::LibraryClass| {
@@ -339,7 +345,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // `validate_each`) is humanized at run time. Anything else stays
     // residue: the field would be evaluated twice.
     let field_kind = match &*expr.node {
-        ExprNode::Send { args, .. } if !args.is_empty() && args.len() <= 2 => match &*args[0].node {
+        ExprNode::Send { args, .. } if !args.is_empty() && (args.len() <= 2 || typed_message_option(args)) => match &*args[0].node {
             ExprNode::Lit { value: Literal::Sym { .. } } => Some(true),
             ExprNode::Var { .. } => Some(false),
             _ => None,
@@ -365,6 +371,11 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     let mut args = args.into_iter();
     let field_expr = args.next().expect("checked non-empty");
     let mut msg = args.next().map(fold_str_concat);
+    // `errors.add(:field, :type, message: "…")`: the `message:` option
+    // wins over the type's own text, as with the options spelling below.
+    if let Some(options) = args.next() {
+        msg = Some(fold_str_concat(options));
+    }
     // Rails' options spelling: `errors.add(:field, message: "…")`.
     // The kwargs hash IS the message carrier — unwrap a sole
     // `message:` entry; any other option set stays residue (put the
@@ -740,6 +751,16 @@ fn reads_without_effect_deep(e: &Expr) -> bool {
 /// analyzer types `errors` as on AR records and on includers of
 /// `ActiveModel::Validations`/`Model`: the shared runtime implements it
 /// as that very accumulator, so it grounds like an untyped receiver.
+/// `(:type, message: "…")` after the field: a Symbol error type and a
+/// sole `message:` option.
+fn typed_message_option(args: &[Expr]) -> bool {
+    let [_, kind, options] = args else { return false };
+    matches!(&*kind.node, ExprNode::Lit { value: Literal::Sym { .. } })
+        && matches!(&*options.node, ExprNode::Hash { entries, .. }
+            if entries.len() == 1
+                && matches!(&*entries[0].0.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "message"))
+}
+
 fn names_own_class(ty: &Ty) -> bool {
     let app_class = |v: &Ty| matches!(v, Ty::Class { id, .. } if id.0.as_str() != "ActiveModel::Errors");
     match ty {
