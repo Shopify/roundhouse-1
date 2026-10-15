@@ -302,6 +302,41 @@ pub(super) fn ingest_model_with_enum_constants(
     enum_constants: &EnumConstants,
     model_bases: &super::library_class::ModelBases,
 ) -> IngestResult<Option<Model>> {
+    ingest_model_class_at(source, file, schema, prefixes, base_prefixes, enum_constants, model_bases, None)
+}
+
+/// The byte offsets of the classes `source` declares that descend from an
+/// ActiveRecord base, in source order: a file that declares several
+/// models (a test-support helper's dummy models) is ingested once per
+/// offset ([`ingest_model_class_at`]).
+pub(super) fn active_record_class_offsets(source: &[u8], model_bases: &super::library_class::ModelBases) -> Vec<usize> {
+    let result = super::prism::parse(source, "");
+    let root = result.node();
+    super::util::find_all_classes_with_scope(&root)
+        .into_iter()
+        .filter(|(scope, class)| {
+            class
+                .superclass()
+                .and_then(|n| constant_path_of(&n))
+                .is_some_and(|path| model_bases.contains(&model_bases.resolve_superclass(scope, &path)))
+        })
+        .map(|(_, class)| class.location().start_offset())
+        .collect()
+}
+
+/// [`ingest_model_with_enum_constants`] for the class starting at byte
+/// `class_at`, not the file's primary class.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ingest_model_class_at(
+    source: &[u8],
+    file: &str,
+    schema: &Schema,
+    prefixes: &TablePrefixes,
+    base_prefixes: &TablePrefixes,
+    enum_constants: &EnumConstants,
+    model_bases: &super::library_class::ModelBases,
+    class_at: Option<usize>,
+) -> IngestResult<Option<Model>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -309,9 +344,18 @@ pub(super) fn ingest_model_with_enum_constants(
     // must ingest as `Admin::Report` (the compound `class Admin::Report`
     // spelling already carries its path). Falls back to the scopeless
     // finder for shapes the scoped walk doesn't cover.
-    let (scope, class) = match super::util::primary_class_with_scope(&root) {
-        Some((s, c)) => (s, Some(c)),
-        None => (Vec::new(), find_first_class(&root)),
+    let (scope, class) = match class_at {
+        Some(at) => match super::util::find_all_classes_with_scope(&root)
+            .into_iter()
+            .find(|(_, c)| c.location().start_offset() == at)
+        {
+            Some((s, c)) => (s, Some(c)),
+            None => (Vec::new(), None),
+        },
+        None => match super::util::primary_class_with_scope(&root) {
+            Some((s, c)) => (s, Some(c)),
+            None => (Vec::new(), find_first_class(&root)),
+        },
     };
     let Some(class) = class else {
         return Ok(None);
