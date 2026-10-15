@@ -872,6 +872,28 @@ module ActionController
       raise NotImplementedError, "process_action must be overridden by subclass"
     end
 
+    # Run-time filter hooks: a synthesized `process_action` whose chain
+    # has a class-body macro call (a Concern's `before_action` wrapper)
+    # runs these around its lowered filters. Nothing registers a filter
+    # on the shared runtime, so they do nothing; the ruby overlay
+    # (action_controller_filters.rb) carries the registry.
+    def run_prepended_filters(_action_name)
+      nil
+    end
+
+    def run_appended_filters(_action_name)
+      nil
+    end
+
+    def run_around_filters(_action_name, &block)
+      block.call
+      nil
+    end
+
+    def run_after_filters(_action_name)
+      nil
+    end
+
     # Render a response. The `content_type` kwarg defaults to the
     # current `@content_type` (`text/html; charset=utf-8` on init).
     # Jbuilder-lowered actions pass `content_type: "application/json"`

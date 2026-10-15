@@ -85,6 +85,14 @@ pub(super) struct WrapFilters {
     /// callbacks in reverse order"). Named targets and block-form
     /// (`after_action only: [...] do … end`) alike.
     pub after: Vec<PreambleStmt>,
+    /// The controller chain has a class-body macro call that may register
+    /// filters when the class loads (a Concern's `allow_*` wrapper over
+    /// `prepend_before_action { … }`). The dispatcher then also runs the
+    /// run-time registry's hooks (`run_prepended_filters`,
+    /// `run_appended_filters`, `run_around_filters`, `run_after_filters`;
+    /// runtime/ruby/action_controller/base.rb) around the lowered
+    /// filters. A controller without one emits the dispatcher it always did.
+    pub runtime_hooks: bool,
 }
 
 /// The dispatcher's parameter in a controller that reads `action_name`.
@@ -188,7 +196,18 @@ pub(super) fn synthesize_process_action(
         })
     });
 
+    // Run-time registry hooks: prepended filters lead the chain (after
+    // ParamsWrapper's `Lead`, which Rails runs outside the callbacks).
+    let mut prepended_hooked = !wraps.runtime_hooks;
+    let hook_prepended = |stmts: &mut Vec<Expr>| {
+        stmts.push(runtime_hook("run_prepended_filters", param));
+        stmts.push(halt_if_performed());
+    };
     for p in preamble {
+        if !prepended_hooked && !matches!(p, PreambleStmt::Lead { .. }) {
+            hook_prepended(&mut stmts);
+            prepended_hooked = true;
+        }
         let (stmt, halt_check) = match p {
             PreambleStmt::Call { filter, halt_check } => {
                 (filter_dispatch_stmt(filter, param), *halt_check)
@@ -228,6 +247,14 @@ pub(super) fn synthesize_process_action(
             stmts.push(halt_if_performed());
         }
     }
+    if !prepended_hooked {
+        hook_prepended(&mut stmts);
+    }
+    if wraps.runtime_hooks {
+        // The rest of the run-time before filters follow the lowered ones.
+        stmts.push(runtime_hook("run_appended_filters", param));
+        stmts.push(halt_if_performed());
+    }
 
     if !publics.is_empty() || !inherited.is_empty() {
         // `around_action :m` — `m` runs the action by yielding, so the
@@ -237,6 +264,22 @@ pub(super) fn synthesize_process_action(
         // `track_story_reads` loads the story and the read ribbon the
         // story page renders, then bumps the ribbon after it.
         let mut dispatch = case_dispatch(publics, inherited, deferred_tails, param);
+        if wraps.runtime_hooks {
+            // Run-time arounds wrap the action itself, inside the lowered ones.
+            dispatch = syn(ExprNode::Send {
+                recv: None,
+                method: Symbol::from("run_around_filters"),
+                args: vec![var_ref(param)],
+                block: Some(syn(ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(),
+                    params: vec![],
+                    rest_param: None,
+                    block_param: None,
+                    body: dispatch,
+                    block_style: crate::expr::BlockStyle::Do,
+                })),
+                parenthesized: true,
+            });
+        }
         for f in wraps.around.iter().rev() {
             let wrapped = syn(ExprNode::Send {
                 recv: None,
@@ -259,6 +302,11 @@ pub(super) fn synthesize_process_action(
         stmts.push(dispatch);
         // `after_action :m` — after the action returns (a halted chain
         // returned above; an action that raised is in the rescue).
+        // Run-time after filters were declared after the lowered ones,
+        // so they run first (after callbacks run in reverse).
+        if wraps.runtime_hooks {
+            stmts.push(runtime_hook("run_after_filters", param));
+        }
         for a in wraps.after.iter().rev() {
             stmts.push(match a {
                 PreambleStmt::Call { filter, .. } => filter_dispatch_stmt(filter, param),
@@ -370,6 +418,17 @@ pub(super) fn synthesize_process_action(
         mutates_self: reads_action_name,
         block_param: None,
     }
+}
+
+/// `hook(action_name)` — one of the run-time filter registry's entry points.
+fn runtime_hook(name: &str, param: &str) -> Expr {
+    syn(ExprNode::Send {
+        recv: None,
+        method: Symbol::from(name),
+        args: vec![var_ref(param)],
+        block: None,
+        parenthesized: true,
+    })
 }
 
 /// `return if performed?` — the halting check after a filter that can

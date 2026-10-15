@@ -137,6 +137,11 @@ require_relative "runtime/action_controller"
 # includes and overrides (`_render_with_renderer_json`). Base includes
 # `Renderers::All`. Dynamic Ruby (define_method, send), so ruby lane only.
 require_relative "runtime/action_controller_renderers"
+# `before_action` / `prepend_before_action` / `after_action` / `around_action`
+# called on a controller class at run time (a Concern's class macro), and
+# the hooks the synthesized `process_action` runs them through. Dynamic
+# Ruby (procs, instance_exec), so ruby lane only.
+require_relative "runtime/action_controller_filters"
 # Replace the portable character walk only after loading the shared policy.
 require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.

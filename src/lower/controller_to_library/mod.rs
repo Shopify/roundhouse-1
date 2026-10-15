@@ -1224,7 +1224,14 @@ fn build_methods(
     // `own_filter_inlining_is_ordered`. When it declines, every own
     // filter falls through to the preamble, which emits them in
     // declaration order.
-    let inlining_ordered = own_filter_inlining_is_ordered(controller, &privs);
+    //
+    // A controller whose chain carries a class-body macro call registers
+    // some filters at run time (`chain_has_runtime_macro_calls`), and
+    // those run from the dispatcher; a filter inlined into an action
+    // body would run after them whatever its declaration order was, so
+    // such a controller keeps every own filter in the preamble.
+    let runtime_hooks = chain_has_runtime_macro_calls(controller, all_controllers);
+    let inlining_ordered = !runtime_hooks && own_filter_inlining_is_ordered(controller, &privs);
     let resolve_own = |name: &Symbol, visit: &mut dyn FnMut(&Expr)| {
         if let Some(a) = privs
             .iter()
@@ -1370,7 +1377,8 @@ fn build_methods(
             &privs,
             /*own_privs_inlined=*/ inlining_ordered,
         );
-        let (mut stmts, wraps) = preamble;
+        let (mut stmts, mut wraps) = preamble;
+        wraps.runtime_hooks = runtime_hooks;
         // ParamsWrapper runs before every callback in Rails (it wraps
         // `process_action` outside them), so it leads as `Lead` — not a
         // filter `Block` with empty guards.
@@ -2314,6 +2322,47 @@ fn ancestor_chain<'a>(controller: &Controller, all: &'a [Controller]) -> Vec<&'a
     }
     chain.reverse();
     chain
+}
+
+/// Framework macros in a controller body that lowering consumes (or that
+/// register no filter): their `Unknown` item says nothing about a
+/// run-time filter.
+const NON_FILTER_BODY_MACROS: &[&str] = &[
+    "rescue_from", "helper_method", "helper", "delegate", "attr_reader", "attr_writer",
+    "attr_accessor", "alias_method", "undef_method", "include", "extend", "prepend", "private",
+    "public", "protected", "private_constant", "layout", "protect_from_forgery",
+    "skip_forgery_protection", "default_form_builder", "wrap_parameters", "etag",
+    "http_basic_authenticate_with", "http_basic_authenticate_with", "rate_limit",
+    "private_class_method", "public_class_method", "module_function",
+];
+
+/// Does this controller or an ancestor carry a class-body macro call the
+/// lowering does not consume: a receiverless call that a Concern's
+/// `ClassMethods` (or an app base class) answers, and that may call
+/// `before_action` / `prepend_before_action` / `after_action` /
+/// `around_action` itself when the class loads. Its filters exist only
+/// at run time, so the dispatcher has to ask the registry for them
+/// (`WrapFilters::runtime_hooks`).
+fn chain_has_runtime_macro_calls(controller: &Controller, all: &[Controller]) -> bool {
+    let mut chain = ancestor_chain(controller, all);
+    chain.push(controller);
+    chain.iter().any(|c| {
+        c.body.iter().any(|item| {
+            // `Unknown`: a call nothing recognized. `ClassIvarInit`: a
+            // call of a Concern's `ClassMethods` macro that
+            // `replay_subclass_macros` wrote back as the class-body
+            // statement it is (an assignment there is a configuration
+            // write, not a call).
+            let (ControllerBodyItem::Unknown { expr, .. }
+            | ControllerBodyItem::ClassIvarInit { expr, .. }) = item
+            else {
+                return false;
+            };
+            let ExprNode::Send { recv: None, method, .. } = &*expr.node else { return false };
+            !NON_FILTER_BODY_MACROS.contains(&method.as_str())
+                && crate::ingest::controller::lambda_filter_target(expr).is_none()
+        })
+    })
 }
 
 /// Does this controller or an ancestor read `action_name`, bare or on

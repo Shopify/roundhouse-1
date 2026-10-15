@@ -183,6 +183,15 @@ module ActionController
     %a{abstract}
     def process_action: (Symbol _action_name) -> void
 
+    # The run-time filter hooks a synthesized `process_action` calls when
+    # its controller chain has a class-body macro that may register
+    # filters. No-ops here; the ruby overlay's registry
+    # (action_controller_filters.rb) overrides them.
+    def run_prepended_filters: (Symbol _action_name) -> void
+    def run_appended_filters: (Symbol _action_name) -> void
+    def run_around_filters: (Symbol _action_name) { () -> void } -> void
+    def run_after_filters: (Symbol _action_name) -> void
+
     # `render(body, status:, content_type:, location:)` — sets @body,
     # @status, and optionally @content_type / @location. `status:` is
     # monomorphic Symbol (was untyped Symbol|Integer; real-blog only
