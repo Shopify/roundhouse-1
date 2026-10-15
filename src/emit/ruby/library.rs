@@ -11614,7 +11614,9 @@ fn emit_library_class_decl_inner(
             }
         }
         let text = if railtie {
-            super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
+            let mut carried = carried_loads(effect, app, railtie_root.as_deref(), &mut sources);
+            program_concern_extends(&mut carried, app);
+            super::emit_expr(&carried)
         } else {
             idempotent_const_set(effect).unwrap_or_else(|| super::emit_expr(effect))
         };
@@ -16238,11 +16240,17 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
 fn program_concern_extends(e: &mut Expr, app: &App) {
     // `Base.include(Concern)` (a boot initializer's `on_load` block,
     // lifted into `run_initializer`) takes its extends on `Base`.
+    // `klass.prepend(Concern)` (an autoloader `on_load` hook's block
+    // parameter, Core's BillingApiMockConnection) takes the carrier on
+    // `klass.singleton_class`, as `prepend_features` prepends it there.
     if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node
-        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Const { .. }))
-        && method.as_str() == "include"
+        && recv.as_ref().is_none_or(|r| {
+            matches!(&*r.node, ExprNode::Const { .. }) || (method.as_str() == "prepend" && matches!(&*r.node, ExprNode::Var { .. }))
+        })
+        && matches!(method.as_str(), "include" | "prepend")
         && !args.is_empty()
     {
+        let prepend = method.as_str() == "prepend";
         let recv = recv.clone();
         let names: Option<Vec<ClassId>> = args
             .iter()
@@ -16262,7 +16270,14 @@ fn program_concern_extends(e: &mut Expr, app: &App) {
             for carrier in carriers {
                 let path = std::iter::once(Symbol::from("")).chain(carrier.0.as_str().split("::").map(Symbol::from)).collect();
                 let arg = Expr::new(span, ExprNode::Const { path });
-                exprs.push(Expr::new(span, ExprNode::Send { recv: recv.clone(), method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }));
+                let call = if prepend {
+                    let target = recv.clone().unwrap_or_else(|| Expr::new(span, ExprNode::SelfRef));
+                    let singleton = Expr::new(span, ExprNode::Send { recv: Some(target), method: Symbol::from("singleton_class"), args: vec![], block: None, parenthesized: false });
+                    ExprNode::Send { recv: Some(singleton), method: Symbol::from("prepend"), args: vec![arg], block: None, parenthesized: false }
+                } else {
+                    ExprNode::Send { recv: recv.clone(), method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }
+                };
+                exprs.push(Expr::new(span, call));
             }
             *e = Expr::new(span, ExprNode::Seq { exprs });
         }
