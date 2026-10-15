@@ -145,6 +145,16 @@ module ActionDispatch
       end
     end
 
+    # Rails' `request.cookie_jar`: the jar over this request's cookies,
+    # built once and kept in the env (`ActionDispatch::Cookies::CookieJar.
+    # build`, runtime/ruby/action_controller/cookies.rb). Core's
+    # Checkouts::One::ClientDetails reads `cookie_jar.signed[...]`.
+    def cookie_jar
+      fetch_header("action_dispatch.cookies") do |key|
+        set_header(key, ActionDispatch::Cookies::CookieJar.build(self, cookies))
+      end
+    end
+
     # Rails' `request.authorization`: the header, or one of the names a
     # proxy or rewrite moves it to (the shared Headers table).
     def authorization
