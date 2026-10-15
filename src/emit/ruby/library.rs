@@ -10072,6 +10072,16 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // A class under a model whose column storage moved to a slot
+    // (`column_slot`) reads it there too.
+    let with_slots;
+    let lc = match super::column_slot::for_descendant(lc, app) {
+        Some(copy) => {
+            with_slots = copy;
+            &with_slots
+        }
+        None => lc,
+    };
     // `delegate :m, to: :t` forwards `(...)` in Ruby; the IR's forwarder
     // is the zero-arg one the strict targets get (`App::ruby_delegate_forwarders`).
     // A declaration ingest declined for the strict targets (it needs

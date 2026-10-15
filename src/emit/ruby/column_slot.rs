@@ -83,7 +83,58 @@ fn rename(e: &mut Expr, renames: &BTreeMap<Symbol, Symbol>, only_compiled: bool)
     e.node.for_each_child_mut(&mut |c| rename(c, renames, only_compiled));
 }
 
+thread_local! {
+    /// The renames `apply` settled, by table, for the classes the app
+    /// reopens under a model (`for_descendant`).
+    static SLOTS: std::cell::RefCell<BTreeMap<String, BTreeMap<Symbol, Symbol>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// `lc`, a class that is no model of its own, with the compiled uses of
+/// its model ancestor's renamed storage moved to the slots `apply` chose
+/// (`class ApiCarrierService < CarrierService` carries `has_one` readers
+/// the lowering wrote against `@id`, while the parent's `id` is read from
+/// `@__attr_id`). `None` when nothing in it needs the rename.
+pub(crate) fn for_descendant(lc: &LibraryClass, app: &App) -> Option<LibraryClass> {
+    if SLOTS.with(|s| s.borrow().is_empty()) || app.models.iter().any(|m| m.name == lc.name) {
+        return None;
+    }
+    let mut parent = lc.parent.clone();
+    let mut base = None;
+    for _ in 0..8 {
+        let name = parent.take()?;
+        if let Some(model) = app.models.iter().find(|m| m.name == name) {
+            base = Some(model);
+            break;
+        }
+        parent = app.library_classes.iter().find(|c| c.name == name).and_then(|c| c.parent.clone());
+    }
+    let table = storage_table(base?, app);
+    let renames = SLOTS.with(|s| s.borrow().get(table.as_str()).cloned())?;
+    let mut copy = lc.clone();
+    for m in copy.methods.iter_mut() {
+        let compiled = m.name_span.is_synthetic();
+        rename(&mut m.body, &renames, !compiled);
+    }
+    Some(copy)
+}
+
+/// The table `model`'s columns come from: its own, or, for an STI child
+/// that names none of its own, the nearest model ancestor's.
+fn storage_table<'a>(model: &'a crate::dialect::Model, app: &'a App) -> &'a Symbol {
+    let mut at = model;
+    for _ in 0..8 {
+        if app.schema.tables.contains_key(&at.table.0) {
+            return &at.table.0;
+        }
+        let Some(parent) = at.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)) else { break };
+        at = parent;
+    }
+    &model.table.0
+}
+
 pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
+    SLOTS.with(|s| s.borrow_mut().clear());
     // Per table: the storage ivars of its columns an authored method names.
     let mut colliding: BTreeMap<&str, BTreeSet<Symbol>> = BTreeMap::new();
     for model in &app.models {
@@ -103,6 +154,7 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         let Some(names) = colliding.get(model.table.0.as_str()) else { continue };
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
         let renames: BTreeMap<Symbol, Symbol> = names.iter().map(|n| (n.clone(), slot_name(n.as_str()))).collect();
+        SLOTS.with(|s| s.borrow_mut().insert(model.table.0.as_str().to_string(), renames.clone()));
         for m in lc.methods.iter_mut() {
             let compiled = m.name_span.is_synthetic();
             rename(&mut m.body, &renames, !compiled);
