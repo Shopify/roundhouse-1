@@ -219,13 +219,18 @@ module ActiveRecord
     # spawns: `clone` keeps the singleton class), ahead of Relation's own,
     # so an override's `super` reaches the Relation method. A model's
     # `default_scope { extending(Mod) }` puts it on every relation.
-    def extending(*modules)
-      spawn.extending!(*modules)
+    # As in Rails the modules may come as lists (`extending([A, B])`),
+    # and a block is a module of its own; one `extend(*modules)` keeps
+    # the first listed nearest.
+    def extending(*modules, &block)
+      spawn.extending!(*modules, &block)
     end
 
-    def extending!(*modules)
+    def extending!(*modules, &block)
       unload_records
-      modules.each { |mod| self.extend(mod) }
+      modules << Module.new(&block) if block
+      modules.flatten!
+      extend(*modules) unless modules.empty?
       self
     end
 

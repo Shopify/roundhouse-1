@@ -1108,9 +1108,16 @@ fn nested_blocks(
         let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
         let after_defs = builds_after_parent_defs(parent, kid, app);
-        let at = nested_position(parent, kid, app).or_else(|| after_defs.then(|| declared_at(kid, app)).flatten());
+        // A class the owner's `const_set` builds follows everything the
+        // owner's body writes: that call may be written among its tail
+        // effects (a `self.cacheable = true` below it), and the class
+        // reopens what the call built.
+        let built = const_set_site(kid, app).filter(|site| !site.is_synthetic());
+        let at = nested_position(parent, kid, app)
+            .or_else(|| after_defs.then(|| declared_at(kid, app)).flatten())
+            .or(built);
         blocks.push((at, block));
-        late.push(after_defs && at.is_some());
+        late.push((after_defs || built.is_some()) && at.is_some());
         names.push(kid.name.0.as_str().to_string());
         if inline.is_some() {
             continue;
@@ -10078,6 +10085,16 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // A class under a model whose column storage moved to a slot
+    // (`column_slot`) reads it there too.
+    let with_slots;
+    let lc = match super::column_slot::for_descendant(lc, app) {
+        Some(copy) => {
+            with_slots = copy;
+            &with_slots
+        }
+        None => lc,
+    };
     // `delegate :m, to: :t` forwards `(...)` in Ruby; the IR's forwarder
     // is the zero-arg one the strict targets get (`App::ruby_delegate_forwarders`).
     // A declaration ingest declined for the strict targets (it needs
@@ -11699,7 +11716,7 @@ fn emit_library_class_decl_inner(
             if !std::mem::replace(&mut first, false) {
                 writeln!(s).unwrap();
             }
-            write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
+            write_body_lines(&mut s, &body_pad, &idempotent_const_set(call).unwrap_or_else(|| super::emit_expr(call)));
         }
         // Written at its include (`carried_method`).
         if carried_method(m) {
@@ -11772,7 +11789,7 @@ fn emit_library_class_decl_inner(
     }
     for (_, call) in positioned_statements.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
-        write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
+        write_body_lines(&mut s, &body_pad, &idempotent_const_set(call).unwrap_or_else(|| super::emit_expr(call)));
     }
 
     if !tail_effects.is_empty() && !lc.methods.is_empty() {
@@ -11782,7 +11799,8 @@ fn emit_library_class_decl_inner(
         for line in nested_files_above(lc, effect.span, app, &out_path, &mut nested_required) {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
-        for line in super::emit_expr(effect).lines() {
+        let text = idempotent_const_set(effect).unwrap_or_else(|| super::emit_expr(effect));
+        for line in text.lines() {
             if line.is_empty() {
                 writeln!(s).unwrap();
             } else {
@@ -13958,18 +13976,25 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
 /// calls (`field :filters`) run on them. Replayed as written, as a body
 /// over a base we do not model.
 fn built_by_const_set(lc: &LibraryClass, app: &App) -> bool {
+    const_set_site(lc, app).is_some()
+}
+
+/// The span of the owner's `const_set(:Leaf, ...)` call that builds the
+/// nested class `lc` (`built_by_const_set`).
+fn const_set_site(lc: &LibraryClass, app: &App) -> Option<crate::span::Span> {
     if lc.is_module || lc.parent.is_some() {
-        return false;
+        return None;
     }
-    let Some((owner, leaf)) = lc.name.0.as_str().rsplit_once("::") else { return false };
-    library_classes_named(owner, app).iter().any(|owner| {
-        owner.unknown_calls.iter().any(|call| {
-            let ExprNode::Send { recv, method, args, .. } = &*call.node else { return false };
-            method.as_str() == "const_set"
+    let (owner, leaf) = lc.name.0.as_str().rsplit_once("::")?;
+    library_classes_named(owner, app).iter().find_map(|owner| {
+        owner.unknown_calls.iter().find_map(|call| {
+            let ExprNode::Send { recv, method, args, .. } = &*call.node else { return None };
+            (method.as_str() == "const_set"
                 && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 && args.first().is_some_and(|name| {
                     matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == leaf)
-                })
+                }))
+            .then_some(call.span)
         })
     })
 }
@@ -15464,9 +15489,36 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
             a.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
         }) || extended.iter().any(|m| module_defines(m, name, app, &mut Vec::new()))
     };
+    // A `with_options(optional: true) do attribute(:x, :string) end`
+    // whose block (no parameter: its calls reach the OptionMerger, which
+    // merges the options into each) holds only such macros runs as
+    // written, on the option merger the validations port carries (an app class
+    // includes ActiveModel::Validations, which carries the port). Core's
+    // Customers::RedactCustomerInput declares its optional attributes so.
+    let merged_macros = |call: &Expr| {
+        let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return false };
+        let ExprNode::Lambda { params, rest_param: None, extra_params, body, .. } = &*block.node else { return false };
+        let statements: &[Expr] = match &*body.node {
+            ExprNode::Seq { exprs } => exprs,
+            _ => std::slice::from_ref(body),
+        };
+        method.as_str() == "with_options"
+            && args.len() == 1
+            && params.is_empty()
+            && extra_params.is_empty()
+            && !statements.is_empty()
+            && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            && app.library_classes.iter().any(|c| includes_active_model_validations(c, app))
+            && statements.iter().all(|s| {
+                matches!(&*s.node, ExprNode::Send { recv: None, method, .. } if inherited(method.as_str()))
+            })
+    };
     lc.unknown_calls
         .iter()
         .filter(|call| {
+            if merged_macros(call) {
+                return true;
+            }
             let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
             let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
             on_self && (inherited(method.as_str()) || app_module_extend(lc, call, app).is_some())

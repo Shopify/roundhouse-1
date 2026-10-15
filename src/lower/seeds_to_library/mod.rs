@@ -251,6 +251,12 @@ fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model], rooted: bool
         _ => return None,
     };
     let declared = declared_target(&parent_class, assoc_method.as_str());
+    // `Checkouts::One::ProposalBuilder.new.build` is a constructor and a
+    // method of a plain class, not a child built through an association:
+    // the owner is a record, never a class reference.
+    if matches!(&*parent_expr.node, ExprNode::Const { .. }) {
+        return None;
+    }
     let default_fk = format!("{}_id", crate::naming::snake_case(&parent_class));
     // An association declaring `primary_key:` matches the owner's
     // column, not `id`; its foreign key is the declared one.

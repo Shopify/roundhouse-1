@@ -27,8 +27,8 @@ module ActiveRecord
     def initialize: (Base model, ?bool default_scoped) -> void
     @default_scoped: bool
     def unscoped: () -> Relation
-    def extending: (*::Module modules) -> Relation
-    def extending!: (*::Module modules) -> Relation
+    def extending: (*(::Module | ::Array[::Module]) modules) ?{ () -> void } -> Relation
+    def extending!: (*(::Module | ::Array[::Module]) modules) ?{ () -> void } -> Relation
     def build: (?Hash[Symbol, untyped] attrs) -> Base
     def create: (?Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
     def create!: (?Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
