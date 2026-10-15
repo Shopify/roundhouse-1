@@ -179,6 +179,60 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
 #[derive(Default)]
 pub(super) struct FiredHooks {
     pub bases: BTreeMap<String, String>,
+    /// The modules that `extend GraphQL::Shopify::ConfigureType`, by full
+    /// name ([`configure_modules`]): each `configure_type` on one defines
+    /// a `configure_<type>` singleton method that registers its block with
+    /// `ActiveSupport.on_load`, which runs it with `self` the type.
+    pub configure_modules: crate::det::HashSet<String>,
+}
+
+/// The modules `extend GraphQL::Shopify::ConfigureType` in the app's and
+/// the compiled gems' non-test sources (graphql-shopify
+/// lib/graphql/shopify/configure_type.rb), by full name.
+pub(super) fn configure_modules(sources: &[crate::span::SourceFile], dir: &Path) -> crate::det::HashSet<String> {
+    fn walk(stmts: Vec<Node<'_>>, nesting: &[String], out: &mut crate::det::HashSet<String>) {
+        for stmt in stmts {
+            if let Some(call) = stmt.as_call_node() {
+                let extends = call.receiver().is_none()
+                    && constant_id_str(&call.name()) == "extend"
+                    && call.arguments().is_some_and(|a| {
+                        a.arguments().iter().any(|arg| {
+                            constant_path_segments_strs(&arg)
+                                .is_some_and(|p| p.join("::").trim_start_matches("::") == "GraphQL::Shopify::ConfigureType")
+                        })
+                    });
+                if extends && !nesting.is_empty() {
+                    out.insert(nesting.join("::"));
+                }
+                continue;
+            }
+            let (path, body) = if let Some(class) = stmt.as_class_node() {
+                (class_name_path(&class), class.body())
+            } else if let Some(module) = stmt.as_module_node() {
+                (module_name_path(&module), module.body())
+            } else {
+                continue;
+            };
+            let Some(path) = path else { continue };
+            let full: Vec<String> = nesting.iter().cloned().chain(path).collect();
+            walk(body.map(flatten_statements).unwrap_or_default(), &full, out);
+        }
+    }
+    let mut out = crate::det::HashSet::default();
+    for source in sources {
+        if !source.path.ends_with(".rb") || !source.text.contains("GraphQL::Shopify::ConfigureType") {
+            continue;
+        }
+        let rel = relative(dir, Path::new(&source.path));
+        if rel.split('/').any(|seg| seg == "test" || seg == "spec") {
+            continue;
+        }
+        let result = ruby_prism::parse(source.text.as_bytes());
+        if let Some(program) = result.node().as_program_node() {
+            walk(program.statements().body().iter().collect(), &[], &mut out);
+        }
+    }
+    out
 }
 
 /// Every `ActiveSupport.run_load_hooks(<literal>, …)` in the app's
@@ -1018,7 +1072,11 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         if let Some(call) = stmt.as_call_node() {
             let name = constant_id_str(&call.name());
             if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
-                if DEFERRED.contains(&name) {
+                // `GraphApi::Admin.configure_query_root do … end`: the
+                // block is an `on_load` block of the type, run later with
+                // `self` the type (`ConfigureType`).
+                let configure = self.configure_call(&call);
+                if DEFERRED.contains(&name) || configure {
                     // The call minus its block.
                     if let Some(r) = call.receiver() {
                         self.visit(&r);
@@ -1030,8 +1088,8 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
                     }
                     // A load hook's block runs on its base; a Zeitwerk
                     // callback's at `main`, like the rest of the file.
-                    let mut hook = name == "on_load";
-                    if hook {
+                    let mut hook = name == "on_load" || configure;
+                    if name == "on_load" {
                         match self.hook(&call) {
                             Ok(Hook::Fired) => {}
                             Ok(Hook::Autoload) => hook = false,
@@ -1078,6 +1136,17 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         if self.reason.is_none() {
             self.reason = Some(reason.into());
         }
+    }
+
+    /// Whether `call` is `<Module>.configure_<type>` of a module that
+    /// extends `GraphQL::Shopify::ConfigureType`, given a literal block.
+    fn configure_call(&self, call: &ruby_prism::CallNode<'_>) -> bool {
+        if !constant_id_str(&call.name()).starts_with("configure_") || self.fired.configure_modules.is_empty() {
+            return false;
+        }
+        call.receiver()
+            .and_then(|r| constant_path_segments_strs(&r))
+            .is_some_and(|p| self.fired.configure_modules.contains(p.join("::").trim_start_matches("::")))
     }
 
     /// Which `on_load` `call` is, or why it cannot run.
