@@ -9439,6 +9439,14 @@ pub(crate) fn apply_constant_rooting(
         let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes, namespaces: &namespaces, value_constants: &value_constants };
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, &shadowing, &scope, &known);
+            // A parameter default is read in the same scope as the body
+            // (`def enable(buyer_id: Box::TOKEN)` in `module Dp; class Box`
+            // beside a `Dp::Dp`: `Dp::Box::TOKEN` bound `Dp` to the sibling).
+            for param in &mut m.params {
+                if let Some(default) = &mut param.default {
+                    root_shadowed_constants(default, &shadowing, &scope, &known);
+                }
+            }
         }
         // The class body is the same lexical scope as its methods: a
         // constant's value and a class-level `@ivar = …` read their
