@@ -9374,7 +9374,18 @@ fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param) ->
         .as_ref()
         .and_then(|d| d.ty.clone())
         .filter(|t| !matches!(t, Ty::Var { .. }));
+    // An empty `[]` default is no evidence of an Array: a caller outside
+    // the sites seen here may pass a Hash, a Symbol or nil (below). Sites
+    // that pass Array literals do not close it either, so a parameter whose
+    // only evidence is Array stays open: graphql-easy-testing's
+    // `mutation_query(selections: [])` is called with an Array by one test
+    // and with a Hash by every `on_mutation` caller.
+    let open_array_default = default.is_some() && param.default.as_ref().is_some_and(is_empty_array_literal);
     match (observed, default) {
+        (Some(o), Some(d)) if open_array_default => {
+            let joined = crate::analyze::body::union_of(o, d);
+            Some(if matches!(joined, Ty::Array { .. }) { Ty::Untyped } else { joined })
+        }
         (Some(o), Some(d)) => Some(crate::analyze::body::union_of(o, d)),
         (Some(o), None) => Some(o),
         // A `nil` default says nothing about what a caller passes. With

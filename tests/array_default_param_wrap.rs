@@ -30,9 +30,13 @@ end
 "#;
 
 fn emitted(target: BuildTarget) -> String {
+    emitted_model(target, MODEL)
+}
+
+fn emitted_model(target: BuildTarget, model: &str) -> String {
     let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define(version: 1) do\nend\n".to_vec());
-    tree.insert(PathBuf::from("app/models/gen.rb"), MODEL.as_bytes().to_vec());
+    tree.insert(PathBuf::from("app/models/gen.rb"), model.as_bytes().to_vec());
     let mut app = ingest_app_from_tree(tree).expect("ingest");
     roundhouse::session::analyze_and_lower(&mut app);
     let files = target_files(&app, Path::new("fixtures/tiny-blog"), target).expect("emit");
@@ -66,4 +70,56 @@ fn a_hash_passed_for_an_empty_array_default_is_wrapped() {
         "[[], [:a], [{doc: [:id]}], [:id]]",
         "{src}"
     );
+}
+
+/// The same, with the signature the gem writes (`selections: selection`,
+/// an alias for a name, a Hash or an Array of them): the declared type
+/// names a Hash, so it is no evidence of an Array either.
+const SIGNED_MODEL: &str = r#"class Gen
+  #: type selectionHash = Hash[Symbol, Array[Symbol]]
+  #: type selection = Symbol | selectionHash | Array[Symbol | selectionHash]
+
+  #: (?selections: selection) -> untyped
+  def on(selections: [])
+    query(selections: selections)
+  end
+
+  #: (?selections: selection) -> untyped
+  def query(selections: [])
+    Array.wrap(selections)
+  end
+end
+"#;
+
+#[test]
+fn a_signed_union_alias_keeps_the_wrap() {
+    let src = emitted_model(BuildTarget::Ruby, SIGNED_MODEL);
+    assert!(
+        src.contains("Array.wrap(selections)") || src.contains("is_a?(Array)"),
+        "the wrap of a `selection` parameter was folded away:\n{src}"
+    );
+}
+
+/// A second caller that passes an Array literal is one visible site; the
+/// pass-through from the untyped `on` is the other. The parameter is
+/// still open: `on`'s callers are not sites the analyzer sees.
+const TWO_CALLERS_MODEL: &str = r#"class Gen
+  def on(args: {}, selections: [])
+    query(args: args, selections: selections)
+  end
+
+  def fixed
+    query(selections: [:id])
+  end
+
+  def query(args: {}, selections: [])
+    Array.wrap(selections)
+  end
+end
+"#;
+
+#[test]
+fn an_array_literal_site_does_not_close_the_parameter() {
+    let src = emitted_model(BuildTarget::Ruby, TWO_CALLERS_MODEL);
+    assert!(src.contains("Array.wrap(selections)") || src.contains("is_a?(Array)"), "{src}");
 }
