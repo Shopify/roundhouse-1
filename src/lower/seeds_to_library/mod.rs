@@ -251,6 +251,21 @@ fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model], rooted: bool
         _ => return None,
     };
     let declared = declared_target(&parent_class, assoc_method.as_str());
+    // An undeclared reader the owner DEFINES as a plain method
+    // (`Theme#files` returning an `AssetCloud::ThemeFiles`) is not an
+    // association whose target the name can be guessed from: leave the
+    // call to run that method.
+    if declared.is_none()
+        && models.iter().any(|m| {
+            m.name.0.as_str() == parent_class
+                && m.methods().any(|d| {
+                    matches!(d.receiver, crate::dialect::MethodReceiver::Instance)
+                        && d.name.as_str() == assoc_method.as_str()
+                })
+        })
+    {
+        return None;
+    }
     let default_fk = format!("{}_id", crate::naming::snake_case(&parent_class));
     // An association declaring `primary_key:` matches the owner's
     // column, not `id`; its foreign key is the declared one.
@@ -299,6 +314,10 @@ fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model], rooted: bool
                 new_entries.push(fk_entry);
                 Expr::new(arg.span, ExprNode::Hash { entries: new_entries, kwargs: *kwargs })
             }
+            // A literal that is not a Hash (`files.build("a.liquid")`) has no
+            // `merge`: the constructor takes something other than attributes.
+            ExprNode::Lit { value } if !matches!(value, crate::expr::Literal::Nil) => return None,
+            ExprNode::Array { .. } => return None,
             _ => Expr::new(
                 arg.span,
                 ExprNode::Send {
