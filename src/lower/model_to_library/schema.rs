@@ -4189,10 +4189,47 @@ fn schema_default_literal(col: &Column) -> Option<Expr> {
             )),
             _ => None,
         },
-        // Temporal / binary / json / reference defaults are SQL
-        // expressions as often as they are literals (`-> { "DATETIME(
-        // 'now') }`), and none of the corpus declares one that isn't.
+        // A temporal default is a literal only when it reads as one
+        // (`DEFAULT '1970-01-01 00:00:00'::timestamp`, Core's
+        // `last_event_timestamp NOT NULL`): without it the unset slot is
+        // `""` and the INSERT sends `''` to PostgreSQL, which aborts the
+        // transaction (invalid input syntax for type timestamp).
+        ColumnType::Date | ColumnType::DateTime | ColumnType::Time => {
+            temporal_literal(&col.col_type, raw).then(|| lit_str(raw.clone()))
+        }
+        // Binary / json / reference defaults are SQL expressions as
+        // often as they are literals (`-> { "DATETIME('now') }`), and
+        // none of the corpus declares one that isn't.
         _ => None,
+    }
+}
+
+/// `YYYY-MM-DD`, `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` (date and datetime
+/// columns) or `HH:MM:SS[.ffffff]` (time columns) — and nothing an
+/// expression such as `CURRENT_TIMESTAMP` or `now()` could be.
+fn temporal_literal(col_type: &crate::schema::ColumnType, raw: &str) -> bool {
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let clock = |s: &str| {
+        let (hms, frac) = match s.split_once('.') {
+            Some((hms, frac)) => (hms, Some(frac)),
+            None => (s, None),
+        };
+        let parts: Vec<&str> = hms.split(':').collect();
+        parts.len() == 3
+            && parts.iter().all(|p| digits(p, 2))
+            && frac.is_none_or(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let date = |s: &str| {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 3 && digits(parts[0], 4) && digits(parts[1], 2) && digits(parts[2], 2)
+    };
+    match col_type {
+        crate::schema::ColumnType::Time => clock(raw),
+        crate::schema::ColumnType::Date => date(raw),
+        _ => match raw.split_once([' ', 'T']) {
+            Some((d, t)) => date(d) && clock(t),
+            None => date(raw),
+        },
     }
 }
 

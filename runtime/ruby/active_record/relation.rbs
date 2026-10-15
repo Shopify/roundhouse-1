@@ -10,6 +10,41 @@ module ActiveRecord
     def run: () -> nil
   end
 
+  class EagerNode
+    @reflection: untyped
+    @parent: EagerNode?
+    @klass: untyped
+    @ref: String
+    @children: Array[EagerNode]
+    @index: Integer
+    @leftover: Array[untyped]?
+    def reflection: () -> untyped
+    def parent: () -> EagerNode?
+    def klass: () -> untyped
+    def ref: () -> String
+    def children: () -> Array[EagerNode]
+    def index: () -> Integer
+    def index=: (Integer value) -> Integer
+    def leftover: () -> Array[untyped]?
+    def leftover=: (Array[untyped]? value) -> Array[untyped]?
+    def initialize: (untyped reflection, EagerNode? parent, String ref) -> void
+    def name: () -> Symbol
+    def collection?: () -> bool
+  end
+
+  class EagerPlan
+    @roots: Array[EagerNode]
+    @nodes: Array[EagerNode]
+    @frags: Array[String]
+    @leftover: Array[untyped]?
+    def roots: () -> Array[EagerNode]
+    def nodes: () -> Array[EagerNode]
+    def frags: () -> Array[String]
+    def leftover: () -> Array[untyped]?
+    def leftover=: (Array[untyped]? value) -> Array[untyped]?
+    def initialize: () -> void
+  end
+
   # Lazy chainable query builder. Chain methods return `self` (typed as
   # Relation); terminals execute and return rows / scalars. Loaded
   # records are `Base` as an interim (same as first/take) — not
@@ -64,6 +99,8 @@ module ActiveRecord
     @records: Array[Base]?
     @includes: Array[Symbol | Hash[Symbol, Symbol]]
     @referenced: Array[String]
+    @eager_loading: bool
+    @eager_frags: Array[String]
 
     @from: String?
     @annotations: Array[String]
@@ -177,7 +214,7 @@ module ActiveRecord
     def join_fragment: (untyped spec, ?String kind) -> String
     def reflected_join_sql: (untyped owner, untyped spec, String kind) -> String
     def reflect_join_hop: (untyped owner, untyped name) -> untyped
-    def reflection_join_sql: (untyped owner, untyped reflection, String kind, ?String? table_alias) -> String
+    def reflection_join_sql: (untyped owner, untyped reflection, String kind, ?String? table_alias, ?String? owner_ref) -> String
     def join_key_list: (untyped key) -> Array[String]
     def left_outer_joins: (untyped spec) -> Relation
     def left_outer_joins!: (untyped spec) -> Relation
@@ -401,6 +438,16 @@ module ActiveRecord
     def exists_sql: (Integer n) -> String
     def reference_tables: (Hash[String | Symbol, untyped] hash) -> void
     def sync_eager_joins: () -> void
+    def eager_loading?: () -> bool
+    def referenced_collection_hop?: (untyped owner, untyped spec) -> bool
+    def sync_eager_plan_joins: () -> EagerPlan
+    def build_eager_plan: () -> EagerPlan
+    def eager_build: (untyped owner, EagerNode? owner_node, untyped spec, Hash[String, Integer] counts, EagerPlan plan) -> untyped
+    def eager_hop: (untyped owner, EagerNode? owner_node, Symbol name, untyped nested, Hash[String, Integer] counts, EagerPlan plan) -> untyped
+    def eager_joinable?: (untyped owner, untyped reflection, Symbol name) -> bool
+    def load_eager_records: (EagerPlan plan) -> Array[Base]
+    def qualify_eager_order: (String term) -> String
+    def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
     def nested_table: (String | Symbol key) -> [String, untyped]
     def associated_model_by_table: (String name) -> untyped
     def tuple_predicate: (Array[untyped] columns, untyped val) -> String

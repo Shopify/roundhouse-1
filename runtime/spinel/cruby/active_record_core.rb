@@ -410,7 +410,7 @@ module ActiveRecord
     class AssociationReflection
       attr_reader :name, :active_record
 
-      def initialize(name, target, foreign_key, options, active_record, unsupported: [], instance_dependent_scope: false)
+      def initialize(name, target, foreign_key, options, active_record, unsupported: [], instance_dependent_scope: false, scoped: false)
         @name = name
         @target = target
         @foreign_key = foreign_key
@@ -418,6 +418,35 @@ module ActiveRecord
         @active_record = active_record
         @unsupported = unsupported
         @instance_dependent_scope = instance_dependent_scope
+        @scoped = scoped || instance_dependent_scope
+      end
+
+      # Whether the declaration has a scope lambda (Rails' `scope`, which
+      # an automatic inverse refuses); the lambda itself is not carried.
+      def _roundhouse_scoped?
+        @scoped
+      end
+
+      # reflection.rb's `inverse_name`: the `inverse_of:` option when the
+      # declaration names one (`false` opts out), else the automatic
+      # inverse Rails finds on the target by the owner's name.
+      def inverse_name
+        unless defined?(@inverse_name)
+          @inverse_name = options.fetch(:inverse_of) { automatic_inverse_of }
+        end
+        @inverse_name
+      end
+      private :inverse_name
+
+      def has_inverse?
+        inverse_name
+      end
+
+      # reflection.rb's `inverse_of`: the target class's reflection named
+      # by `inverse_name`, nil without one.
+      def inverse_of
+        return nil unless inverse_name
+        @inverse_of ||= klass.reflect_on_association(inverse_name)
       end
 
       # reflection.rb `check_eager_loadable!`: a scope that takes the
@@ -548,6 +577,48 @@ module ActiveRecord
           !@options.nil? && @unsupported.empty?
         end
 
+        VALID_AUTOMATIC_INVERSE_MACROS = [:has_many, :has_one, :belongs_to].freeze
+        INVALID_AUTOMATIC_INVERSE_OPTIONS = [:through, :foreign_key].freeze
+
+        # reflection.rb's `automatic_inverse_of`: the target's association
+        # named after the owner (`Order` -> `:order`; the plural too when
+        # the owner class says it inverts those), when it takes this
+        # association's foreign key and neither side forbids it.
+        def automatic_inverse_of
+          return nil unless can_find_inverse_of_automatically?(self)
+          inverse_name = ActiveSupport::Inflector.underscore(options[:as] || active_record.name.demodulize).to_sym
+          reflection = klass.reflect_on_association(inverse_name)
+          if reflection.nil? && active_record.respond_to?(:automatically_invert_plural_associations) &&
+              active_record.automatically_invert_plural_associations
+            reflection = klass.reflect_on_association(ActiveSupport::Inflector.pluralize(inverse_name))
+          end
+          inverse_name if valid_inverse_reflection?(reflection)
+        end
+
+        def valid_inverse_reflection?(reflection)
+          !reflection.nil? &&
+            !reflection.equal?(self) &&
+            foreign_key == reflection.foreign_key &&
+            klass <= reflection.active_record &&
+            can_find_inverse_of_automatically?(reflection, true)
+        end
+
+        def can_find_inverse_of_automatically?(reflection, inverse_reflection = false)
+          reflection.options[:inverse_of] != false &&
+            VALID_AUTOMATIC_INVERSE_MACROS.include?(reflection.macro) &&
+            INVALID_AUTOMATIC_INVERSE_OPTIONS.none? { |opt| reflection.options[opt] } &&
+            scope_allows_automatic_inverse_of?(reflection, inverse_reflection)
+        end
+
+        def scope_allows_automatic_inverse_of?(reflection, inverse_reflection)
+          if inverse_reflection
+            !reflection._roundhouse_scoped?
+          else
+            !reflection._roundhouse_scoped? ||
+              (reflection.klass.respond_to?(:automatic_scope_inversing) && reflection.klass.automatic_scope_inversing)
+          end
+        end
+
         # A `:foreign_key` / `:primary_key` option as reflection.rb
         # normalizes it: a frozen String, or an Array of them.
         def _roundhouse_key_names(key)
@@ -633,8 +704,8 @@ module ActiveRecord
     class BelongsToReflection < AssociationReflection
       attr_reader :foreign_type
 
-      def initialize(name, foreign_key, class_name, foreign_type, primary_key, options = nil, active_record = nil, unsupported: [])
-        super(name, class_name, foreign_key, options, active_record, unsupported: unsupported)
+      def initialize(name, foreign_key, class_name, foreign_type, primary_key, options = nil, active_record = nil, unsupported: [], scoped: false)
+        super(name, class_name, foreign_key, options, active_record, unsupported: unsupported, scoped: scoped)
         @foreign_type = foreign_type
         @primary_key = primary_key
       end
@@ -693,6 +764,8 @@ module ActiveRecord
 
       def name = @delegate_reflection.name
       def options = @delegate_reflection.options
+      def inverse_of = @delegate_reflection.inverse_of
+      def _roundhouse_scoped? = @delegate_reflection._roundhouse_scoped?
       def macro = @delegate_reflection.macro
       def active_record = @delegate_reflection.active_record
       def class_name = @delegate_reflection.class_name

@@ -352,6 +352,11 @@ module ActiveRecord
         false
       end
 
+      # abstract_adapter.rb: INSERT ... RETURNING is opt-in per adapter.
+      def supports_insert_returning?
+        false
+      end
+
       # abstract/database_statements.rb query_command: a statement without
       # rows on this adapter's session, recorded and instrumented as every
       # statement is.

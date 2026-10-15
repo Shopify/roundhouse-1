@@ -880,6 +880,47 @@ end
     assert!(rendered.contains("Float { value: 0.0 }"), "decimal default not a float: {rendered}");
 }
 
+/// A temporal column's literal default backs the unset attribute, as a
+/// string default does: Core's `last_event_timestamp timestamp NOT NULL
+/// DEFAULT '1970-01-01 00:00:00'` otherwise started as `""`, and the INSERT
+/// sent `''` to PostgreSQL (invalid input syntax for type timestamp,
+/// aborting the transaction). A default that is an expression
+/// (`now()`) is not a literal and leaves the slot unset.
+#[test]
+fn temporal_literal_default_backs_the_unset_attribute() {
+    use roundhouse::ingest::{ingest_model, ingest_structure_sql};
+
+    let schema = ingest_structure_sql(
+        br#"
+CREATE TABLE public.assignments (
+    id bigint NOT NULL,
+    last_event_timestamp timestamp without time zone DEFAULT '1970-01-01 00:00:00'::timestamp without time zone NOT NULL,
+    starts_on date DEFAULT '2026-01-31'::date,
+    opens_at time without time zone DEFAULT '09:30:00'::time without time zone,
+    created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL
+);
+"#,
+        "db/structure.sql",
+    )
+    .expect("ingest structure");
+    let model = ingest_model(
+        b"class Assignment < ApplicationRecord\nend\n",
+        "app/models/assignment.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let init = lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize");
+    let rendered = format!("{:?}", body_stmts(init));
+    for literal in ["1970-01-01 00:00:00", "2026-01-31", "09:30:00"] {
+        assert!(rendered.contains(literal), "temporal default {literal} missing: {rendered}");
+    }
+    assert!(!rendered.contains("now()"), "an expression became a default: {rendered}");
+}
+
 #[test]
 fn raw_slot_columns_route_through_writers_in_initialize_and_presence() {
     use roundhouse::ingest::{ingest_model, ingest_schema};
