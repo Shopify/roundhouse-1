@@ -1033,6 +1033,11 @@ module ActiveRecord
         database_version >= 12_00_00 # >= 12.0
       end
 
+      # postgresql_adapter.rb: every supported server returns inserted columns.
+      def supports_insert_returning?
+        true
+      end
+
       def database_version # :nodoc:
         @database_version ||= valid_raw_connection.server_version
       end

@@ -30,6 +30,51 @@ module ActiveRecord
     end
   end
 
+  # One association hop of an eager load, Rails' JoinDependency::
+  # JoinAssociation: the reflection, the node it hangs off (nil for the
+  # base model), the table reference its JOIN names (the table, or the
+  # alias Rails' AliasTracker gave it) and the `AS` column index its
+  # primary key is selected under.
+  class EagerNode
+    attr_reader :reflection, :parent, :klass, :ref, :children
+    attr_accessor :index, :leftover
+
+    def initialize(reflection, parent, ref)
+      @reflection = reflection
+      @parent = parent
+      @klass = reflection.klass
+      @ref = ref
+      @children = []
+      @index = 0
+      @leftover = nil
+    end
+
+    def name
+      @reflection.name
+    end
+
+    def collection?
+      m = @reflection.macro
+      m == :has_many || m == :has_and_belongs_to_many
+    end
+  end
+
+  # The join tree of a relation's `eager_load` / referenced `includes`
+  # (JoinDependency): the nodes in JOIN order, the LEFT OUTER JOIN
+  # fragments, and the specs no JOIN can express (a through, polymorphic
+  # or STI hop), which stay lazy preloads.
+  class EagerPlan
+    attr_reader :roots, :nodes, :frags
+    attr_accessor :leftover
+
+    def initialize
+      @roots = []
+      @nodes = []
+      @frags = []
+      @leftover = nil
+    end
+  end
+
   # A lazy, chainable query builder — the metaprogramming-free analog of
   # ActiveRecord::Relation. Lowered model code drives it: `scope`s become
   # class methods that take/return a Relation, associations return one,
@@ -86,6 +131,8 @@ module ActiveRecord
       @offset = nil
       @includes = []
       @referenced = []
+      @eager_loading = false
+      @eager_frags = []
       @skip_preloading = false
       # Rails' NullRelation flag: `Model.none` and `where(id: [])` must not
       # hit the database. Chain methods call `unload_records`, which keeps
@@ -847,7 +894,11 @@ module ActiveRecord
       when :limit then @limit = nil
       when :offset then @offset = nil
       when :joins, :left_outer_joins then @joins = []
-      when :includes, :eager_load, :preload then @includes = []
+      when :includes, :eager_load, :preload
+        @includes = []
+        @eager_loading = false
+        @joins = @joins.reject { |j| @eager_frags.include?(j) }
+        @eager_frags = []
       when :from then @from = nil
       when :annotate then @annotations = []
       when :readonly then @readonly = false
@@ -1292,7 +1343,7 @@ module ActiveRecord
     # JoinDependency's join for one reflection: a `through` is its
     # through hop then its source hop off the through model, every hop
     # carrying `kind`.
-    def reflection_join_sql(owner, reflection, kind, table_alias = nil)
+    def reflection_join_sql(owner, reflection, kind, table_alias = nil, owner_ref = nil)
       reflection.check_eager_loadable! if reflection.respond_to?(:check_eager_loadable!)
       if reflection.through_reflection?
         through = reflection.through_reflection
@@ -1316,8 +1367,8 @@ module ActiveRecord
         raise NotImplementedError, "roundhouse: #{name} on #{owner}: the target #{target} is an STI subclass; its type condition is not resolved at runtime"
       end
       table = target._table_sql
-      own = owner._table_sql
-      if table == own
+      own = owner_ref.nil? ? owner._table_sql : owner_ref
+      if table_alias.nil? && table == own
         raise NotImplementedError, "roundhouse: #{name} on #{owner}: a self join needs a table alias, which is not resolved at runtime"
       end
       scope_sql = target._join_scope_sql
@@ -1367,9 +1418,18 @@ module ActiveRecord
     # collection association is not joined: its rows would repeat the parent,
     # which needs Rails' JoinDependency de-duplication, and the where on its
     # table raises PostgreSQL's missing FROM-clause entry as before.
+    #
+    # An `eager_load`, or an `includes` whose referenced table is a
+    # collection, is Rails' `eager_loading?`: the whole include tree is
+    # JOINed (`sync_eager_plan_joins`) and `load_eager_records` folds the
+    # rows back into one record per parent.
     def sync_eager_joins
-      return if @referenced.empty? || @includes.empty?
       return unless @model.respond_to?(:reflect_on_association)
+      if eager_loading?
+        sync_eager_plan_joins
+        return
+      end
+      return if @referenced.empty? || @includes.empty?
       @includes.each do |spec|
         next unless spec.is_a?(Symbol)
         reflection = @model.reflect_on_association(spec)
@@ -1384,6 +1444,259 @@ module ActiveRecord
         next if @joins.any? { |j| j == join || j.include?("JOIN #{sql_table} ") }
         @joins << join
       end
+    end
+
+    # Rails' `eager_loading?`: an `eager_load`, or an `includes` of a
+    # collection whose table a where hash names (`references`).
+    def eager_loading?
+      return false if @includes.empty?
+      return true if @eager_loading
+      return false if @referenced.empty?
+      referenced_collection_hop?(@model, @includes)
+    end
+
+    def referenced_collection_hop?(owner, spec)
+      case spec
+      when Symbol, String
+        reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(spec.to_sym) : nil
+        return false if reflection.nil?
+        return false unless reflection.macro == :has_many || reflection.macro == :has_and_belongs_to_many
+        @referenced.include?(spec.to_s) || @referenced.include?(reflection.klass.table_name.to_s)
+      when Array
+        spec.any? { |el| referenced_collection_hop?(owner, el) }
+      when Hash
+        spec.any? do |name, nested|
+          reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(name.to_sym) : nil
+          next false if reflection.nil?
+          referenced_collection_hop?(owner, name) || referenced_collection_hop?(reflection.klass, nested)
+        end
+      else
+        false
+      end
+    end
+
+    # Replaces this relation's eager LEFT OUTER JOINs in `@joins` with the
+    # ones the current include tree and string joins call for (the alias
+    # names depend on every table already joined), and answers the plan.
+    def sync_eager_plan_joins
+      own_lists
+      plan = build_eager_plan
+      old = @eager_frags
+      unless plan.frags == old
+        @joins = copy_string_list(@joins.reject { |j| old.include?(j) })
+        plan.frags.each { |frag| @joins << frag }
+        @eager_frags = plan.frags
+      end
+      plan
+    end
+
+    # JoinDependency over `@includes`: every joinable hop becomes a node
+    # whose table is aliased as Rails' AliasTracker does (the table itself
+    # on first use, then `<reflection plural>_<parent table>`, then a
+    # `_<n>` suffix), depth first in spec order. A hop no JOIN expresses
+    # (through, polymorphic, habtm, an STI target, a composite key, a
+    # model without the `_preload_<name>` setter) stays a lazy preload.
+    def build_eager_plan
+      plan = EagerPlan.new
+      pk = @model.primary_key
+      return plan if pk.nil? || pk.is_a?(Array)
+      counts = {}
+      counts[@model.table_name.to_s] = 1
+      @joins.each do |j|
+        next if @eager_frags.include?(j)
+        j.scan(/JOIN\s+"?([A-Za-z0-9_.]+)"?/i).each do |m|
+          counts[m[0]] = (counts[m[0]] || 0) + 1
+        end
+      end
+      plan.leftover = eager_build(@model, nil, @includes, counts, plan)
+      plan
+    end
+
+    def eager_build(owner, owner_node, spec, counts, plan)
+      case spec
+      when Symbol, String
+        eager_hop(owner, owner_node, spec.to_sym, nil, counts, plan)
+      when Array
+        left = []
+        spec.each do |el|
+          rest = eager_build(owner, owner_node, el, counts, plan)
+          if rest.is_a?(Array)
+            rest.each { |r| left << r }
+          elsif !rest.nil?
+            left << rest
+          end
+        end
+        left.empty? ? nil : left
+      when Hash
+        left = []
+        spec.each do |name, nested|
+          rest = eager_hop(owner, owner_node, name.to_sym, nested, counts, plan)
+          left << rest unless rest.nil?
+        end
+        left.empty? ? nil : left
+      else
+        nil
+      end
+    end
+
+    # One hop. Answers the spec to keep lazy, or nil when it is joined.
+    def eager_hop(owner, owner_node, name, nested, counts, plan)
+      reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(name) : nil
+      return (nested.nil? ? name : { name => nested }) unless eager_joinable?(owner, reflection, name)
+      siblings = owner_node.nil? ? plan.roots : owner_node.children
+      node = siblings.find { |n| n.name == reflection.name }
+      if node.nil?
+        klass = reflection.klass
+        table = klass.table_name.to_s
+        table_alias = nil
+        if (counts[table] || 0) == 0
+          counts[table] = 1
+          # `where(widget: {...})` names the association, not the table:
+          # the first use is aliased to the key, as the compiler renders
+          # the `joins` of the same key.
+          table_alias = reflection.name.to_s if reflection.name.to_s != table && @referenced.include?(reflection.name.to_s)
+        else
+          aliased = "#{reflection.name.to_s.pluralize}_#{owner.table_name}"
+          used = (counts[aliased] || 0) + 1
+          counts[aliased] = used
+          table_alias = used > 1 ? "#{aliased}_#{used}" : aliased
+        end
+        owner_ref = owner_node.nil? ? nil : owner_node.ref
+        plan.frags << reflection_join_sql(owner, reflection, "LEFT OUTER JOIN", table_alias, owner_ref)
+        node = EagerNode.new(reflection, owner_node, table_alias.nil? ? klass._table_sql : table_alias)
+        node.index = plan.nodes.length + 1
+        plan.nodes << node
+        siblings << node
+      end
+      unless nested.nil?
+        rest = eager_build(node.klass, node, nested, counts, plan)
+        node.leftover = node.leftover.nil? ? rest : node.leftover + rest unless rest.nil?
+      end
+      nil
+    end
+
+    def eager_joinable?(owner, reflection, name)
+      return false if reflection.nil?
+      return false if reflection.through_reflection? || reflection.polymorphic?
+      return false if reflection.macro == :has_and_belongs_to_many
+      return false unless owner.method_defined?(:"_preload_#{name}")
+      klass = reflection.klass
+      return false if klass._type_conditioned?
+      pk = klass.primary_key
+      !(pk.nil? || pk.is_a?(Array))
+    end
+
+    # The rows of the JOINed query reduced to the primary keys of every
+    # node (Rails selects every column as `t<n>_r<m>`), folded the way
+    # JoinDependency#instantiate does: one record per parent in first-seen
+    # row order, each association holding exactly the joined rows that
+    # survived the WHERE, de-duplicated per parent. The records themselves
+    # load by key, and the `_preload_<name>` setters seat them.
+    def load_eager_records(plan)
+      if !@limit.nil? || !@offset.nil?
+        if plan.nodes.any? { |n| n.collection? }
+          raise NotImplementedError, "roundhouse: eager_load of a collection with limit/offset needs Rails' distinct-id pre-query, which is not resolved at runtime"
+        end
+      end
+      cols = ["#{@table}.#{@model.primary_key} AS rh_eager_0"]
+      plan.nodes.each { |n| cols << "#{n.ref}.#{n.klass.primary_key} AS rh_eager_#{n.index}" }
+      # Rails qualifies a bare `order(:id)` with the table, which the JOINs
+      # make necessary; the terms are kept as written elsewhere.
+      written = @orders
+      @orders = written.map { |term| qualify_eager_order(term) }
+      begin
+        sql = select_sql_with(cols.join(", "))
+      ensure
+        @orders = written
+      end
+      rows = ActiveRecord.adapter.select_rows(sql)
+      base_keys = [] #: Array[String]
+      base_ids = {} #: Hash[String, untyped]
+      links = {} #: Hash[Integer, Hash[String, Array[String]]]
+      child_ids = {} #: Hash[Integer, Hash[String, untyped]]
+      plan.nodes.each do |n|
+        links[n.index] = {}
+        child_ids[n.index] = {}
+      end
+      rows.each do |row|
+        base = row["rh_eager_0"]
+        next if base.nil?
+        bkey = base.to_s
+        unless base_ids.key?(bkey)
+          base_ids[bkey] = base
+          base_keys << bkey
+        end
+        plan.nodes.each do |n|
+          child = row["rh_eager_#{n.index}"]
+          parent = n.parent.nil? ? base : row["rh_eager_#{n.parent.index}"]
+          next if child.nil? || parent.nil?
+          ckey = child.to_s
+          pkey = parent.to_s
+          child_ids[n.index][ckey] = child
+          list = links[n.index][pkey]
+          if list.nil?
+            links[n.index][pkey] = [ckey]
+          elsif !list.include?(ckey)
+            list << ckey
+          end
+        end
+      end
+      base_map = eager_records_by_key(@model, base_ids.values)
+      by_node = {} #: Hash[Integer, Hash[String, Base]]
+      plan.nodes.each { |n| by_node[n.index] = eager_records_by_key(n.klass, child_ids[n.index].values) }
+      records = [] #: Array[Base]
+      base_keys.each do |k|
+        record = base_map[k]
+        records << record unless record.nil?
+      end
+      records.each { |record| record.readonly! } if @readonly
+      plan.nodes.each do |n|
+        parents = n.parent.nil? ? base_map : by_node[n.parent.index]
+        children = by_node[n.index]
+        setter = :"_preload_#{n.name}"
+        parents.each do |pkey, parent|
+          keys = links[n.index][pkey] || []
+          if n.collection?
+            list = []
+            keys.each do |ck|
+              child = children[ck]
+              list << child unless child.nil?
+            end
+            parent.public_send(setter, list)
+          else
+            parent.public_send(setter, keys.empty? ? nil : children[keys[0]])
+          end
+        end
+      end
+      plan.nodes.each do |n|
+        next if n.leftover.nil?
+        loaded = by_node[n.index].values
+        n.klass.preload_associations(loaded, n.leftover) if loaded.length > 0
+      end
+      if !plan.leftover.nil? && !@skip_preloading && records.length > 0
+        pending = ActiveRecord::PendingPreload.new(@model, records, plan.leftover)
+        records.each { |record| record._pend_preload(pending) }
+      end
+      records
+    end
+
+    # `id` / `"id" DESC` -> `<table>.id` / `<table>."id" DESC`; anything
+    # else (a qualified column, an expression) is the author's SQL.
+    def qualify_eager_order(term)
+      m = term.match(/\A("?[A-Za-z_][A-Za-z0-9_]*"?)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)\z/i)
+      return term if m.nil?
+      "#{@table}.#{m[1]}#{m[2]}"
+    end
+
+    # `klass` records for these primary-key values, keyed by their
+    # String form (the joined query and the records may spell an id
+    # differently).
+    def eager_records_by_key(klass, ids)
+      out = {}
+      return out if ids.empty?
+      relation = ActiveRecord::Relation.new(klass, false).where(klass.primary_key.to_sym => ids)
+      relation.to_a.each { |record| out[record.id.to_s] = record }
+      out
     end
 
     # A reflection's key is one column or an Array of them (composite).
@@ -1521,6 +1834,7 @@ module ActiveRecord
       unload_records
       names.each { |n| check_eager_loadable(@model, n) }
       names.each { |n| @includes << n }
+      @eager_loading = true
       sync_eager_joins
       self
     end
@@ -1686,6 +2000,10 @@ module ActiveRecord
     # explicit `select` can project anything, and keeps the Hash path.
     def load_records
       return [] if @null
+      if @select_sql.nil? && @from.nil? && eager_loading?
+        plan = sync_eager_plan_joins
+        return load_eager_records(plan) unless plan.nodes.empty?
+      end
       records = if @select_sql.nil?
         @model._hydrate_all(select_sql_with(@model._columns_sql))
       else

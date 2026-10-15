@@ -1253,7 +1253,12 @@ fn every_runtime_method_body_concretely_typed() {
     // cruby/active_record_transactions.rb's transaction-changes port, and
     // the `_indifferent_changes` / class `readonly` additions to
     // connection.rb. The per-file split was not diffed.
-    const CEILING: usize = 1790;
+    // MEASURED 1920 on 2026-10-15 (om128): +130 gradual sites, all in
+    // relation.rb's JoinDependency port (`build_eager_plan`, `eager_hop`,
+    // `load_eager_records`): reflections are untyped, as in Rails, and the
+    // joined rows' key values are caller-defined column values; the local
+    // tables around them are ascribed so the typed sweep stays clean.
+    const CEILING: usize = 1920;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

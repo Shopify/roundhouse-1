@@ -4125,6 +4125,10 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             if matches!(assoc, Association::HasMany { scope_owner: Some(_), .. } | Association::HasOne { scope_owner: Some(_), .. }) {
                 unsupported.push_str(", instance_dependent_scope: true");
             }
+            // A scope lambda keeps Rails from finding the inverse by itself.
+            if matches!(assoc, Association::HasMany { scope: Some(_), .. } | Association::HasOne { scope: Some(_), .. }) {
+                unsupported.push_str(", scoped: true");
+            }
             let class = |t: &ClassId| format!("{:?}", t.0.as_str().trim_start_matches("::"));
             let reflection = "::ActiveRecord::Reflection";
             let new = match assoc {
