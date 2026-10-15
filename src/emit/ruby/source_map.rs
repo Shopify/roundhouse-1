@@ -135,6 +135,41 @@ fn constants(app: &App) -> BTreeMap<String, (String, u32, bool)> {
     out
 }
 
+/// A Cusco client's schema, beside the file the emit moved.
+/// `Cusco::Client::GraphQL.infer_schema_file` reads
+/// `<caller dir>/<caller name>/schema.{graphql,json}` from
+/// `caller_locations`: Core's `taxes_api.rb` in
+/// `components/taxes/app/graph_clients/` finds
+/// `taxes_api/schema.graphql` beside it, while the emitted caller is
+/// `app/models/taxes_api.rb` and looks in `app/models/taxes_api/`. Each
+/// carried `schema.graphql` / `schema.json` whose directory is named for
+/// a class's authored file (`<dir>.rb`, the class whose underscored name
+/// ends in that stem) is also written at `app/models/<class>/`. A
+/// directory no authored class file of the app names (the schema a client
+/// names with `schema_file:`) gets no copy.
+pub fn client_schema_copies(app: &App, data: &[(String, String)]) -> Vec<(String, String)> {
+    let by_path: BTreeMap<String, String> = constants(app)
+        .into_iter()
+        .filter_map(|(name, (path, _, _))| {
+            let stem = path.rsplit('/').next()?.strip_suffix(".rb")?.to_string();
+            (crate::naming::underscore(&name).rsplit('/').next() == Some(stem.as_str())).then_some((path, name))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (rel, content) in data {
+        let Some((dir, file)) = rel.rsplit_once('/') else { continue };
+        if file != "schema.graphql" && file != "schema.json" {
+            continue;
+        }
+        let Some(name) = by_path.get(&format!("{dir}.rb")) else { continue };
+        let dest = format!("app/models/{}/{file}", crate::naming::underscore(name));
+        if dest != *rel && !data.iter().any(|(have, _)| *have == dest) {
+            out.push((dest, content.clone()));
+        }
+    }
+    out
+}
+
 /// Emitted test file → authored test file, from the emitted test index.
 fn test_files(files: &[(String, String)]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();

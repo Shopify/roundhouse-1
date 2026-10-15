@@ -218,3 +218,60 @@ fn a_slice_carries_a_binary_data_file_its_manifest_names() {
     let _ = std::fs::remove_dir_all(&base);
     assert_eq!(carried, vec![("fixtures/geoip/City.mmdb", bytes)]);
 }
+
+/// A Cusco client built without `schema_file:` reads its schema from
+/// `<caller dir>/<caller name>/schema.graphql` (`caller_locations`). The
+/// emit moves the class to `app/models/<name>.rb`, so the schema the
+/// slicer (v3.41) carries beside the authored file is also written
+/// beside the emitted one: Core's `TaxesApi` raised "schema.graphql or
+/// schema.json must exist in .../app/models/taxes_api" in four tests.
+/// A schema in a directory no class file is named for is not copied.
+#[test]
+fn a_client_schema_beside_its_authored_class_file_is_also_beside_the_emitted_one() {
+    use roundhouse::diagnostic::Severity;
+    let base = std::env::temp_dir().join(format!("roundhouse-client-schema-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("slice/root");
+    let write = |rel: &str, content: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("lib/clients/lineup_api.rb", "module LineupApi\n  def self.schema_file\n    dir = File.dirname(caller_locations(1, 1).first.absolute_path)\n    File.join(dir, \"lineup_api\", \"schema.graphql\")\n  end\n  SCHEMA = File.read(schema_file)\nend\n");
+    write("lib/clients/lineup_api/schema.graphql", "type Query { position: Int }\n");
+    write("lib/clients/other/schema.graphql", "type Query { other: Int }\n");
+    let entry = |path: &str, role: &str| format!("{{\"role\": {role:?}, \"core_path\": {path:?}, \"slice_path\": {path:?}}}");
+    let manifest = format!(
+        "{{\"files\": [{}, {}, {}]}}",
+        entry("lib/clients/lineup_api.rb", "autoload"),
+        entry("lib/clients/lineup_api/schema.graphql", "data"),
+        entry("lib/clients/other/schema.graphql", "data"),
+    );
+    std::fs::write(base.join("slice/slice-manifest.json"), manifest).unwrap();
+
+    let mut app = roundhouse::ingest::ingest_app(&root).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, &root, roundhouse::project::BuildTarget::Ruby)
+    });
+    let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).map(|d| d.message.clone()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let files = files.expect("target files");
+    let has = |p: &str| files.iter().any(|(path, _)| path == p);
+    assert!(has("lib/clients/lineup_api/schema.graphql"));
+    assert!(has("app/models/lineup_api/schema.graphql"), "no schema beside the emitted class file");
+    assert!(!has("app/models/other/schema.graphql"));
+
+    let emitted = base.join("emitted");
+    roundhouse::project::write_to_dir(&files, &emitted).expect("write tree");
+    let out = emit_and_run::ruby()
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .args(["-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\np LineupApi::SCHEMA\n"])
+        .output()
+        .expect("ruby");
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "\"type Query { position: Int }\\n\"\n");
+}

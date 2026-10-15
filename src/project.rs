@@ -14117,6 +14117,8 @@ fn spinel_files_with_assertions(
     let mut data = Vec::new();
     walk_data_files_into(fixture, &mut data)?;
     walk_gem_source_data_into(app, fixture, &mut data)?;
+    let schemas = emit::ruby::source_map::client_schema_copies(app, &data);
+    data.extend(schemas);
     files.splice(0..0, data);
     // `test/fixtures/files` — `file_fixture_path`, which `file_fixture`,
     // `fixture_file_upload` and an `ActiveStorage::FixtureSet.blob`
