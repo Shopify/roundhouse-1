@@ -90,10 +90,13 @@ pub(super) fn carry(
     carriers: &[ConcernClassMethodSpans],
     framework_shadows: &HashSet<ClassId>,
 ) {
-    if app.concern_model_items.is_empty() || app.controllers.is_empty() {
+    if app.controllers.is_empty() {
         return;
     }
     let setup = Setup::new(app, carriers, framework_shadows);
+    if setup.class_side.is_empty() {
+        return;
+    }
     let walk = setup.walk(app);
 
     // Each controller's own `include`s (a `prepend` is no include), and
@@ -130,9 +133,11 @@ pub(super) fn carry(
             }
             let mut own = Vec::new();
             walk.run(root, &mut seen, &mut own);
-            // A Concern with a `ClassMethods` and no macro to run stays
-            // as it was (`extend` alone).
-            if own.iter().all(is_extend) {
+            // A Concern with a `ClassMethods` and no block to run is
+            // still included and extended: `append_features` extends the
+            // includer either way, and `replay_subclass_macros` writes
+            // calls of its macros on that.
+            if own.is_empty() {
                 continue;
             }
             includes.push(root.clone());
@@ -170,7 +175,7 @@ pub(super) fn replay_subclass_macros(
     carriers: &[ConcernClassMethodSpans],
     framework_shadows: &HashSet<ClassId>,
 ) {
-    if app.concern_model_items.is_empty() || app.controllers.is_empty() {
+    if app.controllers.is_empty() {
         return;
     }
     let setup = Setup::new(app, carriers, framework_shadows);
@@ -201,7 +206,7 @@ pub(super) fn replay_subclass_macros(
         }
         let mut macros: HashMap<Symbol, ClassId> = HashMap::default();
         for module in modules {
-            if !walk.has_class_methods_module(module) {
+            if !walk.extends_class_methods(module) {
                 continue;
             }
             if let Some((methods, _)) = setup.class_side.get(module) {
@@ -235,10 +240,6 @@ pub(super) fn replay_subclass_macros(
             };
         }
     }
-}
-
-fn is_extend(expr: &Expr) -> bool {
-    matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "extend")
 }
 
 /// The modules a controller body `include`s, by constant, in order.
@@ -278,6 +279,14 @@ impl Walk<'_> {
         let carrier = format!("{}::ClassMethods", id.0.as_str());
         self.app.class_methods_blocks.contains_key(id)
             || self.app.library_classes.iter().any(|lc| lc.is_module && lc.name.0.as_str() == carrier)
+    }
+
+    /// Whether `include id` extends the includer with a `ClassMethods`:
+    /// the one rule `run` writes the `extend` by and `replay_subclass_macros`
+    /// reads a macro callable by, so a call is never written for a module
+    /// the controller was not extended with.
+    fn extends_class_methods(&self, id: &ClassId) -> bool {
+        self.class_side.contains_key(id) && self.has_class_methods_module(id)
     }
 
     /// The modules `concern`'s block includes, resolved from its scope.
@@ -370,7 +379,7 @@ impl Walk<'_> {
         // it (`Concern::ClassMethods` is the nested module or the one a
         // `class_methods do` builds). A Concern with neither (only an
         // `included do` block) has no module to extend with.
-        if self.class_side.contains_key(id) && self.has_class_methods_module(id) {
+        if self.extends_class_methods(id) {
             let mut path: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
             path.push(Symbol::from("ClassMethods"));
             out.push(Expr::new(
