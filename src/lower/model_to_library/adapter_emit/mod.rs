@@ -1526,10 +1526,16 @@ fn var_ref(name: &Symbol) -> Expr {
 /// picks the `_opt` variant: nil has to reach the DB as the SQL keyword
 /// NULL, not as `''` / `0` — otherwise a nullable UNIQUE column
 /// collides on its second unset row and `where(fk: nil)` matches
-/// nothing. Temporal columns store ISO-8601 text, so they escape as
+/// nothing. A NOT NULL string / integer with no default holds nil until
+/// set (`ty_of_column_slot`), so it picks the `_opt` variant too and the
+/// database refuses the row, as in Rails, rather than being handed `''`
+/// / `0`. Temporal columns store ISO-8601 text, so they escape as
 /// strings like any other text column.
 fn value_type_for_column(col: &crate::schema::Column) -> ValueType {
-    let nullable = col.nullable && !col.primary_key;
+    let unset = !col.nullable
+        && col.generated.is_none()
+        && matches!(super::ty_of_column_slot(col), Ty::Union { .. });
+    let nullable = (col.nullable || unset) && !col.primary_key;
     match ty_of_column(&col.col_type) {
         Ty::Int => {
             if nullable {
