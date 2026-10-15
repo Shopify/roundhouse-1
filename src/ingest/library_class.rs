@@ -7244,10 +7244,16 @@ fn apply_class_side_visibility(
     use crate::dialect::{MethodReceiver, MethodVisibility, ModelBodyItem};
     for item in items.iter_mut() {
         let ModelBodyItem::Method { method, .. } = item else { continue };
-        if method.receiver != MethodReceiver::Class || !method.name_span.is_synthetic() {
+        if !method.name_span.is_synthetic() {
             continue;
         }
         let name = method.name.as_str().to_string();
+        if method.receiver != MethodReceiver::Class {
+            if let Some((_, visibility)) = class_side.instance_visibility.iter().find(|(n, _)| *n == name) {
+                method.visibility = *visibility;
+            }
+            continue;
+        }
         if let Some((attr, param, reader)) =
             class_side.wrapped.iter().find(|(attr, _, _)| format!("{attr}=") == name)
             && let Some(wrapped) = super::class_attribute::wrapped_writer(owner, attr, param, reader)

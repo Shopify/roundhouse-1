@@ -180,7 +180,8 @@ impl Walk<'_> {
     }
 
     /// The `class_attribute` statements of `concern`'s `included do`
-    /// blocks, as written.
+    /// blocks, as written, and the `private :reader` / `protected :reader`
+    /// that make a generated reader non-public on the includer.
     fn block_class_attributes(&self, concern: &ClassId) -> Vec<Expr> {
         let mut out = Vec::new();
         for lc in self.app.library_classes.iter().filter(|lc| &lc.name == concern) {
@@ -197,8 +198,11 @@ impl Walk<'_> {
                     _ => vec![body],
                 };
                 out.extend(statements.into_iter().filter(|stmt| {
-                    matches!(&*stmt.node, ExprNode::Send { recv: None, method, block: None, .. }
-                        if method.as_str() == "class_attribute")
+                    matches!(&*stmt.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                        if method.as_str() == "class_attribute"
+                            || matches!(method.as_str(), "private" | "protected")
+                                && !args.is_empty()
+                                && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } })))
                 }).cloned());
             }
         }

@@ -315,13 +315,22 @@ pub(crate) struct ClassSideVisibility {
     pub protected: Vec<String>,
     /// (attribute, the redefined block's parameter, the reader it protects).
     pub wrapped: Vec<(String, String, String)>,
+    /// `private :name` / `protected :name` naming an instance method an
+    /// earlier `class_attribute` of the block generated.
+    pub instance_visibility: Vec<(String, crate::dialect::MethodVisibility)>,
 }
 
 pub(crate) fn class_side_visibility(direct: &[ruby_prism::Node<'_>], file: &str) -> Option<ClassSideVisibility> {
     use super::util::flatten_statements;
     let mut declared: Vec<String> = Vec::new();
     let mut captures: Vec<(String, String, usize)> = Vec::new();
-    let mut out = ClassSideVisibility { consumed: Vec::new(), protected: Vec::new(), wrapped: Vec::new() };
+    let mut out = ClassSideVisibility {
+        consumed: Vec::new(),
+        protected: Vec::new(),
+        wrapped: Vec::new(),
+        instance_visibility: Vec::new(),
+    };
+    let mut instance_declared: Vec<String> = Vec::new();
     let mut capture_reads: Vec<(String, usize)> = Vec::new();
     let sym_args = |call: &ruby_prism::CallNode<'_>| -> Option<Vec<String>> {
         let args: Vec<String> = call.arguments()?.arguments().iter().map(|a| symbol_value(&a)).collect::<Option<_>>()?;
@@ -342,7 +351,36 @@ pub(crate) fn class_side_visibility(direct: &[ruby_prism::Node<'_>], file: &str)
                 if decl.instance_predicate {
                     declared.push(format!("{n}?"));
                 }
+                if decl.instance_reader {
+                    instance_declared.push(n.to_string());
+                }
+                if decl.instance_writer {
+                    instance_declared.push(format!("{n}="));
+                }
+                if decl.instance_predicate && decl.instance_reader {
+                    instance_declared.push(format!("{n}?"));
+                }
             }
+            continue;
+        }
+        // `private :name` on the includer's instance reader the block's
+        // `class_attribute` generated.
+        if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && call.block().is_none()
+            && let visibility = match constant_id_str(&call.name()) {
+                "private" => Some(crate::dialect::MethodVisibility::Private),
+                "protected" => Some(crate::dialect::MethodVisibility::Protected),
+                _ => None,
+            }
+            && let Some(visibility) = visibility
+            && let Some(names) = sym_args(&call)
+            && names.iter().all(|n| instance_declared.contains(n))
+        {
+            for name in names {
+                out.instance_visibility.push((name, visibility));
+            }
+            out.consumed.push(offset);
             continue;
         }
         // `wrapped_method = method(:gate=)`

@@ -198,7 +198,7 @@ fn a_refused_included_block_is_reported_at_its_own_line() {
     std::fs::write(dir.join("roundhouse.yml"), "test_paths: []\n").unwrap();
     std::fs::write(
         dir.join("app/controllers/concerns/framed.rb"),
-        "module Framed\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :rules, instance_writer: false\n    private :rules\n    self.rules = []\n  end\nend\n",
+        "module Framed\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :rules, instance_writer: false\n    private :helper\n    self.rules = []\n  end\nend\n",
     )
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))

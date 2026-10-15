@@ -55,3 +55,8 @@ require_relative "action_controller/inertia"
 # `invisible_captcha`'s honeypot gate — called from the filter method
 # the lowering synthesizes.
 require_relative "action_controller/invisible_captcha"
+# `ActionController::Renderers`: the `render json:`/`xml:`/`js:` registry
+# and `use_renderers`, which a gem such as active_model_serializers
+# includes and overrides (`_render_with_renderer_json`). After Base,
+# which includes `Renderers::All`.
+require_relative "action_controller/renderers"

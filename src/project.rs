@@ -6041,6 +6041,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("action_pack", &["action_controller"]),
     ("abstract_controller", &["action_controller"]),
     ("action_controller/metal/exceptions", &["action_controller_exceptions"]),
+    ("action_controller/metal/renderers", &["action_controller"]),
     ("action_view", &["action_view"]),
     ("action_mailer", &["action_mailer"]),
     ("active_job", &["active_job", "active_job_errors"]),
