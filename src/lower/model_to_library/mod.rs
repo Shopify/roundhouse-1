@@ -3974,12 +3974,20 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
 /// hydration path treats it as present, so widening it would nilify
 /// every `record.id` read for no semantic gain.
 ///
+/// A NOT NULL `string` / `text` with no schema default is unset the same
+/// way: Rails reads nil from `Model.new`, not `""` (the INSERT is what
+/// refuses it, and `assert_not_equal "", record.ref` sees the nil). A
+/// default, even a blank one (`DEFAULT ''`), is the unset value.
+///
 /// NOT for the SQL seam — `column_read_method` and the Arel visitor pick
 /// their reader from the underlying column type, which nullability
 /// doesn't change.
 pub fn ty_of_column_slot(col: &Column) -> Ty {
     let base = ty_of_column(&col.col_type);
-    if (col.nullable || col.generated.is_some()) && !col.primary_key {
+    let unset_string = !col.nullable
+        && col.default.is_none()
+        && matches!(col.col_type, ColumnType::String { .. } | ColumnType::Text);
+    if (col.nullable || col.generated.is_some() || unset_string) && !col.primary_key {
         Ty::Union { variants: vec![base, Ty::Nil].into() }
     } else {
         base

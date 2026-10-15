@@ -1724,10 +1724,12 @@ fn only_optional_nullability(s: &str) -> bool {
 
 /// From a column definition's modifier tail: whether the column is
 /// nullable (`NOT NULL` seen → false; otherwise the schema.rb-ingest
-/// default of `true`) and its literal string default, if any — parity
-/// with `ingest_schema`'s own `parse_column_opts`, which likewise only
-/// captures a `DEFAULT` when it's a quoted string (never a bare
-/// number/boolean, and never an expression like `nextval(…)`).
+/// default of `true`) and its literal default, if any: a quoted string,
+/// or a bare boolean / number (`DEFAULT false`, `DEFAULT 0.0`, which
+/// schema.rb spells `default: false`). Never an expression like
+/// `nextval(…)` or `now()`. A nullable column keeps its default as the
+/// value a new record has: `products.gift_card boolean DEFAULT false`
+/// reads `false`, not nil, on `Product.new`.
 fn parse_modifiers(modifiers: &str) -> (bool, Option<String>) {
     let words = top_level_words(modifiers);
     let mut nullable = true;
@@ -1741,10 +1743,31 @@ fn parse_modifiers(modifiers: &str) -> (bool, Option<String>) {
             let after = pos + "DEFAULT".len();
             if let Some(v) = try_read_string_literal(modifiers, after) {
                 default = Some(v);
+            } else if let Some(v) = words.get(idx + 1).and_then(|(_, w)| bare_literal_default(w)) {
+                default = Some(v);
             }
         }
     }
     (nullable, default)
+}
+
+/// A bare `DEFAULT` token the column type reads as a value: `true` / `false`
+/// or a plain decimal number, as pg_dump writes `boolean DEFAULT false`
+/// and `numeric(21,3) DEFAULT 0.0`. A token that is a function call or any
+/// other expression is not a literal, and `top_level_words` has already cut
+/// a `(`-led one off, so only the word itself is judged.
+fn bare_literal_default(word: &str) -> Option<String> {
+    let word = word.split("::").next().unwrap_or(word);
+    if word.eq_ignore_ascii_case("true") || word.eq_ignore_ascii_case("false") {
+        return Some(word.to_ascii_lowercase());
+    }
+    let digits = word.strip_prefix(['-', '+']).unwrap_or(word);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, "0"));
+    let numeric = !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && !fraction.is_empty()
+        && fraction.bytes().all(|b| b.is_ascii_digit());
+    numeric.then(|| word.trim_start_matches('+').to_string())
 }
 
 /// If a `'single-quoted string'` (with `''` escaping) starts at or

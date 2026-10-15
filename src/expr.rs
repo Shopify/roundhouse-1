@@ -297,6 +297,12 @@ pub const UNINDEXED_SCOPE_CONST_REF: u64 = 1 << 36;
 /// The `defaults.merge(hash)` ingest wrote for `hash.reverse_merge(defaults)`.
 pub const REVERSE_MERGE: u64 = 1 << 37;
 
+/// A column slot read (`@total`) that must stay a slot read: ActiveModel's
+/// numericality validator checks the attribute's raw value
+/// (`prepare_value_for_validation`), not the reader a module the model
+/// includes redefines.
+pub const RAW_ATTRIBUTE_READ: u64 = 1 << 39;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -2041,7 +2047,7 @@ mod tests {
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
             FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN,
-            DISCARDED_VALUE, ADMITTED_PRELOADER_CALL, UNINDEXED_SCOPE_CONST_REF, REVERSE_MERGE, CLASS_METHODS_BLOCK_STATEMENT,
+            DISCARDED_VALUE, ADMITTED_PRELOADER_CALL, UNINDEXED_SCOPE_CONST_REF, REVERSE_MERGE, CLASS_METHODS_BLOCK_STATEMENT, RAW_ATTRIBUTE_READ,
             crate::emit::rust::decide::bits::STR_TO_OWNED, crate::emit::rust::decide::bits::STR_BORROW,
             crate::emit::rust::decide::bits::CLONE_AT,
         ];

@@ -956,3 +956,27 @@ fn unique_keys_are_read_or_ledgered() {
     assert!(indexes[0].unique && indexes[0].columns == [Symbol::from("code")]);
     assert!(gaps.iter().any(|g| g.contains("unique key dropped") && g.contains("index_codes_on_slug")), "{gaps:?}");
 }
+
+/// pg_dump writes a bare `DEFAULT false` / `DEFAULT 0.0` / `DEFAULT 5` for
+/// boolean and numeric columns. Core's `products.gift_card boolean DEFAULT
+/// false` is nullable, and `Product.new` reads `false` from it (Rails'
+/// column default), which `validates :gift_card, inclusion: { in: [true,
+/// false] }` needs. A function default is not a literal.
+#[test]
+fn bare_boolean_and_numeric_defaults_are_kept() {
+    let sql = "CREATE TABLE public.products (\n    id bigint NOT NULL,\n    gift_card boolean DEFAULT false,\n    featured boolean DEFAULT true NOT NULL,\n    total numeric(21,3) DEFAULT 0.0 NOT NULL,\n    position integer DEFAULT 5 NOT NULL,\n    delta integer DEFAULT -1,\n    stamp bigint DEFAULT 0::bigint,\n    created_at timestamp without time zone DEFAULT now() NOT NULL,\n    token character varying DEFAULT public.make_token(),\n    kind character varying DEFAULT 'plain'::character varying,\n    CONSTRAINT products_pkey PRIMARY KEY (id)\n);\n";
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("ingest");
+    let products = schema.tables.get(&Symbol::from("products")).expect("products");
+    let default = |name: &str| {
+        products.columns.iter().find(|c| c.name.as_str() == name).unwrap_or_else(|| panic!("{name}")).default.clone()
+    };
+    assert_eq!(default("gift_card").as_deref(), Some("false"));
+    assert_eq!(default("featured").as_deref(), Some("true"));
+    assert_eq!(default("total").as_deref(), Some("0.0"));
+    assert_eq!(default("position").as_deref(), Some("5"));
+    assert_eq!(default("delta").as_deref(), Some("-1"));
+    assert_eq!(default("stamp").as_deref(), Some("0"));
+    assert_eq!(default("created_at"), None);
+    assert_eq!(default("token"), None);
+    assert_eq!(default("kind").as_deref(), Some("plain"));
+}

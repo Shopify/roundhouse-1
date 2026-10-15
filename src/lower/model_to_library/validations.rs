@@ -530,7 +530,17 @@ pub(crate) fn validation_statements_split<'v>(
                 let read_by_send = any_assoc
                     || read_through_method(model, &v.attribute, attr_ty)
                     || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. });
-                let value = if read_by_send { reader } else { ivar(&v.attribute) };
+                let value = if read_by_send {
+                    reader
+                } else if matches!(rule, ValidationRule::Numericality { .. }) {
+                    // Numericality checks the raw value, not a reader an
+                    // included module redefines (`validation_readers`).
+                    let mut slot = ivar(&v.attribute);
+                    slot.decisions |= crate::expr::RAW_ATTRIBUTE_READ;
+                    slot
+                } else {
+                    ivar(&v.attribute)
+                };
                 (validation_rule_to_calls(model, &declarer.finder, &v.attribute, rule, attr_ty, &value, &text), value)
             };
             let prepend = options.is_some_and(|o| o.prepend);

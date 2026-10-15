@@ -926,8 +926,8 @@ module ActiveRecord
     # `Model.upsert(attrs, …)` — INSERT that folds into an UPDATE when it
     # collides, in one statement. Rails routes the single-row form
     # through `upsert_all`; so does this.
-    def self.upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
-      all.upsert(attrs, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
+    def self.upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
+      all.upsert(attrs, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
     end
 
     # The predicate of the unique index on `columns` (sorted, joined with
@@ -955,19 +955,21 @@ module ActiveRecord
     # `update_only:` (a column or list of columns, insert_all.rb) narrows
     # that default to the named columns; the rest keep their stored value.
     #
+    # created_at / updated_at the table has and the rows lack are stamped
+    # (`record_timestamps:`, default the model's); on a conflict
+    # updated_at moves only when a written column changed.
+    #
     # NOT Rails-complete, deliberately: no RETURNING (asking for it
-    # raises rather than quietly handing back nothing) and no
-    # `record_timestamps` stamping — no corpus model upserts a table
-    # that has timestamps. Returns the affected-row count, the same
-    # currency `update_counters` deals in.
-    def self.upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
-      all.upsert_all(rows, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
+    # raises rather than quietly handing back nothing). Returns the
+    # affected-row count, the same currency `update_counters` deals in.
+    def self.upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
+      all.upsert_all(rows, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
     end
 
     # The write behind `Relation#upsert_all`, which Rails reaches from
     # the model through `all`: a patch prepended on Relation (Core's
     # GenerateOid allocates the ids there) runs first.
-    def self._upsert_rows(rows, unique_by, on_duplicate, update_only, returning)
+    def self._upsert_rows(rows, unique_by, on_duplicate, update_only, returning, record_timestamps = nil)
       return 0 if rows.length == 0
       if returning
         raise NotImplementedError, "#{name}.upsert_all: RETURNING is not supported"
@@ -977,28 +979,53 @@ module ActiveRecord
       target = unique_by.nil? ? primary_key : unique_by
       target_names = target.is_a?(Array) ? target.map { |c| c.to_s } : [target.to_s]
 
-      tuples = rows.map do |row|
-        "(" + cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }.join(", ") + ")"
+      # created_at / updated_at the table has and the rows lack are
+      # stamped, as Rails does under `record_timestamps`: without them a
+      # NOT NULL timestamp column rejects the insert.
+      stamp = record_timestamps.nil? ? self.record_timestamps : record_timestamps
+      now = stamp ? ActiveSupport.db_now : nil
+      known = schema_columns.map { |c| c.to_s }
+      stamped = []
+      if stamp
+        ["created_at", "updated_at"].each do |c|
+          next unless known.include?(c)
+          next if cols.any? { |k| k.to_s == c }
+          stamped.push(c)
+        end
       end
+
+      tuples = rows.map do |row|
+        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        stamped.each { |_c| values.push(ActiveRecord.adapter.escape_value(now)) }
+        "(" + values.join(", ") + ")"
+      end
+      insert_cols = cols.map { |c| c.to_s } + stamped
 
       assigns = on_duplicate
       if assigns.nil?
-        updatable = cols.reject { |c| target_names.include?(c.to_s) }
+        updatable = cols.map { |c| c.to_s }.reject { |c| target_names.include?(c) }
         unless update_only.nil?
           only = (update_only.is_a?(Array) ? update_only : [update_only]).map { |c| c.to_s }
-          updatable = updatable.select { |c| only.include?(c.to_s) }
+          updatable = updatable.select { |c| only.include?(c) }
+        end
+        sets = updatable.map { |c| "#{c} = excluded.#{c}" }
+        # A conflicting row keeps its updated_at unless a written column
+        # actually changed (Rails' touch_model_timestamps_unless).
+        if stamped.include?("updated_at") && !updatable.empty?
+          same = updatable.map { |c| "#{table_name}.#{c} IS NOT DISTINCT FROM excluded.#{c}" }.join(" AND ")
+          sets.push("updated_at = CASE WHEN (#{same}) THEN #{table_name}.updated_at ELSE excluded.updated_at END")
         end
         # Every column IS the conflict target: there is nothing left to
         # assign, and `DO UPDATE SET` with an empty list is a syntax
         # error. Rails degrades to a no-op insert here too.
-        assigns = updatable.length == 0 ? nil : updatable.map { |c| "#{c} = excluded.#{c}" }.join(", ")
+        assigns = sets.empty? ? nil : sets.join(", ")
       end
       action = assigns.nil? ? "DO NOTHING" : "DO UPDATE SET #{assigns}"
 
       predicate = _conflict_predicate(target_names.sort.join(", "))
       conflict_where = predicate == "" ? "" : " WHERE #{predicate}"
 
-      sql = "INSERT INTO #{table_name} (#{cols.join(", ")}) VALUES #{tuples.join(", ")}" \
+      sql = "INSERT INTO #{table_name} (#{insert_cols.join(", ")}) VALUES #{tuples.join(", ")}" \
             " ON CONFLICT (#{target_names.join(", ")})#{conflict_where} #{action}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
@@ -3596,12 +3623,12 @@ module ActiveRecord
       insert_all!([attrs], returning: returning, record_timestamps: record_timestamps)
     end
 
-    def upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
-      @model._upsert_rows(rows, unique_by, on_duplicate, update_only, returning)
+    def upsert_all(rows, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
+      @model._upsert_rows(rows, unique_by, on_duplicate, update_only, returning, record_timestamps)
     end
 
-    def upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil)
-      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning)
+    def upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
+      upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
     end
   end
 end

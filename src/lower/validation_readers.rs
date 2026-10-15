@@ -52,7 +52,9 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
 
 fn read_through_reader(e: &mut Expr, readers: &crate::det::HashSet<Symbol>) {
     if let ExprNode::Ivar { name } = &*e.node {
-        if readers.contains(name) {
+        // Numericality reads the raw value (`prepare_value_for_validation`),
+        // not a reader over it (Core's `money_bags` answers a MoneyBag).
+        if readers.contains(name) && e.decisions & crate::expr::RAW_ATTRIBUTE_READ == 0 {
             let reader = Expr::new(
                 e.span,
                 ExprNode::Send {
