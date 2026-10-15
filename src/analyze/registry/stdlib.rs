@@ -1002,6 +1002,22 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // tree (ruby_overlay active_record_sqlite3_adapter.rb), as a name;
     // `project` refuses it on every other target.
     register_stdlib_class(classes, "ActiveRecord::ConnectionAdapters::SQLite3Adapter", &[], &[]);
+    // The built-in validators `runtime/spinel/active_model_validations.rb`
+    // ports (EachValidator's surface); a memoized instance
+    // (`#: ActiveModel::Validations::LengthValidator`) answers
+    // `validate_each` and `validate` as it does in Rails.
+    for validator in [
+        "Absence", "Acceptance", "Comparison", "Confirmation", "Exclusion", "Format", "Inclusion",
+        "Length", "Numericality", "Presence",
+    ] {
+        register_stdlib_class(classes, &format!("ActiveModel::Validations::{validator}Validator"), &[], &[
+            ("validate_each", Ty::Untyped),
+            ("validate", Ty::Untyped),
+            ("attributes", Ty::Untyped),
+            ("options", Ty::Untyped),
+            ("kind", Ty::Untyped),
+        ]);
+    }
     // `ActiveModel::Type.default_value` (activemodel 8.2.0.alpha
     // type.rb): the `Type::Value` an attribute with no declared type
     // answers. The Ruby family's type port defines it
