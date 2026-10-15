@@ -1107,7 +1107,11 @@ fn nested_blocks(
             .collect();
         let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
-        let after_defs = builds_after_parent_defs(parent, kid, app);
+        // A class nested in the kid loads inside the kid's block, so one
+        // that calls the parent's class method (Core's InsightOpinion enums
+        // nested in InsightOpinionDataInputs) keeps the kid below the defs.
+        let after_defs =
+            builds_after_parent_defs(parent, kid, app) || own_kids.iter().any(|d| builds_after_parent_defs(parent, d, app));
         // A class the owner's `const_set` builds follows everything the
         // owner's body writes: that call may be written among its tail
         // effects (a `self.cacheable = true` below it), and the class
