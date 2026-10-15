@@ -209,6 +209,13 @@ fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &
     #[derive(Default)]
     struct Declares {
         names: Vec<String>,
+        /// Generators a constant of that name is itself built from,
+        /// written rooted (`Data = ::Data.define(…)`): the file declares
+        /// the name, but the factory does not read it.
+        rooted: Vec<String>,
+        /// Generators a factory names bare (`Data.define`), which a
+        /// same-named declaration in scope would capture.
+        bare: Vec<String>,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Declares {
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
@@ -220,7 +227,18 @@ fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &
             ruby_prism::visit_module_node(self, node);
         }
         fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
-            self.names.push(constant_id_str(&node.name()).to_string());
+            let name = constant_id_str(&node.name()).to_string();
+            let generator = node.value().as_call_node().filter(|c| matches!(constant_id_str(&c.name()), "new" | "define")).and_then(|c| c.receiver());
+            match generator {
+                Some(recv) if recv.as_constant_path_node().is_some_and(|p| p.parent().is_none() && p.name().is_some_and(|id| constant_id_str(&id) == name)) => {
+                    self.rooted.push(name);
+                }
+                Some(recv) if recv.as_constant_read_node().is_some_and(|c| matches!(constant_id_str(&c.name()), "Data" | "Struct")) => {
+                    self.bare.extend(constant_path_of(&recv).into_iter().flatten());
+                    self.names.push(name);
+                }
+                _ => self.names.push(name),
+            }
             ruby_prism::visit_constant_write_node(self, node);
         }
     }
@@ -235,7 +253,9 @@ fn refuse_shadowed_generators(root: &Node<'_>, classes: &[LibraryClass], file: &
     ruby_prism::Visit::visit(&mut declares, root);
     for class in factories {
         if let Some(generator) = class.parent.as_ref().map(|p| p.0.as_str()) {
-            if matches!(generator, "Data" | "Struct") && declares.names.iter().any(|n| n == generator) {
+            let captured = declares.names.iter().any(|n| n == generator)
+                || (declares.rooted.iter().any(|n| n == generator) && declares.bare.iter().any(|n| n == generator));
+            if matches!(generator, "Data" | "Struct") && captured {
                 return Err(unsupported(
                     file,
                     &format!("{generator} factory in a file that declares its own `{generator}`"),
