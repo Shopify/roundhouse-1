@@ -4431,14 +4431,23 @@ fn app_calls_method(app: &App, method: &str) -> bool {
 /// foreign key, type), whether or not the app spells the call.
 fn app_has_collection_association(app: &App) -> bool {
     use crate::dialect::Association;
-    app.models.iter().flat_map(|m| m.associations()).any(|a| matches!(a, Association::HasMany { .. } | Association::HasOne { .. }))
+    any_declared_association(app, |a| matches!(a, Association::HasMany { .. } | Association::HasOne { .. }))
+}
+
+/// Some association a model declares, or a subclass of a model declares
+/// on itself (`lower::subclass_macros`, whose view carries only those),
+/// satisfies `pred`. An STI subclass's `has_many :pins, dependent:
+/// :destroy` reads the reflection with no model declaring any.
+fn any_declared_association(app: &App, pred: impl Fn(&crate::dialect::Association) -> bool) -> bool {
+    app.models.iter().flat_map(|m| m.associations()).any(&pred)
+        || crate::lower::subclass_macros::views(app).values().flat_map(|m| m.associations()).any(&pred)
 }
 
 /// Some model declares a `has_one`: its generated writer replaces the
 /// target through the association object (`association(:name).replace`).
 fn app_has_has_one(app: &App) -> bool {
     use crate::dialect::Association;
-    app.models.iter().flat_map(|m| m.associations()).any(|a| matches!(a, Association::HasOne { .. }))
+    any_declared_association(app, |a| matches!(a, Association::HasOne { .. }))
 }
 
 /// Some association's scope takes the owner (`->(owner) { ... }`).

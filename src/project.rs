@@ -9266,30 +9266,45 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
         let wanted = fold(stem);
-        let named: Vec<&&str> = sources
-            .iter()
-            .filter(|source| {
-                let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
-                let path = constant_path(rel.strip_suffix(".rb").unwrap_or(rel));
-                let depth = stem.matches('/').count() + 1;
-                let segments: Vec<&str> = path.split('/').collect();
-                if segments.len() < depth {
-                    return false;
-                }
-                let (dir, named) = segments.split_at(segments.len() - depth);
-                fold(&named.join("/")) == wanted && autoload_root(dir)
-            })
-            .collect();
+        // The sources whose path under an autoload root names the first
+        // `k` segments of the anchor's constant: all of it (`k == depth`),
+        // or a namespace enclosing it.
+        let named_to = |k: usize| -> Vec<&&str> {
+            sources
+                .iter()
+                .filter(|source| {
+                    let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+                    let path = constant_path(rel.strip_suffix(".rb").unwrap_or(rel));
+                    let segments: Vec<&str> = path.split('/').collect();
+                    if segments.len() < k {
+                        return false;
+                    }
+                    let (dir, named) = segments.split_at(segments.len() - k);
+                    let wanted_k = wanted.split('/').take(k).collect::<Vec<_>>().join("/");
+                    fold(&named.join("/")) == wanted_k && autoload_root(dir)
+                })
+                .collect()
+        };
+        let depth = stem.matches('/').count() + 1;
+        let named = named_to(depth);
         if !named.is_empty() {
             declared_path_named.insert(anchor.clone());
         }
-        let owner = match named.as_slice() {
-            [one] => Some(**one),
+        // A file named for a namespace enclosing the constant is its
+        // file too: Core's app/utils/crypto.rb is `Crypto`'s, though it
+        // declares only `Crypto::InvalidSignature` and `Crypto::Symmetric::
+        // Encryption` (anchors models/crypto/invalid_signature, ...), so
+        // Zeitwerk autoloads it with `Crypto`. Not in_place: nothing
+        // reopens a library's constant here.
+        let enclosing_named = if named.is_empty() { (1..depth).rev().flat_map(named_to).collect() } else { Vec::new() };
+        let owner = match (named.as_slice(), enclosing_named.as_slice()) {
+            ([one], _) | ([], [one]) => Some(**one),
             _ => None,
         };
         if let Some(program) = owner.and_then(|o| program_by_source.get(o)) {
             program_of_file.insert(anchor.clone(), program.clone());
         } else if named.is_empty()
+            && enclosing_named.is_empty()
             && !app_dir_named.contains(&wanted)
             && sources.iter().all(|source| program_by_source.contains_key(source))
         {
