@@ -529,6 +529,7 @@ pub(crate) fn validation_statements_split<'v>(
                 // and so does every rule on a name no slot holds.
                 let read_by_send = any_assoc
                     || read_through_method(model, &v.attribute, attr_ty)
+                    || (!matches!(rule, ValidationRule::Numericality { .. }) && overrides_reader(model, &v.attribute))
                     || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. });
                 let value = if read_by_send {
                     reader
@@ -1678,6 +1679,20 @@ fn read_through_method(model: &Model, attr: &Symbol, attr_ty: Option<&Ty>) -> bo
     attr_ty.is_none()
         && !super::markers::declared_attr_names(model).contains(attr)
         && !crate::lower::secure_password::secure_password_attrs(&model.body).contains(attr)
+}
+
+/// Whether the model writes its own reader for the column `attr`
+/// (`def tax_invoice_status; ::Status.try_deserialize(super); end`):
+/// `read_attribute_for_validation` is `send(attr)`, so the rules judge
+/// what that reader answers, not the column's slot. Numericality reads
+/// the value before type cast and keeps the slot.
+fn overrides_reader(model: &Model, attr: &Symbol) -> bool {
+    model.attributes.fields.contains_key(attr)
+        && model.body.iter().any(|item| matches!(
+            item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.name == *attr && method.receiver == crate::dialect::MethodReceiver::Instance
+        ))
 }
 
 /// The stem of the locals a check on `attr` names (`<stem>_number`):
