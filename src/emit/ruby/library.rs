@@ -4957,22 +4957,29 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        let names: Vec<(Symbol, Symbol, Symbol)> = model
+        let names: Vec<(Symbol, Symbol, Symbol, ClassId)> = model
             .associations()
             .filter_map(|a| match a {
                 // `autosave: false` never saves the target.
-                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, .. }
+                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, target, .. }
                     if *autosave != Some(false) =>
                 {
                     // `primary_key: :uuid`: the key takes the target's
                     // `uuid`, as Rails' `record._read_attribute(primary_key)`.
                     let pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
-                    Some((name.clone(), foreign_key.clone(), pk))
+                    Some((name.clone(), foreign_key.clone(), pk, target.clone()))
                 }
                 _ => None,
             })
             .collect();
-        for (name, fk, pk) in names {
+        for (name, fk, pk, target) in names {
+            // A target keyed on a column list answers `id` with the key
+            // tuple and its `id` column as `id_value`
+            // (`composite_key::rekey`); the foreign key holds the column
+            // (the belongs_to writer does the same).
+            let composite_target =
+                app.models.iter().any(|m| m.name == target && !m.composite_primary_key.is_empty());
+            let pk = if composite_target && pk.as_str() == "id" { Symbol::from("id_value") } else { pk };
             let writer = Symbol::from(format!("{}=", name.as_str()));
             let Some(w) = lc
                 .methods

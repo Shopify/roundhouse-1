@@ -85,6 +85,7 @@ module ActiveRecord
       @limit = nil
       @offset = nil
       @includes = []
+      @referenced = []
       @skip_preloading = false
       # Rails' NullRelation flag: `Model.none` and `where(id: [])` must not
       # hit the database. Chain methods call `unload_records`, which keeps
@@ -626,6 +627,7 @@ module ActiveRecord
       clause = negate ? "NOT (#{sql})" : "(#{sql})"
       empty_in = !negate && condition.is_a?(Hash) && hash_has_empty_in?(condition)
       push_where(clause, empty_in)
+      reference_tables(condition) if condition.is_a?(Hash)
       # A Hash's equalities are separate predicates in Rails, which
       # `unscope(where:)` removes one by one. Reassigned, not written
       # into: a spawned relation shares the Hash.
@@ -1290,7 +1292,7 @@ module ActiveRecord
     # JoinDependency's join for one reflection: a `through` is its
     # through hop then its source hop off the through model, every hop
     # carrying `kind`.
-    def reflection_join_sql(owner, reflection, kind)
+    def reflection_join_sql(owner, reflection, kind, table_alias = nil)
       reflection.check_eager_loadable! if reflection.respond_to?(:check_eager_loadable!)
       if reflection.through_reflection?
         through = reflection.through_reflection
@@ -1318,20 +1320,70 @@ module ActiveRecord
       if table == own
         raise NotImplementedError, "roundhouse: #{name} on #{owner}: a self join needs a table alias, which is not resolved at runtime"
       end
+      scope_sql = target._join_scope_sql
+      # The default scope's conditions are written against the table; an
+      # aliased join names the alias instead.
+      if !table_alias.nil? && scope_sql != ""
+        plain = target.table_name.to_s
+        scope_sql = scope_sql.gsub("\"#{plain}\".", "\"#{table_alias}\".").gsub("#{plain}.", "#{table_alias}.")
+      end
+      table_ref = table_alias.nil? ? table : table_alias
       belongs = reflection.belongs_to?
       theirs = join_key_list(belongs ? reflection.association_primary_key : reflection.foreign_key)
       ours = join_key_list(belongs ? reflection.foreign_key : reflection.active_record_primary_key)
       conditions = []
       index = 0
       while index < theirs.length
-        conditions << "#{table}.#{theirs[index]} = #{own}.#{ours[index]}"
+        conditions << "#{table_ref}.#{theirs[index]} = #{own}.#{ours[index]}"
         index += 1
       end
       type = reflection.type
       unless type.nil?
-        conditions << "#{table}.#{type} = '#{owner.polymorphic_name.to_s.gsub("'", "''")}'"
+        conditions << "#{table_ref}.#{type} = '#{owner.polymorphic_name.to_s.gsub("'", "''")}'"
       end
-      "#{kind} #{table} ON #{conditions.join(" AND ")}#{target._join_scope_sql}"
+      head = table_alias.nil? ? table : "#{table} #{table_alias}"
+      "#{kind} #{head} ON #{conditions.join(" AND ")}#{scope_sql}"
+    end
+
+    # The tables a hash condition names as nested keys
+    # (`where(identity_account: {uuid: x})`): Rails' `references`, which
+    # make an `includes` of the association load by JOIN (`eager_loading?`).
+    def reference_tables(hash)
+      added = []
+      hash.each do |key, val|
+        next unless val.is_a?(Hash)
+        added << key.to_s unless @referenced.include?(key.to_s)
+      end
+      return if added.empty?
+      @referenced = @referenced + added
+      sync_eager_joins
+    end
+
+    # An `includes` of a single-valued association (`belongs_to`, `has_one`)
+    # whose table a where hash names is joined LEFT OUTER, aliased to the key
+    # when the key is not the table's name, as the `joins` the compiler
+    # renders for the same key are (`scope_chain`). One row per record, so
+    # the records load as before and the associations preload lazily. A
+    # collection association is not joined: its rows would repeat the parent,
+    # which needs Rails' JoinDependency de-duplication, and the where on its
+    # table raises PostgreSQL's missing FROM-clause entry as before.
+    def sync_eager_joins
+      return if @referenced.empty? || @includes.empty?
+      return unless @model.respond_to?(:reflect_on_association)
+      @includes.each do |spec|
+        next unless spec.is_a?(Symbol)
+        reflection = @model.reflect_on_association(spec)
+        next if reflection.nil?
+        next unless reflection.macro == :belongs_to || reflection.macro == :has_one
+        next if reflection.through_reflection? || reflection.polymorphic?
+        table = reflection.klass.table_name.to_s
+        key = @referenced.find { |k| k == spec.to_s || k == table }
+        next if key.nil?
+        join = reflection_join_sql(@model, reflection, "LEFT OUTER JOIN", key == table ? nil : key)
+        sql_table = reflection.klass._table_sql
+        next if @joins.any? { |j| j == join || j.include?("JOIN #{sql_table} ") }
+        @joins << join
+      end
     end
 
     # A reflection's key is one column or an Array of them (composite).
@@ -1426,6 +1478,7 @@ module ActiveRecord
       own_lists
       unload_records
       names.each { |n| @includes << n }
+      sync_eager_joins
       self
     end
 
@@ -1468,6 +1521,7 @@ module ActiveRecord
       unload_records
       names.each { |n| check_eager_loadable(@model, n) }
       names.each { |n| @includes << n }
+      sync_eager_joins
       self
     end
 
@@ -3205,11 +3259,16 @@ module ActiveRecord
       parts = []
       named = []
       hash.each do |key, val|
-        if val.is_a?(Hash)
+        if key.is_a?(Array)
+          predicate = tuple_predicate(key, val)
+          parts << predicate
+          named << [key.map { |k| k.to_s }.join(","), predicate]
+        elsif val.is_a?(Hash)
+          table, owner = nested_table(key)
           val.each do |col, v|
-            predicate = column_predicate("#{key}.#{col}", v)
+            predicate = column_predicate("#{table}.#{col}", v, false, owner)
             parts << predicate
-            named << ["#{key}.#{col}", predicate]
+            named << ["#{table}.#{col}", predicate]
           end
         else
           # An alias names its column (`where(subdomain:)`).
@@ -3229,6 +3288,74 @@ module ActiveRecord
       end
       @hash_parts = named
       parts.join(" AND ")
+    end
+
+    # `[qualifier, model]` for a nested condition key (`where(payments_refunds:
+    # {...})`, `where(identity_account: {...})`). The qualifier is the key as
+    # written: Rails' `associated_table` aliases the association's table to the
+    # key when it differs from the table name, and the join the key rides on is
+    # aliased the same way (`INNER JOIN stories story`, `scope_chain`). The
+    # model types the columns: the association the key names, singular or
+    # plural, else the one whose table the key is, so a `model_uuid_attributes`
+    # column serializes its integer to a uuid. A key no association explains
+    # is a plain table, its columns bound as written (model nil).
+    def nested_table(key)
+      name = key.to_s
+      return [name, @model] if name == @table || name == @model.table_name.to_s
+      return [name, nil] unless @model.respond_to?(:reflect_on_association)
+      reflection = @model.reflect_on_association(name.to_sym)
+      reflection = @model.reflect_on_association(name.singularize.to_sym) if reflection.nil?
+      return [name, associated_model_by_table(name)] if reflection.nil?
+      return [name, nil] if reflection.polymorphic?
+      [name, reflection.klass]
+    end
+
+    # The model of an association whose TABLE is `name`, for a key that is a
+    # table name its association is not named after (`delivery_profiles:`
+    # for `belongs_to :profile`): Rails types such a table's columns from
+    # the database, which `model_uuid_attributes` mirrors on the model.
+    # nil when no association of this model lands on the table.
+    def associated_model_by_table(name)
+      return nil unless @model.respond_to?(:_association_names)
+      @model._association_names.each do |assoc|
+        reflection = @model.reflect_on_association(assoc)
+        next if reflection.nil? || reflection.polymorphic?
+        klass = begin
+          reflection.klass
+        rescue NameError, NotImplementedError
+          nil
+        end
+        return klass if !klass.nil? && klass.table_name.to_s == name
+      end
+      nil
+    end
+
+    # `where([:shop_id, :key] => [[1, "a"], [2, "b"]])` — Rails' tuple
+    # condition on a composite key: one row per tuple, a tuple's columns
+    # ANDed; a value that is not a list of tuples is an ArgumentError, as in
+    # Rails' `expand_from_hash`. A nil element is `IS NULL`, as for a plain
+    # column. An empty list matches nothing.
+    def tuple_predicate(columns, val)
+      if val.is_a?(Relation)
+        raise NotImplementedError, "roundhouse: where(#{columns.inspect} => relation): a tuple IN a subquery is not resolved at runtime"
+      end
+      names = columns.map { |c| @model._attribute_name(c.to_s) }
+      rows = val.is_a?(Array) ? val : [val]
+      return "1=0" if rows.empty?
+      groups = rows.map do |row|
+        raise ArgumentError, "Expected corresponding value for #{columns.map { |c| c.to_s }.inspect} to be an Array" unless row.is_a?(Array)
+        unless row.length == names.length
+          raise ArgumentError, "where(#{columns.inspect} => ...): #{row.inspect} is not a tuple of #{names.length} values"
+        end
+        conds = []
+        i = 0
+        while i < names.length
+          conds << column_predicate(names[i], row[i])
+          i += 1
+        end
+        "(#{conds.join(" AND ")})"
+      end
+      groups.length == 1 ? groups[0] : "(#{groups.join(" OR ")})"
     end
 
     # The `belongs_to` a condition key NAMES, when it is not a column of
@@ -3302,7 +3429,9 @@ module ActiveRecord
       end.join(".")
     end
 
-    def column_predicate(col, val, note = false)
+    # `owner` is the model of a `table.col` column (`nested_table`), whose
+    # declared attribute types bind its values; nil binds them as written.
+    def column_predicate(col, val, note = false, owner = nil)
       # `col` or `table.col`, each part a bare identifier (`sql_ident`'s
       # allowlist) or one already quoted as PostgreSQL writes it
       # (`"Order"`, inner quotes doubled); anything else raises before
@@ -3315,11 +3444,14 @@ module ActiveRecord
       # A column of this model with a declared type (`attribute`) binds
       # what the type serializes, as Rails' QueryAttribute does.
       own = col.include?(".") ? nil : col
-      if !own.nil? && @model._attribute_force_equality?(own, val)
+      typed = owner.nil? ? @model : owner
+      tcol = own
+      tcol = col.split(".", -1)[1].to_s.delete('"') if own.nil? && !owner.nil?
+      if !tcol.nil? && typed._attribute_force_equality?(tcol, val)
         # A value the declared type compares whole (a serialized column's
         # `type:` class, an Array or a Hash): predicate_builder.rb's
         # `force_equality?` binds it as one value, not as an IN list.
-        "#{qcol} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(own, val))}"
+        "#{qcol} = #{ActiveRecord.adapter.escape_value(typed._attribute_for_database(tcol, val))}"
       elsif val.is_a?(Relation)
         # A relation value is Rails' subquery form —
         # `where(story_id: Tagging.where(...).select(:story_id))` →
@@ -3336,7 +3468,7 @@ module ActiveRecord
         # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
         # `mark_null!` from `none` / lasting positive `where` only.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
-        ids = ids.map { |x| @model._attribute_for_database(own, x) } unless own.nil?
+        ids = ids.map { |x| typed._attribute_for_database(tcol, x) } unless tcol.nil?
         # An empty list matches nothing: Arel renders `1=0` (`IN ()` is a
         # syntax error), which `where.not` negates to match everything.
         return "1=0" if ids.empty?
@@ -3351,10 +3483,10 @@ module ActiveRecord
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
         note_equality(own, val.id) if note
-        "#{qcol} = #{bind_literal(own.nil? ? val.id : @model._attribute_for_database(own, val.id))}"
+        "#{qcol} = #{bind_literal(tcol.nil? ? val.id : typed._attribute_for_database(tcol, val.id))}"
       else
         note_equality(own, val) if note
-        "#{qcol} = #{bind_literal(own.nil? ? val : @model._attribute_for_database(own, val))}"
+        "#{qcol} = #{bind_literal(tcol.nil? ? val : typed._attribute_for_database(tcol, val))}"
       end
     end
 

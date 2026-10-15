@@ -394,8 +394,13 @@ module ActiveRecord
     # Run raw SQL, collecting every row as name→value. DML statements
     # simply produce zero rows. Delegates to the adapter's row loop
     # (which resolves column names once, not rows×cols times).
+    #
+    # The Result carries the command's `affected_rows` (the adapter's
+    # `changes`, PG's `cmd_tuples`), as Rails' `build_result` does:
+    # `exec_query(insert_sql).affected_rows` is how a bulk insert counts.
     def execute(sql)
-      Result.from_hashes(ActiveRecord.adapter.select_rows(sql))
+      rows = ActiveRecord.adapter.select_rows(sql)
+      Result.from_hashes(rows, affected_rows: ActiveRecord.adapter.changes)
     end
 
     # `select_rows(sql)` — Rails' rows as Arrays of values, in column

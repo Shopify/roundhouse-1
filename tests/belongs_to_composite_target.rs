@@ -68,3 +68,15 @@ fn writer_stores_the_id_column_of_a_composite_target() {
     let plain = emitted(PLAIN_LINE);
     assert!(plain.contains("@part_id = value."), "{plain}");
 }
+
+/// The autosave stamps the foreign key from the saved target the same
+/// way: `@part_id = @part_cache.id` stored the key tuple of a composite
+/// target (NotNullViolation on Core's `subscriptions_discounts`).
+#[test]
+fn autosave_stores_the_id_column_of_a_composite_target() {
+    let line = emitted(LINE);
+    assert!(line.contains("@part_id = @part_cache.id_value"), "{line}");
+    assert!(!line.contains("@part_id = @part_cache.id\n"), "{line}");
+    let plain = emitted(PLAIN_LINE);
+    assert!(plain.contains("@part_id = @part_cache.id"), "{plain}");
+}
