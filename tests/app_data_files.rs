@@ -178,3 +178,43 @@ fn a_rails_root_lua_script_read_at_load_resolves_in_the_tree() {
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, "\"return redis.call('SET', KEYS[1], ARGV[1])\\n\"\n");
 }
+
+/// A binary data file the manifest names is carried byte for byte: Core's
+/// `Shopify::GeoIP` opens `GeoIP2-City.mmdb` from
+/// `components/platform/test/fixtures/geoip` (a MaxMind test database,
+/// not UTF-8), and raised "Missing geoip database" without it. A binary
+/// file the manifest does not list, and one named for secrets, stay out.
+#[test]
+fn a_slice_carries_a_binary_data_file_its_manifest_names() {
+    let base = std::env::temp_dir().join(format!("roundhouse-slice-binary-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("slice/root");
+    let bytes: &[u8] = &[0xAB, 0xCD, 0x00, 0xFF, 0xFE, 0x80];
+    let write = |rel: &str, content: &[u8]| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("fixtures/geoip/City.mmdb", bytes);
+    write("fixtures/geoip/Unlisted.mmdb", bytes);
+    write("fixtures/geoip/signing.key", bytes);
+    write("app/models/geo.rb", b"class Geo\nend\n");
+    let entry = |path: &str, role: &str| format!("{{\"role\": {role:?}, \"core_path\": {path:?}, \"slice_path\": {path:?}}}");
+    let manifest = format!(
+        "{{\"files\": [{}, {}, {}]}}",
+        entry("app/models/geo.rb", "autoload"),
+        entry("fixtures/geoip/City.mmdb", "data"),
+        entry("fixtures/geoip/signing.key", "data"),
+    );
+    std::fs::write(base.join("slice/slice-manifest.json"), manifest).unwrap();
+
+    let app = roundhouse::ingest::ingest_app(&root).expect("ingest");
+    let carried: Vec<(&str, &[u8])> = app
+        .binary_assets
+        .iter()
+        .filter(|(p, _)| p.starts_with("fixtures/"))
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(carried, vec![("fixtures/geoip/City.mmdb", bytes)]);
+}
