@@ -277,7 +277,11 @@ impl Walk<'_> {
     /// `module ClassMethods` or the one a `class_methods do` builds.
     fn has_class_methods_module(&self, id: &ClassId) -> bool {
         let carrier = format!("{}::ClassMethods", id.0.as_str());
-        self.app.class_methods_blocks.contains_key(id)
+        // A carried Concern (`concern_class_attribute`) hands every class
+        // method to its includers as their own, so the module a
+        // `class_methods do` would build is empty and not written: an
+        // `extend` of it is a NameError.
+        (self.app.class_methods_blocks.contains_key(id) && !self.carried.contains(id))
             || self.app.library_classes.iter().any(|lc| lc.is_module && lc.name.0.as_str() == carrier)
     }
 

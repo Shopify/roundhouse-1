@@ -456,14 +456,21 @@ fn fold_array_wrap(span: crate::span::Span, arg: &Expr) -> Option<Expr> {
 fn closed_non_array(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Date | Ty::Time | Ty::Hash { .. } | Ty::Class { .. } | Ty::Fn { .. }
-    )
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Date | Ty::Time | Ty::Hash { .. } | Ty::Fn { .. }
+    ) || matches!(ty, Ty::Class { .. }) && !is_open(ty)
 }
 
 /// A type that says nothing about the value's shape: wrapping it as
 /// one element would wrap an Array a second time.
+///
+/// A class an Array is an instance of says as little: `Enumerable`
+/// (a `T.any(Enumerable, String)` parameter), `Object`, `Kernel`.
 fn is_open(ty: &Ty) -> bool {
-    matches!(ty, Ty::Untyped | Ty::Var { .. })
+    match ty {
+        Ty::Untyped | Ty::Var { .. } => true,
+        Ty::Class { id, .. } => matches!(id.0.as_str(), "Enumerable" | "Array" | "Object" | "BasicObject" | "Kernel"),
+        _ => false,
+    }
 }
 
 /// `Array | Nil` is `[]` or the array. `String | Nil` is `[]` or

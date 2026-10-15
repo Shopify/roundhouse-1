@@ -1341,7 +1341,7 @@ pub fn ingest_rails_application_singleton_methods(
     Ok(out)
 }
 
-fn mark_unindexed_const_refs(expr: &mut crate::expr::Expr) {
+pub(super) fn mark_unindexed_const_refs(expr: &mut crate::expr::Expr) {
     if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
         expr.decisions |= crate::expr::UNINDEXED_SCOPE_CONST_REF;
     }
