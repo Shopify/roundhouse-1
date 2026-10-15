@@ -81,9 +81,73 @@ pub(crate) fn body_loops(statements: &[Node<'_>], file: &str, listing: Option<&[
         }
         if let Some(autoloads) = glob_loop(statement, file, &locals, listing) {
             out.push(Loop { start: statement.location().start_offset(), autoloads });
+        } else if let Some(autoloads) = wrapper_call(statement, statements, file, listing) {
+            out.push(Loop { start: statement.location().start_offset(), autoloads });
         }
     }
     out
+}
+
+/// A call of the body's own `autoload` wrapper:
+///
+/// ```ruby
+/// def self.register_component(name, path)
+///   autoload(name, "components/polaris/#{path}/#{path}")
+/// end
+///
+/// register_component :Badge, "badge"
+/// ```
+///
+/// (polaris 25.0.1's lib/polaris.rb). The wrapper is one `def self.x(a,
+/// b)` of the same body whose only statement is an `autoload` over its
+/// two parameters; the call, with a symbol and a string literal, is the
+/// `autoload :Badge, "components/polaris/badge/badge"` it expands to.
+/// The feature names a file under the gem's `lib/` (the load path Ruby
+/// resolves it on), which is the file the `(constant, file)` autoload
+/// is. With no such file in the tree it is not one (a `None` listing
+/// checks the shape only).
+fn wrapper_call(
+    statement: &Node<'_>,
+    statements: &[Node<'_>],
+    file: &str,
+    listing: Option<&[String]>,
+) -> Option<Vec<(String, String)>> {
+    let call = statement.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    let method = constant_id_str(&call.name()).to_string();
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [name, path] = args.as_slice() else { return None };
+    let (Value::Sym(name), Value::Str(path)) = (eval(name, file, &HashMap::default())?, eval(path, file, &HashMap::default())?)
+    else {
+        return None;
+    };
+    let def = statements.iter().filter_map(|s| s.as_def_node()).find(|def| {
+        constant_id_str(&def.name()) == method && def.receiver().is_some_and(|r| r.as_self_node().is_some())
+    })?;
+    let params = def.parameters()?;
+    let required: Vec<Node<'_>> = params.requireds().iter().collect();
+    if params.optionals().iter().next().is_some()
+        || params.rest().is_some()
+        || params.keywords().iter().next().is_some()
+        || params.keyword_rest().is_some()
+        || params.block().is_some()
+    {
+        return None;
+    }
+    let [first, second] = required.as_slice() else { return None };
+    let param = |node: &Node<'_>| node.as_required_parameter_node().map(|p| constant_id_str(&p.name()).to_string());
+    let body = flatten_statements(def.body()?);
+    let [only] = body.as_slice() else { return None };
+    let mut scope: HashMap<String, Value> = HashMap::default();
+    scope.insert(param(first)?, Value::Sym(name));
+    scope.insert(param(second)?, Value::Str(path));
+    let (constant, feature) = autoload(only, file, &scope)?;
+    let Some(listing) = listing else { return Some(vec![(constant, feature)]) };
+    let lib_end = file.rfind("/lib/")? + "/lib/".len();
+    let target = format!("{}{}.rb", &file[..lib_end], feature.strip_suffix(".rb").unwrap_or(&feature));
+    listing.contains(&target).then(|| vec![(constant, target)])
 }
 
 /// The full constant names a file's glob loops autoload, each under the
@@ -787,5 +851,15 @@ mod tests {
         assert!(features("Other::Engine.root.join(\"test/support/initializers\").glob(\"**/*.rb\") { |f| require f.to_s }\n").is_empty());
         assert!(features("Platform::Engine.root.join(\"test/support/initializers\").glob(\"**/*.rb\") { |f| load f.to_s }\n").is_empty());
         assert!(features("Platform::Engine.root.join(\"test/support/none\").glob(\"**/*.rb\") { |f| require f.to_s }\n").is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_methods_calls_are_the_autoloads_they_expand_to() {
+        let source = "module Pol\n  def self.register_component(name, path)\n    autoload(name, \"components/pol/#{path}/#{path}\")\n  end\n\n  register_component :Badge, \"badge\"\n  register_component :Gone, \"gone\"\n  other :Badge, \"badge\"\nend\n";
+        let listing: Vec<String> = ["/t/g/lib/pol.rb", "/t/g/lib/components/pol/badge/badge.rb"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            file_autoloads(source, "/t/g/lib/pol.rb", &listing),
+            [("Pol::Badge".to_string(), "/t/g/lib/components/pol/badge/badge.rb".to_string())]
+        );
     }
 }
