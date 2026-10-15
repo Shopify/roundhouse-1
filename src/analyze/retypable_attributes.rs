@@ -483,7 +483,15 @@ fn serialized_column_with(expr: &Expr, table: &crate::schema::Table, json: bool)
         }
     }
     let column = table.columns.iter().find(|c| c.name.as_str() == name)?;
-    (coder && matches!(column.col_type, crate::schema::ColumnType::String { .. } | crate::schema::ColumnType::Text | crate::schema::ColumnType::Binary))
+    (coder
+        && matches!(
+            column.col_type,
+            crate::schema::ColumnType::String { .. }
+                | crate::schema::ColumnType::Text
+                | crate::schema::ColumnType::Binary
+                | crate::schema::ColumnType::Json
+                | crate::schema::ColumnType::Jsonb
+        ))
         .then(|| column.name.clone())
 }
 

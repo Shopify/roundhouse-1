@@ -71,6 +71,61 @@ module Enumerable
   end
 end
 
+# AS core_ext/object/json.rb: Enumerable#as_json is `to_a.as_json(options)`
+# (a Set, a Relation, an Enumerator), Struct's is its `to_h`'s, Range's and
+# IO's their `to_s` (Hash and Array answer through the JSON port's table:
+# Array below, Hash here). A Hash, Range, Struct or IO inherits Enumerable,
+# so each needs its own: without them the Enumerable one would answer a
+# Hash's pairs and an IO's lines. A class-body lambda (`property :scope,
+# converts: ->(scopes) { scopes.as_json }`) is a send the compiler does not
+# route to `Encoding.as_json`, so it reaches these.
+module Enumerable
+  def as_json(options = nil)
+    to_a.as_json(options)
+  end
+end
+
+class Hash
+  def as_json(options = nil)
+    if defined?(::ActiveSupport::JSON::Encoding) && ::ActiveSupport::JSON::Encoding.respond_to?(:as_json)
+      return ::ActiveSupport::JSON::Encoding.as_json(self, options)
+    end
+
+    subset = if options
+      if attrs = options[:only]
+        slice(*Array(attrs))
+      elsif attrs = options[:except]
+        except(*Array(attrs))
+      else
+        self
+      end
+    else
+      self
+    end
+    result = {}
+    subset.each { |k, v| result[k.to_s] = options ? v.as_json(options.dup) : v.as_json }
+    result
+  end
+end
+
+class Range
+  def as_json(_options = nil)
+    to_s
+  end
+end
+
+class IO
+  def as_json(_options = nil)
+    to_s
+  end
+end
+
+class Struct
+  def as_json(options = nil)
+    to_h.as_json(options)
+  end
+end
+
 class Hash
   # Rails rejects on the VALUE and keeps the key — `{ host: nil,
   # protocol: "https" }.compact_blank` is `{ protocol: "https" }`,

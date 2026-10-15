@@ -319,3 +319,37 @@ module ActiveSupport
     attr_accessor :parse_json_times
   end
 end
+
+# core_ext/object/json.rb's ToJsonWithActiveSupportEncoder: `to_json` is
+# `ActiveSupport::JSON.encode(self)`, which turns every element through
+# `as_json` first (a value object's own, an object's instance values),
+# unless the json gem's generator is asking (`to_json(state)`). The json
+# gem alone writes an object it has no case for as `to_s.to_json`, so
+# `{ flow: Types::Flow.new(enabled: true) }.to_json` was `{"flow":"#<...>"}`
+# where Rails answers `{"flow":{"enabled":true}}`
+# (MerchantSubscriptions::CapabilityPayload#normalize, which parses it
+# back: `Flow.build("#<...>")` died on String#slice).
+#
+# Only the containers and the generic Object take it: a Hash, an Array and
+# any object without a `to_json` of its own. Rails also prepends it to
+# String, Numeric, nil, true and false, where it only adds the HTML-entity
+# escaping of the encoder, which a scalar `to_json` here still lacks.
+# Prepended on the CRuby and JRuby trees, which carry this port; a class's
+# own `to_json` (a record, TimeWithZone) still answers first.
+if defined?(::JSON::State)
+  module ActiveSupport
+    module ToJsonWithActiveSupportEncoder # :nodoc:
+      def to_json(options = nil)
+        if options.is_a?(::JSON::State)
+          super(options)
+        else
+          ::ActiveSupport::JSON.encode(self, options)
+        end
+      end
+    end
+  end
+
+  [Object, Array, Hash].reverse_each do |klass|
+    klass.prepend(ActiveSupport::ToJsonWithActiveSupportEncoder)
+  end
+end
