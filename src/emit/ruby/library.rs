@@ -11321,16 +11321,28 @@ fn emit_library_class_decl_inner(
         })
         .collect();
     let instance_form = extend_self_instance_defs(lc, app, &replayed);
-    let flush_late = |s: &mut String, upto: Option<Span>| {
+    // The constants are all written before the replayed statements, so an
+    // include the source has below one of those statements is not due at
+    // a constant: it follows the statement (`flush_late` at the effect).
+    let first_effect: Option<Span> = hoistable
+        .iter()
+        .map(|e| e.span)
+        .filter(|sp| !sp.is_synthetic())
+        .min_by_key(|sp| (sp.file.0, sp.start));
+    let flush_late_until = |s: &mut String, upto: Option<Span>, ceiling: Option<Span>| {
         let mut late = late.borrow_mut();
         let due = late
             .iter()
-            .take_while(|(at, _)| upto.is_none_or(|u| !u.is_synthetic() && u.file == at.file && at.start < u.start))
+            .take_while(|(at, _)| {
+                upto.is_none_or(|u| !u.is_synthetic() && u.file == at.file && at.start < u.start)
+                    && ceiling.is_none_or(|c| c.file != at.file || at.start < c.start)
+            })
             .count();
         for (_, inc) in late.drain(..due) {
             write_include(s, inc, true);
         }
     };
+    let flush_late = |s: &mut String, upto: Option<Span>| flush_late_until(s, upto, None);
     for inc in &lc.includes {
         if positioned.iter().any(|(_, p)| *p == inc) || late.borrow().iter().any(|(_, l)| *l == inc) {
             continue;
@@ -11579,7 +11591,7 @@ fn emit_library_class_decl_inner(
                     }
                 }
             }
-            flush_late(s, Some(lc.constants[i].1.span));
+            flush_late_until(s, Some(lc.constants[i].1.span), first_effect);
             place_above(s, lc.constants[i].1.span);
             written.borrow_mut().insert(i);
             let (cname, value) = &lc.constants[i];
@@ -12243,7 +12255,10 @@ const MODULE_BUILTINS: &[&str] = &[
 /// a class macro: a call that is no `Module` builtin (`extend`,
 /// `class_eval`, ...), so one a superclass or an extended module defines,
 /// which reads the state the including body's earlier macro calls set
-/// (Rails' `Module#included` runs where `include` stands).
+/// (Rails' `Module#included` runs where `include` stands). Reading
+/// `base.ancestors` counts too: Core's Apps::ApiService raises unless an
+/// earlier `unsafe_self.include(ExtensionsRuntime::ExtensionImplementation
+/// .owned_by_app)` is among them.
 fn included_hook_sends_class_macro(inc: &ClassId, app: &App) -> bool {
     let bare = inc.0.as_str().trim_start_matches("::");
     let Some(module) = first_module_bare_named(bare, app) else { return false };
@@ -12258,7 +12273,7 @@ fn included_hook_sends_class_macro(inc: &ClassId, app: &App) -> bool {
     fn walk(e: &Expr, base: &Symbol, hit: &mut bool) {
         if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
             && matches!(&*r.node, ExprNode::Var { name, .. } if name == base)
-            && !MODULE_BUILTINS.contains(&method.as_str())
+            && (!MODULE_BUILTINS.contains(&method.as_str()) || matches!(method.as_str(), "ancestors" | "include?"))
         {
             *hit = true;
         }
@@ -12314,7 +12329,15 @@ fn macro_hooked_include_floor(lc: &LibraryClass, app: &App, positioned: &[(usize
     if candidates.is_empty() {
         return None;
     }
-    let calls: Vec<Span> = lc.unknown_calls.iter().map(|c| c.span).filter(|s| !s.is_synthetic()).collect();
+    // A model's carried class-body statements are its class-side
+    // initializers, not `unknown_calls`.
+    let calls: Vec<Span> = lc
+        .unknown_calls
+        .iter()
+        .chain(lc.class_ivar_initializers.iter())
+        .map(|c| c.span)
+        .filter(|s| !s.is_synthetic())
+        .collect();
     let file = calls.iter().map(|s| s.file).min_by_key(|f| f.0)?;
     let source = (file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i))?;
     let offsets = crate::lower::job_class_side::include_offsets(&source.text, lc.name.0.as_str());
