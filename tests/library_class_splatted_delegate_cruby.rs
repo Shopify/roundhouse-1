@@ -33,7 +33,7 @@ class PodClient
   end
 
   self.delegate(
-    *::Commands::TABLE.keys,
+    *::Commands::TABLE.keys, #: as untyped
     to: :upstream
   )
 

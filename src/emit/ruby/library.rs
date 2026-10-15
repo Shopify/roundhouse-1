@@ -14907,8 +14907,15 @@ fn splatted_delegate_call(call: &Expr) -> bool {
     if method.as_str() != "delegate" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
         return false;
     }
-    fn names(e: &Expr) -> bool {
+    // `*COMMANDS.keys, #: as untyped` reads as a `Cast` around the value.
+    fn peel(e: &Expr) -> &Expr {
         match &*e.node {
+            ExprNode::Cast { value, .. } => peel(value),
+            _ => e,
+        }
+    }
+    fn names(e: &Expr) -> bool {
+        match &*peel(e).node {
             ExprNode::Const { .. } | ExprNode::Lit { .. } => true,
             ExprNode::Array { elements, .. } => elements.iter().all(names),
             ExprNode::Send { recv: Some(r), method, args, block: None, .. } => {
@@ -14921,7 +14928,7 @@ fn splatted_delegate_call(call: &Expr) -> bool {
     let mut target = false;
     let mut private = false;
     for arg in args {
-        match &*arg.node {
+        match &*peel(arg).node {
             ExprNode::Splat { value } if names(value) => splatted = true,
             ExprNode::Lit { .. } => {}
             ExprNode::Hash { entries, .. } => {
