@@ -753,6 +753,33 @@ impl<'a> BodyTyper<'a> {
         })
     }
 
+    /// `A::B::Rest`, where the longest prefix Rubydex answers is a
+    /// constant that aliases a class or module (`Metafields::Types::
+    /// MeasuredSupport = ShopifyMetafields::Types::MeasuredSupport`): the
+    /// path Ruby reads, `ShopifyMetafields::Types::MeasuredSupport::Rest`.
+    fn aliased_prefix_path(&self, span: crate::span::Span, path: &[Symbol]) -> Option<Vec<Symbol>> {
+        let resolver = self.const_resolver.as_ref()?;
+        if span.is_synthetic() {
+            return None;
+        }
+        for split in (1..path.len()).rev() {
+            let suffix_len: usize = path[split..].iter().map(|s| s.as_str().len() + 2).sum();
+            let end = span.end.checked_sub(u32::try_from(suffix_len).ok()?)?;
+            let prefix = crate::span::Span { end, ..span };
+            match resolver.reference(prefix, &path[..split]) {
+                Some(Some(ResolvedConstant::Value { stdlib: false, declaration, singleton: false, runtime: None, .. })) => {
+                    let Some(Ty::Class { id, .. }) = self.typed_constant(declaration) else { return None };
+                    let mut target: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
+                    target.extend(path[split..].iter().cloned());
+                    return Some(target);
+                }
+                Some(Some(_)) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// A constant read through an app value constant whose value only
     /// Ruby computes: `Types::DryTypes::Array`, where `Component::Schema`
     /// writes `DryTypes = Dry.Types(default: :nominal)`, which returns a
@@ -776,6 +803,13 @@ impl<'a> BodyTyper<'a> {
                     }
                     let opaque = match self.typed_constant(declaration) {
                         None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => true,
+                        // An alias of a class or module (`SupportedMeasuredUnit =
+                        // ShopifyMetafields::…::SupportedMeasuredUnit`) answers
+                        // the members its class models; one it does not
+                        // (a gem enum's values) Ruby looks up in the value.
+                        Some(Ty::Class { id, .. }) => {
+                            !self.classes().get(id).is_some_and(|info| info.constants.contains_key(&path[split]))
+                        }
                         Some(_) => false,
                     };
                     return opaque.then(|| {
@@ -787,6 +821,29 @@ impl<'a> BodyTyper<'a> {
             }
         }
         None
+    }
+
+    /// A class name written in `scope` that is an app constant holding a
+    /// modeled class (`SupportedMeasuredUnit = Metafields::Types::
+    /// MeasuredSupport::MeasuredUnits::SupportedMeasuredUnit`), resolved
+    /// lexically: the class the constant holds.
+    fn constant_held_class(&self, written: &ClassId, scope: &str) -> Option<ClassId> {
+        let resolver = self.const_resolver.as_ref()?;
+        let name = written.0.as_str().trim_start_matches("::");
+        let rooted = written.0.as_str().starts_with("::");
+        let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty() && !rooted).collect();
+        loop {
+            let candidate = if parts.is_empty() { name.to_owned() } else { format!("{}::{name}", parts.join("::")) };
+            if let Some(declaration) = resolver.source_constant(&candidate) {
+                return match self.typed_constant(&declaration) {
+                    Some(Ty::Class { id, .. }) if self.classes().contains_key(id) => Some(id.clone()),
+                    _ => None,
+                };
+            }
+            if parts.pop().is_none() {
+                return None;
+            }
+        }
     }
 
     /// A class name written in `scope` that names a class through a
@@ -1897,6 +1954,17 @@ impl<'a> BodyTyper<'a> {
                                 // aliased module, which only the gem's RBI
                                 // declares. The read stays as written.
                                 Some(target) => {
+                                    let ty = exact_modeled_class(&target);
+                                    if matches!(ty, Ty::Var { .. }) { exact_modeled_class(path) } else { ty }
+                                }
+                                // `Metafields::Types::MeasuredSupport::
+                                // MeasuredUnits::SupportedMeasuredUnit`,
+                                // where an app constant in the path
+                                // aliases a gem's namespace (`MeasuredSupport =
+                                // ShopifyMetafields::Types::MeasuredSupport`):
+                                // the read is the aliased path's, answered
+                                // when it names a modeled class.
+                                None if let Some(target) = self.aliased_prefix_path(expr_span, path) => {
                                     let ty = exact_modeled_class(&target);
                                     if matches!(ty, Ty::Var { .. }) { exact_modeled_class(path) } else { ty }
                                 }
@@ -4419,6 +4487,7 @@ impl<'a> BodyTyper<'a> {
                         },
                         &|id, scope| cref_class(id, scope, self.classes())
                             .or_else(|| self.dealiased_class(id, scope))
+                            .or_else(|| self.constant_held_class(id, scope))
                             .unwrap_or_else(|| id.clone()),
                         false,
                     ),
