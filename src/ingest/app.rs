@@ -3386,6 +3386,8 @@ end
                     || crate::analyze::retypable_attributes::decorated_columns(expr, table).is_some()
                     || crate::analyze::retypable_attributes::defaulted_attribute(expr, table).is_some()
                     || crate::analyze::retypable_attributes::alias_attribute_decl(expr, table).is_some()
+                    || crate::analyze::retypable_attributes::store_accessor_decl(expr, table)
+                        .is_some_and(|(column, _)| model.retypable_attributes.contains(&column))
                 {
                     *item = crate::dialect::ModelBodyItem::ClassBody {
                         expr: expr.clone(),

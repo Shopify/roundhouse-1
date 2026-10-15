@@ -1300,8 +1300,8 @@ module ActiveRecord
     # type/serialized.rb (8.2.0.alpha): the type `serialize` decorates a
     # column's type with. Reads load the subtype's value through the
     # coder, writes dump it; a value equal to the coder's load of nil
-    # (its default) stores nil and reads back as itself. `accessor`
-    # (ActiveRecord::Store's IndifferentHashAccessor) is not ported.
+    # (its default) stores nil and reads back as itself. `accessor` is
+    # ActiveRecord::Store's IndifferentHashAccessor.
     class Serialized < SerializedDelegator # :nodoc:
       include ActiveModel::Type::Helpers::Mutable
       include QueryPredicates::Decorator
@@ -1376,6 +1376,13 @@ module ActiveRecord
 
       def serialized? # :nodoc:
         true
+      end
+
+      def accessor
+        unless defined?(ActiveRecord::Store::IndifferentHashAccessor)
+          raise NotImplementedError, "ActiveRecord::Type::Serialized#accessor: ActiveRecord::Store::IndifferentHashAccessor is not ported"
+        end
+        ActiveRecord::Store::IndifferentHashAccessor
       end
 
       private
