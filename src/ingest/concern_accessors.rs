@@ -1278,6 +1278,23 @@ pub(super) fn splice_into_library_includers(
                         plan.carried.push(expr);
                         continue;
                     }
+                    // A local the block writes (`parent_query = superclass`):
+                    // the statements below it read it, so it is written
+                    // where it stands, at the includer's class body, as
+                    // the block's own would have it.
+                    if plain
+                        && let ModelBodyItem::Unknown { expr, .. } = item
+                        && matches!(&*expr.node, ExprNode::Assign { target: crate::expr::LValue::Var { .. }, .. })
+                    {
+                        let root_id = block_included.last().map(top).unwrap_or_else(|| top(&lc.includes[*root]));
+                        let class_attributes: &[Symbol] = &declared;
+                        if let ModelBodyItem::Unknown { expr, .. } =
+                            super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                        {
+                            plan.statements.push((root_id, expr));
+                        }
+                        continue;
+                    }
                     let (span, name) = dropped_statement(item, included_call(app, concern), sources);
                     let entry = dropped.entry(span).or_insert_with(|| (name, concern.clone(), Vec::new()));
                     if !entry.2.contains(&lc.name) {
