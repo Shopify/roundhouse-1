@@ -556,26 +556,48 @@ pub(crate) fn virtual_default_attribute_decls(model: &Model) -> Vec<(Symbol, Sym
     out
 }
 
-/// `(name, type, default)` of `attribute :name, :type, default: <literal>`.
+/// `(name, type, default)` of `attribute :name, :type, default: <literal>`
+/// or the untyped `attribute :name, default: -> { [] }` (type `value`,
+/// Rails' untyped `ValueType`). A lambda default is its body: a literal,
+/// or an array/hash of literals (what `-> { [] }` / `-> { {} }` answer).
 pub(crate) fn virtual_default_attribute_decl(expr: &Expr) -> Option<(Symbol, Symbol, Expr)> {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
-    if method.as_str() != "attribute" || args.len() != 3 {
+    if method.as_str() != "attribute" || !(2..=3).contains(&args.len()) {
         return None;
     }
-    let (ExprNode::Lit { value: Literal::Sym { value: name } }, ExprNode::Lit { value: Literal::Sym { value: ty } }) =
-        (&*args[0].node, &*args[1].node)
-    else {
-        return None;
+    let ExprNode::Lit { value: Literal::Sym { value: name } } = &*args[0].node else { return None };
+    let ty = if args.len() == 3 {
+        let ExprNode::Lit { value: Literal::Sym { value: ty } } = &*args[1].node else { return None };
+        ty.clone()
+    } else {
+        Symbol::from("value")
     };
-    let ExprNode::Hash { entries, .. } = &*args[2].node else { return None };
+    let ExprNode::Hash { entries, .. } = &*args[args.len() - 1].node else { return None };
     let [(key, default)] = entries.as_slice() else { return None };
     let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
     if key.as_str() != "default" {
         return None;
     }
-    let ExprNode::Lit { value } = &*default.node else { return None };
-    matches!(value, Literal::Bool { .. } | Literal::Int { .. } | Literal::Float { .. } | Literal::Str { .. } | Literal::Sym { .. } | Literal::Nil)
-        .then(|| (name.clone(), ty.clone(), default.clone()))
+    fn plain(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { value } => matches!(
+                value,
+                Literal::Bool { .. } | Literal::Int { .. } | Literal::Float { .. } | Literal::Str { .. } | Literal::Sym { .. } | Literal::Nil
+            ),
+            ExprNode::Array { elements, .. } => elements.iter().all(plain),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| plain(k) && plain(v)),
+            _ => false,
+        }
+    }
+    match &*default.node {
+        ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+            if params.is_empty() && extra_params.is_empty() && plain(body) =>
+        {
+            Some((name.clone(), ty, body.clone()))
+        }
+        ExprNode::Lit { .. } if args.len() == 3 && plain(default) => Some((name.clone(), ty, default.clone())),
+        _ => None,
+    }
 }
 
 /// `attribute :name, :type` — typed virtual attributes (lobsters'
@@ -611,7 +633,17 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 params: Vec::new(),
                 body: if let Some(default) = default {
                     // The default stands until the attribute is assigned
-                    // (an explicit nil stays nil).
+                    // (an explicit nil stays nil). A collection default is
+                    // stored on first read, so `movement_ids << 1` sticks
+                    // as it does on Rails' cached default.
+                    let default = if matches!(&*default.node, ExprNode::Array { .. } | ExprNode::Hash { .. }) {
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Assign { target: LValue::Ivar { name: name.clone() }, value: default },
+                        )
+                    } else {
+                        default
+                    };
                     Expr::new(
                         Span::synthetic(),
                         ExprNode::If {

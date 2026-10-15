@@ -454,7 +454,8 @@ module ActiveRecord
     def hash_conditions: (Hash[String | Symbol, untyped] hash, ?bool note) -> String
     def association_key_reflection: (String column) -> untyped
     def association_key_predicates: (untyped reflection, untyped val, bool note) -> Array[[String, String]]
-    def column_predicate: (String col, Relation | Array[untyped] | Base | String | Integer | Float | bool | nil val, ?bool note, ?untyped owner) -> String
+    def column_predicate: (String col, Relation | Array[untyped] | Range[untyped] | Base | String | Integer | Float | bool | nil val, ?bool note, ?untyped owner) -> String
+    def range_predicate: (String qcol, Range[untyped] range, untyped typed, String? tcol) -> String
     def note_equality: (String? own, String | Integer | Float | bool | nil val) -> nil
     def bound_exists_sql: (Integer n) -> String
     def substitute_binds: (String sql, Array[untyped] args) -> String

@@ -206,3 +206,21 @@ fn virtual_attribute_with_a_literal_default_gets_a_reader_and_writer() {
     }
     assert!(src.contains("defined?(@force_flag)"), "the reader answers the default until assigned:\n{src}");
 }
+
+/// The untyped `attribute :movement_ids, default: -> { [] }` (Core's
+/// `Inventory::AdjustmentGroup#emit_commit_log` reads `movement_ids`:
+/// `undefined local variable or method`): a virtual attribute whose
+/// collection default is stored on first read.
+#[test]
+fn untyped_virtual_attribute_with_a_lambda_default_gets_a_reader() {
+    let src = emitted_file(
+        &[(
+            "app/models/code.rb",
+            "class Code < ApplicationRecord\n  attribute :movement_ids, default: -> { [] }\nend\n",
+        )],
+        "app/models/code.rb",
+    );
+    assert!(src.contains("def movement_ids\n"), "reader missing:\n{src}");
+    assert!(src.contains("def movement_ids="), "writer missing:\n{src}");
+    assert!(src.contains("@movement_ids = []"), "the default is stored on first read:\n{src}");
+}
