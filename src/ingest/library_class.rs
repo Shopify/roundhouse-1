@@ -5217,11 +5217,22 @@ fn walk_decl_body_in<'pr>(
     }
     if !module_function_named.is_empty() {
         let mut promoted: Vec<Symbol> = Vec::new();
+        let mut instance_copies: Vec<MethodDef> = Vec::new();
         for pos in &direct_def_positions {
             if module_function_named
                 .iter()
                 .any(|n| n == out.methods[*pos].name.as_str())
             {
+                // Ruby keeps the instance method too — private, as
+                // `module_function` makes it — so an includer's bare
+                // `x(...)` (Core's `TestAccessControl` includes
+                // `Apps::TestHelper` and calls `grant_scope`) still
+                // finds it. Same pairing `module_function def x` keeps.
+                if out.methods[*pos].receiver == MethodReceiver::Instance {
+                    let mut copy = out.methods[*pos].clone();
+                    copy.visibility = crate::dialect::MethodVisibility::Private;
+                    instance_copies.push(copy);
+                }
                 out.methods[*pos].receiver = MethodReceiver::Class;
                 // Same rule as the bare marker: the copy starts public,
                 // and a later `private_class_method :name` keeps the
@@ -5232,6 +5243,7 @@ fn walk_decl_body_in<'pr>(
                 promoted.push(out.methods[*pos].name.clone());
             }
         }
+        out.methods.extend(instance_copies);
         if !promoted.is_empty() {
             for m in &mut out.methods {
                 // The promoted method's own body is included: a

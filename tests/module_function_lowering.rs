@@ -157,9 +157,15 @@ fn module_function_copies_are_public_even_when_the_instance_definition_is_privat
     ] {
         let classes = ingest_library_classes(source.as_bytes(), "util.rb").unwrap();
         for method in &classes[0].methods {
-            assert_eq!(method.receiver, MethodReceiver::Class, "{source}");
-            assert_eq!(method.visibility, MethodVisibility::Public, "{source}");
+            if method.receiver == MethodReceiver::Instance {
+                // `module_function :helper` leaves Ruby's private instance copy.
+                assert!(source.contains("module_function :helper"), "{source}");
+                assert_eq!(method.visibility, MethodVisibility::Private, "{source}");
+            } else {
+                assert_eq!(method.visibility, MethodVisibility::Public, "{source}");
+            }
         }
+        assert!(classes[0].methods.iter().any(|m| m.receiver == MethodReceiver::Class), "{source}");
         let out = emit(source);
         assert!(!out.contains("private_class_method"), "{out}");
     }
@@ -186,4 +192,25 @@ fn only_bare_instance_visibility_markers_end_module_function_mode() {
         assert_eq!(methods[2].receiver, MethodReceiver::Instance, "{source}");
         assert_eq!(methods[2].visibility, visibility, "{source}");
     }
+}
+
+#[test]
+fn argument_form_keeps_a_private_instance_copy_for_includers() {
+    // Ruby keeps the instance method (private) beside the module copy:
+    // Core's `OnlineStoreApiTestHelper::TestAccessControl` includes
+    // `Apps::TestHelper` and calls its bare `grant_scope(...)`.
+    let out = emit(
+        r#"
+module Helper
+  def grant(scope)
+    scope
+  end
+
+  module_function :grant
+end
+"#,
+    );
+    assert!(out.contains("def self.grant"), "module copy:\n{out}");
+    assert!(out.contains("def grant(scope)"), "instance copy:\n{out}");
+    assert!(out.contains("private :grant"), "instance copy is private:\n{out}");
 }

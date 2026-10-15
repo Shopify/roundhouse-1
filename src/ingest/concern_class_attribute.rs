@@ -42,11 +42,30 @@ struct Carrier {
     methods: Vec<(MethodDef, Symbol)>,
 }
 
-pub(super) fn expand(
-    app: &mut App,
+/// The Concerns `expand` carries. Anything else that declares a
+/// `class_attribute` in `included do` has it run on the includer as the
+/// macro it is (`controller_concern_blocks`); `record` ledgers what is
+/// refused, once, from `expand`.
+pub(super) fn admitted_carriers(
+    app: &App,
     carriers: &[ConcernClassMethodSpans],
     framework_shadows: &HashSet<ClassId>,
-) {
+    record: bool,
+) -> HashSet<ClassId> {
+    admit(app, carriers, framework_shadows, record).into_keys().collect()
+}
+
+fn admit(
+    app: &App,
+    carriers: &[ConcernClassMethodSpans],
+    framework_shadows: &HashSet<ClassId>,
+    record: bool,
+) -> HashMap<ClassId, Carrier> {
+    let record_unsupported = |error: &IngestError| {
+        if record {
+            survey::record(error);
+        }
+    };
     let catalog = concern_class_method_catalog(&app.library_classes, carriers);
     let surfaces = controller_concern_surfaces(app);
     let verified = verified_framework_concerns(carriers, &surfaces.module_includes, framework_shadows);
@@ -68,7 +87,7 @@ pub(super) fn expand(
             let controller_carrier =
                 surfaces.controllers.values().any(|surface| surface.includes.contains(&lc.name));
             if controller_carrier && included_declares_class_attribute(&lc.unknown_calls) {
-                survey::record(&IngestError::Unsupported {
+                record_unsupported(&IngestError::Unsupported {
                     file: lc.name.0.as_str().to_string(),
                     message: "class_attribute carrier `included do` must contain only class_attribute and filter DSL"
                         .to_string(),
@@ -102,7 +121,7 @@ pub(super) fn expand(
             Some(methods) => {
                 admitted.insert(lc.name.clone(), Carrier { attributes, methods });
             }
-            None => survey::record(&IngestError::Unsupported {
+            None => record_unsupported(&IngestError::Unsupported {
                 file: lc.name.0.as_str().to_string(),
                 message: "class_attribute written other than by `self.name = value`, or two written by one method, is not modeled"
                     .to_string(),
@@ -110,7 +129,7 @@ pub(super) fn expand(
         }
     }
     if admitted.is_empty() {
-        return;
+        return admitted;
     }
     // Only expand onto controllers that name the carrier (or inherit a
     // direct include). `includes` is transitive through other modules;
@@ -126,7 +145,7 @@ pub(super) fn expand(
             surface.includes.contains(carrier) && !surface.direct_includes.contains(carrier)
         });
         if nested_only {
-            survey::record(&IngestError::Unsupported {
+            record_unsupported(&IngestError::Unsupported {
                 file: carrier.0.as_str().to_string(),
                 message: "class_attribute carrier included through another module is not modeled"
                     .to_string(),
@@ -135,9 +154,19 @@ pub(super) fn expand(
         }
         any_direct
     });
+    admitted
+}
+
+pub(super) fn expand(
+    app: &mut App,
+    carriers: &[ConcernClassMethodSpans],
+    framework_shadows: &HashSet<ClassId>,
+) {
+    let admitted = admit(app, carriers, framework_shadows, true);
     if admitted.is_empty() {
         return;
     }
+    let surfaces = controller_concern_surfaces(app);
     // On the module itself these methods would write an attribute the
     // module does not have; they exist only as each includer's own.
     for lc in &mut app.library_classes {

@@ -271,6 +271,21 @@ module ActionDispatch
       @env["HTTP_USER_AGENT"] || ""
     end
 
+    # The raw Accept-* request headers, as Rails' `HTTP_HEADERS` readers
+    # answer them (`Checkouts::One::ClientDetails.from_request` reads
+    # `request.accept_language`): the header's string, nil when unset.
+    def accept_charset
+      @env["HTTP_ACCEPT_CHARSET"]
+    end
+
+    def accept_encoding
+      @env["HTTP_ACCEPT_ENCODING"]
+    end
+
+    def accept_language
+      @env["HTTP_ACCEPT_LANGUAGE"]
+    end
+
     # Shared constructor — see the twin in
     # `runtime/ruby/action_dispatch/request.rb`. The two classes hold
     # their state differently and so cannot share a `new`; this is the
