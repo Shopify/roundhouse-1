@@ -435,15 +435,35 @@ module ActiveRecord
       RawConnection.new
     end
 
-    def exec_query(sql)
-      execute(sql)
+    # Rails' `exec_query(sql, name = "SQL", binds = [], prepare: false)`:
+    # `name` is the log label and `prepare` a statement-cache hint, neither
+    # of which changes the rows. Binds are written in as `exec_update`'s are
+    # (`$1` of the PostgreSQL adapter, or `?`).
+    def exec_query(sql, name = nil, binds = [], prepare: false)
+      execute(_with_binds(sql, binds))
     end
 
-    # `select_all(sql)` — the same rows under the name Rails' query
+    # `select_all(sql, name = nil, binds = [], preparable: nil,
+    # async: false)` — the same rows under the name Rails' query
     # interface gives them (lobsters' TrafficHelper reads its activity
     # range this way).
-    def select_all(sql)
-      execute(sql)
+    def select_all(sql, name = nil, binds = [], preparable: nil, async: false)
+      execute(_with_binds(sql, binds))
+    end
+
+    # `sql` with the positional binds written in: `$n` placeholders when
+    # it has them, else `?`. A bind that is an Attribute answers its
+    # database value.
+    def _with_binds(sql, binds)
+      # Rails reads the SQL of a Relation or Arel tree it is given.
+      sql = sql.to_sql unless sql.is_a?(String)
+      return sql if binds.empty?
+      values = binds.map { |b| b.respond_to?(:value_for_database) ? b.value_for_database : b }
+      if sql.match?(/\$\d+/)
+        sql.gsub(/\$(\d+)/) { quote(values[Regexp.last_match(1).to_i - 1]) }
+      else
+        Base.sanitize_sql([sql] + values)
+      end
     end
 
     # Rails' `exec_update(sql, name, binds)` / `exec_delete`: DML with

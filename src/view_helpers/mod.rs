@@ -39,6 +39,14 @@ pub(crate) fn is_marker_include(path: &[&str]) -> bool {
     matches!(path, ["ActionView", "Helpers", ..] | ["ActiveSupport", "NumberHelper"])
 }
 
+/// Whether the runtime defines `module` (`ActionView::Helpers::...`) as a
+/// real module an includer can keep: the include survives into the
+/// emitted tree where a `super` in a module the class also includes
+/// lands on one of its members.
+pub(crate) fn runtime_module(module: &str) -> bool {
+    module.trim_start_matches("::") == "ActionView::Helpers::TranslationHelper"
+}
+
 /// Framework view helpers callable from a helper/model body that the
 /// view-template classifier (which runs only on views) never reaches —
 /// plus bare calls in view bodies the classifier has no kind for (it

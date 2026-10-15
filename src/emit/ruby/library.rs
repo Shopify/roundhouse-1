@@ -1908,14 +1908,7 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
     // like a builtin would already dispatch to the builtin under
     // Rails' merge semantics, and the reopen must not clobber the
     // query-builder surface.
-    const RELATION_BUILTINS: &[&str] = &[
-        "where", "not", "or", "order", "limit", "offset", "group", "having", "joins",
-        "left_outer_joins", "left_joins", "select", "distinct", "includes", "preload",
-        "find", "find_by", "first", "last", "all", "each", "map", "to_a", "count",
-        "exists?", "empty?", "any?", "none?", "sum", "maximum", "minimum", "pluck",
-        "pick", "destroy_all", "delete_all", "update_all", "klass", "where_clauses",
-        "spawn", "find_each", "find_in_batches",
-    ];
+    use crate::lower::scope_chain::RELATION_BUILTINS;
     let scopes = crate::lower::scope_chain::build_scope_registry(&app.models);
     // name -> [(model, params)] in app-model order, names sorted — the
     // generated file must be byte-stable across runs.
@@ -11651,7 +11644,9 @@ fn emit_library_class_decl_inner(
             }
         }
         let text = if railtie {
-            super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
+            let mut carried = carried_loads(effect, app, railtie_root.as_deref(), &mut sources);
+            program_concern_extends(&mut carried, app);
+            super::emit_expr(&carried)
         } else {
             idempotent_const_set(effect).unwrap_or_else(|| super::emit_expr(effect))
         };
@@ -14952,8 +14947,15 @@ fn splatted_delegate_call(call: &Expr) -> bool {
     if method.as_str() != "delegate" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
         return false;
     }
-    fn names(e: &Expr) -> bool {
+    // `*COMMANDS.keys, #: as untyped` reads as a `Cast` around the value.
+    fn peel(e: &Expr) -> &Expr {
         match &*e.node {
+            ExprNode::Cast { value, .. } => peel(value),
+            _ => e,
+        }
+    }
+    fn names(e: &Expr) -> bool {
+        match &*peel(e).node {
             ExprNode::Const { .. } | ExprNode::Lit { .. } => true,
             ExprNode::Array { elements, .. } => elements.iter().all(names),
             ExprNode::Send { recv: Some(r), method, args, block: None, .. } => {
@@ -14966,7 +14968,7 @@ fn splatted_delegate_call(call: &Expr) -> bool {
     let mut target = false;
     let mut private = false;
     for arg in args {
-        match &*arg.node {
+        match &*peel(arg).node {
             ExprNode::Splat { value } if names(value) => splatted = true,
             ExprNode::Lit { .. } => {}
             ExprNode::Hash { entries, .. } => {
@@ -16303,11 +16305,17 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
 fn program_concern_extends(e: &mut Expr, app: &App) {
     // `Base.include(Concern)` (a boot initializer's `on_load` block,
     // lifted into `run_initializer`) takes its extends on `Base`.
+    // `klass.prepend(Concern)` (an autoloader `on_load` hook's block
+    // parameter, Core's BillingApiMockConnection) takes the carrier on
+    // `klass.singleton_class`, as `prepend_features` prepends it there.
     if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node
-        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Const { .. }))
-        && method.as_str() == "include"
+        && recv.as_ref().is_none_or(|r| {
+            matches!(&*r.node, ExprNode::Const { .. }) || (method.as_str() == "prepend" && matches!(&*r.node, ExprNode::Var { .. }))
+        })
+        && matches!(method.as_str(), "include" | "prepend")
         && !args.is_empty()
     {
+        let prepend = method.as_str() == "prepend";
         let recv = recv.clone();
         let names: Option<Vec<ClassId>> = args
             .iter()
@@ -16327,7 +16335,14 @@ fn program_concern_extends(e: &mut Expr, app: &App) {
             for carrier in carriers {
                 let path = std::iter::once(Symbol::from("")).chain(carrier.0.as_str().split("::").map(Symbol::from)).collect();
                 let arg = Expr::new(span, ExprNode::Const { path });
-                exprs.push(Expr::new(span, ExprNode::Send { recv: recv.clone(), method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }));
+                let call = if prepend {
+                    let target = recv.clone().unwrap_or_else(|| Expr::new(span, ExprNode::SelfRef));
+                    let singleton = Expr::new(span, ExprNode::Send { recv: Some(target), method: Symbol::from("singleton_class"), args: vec![], block: None, parenthesized: false });
+                    ExprNode::Send { recv: Some(singleton), method: Symbol::from("prepend"), args: vec![arg], block: None, parenthesized: false }
+                } else {
+                    ExprNode::Send { recv: recv.clone(), method: Symbol::from("extend"), args: vec![arg], block: None, parenthesized: false }
+                };
+                exprs.push(Expr::new(span, call));
             }
             *e = Expr::new(span, ExprNode::Seq { exprs });
         }

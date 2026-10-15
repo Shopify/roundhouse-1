@@ -793,6 +793,21 @@ pub fn collect_relation_class_method_demand(
     });
 }
 
+/// The methods the runtime's Relation answers itself. A model's class
+/// method of the same name is never reached through a relation (Rails
+/// delegates to the class only for names the Relation lacks), so it is
+/// neither delegated to nor given the relation as `__rel`: Core's
+/// `Product.annotate(&block)` (ModelMetadata) does not take over
+/// `relation.annotate("comment")`.
+pub const RELATION_BUILTINS: &[&str] = &[
+    "where", "not", "or", "order", "limit", "offset", "group", "having", "joins",
+    "left_outer_joins", "left_joins", "select", "distinct", "includes", "preload",
+    "find", "find_by", "first", "last", "all", "each", "map", "to_a", "count",
+    "exists?", "empty?", "any?", "none?", "sum", "maximum", "minimum", "pluck",
+    "pick", "destroy_all", "delete_all", "update_all", "klass", "where_clauses",
+    "spawn", "find_each", "find_in_batches", "annotate",
+];
+
 /// Survey the whole App for class methods reached through an
 /// association, and resolve them against the models.
 ///
@@ -948,6 +963,9 @@ pub fn build_assoc_class_methods(
             if assocs.is_unseedable(Some(&owner.name), aname) {
                 continue;
             }
+            if RELATION_BUILTINS.contains(&mname.as_str()) {
+                continue;
+            }
             if scopes.get(target).is_some_and(|s| s.contains_key(mname)) {
                 continue;
             }
@@ -991,6 +1009,9 @@ pub fn build_assoc_class_methods(
     wanted_models
         .sort_by(|a, b| (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str())));
     for (target, mname) in wanted_models {
+        if RELATION_BUILTINS.contains(&mname.as_str()) {
+            continue;
+        }
         if scopes.get(target).is_some_and(|s| s.contains_key(mname)) {
             continue;
         }

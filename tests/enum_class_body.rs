@@ -440,3 +440,52 @@ raise "predicate" unless a.role_a?
         )
         .assert_passes();
 }
+
+/// Core's `Merchandising::GroupableProduct`: the concern's `included do`
+/// names a mapping constant the module body assigns, whose values are
+/// constants too, with a `prefix:` and `validate:` option. The enum was
+/// dropped ("mapping must be an array or hash literal"), leaving
+/// `combined_listing_parent?` undefined on the includer.
+#[test]
+fn emitted_included_enum_names_a_module_constant_mapping() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/groupable.rb",
+            r##"module Groupable
+  extend ActiveSupport::Concern
+
+  LISTING_PARENT = "parent"
+  LISTING_CHILD = "child"
+
+  VALID_ROLES = { parent: LISTING_PARENT, child: LISTING_CHILD }.freeze #: Hash[Symbol, String]
+
+  included do
+    enum :grouping_role, VALID_ROLES, prefix: "listing", validate: { allow_nil: true }
+  end
+end
+"##,
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  include Groupable\n",
+        )
+        .edit(
+            "db/schema.rb",
+            "    t.string \"title\"",
+            "    t.string \"title\"\n    t.string \"grouping_role\"",
+        )
+        .run_ruby(
+            r#"
+a = Article.new(title: "Hello world", body: "abcdefghij")
+raise "nil role" if a.listing_parent? || a.listing_child?
+a.listing_parent!
+raise "predicate" unless a.listing_parent? && !a.listing_child?
+raise "stored" unless a.grouping_role == "parent"
+a.save!
+raise "scope" unless Article.listing_parent.where(id: a.id).exists?
+puts "module constant enum passed"
+"#,
+        )
+        .assert_passes();
+}

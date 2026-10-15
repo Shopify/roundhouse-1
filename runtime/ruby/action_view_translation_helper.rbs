@@ -1,0 +1,13 @@
+module ActionView
+  module Helpers
+    module TranslationHelper
+      self.@raise_on_missing_translations: bool?
+      def self.raise_on_missing_translations: () -> bool?
+      def self.raise_on_missing_translations=: (bool? value) -> bool?
+      def translate: (String | Symbol | Array[String | Symbol] key, **untyped options) -> untyped
+      def t: (String | Symbol | Array[String | Symbol] key, **untyped options) -> untyped
+      def localize: (untyped object, **untyped options) -> String
+      def l: (untyped object, **untyped options) -> String
+    end
+  end
+end

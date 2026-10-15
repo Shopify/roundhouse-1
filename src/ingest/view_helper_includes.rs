@@ -49,6 +49,8 @@ struct Node {
     defines: [HashSet<Symbol>; 2],
     /// `(name, written with an explicit self receiver)`.
     calls: [Vec<(Symbol, bool)>; 2],
+    /// Instance methods whose body calls `super`.
+    supers: HashSet<Symbol>,
     helper_module: bool,
 }
 
@@ -115,17 +117,23 @@ pub(super) fn settle(app: &mut App) {
     for lc in &mut app.library_classes {
         let owner = lc.name.clone();
         let mut kept = Vec::with_capacity(lc.unknown_calls.len());
+        let mut retained = Vec::new();
         for mut call in std::mem::take(&mut lc.unknown_calls) {
-            if settle_call(&mut call, &owner, &graph) {
+            if settle_call(&mut call, &owner, &graph, &mut retained) {
                 kept.push(call);
             }
         }
         lc.unknown_calls = kept;
+        for module in retained.into_iter().rev() {
+            if !lc.includes.contains(&module) {
+                lc.includes.insert(0, module);
+            }
+        }
     }
     for model in &mut app.models {
         let owner = model.name.clone();
         model.body.retain_mut(|item| match item {
-            ModelBodyItem::Unknown { expr, .. } => settle_call(expr, &owner, &graph),
+            ModelBodyItem::Unknown { expr, .. } => settle_call(expr, &owner, &graph, &mut Vec::new()),
             _ => true,
         });
     }
@@ -147,6 +155,18 @@ fn add_method(node: &mut Node, m: &MethodDef) {
     };
     node.defines[side].insert(m.name.clone());
     collect_self_calls(&m.body, &mut node.calls[side]);
+    if side == 0 && calls_super(&m.body) {
+        node.supers.insert(m.name.clone());
+    }
+}
+
+fn calls_super(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Super { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || calls_super(c));
+    found
 }
 
 fn collect_self_calls(e: &Expr, out: &mut Vec<(Symbol, bool)>) {
@@ -182,7 +202,7 @@ fn resolve_name(written: &ClassId, scope: &ClassId, names: &HashSet<ClassId>) ->
 }
 
 /// Settle one class-body call of `owner`. Returns whether it stays.
-fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>) -> bool {
+fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &mut Vec<ClassId>) -> bool {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *call.node else { return true };
     let side = match method.as_str() {
         "include" => Side::Instance,
@@ -207,9 +227,30 @@ fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>) -> bool {
         });
         return true;
     }
-    // Answered: the include contributes nothing the emitted tree needs.
+    // Answered: the include contributes nothing the emitted tree needs,
+    // unless a module the owner includes reaches the helper's own method
+    // with `super` (`ShopifyI18n::ActionViewSoftDegrade#translate`):
+    // nothing is called on the owner for the scan above to see, yet the
+    // `super` has no method to land on without the module in the chain.
+    if side == Side::Instance {
+        for module in &markers {
+            if crate::view_helpers::runtime_module(module) && super_reaches(owner, module, graph) {
+                retained.push(ClassId(Symbol::from(format!("::{module}"))));
+            }
+        }
+    }
     args.retain(|arg| marker_path(arg).is_none());
     !args.is_empty()
+}
+
+/// Whether a module `owner` includes (or `owner` itself) has an instance
+/// method named like a member of `module` that calls `super`.
+fn super_reaches(owner: &ClassId, module: &str, graph: &Graph<'_>) -> bool {
+    let Some(members) = crate::view_helpers::members(module) else { return false };
+    let reaches = |c: &ClassId| {
+        graph.nodes.get(c).is_some_and(|n| n.supers.iter().any(|name| members.contains(&name.as_str())))
+    };
+    reaches(owner) || graph.included.get(owner).into_iter().flatten().any(reaches)
 }
 
 fn marker_path(arg: &Expr) -> Option<String> {

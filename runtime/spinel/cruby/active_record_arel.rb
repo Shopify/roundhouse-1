@@ -211,8 +211,8 @@ module ActiveRecord
         super(arel_join_spec(spec))
       end
 
-      def from(source)
-        super(arel_text(source))
+      def from(source, subquery_name = nil)
+        super(arel_text(source), subquery_name)
       end
 
       # `update_all(col => node)`: a node's SQL stands where the value's

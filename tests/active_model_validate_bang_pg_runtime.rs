@@ -87,6 +87,11 @@ const PROBE: &str = r##"class VbProbe
     out << "no context: #{attempt { ticket.validate! }}"
     out << "context: #{attempt { ticket.validate!(:booking) }}"
     out << "seated: #{attempt { Ticket.new("A1").validate!(:booking) }}"
+    # `validate(context)` is `valid?(context)`; nil names a context too.
+    unseated = Ticket.new(nil)
+    out << "validate context: #{unseated.validate(:booking)} #{unseated.errors.full_messages.inspect}"
+    out << "validate seated: #{Ticket.new("A1").validate(:booking)}"
+    out << "validate nil: #{Ticket.new(nil).validate(nil)} #{Ticket.new(nil).validate(nil).class}"
     out
   end
 end
@@ -94,7 +99,7 @@ end
 
 /// What native Rails 8.2 (activemodel 8.2.0.alpha) answers, so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 11] = [
     r#"ok: "REQUEST_FOR_INFORMATION_221""#,
     r#"blank: ActiveModel::ValidationError: Validation failed: Request name can't be blank, Request name is invalid"#,
     r#"pattern: ActiveModel::ValidationError: Validation failed: Request name is invalid"#,
@@ -103,6 +108,9 @@ const EXPECTED: [&str; 8] = [
     r#"no context: true"#,
     r#"context: ActiveModel::ValidationError: Validation failed: Seat can't be blank"#,
     r#"seated: true"#,
+    r#"validate context: false ["Seat can't be blank"]"#,
+    r#"validate seated: true"#,
+    r#"validate nil: true TrueClass"#,
 ];
 
 const FILES: [(&str, &str); 7] = [
@@ -139,6 +147,9 @@ fn a_tableless_model_defines_validate_bang() {
     let ticket = std::fs::read_to_string(emitted.join("app/models/ticket.rb")).unwrap();
     assert!(ticket.contains("def validate!(context = nil)"), "{ticket}");
     assert!(ticket.contains("valid?(context) || raise("), "{ticket}");
+    // An explicit context goes to `valid?`; no argument stays the checks.
+    assert!(ticket.contains("def validate(*context)"), "{ticket}");
+    assert!(ticket.contains("valid?(context.first)"), "{ticket}");
 }
 
 /// The same app natively, on Rails 8.2, and emitted.

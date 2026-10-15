@@ -89,8 +89,12 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         // body, or a Concern's `included do`), or reached through an app macro
         // (Core's `redactable_typed_store`): it calls `decorate_attributes`
         // for the column (activerecord-typedstore extension.rb).
+        // A Concern's `included do` statement that calls a class macro the
+        // model chain defines (Core's `redactable_typed_store`) is carried
+        // in `included_block_statements` rather than the body calls.
         let side = ClassSide::of_sti_subclass(lc, model, app);
-        for (_, call_names) in calls_reaching(&side, lc.unknown_calls.iter(), "typed_store", true) {
+        let carried = app.included_block_statements.get(&lc.name).into_iter().flatten().map(|(_, e)| e);
+        for (_, call_names) in calls_reaching(&side, lc.unknown_calls.iter().chain(carried), "typed_store", true) {
             names.extend(call_names.into_iter().take(1));
         }
     }
