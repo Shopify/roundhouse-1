@@ -1202,7 +1202,14 @@ fn synth_attr_reader(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
 /// A column whose public accessors go through `RoundhouseJsonColumn` load/dump:
 /// schema `t.json` / `t.jsonb` (except `has_json` keyed schemas), or an
 /// ActiveRecord `serialize …, coder: JSON` declaration on text/string/json.
+///
+/// Not a retypable column (`attribute :options, :json, default: []`): its
+/// slot holds the declared type's value, which `RoundhouseJsonColumn.load`
+/// would be handed as if it were stored text.
 fn is_generic_json_col(col: &Column, model: &Model) -> bool {
+    if is_retypable(model, col) {
+        return false;
+    }
     if crate::lower::serialize::json_serialize_columns(model).contains(&col.name) {
         return true;
     }
