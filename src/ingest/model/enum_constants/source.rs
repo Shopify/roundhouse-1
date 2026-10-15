@@ -262,18 +262,28 @@ impl EnumConstants {
                 _ => Some(value),
             };
             // `%w[…]` strings and `%i[…]` / `[:A, :B]` symbols — same
-            // label list `enum_label_values` admits for class-local consts.
-            let labels = literal.filter(|_| direct).and_then(|node| {
+            // label list `enum_label_values` admits for class-local consts —
+            // or sibling string constants (`[KIND_SHIPMENT].freeze`).
+            let labels = literal.as_ref().filter(|_| direct).and_then(|node| {
                 node.as_array_node()?
                     .elements()
                     .iter()
                     .enumerate()
                     .map(|(i, el)| {
                         symbol_or_string_value(&el)
+                            .or_else(|| {
+                                let cr = el.as_constant_read_node()?;
+                                self.scalars.get(&Self::qualify(owner, constant_id_str(&cr.name())))?.clone()
+                            })
                             .map(|label| (label, Literal::Int { value: i as i64 }))
                     })
                     .collect()
             });
+            let scalar = literal.as_ref().filter(|_| direct).and_then(symbol_or_string_value);
+            self.scalars
+                .entry(name.clone())
+                .and_modify(|value| *value = None)
+                .or_insert(scalar);
             // Reassignments have load-order-dependent semantics, never choose
             // whichever file happened to be visited last.
             self.values

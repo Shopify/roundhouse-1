@@ -660,6 +660,10 @@ fn dynamic_inverse_of_stays_unexpanded() {
 fn emitted_inverse_of_nested_constant_namespaced_runs() {
     runtime_app()
         .write(
+            "app/controllers/entries_controller.rb",
+            "class EntriesController < ApplicationController\n  def index\n    render plain: Inventory::CostAdjustment.count.to_s\n  end\nend\n",
+        )
+        .write(
             "db/schema.rb",
             r#"ActiveRecord::Schema.define do
   create_table "inventory_cost_adjustments", force: :cascade do |t|

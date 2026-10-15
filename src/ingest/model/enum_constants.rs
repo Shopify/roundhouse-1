@@ -74,6 +74,10 @@ enum SourceFact {
 #[derive(Default)]
 pub(in crate::ingest) struct EnumConstants {
     values: crate::det::HashMap<String, EnumConstant>,
+    /// `NAME = "x"` / `NAME = :x` written directly in a class body, so a
+    /// later list of them (`TYPES = [KIND_X].freeze`) folds; `None` once
+    /// reassigned.
+    scalars: crate::det::HashMap<String, Option<String>>,
     /// Lexical owners at each class/module open, keyed by (file, start).
     /// Concern `included do` resolution reads the same table models use.
     pub(in crate::ingest) nesting: crate::det::HashMap<(String, usize), Vec<String>>,
