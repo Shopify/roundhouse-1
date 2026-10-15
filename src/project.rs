@@ -5217,7 +5217,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
-        "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
+        "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_redefine_method", "active_support_class_attribute",
         "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
         "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
@@ -5999,6 +5999,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/module/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/core_ext/class/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/core_ext/module/redefine_method", &["active_support_redefine_method"]),
+    ("active_support/core_ext/module/introspection", &["active_support_module_introspection"]),
     ("active_support/core_ext/class", &["active_support_class_attribute", "active_support_class_subclasses"]),
     ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
     ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
@@ -6087,6 +6088,12 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         ports: &["active_support_redefine_method"],
         calls: &["redefine_method", "redefine_singleton_method", "silence_redefinition_of_method"],
         at_require_rails: true,
+    },
+    BootCoreExtension {
+        feature: "active_support/core_ext/module/introspection",
+        ports: &["active_support_module_introspection"],
+        calls: &["module_parent", "module_parent_name", "module_parents"],
+        at_require_rails: false,
     },
     BootCoreExtension {
         feature: "active_support/core_ext/class/attribute",
@@ -13724,6 +13731,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_securerandom.rb"
         && p != "runtime/active_support_module_attribute_accessors.rb"
         && p != "runtime/active_support_redefine_method.rb"
+        && p != "runtime/active_support_module_introspection.rb"
         && p != "runtime/active_support_class_attribute.rb"
         && p != "runtime/active_support_class_subclasses.rb"
         && p != "runtime/active_support_numeric_bytes.rb"
