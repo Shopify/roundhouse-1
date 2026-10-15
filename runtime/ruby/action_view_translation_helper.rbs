@@ -5,10 +5,9 @@ module ActionView
       def self.raise_on_missing_translations: () -> bool?
       def self.raise_on_missing_translations=: (bool? value) -> bool?
       def translate: (String | Symbol | Array[String | Symbol] key, **untyped options) -> untyped
-      def t: (String | Symbol | Array[String | Symbol] key, **untyped options) -> untyped
       def localize: (untyped object, **untyped options) -> String
-      def l: (untyped object, **untyped options) -> String
       private def html_safe_translation_key?: (String | Symbol | Array[String | Symbol] key) -> bool
+      private def missing_translation: (String | Symbol key, Hash[Symbol, untyped] options) -> String
     end
   end
 end

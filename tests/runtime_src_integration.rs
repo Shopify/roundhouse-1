@@ -1237,7 +1237,16 @@ fn every_runtime_method_body_concretely_typed() {
     // predicates (om92) and Enumerable (om86) carry caller-defined values
     // (+77 over the estimate). The fixes themselves add two: a Kernel
     // `to_enum` and a splatted `slice` answer gradual.
-    const CEILING: usize = 1737;
+    // MEASURED 1760 on 2026-10-15 (om120): om116-om119 add 23 gradual sites
+    // over om110, in the bodies those rounds added: connection.rb (Arel
+    // SubstituteBinds / `exec_query` binds, the dirty surface and
+    // `_with_binds`, which takes its SQL as untyped because Rails also
+    // accepts a Relation or Arel tree there), the Base query delegators,
+    // `Relation#extending!`, and `action_view_translation_helper.rb` (3:
+    // the i18n gem answers `normalize_keys` untyped, cast to
+    // `Array[Symbol]`, and `**options` is caller-defined). The per-file
+    // split was not diffed against om110.
+    const CEILING: usize = 1760;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
