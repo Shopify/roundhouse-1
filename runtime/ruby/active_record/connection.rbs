@@ -479,9 +479,9 @@ module ActiveRecord
   class Relation
     @model: Base
     def insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
     def insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
     def upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
   end
