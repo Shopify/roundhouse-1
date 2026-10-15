@@ -959,6 +959,14 @@ module ActiveRecord
         scope.sum(*args)
       end
 
+      # `select(:id, :delta)` is the scope's column projection (Rails'
+      # `Relation#select` with fields); the block form filters the
+      # records held (`Enumerable#select`).
+      def select(*fields, &block)
+        return super(&block) if fields.empty? || block
+        scope.select(*fields)
+      end
+
       # The rows go, and so do the records the owner holds.
       def destroy_all
         destroyed = scope.destroy_all

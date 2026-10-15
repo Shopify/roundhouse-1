@@ -383,11 +383,26 @@ module ActiveRecord
       # has_one record is saved with.
       def _nested_set_owner_keys(name, record)
         reflection = self.class.reflect_on_association(name)
-        owner_key = send(reflection.active_record_primary_key)
-        record.public_send(:"#{reflection.foreign_key}=", owner_key)
+        _nested_owner_key_pairs(reflection).each do |foreign_key, owner_key|
+          record.public_send(:"#{foreign_key}=", send(owner_key))
+        end
         record.public_send(:"#{reflection.type}=", self.class.base_class.name) if reflection.type
         _set_inverse_instance(name, record) if respond_to?(:_set_inverse_instance, true)
         ActiveRecord::Associations::Association.enroll(record) if defined?(ActiveRecord::Associations::Association)
+      end
+
+      # `[foreign key column, owner column]` pairs of the association. A
+      # composite owner key (`query_constraints [:shop_id, :id]`) with a
+      # single foreign key column joins as Rails' `derive_fk_query_constraints`
+      # derives it: `[:shop_id, <foreign key>]` against the owner's key, so
+      # `shop_id` is copied along with the id.
+      def _nested_owner_key_pairs(reflection)
+        owner_keys = Array(reflection.active_record_primary_key).map(&:to_s)
+        foreign_keys = Array(reflection.foreign_key).map(&:to_s)
+        if owner_keys.size > 1 && foreign_keys.size == 1
+          foreign_keys = [owner_keys.first] + foreign_keys
+        end
+        foreign_keys.zip(owner_keys.last(foreign_keys.size))
       end
 
       def _nested_autosave_disabled?(name)
@@ -436,10 +451,10 @@ module ActiveRecord
           return nil
         end
         reflection = self.class.reflect_on_association(name)
-        key = send(reflection.active_record_primary_key)
-        foreign_key = reflection.foreign_key
-        if record.changed_for_autosave? || record.new_record? || record.public_send(foreign_key) != key ||
-            record.attribute_changed?(foreign_key.to_s)
+        pairs = _nested_owner_key_pairs(reflection)
+        if record.changed_for_autosave? || record.new_record? ||
+            pairs.any? { |foreign_key, owner_key| record.public_send(foreign_key) != send(owner_key) } ||
+            pairs.any? { |foreign_key, _| record.attribute_changed?(foreign_key) }
           _nested_set_owner_keys(name, record)
           saved = record.save(validate: false)
           raise ActiveRecord::Rollback unless saved

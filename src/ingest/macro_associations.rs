@@ -27,6 +27,20 @@ use crate::ident::Symbol;
 
 /// Add the associations the models' class macro calls declare; answers
 /// whether there were any.
+/// The class an association names, whichever its kind: Rails' `compute_type`
+/// reads a `class_name:` of a `has_many_with_query_constraints` (Core's
+/// `class_name: "FulfillmentOrderLineItem"` in `Fulfillments::FulfillmentOrder`)
+/// from the owner's enclosing namespaces too.
+fn association_target(assoc: &mut crate::dialect::Association) -> Option<&mut crate::ident::ClassId> {
+    use crate::dialect::Association;
+    match assoc {
+        Association::BelongsTo { target, .. }
+        | Association::HasOne { target, .. }
+        | Association::HasMany { target, .. }
+        | Association::HasAndBelongsToMany { target, .. } => Some(target),
+    }
+}
+
 pub(super) fn declare(app: &mut crate::App) -> bool {
     let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     let mut adds: Vec<(usize, Vec<(usize, ModelBodyItem)>)> = Vec::new();
@@ -45,7 +59,7 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
                     && let Some((mut assoc, options)) = literal_association_of(app, expr, &model.name, &literal)
                 {
                     LITERAL_OPTIONS.with_borrow_mut(|m| m.insert((expr.span.file.0, expr.span.start), options));
-                    if let crate::dialect::Association::BelongsTo { target, .. } = &mut assoc {
+                    if let Some(target) = association_target(&mut assoc) {
                         super::app::qualify_target(&model.name, target, &models);
                     }
                     items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
@@ -56,7 +70,7 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
                         continue;
                     }
                     if let Some(mut assoc) = fixed_association_of(app, expr, &model.name, &fixed) {
-                        if let crate::dialect::Association::BelongsTo { target, .. } = &mut assoc {
+                        if let Some(target) = association_target(&mut assoc) {
                             super::app::qualify_target(&model.name, target, &models);
                         }
                         items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
@@ -74,7 +88,7 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
                 if !apply_merged(&mut assoc, &forward.merged) || !apply_scope_wrapper(&mut assoc, forward.scope_wrapper.as_ref()) {
                     continue;
                 }
-                if let crate::dialect::Association::BelongsTo { target, .. } = &mut assoc {
+                if let Some(target) = association_target(&mut assoc) {
                     super::app::qualify_target(&model.name, target, &models);
                 }
                 items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
