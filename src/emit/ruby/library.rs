@@ -4152,10 +4152,20 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
         if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "reflect_on_association" && !generated(m)) {
             continue; // the model's own wins
         }
-        let inherits = model
-            .parent
-            .as_ref()
-            .is_some_and(|p| subclass_views.contains_key(p) || app.models.iter().any(|m| &m.name == p));
+        // A parent that is no model or view itself (an STI subclass
+        // declaring nothing) still hands the names on, to the model above
+        // it: walk the class parents until one is a model.
+        let is_model = |p: &ClassId| subclass_views.contains_key(p) || app.models.iter().any(|m| &m.name == p);
+        let mut inherits = false;
+        let mut cursor = model.parent.clone();
+        for _ in 0..16 {
+            let Some(p) = cursor else { break };
+            if is_model(&p) {
+                inherits = true;
+                break;
+            }
+            cursor = app.library_classes.iter().find(|c| c.name == p).and_then(|c| c.parent.clone());
+        }
         let owner = format!("::{}", model.name.0.as_str().trim_start_matches("::"));
         let macro_declared = crate::lower::model_to_library::macro_associations::declaring_calls(model);
         let mut entries: Vec<(String, String)> = Vec::new();
