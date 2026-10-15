@@ -11171,6 +11171,9 @@ fn emit_library_class_decl_inner(
         .filter(|c| !extends_before.iter().any(|(_, e)| std::ptr::eq(*e, *c)))
         .collect();
     let extended_at_include: std::cell::RefCell<Vec<ClassId>> = std::cell::RefCell::new(Vec::new());
+    // The includes written so far, by module: a later include's carried
+    // statements run with the `ClassMethods` of these already extended.
+    let written_includes: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     // `with_extends`: the include's `ClassMethods` extends follow its
     // line, ahead of its carried block, as `Concern#append_features` runs
     // them (`base.extend(ClassMethods)`, then `base.class_eval(&block)`).
@@ -11206,8 +11209,19 @@ fn emit_library_class_decl_inner(
             .included_block_statements
             .get(&lc.name)
             .is_some_and(|statements| statements.iter().any(|(after, _)| after.0.as_str().trim_start_matches("::") == root));
+        // An earlier include's `ClassMethods` is extended by then too (Core's
+        // `include HasDefaultFullAccessConcern` above `include ColorRolesFields`,
+        // whose block's `field` calls reach the first's override).
+        let mut reached = reached_by(root);
+        for earlier in written_includes.borrow().iter() {
+            for module in reached_by(earlier) {
+                if !reached.contains(&module) {
+                    reached.push(module);
+                }
+            }
+        }
+        written_includes.borrow_mut().push(root.to_string());
         if groups().next().is_some() || carries_statements {
-            let reached = reached_by(root);
             for carrier in &spliced_extends {
                 let owned = crate::app::class_methods_carrier_owner(carrier).is_some_and(|o| reached.contains(&root_of(&o)));
                 if owned && !extended_at_include.borrow().contains(*carrier) {
