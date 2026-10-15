@@ -127,3 +127,53 @@ fn a_module_prepended_to_minitest_test_runs_for_emitted_tests() {
     let row: serde_json::Value = serde_json::from_str(rows.lines().next().expect("one row")).unwrap();
     assert_eq!(row["status"], "pass", "{rows}\n{log}");
 }
+
+const SOURCE_TEST: &str = r##"require "test_helper"
+require "method_source"
+
+class SourceTextTest < ActiveSupport::TestCase
+  def preload_marker
+    assert_no_resolve_queries_marker
+  end
+
+  test "method source reads the emitted text of a moved test" do
+    assert_includes method(:preload_marker).source, "assert_no_resolve_queries_marker"
+    assert_equal "components/checkouts/test/models/source_text_test.rb", method(:preload_marker).source_location.first.delete_prefix("#{Rails.root}/")
+    assert_includes self.class.methods_matching(/^test_/).first, "method_source_reads"
+  end
+end
+"##;
+
+/// method_source's `Method#source` opens the file `source_location`
+/// names, which is the authored one (absent from the tree, and its lines
+/// are not the emitted ones): Core's GraphQLTestHelper raised "Could not
+/// load source" from it for every moved test.
+#[test]
+fn method_source_reads_the_emitted_text_of_a_moved_test() {
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("components/checkouts/test/models/source_text_test.rb", SOURCE_TEST)
+        .write("roundhouse.yml", "test_paths:\n  - components/checkouts/test/models\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(emitted.join("test/roundhouse_tests.json")).unwrap()).unwrap();
+    let file = index["sources"][0]["classes"][0]["file"].as_str().unwrap().to_string();
+    let gem_home = std::env::var("CORE_GEM_HOME")
+        .unwrap_or_else(|_| "/nix/store/d958gj4a8pmld3fxa7fhyqasz61cafch-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
+    let results = emitted.join("results.jsonl");
+    let out = emit_and_run::ruby()
+        .args(["-Itest", &format!("-I{gem_home}/gems/method_source-1.1.0/lib"), "-e", "load ARGV.fetch(0)", &file])
+        .current_dir(&*emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &results)
+        .env("BLOG_DB", ":memory:")
+        .env("RAILS_ENV", "test")
+        .output()
+        .expect("emitted CRuby");
+    let log = format!("stdout={}\nstderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{log}");
+    let rows = std::fs::read_to_string(&results).unwrap_or_else(|e| panic!("no results: {e}\n{log}"));
+    let row: serde_json::Value = serde_json::from_str(rows.lines().next().expect("one row")).unwrap();
+    assert_eq!(row["status"], "pass", "{rows}\n{log}");
+}

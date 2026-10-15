@@ -45,6 +45,14 @@ end
 
 class TestBase
   include ActiveSupport::Testing::ConstantStubbing
+
+  # Minitest::Runnable.methods_matching (minitest/lib/minitest.rb):
+  # the public instance method names, inherited ones included, that
+  # match `re`. Core's GraphQLTestHelper reads the class's own test
+  # names with it (`methods_matching(/^test_/).grep(/preload/)`).
+  def self.methods_matching(re)
+    public_instance_methods(true).grep(re).map(&:to_s)
+  end
 end
 
 # Rails' `ActionMailer::TestHelper` (actionmailer/lib/action_mailer/

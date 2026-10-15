@@ -4405,6 +4405,7 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
         }
     }
     collect_config_data(vfs, dir, &dir.join("config"), app);
+    collect_slice_named_binary_data(vfs, dir, app);
     // A gem carried as source reads its own data at run time by a path
     // under its directory (shopify-money's `Currency::Loader` opens
     // `config/currency_iso.yml` beside `lib/`), which the emitted tree
@@ -4416,6 +4417,32 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
     // Deterministic order: the emit is byte-compared across runs, and
     // `read_dir` order is explicitly unspecified by the trait.
     app.binary_assets.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+/// A data file the slicer's manifest names (role `data` or `boot-config`,
+/// not Ruby) that is not valid UTF-8, carried verbatim: the text pipeline
+/// carries the named files that are (`project::slice_named_data_files`).
+/// Core's `Shopify::GeoIP` opens `GeoIP2-City.mmdb` from
+/// `components/platform/test/fixtures/geoip`, a MaxMind test database.
+/// Nothing named for secrets is carried, as in `walk_data_files_into`.
+fn collect_slice_named_binary_data<V: Vfs + ?Sized>(vfs: &V, root: &Path, app: &mut App) {
+    let Some(manifest) = root.parent().map(|p| p.join("slice-manifest.json")) else { return };
+    let Ok(text) = vfs.read_to_string(&manifest) else { return };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    for file in manifest.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
+        let role = file.get("role").and_then(|r| r.as_str());
+        let Some(rel) = file.get("slice_path").and_then(|p| p.as_str()) else { continue };
+        if !matches!(role, Some("data" | "boot-config")) || rel.ends_with(".rb") || crate::project::named_for_secrets(rel) {
+            continue;
+        }
+        let path = root.join(rel);
+        if vfs.read_to_string(&path).is_ok() || app.binary_assets.iter().any(|(have, _)| have == rel) {
+            continue;
+        }
+        if let Ok(bytes) = vfs.read(&path) {
+            app.binary_assets.push((rel.to_string(), bytes));
+        }
+    }
 }
 
 /// The app's JSON data under `config/`, carried verbatim beside the

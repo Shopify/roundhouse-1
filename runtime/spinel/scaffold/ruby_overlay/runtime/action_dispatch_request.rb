@@ -14,6 +14,7 @@
 # write scratch keys into it (`exception_notifier.exception_data`),
 # which the real ENV object would reject for non-String values.
 require "stringio"
+require "uri"
 require "securerandom"
 require "digest"
 require_relative "action_dispatch/headers"
@@ -122,6 +123,36 @@ module ActionDispatch
 
     def [](key)
       @params[key.to_s]
+    end
+
+    # Rack::Request#cookies: the request's cookies as a name => value
+    # Hash, parsed once from the Cookie header and kept under
+    # `rack.request.cookie_hash` (a TestRequest starts with an empty one,
+    # which a test fills). Rack's rules: pairs split on `;`, the
+    # first occurrence of a name wins, values are URI-decoded.
+    # Core's Checkouts::One::ClientDetails reads the shared-discount-code
+    # cookie off the request this way. (`cookies` on a controller is the
+    # CookieJar, runtime/action_controller_cookies.rb.)
+    def cookies
+      fetch_header("rack.request.cookie_hash") do |key|
+        parsed = {}
+        get_header("HTTP_COOKIE").to_s.split(/; */).each do |pair|
+          name, value = pair.split("=", 2)
+          next if name.nil? || name.empty? || parsed.key?(name)
+          parsed[name] = value && URI.decode_www_form_component(value)
+        end
+        set_header(key, parsed)
+      end
+    end
+
+    # Rails' `request.cookie_jar`: the jar over this request's cookies,
+    # built once and kept in the env (`ActionDispatch::Cookies::CookieJar.
+    # build`, runtime/ruby/action_controller/cookies.rb). Core's
+    # Checkouts::One::ClientDetails reads `cookie_jar.signed[...]`.
+    def cookie_jar
+      fetch_header("action_dispatch.cookies") do |key|
+        set_header(key, ActionDispatch::Cookies::CookieJar.build(self, cookies))
+      end
     end
 
     # Rails' `request.authorization`: the header, or one of the names a

@@ -13,6 +13,13 @@
 # emit/ruby/source_map.rs) when it names an emitted file the table knows,
 # and as Ruby answered otherwise.
 #
+# method_source's `Method#source` / `#comment` read the file a
+# `source_location` names at its line, so they read the emitted
+# location (the authored file is not in the tree, and its lines are not
+# the emitted ones): the text they answer is the emitted code of the
+# method (Core's GraphQLTestHelper looks for `assert_no_resolve_queries`
+# in a preload test's `method(name).source`).
+#
 # DIVERGENCE, stated: the path is the authored file, the line is still
 # the emitted one, except const_source_location's, which is the authored
 # `class`/`module` line. Code under runtime/ and anything the table does
@@ -80,15 +87,43 @@ module RoundhouseSourceLocations
     authored(location)
   end
 
+  # While method_source reads a method's text, source_location answers
+  # the emitted location (see above).
+  def self.emitted_locations
+    previous = Thread.current[:roundhouse_emitted_locations]
+    Thread.current[:roundhouse_emitted_locations] = true
+    yield
+  ensure
+    Thread.current[:roundhouse_emitted_locations] = previous
+  end
+
+  def self.emitted_locations?
+    Thread.current[:roundhouse_emitted_locations]
+  end
+
   module MethodLocation
     def source_location
-      RoundhouseSourceLocations.authored(super, owner)
+      location = super
+      RoundhouseSourceLocations.emitted_locations? ? location : RoundhouseSourceLocations.authored(location, owner)
     end
   end
 
   module ProcLocation
     def source_location
-      RoundhouseSourceLocations.authored(super)
+      location = super
+      RoundhouseSourceLocations.emitted_locations? ? location : RoundhouseSourceLocations.authored(location)
+    end
+  end
+
+  # method_source's readers (the gem is required by app code, after this
+  # file loads, and defines these on the same three classes).
+  module MethodSourceReaders
+    def source
+      RoundhouseSourceLocations.emitted_locations { super }
+    end
+
+    def comment
+      RoundhouseSourceLocations.emitted_locations { super }
     end
   end
 
@@ -108,6 +143,7 @@ end
 Method.prepend(RoundhouseSourceLocations::MethodLocation)
 UnboundMethod.prepend(RoundhouseSourceLocations::MethodLocation)
 Proc.prepend(RoundhouseSourceLocations::ProcLocation)
+[Method, UnboundMethod, Proc].each { |klass| klass.prepend(RoundhouseSourceLocations::MethodSourceReaders) }
 Module.prepend(RoundhouseSourceLocations::ConstLocation)
 module Rails
   singleton_class.prepend(RoundhouseSourceLocations::AbsoluteRoot)

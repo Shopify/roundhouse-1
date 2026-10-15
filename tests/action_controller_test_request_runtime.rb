@@ -57,12 +57,13 @@ else
     "runtime/spinel/action_controller_exceptions.rb" => "action_controller_exceptions.rb",
     "runtime/ruby/action_dispatch/headers.rb" => "action_dispatch/headers.rb",
     "runtime/spinel/http_authentication.rb" => "http_authentication.rb",
+    "runtime/ruby/action_controller/cookies.rb" => "action_controller/cookies.rb",
     "runtime/spinel/scaffold/ruby_overlay/runtime/action_dispatch_request.rb" => "action_dispatch_request.rb",
   }.each do |from, to|
     FileUtils.mkdir_p(File.dirname(File.join(runtime, to)))
     FileUtils.cp(File.join(ROOT, from), File.join(runtime, to))
   end
-  %w[active_support_core_ext action_controller_exceptions http_authentication action_dispatch_request].each do |file|
+  %w[active_support_core_ext action_controller_exceptions http_authentication action_controller/cookies action_dispatch_request].each do |file|
     require File.join(runtime, file)
   end
 end
@@ -89,6 +90,16 @@ show("ad default method", r.request_method)
 show("ad default remote ip", r.remote_ip)
 show("ad default agent", r.user_agent)
 show("ad cookie hash", r.get_header("rack.request.cookie_hash").class.name)
+show("ad cookies empty", r.cookies.to_h)
+r.cookies["shared"] = "CODE10"
+show("ad cookies write", r.cookies.to_h)
+parsed = ActionDispatch::TestRequest.create("HTTP_COOKIE" => "a=1; b=x%20y,c=3; a=dup; e")
+parsed.delete_header("rack.request.cookie_hash")
+show("ad cookies parsed", parsed.cookies.to_h)
+show("ad cookies memoized", parsed.cookies.equal?(parsed.cookies))
+show("ad cookie_jar read", parsed.cookie_jar["a"])
+show("ad cookie_jar decoded", parsed.cookie_jar["b"])
+show("ad cookie_jar memoized", parsed.cookie_jar.equal?(parsed.cookie_jar))
 r.host = "shop.example.com"
 r.request_method = "post"
 r.path = "/en/collections"

@@ -25,6 +25,8 @@ module Rails
     def readlines: (?chomp: bool) -> Array[String]
     def read: () -> String
     def exist?: () -> bool
+    def directory?: () -> bool
+    def file?: () -> bool
   end
 
   class Env

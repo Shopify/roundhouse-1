@@ -122,6 +122,16 @@ module Rails
     def exist?
       File.exist?(@base)
     end
+
+    # Pathname#directory? / #file? — Core's in-process Hedwig Redis gates
+    # its Lua script directory on `dir.directory?`.
+    def directory?
+      File.directory?(@base)
+    end
+
+    def file?
+      File.file?(@base)
+    end
   end
 
   # One store per process. A fresh `Cache.new` per call would make every

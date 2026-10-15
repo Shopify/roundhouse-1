@@ -149,6 +149,14 @@ impl Walk<'_> {
         self.app.concern_model_items.get(concern).map_or(&[][..], Vec::as_slice)
     }
 
+    /// Whether the emitted `id` has a `ClassMethods` module: its nested
+    /// `module ClassMethods` or the one a `class_methods do` builds.
+    fn has_class_methods_module(&self, id: &ClassId) -> bool {
+        let carrier = format!("{}::ClassMethods", id.0.as_str());
+        self.app.class_methods_blocks.contains_key(id)
+            || self.app.library_classes.iter().any(|lc| lc.is_module && lc.name.0.as_str() == carrier)
+    }
+
     /// The modules `concern`'s block includes, resolved from its scope.
     fn block_includes(&self, concern: &ClassId) -> Vec<ClassId> {
         self.items(concern)
@@ -183,8 +191,9 @@ impl Walk<'_> {
         // `append_features` extends the includer with `ClassMethods` before
         // it runs the block, and the emitted module has no Concern to do
         // it (`Concern::ClassMethods` is the nested module or the one a
-        // `class_methods do` builds).
-        if self.class_side.contains_key(id) {
+        // `class_methods do` builds). A Concern with neither (only an
+        // `included do` block) has no module to extend with.
+        if self.class_side.contains_key(id) && self.has_class_methods_module(id) {
             let mut path: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
             path.push(Symbol::from("ClassMethods"));
             out.push(Expr::new(

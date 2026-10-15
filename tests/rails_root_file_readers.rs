@@ -20,3 +20,15 @@ p path.readlines(chomp: true), path.readlines, path.read, path.exist?, Rails.roo
         "[\"alpha\", \"beta\"]\n[\"alpha\\n\", \"beta\\n\"]\n\"alpha\\nbeta\\n\"\ntrue\nfalse\n"
     );
 }
+
+#[test]
+fn rails_root_paths_answer_directory_and_file_predicates() {
+    let script = r#"Dir.mkdir("rails_root_dir") unless Dir.exist?("rails_root_dir")
+File.write("rails_root_dir/a.lua", "x")
+dir = Rails.root.join("rails_root_dir")
+p dir.directory?, dir.file?, dir.join("a.lua").file?, dir.join("a.lua").directory?, dir.join("missing").directory?
+"#;
+    let run = emit_and_run::real_blog().run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "true\nfalse\ntrue\nfalse\nfalse\n");
+}
