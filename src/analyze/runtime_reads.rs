@@ -30,6 +30,7 @@ use crate::App;
 /// The runtime files whose names are gated, by source path and the
 /// path each takes in a finished Ruby-family tree.
 const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
+    ("runtime/ruby/action_view_translation_helper.rb", "runtime/action_view_translation_helper.rb"),
     ("runtime/spinel/active_support_notifications.rb", "runtime/active_support_notifications.rb"),
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),

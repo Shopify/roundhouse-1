@@ -13887,6 +13887,7 @@ fn spinel_files_with_assertions(
         "active_support_number_helper_mixin",
         "action_view_number_helper",
         "action_view_number_helper_mixin",
+        "action_view_translation_helper",
         "active_support_ext",
         // `Rails.event` / `Rails.error`: the reporters, ParameterFilter and
         // ExecutionContext. rails.rb requires it, so it ships beside rails.
