@@ -979,7 +979,11 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // module receiver, which only matters where the source
             // would have raised NameError).
             if let Some((scope, names)) = super::util::dynamic_constant_scope(&p) {
-                let recv = ingest_expr(&scope, file)?;
+                let mut recv = ingest_expr(&scope, file)?;
+                // Rubydex records no reference for a constant that is
+                // the head of such a scope (`Cfg` in `Cfg.builder::Wrapper`),
+                // so its absence is not evidence the constant is unwritten.
+                super::library_class::mark_unindexed_const_refs(&mut recv);
                 let name = if names.len() == 1 {
                     Literal::Sym { value: names[0].as_str().into() }
                 } else {

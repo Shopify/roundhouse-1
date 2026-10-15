@@ -38,6 +38,15 @@ const MODEL: &str = r#"class Widget < ApplicationRecord
     list |= Array.wrap(history)
     list
   end
+
+  extend T::Sig
+
+  sig { params(list: T.any(FalseClass, Enumerable, String, Symbol)).returns(T.any(FalseClass, Enumerable)) }
+  def scoped(list)
+    return false if list == false
+
+    Array.wrap(list).map { |scope| scope.to_s }
+  end
 end
 "#;
 
@@ -120,4 +129,27 @@ fn an_operator_assignment_groups_the_wrap() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#"[["a"], ["a"], ["a", "b"]]"#);
+}
+
+/// A parameter signed `T.any(Enumerable, String, Symbol)` can hold an
+/// Array: `Enumerable` is no closed value, so the fold branches instead of
+/// writing `[list]` (identity_client's `find_scopes` then raised
+/// "client_id class not supported Array" for every Array of client ids).
+#[test]
+fn an_enumerable_in_a_union_is_not_wrapped_twice() {
+    let src = model(BuildTarget::Ruby);
+    let body = method(&src, "scoped");
+    assert!(body.contains("is_a?(Array)"), "{body}");
+    let script = format!(
+        "class Probe\n{body}\n  end\nend\n\
+         p [[\"a\", :b], \"c\", :d, false].map {{ |l| Probe.new.scoped(l) }}\n"
+    );
+    let output = Command::new("ruby").args(["-e", &script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{script}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#"[["a", "b"], ["c"], ["d"], false]"#);
 }
