@@ -72,6 +72,22 @@ const POSTSY: &str = r#"module Postsy
     end
   end
 end
+
+# sprockets-rails 3.5.2's railtie.rb shape: it reopens Rails::Application
+# and drops Rails' own `assets` before redefining it, with no require of
+# core_ext/module/remove_method (active_support/all loads it natively).
+module Rails
+  class Application
+    class Configuration
+      remove_possible_method :assets
+    end
+
+    remove_possible_method :assets
+    remove_possible_method :assets=
+
+    attr_accessor :assets
+  end
+end
 "#;
 
 const QUOTA: &str = r##"class Quota
@@ -106,6 +122,7 @@ const QUOTA: &str = r##"class Quota
       # as Core's class bodies call them: `expected_ttl: 1.year.to_i`,
       # `Time.now.utc.change(nsec: 0)`.
       "calendar: #{1.year.to_i} #{2.months.inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(hour: 5).inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(nsec: 0).nsec}",
+      "removed: #{Rails::Application.method_defined?(:assets)} #{Rails::Application.method_defined?(:assets=)} #{Rails::Application::Configuration.method_defined?(:assets)}",
       zone_line,
     ]
   end
@@ -174,6 +191,7 @@ bytes: 3145728 1572864.0 2048\n\
 window: ActiveSupport::Duration 172800 10800 1.5\n\
 to_fs: 1,234,567 12.1 KB 0.5%\n\
 calendar: 31556952 2 months 2024-01-31 05:00:00 UTC 0\n\
+removed: true true false\n\
 zone: UTC (GMT-05:00) Eastern Time (US & Canada) -0500 America/New_York nil 2022-04-11T12:00:00Z 1649764800 \
 2024-07-01T12:00:00-04:00 2024-03-10T03:30:00-04:00 1969-12-31T19:00:00-05:00 2024-01-15T08:00:00-05:00 \
 2024-01-15T03:00:00-05:00 Bogota 32400 154 nil America/Chicago 1 true\n";
@@ -187,6 +205,7 @@ fn app_code_calls_the_core_extensions_rails_boot_loaded() {
     for port in [
         "active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric",
         "active_support_integer_time", "active_support_time_change", "active_support_time_zone",
+        "active_support_remove_method",
     ] {
         assert!(facades.contains(&format!("require_relative \"{port}\"\n")), "{port} not loaded at boot:\n{facades}");
     }

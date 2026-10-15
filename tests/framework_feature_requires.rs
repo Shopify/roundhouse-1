@@ -55,6 +55,7 @@ require "active_support/core_ext/class/attribute_accessors"
 require "active_support/core_ext/class"
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/module/redefine_method"
+require "active_support/core_ext/module/remove_method"
 require "active_support/core_ext/numeric"
 require "active_support/number_helper"
 
@@ -236,11 +237,21 @@ module ProbeGem
     end
     redefined.redefine_method(:x) { 10 }
     redefined.redefine_method(:y) { 20 }
+    removable = Class.new do
+      def x = 1
+      private def y = 2
+      def self.z = 3
+    end
+    removable.remove_possible_method(:x)
+    removable.remove_possible_method(:y)
+    removable.remove_possible_method(:never_defined)
+    removable.remove_possible_singleton_method(:z)
+    removed = [removable.method_defined?(:x), removable.private_method_defined?(:y), removable.respond_to?(:z)]
     [AttrBase.setting, AttrChild.setting, AttrGrandChild.setting, b.setting, c.setting, AttrChild.new.setting, AttrBase.setting?, b.setting?,
      b.respond_to?(:tags=), AttrBase.tags, AttrBase.respond_to?(:secret), b.respond_to?(:secret), b.respond_to?(:secret?), AttrBase.respond_to?(:secret?),
      invalid, single.solo, AttrBase.descendants.map(&:name).sort, AttrBase.subclasses.map(&:name), AttrGrandChild.descendants,
      redefined.new.x, redefined.private_method_defined?(:y), redefined.new.send(:y), redefined.method_visibility(:y),
-     ActiveSupport::DescendantsTracker.descendants(AttrBase).size]
+     ActiveSupport::DescendantsTracker.descendants(AttrBase).size, removed]
   end
 
   # polaris' and database_documentation's Numeric extensions, and the
@@ -441,7 +452,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
         "try: [nil, 3, nil, \"ABC\", nil, :nope]",
         "numeric: [12288, 1048576, 2684354560.0, 3, 1125899906842624, 172800, 5400, 1814400, 1209600, 90, 120, true, \"ActiveSupport::Duration\", 5000, 86400, true, \"1,234,567\", \"1234567.89\", \"0.500%\", \"$1,234.50\", \"1.23 Million\", \"12 KB\", \"5551234\", \"42\", \"ff\", \"3\", \"1.500\", \"1.5\", \"$1.50\", \"-1,234.50 EUR\", \"1.5 Million\", \"1 mm\", \"12.345.678.05\", \"110\", \"1.15 GB\", \"+1-123-555-1234 x 55\", \"302.24399%\", \"$abc\", nil, \"Infinity\"]",
-        "class_ext: [:base, :child, :child, :base, :instance, :child, true, true, false, [], true, false, false, false, \"1 is not a symbol nor a string\", :s, [\"ProbeGem::AttrChild\", \"ProbeGem::AttrGrandChild\"], [\"ProbeGem::AttrChild\"], [], 10, true, 20, :private, 2]",
+        "class_ext: [:base, :child, :child, :base, :instance, :child, true, true, false, [], true, false, false, false, \"1 is not a symbol nor a string\", :s, [\"ProbeGem::AttrChild\", \"ProbeGem::AttrGrandChild\"], [\"ProbeGem::AttrChild\"], [], 10, true, 20, :private, 2, [false, false, false]]",
         "mattr: [:warn, :warn, [:block], [:block], :io, false, true, false, 2, 2, 5, \"invalid attribute name: bad-name\", \"module attributes should be defined directly on class, not singleton\", \"probe_gem.rb\", \"probe_gem.rb\"]",
         "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
         "reporting: [[nil, true, false], true, [\"inside\", true], nil, \"kept\", :value, true]",
