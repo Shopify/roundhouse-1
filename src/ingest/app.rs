@@ -5174,7 +5174,7 @@ fn splice_concern_class_methods_into_includers(
         }
         out
     };
-    let copies = |includes: Vec<ClassId>, mut taken: HashSet<Symbol>, inherited: HashSet<ClassId>| {
+    let copies = |includes: Vec<ClassId>, mut taken: HashSet<Symbol>, supering: &HashSet<Symbol>, inherited: HashSet<ClassId>| {
         // Transitive closure of the includer's includes, in ancestor order.
         // `via` is whether a native include reaches the includer through
         // Concerns only: a Concern defers its own includes to its
@@ -5194,6 +5194,7 @@ fn splice_concern_class_methods_into_includers(
             order.push((id, via));
         }
         let mut added = Vec::new();
+        let mut renamed: Vec<Symbol> = Vec::new();
         let mut provenance: HashMap<Symbol, ClassId> = HashMap::default();
         let mut carried: Vec<crate::app::ClassMethodsCarrierSplice> = Vec::new();
         for (concern, via) in &order {
@@ -5202,6 +5203,25 @@ fn splice_concern_class_methods_into_includers(
             let mut carrier_copies = Vec::new();
             for m in methods {
                 if !taken.insert(m.name.clone()) {
+                    // The includer writes this class method itself and calls `super`
+                    // in it: the first concern copy is the method it reaches, kept
+                    // under a name of its own (`super_copy_name`) that the includer
+                    // calls in place of the `super`.
+                    if supering.contains(&m.name) && !renamed.contains(&m.name) {
+                        renamed.push(m.name.clone());
+                        let mut copy = m.clone();
+                        copy.name = super_copy_name(&m.name);
+                        refuse_copied_classvars(&mut copy.body, concern);
+                        if !consts.is_empty() {
+                            qualify_lexical_consts(&mut copy.body, concern, consts);
+                            for param in &mut copy.params {
+                                if let Some(default) = &mut param.default {
+                                    qualify_lexical_consts(default, concern, consts);
+                                }
+                            }
+                        }
+                        added.push(copy);
+                    }
                     continue;
                 }
                 provenance.insert(m.name.clone(), concern.clone());
@@ -5255,6 +5275,11 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
+        let supering: HashSet<Symbol> = model
+            .methods()
+            .filter(|m| m.receiver == MethodReceiver::Class && super_forwardable(m) && contains_super(&m.body))
+            .map(|m| m.name.clone())
+            .collect();
         // A model's concerns reach its class side as these copies. Only a
         // carrier with its own `extended` hook is also extended, where
         // ActiveSupport::Concern would extend it, so the hook runs as in
@@ -5266,7 +5291,17 @@ fn splice_concern_class_methods_into_includers(
         // authored `prepended` hook's business, as with `included`.
         let mut mixins: Vec<ClassId> = model_concern_prepends(model, &concerns);
         mixins.extend(crate::analyze::model_includes(model));
-        let (added, provenance, carried) = copies(mixins, taken, inherited(&model.name));
+        let (added, provenance, carried) = copies(mixins, taken, &supering, inherited(&model.name));
+        for copy in added.iter().filter_map(|m| super_copy_source(&m.name)) {
+            for item in &mut model.body {
+                if let ModelBodyItem::Method { method, .. } = item
+                    && method.receiver == MethodReceiver::Class
+                    && method.name == copy
+                {
+                    redirect_super(method);
+                }
+            }
+        }
         let hooked: Vec<crate::app::ClassMethodsCarrierSplice> = carried
             .into_iter()
             .filter(|splice| splice.extend && extended_hooks.contains(&splice.carrier))
@@ -5292,7 +5327,7 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance, carried) = copies(lc.includes.clone(), taken, inherited(&lc.name));
+        let (added, provenance, carried) = copies(lc.includes.clone(), taken, &HashSet::default(), inherited(&lc.name));
         lc.methods.extend(added);
         if !provenance.is_empty() {
             spliced.insert(lc.name.clone(), provenance);
@@ -5312,7 +5347,7 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance, carried) = copies(tm.includes.clone(), taken, inherited(&tm.name));
+        let (added, provenance, carried) = copies(tm.includes.clone(), taken, &HashSet::default(), inherited(&tm.name));
         tm.helpers.extend(added);
         if !provenance.is_empty() {
             spliced.insert(tm.name.clone(), provenance);
@@ -15026,4 +15061,70 @@ mod locale_tests {
         assert_eq!(locale_literal("'ja'").as_deref(), Some("ja"));
         assert_eq!(locale_literal("ENV[\"LOCALE\"]"), None);
     }
+}
+
+/// The name a concern's class method is kept under when the includer
+/// overrides it and calls `super`: `cache_key_by_id` →
+/// `__concern_cache_key_by_id`.
+fn super_copy_name(name: &Symbol) -> Symbol {
+    Symbol::from(format!("__concern_{}", name.as_str()))
+}
+
+/// The method a [`super_copy_name`] copy stands in for.
+fn super_copy_source(name: &Symbol) -> Option<Symbol> {
+    name.as_str().strip_prefix("__concern_").map(Symbol::from)
+}
+
+fn contains_super(e: &crate::expr::Expr) -> bool {
+    let mut found = matches!(&*e.node, crate::expr::ExprNode::Super { .. });
+    e.node.for_each_child(&mut |c| found = found || contains_super(c));
+    found
+}
+
+/// Whether a `super` in `m` can be written as a call that names its
+/// arguments: plain positional and keyword parameters, no rest, no
+/// forwarding and no block parameter (Ruby passes those implicitly).
+fn super_forwardable(m: &crate::dialect::MethodDef) -> bool {
+    m.block_param.is_none()
+        && !m.has_anonymous_block
+        && m.unsupported_formals.is_none()
+        && m.params.iter().all(|p| !p.rest && !p.forwarding && !p.name.as_str().is_empty())
+}
+
+/// Rewrite each `super` in the class method `m` into a call of its
+/// concern copy (`self.__concern_<name>(…)`): a bare `super` passes the
+/// method's own arguments (positional by value, keywords by name).
+fn redirect_super(m: &mut crate::dialect::MethodDef) {
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::VarId;
+    let target = super_copy_name(&m.name);
+    let forwarded: Vec<Expr> = {
+        let span = m.body.span;
+        let var = |p: &crate::dialect::Param| Expr::new(span, ExprNode::Var { id: VarId(0), name: p.name.clone() });
+        let mut args: Vec<Expr> = m.params.iter().filter(|p| !p.keyword).map(var).collect();
+        let keywords: Vec<(Expr, Expr)> = m
+            .params
+            .iter()
+            .filter(|p| p.keyword)
+            .map(|p| (Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: p.name.clone() } }), var(p)))
+            .collect();
+        if !keywords.is_empty() {
+            args.push(Expr::new(span, ExprNode::Hash { entries: keywords, kwargs: true }));
+        }
+        args
+    };
+    fn rewrite(e: &mut crate::expr::Expr, target: &Symbol, forwarded: &[crate::expr::Expr]) {
+        e.node.for_each_child_mut(&mut |c| rewrite(c, target, forwarded));
+        if let ExprNode::Super { args, block } = &*e.node {
+            let call = ExprNode::Send {
+                recv: Some(Expr::new(e.span, ExprNode::SelfRef)),
+                method: target.clone(),
+                args: args.clone().unwrap_or_else(|| forwarded.to_vec()),
+                block: block.clone(),
+                parenthesized: true,
+            };
+            e.node = Box::new(call);
+        }
+    }
+    rewrite(&mut m.body, &target, &forwarded);
 }
