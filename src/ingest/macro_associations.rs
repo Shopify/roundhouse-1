@@ -50,48 +50,8 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
         let mut items = Vec::new();
         for (at, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-            let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else { continue };
-            let Some(def) = side.macro_def(method.as_str()) else { continue };
-            let Some(forward) = forwarded_to_association(&side, def, 0) else {
-                if postgresql
-                    && fixed_association(&side, def, 0).is_none()
-                    && let Some(literal) = literal_association(&side, def, 0)
-                    && let Some((mut assoc, options)) = literal_association_of(app, expr, &model.name, &literal)
-                {
-                    LITERAL_OPTIONS.with_borrow_mut(|m| m.insert((expr.span.file.0, expr.span.start), options));
-                    if let Some(target) = association_target(&mut assoc) {
-                        super::app::qualify_target(&model.name, target, &models);
-                    }
-                    items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
-                    continue;
-                }
-                if let Some(fixed) = fixed_association(&side, def, 0) {
-                    if fixed.kind != "belongs_to" && !postgresql {
-                        continue;
-                    }
-                    if let Some(mut assoc) = fixed_association_of(app, expr, &model.name, &fixed) {
-                        if let Some(target) = association_target(&mut assoc) {
-                            super::app::qualify_target(&model.name, target, &models);
-                        }
-                        items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
-                    }
-                }
-                continue;
-            };
-            // A `has_one`/`has_many` reflection is answered from the
-            // reflection classes the PostgreSQL runtime carries
-            // (`emit::ruby::library::apply_association_reflections`).
-            if forward.kind != "belongs_to" && !postgresql {
-                continue;
-            }
-            if let Some(mut assoc) = association_of(app, expr, &model.name, forward.kind) {
-                if !apply_merged(&mut assoc, &forward.merged) || !apply_scope_wrapper(&mut assoc, forward.scope_wrapper.as_ref()) {
-                    continue;
-                }
-                if let Some(target) = association_target(&mut assoc) {
-                    super::app::qualify_target(&model.name, target, &models);
-                }
-                items.push((at, ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span }));
+            if let Some(item) = association_of_call(app, &side, expr, &model.name, &models, postgresql) {
+                items.push((at, item));
             }
         }
         if !items.is_empty() {
@@ -110,6 +70,124 @@ pub(super) fn declare(app: &mut crate::App) -> bool {
     }
     super::model::forget_merged_calls();
     any
+}
+
+/// The associations a model subclass's class macros declare
+/// (`readonly_belongs_to :location, ...` in Core's `Shipping::ReturnLabel`,
+/// an STI subclass of `Shipping::Label`): the subclass is a library class,
+/// whose body does not replay, so the call is read as the model body reads
+/// it and stored with the subclass's other declarations on its nearest
+/// model (`Model::subclass_declarations`), where the view that declares the
+/// reader and the reflection finds it.
+pub(super) fn declare_subclasses(app: &mut crate::App) {
+    let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let postgresql = app.carries_postgresql_runtime();
+    if !postgresql {
+        return;
+    }
+    let mut parents: crate::det::HashMap<crate::ident::ClassId, Option<crate::ident::ClassId>> = Default::default();
+    for lc in &app.library_classes {
+        parents.entry(lc.name.clone()).or_insert_with(|| lc.parent.clone());
+    }
+    let mut found: Vec<(usize, crate::ident::ClassId, Vec<ModelBodyItem>)> = Vec::new();
+    for lc in &app.library_classes {
+        if models.contains(lc.name.0.as_str()) || lc.unknown_calls.is_empty() {
+            continue;
+        }
+        let mut cursor = lc.parent.clone();
+        let mut base = None;
+        for _ in 0..8 {
+            let Some(parent) = cursor else { break };
+            if let Some(at) = app.models.iter().position(|m| m.name == parent) {
+                base = Some(at);
+                break;
+            }
+            cursor = parents.get(&parent).and_then(|p| p.clone());
+        }
+        let Some(base) = base else { continue };
+        let side = crate::lower::model_to_library::macro_replay::ClassSide::of_model(&app.models[base], app);
+        let mut items = Vec::new();
+        for call in &lc.unknown_calls {
+            if let Some(item) = association_of_call(app, &side, call, &lc.name, &models, postgresql) {
+                items.push(item);
+            }
+        }
+        if !items.is_empty() {
+            found.push((base, lc.name.clone(), items));
+        }
+    }
+    for (base, sub, items) in found {
+        let declared = &mut app.models[base].subclass_declarations;
+        match declared.iter_mut().find(|(s, _)| *s == sub) {
+            Some((_, existing)) => {
+                existing.extend(items);
+                existing.sort_by_key(|item| match item {
+                    ModelBodyItem::Association { span, .. } => (span.file.0, span.start),
+                    ModelBodyItem::Callback { span, .. } => (span.file.0, span.start),
+                    _ => (u32::MAX, u32::MAX),
+                });
+            }
+            None => declared.push((sub, items)),
+        }
+    }
+    for model in &mut app.models {
+        for (_, items) in &mut model.subclass_declarations {
+            drop_redeclared(items);
+        }
+    }
+    super::model::forget_merged_calls();
+}
+
+/// The association the class macro call `expr` declares on `owner`, when it
+/// declares one: forwarded to a `belongs_to`/`has_one`/`has_many` with the
+/// call's own arguments, or declaring a literal one itself.
+fn association_of_call(
+    app: &crate::App,
+    side: &crate::lower::model_to_library::macro_replay::ClassSide<'_>,
+    expr: &Expr,
+    owner: &crate::ident::ClassId,
+    models: &crate::det::HashSet<String>,
+    postgresql: bool,
+) -> Option<ModelBodyItem> {
+    let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else { return None };
+    let def = side.macro_def(method.as_str())?;
+    let item = |assoc| ModelBodyItem::Association { assoc, leading_comments: Vec::new(), leading_blank_line: false, span: expr.span };
+    let Some(forward) = forwarded_to_association(side, def, 0) else {
+        if postgresql
+            && fixed_association(side, def, 0).is_none()
+            && let Some(literal) = literal_association(side, def, 0)
+            && let Some((mut assoc, options)) = literal_association_of(app, expr, owner, &literal)
+        {
+            LITERAL_OPTIONS.with_borrow_mut(|m| m.insert((expr.span.file.0, expr.span.start), options));
+            if let Some(target) = association_target(&mut assoc) {
+                super::app::qualify_target(owner, target, models);
+            }
+            return Some(item(assoc));
+        }
+        let fixed = fixed_association(side, def, 0)?;
+        if fixed.kind != "belongs_to" && !postgresql {
+            return None;
+        }
+        let mut assoc = fixed_association_of(app, expr, owner, &fixed)?;
+        if let Some(target) = association_target(&mut assoc) {
+            super::app::qualify_target(owner, target, models);
+        }
+        return Some(item(assoc));
+    };
+    // A `has_one`/`has_many` reflection is answered from the
+    // reflection classes the PostgreSQL runtime carries
+    // (`emit::ruby::library::apply_association_reflections`).
+    if forward.kind != "belongs_to" && !postgresql {
+        return None;
+    }
+    let mut assoc = association_of(app, expr, owner, forward.kind)?;
+    if !apply_merged(&mut assoc, &forward.merged) || !apply_scope_wrapper(&mut assoc, forward.scope_wrapper.as_ref()) {
+        return None;
+    }
+    if let Some(target) = association_target(&mut assoc) {
+        super::app::qualify_target(owner, target, models);
+    }
+    Some(item(assoc))
 }
 
 /// A second declaration of an association name replaces the first, as

@@ -3451,6 +3451,7 @@ end
     if super::macro_associations::declare(&mut app) {
         resolve_polymorphic_targets(&mut app);
     }
+    super::macro_associations::declare_subclasses(&mut app);
     // The models whose subclasses (STI or not, through library-class
     // parents) declare a default scope of their own.
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();

@@ -2826,6 +2826,20 @@ fn constant_multi_write<'a>(stmt: &ruby_prism::Node<'a>) -> Option<Vec<(Symbol, 
     Some(names.into_iter().map(Symbol::from).zip(elements).collect())
 }
 
+/// `a, b = <value>` in a class or module body: every target a plain
+/// local, no splat or nested target. The names, in order.
+fn local_multi_write_names(stmt: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    let write = stmt.as_multi_write_node()?;
+    if write.rest().is_some() || !write.rights().is_empty() {
+        return None;
+    }
+    write
+        .lefts()
+        .iter()
+        .map(|left| left.as_local_variable_target_node().map(|target| constant_id_str(&target.name()).to_string()))
+        .collect()
+}
+
 pub(crate) fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
@@ -4303,6 +4317,52 @@ fn walk_decl_body_in<'pr>(
                 }
             }
             body_locals.push(local);
+            continue;
+        }
+        // `gated, ungated = Values.each_value.partition { … }`: the locals
+        // of one multiple assignment, each a read of the array the value
+        // evaluates to once, stored in a private constant as a single
+        // local's value is.
+        if let Some(names) = local_multi_write_names(stmt) {
+            let write = stmt.as_multi_write_node().expect("local_multi_write_names read a multiple assignment");
+            let value = ingest_expr(&write.value(), file)
+                .map_err(|err| format!("holds a value ingest cannot read ({err})"))
+                .and_then(|mut value| {
+                    substitute_body_locals(&mut value, &body_locals, file).map_err(|err| err.to_string())?;
+                    Ok(value)
+                });
+            let constant = body_local_constant(&Symbol::from(names.join("_")), file, write.location().start_offset());
+            let stored = match value {
+                Ok(value) => {
+                    let mut read = Expr::new(value.span, ExprNode::Const { path: vec![constant.clone()] });
+                    read.decisions |= crate::expr::GENERATED_CONST_REF;
+                    out.constants.push((constant, value));
+                    Ok(read)
+                }
+                Err(why) => Err(why),
+            };
+            for (at, name) in names.iter().enumerate() {
+                let name = Symbol::from(name.as_str());
+                let value = stored.clone().map(|read| {
+                    let span = read.span;
+                    let index = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: at as i64 } });
+                    Expr::new(
+                        span,
+                        ExprNode::Send {
+                            recv: Some(read),
+                            method: Symbol::from("[]"),
+                            args: vec![index],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    )
+                });
+                if let Some(earlier) = body_locals.iter_mut().find(|l: &&mut BodyLocal| l.name == name) {
+                    earlier.value = Err("is assigned more than once".to_string());
+                    continue;
+                }
+                body_locals.push(BodyLocal { name, value, lambda: false, stored: false });
+            }
             continue;
         }
         // Class-level constant `NAME = <expr>` (e.g. `STORIES_PER_PAGE = 25`).
