@@ -55,3 +55,16 @@ fn undeclared_key_keeps_the_plain_check() {
     let line = emitted(PLAIN_LINE);
     assert!(line.contains("Part.exists?(@part_id)"), "{line}");
 }
+
+/// The writer stores the target's `id` column, which a composite-keyed
+/// target answers as `id_value` (its `id` is the key tuple): Core's
+/// `Discount.create!(contract_identity: contract.contract_identity)`
+/// stored the tuple, serialized as NULL.
+#[test]
+fn writer_stores_the_id_column_of_a_composite_target() {
+    let line = emitted(LINE);
+    assert!(line.contains("@part_id = value.id_value"), "{line}");
+    assert!(!line.contains("@part_id = value.id\n"), "{line}");
+    let plain = emitted(PLAIN_LINE);
+    assert!(plain.contains("@part_id = value."), "{plain}");
+}
