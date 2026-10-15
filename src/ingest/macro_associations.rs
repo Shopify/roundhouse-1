@@ -807,6 +807,34 @@ fn graft(chain: &mut Expr, base: &Expr) -> bool {
             *recv = Some(base.clone());
             true
         }
+        // An owner-dependent scope of several statements
+        // (`->(fee) { scope = where(...); scope = scope.where(...) if
+        // cond; scope }`, Core's `ReturnFee#sales`) runs on the relation
+        // from its first receiverless call: every statement that
+        // starts a chain from the implicit relation is rooted on `base`,
+        // the ones that build on the local it was bound to stay as they are.
+        ExprNode::Seq { exprs } => {
+            let mut grafted = false;
+            for stmt in exprs {
+                grafted |= graft_statement(stmt, base);
+            }
+            grafted
+        }
+        _ => false,
+    }
+}
+
+/// [`graft`] into one statement of a scope body: through an assignment's
+/// value and an `if`'s branches.
+fn graft_statement(stmt: &mut Expr, base: &Expr) -> bool {
+    match &mut *stmt.node {
+        ExprNode::Assign { value, .. } => graft(value, base),
+        ExprNode::If { then_branch, else_branch, .. } => {
+            let then = graft_statement(then_branch, base);
+            let otherwise = graft_statement(else_branch, base);
+            then || otherwise
+        }
+        ExprNode::Send { .. } => graft(stmt, base),
         _ => false,
     }
 }
