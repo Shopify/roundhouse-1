@@ -10620,6 +10620,45 @@ fn emit_library_class_decl_inner(
         body_requires.extend(now.iter().filter_map(|p| resolve(p, true)));
         body_requires.extend(later.iter().filter(|p| !now.contains(*p)).filter_map(|p| resolve(p, false)));
     }
+    // The `included do` statements an include's Concern runs on the class
+    // (`App::included_block_statements`), among them the `extend
+    // Concern::ClassMethods` the include brings: they run as the body loads,
+    // and the module they name is a file of its own the include's file does
+    // not load. A controller boots through `config/routes.rb` ahead of
+    // app/models.rb's autoloads, so `extend ClickjackingProtection::ClassMethods`
+    // named a constant nothing had loaded.
+    for (after, statement) in app.included_block_statements.get(&lc.name).into_iter().flatten() {
+        body_requires.extend(resolve_load(statement));
+        // A class macro the statement calls (`deny_frames`, a method of the
+        // Concern's `ClassMethods`) runs its body now too: what it names
+        // (`ClickjackingProtection::ClickjackingRule`, a file of its own)
+        // loads with it, as no autoload is registered yet.
+        let ExprNode::Send { recv, method, .. } = &*statement.node else { continue };
+        if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+            continue;
+        }
+        let carrier = format!("{}::ClassMethods", after.0.as_str().trim_start_matches("::"));
+        for class in library_classes_named(&carrier, app).into_iter().filter(|c| c.is_module) {
+            for m in class.methods.iter().filter(|m| m.name == *method) {
+                // Resolved from the carrier's scope, where its bare
+                // constants (`ClickjackingRule`) are sibling files. Every
+                // constant the body names, whatever node reads it.
+                fn named<'a>(e: &'a Expr, out: &mut BTreeSet<Vec<String>>) {
+                    if let ExprNode::Const { path } = &*e.node {
+                        out.insert(path.iter().map(|s| s.as_str().to_string()).collect());
+                    }
+                    e.node.for_each_child(&mut |child| named(child, out));
+                }
+                let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+                named(&m.body, &mut paths);
+                for anchor in paths.iter().filter_map(|p| require_path_for_body_const(p, app, &carrier)) {
+                    if anchor != self_anchor {
+                        body_requires.insert(relpath(&out_dir, &anchor));
+                    }
+                }
+            }
+        }
+    }
     // A body statement the file keeps where the source has it
     // (`carries_body_statement`) runs as the body loads, after the
     // `require`s above it: `Format.register_lazy(...)` after a body

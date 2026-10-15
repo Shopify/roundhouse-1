@@ -197,13 +197,37 @@ impl Walk<'_> {
                     ExprNode::Seq { exprs } => exprs.iter().collect(),
                     _ => vec![body],
                 };
-                out.extend(statements.into_iter().filter(|stmt| {
-                    matches!(&*stmt.node, ExprNode::Send { recv: None, method, args, block: None, .. }
-                        if method.as_str() == "class_attribute"
-                            || matches!(method.as_str(), "private" | "protected")
+                // The attributes the block declares: `self.rules = []`
+                // seeds one, and the macros below it (`deny_frames`
+                // reading `rules + [..]`) find nil without it.
+                let mut declared: Vec<&str> = Vec::new();
+                for stmt in statements {
+                    let keep = match &*stmt.node {
+                        ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "class_attribute" => {
+                            for arg in args {
+                                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
+                                    declared.push(value.as_str());
+                                }
+                            }
+                            true
+                        }
+                        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+                            matches!(method.as_str(), "private" | "protected")
                                 && !args.is_empty()
-                                && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } })))
-                }).cloned());
+                                && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }))
+                        }
+                        // `self.rules = []`: the writer call, on the class itself.
+                        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+                            matches!(&*recv.node, ExprNode::SelfRef)
+                                && args.len() == 1
+                                && method.as_str().strip_suffix('=').is_some_and(|attr| declared.contains(&attr))
+                        }
+                        _ => false,
+                    };
+                    if keep {
+                        out.push(stmt.clone());
+                    }
+                }
             }
         }
         out
