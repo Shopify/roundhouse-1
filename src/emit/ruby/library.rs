@@ -12178,21 +12178,22 @@ fn late_includes<'a>(lc: &'a LibraryClass, app: &App, positioned: &[(usize, &Cla
     late
 }
 
+const MODULE_BUILTINS: &[&str] = &[
+    "extend", "include", "prepend", "class_eval", "class_exec", "module_eval", "module_exec", "instance_eval",
+    "instance_exec", "send", "public_send", "__send__", "define_method", "define_singleton_method", "alias_method",
+    "attr_accessor", "attr_reader", "attr_writer", "const_set", "const_get", "const_defined?", "method_defined?",
+    "instance_methods", "instance_method", "name", "to_s", "is_a?", "kind_of?", "respond_to?", "ancestors",
+    "include?", "private", "public", "protected", "private_constant", "remove_method", "undef_method",
+    "instance_variable_get", "instance_variable_set", "class_variable_get", "class_variable_set", "singleton_class",
+    "module_function", "freeze", "tap", "then", "nil?", "equal?", "object_id", "instance_variable_defined?",
+];
+
 /// Whether the app module `inc`'s `self.included(base)` hook sends `base`
 /// a class macro: a call that is no `Module` builtin (`extend`,
 /// `class_eval`, ...), so one a superclass or an extended module defines,
 /// which reads the state the including body's earlier macro calls set
 /// (Rails' `Module#included` runs where `include` stands).
 fn included_hook_sends_class_macro(inc: &ClassId, app: &App) -> bool {
-    const MODULE_BUILTINS: &[&str] = &[
-        "extend", "include", "prepend", "class_eval", "class_exec", "module_eval", "module_exec", "instance_eval",
-        "instance_exec", "send", "public_send", "__send__", "define_method", "define_singleton_method", "alias_method",
-        "attr_accessor", "attr_reader", "attr_writer", "const_set", "const_get", "const_defined?", "method_defined?",
-        "instance_methods", "instance_method", "name", "to_s", "is_a?", "kind_of?", "respond_to?", "ancestors",
-        "include?", "private", "public", "protected", "private_constant", "remove_method", "undef_method",
-        "instance_variable_get", "instance_variable_set", "class_variable_get", "class_variable_set", "singleton_class",
-        "module_function", "freeze", "tap", "then", "nil?", "equal?", "object_id", "instance_variable_defined?",
-    ];
     let bare = inc.0.as_str().trim_start_matches("::");
     let Some(module) = first_module_bare_named(bare, app) else { return false };
     let Some(hook) = module
@@ -12217,6 +12218,33 @@ fn included_hook_sends_class_macro(inc: &ClassId, app: &App) -> bool {
     hit
 }
 
+/// Whether the `included do` block of the concern `inc` (carried into `lc`,
+/// `App::included_block_statements`) calls a class macro: a receiverless
+/// call that is no `Module` builtin, which runs at the `include` and reads
+/// what the body's earlier statements set. Core's SavedView writes `self.model
+/// = -> { ::SavedView }` above `include AppliedIndexTableFiltersField`,
+/// whose block declares a `field … preload: :saved_search`, and a
+/// preload reads the model: the include bucket wrote it above the
+/// assignment.
+fn included_block_sends_class_macro(lc: &LibraryClass, inc: &ClassId, app: &App) -> bool {
+    fn walk(e: &Expr, hit: &mut bool) {
+        if let ExprNode::Send { recv: None, method, .. } = &*e.node
+            && !MODULE_BUILTINS.contains(&method.as_str())
+        {
+            *hit = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, hit));
+    }
+    let root = inc.0.as_str().trim_start_matches("::");
+    let mut hit = false;
+    for (after, statement) in app.included_block_statements.get(&lc.name).into_iter().flatten() {
+        if after.0.as_str().trim_start_matches("::") == root {
+            walk(statement, &mut hit);
+        }
+    }
+    hit
+}
+
 /// The first body statement the source writes above an include of `lc`
 /// whose `included` hook sends `base` a class macro
 /// (`included_hook_sends_class_macro`): from it on the includes are
@@ -12230,7 +12258,7 @@ fn macro_hooked_include_floor(lc: &LibraryClass, app: &App, positioned: &[(usize
         .includes
         .iter()
         .filter(|inc| !positioned.iter().any(|(_, p)| p == inc))
-        .filter(|inc| included_hook_sends_class_macro(inc, app))
+        .filter(|inc| included_hook_sends_class_macro(inc, app) || included_block_sends_class_macro(lc, inc, app))
         .collect();
     if candidates.is_empty() {
         return None;
