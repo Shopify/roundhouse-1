@@ -21,6 +21,10 @@ const ATTRIBUTES: &str = r#"module Component
       end
     end
 
+    def trusted_scope(id_column, ids, trusted_id_filters = nil)
+      where(id_column => ids)
+    end
+
     def trusted_id_attribute(attr_name, id_class = Component::TrustedId, attribute: attr_name)
       self.trusted_id_attributes = trusted_id_attributes.merge(attr_name => id_class)
       trusted_ivar_name = "@_trusted_#{attr_name}"
@@ -68,7 +72,7 @@ fn trusted_id_attribute_defines_its_reader_and_records_the_class() {
     assert!(dropped.is_empty(), "{dropped:?}");
     assert!(!diagnostics.iter().any(|d| d.contains("trusted_variant") || d.contains("`db_id`")), "{diagnostics:?}");
 
-    let files = roundhouse::emit::ruby::emit_lowered_models(&app);
+    let files = roundhouse::emit::ruby::with_native_keyword_splats(|| roundhouse::emit::ruby::emit_lowered_models(&app));
     let src = |suffix: &str| {
         files
             .iter()
@@ -96,4 +100,6 @@ fn trusted_id_attribute_defines_its_reader_and_records_the_class() {
     let base = src("models/application_record.rb");
     assert!(base.contains("def self.trusted_id_attributes"), "{base}");
     assert!(base.contains("@__class_attr_trusted_id_attributes = {}"), "{base}");
+    // The module's own methods reach the class side, without its hook.
+    assert!(base.contains("class << self\n    include Component::TrustedIdAttributes\n  end"), "{base}");
 }

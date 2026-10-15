@@ -112,6 +112,22 @@ pub(crate) fn expand(app: &mut App) {
         let mut body = Vec::with_capacity(model.body.len());
         for item in std::mem::take(&mut model.body) {
             if extender && is_extend_of_module(&item, &name, &known) {
+                // The hook's effect is the class attribute lowered below;
+                // what `extend` leaves is the module's own methods
+                // (`trusted_scope`, `trusted_pluck`, which Core calls on
+                // every model class). They are mixed into the singleton as
+                // `class << self; include M; end` (`SINGLETON_BODY`), which
+                // does not fire the hook the lowering already applied.
+                // Written as a `ClassBody` here, past the macro replay's
+                // reach gate, which refuses an `extend` whose `extended`
+                // hook calls `class_attribute`: the `include` fires no hook.
+                let item = match item {
+                    ModelBodyItem::Unknown { mut expr, leading_comments, leading_blank_line } => {
+                        expr.decisions |= crate::expr::SINGLETON_BODY;
+                        ModelBodyItem::ClassBody { expr, leading_comments, leading_blank_line }
+                    }
+                    other => other,
+                };
                 body.push(item);
                 body.extend(class_attribute_items(&owner));
                 continue;
