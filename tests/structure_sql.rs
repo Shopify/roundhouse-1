@@ -712,12 +712,12 @@ fn a_postgres_column_named_key_is_still_a_column() {
     assert_eq!(col(settings, "index").col_type, ColumnType::Integer);
 }
 
-/// A NOT NULL integer's unsaved slot holds 0, never nil, so presence on it
-/// could not fail the way Rails' does (`new(shop_id: nil).valid?` is
-/// false there). That is refused by name rather than emitted wrong; the
-/// string column, whose zero is blank, and the nullable integer are not.
+/// A NOT NULL integer with no default reads nil until assigned, as in
+/// Rails (`new(shop_id: nil).valid?` is false), so presence on it is
+/// emitted like any other column. It used to hold 0 and was refused by
+/// name (`presence_on_not_null_column`); no column here is refused now.
 #[test]
-fn presence_on_a_not_null_numeric_column_is_refused() {
+fn presence_on_a_not_null_numeric_column_is_not_refused() {
     use roundhouse::analyze::{diagnose, Analyzer};
     let tree = [
         ("db/structure.sql", "CREATE TABLE `shops` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `shop_id` bigint NOT NULL,\n  `owner_id` bigint DEFAULT NULL,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
@@ -734,8 +734,7 @@ fn presence_on_a_not_null_numeric_column_is_refused() {
         .map(|d| d.to_string())
         .filter(|d| d.contains("presence_on_not_null_column"))
         .collect();
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].starts_with("error") && refused[0].contains("Shop.shop_id"), "{refused:?}");
+    assert!(refused.is_empty(), "{refused:?}");
 }
 
 /// A fixture entry the loader cannot place used to vanish from the test
