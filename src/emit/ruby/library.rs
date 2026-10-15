@@ -1288,8 +1288,41 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Opti
     }
     let first = declared_at(kid, app)?;
     let above = |span: &crate::span::Span| span.file == first.file && *span != crate::span::Span::synthetic() && span.start < first.start;
-    (parent.constants.iter().any(|(_, value)| above(&value.span)) || parent.unknown_calls.iter().any(|call| above(&call.span)))
-        .then_some(first)
+    (parent.constants.iter().any(|(_, value)| above(&value.span))
+        || parent.unknown_calls.iter().any(|call| above(&call.span))
+        || includes_hooking_subclass_above(parent, kid, first, app))
+    .then_some(first)
+}
+
+/// Whether `parent` includes, above `kid`'s declaration, a module whose
+/// hooks run for each subclass (`Singleton`, whose `inherited` gives a
+/// subclass its own instance and mutex; a module with an `inherited`
+/// of its own or in its `ClassMethods`): the subclass must be declared
+/// after the include, as Ruby declared it, or the hook never ran for it
+/// (Core's `MarketingEventHierarchyLevel`: `Ad.instance` raised "undefined
+/// method 'synchronize' for nil").
+fn includes_hooking_subclass_above(parent: &LibraryClass, kid: &LibraryClass, first: crate::span::Span, app: &App) -> bool {
+    if kid.parent.as_ref() != Some(&parent.name) || parent.includes.is_empty() {
+        return false;
+    }
+    let Some(source) = (first.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else { return false };
+    let hooks = |module: &ClassId| {
+        let name = module.0.as_str().trim_start_matches("::");
+        name == "Singleton"
+            || library_classes_named(name, app).iter().any(|m| {
+                m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "inherited")
+            })
+            || library_classes_named(&format!("{name}::ClassMethods"), app).iter().any(|m| {
+                m.methods.iter().any(|d| d.name.as_str() == "inherited")
+            })
+    };
+    crate::lower::job_class_side::include_offsets(&source.text, parent.name.0.as_str()).iter().any(|(written, at)| {
+        *at < first.start
+            && parent.includes.iter().any(|inc| {
+                let id = inc.0.as_str().trim_start_matches("::");
+                (id == written || id.ends_with(&format!("::{written}"))) && hooks(inc)
+            })
+    })
 }
 
 /// Whether `kid`'s body, as it loads, builds `parent` or calls one of its
