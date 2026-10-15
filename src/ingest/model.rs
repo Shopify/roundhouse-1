@@ -720,8 +720,19 @@ pub(super) fn ingest_model_class_at(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
-            let items = match in_model_class_body(|| {
-                ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults))
+            let items = match in_model_class_body(|| match constant_writes_in_list(&stmt) {
+                // `[A = "a", B = "b"].freeze`: Ruby assigns each constant as
+                // the list is built, and the list itself is not kept.
+                Some(writes) => {
+                    let mut items = Vec::new();
+                    let mut leading = Some(leading);
+                    for write in &writes {
+                        let own = leading.take().unwrap_or_default();
+                        items.extend(ingest_model_body_items(write, &owner, file, own, Some(&mut class_attr_defaults))?);
+                    }
+                    Ok(items)
+                }
+                None => ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults)),
             }) {
                 Ok(items) => items,
                 Err(err) if super::survey::is_active() => {
@@ -3634,4 +3645,20 @@ mod singleton_visibility_tests {
         );
         assert!(err.is_err(), "an unmodeled singleton statement is still an error: {err:?}");
     }
+}
+
+/// The constant writes of a body statement that is a literal list of
+/// them, `[A = "a", B = "b"]`, with or without a trailing `.freeze`
+/// (Core's `Delivery::Setting`). The list itself is unused, so only
+/// the writes it makes carry on; `None` for any other statement,
+/// including a list with an element that is not a constant write.
+fn constant_writes_in_list<'pr>(stmt: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
+    let list = match stmt.as_call_node() {
+        Some(call) if call.name().as_slice() == b"freeze" && call.arguments().is_none() => call.receiver()?.as_array_node()?,
+        Some(_) => return None,
+        None => stmt.as_array_node()?,
+    };
+    let writes: Vec<Node<'pr>> = list.elements().iter().collect();
+    let all = !writes.is_empty() && writes.iter().all(|e| e.as_constant_write_node().is_some());
+    all.then_some(writes)
 }

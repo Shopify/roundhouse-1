@@ -83,7 +83,7 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
         names.extend(call_names);
     }
-    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+    for lc in sti_descendants(model, app) {
         names.extend(lc.unknown_calls.iter().filter_map(|e| sti_serialized_column(e, table)).map(|c| c.as_str().to_string()));
         // The typed_store gem's `typed_store :col`, run in the subclass (its
         // body, or a Concern's `included do`), or reached through an app macro
@@ -119,7 +119,7 @@ pub(crate) fn defaulted_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         names.extend(body_statements(m).filter_map(|e| defaulted_attribute(e, table)));
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
-    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+    for lc in sti_descendants(model, app) {
         names.extend(lc.unknown_calls.iter().filter_map(|e| defaulted_attribute(e, table)));
     }
     table.columns.iter().filter(|c| names.contains(&c.name)).map(|c| c.name.clone()).collect()
@@ -286,7 +286,7 @@ fn sti_subclass_macro_calls<'a>(
     target: &str,
 ) -> Vec<(&'a LibraryClass, &'a Expr, Vec<String>)> {
     let mut out = Vec::new();
-    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+    for lc in sti_descendants(model, app) {
         let side = ClassSide::of_sti_subclass(lc, model, app);
         for (call, names) in calls_reaching(&side, lc.unknown_calls.iter(), target, false) {
             out.push((lc, call, names));
@@ -616,7 +616,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         out.extend(body_statements(model).filter(|e| claimed_store_accessor(model, e, table)).map(|e| e.span));
         let side = ClassSide::of(model, app);
         out.extend(body_statements(model).filter(|e| macro_alias_pairs(&side, e, table).is_some()).map(|e| e.span));
-        for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+        for lc in sti_descendants(model, app) {
             out.extend(lc.unknown_calls.iter().filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
             out.extend(lc.unknown_calls.iter().filter(|e| sti_serialized_column(e, table).is_some()).map(|e| e.span));
         }
@@ -643,7 +643,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         }
     }
     out.extend(keyed_calls(model, &side, body));
-    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+    for lc in sti_descendants(model, app) {
         out.extend(keyed_calls(model, &ClassSide::of_sti_subclass(lc, model, app), lc.unknown_calls.iter().collect()));
     }
     out
@@ -1086,4 +1086,27 @@ fn module_named<'a>(app: &'a App, owner: &str, constant: &Expr) -> Option<&'a Li
     (0..scope.len()).rev().find_map(|n| {
         if n == 0 { find(&written) } else { find(&format!("{}::{written}", scope[..n].join("::"))) }
     })
+}
+
+/// The library classes below `model`: its STI subclasses that ingest
+/// keeps as library classes, and theirs in turn (Core's
+/// `ExternalProviders::Apple < Social < ExternalProvider`). Each shares
+/// the model's table, so its body declarations retype the model's
+/// columns.
+fn sti_descendants<'a>(model: &'a Model, app: &'a App) -> impl Iterator<Item = &'a LibraryClass> {
+    let mut names: Vec<&crate::ident::ClassId> = vec![&model.name];
+    let mut out: Vec<&LibraryClass> = Vec::new();
+    loop {
+        let before = out.len();
+        for lc in &app.library_classes {
+            if !out.iter().any(|seen| std::ptr::eq(*seen, lc)) && lc.parent.as_ref().is_some_and(|p| names.contains(&p)) {
+                out.push(lc);
+            }
+        }
+        if out.len() == before {
+            break;
+        }
+        names.extend(out[before..].iter().map(|lc| &lc.name));
+    }
+    out.into_iter()
 }
