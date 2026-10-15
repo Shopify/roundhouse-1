@@ -62,6 +62,8 @@ const PROBE: &str = r##"class NestedStoreProbe
     out << "loaded: #{found.settings[:signup].inspect} #{found.signup_types.inspect} #{found.settings[:open].inspect}"
     found.settings[:timezone] = "Paris"
     found.save!
+    pair = found.saved_changes[:settings] #: untyped
+    out << "saved: #{pair.map { |h| h.respond_to?(:delete_if) }.inspect} #{pair.map { |h| h[:timezone] }.inspect}"
     again = Shop.find(shop.id)
     out << "rewritten: #{again.settings[:signup].inspect} #{again.settings[:timezone]} #{again.settings[:open].inspect}"
     out << "dig: #{again.settings.dig(:signup, "industry").inspect}"
@@ -76,9 +78,10 @@ const TYPED_STORE_GEM: &str = "gem \"activerecord-typedstore\"\nrequire \"active
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 4] = [
+const EXPECTED: [&str; 5] = [
     r#"default: {} []"#,
     r#"loaded: {"industry" => "restaurants", "types" => ["x", "y"]} ["x", "y"] true"#,
+    r#"saved: [true, true] ["UTC", "Paris"]"#,
     r#"rewritten: {"industry" => "restaurants", "types" => ["x", "y"]} Paris true"#,
     r#"dig: "restaurants""#,
 ];

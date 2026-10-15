@@ -2306,7 +2306,7 @@ module ActiveRecord
       changes["id"] = [nil, id] if was_new && !id.nil?
       _merge_forced_changes(changes, current)
       @__last_saved_attributes = current
-      @saved_changes = _indifferent_changes(changes)
+      @saved_changes = _indifferent_changes(_typed_store_changes(changes))
       @id_previously_changed = was_new
       @__forced_changes = nil
       nil
@@ -2314,6 +2314,30 @@ module ActiveRecord
 
     def saved_changes
       @saved_changes || _indifferent_changes({})
+    end
+
+    # What `saved_changes` pairs hold for a typed_store column: the Hash the
+    # store reads as (`TypedStore.snapshot`, declared defaults filled in),
+    # as the gem's type hands Rails' dirty tracking, not the serialized
+    # text the column stores. Core's `HashDiff.diff(saved_changes[:settings][0],
+    # saved_changes[:settings][1])` called `delete_if` on the text. The
+    # change itself is still detected on the stored text. The columns are
+    # the ones whose class carries the store view's `__rh_<col>_keys`
+    # (`lower::typed_store`).
+    def _typed_store_changes(changes)
+      return changes unless defined?(::TypedStore) && ::TypedStore.respond_to?(:snapshot)
+      klass = self.class
+      cols = klass.instance_variable_get(:@__typed_store_view_columns)
+      if cols.nil?
+        cols = klass.schema_columns.map { |c| c.to_s }.select { |c| klass.private_method_defined?(:"__rh_#{c}_keys") }
+        klass.instance_variable_set(:@__typed_store_view_columns, cols)
+      end
+      cols.each do |col|
+        pair = changes[col]
+        next if pair.nil?
+        changes[col] = [::TypedStore.snapshot(self, col, pair[0]), ::TypedStore.snapshot(self, col, pair[1])]
+      end
+      changes
     end
 
     # ActiveModel::Dirty#previous_changes is `mutations_before_last_save

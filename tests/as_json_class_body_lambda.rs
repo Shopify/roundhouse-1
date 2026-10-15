@@ -62,3 +62,30 @@ raise "Enumerator" unless Installer.convert([3, 4].each) == [3, 4]
         )
         .assert_passes();
 }
+
+/// Core's CapabilityPayload#normalize round trip: a Hash holding value
+/// objects is written through `to_json` and parsed back. The json gem
+/// alone writes an object as its `to_s`, which Rails' encoder does not.
+#[test]
+fn to_json_encodes_value_objects_through_as_json() {
+    emit_and_run::real_blog()
+        .write("app/models/business_process.rb", BASE)
+        .write("app/models/installer.rb", INSTALLER)
+        .write(
+            "app/models/flow.rb",
+            "class Flow\n  def initialize(enabled)\n    @enabled = enabled\n    @label = \"<b>\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"flow = Flow.new(true)
+text = { flow: flow, list: [flow, :x], at: 1 }.to_json
+parsed = JSON.parse(text, symbolize_names: true)
+plain = { enabled: true, label: "<b>" }
+raise "Hash#to_json: #{text}" unless parsed == { flow: plain, list: [plain, "x"], at: 1 }
+raise "html entities: #{text}" unless text.include?("\\u003cb\\u003e")
+raise "Object#to_json: #{flow.to_json}" unless JSON.parse(flow.to_json, symbolize_names: true) == plain
+raise "state passthrough" unless JSON.generate({ "a" => [1, nil] }) == '{"a":[1,null]}'
+raise "pretty" unless JSON.pretty_generate({ "a" => 1 }) == "{\n  \"a\": 1\n}"
+"#,
+        )
+        .assert_passes();
+}
