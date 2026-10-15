@@ -14534,12 +14534,33 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
     // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
     // singleton class, which the class's own class methods do not answer.
     let singleton = call.decisions & crate::expr::SINGLETON_BODY != 0;
-    let own: Vec<&Symbol> = lc
+    let mut own: Vec<&Symbol> = lc
         .methods
         .iter()
         .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
         .map(|m| &m.name)
         .collect();
+    // The class methods of the app's own superclasses are inherited
+    // (`AssetCloud::ZippedThemeFiles`' body calls `bucket` and
+    // `asset_extensions`, which the compiled asset_cloud gem's
+    // `AssetCloud::Base` defines): emitted code answers them as in Ruby.
+    // The chain stops at a class the app does not define, whose class
+    // methods a runtime base may or may not give.
+    if !singleton {
+        let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
+        let mut parent = lc.parent.as_ref();
+        while let Some(p) = parent {
+            let name = p.0.as_str().trim_start_matches("::");
+            if seen.contains(&name) || is_model_named(name, app) {
+                break;
+            }
+            let classes = library_classes_named(name, app);
+            let Some(class) = classes.iter().find(|c| !c.is_module) else { break };
+            seen.push(name);
+            own.extend(class.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).map(|m| &m.name));
+            parent = class.parent.as_ref();
+        }
+    }
     fn walk(e: &Expr, own: &[&Symbol], hooked: bool, app: &App, ok: &mut bool) {
         if !*ok {
             return;
