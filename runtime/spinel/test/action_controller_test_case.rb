@@ -82,7 +82,8 @@ module ActionController
           raise "@controller is nil: make sure you set it in your test's setup method."
         end
         controller = @controller
-        if controller.method(:process_action).owner == ActionController::Base
+        # `Object#method` by name: an app controller may define a `method` reader of its own.
+        if Object.instance_method(:method).bind_call(controller, :process_action).owner == ActionController::Base
           raise NotImplementedError,
             "roundhouse: ActionController::TestCase#process (#{action}): #{controller.class} has no emitted process_action " \
             "(lowering synthesizes it for a controller with a routed action, or one a controller test names)"
