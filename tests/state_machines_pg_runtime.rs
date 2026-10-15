@@ -21,6 +21,8 @@ const STRUCTURE: &str = r#"CREATE TABLE vehicles (
     state character varying,
     alarm_state character varying,
     wheels integer DEFAULT 4,
+    type character varying,
+    gear character varying,
     CONSTRAINT vehicles_pkey PRIMARY KEY (id)
 );
 "#;
@@ -124,12 +126,26 @@ const VEHICLE: &str = r#"class Vehicle < ApplicationRecord
 
   # A class-level override over Active Record's, as Core's concerns do.
   def self.table_exists?
-    super && name == "Vehicle"
+    super && %w[Vehicle Truck].include?(name)
   end
 
   def log
     @log ||= []
   end
+end
+"#;
+
+// An STI subclass declares its own machine and validates against it, as
+// Core's OpenSrsDomainSubscription does: the subclass is a library class
+// to ingest, and its `state_machine` call used to be dropped.
+const TRUCK: &str = r#"class Truck < Vehicle
+  state_machine :gear, initial: :neutral do
+    event :shift do
+      transition neutral: :drive
+    end
+  end
+
+  validates :gear, inclusion: state_machines[:gear].states.map(&:name).map(&:to_s)
 end
 "#;
 
@@ -153,6 +169,10 @@ const PROBE: &str = r##"class StateMachinesProbe
     out << "park: #{v.park} #{Vehicle.find(v.id).state}"
     out << "names: #{Vehicle.state_machines.keys.join(",")} #{Vehicle.state_machine(:state).states.map(&:value).join(",")}"
     out << "schema: #{Vehicle.table_exists?} #{Vehicle.column_defaults.map { |k, d| "#{k}=#{d.inspect}" }.join(",")}"
+    t = Truck.create!(name: "t")
+    out << "truck: #{t.type} #{t.gear} #{t.neutral?} #{t.shift} #{t.gear} #{Truck.find(t.id).gear} #{Truck.state_machines.keys.join(",")} #{Truck.state_machine(:gear).states.map(&:name).join(",")}"
+    t.gear = "bogus"
+    out << "invalid: #{t.valid?} #{t.errors[:gear].include?("is not included in the list")}"
     out
   end
 end
@@ -160,7 +180,7 @@ end
 
 /// Native Rails 8.2 with the same gems on the same PostgreSQL, so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 10] = [
+const EXPECTED: [&str; 12] = [
     "new: parked true false active true",
     "can: true false",
     "ignite: true running true ignited running",
@@ -170,18 +190,21 @@ const EXPECTED: [&str; 10] = [
     "scopes: a b 2",
     "park: true parked",
     "names: state,alarm_state parked,running",
-    "schema: true id=nil,name=nil,state=nil,alarm_state=nil,wheels=4",
+    "schema: true id=nil,name=nil,state=nil,alarm_state=nil,wheels=4,type=nil,gear=nil",
+    "truck: Truck neutral true true drive drive state,alarm_state,gear neutral,drive",
+    "invalid: false true",
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 4] = [
+const LOADS: [&str; 5] = [
     "native/bundler_require",
     "app/models/application_record",
     "app/models/vehicle",
+    "app/models/truck",
     "app/models/state_machines_probe",
 ];
 
-const FILES: [(&str, &str); 12] = [
+const FILES: [(&str, &str); 13] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/application.rb", "Bundler.require(*Rails.groups)\n"),
     ("Gemfile", GEMFILE),
@@ -193,6 +216,7 @@ const FILES: [(&str, &str); 12] = [
     ("db/structure.sql", STRUCTURE),
     ("app/models/application_record.rb", APPLICATION_RECORD),
     ("app/models/vehicle.rb", VEHICLE),
+    ("app/models/truck.rb", TRUCK),
     ("app/models/state_machines_probe.rb", PROBE),
 ];
 

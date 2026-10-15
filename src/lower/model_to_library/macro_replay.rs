@@ -1859,6 +1859,27 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
     }
     let own: Vec<&MethodDef> = lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).collect();
     let callbacks = super::callback_calls(lc.unknown_calls.iter(), &own, lc.parent.as_ref(), &app.models);
+    // The state_machines gem's `state_machine`, which it gives every
+    // class (`lower::state_machines`), runs on the subclass as on a
+    // model: a class method of the subclass's or a model ancestor's by
+    // that name answers instead. Core's `OpenSrsDomainSubscription <
+    // DomainSubscription` declares its `status` machine, and the
+    // `DomainSubscription.status` enum reads its states.
+    let state_machine_answered = {
+        let named = |d: &&MethodDef| d.receiver == MethodReceiver::Class && d.name.as_str() == crate::lower::state_machines::MACRO;
+        let mut ancestor = lc.parent.as_ref();
+        let mut seen: Vec<&ClassId> = Vec::new();
+        let mut answered = own.iter().any(named);
+        while let Some(model) = ancestor.and_then(|p| app.models.iter().find(|m| &m.name == p)) {
+            if seen.contains(&&model.name) {
+                break;
+            }
+            seen.push(&model.name);
+            answered |= model.methods().any(|d| named(&&d));
+            ancestor = model.parent.as_ref();
+        }
+        answered
+    };
     let side = ClassSide::new(&lc.name, own, lc.unknown_calls.iter().collect(), lc.parent.as_ref(), app);
     // The parent model's claims cover its STI subclasses' `query_constraints`
     // macro calls naming its list, which the Ruby emit drops (Rails' list
@@ -1870,6 +1891,9 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
             !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_elsewhere(expr) && !parent_claims.contains(&expr.span)
         })
         .filter_map(|expr| {
+            if !state_machine_answered && crate::lower::state_machines::is_state_machine_call(expr) {
+                return Some((expr, MacroVerdict::Replay));
+            }
             side.verdict(expr).map(|v| match v {
                 MacroVerdict::BelongsToRequiredByDefault(value) if !declares_belongs_to_after(lc, expr, app) => {
                     (expr, MacroVerdict::BelongsToRequiredByDefault(value))
