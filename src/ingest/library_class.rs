@@ -7347,6 +7347,9 @@ fn ingest_concern_hook_items(
         };
 
         let Some(body) = module.body() else { continue };
+        // The constants the module body assigns (`VALID_ROLES = { … }`),
+        // which an `enum :role, VALID_ROLES` in its `included do` names.
+        let module_consts = super::model::ClassConsts::collect(&flatten_statements(module.body().unwrap()), file);
         let mut items: Vec<ModelBodyItem> = Vec::new();
         let mut enums: Vec<ConcernEnumDecl> = Vec::new();
         let is_concern = module.body().is_some_and(|b| flatten_statements(b).iter().any(|stmt| {
@@ -7432,7 +7435,7 @@ fn ingest_concern_hook_items(
                         &call,
                         file,
                         &[],
-                        &super::model::ClassConsts::default(),
+                        &module_consts,
                         &resolve_constant,
                     ) {
                         Ok(Some(super::model::ClassBodyExpansion::DelegatedType(expanded))) => {
