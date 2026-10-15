@@ -90,3 +90,95 @@ fn a_class_reopened_after_const_set_reopens_the_class_const_set_built() {
     assert!(run.stdout.lines().any(|l| l == "7"), "{}", run.stdout);
     assert!(!run.stderr.contains("already initialized"), "{}", run.stderr);
 }
+
+const GRAPH_BASE: &str = r#"require "logger"
+
+class GraphBase < Logger
+  def self.field(name, **)
+    (@fields ||= []) << name
+  end
+
+  def self.fields
+    @fields ||= []
+  end
+
+  def self.post_hook(&block)
+    @hook = block
+  end
+
+  class << self
+    attr_accessor :cacheable
+  end
+end
+"#;
+
+const GRAPH_FACTORY: &str = r#"
+module GraphFactory
+  #: (Class) -> Class
+  def self.for(owner)
+    connection = Class.new(GraphBase)
+    owner.const_set(:Connection, connection)
+    connection
+  end
+end
+"#;
+
+/// A block calling the class's own def, then `self.cacheable = true`: the
+/// body's tail effects, written after the methods. The `const_set` from the
+/// other file lands among them, and the reopening follows it.
+const GRAPH_PRODUCT: &str = r#"
+module Graph
+  module Storefront
+    class Product < GraphBase
+      post_hook do |product, ctx|
+        contextually_published?(ctx, product)
+      end
+
+      self.cacheable = true
+
+      field :name
+
+      def name = "n"
+
+      def self.contextually_published?(ctx, product) = ctx
+    end
+  end
+end
+"#;
+
+const GRAPH_CONNECTION: &str = r#"
+module Graph
+  module Storefront
+    class Product
+      const_set(:Connection, GraphFactory.for(Product))
+
+      class Connection
+        field :filters
+      end
+    end
+  end
+end
+"#;
+
+/// Core's graph_api/storefront/product.rb: the `const_set` is one of the
+/// parent's tail effects (a block that calls its own def is above it), so
+/// the reopening was written above the methods, ahead of the call, and
+/// `field` ran on a plain class ("undefined method 'field' for class
+/// ...::Product::Connection"). The tail's `const_set` was also written
+/// bare, setting the constant a second time.
+#[test]
+fn a_reopening_follows_a_const_set_written_among_the_parents_tail_effects() {
+    let run = emit_and_run::empty_app()
+        .write("lib/graph_base.rb", GRAPH_BASE)
+        .write("lib/graph_factory.rb", GRAPH_FACTORY)
+        .write("app/models/graph/storefront/product.rb", GRAPH_PRODUCT)
+        .write("app/models/graph/storefront/product/connection.rb", GRAPH_CONNECTION)
+        .run_ruby(
+            "$stderr.sync = true\nconn = Graph::Storefront::Product::Connection\nputs conn.fields.inspect\nputs conn.superclass\nputs Graph::Storefront::Product.cacheable\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.lines().any(|l| l == "[:filters]"), "{}", run.stdout);
+    assert!(run.stdout.lines().any(|l| l == "GraphBase"), "{}", run.stdout);
+    assert!(run.stdout.lines().any(|l| l == "true"), "{}", run.stdout);
+    assert!(!run.stderr.contains("already initialized"), "{}", run.stderr);
+}

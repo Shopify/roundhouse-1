@@ -1108,9 +1108,16 @@ fn nested_blocks(
         let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
         let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
         let after_defs = builds_after_parent_defs(parent, kid, app);
-        let at = nested_position(parent, kid, app).or_else(|| after_defs.then(|| declared_at(kid, app)).flatten());
+        // A class the owner's `const_set` builds follows everything the
+        // owner's body writes: that call may be written among its tail
+        // effects (a `self.cacheable = true` below it), and the class
+        // reopens what the call built.
+        let built = const_set_site(kid, app).filter(|site| !site.is_synthetic());
+        let at = nested_position(parent, kid, app)
+            .or_else(|| after_defs.then(|| declared_at(kid, app)).flatten())
+            .or(built);
         blocks.push((at, block));
-        late.push(after_defs && at.is_some());
+        late.push((after_defs || built.is_some()) && at.is_some());
         names.push(kid.name.0.as_str().to_string());
         if inline.is_some() {
             continue;
@@ -11686,7 +11693,7 @@ fn emit_library_class_decl_inner(
             if !std::mem::replace(&mut first, false) {
                 writeln!(s).unwrap();
             }
-            write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
+            write_body_lines(&mut s, &body_pad, &idempotent_const_set(call).unwrap_or_else(|| super::emit_expr(call)));
         }
         // Written at its include (`carried_method`).
         if carried_method(m) {
@@ -11759,7 +11766,7 @@ fn emit_library_class_decl_inner(
     }
     for (_, call) in positioned_statements.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
-        write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
+        write_body_lines(&mut s, &body_pad, &idempotent_const_set(call).unwrap_or_else(|| super::emit_expr(call)));
     }
 
     if !tail_effects.is_empty() && !lc.methods.is_empty() {
@@ -11769,7 +11776,8 @@ fn emit_library_class_decl_inner(
         for line in nested_files_above(lc, effect.span, app, &out_path, &mut nested_required) {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
-        for line in super::emit_expr(effect).lines() {
+        let text = idempotent_const_set(effect).unwrap_or_else(|| super::emit_expr(effect));
+        for line in text.lines() {
             if line.is_empty() {
                 writeln!(s).unwrap();
             } else {
@@ -13945,18 +13953,25 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
 /// calls (`field :filters`) run on them. Replayed as written, as a body
 /// over a base we do not model.
 fn built_by_const_set(lc: &LibraryClass, app: &App) -> bool {
+    const_set_site(lc, app).is_some()
+}
+
+/// The span of the owner's `const_set(:Leaf, ...)` call that builds the
+/// nested class `lc` (`built_by_const_set`).
+fn const_set_site(lc: &LibraryClass, app: &App) -> Option<crate::span::Span> {
     if lc.is_module || lc.parent.is_some() {
-        return false;
+        return None;
     }
-    let Some((owner, leaf)) = lc.name.0.as_str().rsplit_once("::") else { return false };
-    library_classes_named(owner, app).iter().any(|owner| {
-        owner.unknown_calls.iter().any(|call| {
-            let ExprNode::Send { recv, method, args, .. } = &*call.node else { return false };
-            method.as_str() == "const_set"
+    let (owner, leaf) = lc.name.0.as_str().rsplit_once("::")?;
+    library_classes_named(owner, app).iter().find_map(|owner| {
+        owner.unknown_calls.iter().find_map(|call| {
+            let ExprNode::Send { recv, method, args, .. } = &*call.node else { return None };
+            (method.as_str() == "const_set"
                 && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 && args.first().is_some_and(|name| {
                     matches!(&*name.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == leaf)
-                })
+                }))
+            .then_some(call.span)
         })
     })
 }
