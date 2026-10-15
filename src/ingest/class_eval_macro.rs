@@ -344,6 +344,54 @@ fn parse_methods(body: &str) -> Vec<MethodDef> {
     }
 }
 
+/// The methods a class-body `class_eval <<-RUBY, __FILE__, __LINE__ + 1`
+/// of a literal heredoc (no interpolation) writes, in the order it writes
+/// them, or the name of what stops that: the text holds a statement that
+/// is not a `def` (a call, a constant, an include), so the methods alone
+/// would not be what Ruby evaluates. Each method has the visibility the
+/// text gives it, public unless the text itself says otherwise: a string
+/// `class_eval` starts a visibility scope of its own, so a `private`
+/// above the call does not reach it. sprockets-rails 3.5.2's
+/// `Sprockets::Rails::Helper` writes `find_asset` so under
+/// `if RUBY_VERSION >= "2.7"`, beside a plain `def find_asset` in the
+/// `else`, below a `private`.
+pub(super) fn literal_class_eval_methods(stmt: &Expr) -> Result<Vec<MethodDef>, &'static str> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*stmt.node else {
+        return Err("a statement that is not a `class_eval` of a string");
+    };
+    if !matches!(method.as_str(), "class_eval" | "module_eval")
+        || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
+        || args.is_empty()
+        || args.len() > 3
+    {
+        return Err("a statement that is not a `class_eval` of a string");
+    }
+    let src = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return Err("a `class_eval` whose string is not a literal"),
+    };
+    let wrapped = format!("class RoundhouseClassEvalMacro\n{src}\nend\n");
+    let (parsed, diags) =
+        crate::ingest::prism::scope(|| crate::ingest::ingest_library_classes(wrapped.as_bytes(), "<class_eval>"));
+    let classes = match parsed {
+        Ok(classes) if diags.is_empty() => classes,
+        _ => return Err("a `class_eval` string that does not read as a class body"),
+    };
+    let [class] = classes.as_slice() else {
+        return Err("a `class_eval` string that declares a class or module");
+    };
+    if !class.unknown_calls.is_empty()
+        || !class.constants.is_empty()
+        || !class.includes.is_empty()
+        || !class.class_ivar_initializers.is_empty()
+        || !class.visibility_overrides.is_empty()
+        || class.methods.is_empty()
+    {
+        return Err("a `class_eval` string holding a statement other than a `def`");
+    }
+    Ok(class.methods.clone())
+}
+
 /// A class-body loop over a literal list whose block is one `class_eval`
 /// of a string, unrolled into the methods Ruby evaluates. activemerchant
 /// 1.137.0's `CreditCard`:

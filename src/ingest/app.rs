@@ -3201,6 +3201,8 @@ end
     // After both: the chain is complete, so a repeated declaration can
     // find the one it replaces.
     dedup_repeated_filters(&mut app);
+    // A subclass's own calls of the class macros its Concerns define.
+    super::controller_concern_blocks::replay_subclass_macros(&mut app, &concern_class_method_spans, &framework_shadow_scopes);
     // After everything that consumes a class-body call: what is still
     // an unrecognized macro is reported, not dropped in silence.
     report_unrecognized_controller_macros(&app);
@@ -6267,7 +6269,7 @@ fn qualify_model_class_method_ar_calls(app: &mut App) {
 /// markers. (`protect_from_forgery` / `skip_forgery_protection` are not
 /// here: `parse_filter_call` types the forms that are modeled, and one
 /// left in the body — `with: :null_session`, say — is a real gap.)
-const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
+pub(super) const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
     "include",
     "extend",
     "layout",

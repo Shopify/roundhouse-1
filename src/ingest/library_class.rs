@@ -3706,6 +3706,36 @@ fn conditional_definitions(
                 }
                 continue;
             }
+            // `class_eval <<-RUBY` of defs: the methods its text writes,
+            // public as a string eval's own visibility scope makes them,
+            // named at the statement.
+            if visibility::literal_class_eval(stmt) {
+                let refuse = |message: String| {
+                    super::error_site::at(IngestError::Unsupported { file: file.into(), message }, stmt)
+                };
+                if force_class_receiver {
+                    return Err(refuse(
+                        "a `class_eval` of a string in a load-time conditional inside `class << self` is not modeled"
+                            .into(),
+                    ));
+                }
+                let written = ingest_expr(stmt, file)?;
+                let written = super::class_eval_macro::literal_class_eval_methods(&written).map_err(|why| {
+                    refuse(format!("a load-time conditional definition whose branch holds {why} is not modeled"))
+                })?;
+                let name_span = Span {
+                    file: super::sources::file_id(file),
+                    start: stmt.location().start_offset() as u32,
+                    end: stmt.location().end_offset() as u32,
+                };
+                for mut m in written {
+                    m.enclosing_class = Some(owner.0.clone());
+                    m.name_span = name_span;
+                    members.push(crate::dialect::ConditionalMember::of(&m));
+                    methods.push(m);
+                }
+                continue;
+            }
             let Some(def) = visibility::definition(stmt) else {
                 return Err(super::error_site::at(
                     IngestError::Unsupported {
