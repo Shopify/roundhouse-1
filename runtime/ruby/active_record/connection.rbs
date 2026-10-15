@@ -230,6 +230,22 @@ module ActiveRecord
     def self.create_or_find_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.sole: () -> Base
+    def self.select: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.group: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.order: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.reorder: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.limit: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.offset: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.left_joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.left_outer_joins: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.includes: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.preload: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.eager_load: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.distinct: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.having: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.from: (*untyped args) ?{ (untyped) -> untyped } -> Relation
+    def self.extending: (*untyped args) ?{ (untyped) -> untyped } -> Relation
     def self.all: () -> Relation
     def self._hook_attribute_type: (untyped name, untyped cast_type) -> untyped
     def self._create_time_zone_conversion_attribute?: (untyped name, untyped cast_type) -> bool

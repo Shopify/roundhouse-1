@@ -120,6 +120,11 @@ const PROBE: &str = r##"class ArelProbe
     pairs = Arel::Nodes::As.new(Arel::Nodes::Grouping.new(Arel::Nodes::ValuesList.new(pair_rows)), Arel.sql("pairs(id, title)"))
     pairs_join = Arel::Nodes::InnerJoin.new(pairs, Arel::Nodes::On.new(p[:id].eq(Arel::Nodes::NamedFunction.new("CAST", [Arel::Nodes::As.new(Arel.sql("pairs.id"), Arel.sql("bigint"))]))))
     out << "joins bound values: #{titles(Product.where(kind: "b").joins(pairs_join).order(:id))} / #{titles(Product.joins(pairs_join).where(price: 15).order(:id))}"
+    # A class a static lowering cannot resolve (Core's QueryLayer calls
+    # `model.select(*columns)` on a class-valued reader): the class-side
+    # query methods Rails delegates to `all`.
+    klass = Object.const_get("Product")
+    out << "class query: #{titles(klass.select(:id, :title).order(:id))} / #{titles(klass.order(:id).limit(2).offset(1))} / #{klass.group(:kind).order(:kind).pluck(:kind).inspect} / #{klass.distinct.order(:kind).pluck(:kind).inspect}"
     out << "from node: #{Product.from(Arel::Nodes::TableAlias.new(Arel::Nodes::Grouping.new(Arel.sql(Product.where(p[:price].gt(10)).to_sql)), "products")).order(:id).map(&:title).inspect}"
     ranked = Product.order(:id).pluck(Arel::Nodes::NamedFunction.new("CONCAT", [p[:title], Arel.sql("'-'"), p[:price]]))
     out << "concat: #{ranked.inspect}"

@@ -1896,6 +1896,21 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).sole
     end
 
+    # The rest of the query surface Rails delegates to `all`
+    # (querying.rb): `Model.select(…)` and kin on a class a lowering
+    # could not resolve (`model.select(*needed_columns(query))` in Core's
+    # QueryLayer, where `model` is a class-valued reader). Without them
+    # `select` reaches Kernel#select, private, and the rest are undefined.
+    # Each builds the relation `all` builds, so the default scope applies.
+    %i[
+      select group order reorder limit offset joins left_joins left_outer_joins
+      includes preload eager_load distinct having from extending
+    ].each do |name|
+      define_singleton_method(name) do |*args, &block|
+        ActiveRecord::Relation.new(self).public_send(name, *args, &block)
+      end
+    end
+
     # Rails-shape `all` fallback, same story as `where` above: a lazy
     # Relation so refiner chains the lowerers left dynamic
     # (`Category.all.order("category asc, tags.tag asc")…` on lobsters'
