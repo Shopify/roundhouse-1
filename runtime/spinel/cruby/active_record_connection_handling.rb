@@ -846,6 +846,11 @@ module ActiveRecord
         Db.query_cache_enabled?
       end
 
+      def clear_query_cache
+        Db.query_cache_clear
+        nil
+      end
+
       # What `pool.send(:query_cache)` answers (QueryCache::Store): the
       # thread's replay cache, which `clear` empties.
       class QueryCacheStore
@@ -880,6 +885,26 @@ module ActiveRecord
           raise ActiveRecord::ConnectionNotEstablished, @unconnectable.message
         end
         raise @unconnectable
+      end
+    end
+  end
+
+  # query_cache.rb: the executor's hooks. The replay cache is the thread's
+  # (`Db`'s), so enabling and disabling it per pool is the same switch.
+  class QueryCache
+    module ExecutorHooks # :nodoc:
+      def self.run
+        ActiveRecord::Base.connection_handler.each_connection_pool.reject(&:query_cache_enabled).each do |pool|
+          next if pool.db_config&.query_cache == false
+          pool.enable_query_cache!
+        end
+      end
+
+      def self.complete(pools)
+        pools.each do |pool|
+          pool.disable_query_cache!
+          pool.clear_query_cache
+        end
       end
     end
   end

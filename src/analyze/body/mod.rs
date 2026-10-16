@@ -910,6 +910,33 @@ impl<'a> BodyTyper<'a> {
         info.extends.iter().rev().find_map(|module| self.module_constant(resolver, module, &written, &mut seen))
     }
 
+    /// A constant an included module (or one a superclass includes)
+    /// declares in source, when the source index cannot reach it through
+    /// the class's ancestors: Rubydex stops linearizing at an include it
+    /// cannot resolve (`ApiChangeTestHelper` includes `Mocha::API`), so a
+    /// test class that also includes Core's `AccessTestHelper` lost its
+    /// `DEFAULT_WRITE_DEFINITIONS_ACCESS_SCOPE`. Ruby's order: each class's
+    /// included modules, the last first, then its superclass.
+    fn included_source_constant(
+        &self,
+        ctx: &Ctx,
+        path: &[Symbol],
+    ) -> Option<(ClassId, Option<DeclarationId>)> {
+        let resolver = self.const_resolver.as_ref()?;
+        let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
+        let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+        let mut seen = crate::det::HashSet::default();
+        let mut info = self.classes().get(id)?;
+        for _ in 0..32 {
+            if let Some(found) = info.includes.iter().rev().find_map(|module| self.module_constant(resolver, module, &written, &mut seen)) {
+                return Some(found);
+            }
+            let class = info.parent.clone()?;
+            info = self.classes().get(&class)?;
+        }
+        None
+    }
+
     /// `written` under `module` or, Ruby's order, the modules it includes
     /// (the last first).
     fn module_constant(
@@ -1916,6 +1943,10 @@ impl<'a> BodyTyper<'a> {
                     Some(None) => {
                         let lexical = self.lexical_external_constant(expr_span, path);
                         let extended = if lexical.is_none() { self.extended_constant(expr_span, path) } else { None };
+                        let extended = match extended {
+                            None if lexical.is_none() => self.included_source_constant(ctx, path),
+                            found => found,
+                        };
                         // A gem's private constant (google-protobuf's
                         // `private_constant :AbstractMessage`) is read
                         // only as written: qualified, it is NameError.
