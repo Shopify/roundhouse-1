@@ -1451,9 +1451,17 @@ pub(super) fn library_class_and_struct_base(
         // Each member is told the constant it is bound to. sorbet reads
         // that off the constant table when the `enums` block finishes;
         // here it is known at ingest, and `inspect` needs it.
+        let member_names: Vec<Symbol> =
+            constants.iter().filter(|(_, v)| is_enum_member(&owner, v)).map(|(n, _)| n.clone()).collect();
+        let owner_path = enum_owner_path(&owner, &member_names);
         for (name, value) in constants.iter_mut() {
             if !is_enum_member(&owner, value) {
                 continue;
+            }
+            if let ExprNode::Send { recv: Some(recv), .. } = &mut *value.node
+                && let ExprNode::Const { path } = &mut *recv.node
+            {
+                *path = owner_path.clone();
             }
             if let ExprNode::Send { args, .. } = &mut *value.node {
                 // `Desktop = new` — no serialized value given. sorbet
@@ -1734,7 +1742,18 @@ fn is_enum_member(owner: &ClassId, value: &Expr) -> bool {
         return false;
     }
     let ExprNode::Const { path } = &*recv.node else { return false };
-    path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::") == owner.0.as_str()
+    path.iter().map(Symbol::as_str).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::") == owner.0.as_str()
+}
+
+/// `owner`'s constant path, rooted (`::Banking::TermsOfServiceKind`) when a
+/// member shares the name of its first segment: inside the class the
+/// unrooted `Banking` finds the member `Banking = new` once it is
+/// assigned, not the namespace (Core's `Banking::TermsOfServiceKind`).
+fn enum_owner_path<'a>(owner: &ClassId, member_names: impl IntoIterator<Item = &'a Symbol>) -> Vec<Symbol> {
+    let first = owner.0.as_str().split("::").next().unwrap_or_default();
+    let shadowed = member_names.into_iter().any(|name| name.as_str() == first);
+    let rooted = shadowed.then(|| Symbol::from(""));
+    rooted.into_iter().chain(owner.0.as_str().split("::").map(Symbol::from)).collect()
 }
 
 fn str_lit(value: &str) -> Expr {
@@ -1790,18 +1809,11 @@ fn synth_sorbet_enum_methods(owner: &ClassId, members: &[SorbetEnumMember]) -> V
         mutates_self: name == "initialize",
         block_param: None,
     };
+    let owner_path = enum_owner_path(owner, members.iter().map(|m| &m.name));
     let member_const = |name: &Symbol| {
         Expr::new(
             Span::synthetic(),
-            ExprNode::Const {
-                path: owner
-                    .0
-                    .as_str()
-                    .split("::")
-                    .map(Symbol::from)
-                    .chain(std::iter::once(name.clone()))
-                    .collect(),
-            },
+            ExprNode::Const { path: owner_path.iter().cloned().chain(std::iter::once(name.clone())).collect() },
         )
     };
     let ivar = |name: &str| Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from(name) });

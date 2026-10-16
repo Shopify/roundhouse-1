@@ -150,3 +150,41 @@ fn class_body_macros_from_extended_modules_and_aliased_forwarders_run_as_in_crub
         .collect();
     assert!(dropped.is_empty(), "{dropped:#?}");
 }
+
+const KIND: &str = r##"module Banking
+  class TermsOfServiceKind < T::Enum
+    enums do
+      Cardholder = new("cardholder")
+      Banking = new("banking")
+      Credit = new("credit")
+    end
+  end
+end
+"##;
+
+/// A member named for the enum's own namespace (`Banking = new` in
+/// `Banking::TermsOfServiceKind`) shadows the namespace inside the class: the
+/// members after it, and `values`, must name the class from the top level.
+#[test]
+fn a_t_enum_member_named_for_its_namespace_does_not_shadow_the_class() {
+    let script = "puts Banking::TermsOfServiceKind.values.map(&:serialize).inspect\nputs Banking::TermsOfServiceKind::Banking.inspect\nputs Banking::TermsOfServiceKind.from_serialized(\"credit\").inspect";
+    let (tree, errors) = emit_and_run::empty_app().write("lib/banking/terms_of_service_kind.rb", KIND).emit(BuildTarget::Ruby);
+    let run = Command::new("ruby")
+        .current_dir(&tree)
+        .env("BLOG_DB", ":memory:")
+        .arg("-e")
+        .arg(format!("require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\n{script}"))
+        .output()
+        .expect("spawn ruby");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "emitted tree failed in {}: {stderr}\nerrors: {errors:#?}", tree.display());
+    assert_eq!(
+        lines(&run.stdout),
+        [
+            "[\"cardholder\", \"banking\", \"credit\"]",
+            "#<Banking::TermsOfServiceKind::Banking>",
+            "#<Banking::TermsOfServiceKind::Credit>"
+        ],
+        "errors: {errors:#?}"
+    );
+}
