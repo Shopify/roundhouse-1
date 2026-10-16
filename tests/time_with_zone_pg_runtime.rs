@@ -73,6 +73,13 @@ const PROBE: &str = r##"class TimeZoneProbe
     out << "zones: #{Time.zone.at(0).inspect} | #{Time.zone.iso8601("2024-01-15T08:00:00").inspect} | #{Time.zone.parse("2024-06-01 12:00 +0000").inspect} | #{Time.find_zone("Nowhere").inspect}"
     out << "date: #{Date.new(2024, 1, 15).in_time_zone.inspect} | #{"2024-01-15 08:00".in_time_zone.inspect} | #{t.to_date} | #{t.beginning_of_day.inspect} | #{t.end_of_day.inspect}"
     out << "change: #{t.change(hour: 12).inspect} | #{t.advance(months: 1).inspect} | #{t.advance(hours: 2).inspect}"
+    d = Date.new(2024, 3, 10)
+    out << "date calc: #{d - 30.days} | #{d + 2.weeks} | #{d - 1.month} | #{(d + 1.year).class} | #{d.tomorrow} | #{d.yesterday} | #{Date.tomorrow == Date.current + 1} | #{Date.yesterday == Date.current - 1} | #{d - Date.new(2024, 3, 1)}"
+    out << "date weeks: #{d.beginning_of_week} | #{d.end_of_week} | #{d.end_of_month} | #{d.beginning_of_quarter} | #{d.next_weekday} | #{d.prev_weekday} | #{d.next_occurring(:friday)} | #{d.on_weekend?} | #{d.all_week.class} | #{d.quarter}"
+    out << "date times: #{d.noon.inspect} | #{d.end_of_day.inspect} | #{d.since(90).inspect} | #{d.ago(60).inspect} | #{(d <=> Time.utc(2024, 3, 10, 5))}"
+    # public_send: a Time receiver the analyzer can type is lowered to a
+    # zone-aware helper (lower/time_calendar.rs); these call the port's methods.
+    out << "time calc: #{u.public_send(:tomorrow).inspect} | #{u.public_send(:yesterday).inspect} | #{(u.public_send(:tomorrow).public_send(:noon) + 1.hour).to_fs(:db)} | #{u.public_send(:beginning_of_week).inspect} | #{u.public_send(:end_of_month).inspect} | #{u.public_send(:next_week).inspect} | #{u.public_send(:days_ago, 3).inspect} | #{u.public_send(:months_since, 1).inspect} | #{u.public_send(:on_weekday?)} | #{u.public_send(:quarter)}"
     widget = Widget.create!(name: "a", happened_at: t)
     reloaded = Widget.find(widget.id)
     out << "column: #{reloaded.happened_at.inspect} #{reloaded.happened_at.class} #{reloaded.happened_at == t} #{Widget.where(happened_at: t).count}"
@@ -88,7 +95,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 16] = [
+const EXPECTED: [&str; 20] = [
     "default: Eastern Time (US & Canada) Eastern Time (US & Canada) ActiveSupport::TimeWithZone Eastern Time (US & Canada)",
     "assigned: Pacific Time (US & Canada) -08:00",
     "reset: Eastern Time (US & Canada)",
@@ -102,6 +109,10 @@ const EXPECTED: [&str; 16] = [
     "zones: 1969-12-31 19:00:00.000000000 EST -05:00 | 2024-01-15 08:00:00.000000000 EST -05:00 | 2024-06-01 08:00:00.000000000 EDT -04:00 | nil",
     "date: 2024-01-15 00:00:00.000000000 EST -05:00 | 2024-01-15 08:00:00.000000000 EST -05:00 | 2024-03-10 | 2024-03-10 00:00:00.000000000 EST -05:00 | 2024-03-10 23:59:59.999999999 EDT -04:00",
     "change: 2024-03-10 12:00:00.000000000 EDT -04:00 | 2024-04-10 01:30:00.000000000 EDT -04:00 | 2024-03-10 04:30:00.000000000 EDT -04:00",
+    "date calc: 2024-02-09 | 2024-03-24 | 2024-02-10 | Date | 2024-03-11 | 2024-03-09 | true | true | 9/1",
+    "date weeks: 2024-03-04 | 2024-03-10 | 2024-03-31 | 2024-01-01 | 2024-03-11 | 2024-03-08 | 2024-03-15 | true | Range | 1",
+    "date times: 2024-03-10 12:00:00.000000000 EDT -04:00 | 2024-03-10 23:59:59.999999999 EDT -04:00 | 2024-03-10 00:01:30.000000000 EST -05:00 | 2024-03-09 23:59:00.000000000 EST -05:00 | -1",
+    "time calc: 2024-07-02 12:00:00 UTC | 2024-06-30 12:00:00 UTC | 2024-07-02 13:00:00 | 2024-07-01 00:00:00 UTC | 2024-07-31 23:59:59.999999999 UTC | 2024-07-08 00:00:00 UTC | 2024-06-28 12:00:00 UTC | 2024-08-01 12:00:00 UTC | true | 3",
     "column: 2024-03-10 01:30:00.000000000 EST -05:00 ActiveSupport::TimeWithZone true 1",
     "column tokyo: 2024-03-10 15:30:00.000000000 JST +09:00",
     "string cast: 2024-01-15 08:00:00.000000000 EST -05:00 2024-01-15 13:00:00 UTC",
