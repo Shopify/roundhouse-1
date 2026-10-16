@@ -254,8 +254,15 @@ module ActionDispatch
       "#{protocol}#{h}"
     end
 
+    # ActionDispatch::Request#remote_ip: the address the RemoteIp
+    # middleware stores under `action_dispatch.remote_ip`, else the
+    # Rack ip. Without that middleware (tests) a writer stands in for it.
     def remote_ip
-      @env["REMOTE_ADDR"] || "127.0.0.1"
+      (@env["action_dispatch.remote_ip"] || @env["REMOTE_ADDR"] || "127.0.0.1").to_s
+    end
+
+    def remote_ip=(address)
+      @env["action_dispatch.remote_ip"] = address
     end
 
     # Rack::Request#ip: the first REMOTE_ADDR address that is not a
