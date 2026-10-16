@@ -541,6 +541,14 @@ pub struct App {
     /// lift_autoload_includes`); the boot registers each one empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifted_autoload_callbacks: Vec<LiftedAutoloadCallback>,
+    /// Constant paths a carried initializer statement registers a Zeitwerk
+    /// `on_load` callback for through a loop variable
+    /// (`MODELS.each_key { |m| Rails.autoloaders.main.on_load(m) { … } }`),
+    /// evaluated from the literal array or constant hash the loop walks
+    /// (`ingest::initializer_programs`); `project` lists them beside the
+    /// literal ones so their files report their load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub autoload_callback_cpaths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// `(class, module)` for each `<Class>.include(Module)` statement of a
     /// boot initializer's `Rails.autoloaders.main.on_load("<Class>")` block
@@ -1656,6 +1664,7 @@ impl App {
             library_class_reopens: HashMap::default(),
             load_hooks: Vec::new(),
             lifted_autoload_callbacks: Vec::new(),
+            autoload_callback_cpaths: Vec::new(),
             autoload_includes: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),

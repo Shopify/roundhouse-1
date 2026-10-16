@@ -199,3 +199,53 @@ fn a_callback_without_a_literal_path_stays_refused() {
         );
     }
 }
+
+/// Core's components/platform/essentials/config/initializers/
+/// ledger_sharding.rb registers one callback per model through a loop: over
+/// the keys of a hash constant the file's module holds, and over a literal
+/// array. The loop variable is a literal path per iteration, so each
+/// constant's file reports its load and `project` lists it (without which
+/// the `model_uuid_attributes` call of Ledger::Report etc. never ran).
+const LOOP_INITIALIZER: &str = r#"module LoopSharding
+  MODELS = { "CallLog" => 1, "Shop" => 2 }.freeze #: Hash[String, untyped]
+end
+
+LoopSharding::MODELS.each_key do |model_name|
+  Rails.autoloaders.main.on_load(model_name) do |klass, _abspath|
+    CallLog.add("hash #{model_name}")
+  end
+end
+
+["Shop"].each do |model_name|
+  Rails.autoloaders.main.on_load(model_name) do |klass, _abspath|
+    CallLog.add("array #{model_name}")
+  end
+end
+"#;
+
+#[test]
+fn a_loop_over_literal_paths_registers_each_callback() {
+    let (emitted, errors) = overlay()
+        .write("config/initializers/call_log.rb", LOOP_INITIALIZER)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let read = |rel: &str| std::fs::read_to_string(emitted.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    let models = read("app/models.rb");
+    assert!(models.contains("AUTOLOAD_CALLBACK_CPATHS = [\n    \"CallLog\",\n    \"Shop\",\n  ].freeze"), "{models}");
+    let holder = read("app/models/roundhouse_initializer_config_initializers_call_log.rb");
+    assert!(holder.contains("LoopSharding::MODELS.each_key do |model_name|"), "{holder}");
+    assert!(holder.contains("Rails.autoloaders.main.on_load(model_name) do |klass, _abspath|"), "{holder}");
+}
+
+/// A loop whose list is not a literal stays refused, by name.
+#[test]
+fn a_loop_over_a_computed_list_stays_refused() {
+    let initializer = "NAMES = CallLog.lines\nNAMES.each do |name|\n  Rails.autoloaders.main.on_load(name) do |klass|\n    klass.add(1)\n  end\nend\n";
+    let (_emitted, errors) =
+        overlay().write("config/initializers/call_log.rb", initializer).emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("does not run in the emitted app") && e.contains("computed constant path")),
+        "{}",
+        errors.join("\n")
+    );
+}
