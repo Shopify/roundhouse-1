@@ -79,7 +79,11 @@ fn scratch(tag: &str) -> PathBuf {
 /// tiny-blog with the two abstract classes, Dog under AnimalsRecord, the
 /// dogs table, `roundhouse.yml` (postgresql) and the four configurations.
 fn fixture_app() -> PathBuf {
-    let app = scratch("app");
+    fixture_app_in("app")
+}
+
+fn fixture_app_in(tag: &str) -> PathBuf {
+    let app = scratch(tag);
     copy_tree(&Path::new(MANIFEST_DIR).join("fixtures/tiny-blog"), &app);
     let write = |rel: &str, text: &str| {
         let path = app.join(rel);
@@ -102,7 +106,11 @@ fn fixture_app() -> PathBuf {
 }
 
 fn emit(app: &roundhouse::app::App) -> PathBuf {
-    let out = scratch("out");
+    emit_in(app, "out")
+}
+
+fn emit_in(app: &roundhouse::app::App, tag: &str) -> PathBuf {
+    let out = scratch(tag);
     let files = roundhouse::project::target_files(
         app,
         &Path::new(MANIFEST_DIR).join("fixtures/tiny-blog"),
@@ -144,6 +152,97 @@ fn connects_to_on_two_abstract_classes_compiles_without_refusal() {
         let text = read(&out, model);
         assert!(text.contains("self.abstract_class = true"), "{model}: {text}");
     }
+}
+
+/// The probe's `AnimalsRecord`, connecting under a condition and from
+/// computed arguments (Core's QueryEngineRecord, and the treasury
+/// record that builds a HashConfig before connecting).
+const CONDITIONAL_ANIMALS_RECORD: &str = r#"class AnimalsRecord < ActiveRecord::Base
+  self.abstract_class = true
+
+  ENABLED = !Rails.env.test? || ENV["DISABLE_ANIMALS"].blank?
+
+  if ENABLED
+    animals_config = configurations.resolve(:animals)
+    computed = ActiveRecord::DatabaseConfigurations::HashConfig.new(
+      animals_config.env_name,
+      animals_config.name,
+      animals_config.configuration_hash.merge(application_name: "animals-probe"),
+    )
+    connects_to database: { writing: computed, reading: :animals_replica }
+  end
+end
+"#;
+
+/// A `connects_to` the program runs itself (under a condition, from
+/// computed arguments, `shards:`) is neither refused nor dropped: the
+/// emitted class body runs it as written, and its models are not in the
+/// boot replay.
+#[test]
+fn conditional_connects_to_is_replayed_in_the_class_body() {
+    let app_dir = fixture_app_in("cond-app");
+    std::fs::write(app_dir.join("app/models/animals_record.rb"), CONDITIONAL_ANIMALS_RECORD).unwrap();
+    let app = roundhouse::ingest::ingest_app(&app_dir).expect("ingest probe app");
+    let refusals: Vec<_> = app.database_refusals.iter().filter(|r| r.construct != "database_adapter").collect();
+    assert!(refusals.is_empty(), "{refusals:?}");
+    let out = emit_in(&app, "cond-out");
+    let configuration = read(&out, "runtime/database_configuration.rb");
+    assert!(configuration.contains(r#"OWNERSHIP = [["ApplicationRecord", "primary", "primary_replica"]]"#), "{configuration}");
+    assert!(configuration.contains("UNRESOLVED = {  }") || configuration.contains("UNRESOLVED = {}"), "{configuration}");
+    let animals = read(&out, "app/models/animals_record.rb");
+    assert!(animals.contains("if AnimalsRecord::ENABLED") || animals.contains("if ENABLED"), "{animals}");
+    assert!(animals.contains("computed = "), "{animals}");
+    assert!(animals.contains("connects_to database: { writing: computed, reading: :animals_replica }"), "{animals}");
+
+    // `shards:` and a computed `database:` at the top of the body.
+    std::fs::write(
+        app_dir.join("app/models/animals_record.rb"),
+        "class AnimalsRecord < ActiveRecord::Base\n  self.abstract_class = true\n\n  connects_to shards: { default: { writing: :animals, reading: :animals_replica } }\nend\n",
+    )
+    .unwrap();
+    let app = roundhouse::ingest::ingest_app(&app_dir).expect("ingest probe app");
+    let refusals: Vec<_> = app.database_refusals.iter().filter(|r| r.construct != "database_adapter").collect();
+    assert!(refusals.is_empty(), "{refusals:?}");
+    let out = emit_in(&app, "shards-out");
+    let animals = read(&out, "app/models/animals_record.rb");
+    assert!(animals.contains("connects_to shards: {"), "{animals}");
+}
+
+/// The conditional `connects_to` on the emitted program against local
+/// PostgreSQL: enabled (Dog on the animals database, through a computed
+/// HashConfig), disabled (never connected, Dog on primary), and with no
+/// endpoint for the animals database (Rails' ConnectionNotEstablished).
+/// Also the query cache predicates the runtime lacked.
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn conditional_connects_to_runs_on_postgresql() {
+    assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
+    let app_dir = fixture_app_in("cond-run-app");
+    std::fs::write(app_dir.join("app/models/animals_record.rb"), CONDITIONAL_ANIMALS_RECORD).unwrap();
+    // As in Core's test environment, models load lazily, after the test
+    // helper's `DatabaseConfiguration.configure!` resolved database.yml: the
+    // class body reads `configurations`.
+    std::fs::create_dir_all(app_dir.join("config/environments")).unwrap();
+    std::fs::write(
+        app_dir.join("config/environments/test.rb"),
+        "Rails.application.configure do\n  config.eager_load = false\nend\n",
+    )
+    .unwrap();
+    let app = roundhouse::ingest::ingest_app(&app_dir).expect("ingest probe app");
+    let out = emit_in(&app, "cond-run-out");
+    let result = Command::new("ruby")
+        .arg("tests/conditional_connects_to_pg_runtime.rb")
+        .arg(&out)
+        .current_dir(MANIFEST_DIR)
+        .output()
+        .expect("ruby");
+    println!("{}", String::from_utf8_lossy(&result.stdout));
+    assert!(
+        result.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 /// The scenario on the emitted program and on native Rails, same PG.

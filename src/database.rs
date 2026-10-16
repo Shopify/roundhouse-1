@@ -172,6 +172,12 @@ pub enum ModelDatabase {
     /// (`def self.connection_pool`, also from a concern), so which
     /// database a query reaches is app code, not configuration.
     AppDefined { method: Symbol, defined_by: ClassId, span: Span },
+    /// A `connects_to` under a condition, with computed arguments or
+    /// `shards:`, on the model or the nearest ancestor that runs one: the
+    /// emitted class body runs it as written, against the resolved
+    /// `config/database.yml`, so which pool a model reaches is decided at
+    /// class load (the PostgreSQL CRuby tree only).
+    Replayed { declared_by: ClassId, span: Span },
     /// A routing declaration Roundhouse cannot resolve (non-literal,
     /// conditional, `shards:`, on a concrete class, ...).
     Unresolved { reason: String, span: Span },

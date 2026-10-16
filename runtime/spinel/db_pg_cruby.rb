@@ -1383,6 +1383,18 @@ module Db
     context[:cache] = nil
   end
 
+  # Is the replay cache on for this thread? `ActiveRecord::Base.uncached`
+  # turns it off for a block and back on after, and the pool and
+  # adapter's `query_cache_enabled` answer it.
+  def self.query_cache_enabled?
+    !context[:cache].nil?
+  end
+
+  # Drop what the cache holds, leaving it on (`connection.clear_query_cache`).
+  def self.query_cache_clear
+    context[:cache]&.clear
+  end
+
   def self.capture_sql
     previous = context[:capture]
     log = []

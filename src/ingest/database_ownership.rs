@@ -70,6 +70,11 @@ const SWITCHES: &[&str] = &[
 #[derive(Clone)]
 enum Own {
     Named { writing: String, reading: Option<String>, span: Span },
+    /// A `connects_to` the program evaluates itself when the class body
+    /// runs (a condition, computed arguments, `shards:`): the statement
+    /// `stmt` is carried into the emitted class body as written, and the
+    /// runtime's `connects_to` establishes the pools it names.
+    Replayed { stmt: Span, span: Span },
     AppDefined { method: Symbol, defined_by: ClassId, span: Span },
     Unresolved { construct: &'static str, reason: String, span: Span },
 }
@@ -104,9 +109,15 @@ fn roles(e: &Expr) -> Option<(Option<String>, Option<String>)> {
 }
 
 /// A top-level `connects_to` statement, classified.
-fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, span: Span) -> Own {
+fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, stmt: Span, span: Span, replay: bool) -> Own {
     let class = model.name.0.as_str();
-    let unresolved = |reason: String| Own::Unresolved { construct: "connects_to", reason, span };
+    let unresolved = |reason: String| {
+        if replay {
+            Own::Replayed { stmt, span }
+        } else {
+            Own::Unresolved { construct: "connects_to", reason, span }
+        }
+    };
     if block.is_some() {
         return unresolved(format!("`connects_to` on `{class}` passes a block"));
     }
@@ -137,9 +148,11 @@ fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, span: Span) -
         ));
     };
     if !crate::lower::model_to_library::markers::is_abstract_class(model) {
-        return unresolved(format!(
-            "`connects_to` on `{class}`, which is not an abstract class; Rails raises NotImplementedError"
-        ));
+        return Own::Unresolved {
+            construct: "connects_to",
+            reason: format!("`connects_to` on `{class}`, which is not an abstract class; Rails raises NotImplementedError"),
+            span,
+        };
     }
     Own::Named { writing, reading, span }
 }
@@ -172,6 +185,7 @@ fn own_decision(
     model: &Model,
     modules: &HashMap<&str, &crate::dialect::LibraryClass>,
     spliced_from: Option<&HashMap<Symbol, ClassId>>,
+    replay: bool,
 ) -> Option<Own> {
     let mut found: Vec<Own> = Vec::new();
     for item in &model.body {
@@ -181,7 +195,7 @@ fn own_decision(
                     if on_self(recv) {
                         match method.as_str() {
                             "connects_to" => {
-                                found.push(connects_to(model, args, block, expr.span));
+                                found.push(connects_to(model, args, block, expr.span, expr.span, replay));
                                 continue;
                             }
                             "establish_connection" => {
@@ -221,6 +235,13 @@ fn own_decision(
                 let mut nested = Vec::new();
                 calls_named(expr, &["connects_to", "establish_connection"], &mut nested);
                 for (span, method) in nested {
+                    if replay && method == "connects_to" {
+                        // One statement, however many calls it makes.
+                        if !found.iter().any(|f| matches!(f, Own::Replayed { stmt, .. } if *stmt == expr.span)) {
+                            found.push(Own::Replayed { stmt: expr.span, span });
+                        }
+                        continue;
+                    }
                     found.push(Own::Unresolved {
                         construct: if method == "connects_to" { "connects_to" } else { "establish_connection" },
                         reason: format!(
@@ -264,7 +285,7 @@ fn own_decision(
         _ => {
             let first = found.remove(0);
             let second_span = match &found[0] {
-                Own::Named { span, .. } | Own::AppDefined { span, .. } | Own::Unresolved { span, .. } => *span,
+                Own::Named { span, .. } | Own::AppDefined { span, .. } | Own::Unresolved { span, .. } | Own::Replayed { span, .. } => *span,
             };
             match first {
                 Own::Unresolved { .. } => Some(first),
@@ -301,6 +322,12 @@ fn resolve_parent<'a>(child: &str, parent: &str, by_name: &HashMap<&'a str, usiz
 /// Record `app.model_databases` and the routing refusals. Runs after
 /// every model, concern splice and library class exists.
 pub(super) fn resolve(app: &mut App) {
+    // The CRuby PostgreSQL runtime carries Rails' multiple-database model
+    // (runtime/spinel/cruby/active_record_connection_handling.rb): boot
+    // resolves `config/database.yml`, establishes a pool per configuration
+    // a `connects_to` names, and switches roles and shards at run time.
+    let multi_database_runtime = app.database_yml.is_some()
+        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
     let modules: HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().filter(|c| c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
     let by_name: HashMap<&str, usize> =
@@ -308,7 +335,7 @@ pub(super) fn resolve(app: &mut App) {
     let own: Vec<Option<Own>> = app
         .models
         .iter()
-        .map(|m| own_decision(m, &modules, app.concern_spliced_class_methods.get(&m.name)))
+        .map(|m| own_decision(m, &modules, app.concern_spliced_class_methods.get(&m.name), multi_database_runtime))
         .collect();
     let parents: Vec<Option<usize>> = app
         .models
@@ -345,12 +372,6 @@ pub(super) fn resolve(app: &mut App) {
         }
     };
     let have_manifest = !app.databases.is_empty();
-    // The CRuby PostgreSQL runtime carries Rails' multiple-database model
-    // (runtime/spinel/cruby/active_record_connection_handling.rb): boot
-    // resolves `config/database.yml`, establishes a pool per configuration
-    // a `connects_to` names, and switches roles and shards at run time.
-    let multi_database_runtime = app.database_yml.is_some()
-        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
     let mut owners = indexmap::IndexMap::new();
     for (i, model) in app.models.iter().enumerate() {
         let name = model.name.0.as_str();
@@ -431,6 +452,9 @@ pub(super) fn resolve(app: &mut App) {
                 );
                 ModelDatabase::AppDefined { method, defined_by, span }
             }
+            Some((j, Own::Replayed { span, .. })) => {
+                ModelDatabase::Replayed { declared_by: app.models[j].name.clone(), span }
+            }
             Some((_, Own::Unresolved { construct, reason, span })) => {
                 note(span, construct, reason.clone(), name);
                 ModelDatabase::Unresolved { reason, span }
@@ -492,6 +516,22 @@ pub(super) fn resolve(app: &mut App) {
             format!("`{method}` switches the role or shard a block runs on; role and shard switching is not modeled")
         };
         refusals.push(DatabaseRefusal { span, construct: method.clone(), detail, warning: false });
+    }
+
+    // The statements the program runs itself become class-body
+    // statements, written into the emitted class as the app wrote them.
+    for (model, own) in app.models.iter_mut().zip(&own) {
+        let Some(Own::Replayed { stmt, .. }) = own else { continue };
+        for item in &mut model.body {
+            let ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else { continue };
+            if expr.span == *stmt {
+                *item = ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+        }
     }
 
     let any_routing = owners.values().any(|o| !matches!(o, ModelDatabase::Primary));

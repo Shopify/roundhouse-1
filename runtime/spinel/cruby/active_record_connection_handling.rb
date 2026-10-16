@@ -815,7 +815,10 @@ module ActiveRecord
           idle: Db.free_count(@db_key), waiting: 0, checkout_timeout: checkout_timeout }
       end
 
+      # QueryCache::ConnectionPoolConfiguration: the replay cache is the
+      # thread's (`Db`'s), as it is for every pool the thread leases from.
       def disable_query_cache!
+        Db.query_cache_end
         nil
       end
 
@@ -835,12 +838,27 @@ module ActiveRecord
       end
 
       def enable_query_cache!
-        raise NotImplementedError, "ConnectionPool#enable_query_cache!: per-pool query cache control is not ported"
+        Db.query_cache_begin unless Db.query_cache_enabled?
+        nil
       end
 
       def query_cache_enabled
-        false
+        Db.query_cache_enabled?
       end
+
+      # What `pool.send(:query_cache)` answers (QueryCache::Store): the
+      # thread's replay cache, which `clear` empties.
+      class QueryCacheStore
+        def clear
+          Db.query_cache_clear
+          self
+        end
+      end
+
+      def query_cache
+        @query_cache ||= QueryCacheStore.new
+      end
+      private :query_cache
 
       def async_executor
         raise NotImplementedError, "ConnectionPool#async_executor: asynchronous queries are not ported"
@@ -852,8 +870,16 @@ module ActiveRecord
 
       private
 
+      # A configuration whose database this run has no endpoint for
+      # (`database_endpoint`: Core's `query_engine`, which native cannot
+      # reach either) is Rails' connection that cannot be established,
+      # raised by name; any other refusal is the named boot error.
       def refuse_unconnectable!
-        raise @unconnectable if @unconnectable
+        return unless @unconnectable
+        if @unconnectable.is_a?(::DatabaseConfigurations::Error) && @unconnectable.construct == "database_endpoint"
+          raise ActiveRecord::ConnectionNotEstablished, @unconnectable.message
+        end
+        raise @unconnectable
       end
     end
   end
@@ -1340,7 +1366,20 @@ module ActiveRecord
       end
 
       def clear_query_caches_for_current_thread
+        Db.query_cache_clear
         nil
+      end
+
+      # query_cache.rb: `cache { }` turns the replay cache on for the
+      # block (a cache already on stays on after it).
+      def cache
+        was = Db.query_cache_enabled?
+        Db.query_cache_begin unless was
+        begin
+          yield
+        ensure
+          Db.query_cache_end unless was
+        end
       end
 
       # A model whose connection the compiler could not resolve (a
@@ -1528,6 +1567,34 @@ module ActiveRecord
         return false if connection_descriptor.nil?
 
         connection_descriptor.current_preventing_writes
+      end
+
+      # abstract/query_cache.rb: the replay cache is the thread's.
+      def query_cache_enabled
+        Db.query_cache_enabled?
+      end
+
+      def enable_query_cache!
+        Db.query_cache_begin unless Db.query_cache_enabled?
+        nil
+      end
+
+      def disable_query_cache!
+        Db.query_cache_end
+        nil
+      end
+
+      def clear_query_cache
+        Db.query_cache_clear
+        nil
+      end
+
+      def cache(&block)
+        ActiveRecord::Base.cache(&block)
+      end
+
+      def uncached(dirties: true, &block)
+        ActiveRecord::Base.uncached(&block)
       end
     end
   end
