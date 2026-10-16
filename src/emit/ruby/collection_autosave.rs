@@ -119,6 +119,9 @@ struct Single {
     name: Symbol,
     foreign_key: Symbol,
     inverse: Option<Symbol>,
+    /// `through:`: the row lives on the through record, so the owner's key
+    /// is not the held record's to set (Rails: `unless reflection.through_reflection`).
+    through: bool,
     /// `autosave: true`: the lowering's `_autosave_<name>` in after_save
     /// is the save (`model_to_library::associations`).
     autosave: bool,
@@ -200,6 +203,7 @@ pub(crate) fn apply(
                     as_interface,
                     scope,
                     autosave,
+                    through,
                     inverse_of: written_inverse,
                     ..
                 } = assoc
@@ -220,6 +224,7 @@ pub(crate) fn apply(
                     foreign_key: foreign_key.clone(),
                     inverse,
                     autosave: *autosave,
+                    through: through.is_some(),
                 })
             })
             .collect();
@@ -687,8 +692,22 @@ end
 /// its key is not the owner's or a change of its key is pending
 /// (`_record_changed?`), after the owner's key and the inverse are set
 /// on it. It answers whether it saved, nil when nothing was to save.
+/// A `through:` has_one saves only a new record, and sets no key: the
+/// row's key is the through record's.
 fn save_has_one_source(s: &Single) -> String {
     let n = s.name.as_str();
+    if s.through {
+        return format!(
+            r#"def _save_has_one_association_{n}
+  return nil unless @{n}_loaded == true
+  record = @{n}_cache
+  return nil if record.nil? || record.destroyed?
+  return nil unless record.new_record?
+  record.save
+end
+"#
+        );
+    }
     let fk = s.foreign_key.as_str();
     let inverse = match &s.inverse {
         Some(inverse) => format!("  record.{} = self\n", inverse.as_str()),

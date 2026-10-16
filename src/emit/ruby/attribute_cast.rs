@@ -150,7 +150,7 @@ fn cast_declared_writers(lc: &mut LibraryClass, model: &Model, table: &Table) {
         if ty.as_str() == "boolean" || table.columns.iter().any(|c| c.name == name) {
             continue;
         }
-        if !kinds.iter().any(|(n, k)| n == name.as_str() && k != "unported") {
+        if !kinds.iter().any(|(n, k)| n == name.as_str() && k != "unported" && k != "registered") {
             continue;
         }
         let setter = format!("{}=", name.as_str());
