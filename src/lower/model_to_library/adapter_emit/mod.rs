@@ -363,7 +363,22 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
         assignments,
         returns_rowid: supplied_key.is_none(),
     };
-    let op = ArelOp::Insert(insert.clone());
+    // An integer key the record already holds is written, as Rails writes
+    // an explicit `id:` (`Model.insert_all([{ id: 7, … }])`, `create(id: 7)`):
+    // the database allocates only a key the record leaves nil. The
+    // statement still answers the key (`RETURNING` / `last_insert_rowid`).
+    let keyed = key.filter(|c| supplied_key.is_none() && c.primary_key && c.generated.is_none()).map(|k| {
+        let assignments = table
+            .columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .map(|c| Assignment {
+                column: c.name.clone(),
+                value: Value::Runtime { expr: column_bind_expr(model, c), ty: bind_type(model, c) },
+            })
+            .collect();
+        (k, Insert { table: TableRef(table.name.clone()), assignments, returns_rowid: true })
+    });
     let generated: Vec<&crate::schema::Column> =
         table.columns.iter().filter(|c| c.generated.is_some()).collect();
     let ret_ty = if supplied_key.is_some() { key_ty(model, table) } else { Ty::Int };
@@ -376,41 +391,78 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
     let uuid_mint = supplied_key
         .filter(|k| matches!(k.col_type, ColumnType::Uuid) && !super::schema::is_retypable(model, k))
         .map(uuid_key_mint_expr);
-    let body = if generated.is_empty() {
-        // Keep ordinary inserts on their established exec/last-rowid path.
-        let mut exprs = Vec::new();
-        if let Some(mint) = uuid_mint {
-            exprs.push(mint);
-        }
-        exprs.push(dialect.visit(&op, schema, owner));
-        if let Some(k) = supplied_key {
-            exprs.push(ivar_ref(&k.name));
-        }
-        if exprs.len() == 1 {
-            exprs.pop().expect("one ordinary insert expression")
+    let build_insert = |insert: &Insert| -> Expr {
+        if generated.is_empty() {
+            // Keep ordinary inserts on their established exec/last-rowid path.
+            let mut exprs = Vec::new();
+            exprs.push(dialect.visit(&ArelOp::Insert(insert.clone()), schema, owner));
+            if let Some(k) = supplied_key {
+                exprs.push(ivar_ref(&k.name));
+            }
+            if exprs.len() == 1 {
+                exprs.pop().expect("one ordinary insert expression")
+            } else {
+                Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+            }
         } else {
-            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
-        }
-    } else {
-        let returning_key = key_column(model, table)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| Symbol::from("rowid"));
-        let returning_columns: Vec<Symbol> =
-            generated.iter().map(|c| c.name.clone()).collect();
-        let insert = dialect.visit_insert_returning(
-            &insert,
-            schema,
-            &returning_key,
-            key_is_integer(model, table),
-            &returning_columns,
-        );
-        let hydrated = hydrate_generated_after_insert(model, table, &generated, insert, &ret_ty);
-        if let Some(mint) = uuid_mint {
-            Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![mint, hydrated] })
-        } else {
-            hydrated
+            let returning_key = key_column(model, table)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| Symbol::from("rowid"));
+            let returning_columns: Vec<Symbol> =
+                generated.iter().map(|c| c.name.clone()).collect();
+            let insert = dialect.visit_insert_returning(
+                insert,
+                schema,
+                &returning_key,
+                key_is_integer(model, table),
+                &returning_columns,
+            );
+            hydrate_generated_after_insert(model, table, &generated, insert, &ret_ty)
         }
     };
+    let mut body = match &keyed {
+        Some((k, keyed_insert)) => {
+            // A new record's key slot is nil or the runtime's `0`.
+            let send = |method: &str, args: Vec<Expr>| {
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(ivar_ref(&k.name)),
+                        method: Symbol::from(method),
+                        args,
+                        block: None,
+                        parenthesized: false,
+                    },
+                )
+            };
+            let unset = Expr::new(
+                Span::synthetic(),
+                ExprNode::BoolOp {
+                    op: crate::expr::BoolOpKind::Or,
+                    surface: Default::default(),
+                    left: send("nil?", vec![]),
+                    right: send("==", vec![arel_lit_int(0)]),
+                },
+            );
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If { cond: unset, then_branch: build_insert(&insert), else_branch: build_insert(keyed_insert) },
+            )
+        }
+        None => build_insert(&insert),
+    };
+    if let Some(mint) = uuid_mint {
+        body = if generated.is_empty() {
+            let mut exprs = vec![mint];
+            match *body.node {
+                ExprNode::Seq { exprs: rest } => exprs.extend(rest),
+                _ => exprs.push(body),
+            }
+            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+        } else {
+            Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![mint, body] })
+        };
+    }
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
