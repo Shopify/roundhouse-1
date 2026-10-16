@@ -21,6 +21,7 @@ fn lower(body: &mut Expr) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    splat_base_to_hash(expr);
     if !expr.ty.as_ref().is_some_and(|t| !matches!(t, Ty::Var { .. })) {
         return;
     }
@@ -41,6 +42,37 @@ fn rewrite(expr: &mut Expr) {
         replacement.ty = expr.ty.take();
         *expr = replacement;
     }
+}
+
+/// `{ **schema, k: v }` where `schema` is an object, not a Hash: Ruby asks
+/// the value for `to_hash` (a Component::Schema answers it), and the ingest
+/// desugar's `schema.merge({ k: v })` asked for a `merge` it has none of.
+/// The receiver is converted the way the splat converts it. A Hash, an
+/// indifferent hash (whose merge keeps its keys indifferent) and a value
+/// the analysis cannot name keep the plain `merge`.
+fn splat_base_to_hash(expr: &mut Expr) {
+    if expr.decisions & crate::expr::SPLAT_MERGE_BASE == 0 {
+        return;
+    }
+    let ExprNode::Send { recv: Some(recv), method, .. } = &mut *expr.node else { return };
+    if method.as_str() != "merge" {
+        return;
+    }
+    let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return };
+    if matches!(
+        id.0.as_str(),
+        "Hash" | "HashWithIndifferentAccess" | "ActiveSupport::HashWithIndifferentAccess" | "ActionController::Parameters"
+    ) {
+        return;
+    }
+    let span = recv.span;
+    let inner = recv.clone();
+    let mut to_hash = Expr::new(
+        span,
+        ExprNode::Send { recv: Some(inner), method: Symbol::from("to_hash"), args: vec![], block: None, parenthesized: false },
+    );
+    to_hash.ty = Some(Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) });
+    *recv = to_hash;
 }
 
 // Not a receiver of any other class (an app's own `with_indifferent_access`,
