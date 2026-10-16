@@ -5102,6 +5102,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read ActiveModel::Attributes runtime: {e}"))?;
         files.push(("runtime/active_model_attributes.rb".into(), attributes));
     }
+    // ActiveModel::Dirty and its mutation trackers (activemodel 8.2.0.alpha
+    // dirty.rb, attribute_mutation_tracker.rb), over the AttributeMethods
+    // port and, for a class with Attributes, the attribute port, where app
+    // code names it.
+    let carries_dirty = carries_active_model_dirty(files);
+    if carries_dirty {
+        let dirty = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_model_dirty.rb")
+            .map_err(|e| format!("read ActiveModel::Dirty runtime: {e}"))?;
+        files.push(("runtime/active_model_dirty.rb".into(), dirty));
+    }
     // ActiveRecord::Base's callback registration called at runtime
     // (`base.before_create(:x)` from a concern's `included` hook) and the
     // chains it runs with the compiled hooks (activerecord 8.2.0.alpha
@@ -5365,6 +5375,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                         ])
                         .chain(carries_api.then_some("active_model_api"))
                         .chain(carries_attributes.then_some("active_model_attributes"))
+                        .chain(carries_dirty.then_some("active_model_dirty"))
                         .chain([
                             "active_record_callbacks",
                             "active_record_nested_attributes",
@@ -16484,7 +16495,8 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
             &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks", "ActiveModel::EachValidator"],
         )
         || calls_runtime_validates(files);
-    let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
+    let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"])
+        || carries_active_model_dirty(files);
     [
         (true, "active_model_naming"),
         (attribute_methods, "active_model_attribute_methods"),
@@ -16507,6 +16519,13 @@ fn carries_active_model_api(files: &[(String, String)]) -> bool {
 /// runtime/spinel/cruby/active_model_attributes.rb defines.
 fn carries_active_model_attributes(files: &[(String, String)]) -> bool {
     carries_named(files, &["ActiveModel::Attributes"])
+}
+
+/// True where app code names ActiveModel::Dirty, which
+/// runtime/spinel/cruby/active_model_dirty.rb defines (over the
+/// AttributeMethods port, which it brings with it).
+fn carries_active_model_dirty(files: &[(String, String)]) -> bool {
+    carries_named(files, &["ActiveModel::Dirty"])
 }
 
 /// True where app code (not the runtime, not a test body) calls a

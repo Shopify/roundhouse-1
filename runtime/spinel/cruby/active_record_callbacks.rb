@@ -585,7 +585,8 @@ module ActiveRecord
     # writes active_record_core.rb captured), without a redefinition
     # warning.
     [:save, :save!, :destroy!, :mark_persisted!, :_run_commit_hooks, :_transaction_rolled_back,
-     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch, :_runtime_touch_written, :_runtime_touch_named].each do |name|
+     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch, :_runtime_touch_written, :_runtime_touch_named,
+     :run_callbacks].each do |name|
       remove_method(name) if method_defined?(name, false) || private_method_defined?(name, false)
     end
     singleton_class.send(:remove_method, :create!) if singleton_class.method_defined?(:create!, false)
@@ -655,6 +656,37 @@ module ActiveRecord
     def _transaction_rolled_back
       _callback_chain_run(:rollback) { true }
       nil
+    end
+
+    # ActiveSupport::Callbacks#run_callbacks over the chains above (the
+    # chain of a kind a model with no callbacks has is empty): runs the
+    # kind's before and around callbacks, yields the block (if given one),
+    # and then runs the after callbacks. Answers false when a before
+    # callback halted the chain, else the block's result, nil when the
+    # chain is empty and there is no block, or true when there are
+    # callbacks and no block. `type` (:before, :after or :around) runs only
+    # the callbacks of that kind. Core's BulkSqlOperations::Create runs
+    # `record.run_callbacks(:save, :before)` and its tests run
+    # `record.run_callbacks(:commit)`. A kind this runtime keeps no chain
+    # for (a custom `define_callbacks` one is the model's own
+    # ActiveSupport::Callbacks, which precedes this) is refused by name.
+    def run_callbacks(kind, type = nil, &block)
+      event = kind.to_sym
+      config = Callbacks::CHAINS[event]
+      raise NotImplementedError, "roundhouse: #{self.class}#run_callbacks(#{kind.inspect}): no callback chain of that kind is ported" if config.nil?
+      unless type.nil? || [:before, :after, :around].include?(type)
+        raise ArgumentError, "roundhouse: #{self.class}#run_callbacks(#{kind.inspect}, #{type.inspect}): the callback type must be :before, :after or :around"
+      end
+      chain = Callbacks.chain(self.class, event)
+      chain = chain.select { |entry| entry.kind == type } unless type.nil?
+      # The commit and rollback chains always hold the entry of the
+      # model's compiled hooks, which a model that defines none runs as
+      # nothing: natively an empty chain.
+      chain = [] if config[:compiled] && chain.all?(Callbacks::Compiled) && Callbacks.send(:compiled_owner, self.class, config[:defined_by]).nil?
+      return block&.call if chain.empty?
+      env = Callbacks::Environment.new(false, nil)
+      _callback_chain_step(chain, 0, env, config[:skip_after_if_halted], block || proc { true })
+      env.value
     end
 
     private
