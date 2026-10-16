@@ -483,6 +483,7 @@ module ActiveRecord
       def scope
         relation = super
         relation = relation.none if @owner.new_record?
+        relation.instance_variable_set(:@association, self)
         relation
       end
 
@@ -906,10 +907,16 @@ module ActiveRecord
         true
       end
 
+      # The relation answers an `extending(Mod)` declaration's methods,
+      # which read `@association` (Rails' AssociationRelation holds the
+      # association it scopes: Core's `OrderAdjustmentsExtension` reads
+      # `@association.owner`), so it holds this proxy's.
       def scope
         reader_scope = :"_#{@proxy_name}_association_scope"
         if @proxy_owner.respond_to?(reader_scope)
-          @proxy_owner.public_send(reader_scope)
+          relation = @proxy_owner.public_send(reader_scope)
+          relation.instance_variable_set(:@association, proxy_association) if @proxy_owner.respond_to?(:association)
+          relation
         elsif @proxy_owner.respond_to?(:association)
           proxy_association.scope
         else

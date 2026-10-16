@@ -4747,6 +4747,14 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
                 return;
             }
         }
+        // An association extension (`has_many ..., -> { extending(Mod) }`)
+        // reads the association its relation scopes from `@association`
+        // (Rails' AssociationRelation), which the collection proxy sets
+        // from the model's `association(name)`.
+        if matches!(&*e.node, ExprNode::Ivar { name } if name.as_str() == "association") {
+            *found = true;
+            return;
+        }
         // `accepts_nested_attributes_for`'s writers read and build through
         // the association object (runtime/spinel/cruby/active_record_nested_attributes.rb).
         if let ExprNode::Send { method, .. } = &*e.node {

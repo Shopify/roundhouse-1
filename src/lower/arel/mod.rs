@@ -197,7 +197,7 @@ fn hydrate_through_self(expr: &mut Expr, owner: &ClassId) {
 const RELATION_REFINERS: &[&str] = &[
     "where", "not", "joins", "left_outer_joins", "left_joins", "order", "group", "having",
     "limit", "offset", "merge", "includes", "preload", "eager_load", "references", "distinct",
-    "select", "where!", "order!", "reorder", "rewhere",
+    "select", "where!", "order!", "reorder", "rewhere", "extending",
 ];
 
 /// A finder terminates a relation but still needs that relation as its

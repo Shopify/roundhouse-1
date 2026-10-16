@@ -436,8 +436,9 @@ fn push_dirty_methods(
 /// `User#settings`) keeps the column reader every target has.
 ///
 /// `self[:<col>]` reads the same view ([`column_hash_read`]), and
-/// `<col>_was` the Hash of the value before the pending change
-/// (`TypedStore.snapshot`), as Rails' dirty tracking answers it.
+/// `<col>_was` and `<col>_in_database` the Hash of the value before the
+/// pending change (`TypedStore.snapshot`), as Rails' dirty tracking
+/// answers it.
 fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Symbol, attrs: &[TypedStoreAttr]) {
     if !store_reads_as_hash(model, col) {
         return;
@@ -450,10 +451,15 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
     };
     reader.body = accessor(col);
     reader.signature = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
-    let was_name = format!("{}_was", col.as_str());
-    if let Some(was) = methods.iter_mut().find(|m| {
-        m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == was_name && m.params.is_empty()
-    }) {
+    // `<col>_was` and `<col>_in_database`: the Hash the column held
+    // before the pending change, over the raw serialized value.
+    for (suffix, raw_reader) in [("_was", "attribute_was"), ("_in_database", "attribute_in_database")] {
+        let reader_name = format!("{}{}", col.as_str(), suffix);
+        let Some(was) = methods.iter_mut().find(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == reader_name && m.params.is_empty()
+        }) else {
+            continue;
+        };
         was.body = sp_expr(ExprNode::Send {
             recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore")] })),
             method: Symbol::from("snapshot"),
@@ -462,7 +468,7 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
                 str_lit(col.as_str()),
                 sp_expr(ExprNode::Send {
                     recv: None,
-                    method: Symbol::from("attribute_was"),
+                    method: Symbol::from(raw_reader),
                     args: vec![str_lit(col.as_str())],
                     block: None,
                     parenthesized: true,
