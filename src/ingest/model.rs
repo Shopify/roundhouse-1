@@ -1880,7 +1880,11 @@ impl ClassConsts {
 
     /// A label spelled as a symbol, a string, a folded constant, or an
     /// interpolation of folded constants (`"#{UNSET_STATUS}": 0`).
-    fn label(&self, node: &Node<'_>) -> Option<String> {
+    fn label(
+        &self,
+        node: &Node<'_>,
+        resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
+    ) -> Option<String> {
         if let Some(Literal::Str { value }) = self.scalar(node) {
             return Some(value);
         }
@@ -1898,6 +1902,14 @@ impl ClassConsts {
             } else if let Some(e) = part.as_embedded_statements_node() {
                 let body: Vec<Node<'_>> = e.statements()?.body().iter().collect();
                 let [only] = body.as_slice() else { return None };
+                // `Status::Approved.serialize`: a nested T::Enum member's
+                // serialized value, which resolves as a one-pair mapping.
+                if only.as_call_node().is_some() {
+                    let pairs = resolve_constant(only)?;
+                    let [(serialized, _)] = pairs.as_slice() else { return None };
+                    out.push_str(serialized);
+                    continue;
+                }
                 match self.scalar(only)? {
                     Literal::Str { value } => out.push_str(&value),
                     Literal::Int { value } => out.push_str(&value.to_string()),
@@ -1965,14 +1977,14 @@ fn enum_label_values(
         ));
     }
     if let Some(hash) = node.as_hash_node() {
-        return enum_label_pairs(hash.elements().iter(), file, consts);
+        return enum_label_pairs(hash.elements().iter(), file, consts, resolve_constant);
     }
     // `enum :status, processing: 'processing', ready: 'ready'` — Rails 7's
     // dominant spelling. A trailing bare-hash argument (no braces) parses
     // as a `KeywordHashNode`, not a `HashNode`; its elements are the same
     // `AssocNode`s either way, so the extraction logic is shared.
     if let Some(kwhash) = node.as_keyword_hash_node() {
-        return enum_label_pairs(kwhash.elements().iter(), file, consts);
+        return enum_label_pairs(kwhash.elements().iter(), file, consts, resolve_constant);
     }
     let Some(call) = node.as_call_node() else { return Ok(None) };
     let Some(recv) = call.receiver() else { return Ok(None) };
@@ -2152,11 +2164,12 @@ fn enum_label_pairs<'a>(
     elements: impl Iterator<Item = Node<'a>>,
     file: &str,
     consts: &ClassConsts,
+    resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
     let mut out = Vec::new();
     for el in elements {
         let Some(assoc) = el.as_assoc_node() else { return Ok(None) };
-        let Some(label) = consts.label(&assoc.key()) else { return Ok(None) };
+        let Some(label) = consts.label(&assoc.key(), resolve_constant) else { return Ok(None) };
         let value = assoc.value();
         // `pending: PENDING = "pending"` stores the written value and
         // defines the constant, which `mapping_constant_writes` hoists

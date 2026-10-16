@@ -196,11 +196,41 @@ impl EnumConstants {
         true
     }
 
+    /// A member's serialized string: `Status::Approved.serialize`, as a
+    /// hash key's interpolation (`"#{Status::Approved.serialize}": 0`).
+    /// Resolved as the enum is, so a shadowing or invalidated enum yields
+    /// `None`.
+    pub(in crate::ingest) fn serialized_member(
+        &self,
+        node: &Node<'_>,
+        owners: &[String],
+    ) -> Option<String> {
+        let call = node.as_call_node()?;
+        if constant_id_str(&call.name()) != "serialize" || call.arguments().is_some() || call.block().is_some() {
+            return None;
+        }
+        let name = self.resolve_name(&Self::path(&call.receiver()?)?, owners)?;
+        let (enum_name, member) = name.rsplit_once("::")?;
+        if !self.namespace_chain_valid(enum_name) {
+            return None;
+        }
+        match self.values.get(enum_name)? {
+            EnumConstant::Sorbet { members, .. } => members.iter().find_map(|(name, value)| match value {
+                Literal::Str { value } if name.as_str() == member => Some(value.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
     pub(in crate::ingest) fn resolve(
         &self,
         node: &Node<'_>,
         owners: &[String],
     ) -> Option<Vec<(String, Literal)>> {
+        if let Some(serialized) = self.serialized_member(node, owners) {
+            return Some(vec![(serialized.clone(), Literal::Str { value: serialized })]);
+        }
         let values_receiver = node.as_call_node().and_then(|call| {
             (constant_id_str(&call.name()) == "values"
                 && call.arguments().is_none()
