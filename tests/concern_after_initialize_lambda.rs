@@ -33,6 +33,9 @@ fn a_concern_after_initialize_lambda_reaches_the_including_model() {
     roundhouse::session::analyze_and_lower(&mut app);
     let out = emit_lowered_models(&app).into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n");
     assert!(out.contains("self.uuid ||= SecureRandom.uuid if new_record?"), "{out}");
+    // Construction and hydration reach the hook.
+    assert!(out.contains("after_initialize if !(attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS)"), "{out}");
+    assert!(out.contains("instance.after_initialize"), "{out}");
 }
 
 #[test]

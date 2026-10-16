@@ -2689,12 +2689,14 @@ pub(super) fn model_declares_after_initialize(model: &Model) -> bool {
         .any(|item| matches!(item, ModelBodyItem::Unknown { expr, .. } if after_initialize_call(expr)))
 }
 
-/// `after_initialize do … end` or `after_initialize :m, …`.
+/// `after_initialize do … end`, `after_initialize -> { … }` or
+/// `after_initialize :m, …`.
 fn after_initialize_call(expr: &crate::expr::Expr) -> bool {
     matches!(
         &*expr.node,
         ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "after_initialize"
     ) || super::markers::symbol_after_initialize(expr).is_some()
+        || super::markers::block_callback_shape(expr).is_some_and(|(_, hook, _)| hook == "after_initialize")
 }
 
 /// `self.<writer>(<lookup>) unless <lookup>.nil?` — the guarded
