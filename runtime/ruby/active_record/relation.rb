@@ -1605,7 +1605,9 @@ module ActiveRecord
 
     def eager_joinable?(owner, reflection, name)
       return false if reflection.nil?
-      return false if reflection.through_reflection? || reflection.polymorphic?
+      # The shared reflection carries a name alone (the PostgreSQL CRuby
+      # tree's emitted ones answer `through_reflection?`): nothing to join.
+      return false if !reflection.respond_to?(:through_reflection?) || reflection.through_reflection? || reflection.polymorphic?
       return false if reflection.macro == :has_and_belongs_to_many
       return false unless owner.method_defined?(:"_preload_#{name}")
       klass = reflection.klass
@@ -3801,7 +3803,10 @@ module ActiveRecord
       reflection = @model.reflect_on_association(name.to_sym)
       reflection = @model.reflect_on_association(name.singularize.to_sym) if reflection.nil?
       return [name, associated_model_by_table(name)] if reflection.nil?
-      return [name, nil] if reflection.polymorphic?
+      # Only the PostgreSQL CRuby tree's emitted reflections answer
+      # `polymorphic?` / `klass`; elsewhere the shared reflection carries
+      # a name alone, so the table's columns are bound as written.
+      return [name, nil] if !reflection.respond_to?(:polymorphic?) || reflection.polymorphic?
       [name, reflection.klass]
     end
 
@@ -3814,7 +3819,7 @@ module ActiveRecord
       return nil unless @model.respond_to?(:_association_names)
       @model._association_names.each do |assoc|
         reflection = @model.reflect_on_association(assoc)
-        next if reflection.nil? || reflection.polymorphic?
+        next if reflection.nil? || !reflection.respond_to?(:polymorphic?) || reflection.polymorphic?
         klass = begin
           reflection.klass
         rescue NameError, NotImplementedError

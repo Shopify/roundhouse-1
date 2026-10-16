@@ -277,6 +277,7 @@ module ActiveRecord
     # app's whole association graph), an option the compiler did not carry
     # (each of which `joins` itself refuses by name when asked for).
     def joinable_target(reflection)
+      return nil unless reflection.respond_to?(:polymorphic?)
       return nil if reflection.macro == :has_and_belongs_to_many || reflection.polymorphic?
       return nil unless loaded_constant?(reflection.class_name)
       reflection.klass
@@ -313,6 +314,8 @@ module ActiveRecord
     # non-polymorphic association whose name is not its table's.
     def alias_join_reflection?(owner, reflection)
       return false if reflection.nil?
+      # A SQLite tree's reflection is the shared one, a name alone.
+      return false unless reflection.respond_to?(:through_reflection?)
       return false if reflection.through_reflection? || reflection.polymorphic?
       return false if reflection.macro == :has_and_belongs_to_many || reflection._roundhouse_scoped?
       reflection.name.to_s != reflection.klass.table_name.to_s

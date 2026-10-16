@@ -5260,7 +5260,7 @@ raise "beyond-offset poisoned" unless beyond.to_sql == prior_sql
 paged = ActiveRecord::Relation.new(Article).where("title != 'outside'").limit(1).offset(1)
 raise "input slicing" unless paged.find([b.id, a.id]).map(&:title) == ["zebra"]
 raise "pagination poisoned" unless paged.to_a.map(&:title) == ["apple"]
-ordered.limit(1).offset(1)
+ordered = ordered.limit(1).offset(1)
 raise "ordered pagination" unless ordered.find([b.id, a.id]).map(&:title) == ["zebra"]
 selected = ActiveRecord::Relation.new(Article).select(:title)
 prior_sql = selected.to_sql
@@ -5854,7 +5854,7 @@ unordered = ActiveRecord::Relation.new(Article).offset(1)
 raise "excluded invalid input" unless unordered.find(["bogus", 31]).map(&:id) == [31]
 ordered = ActiveRecord::Relation.new(Article).order(:id).limit(1)
 raise "ordered limit cardinality" unless ordered.find(["bogus", 31]).map(&:id) == [31]
-ordered.offset(1)
+ordered = ordered.offset(1)
 begin
   ordered.find(["bogus", 31])
   raise "invalid input dropped from expected size"
@@ -15757,4 +15757,29 @@ raise "second label missed" unless Article.new(title: "draft", body: "b").draft?
 "#,
         )
         .assert_passes();
+}
+
+/// The shared (SQLite) runtime carries the same association surface the
+/// lowering writes against: a `dependent: :destroy` cascade marks each
+/// child `destroyed_by_association` with the reflection before its
+/// destroy, and a SQLite integer column answers Type::Integer at SQLite's
+/// 8-byte default limit (`SQLite3Integer`'s `limit || 8`) rather than
+/// refusing `type_for_attribute`.
+#[test]
+fn sqlite_runtime_marks_destroyed_by_association_and_types_integer_columns() {
+    let run = emit_and_run::real_blog().run_ruby(
+        r#"a = Article.create!(title: "One", body: "A sufficiently long body.")
+c = a.comments.create!(commenter: "x", body: "y")
+raise "unset" unless c.destroyed_by_association.nil?
+c.destroyed_by_association = Article.reflect_on_association(:comments)
+raise "marked: #{c.destroyed_by_association.inspect}" unless c.destroyed_by_association.name == :comments
+a.destroy
+raise "cascade" unless Comment.where(article_id: a.id).count == 0
+type = Comment.type_for_attribute("article_id")
+raise "limit: #{type.inspect}" unless type.is_a?(ActiveRecord::Type::Integer) && type.limit == 8
+puts "sqlite association surface passed"
+"#,
+    );
+    run.assert_passes();
+    assert!(run.stdout.contains("sqlite association surface passed"));
 }

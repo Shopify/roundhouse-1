@@ -271,9 +271,10 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
     match &col.col_type {
         ColumnType::Integer if pg => spec("integer", Some(4)),
         ColumnType::BigInt | ColumnType::Reference { .. } if pg => spec("integer", Some(8)),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } => {
-            unported("ActiveRecord::ConnectionAdapters::SQLite3Adapter::SQLite3Integer")
-        }
+        // SQLite3Integer < Type::Integer, whose only difference is the
+        // default limit: `limit || 8`, the 8 bytes an INTEGER stores. The
+        // cast and range check are Type::Integer's at that limit.
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } => spec("integer", Some(8)),
         ColumnType::String { limit } => spec("string", limit.map(i64::from)),
         ColumnType::Text => spec("text", None),
         ColumnType::Boolean => spec("boolean", None),

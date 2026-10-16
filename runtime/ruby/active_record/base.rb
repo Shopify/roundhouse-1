@@ -779,6 +779,18 @@ module ActiveRecord
       @destroyed
     end
 
+    # The has_many reflection whose `dependent: :destroy` is destroying
+    # this record, nil otherwise (Rails' AutosaveAssociation). The
+    # lowered `dependent: :destroy` cascade sets it before each
+    # `destroy`.
+    def destroyed_by_association
+      @destroyed_by_association
+    end
+
+    def destroyed_by_association=(reflection)
+      @destroyed_by_association = reflection
+    end
+
     # Whether one of this record's association validate/save walks
     # (autosave_association.rb `define_non_cyclic_method`, whose
     # `@_already_called` marks a running call) is on the stack. A

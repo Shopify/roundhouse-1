@@ -233,6 +233,9 @@ module ActiveRecord
     def persisted?: () -> bool
     def new_record?: () -> bool
     def destroyed?: () -> bool
+    @destroyed_by_association: ActiveRecord::Reflection::AssociationReflection?
+    def destroyed_by_association: () -> ActiveRecord::Reflection::AssociationReflection?
+    def destroyed_by_association=: (ActiveRecord::Reflection::AssociationReflection? reflection) -> ActiveRecord::Reflection::AssociationReflection?
     @_already_called: Hash[Symbol, bool]?
     def _association_walk_in_progress?: () -> bool
     # Side-effecting bang method; return value isn't meaningful.

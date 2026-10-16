@@ -3525,14 +3525,14 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
     // it answers. A query that is a relation loaded with `to_a` and
     // reads no local of the reader is it; an unscoped has_many's
     // compiled query is its key (and `as:` type) on the target.
-    // A has_one's is the same without its `.first`, and a scoped
+    // A has_one's is the same without its `.first` (or `.take`), and a scoped
     // association's is its query (a chain of relation methods that
     // reads no local of the reader), as Rails' `association.scope`
     // answers the relation before it loads.
     let scope = match &*query.node {
         ExprNode::Send { recv: Some(rel), method, args, block: None, .. }
             if args.is_empty()
-                && method.as_str() == if singular { "first" } else { "to_a" }
+                && (if singular { matches!(method.as_str(), "first" | "take") } else { method.as_str() == "to_a" })
                 && !reads_local(rel) =>
         {
             Some(rel.clone())
