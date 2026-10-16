@@ -6339,7 +6339,8 @@ fn rewrite_helper_ivars(e: &mut Expr, names: &std::collections::BTreeSet<Symbol>
         method,
         args,
         block: None,
-        parenthesized: false,
+        // `a == controller.instance_variable_get :@x` is not Ruby.
+        parenthesized: shadows_object,
     };
 }
 
