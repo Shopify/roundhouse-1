@@ -12756,7 +12756,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "SocketError"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Net::HTTPSuccess" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError" | "Zlib::DataError" | "OpenSSL::Random"
-        | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
+        | "Rails::HTML5::SafeListSanitizer" | "Rails::Html::Sanitizer" | "Rails::HTML::Sanitizer" | "JSON" | "JSON::ParserError"
         | "Struct" | "Mutex" | "Fiber" | "Process" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"

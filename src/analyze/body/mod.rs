@@ -3428,7 +3428,12 @@ impl<'a> BodyTyper<'a> {
                     let on_i18n = matches!(recv.as_ref().map(|r| &*r.node),
                         Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "I18n");
                     if let Err(reason) = resolved {
-                        if expr.diagnostic.is_none() && !(self.i18n_gem && on_i18n) {
+                        // Only the analyzer holds the app's catalog; the typers
+                        // lowering re-runs over a model or test body hold Rails'
+                        // English, which cannot fold an app's key, so they carry
+                        // the analyzer's verdict (set on the node) instead of
+                        // making their own.
+                        if expr.diagnostic.is_none() && self.i18n.is_some() && !(self.i18n_gem && on_i18n) {
                             expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                                 target: None,
                                 construct: Symbol::from("I18n"),
