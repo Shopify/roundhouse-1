@@ -980,6 +980,25 @@ module ActiveRecord
       @attributes_builder ||= ActiveModel::AttributeSet::Builder.new(attribute_types, {})
     end
 
+    # The hydration sentinel (`HYDRATE_ATTRS`, frozen so a write through
+    # the shared object raises) answers `delete` as the empty Hash a
+    # bare `{}` default would. A model's own `initialize(*attrs)` takes
+    # its option out of the first argument (Core's
+    # ThemeJsonTemplateUpdateDeferredAction:
+    # `@theme = attrs[0]&.delete(:theme)`), and hydration builds the
+    # record through `new` where Rails' `instantiate` skips `initialize`:
+    # deleting from an empty Hash changes nothing, but a frozen one
+    # raised FrozenError. Every other write still raises. Rebuilt here,
+    # not in base.rb, since a frozen object takes no singleton methods.
+    hydrate_attrs = Hash.new
+    hydrate_attrs.extend(Module.new do
+      def delete(key)
+        block_given? ? yield(key) : nil
+      end
+    end)
+    remove_const(:HYDRATE_ATTRS)
+    const_set(:HYDRATE_ATTRS, hydrate_attrs.freeze)
+
     class << self
       # inheritance.rb's `new`: a record built with the inheritance
       # column's value (`Condition.new(attribute_name: "title")`, which

@@ -1010,6 +1010,12 @@ class String
   alias :ends_with? :end_with?
 end
 
+# core_ext/symbol/starts_ends_with.rb
+class Symbol
+  alias :starts_with? :start_with?
+  alias :ends_with? :end_with?
+end
+
 # core_ext/string/access.rb
 class String
   def at(position)
