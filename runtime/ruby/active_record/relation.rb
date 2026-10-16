@@ -2543,6 +2543,105 @@ module ActiveRecord
       rows.length == 0 ? nil : rows[0]
     end
 
+    # Rails' `find_nth(index)`, the base of `second` .. `fifth` and
+    # `forty_two`: the record `index` rows into the relation in key order
+    # (`ordered_relation`), loaded or not. An unloaded relation fetches
+    # that one row with OFFSET `offset_value + index` (a relation already
+    # LIMITed to `limit_value` rows has `limit_value - index` left, none
+    # once that is spent), and a terminal like `first` leaves no memo.
+    def find_nth(index)
+      loaded = @records
+      return loaded[index] unless loaded.nil?
+      room = @limit
+      return nil if !room.nil? && room - index <= 0
+      prior_limit = @limit
+      prior_offset = @offset
+      keyed = order_by_key("ASC")
+      @offset = (prior_offset || 0) + index unless index == 0
+      @limit = 1
+      rows = to_a
+      @limit = prior_limit
+      @offset = prior_offset
+      @orders = [] if keyed
+      unload_records
+      rows.length == 0 ? nil : rows[0]
+    end
+
+    def second
+      find_nth(1)
+    end
+
+    def third
+      find_nth(2)
+    end
+
+    def fourth
+      find_nth(3)
+    end
+
+    def fifth
+      find_nth(4)
+    end
+
+    def forty_two
+      find_nth(41)
+    end
+
+    # Rails' `find_nth_from_last(index)`: `second_to_last` and
+    # `third_to_last`, the record `index` rows before the end.
+    def second_to_last
+      find_nth_from_last(2)
+    end
+
+    def third_to_last
+      find_nth_from_last(3)
+    end
+
+    def find_nth_from_last(index)
+      rows = last_n(index)
+      rows.length == index ? rows[0] : nil
+    end
+
+    def second!
+      find_nth!(1)
+    end
+
+    def third!
+      find_nth!(2)
+    end
+
+    def fourth!
+      find_nth!(3)
+    end
+
+    def fifth!
+      find_nth!(4)
+    end
+
+    def forty_two!
+      find_nth!(41)
+    end
+
+    def second_to_last!
+      find_nth_from_last!(2)
+    end
+
+    def third_to_last!
+      find_nth_from_last!(3)
+    end
+
+    def find_nth!(index)
+      record = find_nth(index)
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
+    def find_nth_from_last!(index)
+      record = find_nth_from_last(index)
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
+      record
+    end
+
     # Rails' `first(n)` / `last(n)` — the COUNTED forms, which answer an
     # Array of up to n records where the bare forms answer one record or
     # nil. Split into their own names rather than overloaded onto

@@ -2409,8 +2409,8 @@ module ActiveRecord
     # Saved-change tracking (ActiveModel::Dirty subset) — the real
     # implementation behind base.rb's compile-surface stubs; see the
     # note there for why the diff is ruby-family-only. The snapshot
-    # from the previous save (nil for a fresh instance, so a create
-    # reports every attribute as [nil, value] — Rails' shape) diffs
+    # from the previous save (a fresh instance's column defaults, so a
+    # create reports what differs from them — Rails' shape) diffs
     # against the post-write attributes; `save` calls this between the
     # row write and the after_* hooks, so callbacks observe the
     # finished save, matching Rails. A record hydrated from the DB has
@@ -2648,6 +2648,19 @@ module ActiveRecord
       nil
     end
 
+    # Called by the compiled `initialize` once the column defaults are
+    # written and before the default scope and `assign_attributes(attrs)`
+    # run: a new record's baseline is the column defaults, as Rails'
+    # `_default_attributes` is, so `FulfillmentOrder.new(status: "open")`
+    # has `status_was == "start"` (the column default) and a column left
+    # at its default is no pending change. A record constructing with
+    # HYDRATE_ATTRS takes its baseline from the row instead.
+    def _note_new_record_baseline(attrs)
+      return nil if attrs.equal?(ActiveRecord::Base::HYDRATE_ATTRS)
+      @__last_saved_attributes = _attribute_snapshot
+      nil
+    end
+
     # The row's unselected schema columns — see base.rb's empty stub.
     # Rails answers `has_attribute?(col)` false for a column a partial
     # `select` left out, and lobsters' Token guard
@@ -2748,11 +2761,11 @@ module ActiveRecord
     # pending — Rails' order (`changes_applied` precedes the after
     # callbacks).
     #
-    # A new record has no baseline, so every non-nil attribute reads as
-    # pending. Rails compares against the column default instead, so a
-    # column still holding its default (a `karma` of 0) over-reports
-    # here; nil-default columns, which is what validations guard on,
-    # agree.
+    # A new record's baseline is its column defaults
+    # (`_note_new_record_baseline`, run by the compiled `initialize`), so
+    # a column still holding its default (a `karma` of 0) is no change,
+    # as in Rails. A record built without that call has no baseline and
+    # every non-nil attribute reads as pending.
     def changes_to_save
       previous = @__last_saved_attributes
       changes = {}

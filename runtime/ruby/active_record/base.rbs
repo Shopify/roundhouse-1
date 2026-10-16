@@ -178,6 +178,7 @@ module ActiveRecord
     def saved_changes: () -> Hash[String, untyped]
     def previous_changes: () -> Hash[String, untyped]
     def _note_hydrated: () -> void
+    def _note_new_record_baseline: (Hash[Symbol, untyped] attrs) -> void
     def attribute_previously_was: (String name) -> untyped
     def saved_change_to_attribute?: (Symbol name) -> bool
     def saved_change_to_attribute: (Symbol name) -> untyped

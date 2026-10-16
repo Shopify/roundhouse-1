@@ -1149,6 +1149,12 @@ module ActiveRecord
     def _note_hydrated
     end
 
+    # Called by the compiled `initialize` after the column defaults are
+    # written: the ruby-family connection.rb reopen snapshots them as a
+    # new record's baseline. No-op here, as `_note_hydrated` is.
+    def _note_new_record_baseline(attrs)
+    end
+
     # The argument-taking half of the ActiveModel::Dirty read surface,
     # for call sites that name the attribute at runtime rather than in
     # the method name (`saved_change_to_attribute?(:url)`,

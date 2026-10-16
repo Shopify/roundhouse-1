@@ -58,7 +58,15 @@ fn route_initialize(method: &mut MethodDef, attrs: &Symbol) {
     let stmts = std::mem::take(exprs);
     let mut routed = Vec::with_capacity(stmts.len() + 1);
     let mut assigned = false;
+    let mut baselined = false;
     for stmt in stmts {
+        // The column defaults are written by here: snapshot them as the
+        // baseline, before a default scope's attributes and the given
+        // ones count as changes.
+        if !baselined && (is_default_scope_seed(&stmt) || (is_after_initialize_tail(&stmt) && !assigned)) {
+            routed.push(note_new_record_baseline(attrs));
+            baselined = true;
+        }
         if is_after_initialize_tail(&stmt) && !assigned {
             routed.push(assign_attributes_unless_hydrating(attrs));
             assigned = true;
@@ -68,6 +76,9 @@ fn route_initialize(method: &mut MethodDef, attrs: &Symbol) {
         }
     }
     if !assigned {
+        if !baselined {
+            routed.push(note_new_record_baseline(attrs));
+        }
         routed.push(assign_attributes_unless_hydrating(attrs));
     }
     *exprs = routed;
@@ -85,6 +96,19 @@ fn route_update(method: &mut MethodDef, attrs: &Symbol) {
     // `self` read after `save!` is for strict targets.
     let save = exprs.swap_remove(save);
     *exprs = vec![send_self("assign_attributes", vec![var(attrs)]), save];
+}
+
+/// `_seed_default_scope_attributes(attrs)`, the default scope's writes
+/// (`schema::synth_initialize`).
+fn is_default_scope_seed(stmt: &Expr) -> bool {
+    matches!(&*stmt.node, ExprNode::Send { recv: None, method, .. }
+        if method.as_str() == "_seed_default_scope_attributes")
+}
+
+/// `_note_new_record_baseline(attrs)`: a new record's baseline for Dirty
+/// is its column defaults (`Base#_note_new_record_baseline`).
+fn note_new_record_baseline(attrs: &Symbol) -> Expr {
+    send_self("_note_new_record_baseline", vec![var(attrs)])
 }
 
 /// `after_initialize unless attrs.equal?(HYDRATE_ATTRS)`, the

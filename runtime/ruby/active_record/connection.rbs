@@ -306,6 +306,7 @@ module ActiveRecord
     def self.none?: () -> bool
     def _attribute_snapshot: () -> Hash[String, untyped]
     def _note_hydrated: () -> void
+    def _note_new_record_baseline: (Hash[Symbol, untyped] attrs) -> void
     def _note_unloaded: (Hash[String, untyped] row) -> nil
     def has_attribute?: (String | Symbol attr_name) -> bool
     def _has_attribute?: (untyped attr_name) -> bool

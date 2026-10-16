@@ -2772,6 +2772,8 @@ fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool
             name,
             "ids" | "pluck" | "count" | "first" | "last" | "first!" | "last!" | "take!" | "exists?" | "any?" | "empty?" | "size"
                 | "length"
+                | "second" | "third" | "fourth" | "fifth" | "forty_two" | "second!" | "third!" | "fourth!" | "fifth!"
+                | "forty_two!"
                 | "destroy_all"
                 | "delete_all"
                 | "update_all"

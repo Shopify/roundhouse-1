@@ -12880,6 +12880,13 @@ fn macro_hooked_include_floor(lc: &LibraryClass, app: &App, positioned: &[(usize
         .unknown_calls
         .iter()
         .chain(lc.class_ivar_initializers.iter())
+        // An `extend` of an app module is written right above the include
+        // that follows it (`extends_before_includes`), so it is no
+        // statement the include has to wait for: Core's Customer extends
+        // `SensitiveAttributeValidations` above `include
+        // CustomerPasswordProtection`, whose hook calls the extended
+        // module's `validate_sensitive`.
+        .filter(|c| !hoistable_extend(lc, c, app))
         .map(|c| c.span)
         .filter(|s| !s.is_synthetic())
         .collect();
@@ -12907,6 +12914,17 @@ fn macro_hooked_include_floor(lc: &LibraryClass, app: &App, positioned: &[(usize
         }
     }
     floor
+}
+
+/// Whether `call` is a replayed `extend M` of the app's own modules,
+/// none of which has an `extended` hook: one whose position among the
+/// body's statements is no more than its place above the include that
+/// follows it (`extends_before_includes`).
+fn hoistable_extend(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    let Some(modules) = app_module_extend(lc, call, app) else { return false };
+    !modules
+        .iter()
+        .any(|m| m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "extended"))
 }
 
 /// The replayed `extend M`s of the app's own modules that the source
@@ -12940,11 +12958,7 @@ fn extends_before_includes<'a, 'e>(
         if call.span.is_synthetic() {
             continue;
         }
-        let Some(modules) = app_module_extend(lc, call, app) else { continue };
-        let hooked = modules.iter().any(|m| {
-            m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "extended")
-        });
-        if hooked {
+        if !hoistable_extend(lc, call, app) {
             continue;
         }
         let includes = by_file.entry(call.span.file.0).or_insert_with(|| {

@@ -354,6 +354,24 @@ module ActiveRecord
     def last!: () -> Base
     def take!: () -> Base
     def last: () -> Base?
+    def find_nth: (Integer index) -> Base?
+    def find_nth_from_last: (Integer index) -> Base?
+    def find_nth!: (Integer index) -> Base
+    def find_nth_from_last!: (Integer index) -> Base
+    def second: () -> Base?
+    def second!: () -> Base
+    def third: () -> Base?
+    def third!: () -> Base
+    def fourth: () -> Base?
+    def fourth!: () -> Base
+    def fifth: () -> Base?
+    def fifth!: () -> Base
+    def forty_two: () -> Base?
+    def forty_two!: () -> Base
+    def second_to_last: () -> Base?
+    def second_to_last!: () -> Base
+    def third_to_last: () -> Base?
+    def third_to_last!: () -> Base
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
     def count: () ?{ (Base) -> bool } -> Integer
