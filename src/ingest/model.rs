@@ -3381,6 +3381,7 @@ pub(super) fn parse_association(
             primary_key: primary_key.as_deref().map(Symbol::from),
             autosave,
             extra_keys,
+            constraint_keys_preserved: override_keys.as_ref().is_some_and(|o| o.query_constraints.is_some()),
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),

@@ -286,6 +286,7 @@ fn parse_sequel_association(
         },
         "many_to_one" => Association::BelongsTo {
             extra_keys: Vec::new(),
+            constraint_keys_preserved: false,
             name: name.clone(),
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))

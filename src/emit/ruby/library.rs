@@ -3123,7 +3123,10 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
         // ran while only some of them were assigned (`attrs` applied one
         // key at a time) must not answer from its nil.
         for a in model.associations() {
-            if let Association::BelongsTo { name, polymorphic: false, extra_keys, .. } = a {
+            // (Not when they are `query_constraints` columns only: the
+            // wrapper's `stale_state` tracks the foreign key alone, so a
+            // `shop_id` written after the target keeps it.)
+            if let Association::BelongsTo { name, polymorphic: false, extra_keys, constraint_keys_preserved: false, .. } = a {
                 for (extra, _) in extra_keys {
                     invalidate_on_fk_write(lc, name, extra, stale_state);
                 }
@@ -5295,13 +5298,25 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
             .associations()
             .filter_map(|a| match a {
                 // `autosave: false` never saves the target.
-                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, target, extra_keys, .. }
-                    if *autosave != Some(false) =>
-                {
+                Association::BelongsTo {
+                    name,
+                    foreign_key,
+                    polymorphic: false,
+                    autosave,
+                    primary_key,
+                    target,
+                    extra_keys,
+                    constraint_keys_preserved,
+                    ..
+                } if *autosave != Some(false) => {
                     // `primary_key: :uuid`: the key takes the target's
                     // `uuid`, as Rails' `record._read_attribute(primary_key)`.
                     let pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
-                    Some((name.clone(), foreign_key.clone(), pk, target.clone(), extra_keys.clone()))
+                    // Only the foreign key follows the saved target when the
+                    // other key columns are `query_constraints` only
+                    // (`save_belongs_to_association` restores them).
+                    let extras = if *constraint_keys_preserved { Vec::new() } else { extra_keys.clone() };
+                    Some((name.clone(), foreign_key.clone(), pk, target.clone(), extras))
                 }
                 _ => None,
             })
