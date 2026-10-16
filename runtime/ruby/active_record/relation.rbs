@@ -113,7 +113,7 @@ module ActiveRecord
     def unload_records: () -> void
     def null_relation?: () -> bool
     def mark_null!: () -> void
-    def hash_has_empty_in?: (Hash[untyped, untyped]) -> bool
+    def hash_has_empty_in?: (Hash[String | Symbol, untyped]) -> bool
     def with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
     def with_recursive!: (Hash[Symbol, Array[Relation]] ctes) -> Relation
     def from: (String | Relation source, ?(String | Symbol)? subquery_name) -> Relation
@@ -457,6 +457,7 @@ def aliased_join_sql: (untyped owner, untyped reflection, String kind) -> String
     def limited_eager_ids: () -> Array[String]
     def order_sql_terms: () -> Array[String]
     def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
+    def nested_hash?: (String | Symbol key, Hash[untyped, untyped] val) -> bool
     def nested_table: (String | Symbol key) -> [String, untyped]
     def associated_model_by_table: (String name) -> untyped
     def tuple_predicate: (Array[untyped] columns, untyped val) -> String
