@@ -5135,6 +5135,68 @@ fn sti_class_dispatch(base_new: Expr, type_read: &Expr, args: &[Expr], span: Spa
     Expr::new(span, ExprNode::Case { scrutinee: type_read.clone(), arms })
 }
 
+/// Ruby-family pre-emit pass: a composite `belongs_to` writer reads the
+/// target's other key columns without raising on an unloaded one.
+///
+/// Rails' `replace_keys` copies each key part with
+/// `record._read_attribute(key)`, which answers nil for a column the
+/// record was loaded without (`Sale.select(:id)`); the generated column
+/// reader would raise `MissingAttributeError`. The shared writer calls
+/// the reader (`@order_id = value.order_id`), so a partially selected
+/// target assigned through a composite association died there (Core's
+/// `PresentmentSale.new(sale: sale)`). The extra pairs go through
+/// `_read_attribute`; the primary column stays a reader call (a composite
+/// target's `id_value` is not a column `_read_attribute` knows).
+pub(crate) fn apply_belongs_to_unloaded_key_reads(lcs: &mut [LibraryClass], app: &App) {
+    use crate::dialect::Association;
+
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        for assoc in model.associations() {
+            let Association::BelongsTo { name, polymorphic: false, extra_keys, .. } = assoc else { continue };
+            if extra_keys.is_empty() {
+                continue;
+            }
+            let writer = Symbol::from(format!("{}=", name.as_str()));
+            let Some(w) = lc
+                .methods
+                .iter_mut()
+                .find(|m| m.name == writer && m.receiver == MethodReceiver::Instance)
+            else {
+                continue;
+            };
+            let ExprNode::If { else_branch, .. } = &mut *w.body.node else { continue };
+            let ExprNode::Seq { exprs } = &mut *else_branch.node else { continue };
+            for e in exprs.iter_mut() {
+                let ExprNode::Assign { target: LValue::Ivar { name: ivar }, value } = &mut *e.node else { continue };
+                if !extra_keys.iter().any(|(efk, _)| efk == ivar) {
+                    continue;
+                }
+                let ExprNode::Send { recv: Some(recv), method, args, .. } = &*value.node else { continue };
+                if !args.is_empty()
+                    || method.as_str() == "id_value"
+                    || !matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == "value")
+                {
+                    continue;
+                }
+                let span = value.span;
+                let column = Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
+                let recv = recv.clone();
+                *value = Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(recv),
+                        method: Symbol::from("_read_attribute"),
+                        args: vec![column],
+                        block: None,
+                        parenthesized: true,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Ruby-family pre-emit pass: `belongs_to` autosave.
 ///
 /// `room.creator = User.new(attrs); room.save!` is ordinary Rails —

@@ -96,6 +96,13 @@ const PROBE: &str = r##"class CompositeAssociationRegressionsProbe
       partial.shop_id = 1
       "#{first.inspect} #{partial.order&.name.inspect}"
     end
+    step(out, "partial select") do
+      # Rails' `replace_keys` reads each key part with `_read_attribute`: nil
+      # for a column the target was loaded without, not a raise.
+      partial = OrderLine.new(sku: "p")
+      partial.order = Order.select(:id).find(o1.id)
+      [partial.shop_id, partial.order_id == o1.id].inspect
+    end
     step(out, "where list") { OrderLine.where(order: [o1, o2]).pluck(:sku).sort.inspect }
     step(out, "where list one") { OrderLine.where(order: [o1]).pluck(:sku).sort.inspect }
     step(out, "includes") { OrderLine.includes(:order).order(:id).map { |l| l.order&.name }.inspect }
@@ -120,11 +127,12 @@ end
 "##;
 
 /// Native Rails 8.2 on the same PostgreSQL.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 12] = [
     "writer: [1, true]",
     "writer nil: [nil, nil]",
     "writer saved: [2, true, \"two\"]",
     "partial keys: nil \"one\"",
+    "partial select: [nil, true]",
     "where list: [\"a\", \"b\", \"w\"]",
     "where list one: [\"a\"]",
     "includes: [\"one\", \"two\", nil, \"two\"]",
@@ -209,7 +217,7 @@ fn the_composite_belongs_to_writer_stores_every_key_part() {
     let writer = method_with(&out, "order=(value)");
     assert!(writer.contains("@shop_id = nil"), "{writer}");
     assert!(writer.contains("@order_id = value.id_value") || writer.contains("@order_id = value.id"), "{writer}");
-    assert!(writer.contains("@shop_id = value.shop_id"), "{writer}");
+    assert!(writer.contains("@shop_id = value._read_attribute(:shop_id)"), "{writer}");
     // A new target is saved first and both parts follow its saved row.
     let autosave = method_with(&out, "_autosave_order");
     assert!(autosave.contains("@shop_id = @order_cache.shop_id"), "{autosave}");
