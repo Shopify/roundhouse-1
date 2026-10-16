@@ -1264,11 +1264,10 @@ fn every_runtime_method_body_concretely_typed() {
     // stringified insert rows, typed_store saved_changes with an untyped
     // class and store, composite nested keys). om129's Renderers port is
     // dynamic Ruby and lives in the ruby overlay, outside this gate.
-    // MEASURED 2013 on 2026-10-16 (om160): +28 in relation.rb's
-    // `alias_referenced_joins` / `alias_join_reflection?` / `join_alias_for`
-    // (reflections are untyped, as in Rails) and connection.rb's
-    // `_unique_index_columns` / `_conflict_target_columns`.
-    const CEILING: usize = 2013;
+    // om160's join aliasing (`alias_referenced_joins` and its reflection
+    // reads) lives in the ruby overlay's active_record_relation_ext.rb, outside
+    // this gate: back to 1985 (om162; om160 had measured 2013).
+    const CEILING: usize = 1985;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

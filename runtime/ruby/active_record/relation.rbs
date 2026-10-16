@@ -438,9 +438,6 @@ module ActiveRecord
     def distinct_count_columns: () -> String
     def exists_sql: (Integer n) -> String
     def reference_tables: (Hash[String | Symbol, untyped] hash) -> void
-    def alias_referenced_joins: (Array[String] keys) -> void
-    def alias_join_reflection?: (untyped owner, untyped reflection) -> bool
-    def join_alias_for: (untyped owner, untyped reflection) -> String?
     def sync_eager_joins: () -> void
     def eager_loading?: () -> bool
     def referenced_collection_hop?: (untyped owner, untyped spec) -> bool
