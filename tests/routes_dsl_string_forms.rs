@@ -66,9 +66,10 @@ end
 }
 
 /// A block that returns a string is served. A block whose value is not
-/// a string stays the survey gap #82 recorded.
+/// a string cannot be served, but Rails still names the route: it stays
+/// as an unmodeled-endpoint route (URL helper kept, never dispatched).
 #[test]
-fn a_string_block_redirect_is_served_and_a_non_string_stays_a_gap() {
+fn a_string_block_redirect_is_served_and_a_non_string_keeps_its_helper() {
     let table = ingest_routes(
         br#"Rails.application.routes.draw do
   get "/old", to: redirect { |params, request| "/scan" }
@@ -80,25 +81,31 @@ end
     assert_eq!(table.redirects.len(), 1, "{:?}", table.redirects);
     assert!(table.redirects[0].location.contains("/scan"), "{:?}", table.redirects);
 
-    roundhouse::ingest::survey::activate();
-    ingest_routes(
+    let table = ingest_routes(
         br#"Rails.application.routes.draw do
-  get "/old", to: redirect { |params, request| 7 }
+  get "/old", to: redirect { |params, request| 7 }, as: :old
 end
 "#,
         "config/routes.rb",
     )
     .expect("ingest routes");
-    let gaps = roundhouse::ingest::survey::drain();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert!(gaps[0].to_string().contains("non-string target"), "{}", gaps[0]);
+    assert!(table.redirects.is_empty(), "{:?}", table.redirects);
+    let mut app = App::default();
+    app.routes = table;
+    assert!(flatten_routes(&app).is_empty(), "never dispatched");
+    let helpers = roundhouse::lower::routes::flatten_routes_for_helpers(&app);
+    assert_eq!(helpers.len(), 1, "{helpers:?}");
+    assert_eq!(helpers[0].as_name, "old");
+    assert_eq!(
+        helpers[0].refused.as_ref().map(|(p, kind)| (p.as_str(), kind.as_str())),
+        Some(("endpoint", "redirect block")),
+    );
 }
 
-/// Every verb of a `via:` route can be dropped. That is a missing
-/// route, not an ingest panic, and the survey line is recorded once.
+/// Every verb of a `via:` route keeps its helper-only entry; the
+/// diagnostic names each verb and path once.
 #[test]
-fn via_with_a_dropped_target_does_not_panic() {
-    roundhouse::ingest::survey::activate();
+fn via_with_an_unmodeled_endpoint_does_not_panic() {
     let table = ingest_routes(
         br#"Rails.application.routes.draw do
   match "/old", to: redirect { |params, request| 7 }, via: [:get, :post]
@@ -106,10 +113,11 @@ end
 "#,
         "config/routes.rb",
     )
-    .expect("dropped via target");
-    assert!(table.entries.is_empty(), "{:?}", table.entries);
-    let gaps = roundhouse::ingest::survey::drain();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    .expect("unmodeled via target");
+    let mut app = App::default();
+    app.routes = table;
+    assert!(flatten_routes(&app).is_empty());
+    assert_eq!(roundhouse::lower::routes::flatten_routes_for_helpers(&app).len(), 2);
 }
 
 #[test]

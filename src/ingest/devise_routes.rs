@@ -321,7 +321,7 @@ pub(super) fn ingest_devise_for(
         as_prefix: None,
         defaults: IndexMap::new(),
         nest: false,
-        suppress_helpers: false,
+        suppress_helpers: false, within: ResourceScope::Nested,
         entries,
     }))
 }
