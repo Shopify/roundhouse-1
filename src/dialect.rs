@@ -2863,6 +2863,13 @@ pub struct TestModule {
     /// (`RoundhouseTestRunner.loaded_tests`) beside the ones named here.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tests_at_load: bool,
+    /// The class body's explicit `tests Subject` macro, carried as
+    /// written. `target` already answers the lowering passes; the Ruby
+    /// emit replays this one in a controller test class, where
+    /// `ActionController::TestCase.tests` sets the controller class the
+    /// name (`FooControllerApiTest` -> `FooControllerApi`) would not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_macro: Option<TestBodyStatement>,
 }
 
 /// A test file's top-level load (`TestModule::file_requires`).

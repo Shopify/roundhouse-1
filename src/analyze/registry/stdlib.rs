@@ -1002,6 +1002,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // tree (ruby_overlay active_record_sqlite3_adapter.rb), as a name;
     // `project` refuses it on every other target.
     register_stdlib_class(classes, "ActiveRecord::ConnectionAdapters::SQLite3Adapter", &[], &[]);
+    // The type name a `where` chain is checked against
+    // (runtime/ruby/active_record/relation.rb): no instance exists.
+    register_stdlib_class(classes, "ActiveRecord::QueryMethods", &[], &[]);
+    register_stdlib_class(classes, "ActiveRecord::QueryMethods::WhereChain", &[], &[]);
     // The built-in validators `runtime/spinel/active_model_validations.rb`
     // ports (EachValidator's surface); a memoized instance
     // (`#: ActiveModel::Validations::LengthValidator`) answers
