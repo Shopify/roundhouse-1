@@ -1402,13 +1402,18 @@ module ActiveRecord
       end
       table_ref = table_alias.nil? ? table : table_alias
       belongs = reflection.belongs_to?
-      theirs = join_key_list(belongs ? reflection.association_primary_key : reflection.foreign_key)
-      ours = join_key_list(belongs ? reflection.foreign_key : reflection.active_record_primary_key)
       conditions = []
-      index = 0
-      while index < theirs.length
-        conditions << "#{table_ref}.#{theirs[index]} = #{own}.#{ours[index]}"
-        index += 1
+      pairs = join_key_pairs(reflection)
+      if pairs.nil?
+        theirs = join_key_list(belongs ? reflection.association_primary_key : reflection.foreign_key)
+        ours = join_key_list(belongs ? reflection.foreign_key : reflection.active_record_primary_key)
+        index = 0
+        while index < theirs.length
+          conditions << "#{table_ref}.#{theirs[index]} = #{own}.#{ours[index]}"
+          index += 1
+        end
+      else
+        pairs.each { |pair| conditions << "#{table_ref}.#{pair[0]} = #{own}.#{pair[1]}" }
       end
       type = reflection.type
       unless type.nil?
@@ -1788,6 +1793,13 @@ module ActiveRecord
     end
 
     # A reflection's key is one column or an Array of them (composite).
+    # A composite-key reflection's `[target column, owner column]` join pairs;
+    # nil for a single-column key. The CRuby overlay answers them
+    # (CompositeAssociationKeyPredicates).
+    def join_key_pairs(reflection)
+      nil
+    end
+
     def join_key_list(key)
       key.is_a?(Array) ? key.map { |k| k.to_s } : [key.to_s]
     end

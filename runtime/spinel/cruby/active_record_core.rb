@@ -477,6 +477,18 @@ module ActiveRecord
         @key_pairs
       end
 
+      # reflection.rb's `query_foreign_key`: the owner's columns the association
+      # is read through, every part of a composite key (a belongs_to's foreign
+      # key columns, a has_one / has_many's owner-side columns), else the
+      # one foreign key (belongs_to) or primary key. Query layers select
+      # these so a partially loaded owner can still find its target.
+      def query_foreign_key
+        if @key_pairs
+          return macro == :belongs_to ? @key_pairs.map(&:first) : @key_pairs.map(&:last)
+        end
+        macro == :belongs_to ? foreign_key : active_record_primary_key
+      end
+
       # Whether the declaration has a scope lambda (Rails' `scope`, which
       # an automatic inverse refuses); the lambda itself is not carried.
       def _roundhouse_scoped?

@@ -386,7 +386,16 @@ pub(super) fn push_association_methods(
                     let composite_target =
                         models.iter().any(|m| &m.name == target && !m.composite_primary_key.is_empty());
                     let written_pk = if composite_target && assoc_pk.as_str() == "id" { Symbol::from("id_value") } else { assoc_pk.clone() };
-                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &written_pk, sentinel));
+                    // A composite key's other pairs follow the primary one
+                    // (Rails' `replace_keys` writes every foreign key part).
+                    let extras: Vec<(Symbol, Symbol)> = extra_keys
+                        .iter()
+                        .map(|(fk, pk)| {
+                            let pk = if composite_target && pk.as_str() == "id" { Symbol::from("id_value") } else { pk.clone() };
+                            (fk.clone(), pk)
+                        })
+                        .collect();
+                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &written_pk, sentinel, &extras));
                 }
                 push_singular_loaded_reader(methods, model, owner, name);
             }
@@ -1916,6 +1925,7 @@ fn synth_belongs_to_writer(
     foreign_key: &Symbol,
     assoc_pk: &Symbol,
     sentinel: Expr,
+    extras: &[(Symbol, Symbol)],
 ) -> MethodDef {
     // def story=(value)
     //   if value.nil?
@@ -1960,13 +1970,30 @@ fn synth_belongs_to_writer(
             parenthesized: false,
         },
     );
+    // The other columns of a composite key: nil with the primary one, else
+    // the target's matching column.
+    let mut nil_stmts = vec![fk_assign(sentinel)];
+    let mut set_stmts = vec![fk_assign(id_read)];
+    for (fk, pk) in extras {
+        let ivar = |v: Expr| {
+            Expr::new(Span::synthetic(), ExprNode::Assign { target: LValue::Ivar { name: fk.clone() }, value: v })
+        };
+        nil_stmts.push(ivar(nil_lit()));
+        set_stmts.push(ivar(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(var_ref(value.clone())),
+                method: pk.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        )));
+    }
+    let branch = |mut stmts: Vec<Expr>| if stmts.len() == 1 { stmts.remove(0) } else { seq(stmts) };
     let body = Expr::new(
         Span::synthetic(),
-        ExprNode::If {
-            cond: nil_check,
-            then_branch: fk_assign(sentinel),
-            else_branch: fk_assign(id_read),
-        },
+        ExprNode::If { cond: nil_check, then_branch: branch(nil_stmts), else_branch: branch(set_stmts) },
     );
 
     // Void return (Ty::Nil), matching `synth_preload_setter`: callers

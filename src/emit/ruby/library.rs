@@ -3118,6 +3118,17 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
                 invalidate_on_fk_write(lc, &name, &type_column, stale_state);
             }
         }
+        // A composite key's other columns make the target stale as well
+        // (Rails' `stale_state` reads every key part): the reader that
+        // ran while only some of them were assigned (`attrs` applied one
+        // key at a time) must not answer from its nil.
+        for a in model.associations() {
+            if let Association::BelongsTo { name, polymorphic: false, extra_keys, .. } = a {
+                for (extra, _) in extra_keys {
+                    invalidate_on_fk_write(lc, name, extra, stale_state);
+                }
+            }
+        }
     }
 }
 
@@ -5118,22 +5129,22 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
 
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
-        let names: Vec<(Symbol, Symbol, Symbol, ClassId)> = model
+        let names: Vec<(Symbol, Symbol, Symbol, ClassId, Vec<(Symbol, Symbol)>)> = model
             .associations()
             .filter_map(|a| match a {
                 // `autosave: false` never saves the target.
-                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, target, .. }
+                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, primary_key, target, extra_keys, .. }
                     if *autosave != Some(false) =>
                 {
                     // `primary_key: :uuid`: the key takes the target's
                     // `uuid`, as Rails' `record._read_attribute(primary_key)`.
                     let pk = primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
-                    Some((name.clone(), foreign_key.clone(), pk, target.clone()))
+                    Some((name.clone(), foreign_key.clone(), pk, target.clone(), extra_keys.clone()))
                 }
                 _ => None,
             })
             .collect();
-        for (name, fk, pk, target) in names {
+        for (name, fk, pk, target, extra_keys) in names {
             // A target keyed on a column list answers `id` with the key
             // tuple and its `id` column as `id_value`
             // (`composite_key::rekey`); the foreign key holds the column
@@ -5156,17 +5167,32 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
             // `_autosave_<name>` reads, and watching a slot nobody
             // fills would be worse than the gap.
             let ExprNode::If { else_branch, .. } = &mut *w.body.node else { continue };
-            if !matches!(&*else_branch.node, ExprNode::Assign { target: LValue::Ivar { name: n }, .. } if n == &fk)
-            {
+            let is_fk_assign =
+                |e: &Expr| matches!(&*e.node, ExprNode::Assign { target: LValue::Ivar { name: n }, .. } if n == &fk);
+            let span = else_branch.span;
+            // A composite key's writer is `fk = ...; other_fk = ...`.
+            if let ExprNode::Seq { exprs } = &mut *else_branch.node {
+                if !exprs.first().is_some_and(is_fk_assign) {
+                    continue;
+                }
+                exprs.push(stash_unsaved(&name, span));
+            } else if is_fk_assign(else_branch) {
+                let assign = else_branch.clone();
+                *else_branch = Expr::new(
+                    span,
+                    ExprNode::Seq { exprs: vec![assign, stash_unsaved(&name, span)] },
+                );
+            } else {
                 continue;
             }
-            let span = else_branch.span;
-            let assign = else_branch.clone();
-            *else_branch = Expr::new(
-                span,
-                ExprNode::Seq { exprs: vec![assign, stash_unsaved(&name, span)] },
-            );
-            lc.methods.push(autosave_method(&lc.name, &name, &fk, &pk));
+            let extras: Vec<(Symbol, Symbol)> = extra_keys
+                .iter()
+                .map(|(efk, epk)| {
+                    let epk = if composite_target && epk.as_str() == "id" { Symbol::from("id_value") } else { epk.clone() };
+                    (efk.clone(), epk)
+                })
+                .collect();
+            lc.methods.push(autosave_method(&lc.name, &name, &fk, &pk, &extras));
             fold_before_validation(&mut lc.methods, &lc.name, &name);
             for m in lc.methods.iter_mut().filter(|m| {
                 m.receiver == MethodReceiver::Instance
@@ -5274,6 +5300,7 @@ fn autosave_method(
     name: &Symbol,
     fk: &Symbol,
     pk: &Symbol,
+    extras: &[(Symbol, Symbol)],
 ) -> crate::dialect::MethodDef {
     let span = Span::synthetic();
     let syn = |n| Expr::new(span, n);
@@ -5334,7 +5361,15 @@ fn autosave_method(
                     target: LValue::Ivar { name: fk.clone() },
                     value: send(cache(), pk.as_str()),
                 }),
-            ],
+            ]
+            .into_iter()
+            .chain(extras.iter().map(|(efk, epk)| {
+                syn(ExprNode::Assign {
+                    target: LValue::Ivar { name: efk.clone() },
+                    value: send(cache(), epk.as_str()),
+                })
+            }))
+            .collect(),
         }),
         else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
     });
@@ -20496,6 +20531,24 @@ enum PreloadKind {
     PlainText { attr: String, owner: String },
 }
 
+/// The composite-key `belongs_to` associations [`preload_targets`] leaves to
+/// the lazy reader: they still need the `_preload_<name>` setter.
+fn composite_belongs_to_setters(model: &crate::dialect::Model, app: &App) -> Vec<String> {
+    use crate::dialect::Association;
+
+    model
+        .associations()
+        .filter(|assoc| !assoc.extra_keys().is_empty())
+        .filter(|assoc| crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_none())
+        .filter_map(|assoc| match assoc {
+            Association::BelongsTo { name, target, polymorphic: false, .. } if app.models.iter().any(|m| &m.name == target) => {
+                Some(name.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Select association shapes whose batch queries preserve the reader's filters,
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
@@ -20989,6 +21042,23 @@ end
                 );
             }
         }
+    }
+
+    // A composite-key belongs_to has no batch loader (the lazy reader
+    // matches every key column), but `eager_load`'s JOIN seats the joined
+    // record through the same setter, and the join planner only joins an
+    // association that has one.
+    for name in composite_belongs_to_setters(model, app) {
+        let _ = write!(
+            src,
+            r#"
+def _preload_{name}(rec)
+  @{name}_cache = rec
+  @{name}_loaded = true
+  nil
+end
+"#
+        );
     }
 
     // Dispatch: one case arm per preloadable assoc; unknown names fall

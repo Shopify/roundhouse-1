@@ -166,15 +166,18 @@ pub(crate) fn apply(
                     as_interface,
                     scope,
                     skip_validation,
+                    inverse_of: written_inverse,
                     ..
                 } = assoc
                 else {
                     return None;
                 };
-                let inverse = if *foreign_key_explicit || scope.is_some() || as_interface.is_some() {
+                let inverse = if scope.is_some() || as_interface.is_some() {
                     None
                 } else {
-                    inverse_of(app, model, target, foreign_key)
+                    written_inverse_of(app, target, written_inverse.as_ref()).or_else(|| {
+                        (!*foreign_key_explicit).then(|| inverse_of(app, model, target, foreign_key)).flatten()
+                    })
                 };
                 memoizes(lc, name).then(|| Collection {
                     span,
@@ -189,15 +192,26 @@ pub(crate) fn apply(
         let singles: Vec<Single> = model
             .spanned_associations()
             .filter_map(|(span, assoc)| {
-                let Association::HasOne { name, target, foreign_key, foreign_key_explicit, as_interface, scope, autosave, .. } =
-                    assoc
+                let Association::HasOne {
+                    name,
+                    target,
+                    foreign_key,
+                    foreign_key_explicit,
+                    as_interface,
+                    scope,
+                    autosave,
+                    inverse_of: written_inverse,
+                    ..
+                } = assoc
                 else {
                     return None;
                 };
-                let inverse = if *foreign_key_explicit || scope.is_some() || as_interface.is_some() {
+                let inverse = if scope.is_some() || as_interface.is_some() {
                     None
                 } else {
-                    inverse_of(app, model, target, foreign_key)
+                    written_inverse_of(app, target, written_inverse.as_ref()).or_else(|| {
+                        (!*foreign_key_explicit).then(|| inverse_of(app, model, target, foreign_key)).flatten()
+                    })
                 };
                 let saved_by_lowering = *autosave && defines(lc, &format!("_autosave_{}", name.as_str()));
                 (memoizes(lc, name) && (saved_by_lowering || !*autosave)).then(|| Single {
@@ -406,6 +420,19 @@ fn memoizes(lc: &LibraryClass, name: &Symbol) -> bool {
             && m.receiver == MethodReceiver::Instance
             && matches!(&*m.body.node, ExprNode::Seq { exprs } if exprs.iter().any(|e| matches!(&*e.node,
                 ExprNode::Assign { target: LValue::Ivar { name }, .. } if name.as_str() == loaded)))
+    })
+}
+
+/// An `inverse_of: :name` as written: the target's non-polymorphic
+/// `belongs_to` of that name. It holds whatever `foreign_key:` the
+/// declaration carries (reflection.rb `inverse_of` takes the option
+/// literally), which Core's composite `yugabyte_overrides` keys always do.
+fn written_inverse_of(app: &App, target: &ClassId, written: Option<&Symbol>) -> Option<Symbol> {
+    let written = written?;
+    let target = app.models.iter().find(|m| &m.name == target)?;
+    target.associations().find_map(|a| match a {
+        Association::BelongsTo { name, polymorphic: false, .. } if name == written => Some(name.clone()),
+        _ => None,
     })
 }
 

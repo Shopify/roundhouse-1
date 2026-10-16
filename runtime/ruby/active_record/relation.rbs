@@ -216,6 +216,7 @@ module ActiveRecord
     def reflected_join_sql: (untyped owner, untyped spec, String kind) -> String
     def reflect_join_hop: (untyped owner, untyped name) -> untyped
     def reflection_join_sql: (untyped owner, untyped reflection, String kind, ?String? table_alias, ?String? owner_ref) -> String
+    def join_key_pairs: (untyped reflection) -> Array[[String, String]]?
     def join_key_list: (untyped key) -> Array[String]
     def left_outer_joins: (untyped spec) -> Relation
     def left_outer_joins!: (untyped spec) -> Relation
