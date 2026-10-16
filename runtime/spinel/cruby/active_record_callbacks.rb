@@ -585,7 +585,7 @@ module ActiveRecord
     # writes active_record_core.rb captured), without a redefinition
     # warning.
     [:save, :save!, :destroy!, :mark_persisted!, :_run_commit_hooks, :_transaction_rolled_back,
-     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch, :_runtime_touch_written].each do |name|
+     :_runtime_save_after_validation, :_runtime_destroy, :_runtime_touch, :_runtime_touch_written, :_runtime_touch_named].each do |name|
       remove_method(name) if method_defined?(name, false) || private_method_defined?(name, false)
     end
     singleton_class.send(:remove_method, :create!) if singleton_class.method_defined?(:create!, false)
@@ -727,6 +727,26 @@ module ActiveRecord
 
       def _runtime_touch_written
         _runtime_touch_with { _adapter_update }
+      end
+
+      # Rails' `touch(*names, time:)`: the named attributes and the
+      # update timestamps the model has are all written `time` (now when
+      # none is given), so a `touch(:touched_at)` leaves `touched_at`
+      # and `updated_at` equal. The whole row is written, as in
+      # `_runtime_touch_written`.
+      def _runtime_touch_named(names, time)
+        _runtime_touch_with do
+          time ||= ActiveSupport.db_now
+          columns = self.class.schema_columns
+          written = ["updated_at", "updated_on"].select { |column| columns.include?(column.to_sym) }
+          names.each do |name|
+            column = (self.class.attribute_aliases[name.to_s] || name).to_s
+            written << column unless written.include?(column)
+          end
+          written.each { |column| self[column] = time }
+          _adapter_update
+          clear_attribute_changes(written)
+        end
       end
 
       def _runtime_touch_with

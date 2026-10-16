@@ -282,6 +282,39 @@ module ActiveRecord
       self
     end
 
+    # Rails' `initialize_dup`: `dup` answers a NEW record with the
+    # attributes copied and the primary key and the timestamps cleared
+    # (`@attributes.reset(@primary_key)`, `clear_timestamp_attributes`),
+    # not destroyed, with no loaded associations, errors or saved
+    # changes of the original, and the initialize callbacks run.
+    def initialize_dup(other)
+      super
+      @persisted = false
+      @destroyed = false
+      @readonly = false
+      @errors = _fresh_errors
+      @error_details = []
+      @saved_changes = nil
+      @id_previously_changed = false
+      @__last_saved_attributes = nil
+      @__forced_changes = nil
+      @_new_record_before_last_commit = false
+      @_trigger_update_callback = false
+      @_trigger_destroy_callback = false
+      @_committed_already_called = false
+      @destroyed_by_association = nil
+      instance_variables.each do |ivar|
+        instance_variable_set(ivar, false) if ivar.end_with?("_loaded") && instance_variable_get(ivar) == true
+      end
+      primary_key = self.class.primary_key
+      self[primary_key] = nil if primary_key.is_a?(String)
+      columns = self.class.schema_columns
+      [:created_at, :created_on, :updated_at, :updated_on].each do |column|
+        self[column] = nil if columns.include?(column)
+      end
+      after_initialize
+    end
+
     # Clears all dirty data: current changes and previous changes.
     def clear_changes_information
       @__last_saved_attributes = _attribute_snapshot
@@ -358,9 +391,12 @@ module ActiveRecord
       _runtime_destroy
     end
 
-    def touch
+    # Rails' `touch(*names, time: nil)`: with names or a time, those
+    # attributes (and the update timestamps) are written `time`.
+    def touch(*names, time: nil)
       _raise_readonly_record_error if readonly?
-      _runtime_touch
+      return _runtime_touch if names.empty? && time.nil?
+      _runtime_touch_named(names, time)
     end
 
     def touch_written

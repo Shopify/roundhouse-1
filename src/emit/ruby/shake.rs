@@ -170,6 +170,51 @@ fn tokens<'a>(line: &'a str, out: &mut HashSet<&'a str>, defined: Option<&str>) 
     }
 }
 
+/// The fixed halves of a method name built by interpolation:
+/// `"#{option}_previously_changed?"` calls whatever ends in
+/// `_previously_changed?`, `"saved_change_to_#{col}?"` whatever starts
+/// with `saved_change_to_`. No token of such a line names the method, so
+/// a def with that suffix or prefix is kept. Affixes shorter than three
+/// characters (`"#{x}s"`) would keep nearly everything and are ignored.
+fn dynamic_affixes(line: &str, suffixes: &mut HashSet<String>, prefixes: &mut HashSet<String>) {
+    let bytes = line.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'?' || b == b'!';
+    let mut from = 0;
+    while let Some(open) = line[from..].find("#{") {
+        let open = from + open;
+        let mut start = open;
+        while start > 0 && ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        if open - start >= 3 {
+            prefixes.insert(line[start..open].to_owned());
+        }
+        // Skip to the matching `}` of the interpolation.
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, b) in bytes.iter().enumerate().skip(open + 2) {
+            match b {
+                b'{' => depth += 1,
+                b'}' if depth == 0 => {
+                    close = Some(i);
+                    break;
+                }
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        let mut end = close + 1;
+        while end < bytes.len() && ident(bytes[end]) {
+            end += 1;
+        }
+        if end - (close + 1) >= 3 {
+            suffixes.insert(line[close + 1..end].to_owned());
+        }
+        from = close + 1;
+    }
+}
+
 /// Delete `def <name>` spans from a file body. Returns the number of
 /// defs removed. Single-line defs (`def x; end`) delete just their
 /// line; multi-line defs delete through the matching `end` at the
@@ -305,6 +350,9 @@ pub fn shake_tree(
                 && (is_framework_runtime(path) || path.starts_with("app/models/")))
     }).collect();
     let mut stable_usage: HashSet<String> = HashSet::default();
+    // Never cleared: keeping a def a dropped body once reached is safe.
+    let mut dyn_suffixes: HashSet<String> = HashSet::default();
+    let mut dyn_prefixes: HashSet<String> = HashSet::default();
     let mut total_runtime = 0usize;
     let mut total_synth = 0usize;
     for pass in 0..10 {
@@ -329,6 +377,9 @@ pub fn shake_tree(
                     sig_line_name(line)
                 };
                 tokens(line, out, defined);
+                if line.contains("#{") {
+                    dynamic_affixes(line, &mut dyn_suffixes, &mut dyn_prefixes);
+                }
             }
         }
 
@@ -355,6 +406,8 @@ pub fn shake_tree(
                     if !usage.contains(name)
                         && !stable_tokens.contains(name)
                         && !stable_usage.contains(name)
+                        && !dyn_suffixes.iter().any(|affix| name.ends_with(affix.as_str()))
+                        && !dyn_prefixes.iter().any(|affix| name.starts_with(affix.as_str()))
                     {
                         dead.insert(name.to_owned());
                     }
@@ -414,6 +467,30 @@ mod tests {
             found,
             HashSet::from_iter(["ready!", "ready", "other", "next?", "_keep"])
         );
+    }
+
+    #[test]
+    fn interpolated_names_yield_their_fixed_affixes() {
+        let (mut suffixes, mut prefixes) = (HashSet::default(), HashSet::default());
+        dynamic_affixes(
+            r##"any? { |o| public_send("#{o}_previously_changed?".to_sym) } send("saved_change_to_#{c}?") "#{x}s""##,
+            &mut suffixes,
+            &mut prefixes,
+        );
+        assert_eq!(suffixes, HashSet::from_iter(["_previously_changed?".to_owned()]));
+        assert_eq!(prefixes, HashSet::from_iter(["saved_change_to_".to_owned()]));
+    }
+
+    #[test]
+    fn a_def_reached_through_an_interpolated_name_is_kept() {
+        // ProductVariant#option_values_previously_changed?:
+        // `public_send("#{option}_previously_changed?")`.
+        let model = "class A\n  def option1_previously_changed?\n    true\n  end\n  def option1_changed?\n    true\n  end\n  def go\n    [:option1].any? { |o| public_send(\"#{o}_previously_changed?\") }\n  end\nend\n";
+        let mut files = vec![("app/models/a.rb".to_owned(), model.to_owned())];
+        let synth = HashSet::from_iter(["option1_previously_changed?".to_owned(), "option1_changed?".to_owned()]);
+        shake_tree(&mut files, &synth, "test");
+        assert!(files[0].1.contains("def option1_previously_changed?"));
+        assert!(!files[0].1.contains("def option1_changed?"));
     }
 
     #[test]
