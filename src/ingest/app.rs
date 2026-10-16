@@ -3449,6 +3449,11 @@ end
     // their targets qualified as they are added, and the polymorphic
     // ones resolved with the rest.
     if super::macro_associations::declare(&mut app) {
+        // A `readonly_has_one :x, through: :y` is declared here, after the
+        // pass above ran: its class is the source association's too (Core's
+        // `Shop#shopify_payments_account` is `ShopifyPayments::Account`,
+        // by `ShopLegalEntity`'s `class_name:`, not a `ShopifyPaymentsAccount`).
+        resolve_has_one_through_targets(&mut app);
         resolve_polymorphic_targets(&mut app);
     }
     super::macro_associations::declare_subclasses(&mut app);
@@ -4014,13 +4019,16 @@ fn app_class_method_call(
             });
         }
         if let Some((last, holder)) = written.split_last()
-            && !holder.is_empty()
+            && (!holder.is_empty() || depth > 0)
         {
+            let written_holder = !holder.is_empty();
             let holder = scope[..depth].iter().chain(holder.iter()).copied().collect::<Vec<_>>().join("::");
             let aliased = by_name.get(holder.as_str()).is_some_and(|at| {
                 at.iter().any(|&i| {
                     app.library_classes[i].constants.iter().any(|(name, value)| {
-                        name.as_str() == *last && matches!(&*value.node, crate::expr::ExprNode::Const { .. })
+                        name.as_str() == *last
+                            && ((written_holder && matches!(&*value.node, crate::expr::ExprNode::Const { .. }))
+                                || constructs_app_instance_answering(app, by_name, &holder, value, method))
                     })
                 })
             });
@@ -15266,4 +15274,42 @@ fn redirect_super(m: &mut crate::dialect::MethodDef) {
         }
     }
     rewrite(&mut m.body, &target, &forwarded);
+}
+
+/// Whether a library class's constant is `Klass.new(...)` of one of the
+/// app's library classes whose instance methods answer `method`: Core's
+/// `Podding::Redis::ClientFactory = ClientsByType.new`, whose
+/// `register(owner:, accessor:)` a class body calls
+/// (`Podding::Redis::ClientFactory.register(owner: self, accessor: :redis)
+/// do … end`) to bind the accessor it reads.
+fn constructs_app_instance_answering(
+    app: &App,
+    by_name: &crate::det::HashMap<&str, Vec<usize>>,
+    holder: &str,
+    value: &crate::expr::Expr,
+    method: &crate::ident::Symbol,
+) -> bool {
+    use crate::expr::ExprNode;
+    let ExprNode::Send { recv: Some(r), method: ctor, .. } = &*value.node else { return false };
+    let ExprNode::Const { path } = &*r.node else { return false };
+    if ctor.as_str() != "new" {
+        return false;
+    }
+    let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+    // The constant resolves from the holder's namespace outward, as Ruby
+    // reads it in the holder's body.
+    let scope: Vec<&str> = holder.split("::").collect();
+    let depths: Vec<usize> = if rooted { vec![0] } else { (0..=scope.len()).rev().collect() };
+    depths.into_iter().any(|depth| {
+        let name = scope[..depth].iter().chain(written.iter()).copied().collect::<Vec<_>>().join("::");
+        by_name.get(name.as_str()).is_some_and(|at| {
+            at.iter().any(|&i| {
+                app.library_classes[i]
+                    .methods
+                    .iter()
+                    .any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name == *method)
+            })
+        })
+    })
 }

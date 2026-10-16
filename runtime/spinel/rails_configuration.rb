@@ -102,6 +102,24 @@ module Rails
     end
   end
 
+  # `Rails.context` — the gurgel gem's RailsContextExtension (Core's
+  # `Rails.load_embedded_engines` reads `config/contexts.yml` and requires
+  # the engines of the context `RAILS_CONTEXT` selects, "all" by default;
+  # `Rails.context` answers that name as an inquirer). Core asks it
+  # `Rails.context.essentials?` / `server_intents?` / `all?`, compares it
+  # (`Rails.context != "essentials"`) and stores it as the request's
+  # RAILS_CONTEXT. A StringInquirer like `Rails.env`: the name is the
+  # value, a predicate for any other name is false. Read from ENV on each
+  # call so a test that sets RAILS_CONTEXT sees it; the inquirer built for
+  # the current name is kept (a stub or `equal?` check sees one object).
+  def self.context
+    name = ENV.fetch("RAILS_CONTEXT", "all")
+    name = "all" if name.empty?
+    cached = @context
+    return cached if cached && cached == name
+    @context = ActiveSupport::StringInquirer.new(name)
+  end
+
   # `Rails.logger` on this tree is the logger railties' bootstrap
   # initializer makes (railties 8.2.0.alpha application/bootstrap.rb:34-64,
   # `initialize_logger`): `config.logger`, or else an ActiveSupport::Logger

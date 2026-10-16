@@ -116,4 +116,54 @@ module ActiveRecord
     private :unscope_clause
   end
   Relation.prepend(RelationSelectValues)
+
+  # Rails' `Relation#joins_values` / `left_outer_joins_values`: the specs
+  # `joins` / `left_outer_joins` were given, as written (Symbols, Hashes,
+  # Strings), in order, each once (`joins_values |= args`). The shared
+  # relation keeps only the join SQL, so the overlay records the specs
+  # beside it, as it does for `select_values`: Core's
+  # `GeneralizedBatchedFinder::Cursor` reads `relation.joins_values` to
+  # require fully-qualified cursor columns once the relation joins a table.
+  # Arrays are replaced, never appended to, so a spawned relation shares
+  # its parent's list safely. `unscope(:joins)` clears the lists with the
+  # SQL, and a relation built under a current scope inherits the scope's.
+  module RelationJoinsValues
+    def joins!(spec)
+      super
+      @joins_values = joins_values | [spec]
+      self
+    end
+
+    def left_outer_joins!(spec)
+      super
+      @left_outer_joins_values = left_outer_joins_values | [spec]
+      self
+    end
+
+    def joins_values
+      @joins_values || []
+    end
+
+    def left_outer_joins_values
+      @left_outer_joins_values || []
+    end
+
+    def inherit_scope(scope)
+      super
+      @joins_values = joins_values | scope.joins_values
+      @left_outer_joins_values = left_outer_joins_values | scope.left_outer_joins_values
+      self
+    end
+    private :inherit_scope
+
+    def unscope_clause(scope)
+      if scope == :joins || scope == :left_outer_joins
+        @joins_values = []
+        @left_outer_joins_values = []
+      end
+      super
+    end
+    private :unscope_clause
+  end
+  Relation.prepend(RelationJoinsValues)
 end

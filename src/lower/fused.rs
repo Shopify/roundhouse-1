@@ -155,7 +155,16 @@ pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
         .iter()
         .map(|m| m.name.0.as_str().to_string())
         .collect();
-    let sti_names = super::sti_is_a::subclass_type_names(app);
+    // The PostgreSQL CRuby tree hydrates a row as its STI subclass
+    // (`apply_sti_hydration`), so `is_a?` answers there. A column read
+    // would NoMethodError on a receiver that is no STI row: Core's
+    // `ledger.is_a?(StripeConnect::Account)` on a polymorphic `ledger`
+    // that is a `Payments::Account`, which has no `type`.
+    let sti_names = if app.carries_postgresql_runtime() {
+        crate::det::HashMap::default()
+    } else {
+        super::sti_is_a::subclass_type_names(app)
+    };
     let contracts = super::controller_class_render::call_contracts(app);
     let none = HashSet::default();
 
