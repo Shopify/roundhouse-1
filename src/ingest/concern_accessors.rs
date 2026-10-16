@@ -1176,6 +1176,18 @@ pub(super) fn splice_into_library_includers(
                         .find(|m| app.gem_boundary.loaded_mixed_in_class_methods(&top(m)).contains(&name))
                         .map(top)
                 };
+                // ActiveModel::AttributeMethods' `attribute_method_prefix`,
+                // `_suffix` and `_affix` (KeyValueModel::AttributeMethods:
+                // `attribute_method_suffix '='`): the port answers them on a
+                // class that includes it, so they run after that include,
+                // the block's own or the includer's.
+                let attribute_methods_anchor = |method: &str| -> Option<ClassId> {
+                    if !matches!(method, "attribute_method_prefix" | "attribute_method_suffix" | "attribute_method_affix") {
+                        return None;
+                    }
+                    let is_port = |m: &ClassId| top(m).0.as_str() == "ActiveModel::AttributeMethods";
+                    block_included.iter().rev().find(|m| is_port(m)).or_else(|| lc.includes.iter().find(|m| is_port(m))).map(top)
+                };
                 if !job
                     && !lc.is_module
                     && hook.is_none()
@@ -1186,12 +1198,15 @@ pub(super) fn splice_into_library_includers(
                         || gained.contains(method.as_str())
                         || gem_class_side(lc, method.as_str())
                         || gem_anchor(method.as_str()).is_some()
+                        || attribute_methods_anchor(method.as_str()).is_some()
                         || test_case_side(lc, method.as_str()))
                 {
                     if method.as_str() == "define_model_callbacks" {
                         gained.extend(model_callback_names(expr));
                     }
-                    let root_id = gem_anchor(method.as_str()).unwrap_or_else(|| top(&lc.includes[*root]));
+                    let root_id = gem_anchor(method.as_str())
+                        .or_else(|| attribute_methods_anchor(method.as_str()))
+                        .unwrap_or_else(|| top(&lc.includes[*root]));
                     let class_attributes: &[Symbol] = &declared;
                     if let ModelBodyItem::Unknown { expr, .. } =
                         super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
