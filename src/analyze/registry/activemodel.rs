@@ -77,6 +77,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("empty?", Ty::Bool),
         ("include?", Ty::Bool),
         ("full_messages", str_arr()),
+        // Rails aliases `to_a` to `full_messages`.
+        ("to_a", str_arr()),
         // `errors[:title]` returns an Array<String> of messages for that attribute.
         ("[]", str_arr()),
         ("messages_for", str_arr()),

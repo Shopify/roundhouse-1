@@ -185,6 +185,17 @@ module ActionDispatch
       @env["PATH_INFO"] || "/"
     end
 
+    # Rack::Request::Helpers' `path_info`: the PATH_INFO header, "" when
+    # absent (a controller-test request has none until `path=`). Core's
+    # MultiSessionStore routes a request by it.
+    def path_info
+      @env["PATH_INFO"].to_s
+    end
+
+    def path_info=(value)
+      set_header("PATH_INFO", value.to_s)
+    end
+
     def query_string
       @env["QUERY_STRING"] || ""
     end
@@ -749,6 +760,27 @@ end
 module ActionController
   class Base
     attr_accessor :request
+
+    # Rack::Response::Helpers' header accessors, over the response
+    # headers: this controller IS its own response, so
+    # `response.set_header(name, value)` (Core's API deprecation concern
+    # writes its reason header so) lands in the store the dispatchers
+    # copy to the outgoing response.
+    def get_header(name)
+      @headers[name]
+    end
+
+    def set_header(name, value)
+      @headers[name] = value
+    end
+
+    def has_header?(name)
+      !@headers[name].nil?
+    end
+
+    def delete_header(name)
+      @headers.delete(name)
+    end
 
     # Rails' controller-test `recycle!` (actionpack
     # action_controller/test_case.rb): the response this controller is

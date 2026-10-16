@@ -119,13 +119,14 @@ pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
 /// holds full-message Strings, so these run over
 /// `ActiveModel::ErrorAttributes.objects(errors)`. A blockless count,
 /// emptiness or truth query answers the same over the messages and
-/// stays on the accumulator.
+/// stays on the accumulator, and so does `to_a`, which Rails aliases to
+/// `full_messages`.
 pub fn errors_enumerable(method: &str, args: usize, block: bool) -> bool {
     match method {
         "errors" | "objects" => args == 0 && !block,
         "each" | "any?" | "none?" | "all?" | "one?" | "count" => block,
         "map" | "collect" | "flat_map" | "collect_concat" | "filter_map" | "select" | "filter" | "reject"
-        | "find" | "detect" | "find_index" | "first" | "to_a" | "entries" | "each_with_object"
+        | "find" | "detect" | "find_index" | "first" | "entries" | "each_with_object"
         | "each_with_index" | "inject" | "reduce" | "group_by" | "partition" | "sort_by" | "min_by"
         | "max_by" | "sum" | "take" | "drop" | "take_while" | "drop_while" | "uniq" | "tally"
         | "each_slice" | "zip" | "index_by" | "index_with" | "pluck" | "many?" => true,

@@ -3553,6 +3553,28 @@ module ActiveRecord
         define_method(reader) { |*args, **options, &block| ::ActiveModel::ErrorAttributes.public_send(reader, self, *args, **options, &block) }
       end
       alias_method :has_key?, :key?
+
+      # Rails' Errors includes Enumerable over `each`, which yields each
+      # ActiveModel::Error (`error.attribute`, `error.type`), where the
+      # accumulator's Array yields the full message Strings. Where the
+      # compiler cannot see the receiver is the collection (an `errors`
+      # held in a struct, a result or a local, `error.active_model_errors`)
+      # these run over the Errors the pushes recorded. `each`, `to_a`
+      # (Rails' `full_messages`) and the blockless count and emptiness
+      # queries stay Array's own, as the compiled rules use them on the
+      # accumulator.
+      %i[map collect flat_map collect_concat filter_map select filter reject find detect find_index
+         each_with_object each_with_index inject reduce group_by partition sort_by min_by max_by sum
+         take_while drop_while tally uniq each_slice zip index_by index_with pluck first take drop].each do |reader|
+        define_method(reader) { |*args, &block| ::ActiveModel::ErrorAttributes.objects(self).public_send(reader, *args, &block) }
+      end
+
+      %i[any? none? all? one? count many?].each do |reader|
+        define_method(reader) do |*args, &block|
+          return super(*args) if block.nil?
+          ::ActiveModel::ErrorAttributes.objects(self).public_send(reader, *args, &block)
+        end
+      end
     end
 
     # A validate callback (ActiveSupport::Callbacks::Callback) with its
