@@ -8750,6 +8750,17 @@ fn apply_route_helpers_demand(files: &mut Vec<(String, String)>) {
          # not in this tree), so no route helper is generated. Code that\n\
          # names one loads; calling it raises NoMethodError, naming it.\n\
          module RouteHelpers\n\
+         end\n\
+         \n\
+         # An app module that includes it (Core's UrlHelpers, `class << self`\n\
+         # around `include(Rails.application.routes.url_helpers)`) is called\n\
+         # on the module itself, so it answers by the url_helpers dispatch:\n\
+         # a name the route set does not draw is a refusal naming the route\n\
+         # blocks this tree does not draw, not a bare NoMethodError.\n\
+         module RouteHelpers\n\
+         \x20 def self.included(base)\n\
+         \x20   base.extend(Rails::Application::UrlHelpers::Dispatch) if defined?(Rails::Application::UrlHelpers::Dispatch)\n\
+         \x20 end\n\
          end\n"
             .to_string(),
     ));
