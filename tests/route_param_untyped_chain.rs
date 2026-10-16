@@ -261,3 +261,37 @@ fn a_local_rebound_to_an_unclassifiable_value_stays_unprojected() {
         "the call itself must survive untouched:\n{out}"
     );
 }
+
+/// A bare name the class does not define is not a call to another class's
+/// method of the same name. Core's `Sales::Query::OrderResponse` reads
+/// `token` from query_layer's `delegate_field :token` (a String), and a
+/// controller elsewhere answers a record under that name: slice-wide, the
+/// String was projected `token.id.to_s` and died `undefined method 'id' for
+/// an instance of String`.
+#[test]
+fn a_bare_name_the_class_does_not_define_is_not_another_classes_method() {
+    let out = emit_helper(
+        "  def token\n    current_user.rooms.original\n  end\n  \
+         def current_user\n    User.first\n  end\n",
+        "  def back_link\n    room_path(token)\n  end\n",
+    );
+    assert!(
+        out.contains("room_path(token)") && !out.contains("token.id"),
+        "a name no ancestor defines must not project:\n{out}"
+    );
+}
+
+/// The same name DEFINED by the class's ancestor still resolves through its
+/// body (the first test of this file, with the name `token`).
+#[test]
+fn a_bare_name_an_ancestor_defines_projects_through_its_body() {
+    let out = emit(
+        "  def token\n    current_user.rooms.original\n  end\n  \
+         def current_user\n    User.first\n  end\n",
+        "  def index\n    redirect_to RouteHelpers.room_path(token)\n  end\n",
+    );
+    assert!(
+        out.contains("RouteHelpers.room_path(token.id)"),
+        "an inherited method answering a record must project:\n{out}"
+    );
+}

@@ -43,7 +43,7 @@ module ActionController
     def record_permanent: (String | Symbol key) -> String
     def flag_expires: (String | Symbol key) -> String
     def self.permanent_expires: () -> String
-    def delete: (String | Symbol key) -> String
+    def delete: (String | Symbol key, ?Hash[Symbol, String | Symbol | bool]? options) -> String
     def pending: () -> Hash[String, String]
     def to_h: () -> Hash[String, String]
     def to_hash: () -> Hash[String, String]
@@ -59,7 +59,7 @@ module ActionController
     def []: (String | Symbol key) -> String?
     def []=: (String | Symbol key, untyped value) -> untyped
     def permanent: () -> ActionController::SignedCookieJar
-    def delete: (String | Symbol key) -> String
+    def delete: (String | Symbol key, ?Hash[Symbol, String | Symbol | bool]? options) -> String
     def self.value_of: (Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
   end
 
@@ -74,7 +74,7 @@ module ActionController
     # cookie write takes.
     def []=: (String | Symbol key, Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
     def signed: () -> ActionController::SignedCookieJar
-    def delete: (String | Symbol key) -> String
+    def delete: (String | Symbol key, ?Hash[Symbol, String | Symbol | bool]? options) -> String
   end
 
   class Base

@@ -238,9 +238,22 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
         if view.is_empty() {
             continue;
         }
+        // A class method's receiverless `new(**attrs)` constructs this
+        // class: `initialize` is the callee. Core's T::Struct does
+        // `private_class_method :new`, which keeps the call receiverless
+        // (an explicit `Klass.new` would be a private call), and so out of
+        // the typed-receiver rewrite above.
+        let constructor: HashMap<Symbol, Vec<Param>> = view
+            .get(&Symbol::from("initialize"))
+            .map(|params| HashMap::from_iter([(Symbol::from("new"), params.clone())]))
+            .unwrap_or_default();
         for m in &mut lc.methods {
-            if matches!(m.receiver, MethodReceiver::Instance) {
-                rewrite_self_sends(&mut m.body, &view, diags);
+            match m.receiver {
+                MethodReceiver::Instance => rewrite_self_sends(&mut m.body, &view, diags),
+                MethodReceiver::Class if !constructor.is_empty() => {
+                    rewrite_self_sends(&mut m.body, &constructor, diags)
+                }
+                _ => {}
             }
         }
     }
