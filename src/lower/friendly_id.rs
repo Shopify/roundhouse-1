@@ -19,7 +19,7 @@
 //! def self.friendly = ActiveRecord::Relation.new(self).friendly
 //! def to_param                              # friendly_id.presence || id
 //!   s = slug
-//!   (s.nil? || s.empty?) ? @id.to_s : s
+//!   (s.nil? || s.empty?) ? self.id.to_s : s
 //! end
 //! ```
 //!
@@ -216,7 +216,7 @@ pub(crate) fn push_friendly_methods(methods: &mut Vec<MethodDef>, model: &Model)
 
   def to_param
     s = {slug}
-    (s.nil? || s.empty?) ? @id.to_s : s
+    (s.nil? || s.empty?) ? self.id.to_s : s
   end
 end
 ",

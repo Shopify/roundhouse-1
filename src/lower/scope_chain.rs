@@ -4568,7 +4568,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                             ctx.assocs.has_many_fk(&self_model, aname).cloned().map(
                                 |(target, fk)| {
                                     let key = ctx.assocs.has_many_owner_key(Some(&self_model), aname);
-                                    (target, fk, syn(span, ExprNode::Ivar { name: key }))
+                                    (target, fk, syn(crate::span::Span::synthetic(), ExprNode::Ivar { name: key }))
                                 },
                             )
                         }),

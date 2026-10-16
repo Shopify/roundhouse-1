@@ -116,7 +116,10 @@ fn composite_primary_key_compiles_to_the_tuple() {
         "    def id\n      [self.shop_id, self.id_value, self.island]\n    end\n",
         "  def id_value\n    @id\n  end\n",
         "  def self.primary_key\n    [\"shop_id\", \"id\", \"island\"]\n  end\n",
-        r#"WHERE \"shop_id\" = " + Db.escape_int(@shop_id) + " AND \"id\" = " + Db.escape_int(@id) + " AND \"island\" = "#,
+        // `shop_id` and `id` are NOT NULL with no default, so they read nil when unset and bind
+        // through the `_opt` primitive (an unset one reaches the database as NULL, as in Rails);
+        // `island` has a default.
+        r#"WHERE \"shop_id\" = " + Db.escape_int_opt(@shop_id) + " AND \"id\" = " + Db.escape_int_opt(@id) + " AND \"island\" = "#,
     ] {
         assert!(order.contains(expected), "missing {expected:?} in:\n{order}");
     }
