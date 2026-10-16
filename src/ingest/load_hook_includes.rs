@@ -321,7 +321,11 @@ pub(super) fn lift_autoload_includes<V: Vfs + ?Sized>(app: &mut App, vfs: &V, bo
             let Some(includes) = receiver_includes(&body, &cpath, param.as_deref(), &known) else {
                 // The block does other work too: it runs at load, as written,
                 // and its includes are the class's from then on.
-                for (_, args) in block_includes(&body, &cpath, param.as_deref(), &known) {
+                let mut lifted = Vec::new();
+                for (call, args) in block_includes(&body, &cpath, param.as_deref(), &known) {
+                    if let Some(expr) = include_statement(&call, &args, &file) {
+                        lifted.push(expr);
+                    }
                     for arg in args {
                         let Some(path) = constant_path_of(&arg) else { continue };
                         let module = crate::ident::ClassId(crate::ident::Symbol::from(path.join("::").trim_start_matches("::")));
@@ -331,6 +335,20 @@ pub(super) fn lift_autoload_includes<V: Vfs + ?Sized>(app: &mut App, vfs: &V, bo
                         }
                     }
                 }
+                // The includes also end the class's body, where its
+                // concerns' `included` blocks and class macros reach it
+                // as they do for a model's own include; the block still
+                // runs at load, and including again is a no-op.
+                let model = &mut app.models[index];
+                let own = model.span.file;
+                let end = model.body.iter().rposition(|item| item.span().file == own).map_or(model.body.len(), |i| i + 1);
+                let done = appended.entry(cpath.clone()).or_default();
+                let at = (end + *done).min(model.body.len());
+                *done += lifted.len();
+                let items = lifted
+                    .into_iter()
+                    .map(|expr| ModelBodyItem::Unknown { expr, leading_comments: Vec::new(), leading_blank_line: false });
+                model.body.splice(at..at, items);
                 continue;
             };
             let mut exprs = Vec::new();
@@ -375,6 +393,28 @@ pub(super) fn lift_autoload_includes<V: Vfs + ?Sized>(app: &mut App, vfs: &V, bo
             });
         }
     }
+}
+
+/// `include(M, …)` as a class-body statement, from the call it was
+/// written as (`klass.include(M, …)`) and its module arguments.
+fn include_statement(call: &CallNode<'_>, args: &[Node<'_>], file: &str) -> Option<crate::expr::Expr> {
+    let args = args.iter().map(|a| super::expr::ingest_expr(a, file)).collect::<Result<Vec<_>, _>>().ok()?;
+    let loc = call.location();
+    let span = crate::span::Span {
+        file: super::sources::file_id(file),
+        start: loc.start_offset() as u32,
+        end: loc.end_offset() as u32,
+    };
+    Some(crate::expr::Expr::new(
+        span,
+        crate::expr::ExprNode::Send {
+            recv: None,
+            method: crate::ident::Symbol::from("include"),
+            args,
+            block: None,
+            parenthesized: false,
+        },
+    ))
 }
 
 /// `Rails.autoloaders.main.on_load("Cpath") do |value, abspath| … end`

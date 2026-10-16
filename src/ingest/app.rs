@@ -3018,6 +3018,9 @@ end
         // `Rails.autoloaders.main.on_load("ApplicationRecord") {
         // ApplicationRecord.include(M) }`: the include ends the model's body.
         super::load_hook_includes::lift_autoload_includes(&mut app, vfs, &boot_initializers);
+        // `MODELS.each_key { |m| on_load(m) { |klass| … } }` over a literal
+        // list: each model's body takes the block's statements.
+        super::autoload_loop_expansion::expand_autoload_loops(&mut app, vfs, &boot_initializers);
     }
     // A model's `begin include(X) rescue NameError end` becomes its
     // `include`s (or nothing), now that every module of the app is

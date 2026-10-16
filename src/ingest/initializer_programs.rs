@@ -559,18 +559,24 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
             }
             // A Zeitwerk callback ingest moved into its constant's body
             // (`load_hook_includes::lift_autoload_includes`): its check.
-            if let Some(lifted) =
-                app.lifted_autoload_callbacks.iter().find(|l| l.file == file && l.start as usize == start).cloned()
-            {
+            let lifted: Vec<crate::app::LiftedAutoloadCallback> =
+                app.lifted_autoload_callbacks.iter().filter(|l| l.file == file && l.start as usize == start).cloned().collect();
+            if !lifted.is_empty() {
                 let site = label(&rel, &text, &stmt);
                 let span = crate::span::Span {
                     file: super::sources::file_id(&file),
                     start: start as u32,
                     end: end as u32,
                 };
-                match lifted_registration(&lifted.cpath, &site, span) {
-                    Ok(expr) => {
-                        kept.push(guard(expr, &site));
+                // One check per constant (a loop's statement lifts to
+                // each model it names).
+                let checks: Result<Vec<Expr>, String> =
+                    lifted.iter().map(|l| lifted_registration(&l.cpath, &site, span)).collect();
+                match checks {
+                    Ok(exprs) => {
+                        for expr in exprs {
+                            kept.push(guard(expr, &site));
+                        }
                         super::initializers::consume(&file, start, end);
                         carried += 1;
                     }
@@ -1073,8 +1079,8 @@ pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
 /// hash's string keys.
 #[derive(Clone, Default)]
 pub(super) struct LiteralConstants {
-    arrays: BTreeMap<String, Vec<String>>,
-    hash_keys: BTreeMap<String, Vec<String>>,
+    pub(super) arrays: BTreeMap<String, Vec<String>>,
+    pub(super) hash_keys: BTreeMap<String, Vec<String>>,
 }
 
 impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
@@ -1306,7 +1312,7 @@ fn cap(text: &str, max: usize) -> String {
 /// `keys` the string keys of a hash literal (what `each_key` and `keys`
 /// walk), directly, through `.freeze`/`.keys`, or as a constant the file
 /// assigns one to.
-fn literal_strings(node: &Node<'_>, keys: bool, constants: &LiteralConstants) -> Option<Vec<String>> {
+pub(super) fn literal_strings(node: &Node<'_>, keys: bool, constants: &LiteralConstants) -> Option<Vec<String>> {
     if let Some(call) = node.as_call_node() {
         let recv = call.receiver()?;
         if call.arguments().is_some() || call.block().is_some() {

@@ -74,6 +74,7 @@ pub(crate) mod validates;
 mod delegated_type;
 mod base_includes;
 mod load_hook_includes;
+mod autoload_loop_expansion;
 mod model_macros;
 mod define_method_loops;
 pub(crate) mod macro_associations;

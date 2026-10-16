@@ -3430,7 +3430,7 @@ fn key_options_of(hash: &ruby_prism::HashNode<'_>) -> composite_keys::KeyOptions
 /// per-model override of the `id` default. Prism parses it as a call to
 /// `primary_key=` on an explicit `self` receiver, which would otherwise
 /// land in `ModelBodyItem::Unknown` and be dropped.
-fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
+pub(super) fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
     let call = stmt.as_call_node()?;
     call.receiver()?.as_self_node()?;
     if constant_id_str(&call.name()) != "primary_key=" {
@@ -3444,7 +3444,7 @@ fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
 
 /// `self.primary_key = [:shop_id, :id]` — Rails' composite primary key,
 /// a literal list of two or more string/symbol column names.
-fn parse_composite_primary_key_decl(stmt: &Node<'_>) -> Option<Vec<Symbol>> {
+pub(super) fn parse_composite_primary_key_decl(stmt: &Node<'_>) -> Option<Vec<Symbol>> {
     let call = stmt.as_call_node()?;
     call.receiver()?.as_self_node()?;
     if constant_id_str(&call.name()) != "primary_key=" {
