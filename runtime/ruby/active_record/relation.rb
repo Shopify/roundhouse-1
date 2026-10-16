@@ -1822,7 +1822,9 @@ module ActiveRecord
       raise ArgumentError, "select: no columns (a block form reached the projection)" if specs.empty?
       unload_records
       cols = []
-      specs.each do |spec|
+      # Rails' `arel_columns` flat_maps the fields: `select(COLUMNS)` with
+      # a column-list Array constant projects each column.
+      specs.flatten.each do |spec|
         cols << (spec.is_a?(Symbol) ? "#{@table}.#{spec}" : spec.to_s)
       end
       # Rails' `select_values |= fields`: a later `select` adds to the
@@ -3074,9 +3076,11 @@ module ActiveRecord
       end
       return [] if @null
       prior = @select_sql
+      # Rails' `arel_columns` flat_maps its fields, so `pluck([:a, :b])`
+      # (a column-list constant) plucks `:a` and `:b`.
       # A column with a declared type reads through it, as Rails' does; an
       # alias names its column.
-      names = cols.map { |col| @model._attribute_name(col.to_s) }
+      names = cols.flatten.map { |col| @model._attribute_name(col.to_s) }
       projections = []
       names.each_with_index { |name, i| projections << "#{@table}.#{name} AS v#{i}" }
       @select_sql = projections.join(", ")
