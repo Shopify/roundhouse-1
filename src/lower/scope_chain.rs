@@ -1174,10 +1174,9 @@ pub struct AssocRegistry {
     /// (model, association name) -> `"<target_table> ON <cond>"`; the
     /// rewrite prefixes `INNER JOIN` / `LEFT OUTER JOIN` by call. Direct
     /// `belongs_to`/`has_many`/`has_one`, plus resolvable `has_many
-    /// :through` — a through tail carries its own second `INNER JOIN`, so
-    /// a `left_outer_joins(:through_assoc)` would outer-join only the
-    /// first hop (no such call exists in the exercised apps; revisit if
-    /// one appears). Habtm and unresolvable through shapes stay absent,
+    /// :through` — a through tail carries its own second `INNER JOIN`,
+    /// which `join_spec_sql` re-kinds to the call's own (`left_joins`
+    /// outer-joins every hop). Habtm and unresolvable through shapes stay absent,
     /// so their `joins(:sym)` is left untouched (visible at runtime
     /// rather than silently mis-joined).
     join_tails: HashMap<(ClassId, Symbol), String>,
@@ -3355,9 +3354,19 @@ fn range_clause(col: &str, e: &Expr, binds: &mut Vec<Expr>) -> Option<String> {
 /// join would silently answer the wrong rows — the same standard the
 /// single-hop form has always held.
 fn join_spec_sql(model: &ClassId, spec: &Expr, kind: &str, ctx: &Ctx) -> Option<String> {
+    // A `:through` tail carries its second hop as ` INNER JOIN `; the
+    // call's own kind applies to every hop (`left_joins(:through_assoc)`
+    // outer-joins both, as Rails' JoinDependency does).
+    fn of_kind(tail: String, kind: &str) -> String {
+        if kind == "INNER JOIN" {
+            tail
+        } else {
+            tail.replace(" INNER JOIN ", &format!(" {kind} "))
+        }
+    }
     match &*spec.node {
         ExprNode::Lit { value: Literal::Sym { value } } => {
-            Some(format!("{kind} {}", ctx.assocs.scoped_join_tail(model, value)?))
+            Some(format!("{kind} {}", of_kind(ctx.assocs.scoped_join_tail(model, value)?, kind)))
         }
         ExprNode::Hash { entries, .. } if !entries.is_empty() => {
             let mut out = String::new();
@@ -3365,7 +3374,7 @@ fn join_spec_sql(model: &ClassId, spec: &Expr, kind: &str, ctx: &Ctx) -> Option<
                 let ExprNode::Lit { value: Literal::Sym { value: name } } = &*k.node else {
                     return None;
                 };
-                let head = ctx.assocs.scoped_join_tail(model, name)?;
+                let head = of_kind(ctx.assocs.scoped_join_tail(model, name)?, kind);
                 let next = ctx.assocs.assoc_target(model, name)?.clone();
                 if !out.is_empty() {
                     out.push(' ');
@@ -5696,6 +5705,34 @@ mod tests {
         };
         assert_eq!(value.matches("LEFT OUTER JOIN").count(), 2, "{value}");
         assert!(!value.contains("INNER JOIN"), "{value}");
+    }
+
+    /// A `:through` tail carries its second hop as ` INNER JOIN `; a
+    /// `left_joins` of it outer-joins both hops.
+    #[test]
+    fn left_joins_of_a_through_tail_is_outer_at_every_hop() {
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), {
+            let mut reg = assoc_fixture();
+            reg.join_tails.insert(
+                (story(), Symbol::from("commenters")),
+                "hidden_stories ON hidden_stories.story_id = stories.id \
+                 INNER JOIN users ON users.id = hidden_stories.user_id"
+                    .to_string(),
+            );
+            reg
+        });
+        let ctx = ctx_with(&scopes, &models, &assocs);
+        let lowered = |method: &str| {
+            let mut args = vec![sym_lit("commenters")];
+            lower_relation_args(&story(), &Symbol::from(method), &mut args, &ctx);
+            let ExprNode::Lit { value: Literal::Str { value } } = &*args[0].node else {
+                panic!("expected Str, got {:?}", args[0].node)
+            };
+            value.clone()
+        };
+        assert_eq!(lowered("left_joins").matches("LEFT OUTER JOIN").count(), 2);
+        assert!(!lowered("left_joins").contains("INNER JOIN"));
+        assert_eq!(lowered("joins").matches("INNER JOIN").count(), 2);
     }
 
     /// ALL-OR-NOTHING: an unresolvable SECOND hop leaves the whole

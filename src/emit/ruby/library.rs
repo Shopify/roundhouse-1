@@ -5555,14 +5555,18 @@ fn resolve_through_chain(
         joins.extend(back_joins);
         return Some((joins, edge_table, edge_fk));
     }
-    // The source is a plain `has_many` on the join model, so the
-    // foreign key is on the TARGET table and the join points the other
-    // way (campfire: `has_many :reachable_messages, through: :rooms,
-    // source: :messages` — Room#messages, `messages.room_id`). The
-    // belongs_to branch above cannot serve this: there is no column on
-    // the join table naming the target.
+    // The source is a plain `has_many` (or `has_one`, `readonly_has_one`)
+    // on the join model, so the foreign key is on the TARGET table and
+    // the join points the other way (campfire: `has_many
+    // :reachable_messages, through: :rooms, source: :messages` —
+    // Room#messages, `messages.room_id`). The belongs_to branch above
+    // cannot serve this: there is no column on the join table naming
+    // the target.
     if let Some((src_fk, src_scope)) = thr_model.associations().find_map(|a| match a {
-        Association::HasMany { target: t, foreign_key, through: None, scope, .. } if t == target => {
+        Association::HasMany { target: t, foreign_key, through: None, scope, .. }
+        | Association::HasOne { target: t, foreign_key, through: None, scope, .. }
+            if t == target =>
+        {
             Some((foreign_key, scope))
         }
         _ => None,
@@ -15465,8 +15469,43 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
                 || ruby2_keywords_call(lc, c)
                 || splatted_delegate_call(c)
+                || podded_client_binding_call(c)
         })
         .collect()
+}
+
+/// `Podding::Redis::ClientFactory.register(owner: self, accessor: :redis)
+/// { make_podded_proxy(...) }`: Core's binding of a class's Redis
+/// accessor (`cattr_accessor(:redis)`) to the pod's client, which the
+/// factory sets as the call runs and again on every `reregister_bindings`.
+/// A plain class that declares it (`LeakyThrottle`, `ShopVersions`, a
+/// redis lock) is not a foreign base, so the call was dropped and its
+/// `redis` stayed nil: `Resiliency.find_redis(LeakyThrottle)` handed back
+/// nothing and `Shipping::RateProviderThrottler` raised `undefined method
+/// 'semian_resource' for class LeakyThrottle`. Replayed as written: the
+/// receiver is the app's own factory and the keywords are literals (the
+/// builder block runs in the factory).
+fn podded_client_binding_call(call: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*call.node else { return false };
+    if method.as_str() != "register" {
+        return false;
+    }
+    let ExprNode::Const { path } = &*recv.node else { return false };
+    let path: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    if path != ["Podding", "Redis", "ClientFactory"] {
+        return false;
+    }
+    let [arg] = args.as_slice() else { return false };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return false };
+    let key = |name: &str| {
+        entries.iter().find(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name))
+    };
+    // `owner:` names the class the accessor is set on: `self` or a constant.
+    key("owner").is_some_and(|(_, v)| matches!(&*v.node, ExprNode::SelfRef | ExprNode::Const { .. }))
+        && entries.iter().all(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } })
+                && matches!(&*v.node, ExprNode::SelfRef | ExprNode::Const { .. } | ExprNode::Lit { .. })
+        })
 }
 
 /// `const_set(:Name, value)` as a class-body statement, written so it sets

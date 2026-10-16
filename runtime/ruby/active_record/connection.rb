@@ -960,6 +960,24 @@ module ActiveRecord
       ""
     end
 
+    # The columns, joined with ", ", of the unique index named `name`
+    # ("" when the model's table has no such index). The lowering
+    # overrides it for a model whose table has unique indexes.
+    # `unique_by: "idx_name"` is Rails' InsertAll#find_unique_index_for:
+    # the conflict target is that index's columns, never its name.
+    def self._unique_index_columns(name)
+      ""
+    end
+
+    # `unique_by:` as the columns an ON CONFLICT clause names: an index
+    # name (a String or Symbol) resolves to its index's columns, any
+    # other target is already columns.
+    def self._conflict_target_columns(names)
+      return names unless names.length == 1
+      resolved = _unique_index_columns(names[0])
+      resolved == "" ? names : resolved.split(", ")
+    end
+
     # `Model.upsert_all(rows, …)` → SQLite's
     # `INSERT … ON CONFLICT (target) DO UPDATE SET …`.
     #
@@ -998,7 +1016,7 @@ module ActiveRecord
 
       cols = rows[0].keys
       target = unique_by.nil? ? primary_key : unique_by
-      target_names = target.is_a?(Array) ? target.map { |c| c.to_s } : [target.to_s]
+      target_names = _conflict_target_columns(target.is_a?(Array) ? target.map { |c| c.to_s } : [target.to_s])
 
       # created_at / updated_at the table has and the rows lack are
       # stamped, as Rails does under `record_timestamps`: without them a
@@ -1130,8 +1148,13 @@ module ActiveRecord
 
       conflict = ""
       if skip_conflicts
-        target = unique_by.nil? ? nil : (unique_by.is_a?(Array) ? unique_by : [unique_by]).map { |c| c.to_s }
-        conflict = target.nil? ? " ON CONFLICT DO NOTHING" : " ON CONFLICT (#{target.join(", ")}) DO NOTHING"
+        target = unique_by.nil? ? nil : _conflict_target_columns((unique_by.is_a?(Array) ? unique_by : [unique_by]).map { |c| c.to_s })
+        if target.nil?
+          conflict = " ON CONFLICT DO NOTHING"
+        else
+          predicate = _conflict_predicate(target.sort.join(", "))
+          conflict = " ON CONFLICT (#{target.join(", ")})#{predicate == "" ? "" : " WHERE #{predicate}"} DO NOTHING"
+        end
       end
       sql = "INSERT INTO #{table_name} (#{cols.join(", ")}) VALUES #{tuples.join(", ")}#{conflict}"
       ActiveRecord.adapter.execute_ddl(sql)

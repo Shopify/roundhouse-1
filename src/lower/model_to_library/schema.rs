@@ -405,6 +405,64 @@ pub(super) fn push_schema_methods(
         });
     }
 
+    // def self._unique_index_columns(name) — the columns of the unique
+    // index `unique_by: "idx_name"` names, joined with ", " (Rails'
+    // `InsertAll#find_unique_index_for`: the conflict target is the
+    // index's columns, never its name). Emitted only for a table with a
+    // unique index; the runtime's default answers "".
+    let named: Vec<(String, String)> = table
+        .indexes
+        .iter()
+        .filter(|i| i.unique)
+        .map(|i| {
+            let cols: Vec<&str> = i.columns.iter().map(|c| c.as_str()).collect();
+            (i.name.as_str().to_string(), cols.join(", "))
+        })
+        .collect();
+    if !named.is_empty() {
+        let name = Symbol::from("name");
+        let mut body = lit_str(String::new());
+        for (index, cols) in named.into_iter().rev() {
+            let cond = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(var_ref(name.clone())),
+                        method: Symbol::from("=="),
+                        args: vec![lit_str(index)],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+                Ty::Bool,
+            );
+            body = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If { cond, then_branch: lit_str(cols), else_branch: body },
+                ),
+                Ty::Str,
+            );
+        }
+        methods.push(MethodDef {
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("_unique_index_columns"),
+            receiver: MethodReceiver::Class,
+            visibility: crate::dialect::MethodVisibility::Public,
+            params: vec![Param::positional(name.clone())],
+            body,
+            signature: Some(fn_sig(vec![(name, Ty::Str)], Ty::Str)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(owner.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+
     // Schema column-name lists. Time vs date stay separate so JSON can
     // apply ISO8601-with-offset vs calendar-only without sniffing values.
     push_schema_symbol_list(methods, owner, "schema_columns", table, |_| true);

@@ -1330,13 +1330,14 @@ module ActiveRecord
       when String
         spec
       when Symbol
-        reflection_join_sql(owner, reflect_join_hop(owner, spec), kind)
+        reflection = reflect_join_hop(owner, spec)
+        reflection_join_sql(owner, reflection, kind, join_alias_for(owner, reflection))
       when Array
         spec.map { |el| reflected_join_sql(owner, el, kind) }.join(" ")
       when Hash
         spec.map do |name, nested|
           reflection = reflect_join_hop(owner, name)
-          head = reflection_join_sql(owner, reflection, kind)
+          head = reflection_join_sql(owner, reflection, kind, join_alias_for(owner, reflection))
           "#{head} #{reflected_join_sql(reflection.klass, nested, kind)}"
         end.join(" ")
       else
@@ -1418,7 +1419,45 @@ module ActiveRecord
       end
       return if added.empty?
       @referenced = @referenced + added
+      alias_referenced_joins(added)
       sync_eager_joins
+    end
+
+    # `joins(:email_addresses)` with `where(email_addresses: {...})`, the
+    # association named differently from its table (`class_name:
+    # "CustomerEmailAddress"`): Rails joins the table aliased to the
+    # association's name, as the where's qualifier says. A `joins` that was
+    # rendered before the where named the association is re-rendered
+    # aliased, in place.
+    def alias_referenced_joins(keys)
+      return if @joins.empty? || !@model.respond_to?(:reflect_on_association)
+      keys.each do |key|
+        reflection = @model.reflect_on_association(key.to_sym)
+        next unless alias_join_reflection?(@model, reflection)
+        ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
+          plain = reflection_join_sql(@model, reflection, kind)
+          index = @joins.index(plain)
+          next if index.nil?
+          own_lists
+          @joins[index] = reflection_join_sql(@model, reflection, kind, key.to_s)
+        end
+      end
+    end
+
+    # A hop `where(<name>: {...})` can alias: a direct, unscoped,
+    # non-polymorphic association whose name is not its table's.
+    def alias_join_reflection?(owner, reflection)
+      return false if reflection.nil? || !owner.equal?(@model)
+      return false if reflection.through_reflection? || reflection.polymorphic?
+      return false if reflection.macro == :has_and_belongs_to_many || reflection._roundhouse_scoped?
+      reflection.name.to_s != reflection.klass.table_name.to_s
+    end
+
+    # The alias a join of `reflection` off `owner` takes: its own name when
+    # a where hash already keys off it, else none.
+    def join_alias_for(owner, reflection)
+      return nil unless alias_join_reflection?(owner, reflection)
+      @referenced.include?(reflection.name.to_s) ? reflection.name.to_s : nil
     end
 
     # An `includes` of a single-valued association (`belongs_to`, `has_one`)

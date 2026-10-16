@@ -150,6 +150,8 @@ module ActiveRecord
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
     def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def self._conflict_predicate: (String columns) -> String
+    def self._unique_index_columns: (String name) -> String
+    def self._conflict_target_columns: (Array[String] names) -> Array[String]
     def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def self.insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def self.insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
