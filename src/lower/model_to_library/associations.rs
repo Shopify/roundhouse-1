@@ -357,6 +357,7 @@ pub(super) fn push_association_methods(
                 polymorphic: false,
                 primary_key,
                 extra_keys,
+                constraint_keys_preserved,
                 ..
             } => {
                 let sentinel = fk_sentinel(model, foreign_key);
@@ -388,7 +389,10 @@ pub(super) fn push_association_methods(
                     let written_pk = if composite_target && assoc_pk.as_str() == "id" { Symbol::from("id_value") } else { assoc_pk.clone() };
                     // A composite key's other pairs follow the primary one
                     // (Rails' `replace_keys` writes every foreign key part).
-                    let extras: Vec<(Symbol, Symbol)> = extra_keys
+                    // (`yugabyte_overrides` `query_constraints`: only the
+                    // foreign key is written, the other columns stay.)
+                    let written_extras: &[(Symbol, Symbol)] = if *constraint_keys_preserved { &[] } else { extra_keys };
+                    let extras: Vec<(Symbol, Symbol)> = written_extras
                         .iter()
                         .map(|(fk, pk)| {
                             let pk = if composite_target && pk.as_str() == "id" { Symbol::from("id_value") } else { pk.clone() };

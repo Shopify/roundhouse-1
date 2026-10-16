@@ -536,6 +536,15 @@ pub enum Association {
         /// primary foreign key, as Rails' `query_constraints` does.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         extra_keys: Vec<(Symbol, Symbol)>,
+        /// The `extra_keys` are `query_constraints` columns only (Core's
+        /// `yugabyte_overrides: { query_constraints: .. }`, which the
+        /// wrapper declares through `belongs_to_with_query_constraints`):
+        /// the writer and the autosave write the foreign key alone and
+        /// leave the other columns as the owner has them
+        /// (`shop_id` survives `record.creator = nil`). Without it
+        /// (`foreign_key: [..]`) Rails' `replace_keys` writes every part.
+        #[serde(default, skip_serializing_if = "is_false")]
+        constraint_keys_preserved: bool,
         /// The declaration's `autosave:`. `Some(false)` (Core's readonly
         /// associations merge it) never saves an assigned target, where
         /// the default saves a new one (`apply_belongs_to_autosave`), as

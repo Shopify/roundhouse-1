@@ -466,6 +466,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // belongs_to autosave: an unsaved target assigned through the
     // writer is saved at before_validation and its id taken (no-op for
     // models with no belongs_to). Ruby-family only — see the pass.
+    library::apply_belongs_to_unloaded_key_reads(&mut lcs, app);
     library::apply_belongs_to_autosave(&mut lcs, app);
     // An STI row hydrates as its subclass (no-op for apps with no STI).
     library::apply_sti_hydration(&mut lcs, app);

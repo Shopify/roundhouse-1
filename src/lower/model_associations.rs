@@ -336,6 +336,7 @@ mod tests {
             autosave: None,
             primary_key: None,
             extra_keys: Vec::new(),
+            constraint_keys_preserved: false,
         }
     }
 
