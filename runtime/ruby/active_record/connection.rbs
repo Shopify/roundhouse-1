@@ -148,17 +148,17 @@ module ActiveRecord
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
-    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
     def self._conflict_predicate: (String columns) -> String
     def self._unique_index_columns: (String name) -> String
     def self._conflict_target_columns: (Array[String] names) -> Array[String]
-    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def self.insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def self.insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
-    def self.insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def self.insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
-    def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, untyped returning, bool? record_timestamps) -> Integer
-    def self._upsert_rows: (Array[Hash[Symbol, untyped]] rows, (String | Symbol | Array[Symbol])? unique_by, String? on_duplicate, (String | Symbol | Array[Symbol | String])? update_only, untyped returning, ?bool? record_timestamps) -> Integer
+    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, untyped returning, bool? record_timestamps) -> ActiveRecord::Result
+    def self._upsert_rows: (Array[Hash[Symbol, untyped]] rows, (String | Symbol | Array[Symbol])? unique_by, String? on_duplicate, (String | Symbol | Array[Symbol | String])? update_only, untyped returning, ?bool? record_timestamps) -> ActiveRecord::Result
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
     def self.abstract_class: () -> bool?
@@ -484,11 +484,11 @@ module ActiveRecord
   # The bulk-write entry points on Relation (see the end of connection.rb).
   class Relation
     @model: Base
-    def insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
-    def insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> Integer
-    def upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
-    def upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
+    def insert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
   end
 end

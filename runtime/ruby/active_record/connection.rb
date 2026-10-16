@@ -1009,7 +1009,7 @@ module ActiveRecord
     # the model through `all`: a patch prepended on Relation (Core's
     # GenerateOid allocates the ids there) runs first.
     def self._upsert_rows(rows, unique_by, on_duplicate, update_only, returning, record_timestamps = nil)
-      return 0 if rows.length == 0
+      return Result.new([], [], nil, affected_rows: 0) if rows.length == 0
       if returning
         raise NotImplementedError, "#{name}.upsert_all: RETURNING is not supported"
       end
@@ -1067,7 +1067,7 @@ module ActiveRecord
       sql = "INSERT INTO #{table_name} (#{insert_cols.join(", ")}) VALUES #{tuples.join(", ")}" \
             " ON CONFLICT (#{target_names.join(", ")})#{conflict_where} #{action}"
       ActiveRecord.adapter.execute_ddl(sql)
-      ActiveRecord.adapter.changes
+      Result.new([], [], nil, affected_rows: ActiveRecord.adapter.changes)
     end
 
     # `Model.insert_all(rows, …)` / `insert_all!` / `insert` / `insert!`
@@ -1079,8 +1079,9 @@ module ActiveRecord
     # and updated_at the model has and the row lacks are stamped, as
     # Rails does under `record_timestamps`. A value goes through its
     # column's cast type (an enum name, a JSON hash) before it is
-    # written. Returns the affected-row count; RETURNING is refused by
-    # name, as in `upsert_all`.
+    # written. Returns an ActiveRecord::Result whose `affected_rows` is the
+    # count (`insert_all(...).affected_rows`); it has no rows, as RETURNING
+    # is refused by name, as in `upsert_all`.
     #
     # Every form goes through `all`, as in Rails (querying.rb delegates
     # them to the relation): the Relation's own methods below do the
@@ -1104,7 +1105,7 @@ module ActiveRecord
     end
 
     def self._insert_rows(rows, skip_conflicts, unique_by, returning, record_timestamps)
-      return 0 if rows.length == 0
+      return Result.new([], [], nil, affected_rows: 0) if rows.length == 0
       if returning
         raise NotImplementedError, "#{name}.insert_all: RETURNING is not supported"
       end
@@ -1158,7 +1159,7 @@ module ActiveRecord
       end
       sql = "INSERT INTO #{table_name} (#{cols.join(", ")}) VALUES #{tuples.join(", ")}#{conflict}"
       ActiveRecord.adapter.execute_ddl(sql)
-      ActiveRecord.adapter.changes
+      Result.new([], [], nil, affected_rows: ActiveRecord.adapter.changes)
     end
 
     # `self.record_timestamps=` — Rails class-attribute toggling auto
