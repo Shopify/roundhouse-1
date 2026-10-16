@@ -460,28 +460,15 @@ module ActiveRecord
     # it has them, else `?`. A bind that is an Attribute answers its
     # database value.
     def _with_binds(sql, binds)
-      # Rails reads the SQL of a Relation or Arel tree it is given: a tree
-      # with binds of its own (`Arel.sql("a = ?", 1)`, the apps runtime's
-      # `Statement#params`) has them written in as quoted literals, as the
-      # unprepared `to_sql_and_binds` does. Compiled plainly they would be
-      # `$n` placeholders no bind answers.
-      sql = _arel_substituted_sql(sql) unless sql.is_a?(String)
+      # Rails reads the SQL of a Relation or Arel tree it is given (an Arel
+      # tree's own binds: runtime/spinel/cruby/active_record_arel.rb).
+      sql = sql.to_sql unless sql.is_a?(String)
       return sql if binds.empty?
       values = binds.map { |b| b.respond_to?(:value_for_database) ? b.value_for_database : b }
       if sql.match?(/\$\d+/)
         sql.gsub(/\$\d+/) { |m| quote(values[m.delete('$').to_i - 1]) }
       else
         Base.sanitize_sql([sql] + values)
-      end
-    end
-
-    def _arel_substituted_sql(node)
-      return node.to_sql unless defined?(::Arel::Collectors::SubstituteBinds) && node.is_a?(::Arel::Nodes::Node)
-      ActiveRecord::Base.with_connection do |connection|
-        collector = ::Arel::Collectors::SubstituteBinds.new(
-          ActiveRecord::ConnectionAdapters::ArelConnection.new(connection), ::Arel::Collectors::SQLString.new
-        )
-        connection.visitor.compile(node, collector)
       end
     end
 
@@ -1770,15 +1757,7 @@ module ActiveRecord
     # then serialized, as QueryAttribute#value_for_database does.
     def self._attribute_for_database(name, value)
       type = _declared_attribute_types[name]
-      return _bind_type_cast(name, type.serialize(type.cast(value))) if type
-      # A boolean over an integer column (`where(is_not_deleted: true)` on
-      # a smallint) is the Integer type's 1/0, as for Rails' QueryAttribute;
-      # the literal TRUE does not compare with a smallint.
-      if value.equal?(true) || value.equal?(false)
-        spec = schema_column_types[name.to_s]
-        return value ? 1 : 0 if !spec.nil? && spec[0] == :integer
-      end
-      _bytea_column?(name) && !value.is_a?(ActiveModel::Type::Binary::Data) ? type_for_attribute(name).serialize(value) : value
+      return type ? _bind_type_cast(name, type.serialize(type.cast(value))) : (_bytea_column?(name) && !value.is_a?(ActiveModel::Type::Binary::Data) ? type_for_attribute(name).serialize(value) : value)
     end
     
     # predicate_builder.rb's `force_equality?` test for a hash condition

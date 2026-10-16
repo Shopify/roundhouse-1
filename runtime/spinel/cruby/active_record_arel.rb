@@ -301,3 +301,25 @@ module ActiveRecord
     prepend ArelArguments
   end
 end
+
+module ActiveRecord
+  # `select_all(Arel.sql(sql, *params))`: an Arel tree given as the SQL of
+  # `_with_binds` has its own binds (`Arel.sql("a = ?", 1)`, the apps
+  # runtime's `Statement#params`) written in as quoted literals, as the
+  # unprepared `to_sql_and_binds` does. Compiled plainly by `to_sql` they
+  # would be `$n` placeholders no bind answers.
+  module ArelSubstitutedBinds
+    def _with_binds(sql, binds)
+      if sql.is_a?(::Arel::Nodes::Node)
+        sql = ActiveRecord::Base.with_connection do |connection|
+          collector = ::Arel::Collectors::SubstituteBinds.new(
+            ActiveRecord::ConnectionAdapters::ArelConnection.new(connection), ::Arel::Collectors::SQLString.new
+          )
+          connection.visitor.compile(sql, collector)
+        end
+      end
+      super(sql, binds)
+    end
+  end
+  Connection.prepend(ArelSubstitutedBinds)
+end

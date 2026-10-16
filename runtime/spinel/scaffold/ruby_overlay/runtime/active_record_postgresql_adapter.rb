@@ -914,3 +914,20 @@ end
 # Base.connection, connection_pool, connects_to, connected_to, ...:
 # Rails' connection handling, one pool per configuration.
 require_relative "active_record_connection_handling"
+
+module ActiveRecord
+  # A boolean over an integer column with no declared attribute type
+  # (`where(is_not_deleted: true)` on a smallint) is the Integer type's
+  # 1/0, as for Rails' QueryAttribute: PostgreSQL's literal TRUE does not
+  # compare with a smallint.
+  module IntegerColumnBooleans
+    def _attribute_for_database(name, value)
+      if (value == true || value == false) && !_declared_attribute_types[name]
+        spec = schema_column_types[name.to_s]
+        return value ? 1 : 0 if spec && spec[0] == :integer
+      end
+      super
+    end
+  end
+  Base.singleton_class.prepend(IntegerColumnBooleans)
+end
