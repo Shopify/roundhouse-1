@@ -46,6 +46,36 @@ module TypedStore
     h.key?(key) ? h[key] : default
   end
 
+# One half of a saved change of the store column, read at `key`: the
+# snapshot Hash `saved_changes` pairs hold for a store with a view
+# (`record._typed_store_changes`), or the stored text. A half the column
+# did not have yet (the nil before a create) reads the declared default.
+def self.pair_value(half, key, default)
+  return default if half.nil?
+  return(half.key?(key) ? half[key] : default) if half.is_a?(Hash)
+  read(half, key, default)
+end
+
+# activerecord store.rb's `saved_change_to_<key>?`, `saved_change_to_<key>`
+# and `<key>_before_last_save`, over the column's saved change `pair`
+# (`saved_change_to_attribute(column)`, nil when the save left it alone).
+def self.saved_key_changed?(pair, key, default)
+  return false if pair.nil?
+  pair_value(pair[0], key, default) != pair_value(pair[1], key, default)
+end
+
+def self.saved_key_change(pair, key, default)
+  return nil unless saved_key_changed?(pair, key, default)
+  [pair_value(pair[0], key, default), pair_value(pair[1], key, default)]
+end
+
+# A create leaves the column unchanged in the emitted tree (native writes
+# the declared defaults into it), so the half before it is the default.
+def self.key_before_last_save(pair, key, default, created)
+  return(created ? default : nil) if pair.nil?
+  pair_value(pair[0], key, default)
+end
+
   # Returns the re-serialized store with `key` set — the caller
   # assigns it back to the column ivar.
   def self.write(serialized, key, value)

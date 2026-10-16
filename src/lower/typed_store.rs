@@ -370,6 +370,50 @@ fn push_dirty_methods(
         let sig = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
         push_synth_instance_method(methods, model, was_name, Vec::new(), was(), sig, AccessorKind::Method, false);
     }
+    // The saved-change trio `store_accessor` also defines
+    // (activerecord store.rb): `saved_change_to_<name>?`,
+    // `saved_change_to_<name>` (the `[before, after]` pair, nil unless the
+    // last save changed the column) and `<name>_before_last_save`, over the
+    // column's saved change. Core's `Shop::Extension` asks
+    // `saved_change_to_password_enabled?` after commit. `TypedStore` reads
+    // the key off each half of the pair (a snapshot Hash or the stored text).
+    for (suffix, helper, ty) in [
+        ("saved_change_to_{}?", "saved_key_changed?", Ty::Bool),
+        ("saved_change_to_{}", "saved_key_change", Ty::Untyped),
+        ("{}_before_last_save", "key_before_last_save", Ty::Untyped),
+    ] {
+        let name = Symbol::from(suffix.replace("{}", a.name.as_str()));
+        if !demanded.contains(&name) {
+            continue;
+        }
+        let pair = sp_expr(ExprNode::Send {
+            recv: None,
+            method: Symbol::from("saved_change_to_attribute"),
+            args: vec![str_lit(col.as_str())],
+            block: None,
+            parenthesized: true,
+        });
+        let default = a.default.clone().unwrap_or_else(|| sp_expr(ExprNode::Lit { value: Literal::Nil }));
+        let mut args = vec![pair, str_lit(a.name.as_str()), default];
+        if helper == "key_before_last_save" {
+            args.push(sp_expr(ExprNode::Send {
+                recv: None,
+                method: Symbol::from("previously_new_record?"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            }));
+        }
+        let body = sp_expr(ExprNode::Send {
+            recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore")] })),
+            method: Symbol::from(helper),
+            args,
+            block: None,
+            parenthesized: true,
+        });
+        let sig = Some(super::model_to_library::fn_sig(vec![], ty));
+        push_synth_instance_method(methods, model, name, Vec::new(), body, sig, AccessorKind::Method, false);
+    }
 }
 
 /// The store column's own reader, as the typed_store gem has it: a Hash
