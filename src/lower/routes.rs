@@ -443,14 +443,11 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
     match spec {
         RouteSpec::Explicit { method, path, controller, action, as_name, scope, constraints } => {
             // A CANONICAL action (`get :index` in `collection`, `patch
-            // :update` in `member`) routes at the resource's own path and,
+            // :update` in `member`; the ingester marks the path) routes at the resource's own path and,
             // with no `as:`, takes the resource's name: Rails'
             // `canonical_action?` drops the action from path and name alike.
             let canonical = matches!(scope, ResourceScope::Member | ResourceScope::Collection)
-                && matches!(
-                    path.trim_matches('/'),
-                    "index" | "create" | "new" | "show" | "update" | "destroy"
-                );
+                && path == crate::ingest::routes::CANONICAL_ACTION_PATH;
             let empty = String::new();
             let path = if canonical { &empty } else { path };
             // `:format => "rss"` rides the constraints map at ingest

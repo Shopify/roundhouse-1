@@ -197,6 +197,7 @@ pub(super) fn ingest_route_file(
         diagnostics: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
         scope_controller: RefCell::new(None),
+        method_scope: Cell::new(false),
         mounted_engines: RefCell::new(HashSet::default()),
     };
 
@@ -333,6 +334,8 @@ struct Ctx<'a> {
     diagnostics: RefCell<Vec<Diagnostic>>,
     /// Fixed runtime mounts cannot inherit path/constraint DSL wrappers.
     mount_scope_depth: Cell<usize>,
+    /// Inside a `member`/`collection` block (Rails' `resource_method_scope?`).
+    method_scope: Cell<bool>,
     /// The `controller:` of the enclosing `scope controller: :x do` /
     /// `controller :x do`: a verb route with no `to:` and no controller of
     /// its own dispatches to it (Rails' scope default).
@@ -345,6 +348,13 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// Walk with `controller` as the scope's default controller, restoring
     /// the enclosing one afterwards.
+    fn with_method_scope<T>(&self, on: bool, walk: impl FnOnce() -> T) -> T {
+        let previous = self.method_scope.replace(on);
+        let result = walk();
+        self.method_scope.set(previous);
+        result
+    }
+
     fn with_scope_controller<T>(&self, controller: Option<String>, walk: impl FnOnce() -> T) -> T {
         let previous = self.scope_controller.replace(controller);
         let result = walk();
@@ -629,6 +639,7 @@ fn ingest_literal_engine_mount(
             diagnostics: RefCell::new(Vec::new()),
             mount_scope_depth: Cell::new(1),
             scope_controller: RefCell::new(None),
+            method_scope: Cell::new(false),
             mounted_engines: RefCell::new(HashSet::default()),
         };
         match ingest_route_body(body, &engine.file, None, &engine_cx) {
@@ -1330,8 +1341,11 @@ fn ingest_route_stmts<'pr>(
             if let Some(block_node) = call.block() {
                 if let Some(block) = block_node.as_block_node() {
                     if let Some(inner_body) = block.body() {
+                        let in_method_scope = matches!(method.as_str(), "member" | "collection");
                         let mut inner = cx.with_mount_scope(cx.mount_scope_depth.get() + 1, || {
-                            ingest_route_body(inner_body, file, parent, cx)
+                            cx.with_method_scope(in_method_scope || cx.method_scope.get(), || {
+                                ingest_route_body(inner_body, file, parent, cx)
+                            })
                         })?;
                         let scope = match method.as_str() {
                             "member" => Some(ResourceScope::Member),
@@ -1847,6 +1861,11 @@ pub const REDIRECT_CONTROLLER: &str = "RoundhouseRedirectsController";
 /// dispatches a target-less `get "token"` in `namespace :reportify` to
 /// `reportify#token`. Lowering resolves it against the module prefix
 /// (`lower::routes::qualify_controller`).
+/// The path of a canonical action (`get :index` in `collection`): the
+/// resource's own path, which the flattener reads as "no segment, no name
+/// prefix". Not the empty path, which `match ""` also produces.
+pub const CANONICAL_ACTION_PATH: &str = "{canonical}";
+
 pub const MODULE_CONTROLLER: &str = "RoundhouseModuleController";
 
 /// The pseudo-controller of a route whose endpoint is Ruby the router
@@ -3142,6 +3161,10 @@ fn ingest_explicit_route(
     // where Rails serves `/searches/clear` (named `clear_searches`).
     let mut on_scope: Option<ResourceScope> = None;
     let mut constraints: IndexMap<Symbol, String> = IndexMap::new();
+    // The path came from a positional SYMBOL (`get :index`): in a
+    // member/collection scope Rails treats a canonical action as the
+    // resource's own path, which a string path never does.
+    let mut symbol_path = false;
 
     for arg in args_node.arguments().iter() {
         if let Some(s) = rstring(&arg) {
@@ -3160,6 +3183,7 @@ fn ingest_explicit_route(
             // symbol appearing after a target can't be mistaken for one.
             if let Some(s) = symbol_value(&arg) {
                 path = Some(s);
+                symbol_path = true;
             }
         } else if let Some(kh) = arg.as_keyword_hash_node() {
             // Two shapes share KeywordHashNode here:
@@ -3399,6 +3423,15 @@ fn ingest_explicit_route(
         }
     };
 
+    let canonical = symbol_path
+        && (cx.method_scope.get() || on_scope.is_some())
+        && matches!(
+            path.as_deref().map(|p| p.trim_matches('/')),
+            Some("index" | "create" | "new" | "show" | "update" | "destroy")
+        );
+    if canonical {
+        path = Some(CANONICAL_ACTION_PATH.to_string());
+    }
     Ok(Some(RouteSpec::Explicit {
         method,
         path: path.unwrap_or_default(),
@@ -3698,8 +3731,9 @@ fn ingest_resources_route(
 
     // A resource's block dispatches to the resource's controller, not an
     // enclosing `scope controller:`.
-    let mut nested =
-        cx.with_scope_controller(None, || block_entries(call, file, Some(name_str.as_str()), cx))?;
+    let mut nested = cx.with_scope_controller(None, || {
+        cx.with_method_scope(false, || block_entries(call, file, Some(name_str.as_str()), cx))
+    })?;
     if !concern_names.is_empty() {
         let none = eval::RVal::Hash(Vec::new());
         nested.extend(cx.with_mount_scope(cx.mount_scope_depth.get() + 1, || {
