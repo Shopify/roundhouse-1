@@ -610,6 +610,7 @@ pub(super) fn ingest_test_class(
     // (`carried_body_statement`), and where each stands: below a
     // definition, below a `setup do` or `teardown do` block.
     let mut body_statements: Vec<crate::dialect::TestBodyStatement> = Vec::new();
+    let mut tests_macro: Option<crate::dialect::TestBodyStatement> = None;
     let mut after_definitions = false;
     let mut after_setup_blocks = false;
     let mut after_teardown_blocks = false;
@@ -753,6 +754,14 @@ pub(super) fn ingest_test_class(
                         if let Some(arg) = args.arguments().iter().next() {
                             if let Some(path) = constant_path_of(&arg) {
                                 target = Some(ClassId(Symbol::from(path.join("::"))));
+                                tests_macro = carried_body_statement(&stmt, &name, file)?.map(|expr| crate::dialect::TestBodyStatement {
+                                    expr,
+                                    line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+                                    after_definitions,
+                                    after_setup_blocks,
+                                    after_teardown_blocks,
+                                    source: None,
+                                });
                             }
                         }
                     }
@@ -1082,6 +1091,7 @@ pub(super) fn ingest_test_class(
         body_statements,
         file_requires: Vec::new(),
         tests_at_load,
+        tests_macro,
     })
 }
 
@@ -2453,6 +2463,23 @@ end
         assert_eq!(flags, [(false, false), (false, false), (false, false), (false, true), (true, true)]);
         assert!(tm.helpers.iter().any(|m| m.name.as_str() == "helper_macro"
             && matches!(m.receiver, crate::dialect::MethodReceiver::Class)));
+    }
+
+    /// An explicit `tests Subject` is carried as written beside `target`
+    /// (the Ruby emit replays it for a controller subject); a class that
+    /// names no subject carries none.
+    #[test]
+    fn tests_macro_is_carried_only_when_written() {
+        let src = "class Admin::ThingsControllerApiTest < ActionController::TestCase\n  tests Admin::ThingsController\n  test \"a\" do\n    assert true\n  end\nend\n";
+        let tm = ingest_test_file(src.as_bytes(), "things_api_test.rb").expect("ingest").expect("test class");
+        assert_eq!(tm.target.as_ref().map(|t| t.0.as_str()), Some("Admin::ThingsController"));
+        let carried = tm.tests_macro.as_ref().expect("the macro is carried");
+        assert_eq!(crate::emit::ruby::expr::emit_expr(&carried.expr), "tests Admin::ThingsController");
+        assert!(tm.body_statements.is_empty(), "{:?}", tm.body_statements);
+
+        let plain = "class ThingsControllerTest < ActionController::TestCase\n  test \"a\" do\n    assert true\n  end\nend\n";
+        let tm = ingest_test_file(plain.as_bytes(), "things_test.rb").expect("ingest").expect("test class");
+        assert!(tm.tests_macro.is_none());
     }
 
     #[test]

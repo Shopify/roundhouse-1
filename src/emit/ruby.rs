@@ -1624,11 +1624,21 @@ pub fn emit_with_assertions(
             // The class body's other statements (`use_gcs`, `let(:x) { … }`),
             // as written and in source order: those above every definition
             // after the class's mixins, the others at the end of the class.
-            if !module.body_statements.is_empty() {
+            // An explicit `tests SomeController` is one of them when the
+            // subject is an app controller: the class's controller is that
+            // one, not the class name's `FooControllerApiTest` -> `FooControllerApi`.
+            let mut body_statements = module.body_statements.clone();
+            if let (Some(statement), Some(target)) = (&module.tests_macro, &module.target) {
+                if app.controllers.iter().any(|c| &c.name == target) {
+                    body_statements.push(statement.clone());
+                    body_statements.sort_by_key(|s| s.line);
+                }
+            }
+            if !body_statements.is_empty() {
                 if minitest {
-                    emitted.content = splice_test_body_statements(&emitted.content, class_name, &module.body_statements, module.source_file.as_deref().unwrap_or(class_name), &test_rb_path);
+                    emitted.content = splice_test_body_statements(&emitted.content, class_name, &body_statements, module.source_file.as_deref().unwrap_or(class_name), &test_rb_path);
                 } else {
-                    for statement in &module.body_statements {
+                    for statement in &body_statements {
                         crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                             statement.expr.span,
                             None,

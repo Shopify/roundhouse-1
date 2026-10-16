@@ -2,6 +2,16 @@
 require_relative "../inflector"
 
 module ActiveRecord
+  module QueryMethods
+    # Rails' `where` with no condition answers a WhereChain. Here the
+    # chain methods (`not`, `missing`, `associated`) live on the Relation,
+    # and `where` answers the relation itself, so no instance of this
+    # class exists: it names the type for `is_a?(WhereChain)` checks
+    # (Podding::Database::ScopeProxy), which a Relation answers through
+    # `respond_to?(:where)` as it does for a chain.
+    class WhereChain; end
+  end
+
   # A Relation's `includes`/`preload`, deferred until a record asks.
   #
   # `load_records` used to batch-load every included association the

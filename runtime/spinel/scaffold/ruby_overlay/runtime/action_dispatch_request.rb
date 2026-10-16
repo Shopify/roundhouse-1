@@ -258,6 +258,40 @@ module ActionDispatch
       @env["REMOTE_ADDR"] || "127.0.0.1"
     end
 
+    # Rack::Request#ip: the first REMOTE_ADDR address that is not a
+    # trusted proxy (loopback / private ranges), else the last such
+    # X-Forwarded-For hop, else REMOTE_ADDR as it stands.
+    TRUSTED_PROXY = /\A(127\.|::1\z|fe80:|fc|fd|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|unix)/i
+
+    def ip
+      remote = @env["REMOTE_ADDR"].to_s.split(/[,\s]+/).reject(&:empty?)
+      external = remote.reject { |addr| addr.match?(TRUSTED_PROXY) }
+      return external.first unless external.empty?
+
+      forwarded = @env["HTTP_X_FORWARDED_FOR"].to_s.split(/[,\s]+/).reject(&:empty?)
+      hop = forwarded.reverse.find { |addr| !addr.match?(TRUSTED_PROXY) }
+      hop || remote.first || forwarded.last
+    end
+
+    # ActionDispatch::Request#request_id / #uuid: the id the
+    # ActionDispatch::RequestId middleware stores under
+    # `action_dispatch.request_id`. Without that middleware in the
+    # stack (controller tests), do what it does: take the sanitized
+    # X-Request-Id header, else a fresh SecureRandom.uuid, and store it
+    # so every later read in the request agrees.
+    def request_id
+      existing = @env["action_dispatch.request_id"]
+      return existing if existing
+
+      external = @env["HTTP_X_REQUEST_ID"].to_s.gsub(/[^\w\-@]/, "")[0, 255]
+      @env["action_dispatch.request_id"] = external.nil? || external.empty? ? SecureRandom.uuid : external
+    end
+    alias uuid request_id
+
+    def request_id=(id)
+      @env["action_dispatch.request_id"] = id
+    end
+
     def referer
       @env["HTTP_REFERER"]
     end
