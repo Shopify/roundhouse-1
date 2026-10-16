@@ -132,6 +132,8 @@ id_probe.request_id = "req-1"
 show("ad request_id=", [id_probe.request_id, id_probe.uuid, id_probe.get_header("action_dispatch.request_id")])
 show("ad headers", %w[HTTP_IF_NONE_MATCH HTTP_IF_MODIFIED_SINCE REQUEST_URI SERVER_PORT HTTP_ACCEPT].map { |k| r.get_header(k) })
 show("ad headers[]", r.headers["Accept"])
+typed = ActionDispatch::TestRequest.create("CONTENT_TYPE" => "Application/XML; charset=utf-8")
+show("ad media_type", [typed.media_type, typed.content_type, ActionDispatch::TestRequest.create.media_type, ActionDispatch::TestRequest.create("CONTENT_TYPE" => "").content_type])
 r.headers["X-Ip-Metadata"] = "countryCode:CA"
 r.headers["HTTP_X_RAW"] = "raw"
 r.headers["Content-Type"] = "text/plain"

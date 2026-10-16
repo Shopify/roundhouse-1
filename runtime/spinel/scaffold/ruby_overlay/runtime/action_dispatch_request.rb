@@ -345,6 +345,18 @@ module ActionDispatch
       end
     end
 
+    # Rack::Request::Helpers: the CONTENT_TYPE header, nil when absent or
+    # empty, and its media type, the part before any parameters, downcased.
+    def content_type
+      value = get_header("CONTENT_TYPE")
+      value.nil? || value.empty? ? nil : value
+    end
+
+    def media_type
+      type = content_type
+      type && type.split(/\s*[;,]\s*/, 2).first.downcase
+    end
+
     def accepts
       fetch_header("action_dispatch.request.accepts") do |k|
         header = @env["HTTP_ACCEPT"].to_s.strip
