@@ -681,7 +681,9 @@ fn computes_names(side: &ClassSide<'_>, call: &Expr) -> bool {
 /// Every positional argument a literal ([`literal_only`]), and keyword
 /// options, if any, literal too (`money_column :price, currency_column:
 /// :currency`): the options name no column the call retypes, which only
-/// its positional names do.
+/// its positional names do. A constant is as good as a literal there
+/// (`money_column :total_price_usd, currency: USD_CURRENCY_CODE`): the
+/// replayed call reads it where the class defines it.
 fn literal_call(call: &Expr) -> bool {
     let ExprNode::Send { args, .. } = &*call.node else { return false };
     let (positional, options) = match args.split_last() {
@@ -691,6 +693,7 @@ fn literal_call(call: &Expr) -> bool {
     let literal_value = |e: &Expr| {
         literal_only(e)
             || matches!(&*e.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil | Literal::Int { .. } })
+            || matches!(&*e.node, ExprNode::Const { .. })
     };
     positional.iter().all(literal_only)
         && options.is_none_or(|o| {
