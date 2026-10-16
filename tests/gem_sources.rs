@@ -261,3 +261,73 @@ end
         .run_test("test/models/box_test.rb");
     run.assert_passes();
 }
+
+/// A module that `extend`s ActiveSupport::Concern and has no hook block
+/// (`included do`, `class_methods do`) still replays its body when it
+/// includes a native gem's module: the calls are the gem's DSL on the
+/// module itself. Core's `GraphApi::DisplayableError` (`field :message`
+/// on a graphql interface) was dropped as a concern and the UserError
+/// type that implements it had no `message` field. The emitted module
+/// writes no `extend ActiveSupport::Concern` (the tree carries none).
+/// Native Ruby on the same files answers the asserted values.
+#[test]
+fn a_concern_without_hook_blocks_replays_its_gem_dsl_body() {
+    const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    concurrent-ruby (1.3.8)\n    widget (1.0.0)\n      concurrent-ruby\n\nDEPENDENCIES\n  activesupport\n  concurrent-ruby\n  widget\n";
+    const RBI: &str = "# typed: true\nmodule Concurrent\n  module Concern\n    module Logging\n      def log(level, progname, message = T.unsafe(nil), &block); end\n    end\n  end\nend\n";
+    const TAGGABLE: &str = "module Widget\n  module Taggable\n    include Concurrent::Concern::Logging\n\n    def self.included(base)\n      base.extend(ClassMethods)\n    end\n\n    module ClassMethods\n      def tag(value = nil)\n        @tag = value if value\n        @tag\n      end\n    end\n  end\nend\n";
+    const APP_TAGGED: &str = "require \"widget\"\n\nmodule AppTagged\n  extend ActiveSupport::Concern\n  include Widget::Taggable\n  tag \"app\"\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", CARRIED)
+        .write("Gemfile.lock", LOCK)
+        .write("sorbet/rbi/gems/concurrent-ruby@1.3.8.rbi", RBI)
+        .write("vendor/gems/widget-1.0.0/lib/widget.rb", "require \"concurrent\"\nrequire \"widget/taggable\"\n\nmodule Widget\nend\n")
+        .write("vendor/gems/widget-1.0.0/lib/widget/taggable.rb", TAGGABLE)
+        .write("lib/app_tagged.rb", APP_TAGGED)
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/tagged_test.rb", r#"require "test_helper"
+require "app_tagged"
+class TaggedTest < ActiveSupport::TestCase
+  test "the concern's gem DSL body ran" do
+    assert_equal "app", AppTagged.tag
+  end
+end
+"#)
+        .run_test("test/models/tagged_test.rb");
+    run.assert_passes();
+}
+
+/// A Concern's `included do CONST.each do ... end end` whose body only
+/// calls the native base's class-side DSL runs on the includer, once per
+/// entry. Core's `GraphApi::Shared::StorefrontGenerationSource` declares
+/// one enum `value` per registry entry this way; the loop was dropped
+/// (`included do` is "not modeled on a plain includer") and every enum
+/// including it had no values (`Enum types require at least one value`).
+/// Native Ruby on the same files answers the asserted values.
+#[test]
+fn a_concerns_constant_loop_over_native_class_side_calls_runs_on_the_includer() {
+    const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    concurrent-ruby (1.3.8)\n    widget (1.0.0)\n      concurrent-ruby\n\nDEPENDENCIES\n  activesupport\n  concurrent-ruby\n  widget\n";
+    const RBI: &str = "# typed: true\nmodule Concurrent\n  module Synchronization\n    class Object\n      def self.safe_initialization!; end\n      def self.safe_initialization?; end\n    end\n  end\nend\n";
+    const WIDGET: &str = "require \"concurrent\"\nrequire \"widget/box\"\n\nmodule Widget\nend\n";
+    const BOX: &str = "module Widget\n  class Box < Concurrent::Synchronization::Object\n  end\nend\n";
+    const SAFE: &str = "module AppSafe\n  extend ActiveSupport::Concern\n\n  SOURCES = [:a, :b].freeze\n\n  included do\n    AppSafe::SOURCES.each do |_source|\n      safe_initialization!\n    end\n  end\nend\n";
+    const APP_BOX: &str = "require \"widget\"\nrequire \"app_safe\"\n\nclass AppBox < Widget::Box\n  include AppSafe\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", CARRIED)
+        .write("Gemfile.lock", LOCK)
+        .write("sorbet/rbi/gems/concurrent-ruby@1.3.8.rbi", RBI)
+        .write("vendor/gems/widget-1.0.0/lib/widget.rb", WIDGET)
+        .write("vendor/gems/widget-1.0.0/lib/widget/box.rb", BOX)
+        .write("lib/app_safe.rb", SAFE)
+        .write("lib/app_box.rb", APP_BOX)
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/box_test.rb", r#"require "test_helper"
+require "app_box"
+class BoxTest < ActiveSupport::TestCase
+  test "the concern's loop ran on the includer" do
+    assert_equal true, AppBox.safe_initialization?
+  end
+end
+"#)
+        .run_test("test/models/box_test.rb");
+    run.assert_passes();
+}

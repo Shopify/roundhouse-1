@@ -4168,17 +4168,19 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_support_file_store.rb: {e}"))?,
         ));
     }
-    // ActiveSupport::FileUpdateChecker, ActiveSupport::Benchmark and
-    // ActiveSupport::ConfigurationFile (8.2.0.alpha file_update_checker.rb,
-    // benchmark.rb, configuration_file.rb), each where app code names it
-    // (Core's developer dashboard, its Trilogy connection timing, its
-    // DisconnectedFixtureSet's fixture reads);
+    // ActiveSupport::FileUpdateChecker, ActiveSupport::Benchmark,
+    // ActiveSupport::ConfigurationFile and ActiveSupport::Gzip (8.2.0.alpha
+    // file_update_checker.rb, benchmark.rb, configuration_file.rb, gzip.rb),
+    // each where app code names it (Core's developer dashboard, its Trilogy
+    // connection timing, its DisconnectedFixtureSet's fixture reads, the
+    // webhook payload envelope);
     // tests/active_support_utilities_runtime.rb holds them to native
     // ActiveSupport.
     let utility_ports: Vec<&str> = [
         ("ActiveSupport::FileUpdateChecker", "active_support_file_update_checker"),
         ("ActiveSupport::Benchmark", "active_support_benchmark"),
         ("ActiveSupport::ConfigurationFile", "active_support_configuration_file"),
+        ("ActiveSupport::Gzip", "active_support_gzip"),
     ]
     .into_iter()
     .filter(|(name, _)| carries_named(&files, &[name]))
@@ -5217,7 +5219,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
-        "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_redefine_method", "active_support_remove_method",
+        "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_module_anonymous", "active_support_redefine_method", "active_support_remove_method",
         "active_support_class_attribute", "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
         "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
@@ -6001,6 +6003,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/module/redefine_method", &["active_support_redefine_method"]),
     ("active_support/core_ext/module/remove_method", &["active_support_remove_method"]),
     ("active_support/core_ext/module/introspection", &["active_support_module_introspection"]),
+    ("active_support/core_ext/module/anonymous", &["active_support_module_anonymous"]),
     ("active_support/core_ext/class", &["active_support_class_attribute", "active_support_class_subclasses"]),
     ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
     ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
@@ -6097,6 +6100,14 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
         feature: "active_support/core_ext/module/remove_method",
         ports: &["active_support_remove_method"],
         calls: &["remove_possible_method", "remove_possible_singleton_method"],
+        at_require_rails: false,
+    },
+    // active_support/all: GraphApi::Schema.error_source_path calls it on a
+    // type class with no require.
+    BootCoreExtension {
+        feature: "active_support/core_ext/module/anonymous",
+        ports: &["active_support_module_anonymous"],
+        calls: &["anonymous?"],
         at_require_rails: false,
     },
     BootCoreExtension {
@@ -13758,6 +13769,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_redefine_method.rb"
         && p != "runtime/active_support_remove_method.rb"
         && p != "runtime/active_support_module_introspection.rb"
+        && p != "runtime/active_support_module_anonymous.rb"
         && p != "runtime/active_support_class_attribute.rb"
         && p != "runtime/active_support_class_subclasses.rb"
         && p != "runtime/active_support_numeric_bytes.rb"
@@ -13820,6 +13832,7 @@ fn spinel_files_with_assertions(
                 | "runtime/active_support_file_update_checker.rb"
                 | "runtime/active_support_benchmark.rb"
                 | "runtime/active_support_configuration_file.rb"
+                | "runtime/active_support_gzip.rb"
         )
     });
     files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");

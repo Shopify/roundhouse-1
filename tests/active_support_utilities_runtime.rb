@@ -1,9 +1,10 @@
 # Native ActiveSupport oracle (the Rails native Core runs; tests/support/
 # rails_oracle.rb) for ActiveSupport::FileUpdateChecker,
-# ActiveSupport::Benchmark and ActiveSupport::ConfigurationFile against
-# runtime/spinel/active_support_file_update_checker.rb,
-# runtime/spinel/active_support_benchmark.rb and
-# runtime/spinel/active_support_configuration_file.rb. Each mode works in its own
+# ActiveSupport::Benchmark, ActiveSupport::ConfigurationFile and
+# ActiveSupport::Gzip against runtime/spinel/active_support_file_update_checker.rb,
+# runtime/spinel/active_support_benchmark.rb,
+# runtime/spinel/active_support_configuration_file.rb and
+# runtime/spinel/active_support_gzip.rb. Each mode works in its own
 # temporary directory and prints one line per observation, with that
 # directory shown as DIR; `compare` requires them equal.
 #
@@ -14,7 +15,9 @@
 # `realtime(unit) { }`: the units Core passes and the default.
 # ConfigurationFile's is `parse(path)` over each fixture file of Core's
 # DisconnectedFixtureSet.load_yaml: plain YAML, ERB, an empty file, a
-# YAML syntax error, a non-breaking space and `context:`.
+# YAML syntax error, a non-breaking space and `context:`. Gzip's is
+# `compress`/`decompress` as Core's webhook payload envelope calls them
+# (a JSON string through Base64), with the levels and the binary stream.
 require "tmpdir"
 require "fileutils"
 require_relative "support/rails_oracle"
@@ -32,7 +35,7 @@ if ARGV.first == "compare"
     abort "utilities differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and the emitted FileUpdateChecker, Benchmark and ConfigurationFile agree (#{RailsOracle.label})"
+  puts "Native ActiveSupport and the emitted FileUpdateChecker, Benchmark, ConfigurationFile and Gzip agree (#{RailsOracle.label})"
   exit
 end
 
@@ -42,10 +45,12 @@ if ARGV.first == "native"
   require "active_support/file_update_checker"
   require "active_support/benchmark"
   require "active_support/configuration_file"
+  require "active_support/gzip"
 else
   require_relative "../runtime/spinel/active_support_file_update_checker"
   require_relative "../runtime/spinel/active_support_benchmark"
   require_relative "../runtime/spinel/active_support_configuration_file"
+  require_relative "../runtime/spinel/active_support_gzip"
 end
 
 ROOT = Dir.mktmpdir("rh-as-utilities-")
@@ -174,3 +179,16 @@ who = "binding"
 show "configuration context", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "context.yml.erb"), context: binding) }
 show "configuration missing", outcome { ActiveSupport::ConfigurationFile.parse(File.join(fixtures, "missing.yml")) }
 show "configuration symbolize_names", outcome { ActiveSupport::ConfigurationFile.parse(erb, symbolize_names: true) }
+
+require "json"
+payload = JSON.generate({ shop_id: 1, id: "abc", payload: { "title" => "caf\u00e9", "n" => [1, 2.5, nil] } })
+packed = ActiveSupport::Gzip.compress(payload)
+show "gzip compress encoding", [packed.encoding.to_s, packed.bytesize, packed.unpack1("H20")]
+show "gzip roundtrip", ActiveSupport::Gzip.decompress(packed) == payload
+show "gzip roundtrip text", ActiveSupport::Gzip.decompress(packed)
+show "gzip deterministic", ActiveSupport::Gzip.compress(payload) == packed
+show "gzip empty", [ActiveSupport::Gzip.compress("").bytesize, ActiveSupport::Gzip.decompress(ActiveSupport::Gzip.compress(""))]
+show "gzip level", [Zlib::BEST_SPEED, Zlib::BEST_COMPRESSION].map { |level| ActiveSupport::Gzip.compress(payload * 20, level).bytesize }
+show "gzip strategy", ActiveSupport::Gzip.compress(payload * 20, Zlib::DEFAULT_COMPRESSION, Zlib::HUFFMAN_ONLY).bytesize
+show "gzip stream", [ActiveSupport::Gzip::Stream.new.string.encoding.to_s, ActiveSupport::Gzip::Stream.superclass]
+show "gzip bad input", outcome { ActiveSupport::Gzip.decompress("not gzip") }

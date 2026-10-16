@@ -11236,7 +11236,14 @@ fn emit_library_class_decl_inner(
     let replayed: Vec<&Expr> = if railtie || is_application_reopen(lc) || replays_foreign_class_body(lc, app) {
         lc.unknown_calls
             .iter()
-            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c) && !is_preserved_external_include(c))
+            .filter(|c| {
+                !crate::analyze::is_include_refusal(c)
+                    && !is_body_statement(c)
+                    && !is_preserved_external_include(c)
+                    // The tree carries no Concern (`modelled_elsewhere`): a module
+                    // that replays its body writes no `extend ActiveSupport::Concern`.
+                    && !(lc.is_module && is_concern_extend(c))
+            })
             .collect()
     } else {
         for call in dropped_class_body_calls(lc, app) {
@@ -11328,10 +11335,6 @@ fn emit_library_class_decl_inner(
             writeln!(s, "{body_pad}::Kernel.raise(::NotImplementedError, '{quoted}')").unwrap();
             return;
         }
-        writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
-        if with_extends {
-            extends_of(inc).iter().for_each(|carrier| write_extend(s, carrier));
-        }
         let root = inc.0.as_str().trim_start_matches("::");
         let groups = || carried_attributes.iter().filter(|g| root_of(&g.after) == root);
         // Concern#append_features extends the includer with ClassMethods
@@ -11354,6 +11357,33 @@ fn emit_library_class_decl_inner(
             }
         }
         written_includes.borrow_mut().push(root.to_string());
+        // A module whose own `self.included(base)` hook runs as the include
+        // does (Core's `ColorRolesGroupInputFields`, whose hook calls
+        // `base.field`) reaches the `ClassMethods` of the includes above it
+        // already: Concern#append_features extended them at their own line.
+        let runs_included_hook = reached_by(root).iter().any(|module| {
+            app.library_classes.iter().any(|m| {
+                m.is_module
+                    && root_of(&m.name) == *module
+                    && m.methods.iter().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "included")
+            })
+        });
+        // The `ClassMethods` a module with an `included` hook reaches are
+        // extended before its include line, as Concern#append_features does
+        // (`base.extend(ClassMethods)`, then the hook runs in `super`).
+        if runs_included_hook {
+            for carrier in &spliced_extends {
+                let owned = crate::app::class_methods_carrier_owner(carrier).is_some_and(|o| reached.contains(&root_of(&o)));
+                if owned && !extended_at_include.borrow().contains(*carrier) {
+                    write_extend(s, carrier);
+                    extended_at_include.borrow_mut().push((*carrier).clone());
+                }
+            }
+        }
+        writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
+        if with_extends {
+            extends_of(inc).iter().for_each(|carrier| write_extend(s, carrier));
+        }
         if groups().next().is_some() || carries_statements {
             for carrier in &spliced_extends {
                 let owned = crate::app::class_methods_carrier_owner(carrier).is_some_and(|o| reached.contains(&root_of(&o)));
@@ -14322,7 +14352,7 @@ fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
         return true;
     }
     if lc.is_module {
-        return !is_concern_body(lc) && includes_loaded_gem_module(lc, app, &mut Vec::new());
+        return !has_spliced_concern_hook(lc) && includes_loaded_gem_module(lc, app, &mut Vec::new());
     }
     let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
     let mut parent = lc.parent.as_ref();
@@ -15269,14 +15299,16 @@ fn is_concern_extend(call: &Expr) -> bool {
                 if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")))
 }
 
-fn is_concern_body(lc: &LibraryClass) -> bool {
-    lc.unknown_calls.iter().any(|call| match &*call.node {
-        ExprNode::Send { recv: None, method, args, .. } => match method.as_str() {
-            "included" | "class_methods" | "prepended" => true,
-            "extend" => args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")),
-            _ => false,
-        },
-        _ => false,
+/// Whether a module body has a Concern hook block (`included do`,
+/// `class_methods do`, `prepended do`), which the ingest splices into
+/// each includer. A bare `extend ActiveSupport::Concern` beside DSL
+/// calls on a loaded gem's module (Core's `GraphApi::DisplayableError`:
+/// `field :message` on a graphql interface) has nothing to splice; the
+/// calls are the gem's DSL on the module itself.
+fn has_spliced_concern_hook(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
+            if matches!(method.as_str(), "included" | "class_methods" | "prepended"))
     })
 }
 

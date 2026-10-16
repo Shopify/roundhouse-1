@@ -41,6 +41,7 @@ pub(super) const SIGNATURE_PORTS: &[&str] = &[
     "runtime/spinel/active_support_file_update_checker.rb",
     "runtime/spinel/active_support_benchmark.rb",
     "runtime/spinel/active_support_configuration_file.rb",
+    "runtime/spinel/active_support_gzip.rb",
     "runtime/spinel/active_support_testing_time_helpers.rb",
     "runtime/spinel/active_support_messages.rb",
     "runtime/spinel/active_model_type.rb",

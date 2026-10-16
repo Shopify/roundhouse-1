@@ -419,7 +419,7 @@ module ActiveRecord
     def find_by!: (Hash[Symbol, untyped] | String | nil conditions) -> Base
     def sole: () -> Base
     def find_sole_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base
-    def first_or_initialize: () -> Base
+    def first_or_initialize: (?Hash[Symbol, untyped]? attrs) ?{ (Base) -> void } -> Base
     def find_or_create_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def create_or_find_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base

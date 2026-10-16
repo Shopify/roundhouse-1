@@ -1219,6 +1219,28 @@ pub(super) fn splice_into_library_includers(
                     }
                     continue;
                 }
+                // `CONST.each do |k, v| value(k, description: v) end`: a loop over a
+                // constant whose body only calls the includer's own class-side DSL
+                // (Core's `GraphApi::Shared::StorefrontGenerationSource`, one enum
+                // `value` per registry entry). Ruby class_evals it on the includer,
+                // so it runs as written right after the include.
+                if !job
+                    && !lc.is_module
+                    && hook.is_none()
+                    && let ModelBodyItem::Unknown { expr, .. } = item
+                    && constant_each_of_class_side(expr, &|method: &str| {
+                        class_side.contains(method) || gained.contains(method) || gem_class_side(lc, method)
+                    })
+                {
+                    let root_id = top(&lc.includes[*root]);
+                    let class_attributes: &[Symbol] = &declared;
+                    if let ModelBodyItem::Unknown { expr, .. } =
+                        super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                    {
+                        plan.statements.push((root_id, expr));
+                    }
+                    continue;
+                }
                 let attribute = match item {
                     ModelBodyItem::Method { method, .. } => declared.iter().find(|n| generated_for(method, n)),
                     ModelBodyItem::ClassBody { expr, .. } => {
@@ -1638,6 +1660,24 @@ fn carry_block_defs(
             methods.retain(|m| !(m.receiver == method.receiver && m.name == method.name));
             methods.push(method);
         }
+    }
+}
+
+/// `Const::Path.each do |args| ... end` whose block holds only
+/// receiverless calls `class_side` answers: the whole loop is the
+/// includer's class-body DSL, run once per entry.
+fn constant_each_of_class_side(expr: &Expr, class_side: &dyn Fn(&str) -> bool) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*expr.node else { return false };
+    if method.as_str() != "each" || !args.is_empty() || !matches!(&*recv.node, ExprNode::Const { .. }) {
+        return false;
+    }
+    let ExprNode::Lambda { body, .. } = &*block.node else { return false };
+    let call = |e: &Expr| {
+        matches!(&*e.node, ExprNode::Send { recv: None, method, block: None, .. } if class_side(method.as_str()))
+    };
+    match &*body.node {
+        ExprNode::Seq { exprs } => !exprs.is_empty() && exprs.iter().all(call),
+        _ => call(body),
     }
 }
 

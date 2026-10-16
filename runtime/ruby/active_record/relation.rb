@@ -3412,13 +3412,17 @@ module ActiveRecord
     # (`User.active_bots.new` -> `User.new(User.active_bots
     # .scope_attributes)`). Ledgered in docs/pipeline/runtime.md.
 
-    # `first_or_initialize` — the first matching row, or a new unsaved
-    # record when there is none. The caller assigns the remaining
-    # attributes before `save` (the write path this serves), so the built
-    # record starts blank rather than pre-filled from the where-conditions.
-    def first_or_initialize
+    # Rails' `first_or_initialize(attributes = nil, &block)`: the first
+    # matching row, or `new(attributes, &block)` on the relation, the new
+    # record unsaved and carrying the relation's scope attributes
+    # (`build`) and the given ones. Core's `OnlineStore::Manager` passes
+    # `first_or_initialize(survives_application_reinstall: true)`.
+    def first_or_initialize(attrs = nil, &block)
       record = first
-      record.nil? ? @model.new : record
+      return record if !record.nil?
+      built = attrs.nil? ? build : build(attrs)
+      block.call(built) if block
+      built
     end
 
     # Rails' `find_or_create_by` — the first row matching `conditions`,
