@@ -88,4 +88,32 @@ module ActiveRecord
     end
   end
   Relation.prepend(RelationSelectBlock)
+
+  # Rails' `Relation#select_values`: the fields `select` was given, as
+  # written (Symbols stay Symbols), in order, each once (`select_values |=
+  # fields`). The shared relation keeps only the projection's SQL, so the
+  # overlay records the specs beside it: Core's
+  # `Podding::Database::Iteration.check_relation_for_batching` reads
+  # `relation.select_values` to see which columns a batched relation
+  # selects. Arrays are replaced, never appended to, so a spawned
+  # relation shares its parent's list safely. `unscope(:select)` clears it
+  # with the SQL.
+  module RelationSelectValues
+    def select!(*specs)
+      super
+      @select_values = select_values | specs.flatten
+      self
+    end
+
+    def select_values
+      @select_values || []
+    end
+
+    def unscope_clause(scope)
+      @select_values = [] if scope == :select
+      super
+    end
+    private :unscope_clause
+  end
+  Relation.prepend(RelationSelectValues)
 end
