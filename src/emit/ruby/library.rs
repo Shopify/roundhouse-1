@@ -10991,7 +10991,12 @@ fn emit_library_class_decl_inner(
     // The source's own top-level requires first, as Ruby runs them
     // before the body (`authored_requires`). A load-time need that one
     // of them already loads is not repeated.
-    let (authored, after, trailing) = authored_requires(lc, app, &out_dir, &self_anchor);
+    let (authored, after, mut trailing) = authored_requires(lc, app, &out_dir, &self_anchor);
+    for line in hook_nested_requires(lc, app, &out_dir) {
+        if !trailing.contains(&line) {
+            trailing.push(line);
+        }
+    }
     for line in &authored {
         writeln!(s, "{line}").unwrap();
     }
@@ -12311,6 +12316,57 @@ fn emit_library_class_decl_inner(
     }
 
     EmittedFile { path: out_path, content: s }
+}
+
+/// The `require_relative` lines, written below the module, of the nested
+/// constants that a module's `included`/`extended`/`prepended` hook names
+/// and that keep a file of their own.
+///
+/// Only a class owns a file's nested classes (`owns_a_file`), so a module's
+/// nested module is emitted apart and nothing loads it with the module. The
+/// hook runs when another file includes the module, and reads the constant
+/// then: identifications' `ApiChangeInterface.included` extends
+/// `ClassMethods`, and `ApiChangeSkeleton` in the next file includes the
+/// interface, before anything had loaded `ClassMethods`
+/// (`uninitialized constant Identifications::ApiChangeInterface::
+/// ClassMethods`). Below the module's `end` the module is whole, so a child
+/// that reopens it finds it, and a file that requires the module has the
+/// children by the time its own body runs.
+fn hook_nested_requires(lc: &LibraryClass, app: &App, out_dir: &Path) -> Vec<String> {
+    if !lc.is_module || lc.origin.is_some() {
+        return Vec::new();
+    }
+    let owner = lc.name.0.as_str().trim_start_matches("::");
+    let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+    for hook in lc.methods.iter().filter(|m| {
+        m.receiver == MethodReceiver::Class && matches!(m.name.as_str(), "included" | "extended" | "prepended")
+    }) {
+        walk_const_paths(&hook.body, &mut paths);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for path in &paths {
+        let written = path.join("::");
+        let written = written.trim_start_matches("::");
+        for candidate in [written.to_string(), format!("{owner}::{written}")] {
+            let nested = candidate.strip_prefix(&format!("{owner}::")).is_some();
+            if nested
+                && !names.contains(&candidate)
+                && library_classes_named(&candidate, app).iter().any(|c| c.origin.is_none())
+                && file_owner(&candidate, app) == candidate
+                && !is_model_named(&candidate, app)
+            {
+                names.push(candidate);
+                break;
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let anchor = format!("app/models/{}", super::library_file_stem(&name, app));
+            format!("require_relative {:?}", relpath(out_dir, &anchor))
+        })
+        .collect()
 }
 
 /// The includes of `lc` the source has below the first callback
