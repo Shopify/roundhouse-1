@@ -15426,6 +15426,13 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[
     // only record an annotation), its Datatypes and its configuration.
     // The gem loads through zeitwerk and ActiveSupport.
     ("database_documentation", &[("runtime/spinel/database_documentation.rb", "runtime/database_documentation.rb")]),
+    // sequenced_column 1.2.1's `sequenced_column` macro: `before_create`
+    // draws the column's next number from `SequencedColumn.store`,
+    // `after_rollback` returns it. The gem is Rails-dependent (it includes
+    // its module into ActiveRecord::Base from an `on_load` hook), so the
+    // port stands in for it, and the macro is replayed in the model body
+    // (the `sequenced_column` verdict in `macro_replay`).
+    ("sequenced_column", &[("runtime/spinel/sequenced_column.rb", "runtime/sequenced_column.rb")]),
 ];
 
 /// Gems a `GEM_RUNTIME_PORTS` port stands in for that the app's
@@ -15434,7 +15441,8 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[
 /// would have loaded the gem, and the feature `require "<gem>"` answers
 /// from runtime/features. semian is not here: the app requires its
 /// features itself (`semian_port_requires`).
-const BUNDLER_REQUIRED_GEM_PORTS: &[(&str, &str)] = &[("database_documentation", "database_documentation")];
+const BUNDLER_REQUIRED_GEM_PORTS: &[(&str, &str)] =
+    &[("database_documentation", "database_documentation"), ("sequenced_column", "sequenced_column")];
 
 /// The [`BUNDLER_REQUIRED_GEM_PORTS`] the app's Gemfile Bundler.requires
 /// in the test environment, less those the app compiles from source
