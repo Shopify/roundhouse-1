@@ -40,6 +40,7 @@ fn test_request_and_basic_auth_answer_like_actionpack() {
         "ac session class: \"ActionController::TestSession\"",
         "encode: \"Basic dGF4ZXM6czNjcjpldA==\"",
         "user_name_and_password: [\"taxes\", \"s3cr:et\"]",
+        "ad media_type: [\"application/xml\", \"Application/XML; charset=utf-8\", nil, nil]",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
     }

@@ -239,6 +239,13 @@ impl Model {
         })
     }
 
+    pub fn validations_mut(&mut self) -> impl Iterator<Item = &mut Validation> {
+        self.body.iter_mut().filter_map(|item| match item {
+            ModelBodyItem::Validation { validation, .. } => Some(validation),
+            _ => None,
+        })
+    }
+
     /// `validations()` paired with each `validates` call's source span.
     pub fn spanned_validations(&self) -> impl Iterator<Item = (Span, &Validation)> {
         self.body.iter().filter_map(|item| match item {

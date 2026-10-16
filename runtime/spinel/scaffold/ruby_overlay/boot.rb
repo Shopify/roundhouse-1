@@ -164,6 +164,9 @@ require_relative "runtime/http_authentication"
 # The signatures on the session and flash cookies — the helpers the two
 # dispatchers restore and persist those cookies through (see the file).
 require_relative "runtime/signed_cookies"
+# `cookies.encrypted`: Rails' AES-256-GCM cookie jar over the messages port
+# (see the file); a view on the shared CookieJar, so after it.
+require_relative "runtime/encrypted_cookies_cruby"
 # The mocha slot `lower::mocha` prepends to an app method a test stubs
 # (`User#reset_remote_connections`): the guard is in the APP's code, so it
 # runs in production too, where it asks the registry, finds nothing and

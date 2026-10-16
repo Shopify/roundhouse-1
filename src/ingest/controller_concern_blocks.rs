@@ -444,3 +444,84 @@ impl Walk<'_> {
         }
     }
 }
+
+/// A module that fires its own load hook, `ActiveSupport.run_load_hooks(:h,
+/// self)` ending its body, is open to the hook blocks registered for it:
+/// Core's support component runs `ShopAwareController.include(EmployeeLogin)`
+/// from `on_load(:shop_aware_controller)`, and `EmployeeLogin` brings
+/// `Authorization::WithActor`'s `set_api_actor` to every controller that
+/// includes `ShopAwareController` (`AdminSectionController`). The splice
+/// copied the module's own methods into the controller and the lowered
+/// class wrote no `include`, so the later `include` reached the module and
+/// no controller. Ruby (3.0 and later) carries a module's new includes to
+/// every class that already includes it, so keeping the real `include`
+/// restores that path.
+///
+/// Each controller keeps the `include`s of the Concerns it writes (not a
+/// superclass's, which that superclass keeps) that are, or reach through
+/// their own includes, such a module. The module's methods are the copies
+/// the controller already defines, which win over the module's.
+pub(super) fn keep_load_hook_includes(app: &mut App) {
+    if app.controllers.is_empty() || app.class_load_hooks.is_empty() {
+        return;
+    }
+    let hooked: HashSet<ClassId> = app
+        .class_load_hooks
+        .iter()
+        .filter(|hook| hook.base == hook.class)
+        .filter_map(|hook| {
+            let id = ClassId(Symbol::from(hook.class.as_str()));
+            app.library_classes.iter().any(|lc| lc.is_module && lc.name == id).then_some(id)
+        })
+        .collect();
+    if hooked.is_empty() {
+        return;
+    }
+    let module_includes: HashMap<&ClassId, &[ClassId]> =
+        app.library_classes.iter().map(|lc| (&lc.name, lc.includes.as_slice())).collect();
+    let reaches_hooked = |root: &ClassId| {
+        let mut seen: HashSet<&ClassId> = HashSet::default();
+        let mut queue = vec![root];
+        while let Some(module) = queue.pop() {
+            if !seen.insert(module) {
+                continue;
+            }
+            if hooked.contains(module) {
+                return true;
+            }
+            queue.extend(module_includes.get(module).into_iter().flat_map(|incs| incs.iter()));
+        }
+        false
+    };
+    let parents: HashMap<&ClassId, &ClassId> =
+        app.controllers.iter().filter_map(|c| Some((&c.name, c.parent.as_ref()?))).collect();
+    let direct: HashMap<&ClassId, Vec<ClassId>> =
+        app.controllers.iter().map(|c| (&c.name, own_includes(&c.body))).collect();
+    let mut planned: Vec<(ClassId, Vec<ClassId>)> = Vec::new();
+    for controller in &app.controllers {
+        // What a superclass controller includes: its own `include` carries it.
+        let mut inherited: HashSet<&ClassId> = HashSet::default();
+        let mut at = parents.get(&controller.name).copied();
+        for _ in 0..32 {
+            let Some(parent) = at.take() else { break };
+            inherited.extend(direct.get(parent).into_iter().flatten());
+            at = parents.get(parent).copied();
+        }
+        let keep: Vec<ClassId> = direct[&controller.name]
+            .iter()
+            .filter(|root| !inherited.contains(root) && reaches_hooked(root))
+            .cloned()
+            .collect();
+        if !keep.is_empty() {
+            planned.push((controller.name.clone(), keep));
+        }
+    }
+    for (name, keep) in planned {
+        let includes = app.controller_runtime_includes.entry(name).or_default();
+        for id in keep {
+            if !includes.contains(&id) {
+                includes.push(id);
+            }
+        }
+    }
+}
