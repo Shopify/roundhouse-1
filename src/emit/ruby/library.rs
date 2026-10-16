@@ -10319,6 +10319,52 @@ fn emit_library_class_decl_inner(
                 copy.methods.push(f.clone());
             }
         }
+        // An `alias_method :to, :from` of a forwarder the ingest declined
+        // (so no def for `ingest::inherited_alias` to copy: the `(...)`
+        // forwarder is made just above) below its `delegate` is the same
+        // forwarder under its name, as for one the ingest expanded.
+        // frozen_record 0.27.4's Scope `alias_method :find_each, :each`
+        // below `delegate :first, …, :each, …, to: :to_a`, where another
+        // class's `def each(*)` declines `each`.
+        for call in std::mem::take(&mut copy.unknown_calls) {
+            let alias = declined.into_iter().flatten().find_map(|f| {
+                let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+                let [to, from] = args.as_slice() else { return None };
+                let (
+                    ExprNode::Lit { value: crate::expr::Literal::Sym { value: to } },
+                    ExprNode::Lit { value: crate::expr::Literal::Sym { value: from } },
+                ) = (&*to.node, &*from.node)
+                else {
+                    return None;
+                };
+                (method.as_str() == "alias_method"
+                    && *from == f.name
+                    && f.receiver == MethodReceiver::Instance
+                    && !call.span.is_synthetic()
+                    && f.name_span.file == call.span.file
+                    && f.name_span.start < call.span.start
+                    && !copy.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == *to))
+                .then(|| (to.clone(), from.clone()))
+            });
+            let original = alias.as_ref().and_then(|(_, from)| {
+                copy.methods.iter().rev().find(|m| m.receiver == MethodReceiver::Instance && m.name == *from)
+            });
+            let (Some((to, from)), Some(original)) = (alias.as_ref(), original) else {
+                copy.unknown_calls.push(call);
+                continue;
+            };
+            let mut method = original.clone();
+            method.name = to.clone();
+            method.name_span = call.span;
+            copy.method_aliases.push(crate::dialect::MethodAlias {
+                name: to.clone(),
+                receiver: MethodReceiver::Instance,
+                original: from.clone(),
+                inherited: false,
+                span: call.span,
+            });
+            copy.methods.push(method);
+        }
         with_full_forwarders = copy;
         &with_full_forwarders
     } else {
@@ -14382,10 +14428,57 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
     let written_mixin = |c: &Expr| statement_mixes_in(c) && !(lc.is_module && is_concern_extend(c));
     if statement_mixes_in(call)
         && (!lc.includes.is_empty() || lc.unknown_calls.iter().any(|c| !std::ptr::eq(c, call) && written_mixin(c)))
+        && !mixins_precede(lc, call, app, &written_mixin)
     {
         return false;
     }
     body_statement_place(lc, call, app).is_some()
+}
+
+/// Whether every mixin `lc`'s body otherwise writes (each `include` the
+/// ingest kept in `lc.includes`, each other mixing statement) stands
+/// above `call` in the same file, which mixes in too. The emitted body
+/// writes its includes at its top and the carried statement after them,
+/// the source's order when nothing mixes in below the statement: Core's
+/// `OnlineStore::ThemeExtension` has `include SmartProperties`, `include
+/// ActiveModel::Validations`, then `unsafe_self.include(ExtensionsRuntime::
+/// ExtensionImplementation.owned_by_app)`. An include the source does
+/// not write as `include Const` (no position) is not placed.
+fn mixins_precede(lc: &LibraryClass, call: &Expr, app: &App, written_mixin: &dyn Fn(&Expr) -> bool) -> bool {
+    if call.span.is_synthetic() {
+        return false;
+    }
+    let above = |span: Span| !span.is_synthetic() && span.file == call.span.file && span.start < call.span.start;
+    if !lc
+        .unknown_calls
+        .iter()
+        .filter(|c| !std::ptr::eq(*c, call) && written_mixin(c))
+        .all(|c| above(c.span))
+    {
+        return false;
+    }
+    if lc.includes.is_empty() {
+        return true;
+    }
+    let Some(source) = (call.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
+        return false;
+    };
+    let offsets = crate::lower::job_class_side::include_offsets(&source.text, lc.name.0.as_str());
+    let mut cursor = 0;
+    for inc in &lc.includes {
+        let id = inc.0.as_str().trim_start_matches("::");
+        let Some(k) = offsets[cursor..]
+            .iter()
+            .position(|(written, _)| id == written || id.ends_with(&format!("::{written}")))
+        else {
+            return false;
+        };
+        cursor += k + 1;
+        if offsets[cursor - 1].1 >= call.span.start {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `call`, a body statement of `lc`'s `class << self`
@@ -14895,7 +14988,7 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
             parent = class.parent.as_ref();
         }
     }
-    fn walk(e: &Expr, own: &[&Symbol], hooked: bool, app: &App, ok: &mut bool) {
+    fn walk(e: &Expr, own: &[&Symbol], extended: &[&LibraryClass], hooked: bool, app: &App, ok: &mut bool) {
         if !*ok {
             return;
         }
@@ -14922,35 +15015,49 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
             // arguments are still read.
             if rebinds {
                 if let Some(r) = recv {
-                    walk(r, own, hooked, app, ok);
+                    walk(r, own, extended, hooked, app, ok);
                 }
                 for a in args {
-                    walk(a, own, hooked, app, ok);
+                    walk(a, own, extended, hooked, app, ok);
                 }
                 return;
             }
-            if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method) && !hooked {
+            if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method)
+                && !extended.iter().any(|m| module_defines(m, method.as_str(), app, &mut Vec::new()))
+                && !hooked {
                 *ok = false;
                 return;
             }
             if let Some(r) = recv {
-                walk(r, own, hooked, app, ok);
+                walk(r, own, extended, hooked, app, ok);
             }
             for a in args {
-                walk(a, own, hooked, app, ok);
+                walk(a, own, extended, hooked, app, ok);
             }
             if let Some(b) = block
                 && !(on_self && method.as_str() == "define_method")
             {
-                walk(b, own, hooked, app, ok);
+                walk(b, own, extended, hooked, app, ok);
             }
             return;
         }
-        e.node.for_each_child(&mut |child| walk(child, own, hooked, app, ok));
+        e.node.for_each_child(&mut |child| walk(child, own, extended, hooked, app, ok));
     }
+    // The app modules the class and its app ancestors `extend` give it
+    // their instance methods as class methods (Core's `Pagination::Query`
+    // `extend CompositionHelper`, whose `sort_param` a subclass's body
+    // loop calls).
+    let extended: Vec<&LibraryClass> = if singleton {
+        Vec::new()
+    } else {
+        std::iter::once(lc)
+            .chain(app_library_ancestors(lc, app))
+            .flat_map(|c| extended_app_modules(c, app))
+            .collect()
+    };
     let hooked = !singleton && includes_app_included_hook(lc, app);
     let mut ok = true;
-    walk(call, &own, hooked, app, &mut ok);
+    walk(call, &own, &extended, hooked, app, &mut ok);
     ok
 }
 
