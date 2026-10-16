@@ -140,7 +140,7 @@ module ActiveRecord
     def self.connection: () -> Connection
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
-    def self.find_by_sql: (untyped sql, ?Array[untyped] binds, ?preparable: bool?, ?allow_retry: bool) ?{ (Base) -> untyped } -> Array[Base]
+    def self.find_by_sql: (String | Array[untyped] sql, ?Array[untyped] binds, ?preparable: bool?, ?allow_retry: bool) ?{ (Base) -> untyped } -> Array[Base]
     def self.uncached: () { () -> untyped } -> untyped
     def self.sanitize_sql_like: (String string, ?String escape_character) -> String
     def self.clear_query_caches_for_current_thread: () -> nil
