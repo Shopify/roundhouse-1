@@ -444,6 +444,39 @@ fn refused_route_diagnostics(entries: &[RouteSpec], source: &[u8], file: &str) -
     out
 }
 
+/// `format: true` on a scope makes `.:format` a REQUIRED suffix of every
+/// route inside. The router matches whole segments and the suffix is not
+/// composed into those routes, so name the scope instead of serving them
+/// without it.
+fn note_required_format(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+    cx: &Ctx<'_>,
+    key: &str,
+    value: &ruby_prism::Node<'_>,
+) {
+    if key != "format" || value.as_true_node().is_none() {
+        return;
+    }
+    let detail = "`format: true` (a required `.:format` suffix) is not modeled; the routes inside \
+                  are served and their helpers generated without the suffix";
+    let location = call.location();
+    cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
+        Span {
+            file: super::sources::file_id(file),
+            start: location.start_offset() as u32,
+            end: location.end_offset() as u32,
+        },
+        None,
+        "route scope option",
+        detail,
+    ));
+    super::survey::record(&IngestError::Unsupported {
+        file: file.into(),
+        message: format!("route scope option: {detail}"),
+    });
+}
+
 /// Attach a located unsupported-mount diagnostic and the matching survey
 /// record to the original mount or engine route call.
 fn route_mount_gap(
@@ -2324,6 +2357,7 @@ fn ingest_namespace_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
+                note_required_format(call, file, cx, key.as_str(), &value);
                 let facet = if value.as_nil_node().is_some() { Some(None) } else { rname(&value).map(Some) };
                 let Some(facet) = facet else { continue };
                 let facet = facet.filter(|v| !v.trim_matches('/').is_empty());
@@ -2368,6 +2402,7 @@ fn ingest_scope_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
+                note_required_format(call, file, cx, key.as_str(), &value);
                 let val = rname(&value);
                 match key.as_str() {
                     "path" => path = val.or(path),

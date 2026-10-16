@@ -59,6 +59,12 @@ pub struct FlatRoute {
     /// segments are appended only when supplied. Equals `path_params.
     /// len()` for the common all-required route.
     pub required_params: usize,
+    /// For the canonical variant of a path with Rails optional groups
+    /// (`(/:locale)/cart(/:id)`), the SHORTEST variant (`/cart`). The
+    /// helper renders the segments the shortest variant lacks only when
+    /// their param is supplied, wherever in the path the group sits.
+    /// `None` for a path without optional groups.
+    pub required_path: Option<String>,
     /// Path params constrained to digit-only segments — Roda's
     /// `Integer` matcher (`r.on Integer`) and Rails digit-class
     /// `constraints:` (`/\d+/`, `/[0-9]+/`). The runtime router
@@ -559,31 +565,22 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     },
                 },
             };
-            // The SHORTEST variant (last — variants are longest-first)
-            // fixes how many leading params are required; the extras the
-            // longer variants add are the trailing optional-group params.
-            // The canonical (named) helper carries that required count so
-            // its optional params get `nil` defaults.
-            //
-            // The optional-path helper body (build_optional_path_expr)
-            // assumes the optional groups are TRAILING — each shorter
-            // variant is a segment-prefix of the longer. A MID-path group
-            // (`/foo(/:bar)/baz`) breaks that: the shortest ("/foo/baz")
-            // isn't a prefix of the longest ("/foo/:bar/baz"), and the
-            // conditional-append body would fold the always-present "/baz"
-            // into `:bar`'s optional chunk. No lobsters route has one; when
-            // the assumption doesn't hold, fall back to all-required (a
-            // valid, if over-constrained, helper) rather than emit a
-            // mangled path.
-            let trailing_optionals = {
-                let short: Vec<&str> = variants.last().unwrap().split('/').collect();
-                let long: Vec<&str> = variants[0].split('/').collect();
-                short.len() <= long.len()
-                    && short.iter().zip(long.iter()).all(|(a, b)| a == b)
-            };
-            let required_count = {
-                let shortest = if trailing_optionals { variants.last() } else { variants.first() };
-                path_ordered_params(shortest.unwrap(), &base_params).len()
+            // The params present only in the longest variant are the
+            // optional ones. The canonical helper takes the required
+            // params first, in path order, then the optional ones with a
+            // `nil` default, and renders each optional segment only when
+            // its param is given: Rails' `required_parts` are what a
+            // positional call fills, whatever the group's position.
+            let (required_count, required_path) = {
+                let shortest_path = variants.last().unwrap();
+                let optional = optional_group_params(&variants[0], shortest_path, &base_params);
+                match optional.is_empty() {
+                    true => (path_ordered_params(&variants[0], &base_params).len(), None),
+                    false => (
+                        path_ordered_params(shortest_path, &base_params).len(),
+                        Some(shortest_path.clone()),
+                    ),
+                }
             };
             // Only the canonical variant carries the helper name; the
             // shorter alternates would otherwise register a duplicate
@@ -608,7 +605,10 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .map(|(name, rx)| (name.as_str().to_string(), rx.clone()))
                 .collect();
             for (i, vpath) in variants.into_iter().enumerate() {
-                let params = path_ordered_params(&vpath, &base_params);
+                let mut params = path_ordered_params(&vpath, &base_params);
+                if let (0, Some(shortest)) = (i, &required_path) {
+                    params = required_first(params, shortest, &base_params);
+                }
                 let required_params = if i == 0 { required_count } else { params.len() };
                 // A shorter optional-group variant may not carry every
                 // constrained param — keep only the ones it captures.
@@ -649,6 +649,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     helpers_enabled: ctx.helpers_enabled,
                     format: forced_format.clone().or_else(|| ctx.default_format()),
                     required_params,
+                    required_path: if i == 0 { required_path.clone() } else { None },
                     param_defaults: defaults_for(ctx, &params),
                     path_params: params,
                     int_params,
@@ -704,6 +705,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 helpers_enabled: ctx.helpers_enabled,
                 format: None,
                 required_params: 0,
+                required_path: None,
                 int_params: vec![],
                 constraints: vec![],
                 seg_patterns: vec![],
@@ -873,52 +875,64 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 // requirement outside the supported subset refuses
                 // this action's route rather than serve it unenforced.
                 let (seg_patterns, refused) = compile_seg_patterns(&other_constraints);
-                out.push(FlatRoute {
-                    method: method.clone(),
-                    path: full_path.clone(),
-                    controller: controller_class.clone(),
-                    action: Symbol::from(action_name),
-                    as_name: if ctx.helpers_enabled { as_name.clone() } else { String::new() },
-                    required_params: params.len(),
-                    param_defaults: defaults_for(ctx, &params),
-                    path_params: params.clone(),
-                    named: ctx.helpers_enabled,
-                    helpers_enabled: ctx.helpers_enabled,
-                    format: ctx.default_format(),
-                    int_params: int_params.clone(),
-                    constraints: other_constraints.clone(),
-                    seg_patterns: seg_patterns.clone(),
-                    refused: refused.clone(),
-                });
-                // Rails routes `update` on BOTH `PATCH` and `PUT` — the
-                // verb changed in Rails 4 and the older one was kept, so
-                // both reach the same action. campfire's controller
-                // tests write `put account_user_url(...)`, and a table
-                // carrying only the PATCH row answered "no route
-                // matches" for a request Rails routes fine.
-                //
-                // `named: false`: the pair is ONE route as far as
-                // helpers go, and a second named row would either
-                // duplicate `<x>_path` or lose the dedupe race with it.
-                // Only the dispatch table needs both.
-                if action_name == "update" {
-                    out.push(FlatRoute {
-                        method: HttpMethod::Put,
-                        path: full_path,
-                        controller: controller_class.clone(),
-                        action: Symbol::from(action_name),
-                        as_name: if ctx.helpers_enabled { as_name } else { String::new() },
-                        required_params: params.len(),
-                        param_defaults: defaults_for(ctx, &params),
-                        path_params: params,
-                        named: false,
-                        helpers_enabled: ctx.helpers_enabled,
-                        format: ctx.default_format(),
-                        int_params,
-                        constraints: other_constraints,
-                        seg_patterns,
-                        refused,
-                    });
+                // A scope path with an optional group (`(/:locale)`)
+                // routes both with and without it, like the `Explicit`
+                // arm; only the canonical (longest) variant is named and
+                // carries the helper's optional-segment shape.
+                let variants = expand_optional_paths(&full_path);
+                let required_path = (variants.len() > 1)
+                    .then(|| variants.last().unwrap().clone())
+                    .filter(|short| !optional_group_params(&variants[0], short, &nested_params).is_empty());
+                let params = match &required_path {
+                    Some(short) => required_first(params, short, &nested_params),
+                    None => params,
+                };
+                for (i, vpath) in variants.into_iter().enumerate() {
+                    let vparams = if i == 0 { params.clone() } else { path_ordered_params(&vpath, &nested_params) };
+                    let required_params = match (i, &required_path) {
+                        (0, Some(short)) => path_ordered_params(short, &nested_params).len(),
+                        _ => vparams.len(),
+                    };
+                    let verbs: &[(HttpMethod, bool)] = if action_name == "update" {
+                        &[(method.clone(), true), (HttpMethod::Put, false)]
+                    } else {
+                        &[(method.clone(), true)]
+                    };
+                    for (verb, primary) in verbs {
+                        // Rails routes `update` on BOTH `PATCH` and `PUT` — the
+                        // verb changed in Rails 4 and the older one was kept, so
+                        // both reach the same action. campfire's controller
+                        // tests write `put account_user_url(...)`, and a table
+                        // carrying only the PATCH row answered "no route
+                        // matches" for a request Rails routes fine.
+                        //
+                        // `named: false` on the PUT: the pair is ONE route as
+                        // far as helpers go, and a second named row would either
+                        // duplicate `<x>_path` or lose the dedupe race with it.
+                        // Only the dispatch table needs both.
+                        out.push(FlatRoute {
+                            method: verb.clone(),
+                            path: vpath.clone(),
+                            controller: controller_class.clone(),
+                            action: Symbol::from(action_name),
+                            as_name: if ctx.helpers_enabled { as_name.clone() } else { String::new() },
+                            required_params,
+                            required_path: if i == 0 { required_path.clone() } else { None },
+                            param_defaults: defaults_for(ctx, &vparams),
+                            path_params: vparams.clone(),
+                            named: *primary && i == 0 && ctx.helpers_enabled,
+                            helpers_enabled: ctx.helpers_enabled,
+                            format: ctx.default_format(),
+                            int_params: int_params.iter().filter(|n| vparams.contains(n)).cloned().collect(),
+                            constraints: other_constraints
+                                .iter()
+                                .filter(|(n, _)| vparams.contains(n))
+                                .cloned()
+                                .collect(),
+                            seg_patterns: seg_patterns.clone(),
+                            refused: refused.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1191,10 +1205,30 @@ fn expand_optional_paths(path: &str) -> Vec<String> {
     // Inline optional format suffix (`(.:format)`) — a dotted segment the
     // slash-splitting router can't capture; drop it, keep only the base.
     if !inside.starts_with('.') {
-        out.extend(expand_optional_paths(&format!("{before}{inside}{after}")));
+        // `scope "(/:locale)"` under a `/` prefix leaves `//` where the
+        // group opens; Rails normalizes the path.
+        let with = format!("{before}{inside}{after}").replace("//", "/");
+        out.extend(expand_optional_paths(&with));
     }
     out.extend(expand_optional_paths(&without));
     out
+}
+
+/// The params only the longest variant of an optional-group path has: the
+/// ones a helper takes with a `nil` default.
+fn optional_group_params(longest: &str, shortest: &str, known: &[String]) -> Vec<String> {
+    let kept = path_ordered_params(shortest, known);
+    path_ordered_params(longest, known).into_iter().filter(|p| !kept.contains(p)).collect()
+}
+
+/// A canonical variant's params with the required ones first, each group
+/// in path order.
+fn required_first(params: Vec<String>, shortest: &str, known: &[String]) -> Vec<String> {
+    let kept = path_ordered_params(shortest, known);
+    let (mut required, optional): (Vec<String>, Vec<String>) =
+        params.into_iter().partition(|p| kept.contains(p));
+    required.extend(optional);
+    required
 }
 
 /// Walk a Rails-shape path (`/posts/:id/edit`,
@@ -1219,7 +1253,8 @@ fn path_ordered_params(path: &str, known: &[String]) -> Vec<String> {
 fn extract_path_params(path: &str, params: &mut Vec<String>) {
     let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == ':' {
+        // `:name` is a segment, `*name` a glob (the rest of the path).
+        if c == ':' || c == '*' {
             let mut ident = String::new();
             while let Some(&nc) = chars.peek() {
                 if nc.is_alphanumeric() || nc == '_' {
