@@ -220,3 +220,23 @@ def aliased_join_sql(owner, reflection, kind)
 end
   end
 end
+
+module ActiveRecord
+  # `where(assoc: record)` over a composite-key association (Core's
+  # yugabyte_overrides / query_constraints keys): the reflection's
+  # `_roundhouse_key_pairs` name each [foreign key, primary key] pair, and
+  # every pair is matched, as Rails' AssociationQueryValue does for a
+  # composite foreign key.
+  module CompositeAssociationKeyPredicates
+    def association_key_predicates(reflection, val, note)
+      pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
+      return super if pairs.nil?
+      raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
+        "#{pairs.map { |pair| pair[0] }.inspect} takes one record or nil" unless val.nil? || val.is_a?(Base)
+      pairs.map do |pair|
+        [pair[0], column_predicate(pair[0], val.nil? ? nil : val.public_send(pair[1]), note)]
+      end
+    end
+  end
+  Relation.prepend(CompositeAssociationKeyPredicates)
+end

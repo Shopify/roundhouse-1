@@ -43,7 +43,7 @@ module ActiveSupport
   def self.symbolize_keys: (Hash[String, untyped] hash) -> Hash[Symbol, untyped]
   def self.stringify_keys: (Hash[Symbol, untyped] hash) -> Hash[String, untyped]
   def self.indifferent: (untyped hash) -> Hash[untyped, untyped]
-  def self.indifferent_param: (untyped value) -> untyped
+  def self.indifferent_param: (Hash[untyped, untyped]? value) -> Hash[untyped, untyped]?
   def self.indifferent_value: (untyped value, bool in_place) -> untyped
   def self.indifferent_key: (untyped key) -> untyped
   def self.indifferent_keys: (Array[untyped] keys) -> Array[untyped]

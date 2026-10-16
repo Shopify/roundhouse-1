@@ -444,14 +444,11 @@ module ActiveSupport
   end
 
   # A parameter declared `HashWithIndifferentAccess` (`lower::indifferent_access::
-  # coerce_declared_params`), which the lowering reads by its string keys: a
-  # caller's plain Symbol-keyed Hash becomes Rails' class, one already is,
-  # and every value else (nil) is left as it came. Off the CRuby overlay
-  # a plain Hash is what "indifferent" means and is left as it is.
+  # coerce_declared_params`), which the lowering reads by its string keys.
+  # Off the CRuby overlay a plain Hash is what "indifferent" means and is
+  # left as it is; the overlay (active_support_core_ext.rb) converts it.
   def self.indifferent_param(value)
-    return value unless defined?(::ActiveSupport::HashWithIndifferentAccess)
-    return value if !value.is_a?(Hash) || value.is_a?(::ActiveSupport::HashWithIndifferentAccess)
-    ::ActiveSupport::HashWithIndifferentAccess.new(value)
+    value
   end
 
   # Not a copy for every Array: Rails converts one written by `[]=` in place, unless it is frozen.

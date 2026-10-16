@@ -1499,3 +1499,18 @@ class Hash
 
   alias_method :to_param, :to_query
 end
+
+module ActiveSupport
+  # A parameter declared `HashWithIndifferentAccess` (`lower::indifferent_access::
+  # coerce_declared_params`), which the lowering reads by its string keys: a
+  # caller's plain Symbol-keyed Hash becomes Rails' class, one already is,
+  # and every value else (nil) is left as it came. Prepended, as the shared
+  # runtime's pass-through loads after this file.
+  module IndifferentParam
+    def indifferent_param(value)
+      return value if !value.is_a?(Hash) || value.is_a?(::ActiveSupport::HashWithIndifferentAccess)
+      ::ActiveSupport::HashWithIndifferentAccess.new(value)
+    end
+  end
+  singleton_class.prepend(IndifferentParam)
+end
