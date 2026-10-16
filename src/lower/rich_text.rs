@@ -158,6 +158,7 @@ pub fn synthesize_record_model(app: &mut App) {
     // `record_id` / `record_type` columns.
     let mut body = vec![ModelBodyItem::Association {
         assoc: Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),

@@ -14,6 +14,7 @@ use crate::span::Span;
 use crate::ty::{Row, Ty};
 use crate::{ClassId, Symbol, TableRef};
 
+use super::composite_keys;
 use super::expr::ingest_expr;
 use super::visibility::{self, Visibility};
 use super::util::{
@@ -3116,6 +3117,10 @@ pub(super) fn parse_association(
     let mut autosave: Option<bool> = None;
     let mut inverse_of: Option<String> = None;
     let mut validate: Option<bool> = None;
+    // The composite-key spellings of `foreign_key:` / `primary_key:` /
+    // `query_constraints:`, plain and under Core's `yugabyte_overrides:`.
+    let mut plain_keys = composite_keys::KeyOptions::default();
+    let mut override_keys: Option<composite_keys::KeyOptions> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
@@ -3170,11 +3175,15 @@ pub(super) fn parse_association(
                 // only unroots a rooted one.
                 "class_name" => class_name = string_value(&value),
                 "foreign_key" => {
-                    foreign_key = string_value(&value).or_else(|| symbol_value(&value))
+                    foreign_key = string_value(&value).or_else(|| symbol_value(&value));
+                    plain_keys.foreign_key = key_option(&value);
                 }
                 "primary_key" => {
-                    primary_key = string_value(&value).or_else(|| symbol_value(&value))
+                    primary_key = string_value(&value).or_else(|| symbol_value(&value));
+                    plain_keys.primary_key = key_option(&value);
                 }
+                "query_constraints" => plain_keys.query_constraints = key_option(&value),
+                "yugabyte_overrides" => override_keys = value.as_hash_node().map(|h| key_options_of(&h)),
                 "foreign_type" => {
                     foreign_type = string_value(&value).or_else(|| symbol_value(&value))
                 }
@@ -3225,6 +3234,29 @@ pub(super) fn parse_association(
         }
     }
 
+    // A composite key: the primary pair fills the single-column fields and
+    // the rest rides in `extra_keys`. Core's `yugabyte_overrides` replace
+    // the plain options when written.
+    let mut extra_keys: Vec<(Symbol, Symbol)> = Vec::new();
+    if matches!(method, "has_many" | "has_one" | "belongs_to") {
+        if let Some(resolved) = composite_keys::resolve(&plain_keys, override_keys.as_ref()) {
+            foreign_key = Some(resolved.foreign_key);
+            primary_key = resolved.primary_key;
+            extra_keys = resolved
+                .extra_keys
+                .into_iter()
+                .map(|(a, b)| (Symbol::from(a.as_str()), Symbol::from(b.as_str())))
+                .collect();
+        } else if let Some(over) = override_keys.as_ref().and_then(|o| o.foreign_key.as_ref()) {
+            // Scalar overrides replace the plain scalar key too.
+            foreign_key = over.columns.first().cloned();
+            primary_key = override_keys
+                .as_ref()
+                .and_then(|o| o.primary_key.as_ref())
+                .and_then(|p| p.columns.first().cloned())
+                .filter(|p| p != "id");
+        }
+    }
     let foreign_key_explicit = foreign_key.is_some();
     let optional = required.map(|r| !r).or(optional);
 
@@ -3302,6 +3334,7 @@ pub(super) fn parse_association(
             skip_validation: validate == Some(false),
             autosave: autosave == Some(true),
             primary_key: primary_key.as_deref().map(Symbol::from),
+            extra_keys,
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
@@ -3326,6 +3359,7 @@ pub(super) fn parse_association(
             scope_owner,
             autosave: autosave.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
+            extra_keys,
         }),
         "belongs_to" => Some(Association::BelongsTo {
             name: name.clone(),
@@ -3346,6 +3380,7 @@ pub(super) fn parse_association(
             foreign_type: foreign_type.as_deref().map(Symbol::from),
             primary_key: primary_key.as_deref().map(Symbol::from),
             autosave,
+            extra_keys,
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),
@@ -3358,6 +3393,37 @@ pub(super) fn parse_association(
         }),
         _ => None,
     }
+}
+
+/// A key option's columns: `:shop_id`, `"shop_id"` or `[:shop_id, :id]`.
+fn key_option(node: &Node<'_>) -> Option<composite_keys::KeyOption> {
+    if let Some(one) = string_value(node).or_else(|| symbol_value(node)) {
+        return Some(composite_keys::KeyOption { columns: vec![one], array: false });
+    }
+    let columns = node
+        .as_array_node()?
+        .elements()
+        .iter()
+        .map(|e| string_value(&e).or_else(|| symbol_value(&e)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(composite_keys::KeyOption { columns, array: true })
+}
+
+/// The key options inside a `yugabyte_overrides: { .. }` hash literal.
+fn key_options_of(hash: &ruby_prism::HashNode<'_>) -> composite_keys::KeyOptions {
+    let mut out = composite_keys::KeyOptions::default();
+    for el in hash.elements().iter() {
+        let Some(assoc) = el.as_assoc_node() else { continue };
+        let Some(key) = symbol_value(&assoc.key()) else { continue };
+        let value = key_option(&assoc.value());
+        match key.as_str() {
+            "foreign_key" => out.foreign_key = value,
+            "primary_key" => out.primary_key = value,
+            "query_constraints" => out.query_constraints = value,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// `self.primary_key = "key"` / `self.primary_key = :key` — Rails'

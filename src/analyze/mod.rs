@@ -10355,6 +10355,7 @@ fn register_wrapped_belongs_to(body: &[ModelBodyItem], wrappers: &BTreeSet<Symbo
         }
         let target = ClassId(Symbol::from(class_name.unwrap_or_else(|| crate::naming::camelize(name.as_str())).trim_start_matches("::")));
         let assoc = crate::dialect::Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: name.clone(),
             target,
             foreign_key: Symbol::from(format!("{}_id", name.as_str())),

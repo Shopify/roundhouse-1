@@ -3822,6 +3822,14 @@ module ActiveRecord
     # with the association's primary key); a list of them is named as
     # unsupported rather than answered wrong.
     def association_key_predicates(reflection, val, note)
+      pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
+      unless pairs.nil?
+        raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
+          "#{pairs.map { |pair| pair[0] }.inspect} takes one record or nil" unless val.nil? || val.is_a?(Base)
+        return pairs.map do |pair|
+          [pair[0], column_predicate(pair[0], val.nil? ? nil : val.public_send(pair[1]), note)]
+        end
+      end
       fk = reflection.foreign_key
       if fk.is_a?(Array)
         raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite foreign key " \

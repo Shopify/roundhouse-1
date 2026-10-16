@@ -170,7 +170,7 @@ impl<'a> ModelIndex<'a> {
         };
         // A keyed association (`primary_key:`) is not matched on the
         // owner's id, so the loaded owner is not the inverse's record.
-        if crate::lower::assoc_primary_key::custom_primary_key(decl).is_some() {
+        if crate::lower::assoc_primary_key::keyed(decl) {
             return None;
         }
         self.decls.get(target)?.iter().find_map(|a| match a {

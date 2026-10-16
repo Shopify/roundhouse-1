@@ -245,6 +245,7 @@ fn parse_sequel_association(
                 Dependent::None
             };
             Association::HasMany {
+                extra_keys: Vec::new(),
                 name,
                 target,
                 foreign_key,
@@ -264,6 +265,7 @@ fn parse_sequel_association(
             }
         }
         "one_to_one" => Association::HasOne {
+            extra_keys: Vec::new(),
             name: name.clone(),
             through: None,
             source: None,
@@ -283,6 +285,7 @@ fn parse_sequel_association(
             primary_key: None,
         },
         "many_to_one" => Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: name.clone(),
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))

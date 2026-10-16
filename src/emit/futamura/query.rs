@@ -543,7 +543,7 @@ impl<'a> Specializer<'a> {
         let Association::HasMany { target, foreign_key, through, as_interface, scope, scope_owner, .. } = assoc else {
             return Err(format!("`{}` is not a has_many", method.as_str()));
         };
-        if crate::lower::assoc_primary_key::custom_primary_key(assoc).is_some() {
+        if crate::lower::assoc_primary_key::keyed(assoc) {
             return Err(format!("has_many `{}` declares `primary_key:`", method.as_str()));
         }
         if through.is_some() || scope_owner.is_some() || !args.is_empty() {

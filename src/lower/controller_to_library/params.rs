@@ -221,7 +221,7 @@ impl ParamsSpecs {
     pub fn mark_keyed_associations(&mut self, models: &[crate::dialect::Model]) {
         for model in models {
             for assoc in model.associations() {
-                if crate::lower::assoc_primary_key::custom_primary_key(assoc).is_some() {
+                if crate::lower::assoc_primary_key::keyed(assoc) {
                     self.keyed_assocs.insert(assoc.name().clone());
                 }
             }

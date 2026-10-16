@@ -131,6 +131,7 @@ pub fn synthesize_record_model(app: &mut App) {
     let attributes = crate::ingest::model::row_from_table(table);
     let body = vec![ModelBodyItem::Association {
         assoc: Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),

@@ -94,6 +94,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
     // the raw `record_id` / `record_type` columns.
     let body = vec![ModelBodyItem::Association {
         assoc: Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),

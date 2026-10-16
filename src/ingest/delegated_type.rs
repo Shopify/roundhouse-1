@@ -260,6 +260,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
         .collect();
     items.push(ModelBodyItem::Association {
         assoc: Association::BelongsTo {
+            extra_keys: Vec::new(),
             name: decl.role.clone(),
             target: ClassId(Symbol::from(crate::naming::camelize(decl.role.as_str()))),
             foreign_key: decl.foreign_key.clone(),

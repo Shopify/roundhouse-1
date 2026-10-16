@@ -1532,20 +1532,34 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     // "product_uuid", primary_key: "uuid"` joined on
                     // `products.id` (a uuid) against a varchar fk.
                     let pk = association_primary_key(models, target, primary_key.as_ref());
+                    let more: String = a
+                        .extra_keys()
+                        .iter()
+                        .map(|(own_col, target_col)| format!(" AND {t}.{target_col} = {own}.{own_col}"))
+                        .collect();
                     reg.join_tails.insert(
                         (m.name.clone(), name.clone()),
-                        format!("{t} ON {t}.{pk} = {own}.{foreign_key}"),
+                        format!("{t} ON {t}.{pk} = {own}.{foreign_key}{more}"),
                     );
-                    reg.belongs_to_fk
-                        .insert((m.name.clone(), name.clone()), foreign_key.clone());
+                    // A composite key stays `where(order: record)` for the
+                    // runtime, which matches every pair of the reflection.
+                    if a.extra_keys().is_empty() {
+                        reg.belongs_to_fk
+                            .insert((m.name.clone(), name.clone()), foreign_key.clone());
+                    }
                     reg.assoc_table
                         .insert((m.name.clone(), name.clone()), Symbol::from(t.as_str()));
                     reg.assoc_target
                         .insert((m.name.clone(), name.clone()), target.clone());
                     if name.as_str() != t {
+                        let more: String = a
+                            .extra_keys()
+                            .iter()
+                            .map(|(own_col, target_col)| format!(" AND {name}.{target_col} = {own}.{own_col}"))
+                            .collect();
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.{pk} = {own}.{foreign_key}"),
+                            format!("{t} {name} ON {name}.{pk} = {own}.{foreign_key}{more}"),
                         );
                     }
                 }
@@ -1568,7 +1582,10 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                         reg.has_many_owner_key
                             .insert((m.name.clone(), name.clone()), owner_key.clone());
                     }
+                    // A composite key's other columns are not in the seed
+                    // (`order.lines.where(..)` would match on one column).
                     if as_interface.is_some()
+                        || !a.extra_keys().is_empty()
                         || scope.as_ref().is_some_and(|s| !scope_is_row_preserving(s))
                     {
                         reg.has_many_unseedable.insert((m.name.clone(), name.clone()));
@@ -1578,10 +1595,20 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     // A scope that takes the owner has no join (Rails'
                     // `check_eager_loadable!`): the spec stays unexpanded
                     // and the runtime reflection refuses it.
+                    let more: String = a
+                        .extra_keys()
+                        .iter()
+                        .map(|(target_col, owner_col)| format!(" AND {t}.{target_col} = {own}.{owner_col}"))
+                        .collect();
+                    let more_aliased: String = a
+                        .extra_keys()
+                        .iter()
+                        .map(|(target_col, owner_col)| format!(" AND {name}.{target_col} = {own}.{owner_col}"))
+                        .collect();
                     if scope_owner.is_none() {
                         reg.join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}"),
+                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}{more}"),
                         );
                     }
                     reg.has_many_fk.insert(
@@ -1595,7 +1622,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if name.as_str() != t {
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}"),
+                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}{more_aliased}"),
                         );
                     }
                     let entry = (target.clone(), foreign_key.clone());
@@ -1611,10 +1638,20 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                 Association::HasOne { name, target, foreign_key, scope_owner, .. } => {
                     let owner_key = a.owner_key();
                     let t = reg.table_for(target);
+                    let more: String = a
+                        .extra_keys()
+                        .iter()
+                        .map(|(target_col, owner_col)| format!(" AND {t}.{target_col} = {own}.{owner_col}"))
+                        .collect();
+                    let more_aliased: String = a
+                        .extra_keys()
+                        .iter()
+                        .map(|(target_col, owner_col)| format!(" AND {name}.{target_col} = {own}.{owner_col}"))
+                        .collect();
                     if scope_owner.is_none() {
                         reg.join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}"),
+                            format!("{t} ON {t}.{foreign_key} = {own}.{owner_key}{more}"),
                         );
                     }
                     reg.assoc_table
@@ -1624,7 +1661,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                     if name.as_str() != t {
                         reg.aliased_join_tails.insert(
                             (m.name.clone(), name.clone()),
-                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}"),
+                            format!("{t} {name} ON {name}.{foreign_key} = {own}.{owner_key}{more_aliased}"),
                         );
                     }
                 }

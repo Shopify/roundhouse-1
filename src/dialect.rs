@@ -517,6 +517,18 @@ pub enum Association {
         /// `None` means `id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// Composite key pairs beyond the primary `foreign_key` /
+        /// `primary_key` pair, as `(column on the foreign-key side,
+        /// column on the referenced side)`: `foreign_key: [:shop_id,
+        /// :order_id]` (Core's `yugabyte_overrides` `query_constraints`)
+        /// is the primary pair `order_id` / `id` plus `(shop_id,
+        /// shop_id)`. The foreign-key side is the target for
+        /// `has_one` / `has_many` and the owner for `belongs_to`. Every
+        /// read of the association (reader, preload, join, where
+        /// through it) matches these too; a build writes only the
+        /// primary foreign key, as Rails' `query_constraints` does.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_keys: Vec<(Symbol, Symbol)>,
         /// The declaration's `autosave:`. `Some(false)` (Core's readonly
         /// associations merge it) never saves an assigned target, where
         /// the default saves a new one (`apply_belongs_to_autosave`), as
@@ -588,6 +600,18 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// Composite key pairs beyond the primary `foreign_key` /
+        /// `primary_key` pair, as `(column on the foreign-key side,
+        /// column on the referenced side)`: `foreign_key: [:shop_id,
+        /// :order_id]` (Core's `yugabyte_overrides` `query_constraints`)
+        /// is the primary pair `order_id` / `id` plus `(shop_id,
+        /// shop_id)`. The foreign-key side is the target for
+        /// `has_one` / `has_many` and the owner for `belongs_to`. Every
+        /// read of the association (reader, preload, join, where
+        /// through it) matches these too; a build writes only the
+        /// primary foreign key, as Rails' `query_constraints` does.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_keys: Vec<(Symbol, Symbol)>,
     },
     HasOne {
         name: Symbol,
@@ -637,6 +661,18 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// Composite key pairs beyond the primary `foreign_key` /
+        /// `primary_key` pair, as `(column on the foreign-key side,
+        /// column on the referenced side)`: `foreign_key: [:shop_id,
+        /// :order_id]` (Core's `yugabyte_overrides` `query_constraints`)
+        /// is the primary pair `order_id` / `id` plus `(shop_id,
+        /// shop_id)`. The foreign-key side is the target for
+        /// `has_one` / `has_many` and the owner for `belongs_to`. Every
+        /// read of the association (reader, preload, join, where
+        /// through it) matches these too; a build writes only the
+        /// primary foreign key, as Rails' `query_constraints` does.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_keys: Vec<(Symbol, Symbol)>,
     },
     HasAndBelongsToMany {
         name: Symbol,
@@ -665,6 +701,17 @@ impl Association {
             | Association::HasMany { primary_key, .. }
             | Association::HasOne { primary_key, .. } => primary_key.as_ref(),
             Association::HasAndBelongsToMany { .. } => None,
+        }
+    }
+
+    /// The composite key pairs beyond the primary one (see
+    /// `extra_keys` on the variants); empty for a single-column key.
+    pub fn extra_keys(&self) -> &[(Symbol, Symbol)] {
+        match self {
+            Association::BelongsTo { extra_keys, .. }
+            | Association::HasMany { extra_keys, .. }
+            | Association::HasOne { extra_keys, .. } => extra_keys,
+            Association::HasAndBelongsToMany { .. } => &[],
         }
     }
 

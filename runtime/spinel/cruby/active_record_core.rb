@@ -456,8 +456,9 @@ module ActiveRecord
     class AssociationReflection
       attr_reader :name, :active_record
 
-      def initialize(name, target, foreign_key, options, active_record, unsupported: [], instance_dependent_scope: false, scoped: false)
+      def initialize(name, target, foreign_key, options, active_record, unsupported: [], instance_dependent_scope: false, scoped: false, key_pairs: nil)
         @name = name
+        @key_pairs = key_pairs
         @target = target
         @foreign_key = foreign_key
         @options = options.nil? ? nil : normalize_options(options)
@@ -465,6 +466,15 @@ module ActiveRecord
         @unsupported = unsupported
         @instance_dependent_scope = instance_dependent_scope
         @scoped = scoped || instance_dependent_scope
+      end
+
+      # A composite key's `[foreign key side column, referenced side column]`
+      # pairs as the compiler resolved them (Core's `yugabyte_overrides`
+      # replace the plain options), the writable pair first; nil for a
+      # single-column key. The target's column for a has_one / has_many,
+      # the owner's for a belongs_to.
+      def _roundhouse_key_pairs
+        @key_pairs
       end
 
       # Whether the declaration has a scope lambda (Rails' `scope`, which
@@ -757,8 +767,8 @@ module ActiveRecord
     class BelongsToReflection < AssociationReflection
       attr_reader :foreign_type
 
-      def initialize(name, foreign_key, class_name, foreign_type, primary_key, options = nil, active_record = nil, unsupported: [], scoped: false)
-        super(name, class_name, foreign_key, options, active_record, unsupported: unsupported, scoped: scoped)
+      def initialize(name, foreign_key, class_name, foreign_type, primary_key, options = nil, active_record = nil, unsupported: [], scoped: false, key_pairs: nil)
+        super(name, class_name, foreign_key, options, active_record, unsupported: unsupported, scoped: scoped, key_pairs: key_pairs)
         @foreign_type = foreign_type
         @primary_key = primary_key
       end

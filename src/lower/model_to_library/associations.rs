@@ -152,6 +152,7 @@ pub(super) fn push_association_methods(
                     as_interface.as_ref(),
                     scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
                     through.is_some(),
+                    assoc.extra_keys(),
                 ));
                 crate::lower::default_scope::materialize_reader(methods.last_mut(), target, models, through.is_some());
                 methods.push(synth_preload_setter(owner, name, target));
@@ -355,6 +356,7 @@ pub(super) fn push_association_methods(
                 foreign_key,
                 polymorphic: false,
                 primary_key,
+                extra_keys,
                 ..
             } => {
                 let sentinel = fk_sentinel(model, foreign_key);
@@ -362,7 +364,7 @@ pub(super) fn push_association_methods(
                 // target's own primary key.
                 let assoc_pk =
                     crate::lower::scope_chain::association_primary_key(models, target, primary_key.as_ref());
-                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone()));
+                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone(), extra_keys));
                 // Rails provides the writer alongside the reader
                 // (`comment.story = obj` stores the foreign key). A
                 // custom writer in the model body must win (Rails: the
@@ -410,6 +412,7 @@ pub(super) fn push_association_methods(
                     &owner_key,
                     as_interface.as_ref(),
                     scope.as_ref().map(|s| bind_scope_owner(s, scope_owner.as_ref())).as_ref(),
+                    assoc.extra_keys(),
                 ));
                 methods.push(synth_has_one_preload_setter(owner, name, target));
                 push_singular_loaded_reader(methods, model, owner, name);
@@ -541,6 +544,17 @@ fn guard_nil_owner_key(query: Expr, foreign_key: &Symbol, owner_key: &Symbol) ->
     )
 }
 
+/// The composite key's other equalities in a has_one / has_many reader's
+/// `where`: the target column against the owner's (`shop_id: @shop_id`).
+fn push_extra_key_entries(entries: &mut Vec<(Expr, Expr)>, extra_keys: &[(Symbol, Symbol)]) {
+    for (target_col, owner_col) in extra_keys {
+        entries.push((
+            lit_sym(target_col.clone()),
+            Expr::new(Span::synthetic(), ExprNode::Ivar { name: owner_col.clone() }),
+        ));
+    }
+}
+
 fn synth_has_many_reader(
     owner: &ClassId,
     name: &Symbol,
@@ -550,6 +564,7 @@ fn synth_has_many_reader(
     as_interface: Option<&Symbol>,
     scope: Option<&Expr>,
     through: bool,
+    extra_keys: &[(Symbol, Symbol)],
 ) -> MethodDef {
     // def comments; Comment.where(article_id: @id); end
     //
@@ -574,6 +589,7 @@ fn synth_has_many_reader(
             ),
         ));
     }
+    push_extra_key_entries(&mut entries, extra_keys);
     let where_args = vec![Expr::new(
         Span::synthetic(),
         ExprNode::Hash { entries, kwargs: true },
@@ -1004,6 +1020,7 @@ fn synth_has_one_reader(
     owner_key: &Symbol,
     as_interface: Option<&Symbol>,
     scope: Option<&Expr>,
+    extra_keys: &[(Symbol, Symbol)],
 ) -> MethodDef {
     let mut entries = vec![(
         lit_sym(foreign_key.clone()),
@@ -1021,6 +1038,7 @@ fn synth_has_one_reader(
             ),
         ));
     }
+    push_extra_key_entries(&mut entries, extra_keys);
     let where_args = vec![Expr::new(
         Span::synthetic(),
         ExprNode::Hash { entries, kwargs: true },
@@ -1466,6 +1484,7 @@ fn synth_belongs_to_reader(
     foreign_key: &Symbol,
     assoc_pk: &Symbol,
     sentinel: Expr,
+    extra_keys: &[(Symbol, Symbol)],
 ) -> MethodDef {
     // def article
     //   @article_id == 0 ? nil : Article.find_by(id: @article_id)
@@ -1485,6 +1504,18 @@ fn synth_belongs_to_reader(
         },
     );
 
+    // A composite key matches the other columns too: the target's column
+    // against the owner's (`orders.shop_id = draft_orders.shop_id`).
+    let mut find_entries = vec![(
+        lit_sym(assoc_pk.clone()),
+        Expr::new(Span::synthetic(), ExprNode::Ivar { name: foreign_key.clone() }),
+    )];
+    for (owner_col, target_col) in extra_keys {
+        find_entries.push((
+            lit_sym(target_col.clone()),
+            Expr::new(Span::synthetic(), ExprNode::Ivar { name: owner_col.clone() }),
+        ));
+    }
     let find_by = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -1492,16 +1523,7 @@ fn synth_belongs_to_reader(
             method: Symbol::from("find_by"),
             args: vec![Expr::new(
                 Span::synthetic(),
-                ExprNode::Hash {
-                    entries: vec![(
-                        lit_sym(assoc_pk.clone()),
-                        Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Ivar { name: foreign_key.clone() },
-                        ),
-                    )],
-                    kwargs: true,
-                },
+                ExprNode::Hash { entries: find_entries, kwargs: true },
             )],
             block: None,
             parenthesized: true,

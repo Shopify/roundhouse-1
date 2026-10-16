@@ -317,6 +317,7 @@ mod tests {
             skip_validation: false,
             autosave: false,
             primary_key: None,
+            extra_keys: Vec::new(),
         }
     }
 
@@ -334,6 +335,7 @@ mod tests {
             foreign_type: None,
             autosave: None,
             primary_key: None,
+            extra_keys: Vec::new(),
         }
     }
 

@@ -41,6 +41,15 @@ pub(crate) fn custom_primary_key(assoc: &Association) -> Option<&Symbol> {
     assoc.declared_primary_key().filter(|k| k.as_str() != "id")
 }
 
+/// Whether the key is anything but the owner's `id` against one column:
+/// a declared `primary_key:` or a composite key's extra pairs. The
+/// consumers that derive the foreign key from the owner's name and read
+/// `.id` (the parent-ivar rewrite, the inverse-loaded-owner shortcut,
+/// the Futamura chain) decline these.
+pub(crate) fn keyed(assoc: &Association) -> bool {
+    custom_primary_key(assoc).is_some() || !assoc.extra_keys().is_empty()
+}
+
 const MAX_THROUGH_DEPTH: usize = 4;
 
 /// First `through:` hop under `model.<thr_name>` (or the join model's

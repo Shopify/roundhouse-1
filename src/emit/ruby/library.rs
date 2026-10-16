@@ -4236,6 +4236,25 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             if matches!(assoc, Association::HasMany { scope_owner: Some(_), .. } | Association::HasOne { scope_owner: Some(_), .. }) {
                 unsupported.push_str(", instance_dependent_scope: true");
             }
+            // A composite key: every `[foreign key side, referenced side]`
+            // pair, the primary one first (`Relation#where(order: record)`
+            // matches them all).
+            if !assoc.extra_keys().is_empty() {
+                let primary = (
+                    match assoc {
+                        Association::HasMany { foreign_key, .. }
+                        | Association::HasOne { foreign_key, .. }
+                        | Association::BelongsTo { foreign_key, .. } => foreign_key.as_str(),
+                        Association::HasAndBelongsToMany { .. } => "",
+                    },
+                    assoc.declared_primary_key().map_or("id", |k| k.as_str()),
+                );
+                let pairs: Vec<String> = std::iter::once(primary)
+                    .chain(assoc.extra_keys().iter().map(|(a, b)| (a.as_str(), b.as_str())))
+                    .map(|(a, b)| format!("[{:?}, {:?}]", a, b))
+                    .collect();
+                unsupported.push_str(&format!(", key_pairs: [{}]", pairs.join(", ")));
+            }
             // A scope lambda keeps Rails from finding the inverse by itself.
             if matches!(assoc, Association::HasMany { scope: Some(_), .. } | Association::HasOne { scope: Some(_), .. }) {
                 unsupported.push_str(", scoped: true");
@@ -20427,6 +20446,11 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
         // A refused association (`assoc_primary_key`) has no reader to
         // preload into.
         if crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_some() {
+            continue;
+        }
+        // The batch loaders match on one key column; a composite key's
+        // other columns stay on the lazy reader, which applies them.
+        if !assoc.extra_keys().is_empty() {
             continue;
         }
         match assoc {
