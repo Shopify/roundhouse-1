@@ -4323,6 +4323,9 @@ fn ingest_hash_literal(
     let mut chain: Option<Expr> = None;
     let mut pending: Vec<(Expr, Expr)> = Vec::new();
     let mut saw_splat = false;
+    // A leading `**value` is the chain's base as written, not a Hash this
+    // desugar built: whether it answers `merge` is the value's own class.
+    let mut bare_base = true;
 
     for el in elements.iter() {
         if let Some(assoc) = el.as_assoc_node() {
@@ -4345,7 +4348,7 @@ fn ingest_hash_literal(
         })?;
         let value = ingest_expr(&value, file)?;
         saw_splat = true;
-        chain = Some(merge_into(chain, std::mem::take(&mut pending), span, value));
+        chain = Some(merge_into(chain, std::mem::take(&mut pending), span, value, &mut bare_base));
     }
 
     if !saw_splat {
@@ -4353,33 +4356,40 @@ fn ingest_hash_literal(
     }
     let mut chain = chain.expect("saw_splat implies at least one link");
     if !pending.is_empty() {
-        chain = merge_call(chain, Expr::new(span, ExprNode::Hash { entries: pending, kwargs: false }), span);
+        chain = merge_call(chain, Expr::new(span, ExprNode::Hash { entries: pending, kwargs: false }), span, &mut bare_base);
     }
     Ok(chain)
 }
 
 /// Append one `**value` link to a merge chain, first folding in any
-/// literal pairs that preceded it.
-fn merge_into(chain: Option<Expr>, pending: Vec<(Expr, Expr)>, span: Span, value: Expr) -> Expr {
+/// literal pairs that preceded it. `bare_base` is true while the chain is
+/// still the first `**value` itself.
+fn merge_into(chain: Option<Expr>, pending: Vec<(Expr, Expr)>, span: Span, value: Expr, bare_base: &mut bool) -> Expr {
     let base = match (chain, pending.is_empty()) {
         // Leading `**value` with nothing before it: the value *is* the
         // base. `{ **h }` copies in Ruby where this aliases; the copy
         // only matters if the callee mutates its options hash, which
         // no roundhouse runtime helper does.
         (None, true) => return value,
-        (None, false) => Expr::new(span, ExprNode::Hash { entries: pending, kwargs: false }),
-        (Some(chain), true) => return merge_call(chain, value, span),
+        (None, false) => {
+            *bare_base = false;
+            Expr::new(span, ExprNode::Hash { entries: pending, kwargs: false })
+        }
+        (Some(chain), true) => return merge_call(chain, value, span, bare_base),
         (Some(chain), false) => merge_call(
             chain,
             Expr::new(span, ExprNode::Hash { entries: pending, kwargs: false }),
             span,
+            bare_base,
         ),
     };
-    merge_call(base, value, span)
+    merge_call(base, value, span, bare_base)
 }
 
-fn merge_call(recv: Expr, arg: Expr, span: Span) -> Expr {
-    Expr::new(
+/// `recv.merge(arg)`, marked [`crate::expr::SPLAT_MERGE_BASE`] when `recv`
+/// is a `**value` as written (the first link of the chain).
+fn merge_call(recv: Expr, arg: Expr, span: Span, bare_base: &mut bool) -> Expr {
+    let mut merge = Expr::new(
         span,
         ExprNode::Send {
             recv: Some(recv),
@@ -4388,7 +4398,11 @@ fn merge_call(recv: Expr, arg: Expr, span: Span) -> Expr {
             block: None,
             parenthesized: true,
         },
-    )
+    );
+    if std::mem::take(bare_base) {
+        merge.decisions |= crate::expr::SPLAT_MERGE_BASE;
+    }
+    merge
 }
 
 thread_local! {

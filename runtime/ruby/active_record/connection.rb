@@ -694,6 +694,27 @@ module ActiveRecord
       sanitize_sql(statement)
     end
 
+    # Rails' `find_by_sql(sql, binds = [], preparable: nil, allow_retry:
+    # false, &block)`: the model's records for hand-written SQL. `sql` is
+    # a String, an `[sql, *values]` Array (the `?` placeholders written
+    # in, as `sanitize_sql` does) or anything that answers `to_sql`;
+    # `binds` are the `$n` / `?` values after it. Each row is hydrated as
+    # an explicit `select`'s is, so a column the SQL left out answers
+    # `has_attribute?` false. `preparable` and `allow_retry` are hints
+    # about the statement cache and retries, which change no row. The
+    # block, when given, sees each record, after the model's find hooks.
+    def self.find_by_sql(sql, binds = [], preparable: nil, allow_retry: false, &block)
+      statement = sql.is_a?(Array) ? sanitize_sql(sql) : sql
+      statement = connection._with_binds(statement, binds)
+      records = ActiveRecord.adapter.select_rows(statement).map do |row|
+        record = instantiate(row)
+        record._note_unloaded(row)
+        record
+      end
+      records.each(&block) if block
+      records
+    end
+
     # Rails' `uncached { }`: the block's reads go to the database, not
     # the per-request replay cache, which comes back on after it.
     def self.uncached
