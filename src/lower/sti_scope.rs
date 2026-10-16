@@ -876,6 +876,7 @@ fn rewrite(
     let class = ClassId(Symbol::from(
         path.iter()
             .map(|s| s.as_str().trim_start_matches("::"))
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("::"),
     ));
@@ -1214,6 +1215,7 @@ fn const_class_id(path: &[Symbol]) -> ClassId {
     ClassId(Symbol::from(
         path.iter()
             .map(|s| s.as_str().trim_start_matches("::"))
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("::"),
     ))

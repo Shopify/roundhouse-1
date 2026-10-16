@@ -1447,6 +1447,10 @@ pub(super) fn library_class_and_struct_base(
         if !declares_props && let Some(props) = synth_struct_props(&owner, &members) {
             synthesized.push(props);
         }
+        let declares_serialize = methods.iter().any(|m| m.name.as_str() == "serialize" && matches!(m.receiver, MethodReceiver::Instance));
+        if !declares_serialize && let Some(serialize) = synth_struct_serialize(&owner, &members) {
+            synthesized.push(serialize);
+        }
         synthesized.append(&mut methods);
         methods = synthesized;
         None
@@ -2303,6 +2307,53 @@ fn synth_struct_props(owner: &ClassId, members: &[SorbetStructMember]) -> Option
         unsupported_formals: None,
         has_anonymous_block: false,
         body: Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }),
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    })
+}
+
+/// sorbet's `T::Props::Serializable#serialize` (a `T::Struct` has it):
+/// the props as a Hash keyed by the prop's name as a String, a nil prop
+/// left out, and a nested struct, enum or collection of them serialized
+/// in turn. Core hands a struct's `serialize` to a model constructor
+/// (`Event.new(input.serialize)` in `Platform::LogEvent`).
+fn synth_struct_serialize(owner: &ClassId, members: &[SorbetStructMember]) -> Option<MethodDef> {
+    if members.is_empty() {
+        return None;
+    }
+    let mut source = String::from(
+        "def serialize(strict = true)\n  h = {}\n  conv = ->(v) { v.respond_to?(:serialize) ? v.serialize : v }\n",
+    );
+    for member in members {
+        let name = member.name.as_str();
+        source.push_str(&format!(
+            "  unless @{name}.nil?\n    h[\"{name}\"] = if @{name}.is_a?(Array)\n      @{name}.map {{ |e| conv.call(e) }}\n    elsif @{name}.is_a?(Hash)\n      @{name}.transform_values {{ |e| conv.call(e) }}\n    else\n      conv.call(@{name})\n    end\n  end\n"
+        ));
+    }
+    source.push_str("  h\nend\n");
+    let parsed = ruby_prism::parse(source.as_bytes());
+    let node = parsed.node();
+    let program = node.as_program_node()?;
+    let stmt = program.statements().body().iter().next()?;
+    let def = stmt.as_def_node()?;
+    let body = ingest_expr(&def.body()?, "(sorbet struct)").ok()?;
+    Some(MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from("serialize"),
+        receiver: MethodReceiver::Instance,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: vec![Param::with_default(
+            Symbol::from("strict"),
+            Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } }),
+        )],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
