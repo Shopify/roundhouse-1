@@ -621,6 +621,13 @@ pub struct App {
     /// (`project::test_load_path_features`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_load_roots: Vec<String>,
+    /// The directories the application and its engines add as autoload
+    /// roots with `paths.add(LIT, eager_load: true)` (or `autoload: true`),
+    /// relative to the app root: Core's online_store `app/liquid/drops`,
+    /// whose `line_item_drop.rb` is `LineItemDrop`
+    /// (`ingest::app::engine_autoload_roots`; `autoload_roots::AutoloadRoots`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_autoload_roots: Vec<String>,
     /// The run-time `$LOAD_PATH` below the app root in every environment,
     /// each ending in `/`: the application's and each engine's `lib`
     /// (Rails::Engine's `paths.add("lib", load_path: true)`, railties
@@ -1680,6 +1687,7 @@ impl App {
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),
+            engine_autoload_roots: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
             application_namespace: None,

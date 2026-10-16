@@ -2480,6 +2480,7 @@ end
         .filter_map(|root| root.strip_prefix(dir).ok())
         .map(|rel| format!("{}/", rel.display()))
         .collect();
+    app.engine_autoload_roots = engine_autoload_roots(vfs, dir, &engine_dirs);
     // Rails' engines and application put `lib` on `$LOAD_PATH` in every
     // environment (engine/configuration.rb `paths.add "lib", load_path: true`).
     app.lib_load_roots = std::iter::once(dir.to_path_buf())
@@ -11058,6 +11059,38 @@ pub(super) fn is_rails_engine_class(class: &ruby_prism::ClassNode<'_>) -> bool {
 /// does not have is skipped, as `set_load_path` skips it. Not read: a
 /// path under another condition, or one written other than as a literal.
 fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![dir.join("test")];
+    roots.extend(rails_paths_with_option(vfs, dir, engine_dirs, &["load_path"]));
+    roots.retain(|root| vfs.is_dir(root));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The directories an engine or the application adds as autoload roots
+/// with `paths.add("app/liquid/drops", eager_load: true)` (or `autoload:
+/// true`): Rails' engine `paths` hold them, and `eager_load` / `autoload`
+/// paths are the autoload roots (engine.rb `_all_autoload_paths`). Core's
+/// online_store and fulfillments engines root `app/liquid/drops` so that
+/// `LineItemDrop` is the constant of `app/liquid/drops/line_item_drop.rb`,
+/// not `Drops::LineItemDrop` as under the `app/liquid` root. Relative to
+/// the app root; the same unconditional or test-environment statements
+/// [`rails_test_load_path`] reads.
+pub(super) fn engine_autoload_roots<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[PathBuf]) -> Vec<String> {
+    let mut roots: Vec<String> = rails_paths_with_option(vfs, dir, engine_dirs, &["eager_load", "autoload"])
+        .into_iter()
+        .filter(|root| vfs.is_dir(root))
+        .filter_map(|root| root.strip_prefix(dir).ok().map(|rel| rel.display().to_string()))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Each `paths.add(LIT, <option>: true)` of the application's class body
+/// in config/application.rb and of each engine's `Rails::Engine` subclass
+/// (see [`rails_test_load_path`]), joined to its root, for one of `options`.
+fn rails_paths_with_option<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[PathBuf], options: &[&str]) -> Vec<PathBuf> {
     use ruby_prism::Node;
     // `Rails.env` (`::Rails.env`).
     fn rails_env(node: &Node<'_>) -> bool {
@@ -11077,7 +11110,7 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
             && call.receiver().is_some_and(|r| rails_env(&r))
     }
     // `paths.add("test", load_path: true)` / `config.paths.add(…)`.
-    fn load_path_entry(node: &Node<'_>) -> Option<String> {
+    fn load_path_entry(node: &Node<'_>, options_wanted: &[&str]) -> Option<String> {
         let call = node.as_call_node()?;
         if super::util::constant_id_str(&call.name()) != "add" {
             return None;
@@ -11099,22 +11132,22 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
         let [path, options] = args.as_slice() else { return None };
         let path = path.as_string_node()?;
         let options = options.as_keyword_hash_node()?;
-        let load_path = options.elements().iter().any(|element| {
+        let wanted = options.elements().iter().any(|element| {
             element.as_assoc_node().is_some_and(|assoc| {
-                assoc.key().as_symbol_node().is_some_and(|key| key.unescaped() == b"load_path")
+                assoc.key().as_symbol_node().is_some_and(|key| options_wanted.iter().any(|o| key.unescaped() == o.as_bytes()))
                     && assoc.value().as_true_node().is_some()
             })
         });
-        load_path.then(|| String::from_utf8_lossy(path.unescaped()).into_owned())
+        wanted.then(|| String::from_utf8_lossy(path.unescaped()).into_owned())
     }
-    fn body_entries(body: Node<'_>, out: &mut Vec<String>) {
+    fn body_entries(body: Node<'_>, options: &[&str], out: &mut Vec<String>) {
         for stmt in super::util::flatten_statements(body) {
-            if let Some(entry) = load_path_entry(&stmt) {
+            if let Some(entry) = load_path_entry(&stmt, options) {
                 out.push(entry);
             } else if let Some(branch) = stmt.as_if_node() {
                 if rails_env_test(&branch.predicate()) {
                     if let Some(then) = branch.statements() {
-                        body_entries(then.as_node(), out);
+                        body_entries(then.as_node(), options, out);
                     }
                 }
             } else if let Some(case) = stmt.as_case_node() {
@@ -11125,7 +11158,7 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
                     for when in case.conditions().iter().filter_map(|c| c.as_when_node()) {
                         let test = when.conditions().iter().any(|c| c.as_string_node().is_some_and(|s| s.unescaped() == b"test"));
                         if let (true, Some(then)) = (test, when.statements()) {
-                            body_entries(then.as_node(), out);
+                            body_entries(then.as_node(), options, out);
                         }
                     }
                 }
@@ -11134,6 +11167,7 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
     }
     struct Classes<'a> {
         engine: bool,
+        options: &'a [&'a str],
         out: &'a mut Vec<String>,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Classes<'_> {
@@ -11148,7 +11182,7 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
             };
             if wanted {
                 if let Some(body) = class.body() {
-                    body_entries(body, self.out);
+                    body_entries(body, self.options, self.out);
                 }
             } else {
                 ruby_prism::visit_class_node(self, class);
@@ -11159,23 +11193,20 @@ fn rails_test_load_path<V: Vfs + ?Sized>(vfs: &V, dir: &Path, engine_dirs: &[Pat
         let mut out = Vec::new();
         let Ok(source) = vfs.read(file) else { return out };
         let needle: &[u8] = if engine { b"Engine" } else { b"Application" };
-        if !source.windows(b"load_path".len()).any(|w| w == b"load_path") || !source.windows(needle.len()).any(|w| w == needle) {
+        if !options.iter().any(|o| source.windows(o.len()).any(|w| w == o.as_bytes())) || !source.windows(needle.len()).any(|w| w == needle) {
             return out;
         }
         let parsed = ruby_prism::parse(&source);
-        ruby_prism::Visit::visit(&mut Classes { engine, out: &mut out }, &parsed.node());
+        ruby_prism::Visit::visit(&mut Classes { engine, options, out: &mut out }, &parsed.node());
         out
     };
-    let mut roots = vec![dir.join("test")];
+    let mut roots = Vec::new();
     roots.extend(entries(&dir.join("config/application.rb"), false).into_iter().map(|path| dir.join(path)));
     for engine in engine_dirs {
         for file in read_rb_files(vfs, &engine.join("lib")).unwrap_or_default() {
             roots.extend(entries(&file, true).into_iter().map(|path| engine.join(path)));
         }
     }
-    roots.retain(|root| vfs.is_dir(root));
-    roots.sort();
-    roots.dedup();
     roots
 }
 

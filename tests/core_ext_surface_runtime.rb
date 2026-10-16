@@ -135,6 +135,10 @@ STRINGS.each do |s|
   show("#{s.inspect}.deep_dup.equal?") { s.deep_dup.equal?(s) }
   show("#{s.inspect}.duplicable?") { s.duplicable? }
 end
+show(":abc.starts_with?('a')") { :abc.starts_with?("a") }
+show(":abc.ends_with?('x', 'c')") { :abc.ends_with?("x", "c") }
+show(":abc.ends_with?('=')") { :abc.ends_with?("=") }
+show(":abc=.ends_with?('=')") { :abc=.ends_with?("=") }
 show("'production'.inquiry.production?") { "production".inquiry.production? }
 show("'production'.inquiry.test?") { "production".inquiry.test? }
 show("'a b c'.truncate_words(2, separator: 'b')") { "a b c".truncate_words(2, separator: "b") }

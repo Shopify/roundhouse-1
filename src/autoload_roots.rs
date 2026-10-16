@@ -12,6 +12,9 @@ pub struct AutoloadRoots<'a> {
     app_root: &'a str,
     /// Each Zeitwerk loader's root, relative to the app root.
     pub loader_roots: BTreeSet<&'a str>,
+    /// Directories an engine's `paths.add(…, eager_load: true)` roots
+    /// (`App::engine_autoload_roots`).
+    engine_roots: BTreeSet<&'a str>,
     /// Directories a loader collapses (they add no namespace).
     collapsed_dirs: BTreeSet<&'a str>,
 }
@@ -22,6 +25,7 @@ impl<'a> AutoloadRoots<'a> {
         AutoloadRoots {
             app_root: app.root.as_str(),
             loader_roots: app.zeitwerk_loaders.iter().map(|l| rel(l.root.as_str())).collect(),
+            engine_roots: app.engine_autoload_roots.iter().map(|r| r.trim_matches('/')).collect(),
             collapsed_dirs: app
                 .zeitwerk_loaders
                 .iter()
@@ -52,6 +56,7 @@ impl<'a> AutoloadRoots<'a> {
             || (n >= 2 && dir[n - 2] == "app")
             || (n >= 3 && dir[n - 1] == "concerns" && dir[n - 3] == "app")
             || self.loader_roots.contains(dir.join("/").as_str())
+            || self.engine_roots.contains(dir.join("/").as_str())
     }
 
     /// A directory a Zeitwerk loader collapses adds no namespace
