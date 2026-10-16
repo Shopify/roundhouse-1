@@ -456,21 +456,24 @@ fn refused_route_diagnostics(entries: &[RouteSpec], source: &[u8], file: &str) -
 }
 
 /// `format: true` on a scope makes `.:format` a REQUIRED suffix of every
-/// route inside. The router matches whole segments and the suffix is not
-/// composed into those routes, so name the scope instead of serving them
-/// without it.
+/// route inside. Record it for the helpers and name the part the router
+/// does not enforce.
 fn note_required_format(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
     cx: &Ctx<'_>,
     key: &str,
     value: &ruby_prism::Node<'_>,
+    defaults: &mut IndexMap<Symbol, String>,
 ) {
     if key != "format" || value.as_true_node().is_none() {
         return;
     }
-    let detail = "`format: true` (a required `.:format` suffix) is not modeled; the routes inside \
-                  are served and their helpers generated without the suffix";
+    // The helpers take the format as a required last param; the router peels
+    // it like an optional suffix, so a request without it is still served.
+    defaults.insert(Symbol::from(crate::lower::routes::FORMAT_REQUIRED_KEY), "true".to_string());
+    let detail = "`format: true` (a required `.:format` suffix) is only modeled in the route helpers; \
+                  the router also serves a request without the suffix";
     let location = call.location();
     cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
         Span {
@@ -2411,6 +2414,7 @@ fn ingest_namespace_route(
     // prefix with no URL segment.
     let (mut path, mut module, mut as_prefix) =
         (Some(name.clone()), Some(name.clone()), Some(name));
+    let mut defaults: IndexMap<Symbol, String> = IndexMap::new();
     if let Some(args) = call.arguments() {
         for arg in args.arguments().iter() {
             let Some(kh) = arg.as_keyword_hash_node() else { continue };
@@ -2418,7 +2422,7 @@ fn ingest_namespace_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
-                note_required_format(call, file, cx, key.as_str(), &value);
+                note_required_format(call, file, cx, key.as_str(), &value, &mut defaults);
                 let facet = if value.as_nil_node().is_some() { Some(None) } else { rname(&value).map(Some) };
                 let Some(facet) = facet else { continue };
                 let facet = facet.filter(|v| !v.trim_matches('/').is_empty());
@@ -2436,7 +2440,7 @@ fn ingest_namespace_route(
         path,
         module,
         as_prefix,
-        defaults: IndexMap::new(),
+        defaults,
         // Rails' `namespace` inside a `resources` block is `nested { super }`:
         // the parent's `/shops/:shop_id` (and `shop_` name) lands BEFORE the
         // namespace's own segment, unlike a plain `scope`.
@@ -2466,7 +2470,7 @@ fn ingest_scope_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
-                note_required_format(call, file, cx, key.as_str(), &value);
+                note_required_format(call, file, cx, key.as_str(), &value, &mut defaults);
                 let val = rname(&value);
                 match key.as_str() {
                     "path" => path = val.or(path),

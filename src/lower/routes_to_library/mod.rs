@@ -768,6 +768,19 @@ fn build_helper_function(
     // extension is a literal here, so it costs the base helper nothing.
     ext: Option<&str>,
 ) -> LibraryFunction {
+    // `scope format: true`: the helper takes the format as one more
+    // required, last segment param (`count.:format`).
+    let format_required;
+    let route = if route.format_required && route.required_path.is_none() {
+        let mut r = route.clone();
+        r.path.push_str(".:format");
+        r.path_params.push("format".to_string());
+        r.required_params = r.path_params.len();
+        format_required = r;
+        &format_required
+    } else {
+        route
+    };
     let slug_id = model_overrides_to_param(route.controller.0.as_str(), helper_name, app);
     // Slugness is PER PARAM: a nested parent's segment names its model
     // directly (`story_id` in `/stories/:story_id/suggestions` → Story,
