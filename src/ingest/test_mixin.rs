@@ -1771,6 +1771,26 @@ impl ClassWalk<'_> {
                     // Every test class already has it (`ActiveSupport::TestCase`).
                     continue;
                 }
+                if is_factory_registration(&stmt) {
+                    // FixtureFactory's `define_factories { … }`, alone or
+                    // under an `if fixture_factory_definitions.empty?`
+                    // guard: `class_eval` runs it on the class where the
+                    // include stands, and the emitted class runs the same
+                    // class method (`FixtureFactory::Registry::ClassMethods`)
+                    // as it loads.
+                    if let Some(mut expr) = super::test::carried_body_statement(&stmt, &self.class, file).map_err(message)? {
+                        self.qualify_block(&mut expr);
+                        self.block_statements.push(crate::dialect::TestBodyStatement {
+                            expr,
+                            line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+                            after_definitions: false,
+                            after_setup_blocks: false,
+                            after_teardown_blocks: false,
+                            source: None,
+                        });
+                        continue;
+                    }
+                }
                 let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
                 let first = text.lines().next().unwrap_or_default();
                 let shown: String = first.chars().take(60).collect();
@@ -2647,6 +2667,70 @@ fn is_extend_declarative(stmt: &Node<'_>) -> bool {
         [arg] => IncludeRef::of(arg).is_some_and(|r| r.written() == "ActiveSupport::Testing::Declarative"),
         _ => false,
     }
+}
+
+/// A statement of an `included do` block that registers FixtureFactory
+/// factories on the class: `define_factories { … }` / `factory(…)`, or an
+/// `if`/`unless` on `fixture_factory_definitions` (the registry the
+/// class already has) whose branches are all such statements.
+fn is_factory_registration(stmt: &Node<'_>) -> bool {
+    fn branch(statements: Option<ruby_prism::StatementsNode<'_>>) -> bool {
+        statements.is_some_and(|s| {
+            let body: Vec<Node<'_>> = s.body().iter().collect();
+            !body.is_empty() && body.iter().all(is_factory_registration)
+        })
+    }
+    fn else_of(node: Option<Node<'_>>) -> bool {
+        match node {
+            None => true,
+            Some(n) => match n.as_else_node() {
+                Some(e) => branch(e.statements()),
+                None => is_factory_registration(&n),
+            },
+        }
+    }
+    // Only a read of the class's registry decides the branch.
+    fn registry_condition(node: &Node<'_>) -> bool {
+        use ruby_prism::Visit;
+        struct Reads {
+            ok: bool,
+            registry: bool,
+        }
+        impl<'pr> Visit<'pr> for Reads {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                match (node.receiver(), constant_id_str(&node.name())) {
+                    (None, "fixture_factory_definitions") => self.registry = true,
+                    (Some(_), "empty?" | "any?" | "blank?" | "present?" | "nil?" | "!") => {}
+                    _ => self.ok = false,
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let mut reads = Reads { ok: true, registry: false };
+        reads.visit(node);
+        reads.ok && reads.registry
+    }
+    if let Some(call) = stmt.as_call_node() {
+        let name = constant_id_str(&call.name());
+        if call.receiver().is_none() {
+            return matches!(name, "define_factories" | "factory");
+        }
+        // `Factories.define(self)`: a factory module registering on the class.
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        return name == "define"
+            && call.receiver().is_some_and(|r| constant_path_of(&r).is_some())
+            && call.block().is_none()
+            && matches!(args.as_slice(), [arg] if arg.as_self_node().is_some());
+    }
+    if let Some(node) = stmt.as_if_node() {
+        return registry_condition(&node.predicate()) && branch(node.statements()) && else_of(node.subsequent());
+    }
+    if let Some(node) = stmt.as_unless_node() {
+        return registry_condition(&node.predicate())
+            && branch(node.statements())
+            && node.else_clause().is_none_or(|e| branch(e.statements()));
+    }
+    false
 }
 
 /// The modules a class body's `include` statements name.
@@ -4501,6 +4585,26 @@ end
             assert!(err.contains("test class `OddTest` refused") && err.contains(why), "{stmt}: {err}");
         }
     }
+    #[test]
+    fn an_included_blocks_factory_registration_runs_as_the_class_body_loads() {
+        let module = "module Shop\n  module FactoryHelper\n    extend ActiveSupport::Concern\n\n    module Factories\n      class << self\n        def define(klass)\n          klass.factory(:shop, class_name: \"Shop\")\n        end\n      end\n    end\n\n    included do\n      setup do\n        @a = 1\n      end\n      if fixture_factory_definitions.empty?\n        define_factories { Factories.define(self) }\n      else\n        Factories.define(self)\n      end\n    end\n  end\nend\n";
+        let class = "class FactoryTest < ActiveSupport::TestCase\n  include Shop::FactoryHelper\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let files = [("support/factory_helper.rb", module), ("factory_test.rb", class)];
+        let tms = run_with(&files, &["support/factory_helper.rb"], "factory_test.rb").unwrap();
+        let [statement] = tms[0].body_statements.as_slice() else { panic!("{:#?}", tms[0].body_statements) };
+        assert!(matches!(&*statement.expr.node, ExprNode::If { .. }), "{:?}", statement.expr);
+        assert!(!statement.after_definitions, "{statement:?}");
+        assert!(consts(&statement.expr).iter().all(|c| c == "::Shop::FactoryHelper::Factories"), "{:?}", consts(&statement.expr));
+    }
+
+    #[test]
+    fn a_factory_guard_that_reads_anything_else_is_still_refused_by_name() {
+        let module = "module Odd\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @a = 1\n    end\n    if ENV[\"X\"]\n      define_factories { }\n    end\n  end\nend\n";
+        let class = "class OddTest < ActiveSupport::TestCase\n  include Odd\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let err = run(&[("odd.rb", module), ("odd_test.rb", class)], "odd_test.rb").unwrap_err();
+        assert!(err.contains("test class `OddTest` refused") && err.contains("which the shared-test splice does not model"), "{err}");
+    }
+
     /// `Merchandising::CatalogTestHelper`'s shape, in a support file.
     const CATALOG: &str = "module Shop\n  COLORS = [:red].freeze\n\n  module CatalogHelper\n    extend ActiveSupport::Concern\n\n    LIMIT = 3\n\n    #: -> void\n    def build_catalog(limit: LIMIT)\n      Factories.define(COLORS, limit)\n    end\n\n    module Factories\n      class << self\n        def define(colors, limit)\n          [colors, limit]\n        end\n      end\n    end\n\n    @loaded = false\n\n    included do\n      setup do\n        @catalog = Factories.define(COLORS, LIMIT)\n      end\n    end\n  end\nend\n";
 
@@ -4887,3 +4991,4 @@ end
         assert_eq!(consts(tm.setup.as_ref().expect("the block's setup")), ["::Shop::Thing"]);
     }
 }
+
