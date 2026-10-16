@@ -141,6 +141,9 @@ const PROBE: &str = r##"class UuidProbe
     out << "exists? id: #{Product.exists?(prod.id)} #{Product.exists?(id: second.id)} #{Product.exists?(0x99)}"
     out << "belongs_to: #{prod.shop.name} #{Product.find(second.id).shop.name}"
     out << "preload belongs_to: #{Product.includes(:shop).to_a.map { |pr| pr.shop.name }.sort.inspect}"
+    out << "eager_load belongs_to: #{Product.eager_load(:shop).to_a.map { |pr| pr.shop.name }.sort.inspect}"
+    out << "eager_load has_many: #{Shop.eager_load(:products).to_a.map { |sh| [sh.name, sh.products.map(&:title)] }.sort.inspect}"
+    out << "eager_load find_by: #{Shop.eager_load(:products).find_by!(id: shop.id).products.map(&:title).inspect}"
     out << "has_many: #{shop.products.map(&:title).inspect} #{other.products.count}"
     prod.title = "u"
     out << "update: #{prod.save} #{Product.find(prod.id).title}"
@@ -161,9 +164,11 @@ const PROBE: &str = r##"class UuidProbe
 end
 "##;
 
-/// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
+/// What native Rails 8.2 answers (checked on the task PostgreSQL; the
+/// `eager_load` lines are the JOIN loader reading a uuid key back from
+/// its `rh_eager_N` columns), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 21] = [
+const EXPECTED: [&str; 24] = [
     "shop id: Integer 4660",
     "assigned uuid string: Integer 22136",
     "generated id: Integer true",
@@ -176,6 +181,9 @@ const EXPECTED: [&str; 21] = [
     "exists? id: true true false",
     "belongs_to: a b",
     r#"preload belongs_to: ["a", "b"]"#,
+    r#"eager_load belongs_to: ["a", "b"]"#,
+    r#"eager_load has_many: [["a", ["t"]], ["b", ["s"]]]"#,
+    r#"eager_load find_by: ["t"]"#,
     r#"has_many: ["t"] 1"#,
     "update: true u",
     "update_all where id: v",

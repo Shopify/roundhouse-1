@@ -286,6 +286,66 @@ module ActionDispatch
       @env["HTTP_ACCEPT_LANGUAGE"]
     end
 
+    # Rails' content negotiation (actionpack http/mime_negotiation.rb).
+    # `content_mime_type` is the CONTENT_TYPE header's type; `accepts`
+    # the Accept header's types in q order (the content type when the
+    # header is absent); `formats` what `format` answers from: the
+    # `format` parameter, else the Accept types when the header is not a
+    # browser's, else the path's extension, else JS for an XHR, else
+    # HTML. `format` has to be public here: `Kernel#format` is private
+    # and would otherwise answer `request.format` with a NoMethodError.
+    BROWSER_LIKE_ACCEPTS = /,\s*\*\/\*|\*\/\*\s*,/
+
+    def content_mime_type
+      fetch_header("action_dispatch.request.content_type") do |k|
+        ctype = @env["CONTENT_TYPE"].to_s
+        value = ctype.empty? ? nil : (Mime::Type.lookup(ctype) rescue nil)
+        set_header(k, value)
+      end
+    end
+
+    def accepts
+      fetch_header("action_dispatch.request.accepts") do |k|
+        header = @env["HTTP_ACCEPT"].to_s.strip
+        types = header.empty? ? [content_mime_type] : parse_accept_header(header)
+        set_header(k, types)
+      end
+    end
+
+    def formats
+      fetch_header("action_dispatch.request.formats") do |k|
+        param_format = path_parameters[:format] || @params["format"] || @params[:format]
+        accept = @env["HTTP_ACCEPT"].to_s
+        types =
+          if param_format && !param_format.to_s.empty?
+            Array(Mime[param_format])
+          elsif (xhr? && (!accept.empty? || content_mime_type)) || (!accept.empty? && accept !~ BROWSER_LIKE_ACCEPTS)
+            accepts.compact
+          elsif (extension = format_from_path_extension)
+            [extension]
+          elsif xhr?
+            [Mime[:js]]
+          else
+            [Mime[:html]]
+          end
+        set_header(k, types.select { |type| type.symbol || type.to_s == "*/*" })
+      end
+    end
+
+    def formats=(extensions)
+      set_header("action_dispatch.request.formats", extensions)
+    end
+
+    def format
+      formats.first || Mime::Type.new("", nil)
+    end
+
+    def format=(extension)
+      @params["format"] = extension.to_s
+      path_parameters[:format] = extension.to_s
+      set_header("action_dispatch.request.formats", [Mime::Type.lookup_by_extension(extension.to_s)].compact)
+    end
+
     # Shared constructor — see the twin in
     # `runtime/ruby/action_dispatch/request.rb`. The two classes hold
     # their state differently and so cannot share a `new`; this is the
@@ -327,8 +387,45 @@ module ActionDispatch
     def query_parameters
       out = {}
       CgiIo.parse_form_into(query_string, out) unless query_string.empty?
-      out
+      out.with_indifferent_access
     end
+
+    # Rack's `request.GET` / `request.POST`, which Rails' `query_parameters`
+    # and `request_parameters` alias: the query string's params and the
+    # body's params, each alone. Core's AdminAreaController reads
+    # `request.GET["debug"]` on every admin request.
+    def GET
+      query_parameters
+    end
+
+    def POST
+      request_parameters.with_indifferent_access
+    end
+
+    def format_from_path_extension
+      path = get_header("action_dispatch.original_path") || get_header("PATH_INFO")
+      match = path && path.match(/\.(\w+)\z/)
+      match && Mime[match[1]]
+    end
+    private :format_from_path_extension
+
+    # `Mime::Type.parse` for an Accept header: the media types in q
+    # order, ties by position; `*/*` is the wildcard, an unregistered
+    # but well-formed type keeps a nil symbol, a malformed one is dropped.
+    def parse_accept_header(header)
+      items = []
+      header.split(",").each_with_index do |part, index|
+        name, *params = part.split(/\s*;\s*/)
+        name = name.to_s.strip.downcase
+        next if name.empty?
+        q = params.map { |p| p[/\Aq=([\d.]+)\z/, 1] }.compact.first
+        items << [-(q ? q.to_f : 1.0), index, name]
+      end
+      items.sort.map { |(_, _, name)|
+        name == "*/*" ? Mime::ALL : (Mime::Type.lookup(name) rescue nil)
+      }.compact.uniq
+    end
+    private :parse_accept_header
   end
 
   # `ActionDispatch::TestRequest.create(env)` — see the twin in

@@ -1975,6 +1975,7 @@ fn build_filter_preamble(
                     }
                     if matches!(f.kind, FilterKind::Around) {
                         wraps.around.push(f);
+                        wraps.around_at.push(preamble.len());
                     } else {
                         wraps.after.push(PreambleStmt::Call { filter: f, halt_check: false });
                     }
@@ -2043,6 +2044,9 @@ fn build_filter_preamble(
     // reverse declaration order — see the comment where `prepends` is
     // declared above.
     if !prepends.is_empty() {
+        for at in &mut wraps.around_at {
+            *at += prepends.len();
+        }
         prepends.reverse();
         prepends.append(&mut preamble);
         preamble = prepends;
