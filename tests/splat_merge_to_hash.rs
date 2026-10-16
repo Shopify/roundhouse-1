@@ -61,3 +61,48 @@ puts "ok"
         )
         .assert_passes();
 }
+
+const UNSIGNED: &str = r#"
+class Inputs
+  attr_reader :values
+
+  def initialize(**values)
+    @values = values
+  end
+
+  def to_hash
+    @values.dup
+  end
+end
+
+class Decrement
+  def self.call(schemas:)
+    new.call(schemas: schemas)
+  end
+
+  # No signature: `schemas` and the block's `schema` are untyped, so the
+  # analysis cannot name the splatted value.
+  def call(schemas:)
+    schemas.map do |schema|
+      Inputs.new(**schema, line_item_id: 7)
+    end
+  end
+end
+"#;
+
+/// `schema` has no type the analysis can name; Ruby's `**` still asks it
+/// for `to_hash` (Core's `Express::DecrementFulfilledLineItem#call`).
+#[test]
+fn an_untyped_splatted_object_converts_through_to_hash() {
+    emit_and_run::real_blog()
+        .write("app/models/decrement.rb", UNSIGNED)
+        .run_ruby(
+            r#"
+inputs = Inputs.new(fulfillment_line_item_id: 3)
+out = Decrement.call(schemas: [inputs, { fulfillment_line_item_id: 4 }])
+raise out.map(&:values).inspect unless out.map(&:values) == [{ fulfillment_line_item_id: 3, line_item_id: 7 }, { fulfillment_line_item_id: 4, line_item_id: 7 }]
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
