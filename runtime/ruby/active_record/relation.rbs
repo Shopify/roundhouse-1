@@ -438,6 +438,12 @@ module ActiveRecord
     def distinct_count_columns: () -> String
     def exists_sql: (Integer n) -> String
     def reference_tables: (Hash[String | Symbol, untyped] hash) -> void
+# Join aliasing by a where hash's key reads dynamic reflections; the
+# bodies live in the ruby overlay (active_record_relation_ext.rb).
+%a{abstract}
+def alias_referenced_joins: (Array[String] keys) -> void
+%a{abstract}
+def aliased_join_sql: (untyped owner, untyped reflection, String kind) -> String
     def sync_eager_joins: () -> void
     def eager_loading?: () -> bool
     def referenced_collection_hop?: (untyped owner, untyped spec) -> bool
