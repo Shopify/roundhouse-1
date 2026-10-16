@@ -451,3 +451,56 @@ end
     // would leave `name` untyped and route to the runtime predicate.
     assert!(!label.contains("ActiveSupport.present?"), "call site through extend not placed:\n{out}");
 }
+
+/// A top-level class with no `empty?` is never blank, though a
+/// namespaced class of the same last segment defines one (Core's
+/// `Collection` model and `Apps::Collection`): grounding it through
+/// `empty?` raised on a record, which has none.
+#[test]
+fn same_last_segment_class_with_empty_does_not_ground_through_empty() {
+    let (out, diags) = lower_and_emit(
+        r#"
+module Apps
+  class Collection
+    def empty?
+      true
+    end
+  end
+end
+
+class Collection
+end
+
+class Util
+  def check
+    c = Collection.new
+    return "none" if c.blank?
+    "some"
+  end
+end
+"#,
+    );
+    assert!(!out.contains("c.empty?") && !out.contains("c || \"\""), "the top-level Collection has no empty?:\n{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let (out, _) = lower_and_emit(
+        r#"
+module Apps
+  class Collection
+    def empty?
+      true
+    end
+  end
+end
+
+class Util
+  def check
+    c = Apps::Collection.new
+    return "none" if c.blank?
+    "some"
+  end
+end
+"#,
+    );
+    assert!(out.contains("empty?"), "Apps::Collection answers through its own empty?:\n{out}");
+}

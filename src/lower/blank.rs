@@ -238,9 +238,19 @@ pub(crate) fn ground_jbuilder_values(body: &mut Expr, defs: &AppDefinitions) -> 
 /// (leave the dispatch alone) or an `empty?` (ground through it).
 /// Keyed by the class name's last segment — the same resolution
 /// `Ty::Class` receivers get elsewhere.
+///
+/// A class the app defines under that exact name answers for itself: a
+/// top-level `Collection` model is not `Apps::Collection`, which defines
+/// `empty?` (`collection.blank?` on the model is never `empty?`, and a
+/// guard `(collection || "").empty?` raised on it). Only a name the app
+/// does not define falls back to the last segment.
+#[derive(Default)]
 pub(crate) struct AppDefinitions {
     own_predicate: HashSet<String>,
     own_empty: HashSet<String>,
+    /// Full names of the classes the app defines, with whether each
+    /// defines its own blank-predicate / `empty?`.
+    defined: crate::det::HashMap<String, (bool, bool)>,
 }
 
 impl AppDefinitions {
@@ -254,51 +264,58 @@ impl AppDefinitions {
     pub(crate) fn from_class_registry(
         classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) -> Self {
-        let mut own_predicate = HashSet::default();
-        let mut own_empty = HashSet::default();
+        let mut defs = Self::default();
         for (id, info) in classes {
-            let last = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()).to_string();
             for name in info.instance_methods.keys() {
-                match name.as_str() {
-                    "blank?" | "present?" | "presence" => {
-                        own_predicate.insert(last.clone());
-                    }
-                    "empty?" => {
-                        own_empty.insert(last.clone());
-                    }
-                    _ => {}
-                }
+                defs.note(id.0.as_str(), name.as_str());
             }
+            defs.defined.entry(id.0.as_str().to_string()).or_default();
         }
-        Self { own_predicate, own_empty }
+        defs
     }
 
     pub(crate) fn collect(app: &App) -> Self {
-        let mut own_predicate = HashSet::default();
-        let mut own_empty = HashSet::default();
-        let mut note = |class: &str, method: &str| {
-            let last = class.rsplit("::").next().unwrap_or(class).to_string();
-            match method {
-                "blank?" | "present?" | "presence" => {
-                    own_predicate.insert(last);
-                }
-                "empty?" => {
-                    own_empty.insert(last);
-                }
-                _ => {}
-            }
-        };
+        let mut defs = Self::default();
         for model in &app.models {
+            defs.defined.entry(model.name.0.as_str().to_string()).or_default();
             for method in model.methods() {
-                note(model.name.0.as_str(), method.name.as_str());
+                defs.note(model.name.0.as_str(), method.name.as_str());
             }
         }
         for lc in &app.library_classes {
+            defs.defined.entry(lc.name.0.as_str().to_string()).or_default();
             for method in &lc.methods {
-                note(lc.name.0.as_str(), method.name.as_str());
+                defs.note(lc.name.0.as_str(), method.name.as_str());
             }
         }
-        Self { own_predicate, own_empty }
+        defs
+    }
+
+    fn note(&mut self, class: &str, method: &str) {
+        let last = class.rsplit("::").next().unwrap_or(class).to_string();
+        let entry = self.defined.entry(class.to_string()).or_default();
+        match method {
+            "blank?" | "present?" | "presence" => {
+                self.own_predicate.insert(last);
+                entry.0 = true;
+            }
+            "empty?" => {
+                self.own_empty.insert(last);
+                entry.1 = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `raw` (a receiver class's full name) defines its own
+    /// blank-predicate / `empty?`: its own answer where the app defines
+    /// a class of that exact name, else the last segment's.
+    fn own(&self, raw: &str) -> (bool, bool) {
+        if let Some(&answer) = self.defined.get(raw) {
+            return answer;
+        }
+        let last = raw.rsplit("::").next().unwrap_or(raw);
+        (self.own_predicate.contains(last), self.own_empty.contains(last))
     }
 }
 
@@ -371,7 +388,8 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
         Ty::Class { id, .. } => {
             let raw = id.0.as_str();
             let last = raw.rsplit("::").next().unwrap_or(raw);
-            if defs.own_predicate.contains(last) || raw == "ActionText::Content" {
+            let (own_predicate, own_empty) = defs.own(raw);
+            if own_predicate || raw == "ActionText::Content" {
                 // `ActionText::Content#blank?` is a RUNTIME method that
                 // tracks plain text, not markup. The app's class
                 // registry often misses it when a single runtime file
@@ -379,7 +397,7 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
                 // folding to NeverBlank made `content.blank?` emit as
                 // `false` — wrong for an empty `<div></div>` body.
                 OwnDispatch
-            } else if last == "Relation" || last == "Errors" || defs.own_empty.contains(last) {
+            } else if last == "Relation" || last == "Errors" || own_empty {
                 // Registry classes the analyzer types but the app
                 // doesn't define: ActiveRecord::Relation and
                 // ActiveModel::Errors both answer `empty?` (the

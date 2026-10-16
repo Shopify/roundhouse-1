@@ -139,6 +139,10 @@ module ActiveModel
         default = _attribute_definitions[name]&.last if default.equal?(NO_DEFAULT_PROVIDED) && _attribute_definitions.key?(name)
         own_attribute_definitions[name] = [type, default]
         define_attribute_accessors(name)
+        # The suffixed and prefixed methods of the attribute-method patterns
+        # a class with ActiveModel::AttributeMethods (ActiveModel::Dirty)
+        # has registered.
+        define_attribute_method(name) if respond_to?(:define_attribute_method, true)
         name
       end
 
@@ -163,11 +167,22 @@ module ActiveModel
         end
       end
 
-      def attribute_method_suffix(*)
+      # A class that includes ActiveModel::AttributeMethods (ActiveModel::Dirty
+      # does) has the real ones, which sit before these.
+      def attribute_method_suffix(*, **)
+        return super if defined?(super)
         raise NotImplementedError, "roundhouse: #{name}.attribute_method_suffix needs ActiveModel::AttributeMethods, which is not ported with ActiveModel::Attributes"
       end
-      alias_method :attribute_method_prefix, :attribute_method_suffix
-      alias_method :attribute_method_affix, :attribute_method_suffix
+
+      def attribute_method_prefix(*, **)
+        return super if defined?(super)
+        raise NotImplementedError, "roundhouse: #{name}.attribute_method_prefix needs ActiveModel::AttributeMethods, which is not ported with ActiveModel::Attributes"
+      end
+
+      def attribute_method_affix(*, **)
+        return super if defined?(super)
+        raise NotImplementedError, "roundhouse: #{name}.attribute_method_affix needs ActiveModel::AttributeMethods, which is not ported with ActiveModel::Attributes"
+      end
 
       # The attributes' defaults, in declaration order: a new
       # ActiveModel::Attribute for each.
@@ -200,12 +215,16 @@ module ActiveModel
           end
         end
 
-        def generated_attribute_methods
-          @generated_attribute_methods ||= Module.new.tap { |mod| include mod }
+        # The readers and writers live apart from the module
+        # ActiveModel::AttributeMethods generates its methods in, whose
+        # `undefine_attribute_methods` (each pattern registered) would
+        # remove them.
+        def generated_attribute_accessors
+          @generated_attribute_accessors ||= Module.new.tap { |mod| include mod }
         end
 
         def define_attribute_accessors(name)
-          generated_attribute_methods.module_eval do
+          generated_attribute_accessors.module_eval do
             define_method(name) { attribute(name) }
             define_method(:"#{name}=") { |value| _write_attribute(name, value) }
           end
