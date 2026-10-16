@@ -258,6 +258,18 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
                     FixtureValue::Ruby(super::expr::ingest_ruby_program(&src, &tag_file)?)
                 }
                 SlotMatch::None => FixtureValue::Scalar(s),
+                // A mapping or sequence with a tag inside: Rails renders
+                // the text and Psych reads the structure, a Hash or Array
+                // whose scalars keep their YAML types (a tag that writes
+                // `42` is an Integer). The column's type casts it on
+                // insert, as it does a literal one.
+                SlotMatch::Whole(_) | SlotMatch::Embedded
+                    if matches!(&v, serde_yaml_ng::Value::Mapping(_) | serde_yaml_ng::Value::Sequence(_)) =>
+                {
+                    let src = structured_source(&v, &split.values);
+                    let tag_file = format!("{file} ({label}.{k} with ERB)");
+                    FixtureValue::Ruby(super::expr::ingest_ruby_program(&src, &tag_file)?)
+                }
                 SlotMatch::Whole(expr) => FixtureValue::Ruby(expr),
                 // `body: "hi <%= name %>"` — the tag is one part of a
                 // larger scalar, so the value is a string built at
@@ -400,6 +412,44 @@ fn interpolated_source(s: &str, values: &[String]) -> String {
         lit = lit.replace(&erb_slot(idx), &format!("#{{({src})}}"));
     }
     format!("\"{lit}\"")
+}
+
+/// A YAML mapping or sequence holding ERB slots, as the source of the Ruby
+/// Hash or Array Psych would read from the rendered text: a scalar that is
+/// exactly one tag is read the way YAML reads what the tag wrote
+/// (`TestFixtures.erb_scalar`), one with text around its tags is the
+/// string they build, and the rest keep their YAML types.
+fn structured_source(v: &serde_yaml_ng::Value, tags: &[String]) -> String {
+    use serde_yaml_ng::Value;
+    let text = |s: &str| {
+        match (0..tags.len()).find(|idx| s == erb_slot(*idx)) {
+            Some(idx) => format!("ActiveRecord::TestFixtures.erb_scalar(({}))", tags[idx]),
+            None => interpolated_source(s, tags),
+        }
+    };
+    match v {
+        Value::Null => "nil".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => text(s),
+        Value::Sequence(items) => {
+            format!("[{}]", items.iter().map(|item| structured_source(item, tags)).collect::<Vec<_>>().join(", "))
+        }
+        Value::Mapping(entries) => {
+            let pairs: Vec<String> = entries
+                .iter()
+                .map(|(key, value)| {
+                    let key = match key {
+                        Value::String(s) => text(s),
+                        other => structured_source(other, tags),
+                    };
+                    format!("{key} => {}", structured_source(value, tags))
+                })
+                .collect();
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        Value::Tagged(t) => structured_source(&t.value, tags),
+    }
 }
 
 fn resolve_slot(s: &str, values: &[Expr]) -> SlotMatch {

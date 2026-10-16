@@ -228,3 +228,29 @@ fn a_def_in_a_statement_tag_is_callable_from_the_value_tags() {
     );
     assert!(load.contains("instance.name = tagged(:david, true)"), "{emitted}");
 }
+
+/// A mapping field with a tag inside (`instruction:` of a jsonb column,
+/// `payment_provider_id: <%= … %>` under it) is the Hash Psych reads from
+/// the rendered text: a tag that is a whole scalar is read the way YAML
+/// reads what it wrote (an Integer), text around a tag builds a string, and
+/// the untouched scalars keep their types. It used to ride as JSON text
+/// with the tag quoted, which the jsonb column then encoded a second time:
+/// the reader answered a String, not a Hash.
+#[test]
+fn a_mapping_with_a_tag_inside_is_a_hash_not_json_text() {
+    let app = app_with_fixture(
+        "david:\n  name:\n    id: <%= 40 + 2 %>\n    label: \"x-<%= 1 %>\"\n    nested:\n      count: 3\n      list: [a, b]\n",
+    );
+    let value = &app.fixtures[0].records[&Symbol::from("david")][&Symbol::from("name")];
+    let FixtureValue::Ruby(expr) = value else {
+        panic!("expected a Ruby value, got {value:?}");
+    };
+    assert!(matches!(&*expr.node, ExprNode::Hash { .. }) || matches!(&*expr.node, ExprNode::Seq { .. }), "{:?}", expr.node);
+    let emitted = emitted_fixture(&app);
+    assert!(
+        emitted.contains(
+            r#"{ "id" => ActiveRecord::TestFixtures.erb_scalar(40 + 2), "label" => "x-#{1}", "nested" => { "count" => 3, "list" => ["a", "b"] } }"#
+        ),
+        "{emitted}"
+    );
+}
