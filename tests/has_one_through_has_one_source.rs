@@ -34,9 +34,12 @@ const MODELS: &[(&str, &str)] = &[
     ),
     (
         "legal_entity",
-        "class LegalEntity < ApplicationRecord\n  belongs_to :shop\n  has_one :payment_account, -> { where(is_not_archived: true, status: [\"enabled\", \"configuring\"]) }, foreign_key: :legal_entity_id\nend\n",
+        "class LegalEntity < ApplicationRecord\n  belongs_to :shop\n  has_one :payment_account, -> { where(is_not_archived: true, status: [\"enabled\", \"configuring\"]) }, class_name: \"Billing::PaymentAccount\", foreign_key: :legal_entity_id\nend\n",
     ),
-    ("payment_account", "class PaymentAccount < ApplicationRecord\nend\n"),
+    (
+        "billing/payment_account",
+        "module Billing\n  class PaymentAccount < ApplicationRecord\n    self.table_name = \"payment_accounts\"\n  end\nend\n",
+    ),
 ];
 
 const PROBE: &str = r##"module HasOneHasOneSourceProbe
@@ -59,19 +62,20 @@ const PROBE: &str = r##"module HasOneHasOneSourceProbe
     other_primary = LegalEntity.create!(shop_id: other.id, is_primary: true)
     archived_primary = LegalEntity.create!(shop_id: archived.id, is_primary: true)
     # Not on the primary entity: must not be answered.
-    PaymentAccount.create!(shop_id: shop.id, legal_entity_id: secondary.id, status: "enabled")
+    Billing::PaymentAccount.create!(shop_id: shop.id, legal_entity_id: secondary.id, status: "enabled")
     # Excluded by the source scope on the primary entity.
-    PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "disabled")
-    PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "enabled", is_not_archived: false)
-    PaymentAccount.create!(shop_id: archived.id, legal_entity_id: archived_primary.id, status: "enabled", is_not_archived: false)
+    Billing::PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "disabled")
+    Billing::PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "enabled", is_not_archived: false)
+    Billing::PaymentAccount.create!(shop_id: archived.id, legal_entity_id: archived_primary.id, status: "enabled", is_not_archived: false)
     show("only excluded rows") { Shop.find(shop.id).payment_account&.status }
-    PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "configuring")
-    PaymentAccount.create!(shop_id: other.id, legal_entity_id: other_primary.id, status: "enabled")
+    Billing::PaymentAccount.create!(shop_id: shop.id, legal_entity_id: primary.id, status: "configuring")
+    Billing::PaymentAccount.create!(shop_id: other.id, legal_entity_id: other_primary.id, status: "enabled")
     show("source scope + through scope") { Shop.find(shop.id).payment_account&.status }
     show("other shop") { Shop.find(other.id).payment_account&.status }
     show("no legal entity") { Shop.find(nolegal.id).payment_account }
     show("archived only") { Shop.find(archived.id).payment_account }
     show("unsaved owner") { Shop.new.payment_account }
+    show("class") { Shop.find(shop.id).payment_account.class.name }
     show("loaded?") do
       found = Shop.find(shop.id)
       found.payment_account
@@ -101,7 +105,9 @@ fn native() -> String {
     std::fs::write(dir.join("has_one_has_one_source_probe.rb"), PROBE).unwrap();
     let mut requires = String::new();
     for (name, source) in MODELS {
-        std::fs::write(dir.join(format!("{name}.rb")), source).unwrap();
+        let path = dir.join(format!("{name}.rb"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
         requires.push_str(&format!("require_relative {name:?}\n"));
     }
     let program = format!(

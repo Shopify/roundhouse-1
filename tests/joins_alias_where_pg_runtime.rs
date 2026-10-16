@@ -61,6 +61,15 @@ const FINDER: &str = r#"class CustomerFinder
       .to_a
   end
 
+  def self.named_owner(shop_id)
+    CustomerEmailAddress
+      .where(shop_id: shop_id)
+      .joins(:customer)
+      .where.not(customer: { name: nil })
+      .order(:id)
+      .to_a
+  end
+
   def self.find_many(shop_id, emails)
     base(Customer)
       .joins(:email_addresses)
@@ -81,12 +90,20 @@ const PROBE: &str = r##"class JoinsAliasWhereProbe
     out << "find_by: #{CustomerFinder.find_one(1, "ann@x")&.name.inspect} #{CustomerFinder.find_one(1, "nobody@x").inspect} #{CustomerFinder.find_one(2, "ann@x").inspect}"
     out << "where: #{CustomerFinder.find_many(1, ["bob@x", "ann@x"]).map(&:name).join(",")}"
     out << "where first: #{CustomerFinder.where_first(1, "bob@x").map(&:name).join(",")}"
+    nameless = Customer.create!(shop_id: 1, name: nil)
+    CustomerEmailAddress.create!(customer_id: nameless.id, shop_id: 1, email_address_normalized: "none@x")
+    out << "belongs_to where.not: #{CustomerFinder.named_owner(1).map(&:email_address_normalized).join(",")}"
     out
   end
 end
 "##;
 
-const EXPECTED: [&str; 3] = ["find_by: \"ann\" nil nil", "where: ann,bob", "where first: bob"];
+const EXPECTED: [&str; 4] = [
+    "find_by: \"ann\" nil nil",
+    "where: ann,bob",
+    "where first: bob",
+    "belongs_to where.not: ann@x,bob@x",
+];
 
 const LOADS: [&str; 5] = [
     "app/models/application_record",
