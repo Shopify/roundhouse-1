@@ -184,48 +184,22 @@ module ActiveRecord
     def alias_referenced_joins(keys)
       return if @joins.empty? || !@model.respond_to?(:reflect_on_association)
       keys.each do |key|
-        joined_hops(@model, joins_values + left_outer_joins_values, key.to_s).each do |owner, reflection|
-          next unless alias_join_reflection?(owner, reflection)
-          ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
-            plain = reflection_join_sql(owner, reflection, kind)
-            index = @joins.index { |join| join.include?(plain) }
-            next if index.nil?
-            own_lists
-            @joins[index] = @joins[index].sub(plain, reflection_join_sql(owner, reflection, kind, key.to_s))
-          end
+        reflection = @model.reflect_on_association(key.to_sym)
+        next unless alias_join_reflection?(@model, reflection)
+        ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
+          plain = reflection_join_sql(@model, reflection, kind)
+          index = @joins.index(plain)
+          next if index.nil?
+          own_lists
+          @joins[index] = reflection_join_sql(@model, reflection, kind, key.to_s)
         end
       end
     end
 
-    # The `[owner, reflection]` hops of the `joins` specs whose association
-    # is called `name`, at any depth: Rails' JoinDependency aliases a hop to
-    # the association's name wherever it sits (`joins(conditions:
-    # :owner_market_definition)` with `where(owner_market_definition:
-    # {...})`).
-    def joined_hops(owner, spec, name)
-      found = []
-      case spec
-      when Symbol, String
-        reflection = owner.reflect_on_association(spec.to_sym)
-        found << [owner, reflection] if !reflection.nil? && reflection.name.to_s == name
-      when Array
-        spec.each { |el| found.concat(joined_hops(owner, el, name)) }
-      when Hash
-        spec.each do |hop, nested|
-          reflection = owner.reflect_on_association(hop.to_sym)
-          next if reflection.nil?
-          found << [owner, reflection] if reflection.name.to_s == name
-          next if reflection.polymorphic?
-          found.concat(joined_hops(reflection.klass, nested, name))
-        end
-      end
-      found
-    end
-
-    # A hop `where(<name>: {...})` can alias: an unscoped, direct,
+    # A hop `where(<name>: {...})` can alias: a direct, unscoped,
     # non-polymorphic association whose name is not its table's.
     def alias_join_reflection?(owner, reflection)
-      return false if reflection.nil?
+      return false if reflection.nil? || !owner.equal?(@model)
       return false if reflection.through_reflection? || reflection.polymorphic?
       return false if reflection.macro == :has_and_belongs_to_many || reflection._roundhouse_scoped?
       reflection.name.to_s != reflection.klass.table_name.to_s
