@@ -409,15 +409,17 @@ fn static_path_name(path: &str) -> Option<String> {
 /// starts with a letter or underscore. A path with a dynamic segment, a
 /// dot or a group names nothing.
 fn own_path_name(path: &str, name_prefix: &str) -> Option<String> {
-    if path.is_empty() || !path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/')) {
+    if !path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/')) {
         return None;
     }
     let own = path.trim_start_matches('/').replace(['/', '-'], "_");
-    let name = format!("{name_prefix}{own}");
-    if name.is_empty()
-        || own.is_empty()
-        || !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-    {
+    // `get "/"` has no name of its own, so it takes the scope's.
+    let name = if own.is_empty() {
+        name_prefix.trim_end_matches('_').to_string()
+    } else {
+        format!("{name_prefix}{own}")
+    };
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
         return None;
     }
     Some(name)
@@ -454,7 +456,13 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 inner_joined.as_str()
             };
             let (nested, base_params) = nest_path(own_path, &ctx.parents, *scope);
+            // Rails normalizes a route's path: `delete "/"` inside
+            // `collection` is `/inventory_levels`, not `/inventory_levels/`.
             let full_path = prefix_path(&ctx.ns_path, &nested);
+            let full_path = match full_path.trim_end_matches('/') {
+                "" => "/".to_string(),
+                trimmed => trimmed.to_string(),
+            };
             // Rails optional `(…)` segments (`get "/s/:id/(:title)"`) match
             // whether or not the segment is present; expand them into
             // concrete routes (`/s/:id/:title` and `/s/:id`) so the

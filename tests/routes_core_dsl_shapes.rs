@@ -12,6 +12,9 @@
 //!   the params it names optional while the others stay required;
 //! - a `*glob` is a helper param, not literal text in the helper's path.
 
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
 use roundhouse::App;
 use roundhouse::ingest::ingest_routes;
 use roundhouse::lower::routes::{FlatRoute, flatten_routes, flatten_routes_for_helpers};
@@ -157,4 +160,71 @@ fn a_glob_is_a_helper_param_the_router_still_serves() {
     assert_eq!(optional.required_params, 0);
     let paths: Vec<_> = dispatched(&app).into_iter().map(|(p, ..)| p).collect();
     assert_eq!(paths, ["/a/*path", "/z/*rest", "/z"]);
+}
+
+#[test]
+fn a_slash_or_empty_path_takes_the_scope_name_and_drops_the_trailing_slash() {
+    let app = app_with(
+        "  namespace :admin do\n    scope \"stafff\", controller: :staff_auth, as: :stafff do\n      get \"\", action: :login\n    end\n    resources :levels, only: [:index] do\n      collection do\n        delete \"/\", action: :destroy\n      end\n    end\n  end\n",
+    );
+    let helpers = named(&app);
+    assert_eq!(helper(&helpers, "admin_stafff").path, "/admin/stafff");
+    let routes = dispatched(&app);
+    assert!(
+        routes.contains(&("/admin/levels".into(), "Admin::LevelsController".into(), "destroy".into())),
+        "`delete \"/\"` in a collection is the collection path: {routes:?}"
+    );
+}
+
+const ROUTES: &str = r#"Rails.application.routes.draw do
+  scope "(/:shop_route_locale)" do
+    get "/cart/add(/:id)", to: "carts#add", as: :cart_add
+    get "/mid(/:a)/tail", to: "carts#mid", as: :mid
+    get "/pages/:slug(/:tab/edit)", to: "pages#show", as: :page
+    get "/px@:hash(/:kind)/pixel-:id@:ver(~:glue)/:name.:ext", to: "pixels#js", as: :pixel
+    resources :things, only: [:index, :show]
+  end
+  get "(/:locale)", to: "home#index", as: :home
+  get "/a/*path", to: "c#a", as: :glob
+  get "/z(/*rest)", to: "c#z", as: :opt_glob
+end
+"#;
+
+const ASSERTIONS: &str = r#"
+require_relative "app/route_helpers"
+
+def check(actual, expected)
+  raise "got #{actual.inspect}, want #{expected.inspect}" unless actual == expected
+end
+
+check RouteHelpers.cart_add_path, "/cart/add"
+check RouteHelpers.cart_add_path("fr"), "/fr/cart/add"
+check RouteHelpers.cart_add_path("fr", 3), "/fr/cart/add/3"
+check RouteHelpers.cart_add_path(nil, 3), "/cart/add/3"
+check RouteHelpers.mid_path(nil, "a"), "/mid/a/tail"
+check RouteHelpers.mid_path, "/mid/tail"
+check RouteHelpers.page_path("s"), "/pages/s"
+check RouteHelpers.page_path("s", "de", "t"), "/de/pages/s/t/edit"
+check RouteHelpers.thing_path(4), "/things/4"
+check RouteHelpers.thing_path(4, "de"), "/de/things/4"
+check RouteHelpers.home_path, "/"
+check RouteHelpers.home_path("en"), "/en"
+check RouteHelpers.pixel_path("h", "i", "v", "n", "e"), "/px@h/pixel-i@v/n.e"
+# The scope's locale is the first optional param, then the route's own.
+check RouteHelpers.pixel_path("h", "i", "v", "n", "e", nil, "k", "g"), "/px@h/k/pixel-i@v~g/n.e"
+check RouteHelpers.pixel_path("h", "i", "v", "n", "e", "fr"), "/fr/px@h/pixel-i@v/n.e"
+check RouteHelpers.glob_path("x/y"), "/a/x/y"
+check RouteHelpers.opt_glob_path, "/z"
+check RouteHelpers.opt_glob_path("p/q"), "/z/p/q"
+puts "route helpers passed"
+"#;
+
+#[test]
+fn optional_groups_and_globs_render_in_ruby() {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", ROUTES)
+        .run_ruby(ASSERTIONS)
+        .assert_passes();
 }

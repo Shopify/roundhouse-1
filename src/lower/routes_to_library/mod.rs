@@ -1879,8 +1879,9 @@ fn build_optional_path_expr(
     let segments: Vec<&str> = path.split('/').collect();
     let kept: Vec<&str> = shortest.map(|s| s.split('/').collect()).unwrap_or_default();
     // A segment's text as parts: literal text and the params it names.
-    let segment_parts = |segment: &str| -> (Vec<InterpPart>, Option<String>) {
-        let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: "/".to_string() }];
+    let segment_parts = |segment: &str, slash: bool| -> (Vec<InterpPart>, Option<String>) {
+        let mut parts: Vec<InterpPart> =
+            vec![InterpPart::Text { value: if slash { "/" } else { "" }.to_string() }];
         let mut first_optional = None;
         let mut buf = String::new();
         let mut chars = segment.chars().peekable();
@@ -1903,8 +1904,10 @@ fn build_optional_path_expr(
                 buf.push_str(&ident);
                 continue;
             }
-            if let Some(InterpPart::Text { value }) = parts.last_mut() {
-                value.push_str(&buf);
+            match parts.last_mut() {
+                Some(InterpPart::Text { value }) => value.push_str(&buf),
+                _ if !buf.is_empty() => parts.push(InterpPart::Text { value: buf.clone() }),
+                _ => {}
             }
             buf.clear();
             if optional.contains(ident.as_str()) && first_optional.is_none() {
@@ -1935,7 +1938,28 @@ fn build_optional_path_expr(
             next_kept = usize::from(!kept.is_empty());
             continue;
         }
-        let (parts, first_optional) = segment_parts(segment);
+        // A group inside a segment (`web-pixel-:id@:v(~:glue)`): the
+        // shortest segment is the always-present head, the rest the group.
+        if let Some(head) = kept.get(next_kept).filter(|head| {
+            !head.is_empty() && head.len() < segment.len() && segment.starts_with(**head)
+        }) {
+            let (head_parts, _) = segment_parts(head, true);
+            let (tail_parts, tail_param) = segment_parts(&segment[head.len()..], false);
+            next_kept += 1;
+            match pieces.last_mut() {
+                Some(Piece::Always(before)) => {
+                    before.extend(head_parts);
+                    merge_adjacent_text(before);
+                }
+                _ => pieces.push(Piece::Always(head_parts)),
+            }
+            match tail_param {
+                Some(param) => pieces.push(Piece::When(param, tail_parts)),
+                None => pending.extend(tail_parts),
+            }
+            continue;
+        }
+        let (parts, first_optional) = segment_parts(segment, true);
         let in_shortest = match shortest {
             Some(_) => {
                 let hit = kept.get(next_kept) == Some(segment);
