@@ -1193,11 +1193,51 @@ fn eq_query_constraints(model: &Model, table: &Table, cols: &[&crate::schema::Co
         .map(|c| {
             Predicate::Eq(
                 ColRef { table: TableRef(table.name.clone()), column: c.name.clone() },
-                Value::Runtime { expr: column_bind_expr(model, c), ty: bind_type(model, c) },
+                Value::Runtime { expr: in_database_bind_expr(model, table, c), ty: bind_type(model, c) },
             )
         })
         .reduce(|a, b| Predicate::And(Box::new(a), Box::new(b)))
         .expect("query_constraints names at least one column")
+}
+
+/// [`column_bind_expr`] over the value the row holds (`attribute_in_database`),
+/// not the pending one: Rails' `_query_constraints_hash` addresses the row by
+/// its stored key, so `address.update!(shop_id: other)` finds the row under
+/// the old `shop_id` instead of matching nothing under the new one. The
+/// key column keeps its ivar (the dirty snapshot does not carry it), and so
+/// do the columns of a composite primary key: a key is not reassigned.
+fn in_database_bind_expr(model: &Model, table: &Table, col: &crate::schema::Column) -> Expr {
+    if col.primary_key
+        || key_column(model, table).is_some_and(|k| k.name == col.name)
+        || model.composite_primary_key.iter().any(|k| k.as_str() == col.name.as_str())
+    {
+        return column_bind_expr(model, col);
+    }
+    let stored = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+            method: Symbol::from("attribute_in_database"),
+            args: vec![arel_lit_str(col.name.as_str().to_string())],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    if super::schema::is_retypable(model, col) {
+        let self_class = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                method: Symbol::from("class"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        declared_type_send(self_class, "_attribute_serialize", col, stored)
+    } else {
+        stored
+    }
 }
 
 /// `if self.class.query_constraints_list then <composite> else <single>

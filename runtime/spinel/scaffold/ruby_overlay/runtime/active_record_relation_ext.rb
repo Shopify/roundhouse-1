@@ -341,14 +341,36 @@ module ActiveRecord
   # every pair is matched, as Rails' AssociationQueryValue does for a
   # composite foreign key.
   module CompositeAssociationKeyPredicates
+    # A join over a composite key matches every pair: the reflection's
+    # `[foreign key side, referenced side]` pairs, read as
+    # `[target column, owner column]` (a belongs_to's foreign-key side is
+    # the owner's).
+    def join_key_pairs(reflection)
+      pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
+      return super if pairs.nil?
+      reflection.belongs_to? ? pairs.map { |pair| [pair[1], pair[0]] } : pairs
+    end
+
     def association_key_predicates(reflection, val, note)
       pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
       return super if pairs.nil?
+      return composite_list_predicates(pairs, val.to_a) if val.is_a?(Array) || val.is_a?(Relation)
       raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
-        "#{pairs.map { |pair| pair[0] }.inspect} takes one record or nil" unless val.nil? || val.is_a?(Base)
+        "#{pairs.map { |pair| pair[0] }.inspect} takes a record, a list of records or nil" unless val.nil? || val.is_a?(Base)
       pairs.map do |pair|
         [pair[0], column_predicate(pair[0], val.nil? ? nil : val.public_send(pair[1]), note)]
       end
+    end
+
+    # A list of records over a composite key is Rails' tuple match: one
+    # AND group of every key pair per record, ORed (an empty list matches
+    # nothing).
+    def composite_list_predicates(pairs, records)
+      groups = records.map do |record|
+        "(" + pairs.map { |pair| column_predicate(pair[0], record.public_send(pair[1])) }.join(" AND ") + ")"
+      end
+      return [[pairs[0][0], "1=0"]] if groups.empty?
+      [[pairs[0][0], groups.length == 1 ? groups[0] : "(#{groups.join(" OR ")})"]]
     end
   end
   Relation.prepend(CompositeAssociationKeyPredicates)
