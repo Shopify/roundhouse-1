@@ -1057,11 +1057,14 @@ module ActiveRecord
     # `after_commit` condition asks it.
     def transaction_include_any_action?(actions)
       actions.any? do |action|
-        case action
-        when :create then _transaction_include_create?
-        when :update then _transaction_include_update?
-        when :destroy then _transaction_include_destroy?
-        else false
+        if action == :create
+          _transaction_include_create?
+        elsif action == :update
+          _transaction_include_update?
+        elsif action == :destroy
+          _transaction_include_destroy?
+        else
+          false
         end
       end
     end
