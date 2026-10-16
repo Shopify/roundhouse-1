@@ -413,6 +413,11 @@ pub(super) struct TestMixins {
     /// The test-path files without a test class, which `ingest::app`
     /// carries as library files (`set_library_context`).
     support_files: Set<String>,
+    /// The modules the app and its gems declare outside the test paths, by
+    /// full name, with whether each `extend`s `ActiveSupport::Concern`
+    /// (`set_app_modules`). A shared test module's `include` of one is
+    /// kept or deferred by what the module is, as for a support file's.
+    app_modules: Map<String, bool>,
     /// The constants a body's lexical scopes may have wherever it runs
     /// (`qualify_lexical`): the app's, the support files' `declared`, and
     /// every namespace above one. A test class's file adds its own
@@ -598,6 +603,15 @@ impl TestMixins {
         for name in app_constants {
             add_with_namespaces(&mut self.lexical, &name);
         }
+    }
+
+    /// Before `finish`: the modules the app and its gems declare (not in
+    /// a test file), each with whether it extends `ActiveSupport::Concern`.
+    /// A shared test module that includes one needs the kind to decide
+    /// whether the include stays in its library body or is deferred to
+    /// each includer (`library_include`).
+    pub(super) fn set_app_modules(&mut self, modules: impl IntoIterator<Item = (String, bool)>) {
+        self.app_modules.extend(modules);
     }
 
     /// After every test file is scanned: ingest the modules that matter to
@@ -796,6 +810,23 @@ impl TestMixins {
             }
             if TEST_FRAMEWORK_MODULES.contains(&gem) {
                 return Ok(false);
+            }
+            // A module of the app or a gem (`Markets::TestHelper`,
+            // `FixtureFactory::Registry`): loaded with the app tree, so a
+            // plain one stays in the module's own ancestry, as natively,
+            // and a concern after this module's own `extend
+            // ActiveSupport::Concern` is deferred to each includer.
+            if let Some((name, concern)) = candidates(r, &m.nesting).into_iter().find_map(|c| self.app_modules.get(&c).map(|k| (c, *k))) {
+                if concern && after_concern {
+                    return Ok(false);
+                }
+                if concern {
+                    return Err(format!(
+                        "its `include {written}` {site} comes before an `extend ActiveSupport::Concern` (or it has none): the concern `{name}` is included into `{}` itself, its `included do` block run on the module, which the library module does not model",
+                        m.name
+                    ));
+                }
+                return Ok(true);
             }
             return Err(format!(
                 "its `include {written}` {site}: whether `{written}` is an ActiveSupport::Concern (an include deferred to each includer) or a plain module (one in `{}`'s own ancestry) is not known to the shared-test splice",
@@ -1599,6 +1630,32 @@ impl ClassWalk<'_> {
                             }
                             self.include(refs)?;
                             continue;
+                        }
+                        "setup" if in_block && call.block().and_then(|b| b.as_block_node()).is_some() && is_prepend_option(&call) => {
+                            // `setup(prepend: true) do … end` in an `included do`
+                            // block: run on the class where the include stands,
+                            // the runtime's `RoundhouseTestCallbacks` chain
+                            // putting it before the callbacks registered earlier.
+                            match super::test::carried_body_statement(&stmt, &self.class, file).map_err(message)? {
+                                Some(mut expr) => {
+                                    self.qualify_block(&mut expr);
+                                    self.block_statements.push(crate::dialect::TestBodyStatement {
+                                        expr,
+                                        line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
+                                        after_definitions: false,
+                                        after_setup_blocks: false,
+                                        after_teardown_blocks: false,
+                                        source: None,
+                                    });
+                                    continue;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "the `setup(prepend: true)` {} is a statement ingest does not model",
+                                        at(file, stmt.location().start_offset())
+                                    ))
+                                }
+                            }
                         }
                         "setup" if call.block().is_some() => {
                             if call.arguments().is_some() || call.block().and_then(|b| b.as_block_node()).is_none() {
@@ -2802,6 +2859,7 @@ fn scan_node(
         concern: false,
     };
     let mut class_defs: Vec<ruby_prism::DefNode<'_>> = Vec::new();
+    let in_class_methods = written.last().map(String::as_str) == Some("ClassMethods");
     // A `def test_…` after a bare `private`/`protected`, or written as
     // `private def test_…`, is a helper: Minitest runs public methods only
     // (`public_instance_methods` in Core's `methods_matching`).
@@ -2831,7 +2889,11 @@ fn scan_node(
         if let Some(level) = bare_visibility(stmt) {
             hidden = level != MethodVisibility::Public;
         }
-        if !non_public_def(stmt, hidden) && (is_test_declaration_shape(stmt) || hidden_test_declaration(stmt).is_some()) {
+        // A `def test_…` of a `ClassMethods` module is a class method of the
+        // includer (`test_input_field_authorization(…)`, a test macro), not
+        // a test: the module is the app's, not a shared test module.
+        let class_method_def = in_class_methods && stmt.as_def_node().is_some();
+        if !class_method_def && !non_public_def(stmt, hidden) && (is_test_declaration_shape(stmt) || hidden_test_declaration(stmt).is_some()) {
             decl.declares = true;
         }
         if let Some(def) = instance_def(stmt) {
@@ -2894,6 +2956,20 @@ fn module_member(stmt: &Node<'_>) -> bool {
         || stmt.as_instance_variable_or_write_node().is_some()
         || stmt.as_instance_variable_and_write_node().is_some()
         || stmt.as_instance_variable_operator_write_node().is_some()
+}
+
+/// Whether `call`'s only argument is the keyword `prepend: true|false`
+/// (`setup(prepend: true) do … end`).
+fn is_prepend_option(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let args: Vec<Node<'_>> = args.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return false };
+    let Some(hash) = arg.as_keyword_hash_node() else { return false };
+    let elements: Vec<Node<'_>> = hash.elements().iter().collect();
+    let [element] = elements.as_slice() else { return false };
+    let Some(assoc) = element.as_assoc_node() else { return false };
+    assoc.key().as_symbol_node().is_some_and(|k| k.unescaped() == b"prepend")
+        && (assoc.value().as_true_node().is_some() || assoc.value().as_false_node().is_some())
 }
 
 /// The hooks Ruby calls on a module as it is included, extended or
@@ -4158,6 +4234,25 @@ end
     }
 
     #[test]
+    fn a_support_modules_test_macros_are_class_methods_not_shared_tests() {
+        let helper = "module AuthHelper\n  extend ActiveSupport::Concern\n  module ClassMethods\n    include TestGenerator\n    def test_field(key)\n      generate_test(\"checks #{key}\") do\n        assert true\n      end\n    end\n  end\nend\n";
+        let class = "class AuthTest < ActiveSupport::TestCase\n  include AuthHelper\n  test_field(:vendor)\nend\n";
+        let mut mixins = TestMixins::default();
+        for (file, source) in [("helper.rb", helper), ("auth_test.rb", class)] {
+            mixins.scan(source.as_bytes(), file);
+        }
+        mixins.set_library_context(["helper.rb".to_string()], Vec::new());
+        mixins.finish();
+        // The module is no shared test module (`ClassMethods#test_field` is a
+        // class method, not a test): no part of it is blanked, the file is
+        // carried whole, and the class's macro call is the app's.
+        assert!(mixins.library_source("helper.rb", helper.as_bytes()).is_none());
+        assert!(mixins.shared_files.is_empty(), "{:?}", mixins.shared_files);
+        let tm = crate::ingest::test::ingest_test_files(class.as_bytes(), "auth_test.rb").unwrap().remove(0);
+        assert!(mixins.gives_test_macros(&tm));
+    }
+
+    #[test]
     fn redeclaring_a_shared_test_is_refused_as_activesupport_raises() {
         let class = "class FooTest < ActiveSupport::TestCase\n  include FooSharedTests\n  test \"one\" do\n    assert true\n  end\nend\n";
         let err = run(&[("shared_tests.rb", PROVIDER), ("foo_shared_tests.rb", FOO), ("foo_test.rb", class)], "foo_test.rb").unwrap_err();
@@ -4377,10 +4472,26 @@ end
     }
 
     #[test]
+    fn a_prepended_setup_in_an_included_block_runs_as_the_class_body_loads() {
+        let module = "module Early\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @a = 1\n    end\n    setup(prepend: true) do\n      next unless tagged?\n\n      @b = 2\n    end\n  end\n  def tagged?\n    true\n  end\nend\n";
+        let class = "class EarlyTest < ActiveSupport::TestCase\n  include Early\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let tms = run(&[("early.rb", module), ("early_test.rb", class)], "early_test.rb").unwrap();
+        // The plain `setup` is the class's own setup; the prepended one is
+        // carried as written, ahead of the callbacks registered earlier.
+        assert!(tms[0].setup.is_some(), "{:?}", tms[0].setup);
+        let [statement] = tms[0].body_statements.as_slice() else { panic!("{:#?}", tms[0].body_statements) };
+        assert!(!statement.after_setup_blocks && !statement.after_definitions, "{statement:?}");
+        let ExprNode::Send { method, args, block, .. } = &*statement.expr.node else { panic!("{:?}", statement.expr) };
+        assert_eq!(method.as_str(), "setup");
+        assert_eq!(args.len(), 1, "{args:?}");
+        assert!(block.is_some());
+    }
+
+    #[test]
     fn unmodeled_included_block_statements_are_refused_by_name() {
         for (stmt, why) in [
             ("cattr_accessor :flavor", "runs `cattr_accessor :flavor` on the class"),
-            ("setup(prepend: true) do\n      @x = 1\n    end", "passes arguments or a block argument"),
+            ("setup(prepend: flag) do\n      @x = 1\n    end", "passes arguments or a block argument"),
             ("include helpers_module", "includes a module that is not a constant"),
             ("setup \"named\"", "is not `setup do … end` or `setup :name, …`"),
         ] {
@@ -4577,6 +4688,56 @@ end
     const INC: &str = "module Shop\n  module IncHelper\n    extend ActiveSupport::Concern\n    extend ActiveSupport::Testing::Declarative\n    include Consts\n    include DepConcern\n\n    def self.depth\n      DEPTH\n    end\n\n    included do\n      setup do\n        @depth = IncHelper.depth\n      end\n    end\n\n    test \"spliced\" do\n      assert true\n    end\n\n    sig { returns(Integer) }\n    def helper_depth\n      DEPTH\n    end\n\n    def with_super\n      super\n    end\n\n    private\n\n    def test_named_helper\n      DEPTH\n    end\n  end\nend\n";
     const CONSTS: &str = "module Shop\n  module Consts\n    DEPTH = 7\n  end\n\n  module DepConcern\n    extend ActiveSupport::Concern\n    included do\n      setup do\n        @dep = true\n      end\n    end\n  end\nend\n";
     const INC_TEST: &str = "class IncTest < ActiveSupport::TestCase\n  include Shop::IncHelper\n  test \"x\" do\n    assert true\n  end\n\n  def helper_depth\n    super + 1\n  end\nend\n";
+
+    /// `include`s of modules the app and its gems declare (not in a test
+    /// file): a plain one stays in the shared module's body, a concern
+    /// after `extend ActiveSupport::Concern` is deferred to each includer.
+    /// Without the app's modules the include is refused by name.
+    #[test]
+    fn a_library_module_includes_the_apps_plain_modules_and_defers_its_concerns() {
+        let helper = "module Shop\n  module AppIncHelper\n    extend ActiveSupport::Concern\n    include Markets::TestHelper\n    include FixtureFactory::Registry\n\n    @loaded = false\n\n    included do\n      setup do\n        @shop = true\n      end\n    end\n\n    def shop_helper\n      true\n    end\n  end\nend\n";
+        let class = "class AppIncTest < ActiveSupport::TestCase\n  include Shop::AppIncHelper\n  test \"x\" do\n    assert shop_helper\n  end\nend\n";
+        let scan = |known: bool| {
+            let mut mixins = TestMixins::default();
+            for (file, source) in [("helper.rb", helper), ("app_inc_test.rb", class)] {
+                mixins.scan(source.as_bytes(), file);
+            }
+            mixins.set_library_context(["helper.rb".to_string()], Vec::new());
+            if known {
+                mixins.set_app_modules([("Markets::TestHelper".to_string(), false), ("FixtureFactory::Registry".to_string(), true)]);
+            }
+            mixins.finish();
+            let tms = crate::ingest::test::ingest_test_files(class.as_bytes(), "app_inc_test.rb").unwrap();
+            let spliced = tms.into_iter().map(|mut tm| mixins.splice(&mut tm, class.as_bytes(), "app_inc_test.rb").map(|_| tm)).collect::<Result<Vec<_>, _>>();
+            (mixins, spliced)
+        };
+        let (_, refused) = scan(false);
+        let err = refused.unwrap_err().to_string();
+        assert!(err.contains("includes shared tests `Shop::AppIncHelper`") && err.contains("`Markets::TestHelper`"), "{err}");
+
+        let (mixins, spliced) = scan(true);
+        let tms = spliced.unwrap();
+        assert_eq!(names(&tms[0]), ["test_x"]);
+        // The plain module stays in the library body; the concern is the
+        // includers' (it comes with the include of the shared module).
+        let library = String::from_utf8(mixins.library_source("helper.rb", helper.as_bytes()).expect("a library file")).unwrap();
+        let kept: Vec<&str> = library.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(kept.contains(&"include Markets::TestHelper"), "{library}");
+        assert!(kept.iter().all(|l| !l.contains("FixtureFactory::Registry") || l.starts_with("include") && l.chars().skip(8).all(char::is_whitespace)), "{library}");
+        // A concern included before its own `extend ActiveSupport::Concern`
+        // is still refused.
+        let before = helper.replace("    extend ActiveSupport::Concern\n    include Markets::TestHelper\n    include FixtureFactory::Registry\n", "    include FixtureFactory::Registry\n    extend ActiveSupport::Concern\n");
+        let mut mixins = TestMixins::default();
+        for (file, source) in [("helper.rb", before.as_str()), ("app_inc_test.rb", class)] {
+            mixins.scan(source.as_bytes(), file);
+        }
+        mixins.set_library_context(["helper.rb".to_string()], Vec::new());
+        mixins.set_app_modules([("FixtureFactory::Registry".to_string(), true)]);
+        mixins.finish();
+        let mut tm = crate::ingest::test::ingest_test_files(class.as_bytes(), "app_inc_test.rb").unwrap().remove(0);
+        let err = mixins.splice(&mut tm, class.as_bytes(), "app_inc_test.rb").unwrap_err().to_string();
+        assert!(err.contains("comes before an `extend ActiveSupport::Concern`"), "{err}");
+    }
 
     #[test]
     fn a_library_module_keeps_its_plain_includes_and_helpers_and_defers_its_concerns() {

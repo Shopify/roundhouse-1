@@ -969,6 +969,38 @@ module ActiveRecord
     end
 
     class << self
+      # inheritance.rb's `new`: a record built with the inheritance
+      # column's value (`Condition.new(attribute_name: "title")`, which
+      # `create!` and an association's `build` reach) is an instance of
+      # the class `find_sti_class` names for it, as a loaded row is.
+      # Differences: a scope's `scope_for_create` and the column defaults
+      # (Rails' two fallbacks when the attributes name no class) are not
+      # consulted.
+      # Written over `*args`: a bare `new` (the compiled hydration's) must
+      # reach `initialize` with no argument, not a nil one.
+      def new(*args, &block)
+        subclass = subclass_from_attributes(args.first)
+        if subclass && !subclass.equal?(self)
+          subclass.new(*args, &block)
+        else
+          super
+        end
+      end
+      ruby2_keywords :new
+
+      # inheritance.rb's `subclass_from_attributes`.
+      def subclass_from_attributes(attributes) # :nodoc:
+        attributes = attributes.to_h if attributes.respond_to?(:permitted?)
+        return nil unless attributes.is_a?(Hash)
+        column = inheritance_column.to_s
+        return nil if column.empty?
+        type_name = attributes[column] || attributes[column.to_sym]
+        return nil if type_name.nil? || (type_name.respond_to?(:empty?) && type_name.empty?)
+        return nil unless schema_columns.include?(column.to_sym)
+        find_sti_class(type_name)
+      end
+      private :subclass_from_attributes
+
       # model_schema.rb's `quoted_table_name` and `quoted_primary_key`:
       # the table and the primary key column as the connection quotes
       # identifiers (a table name may be schema-qualified).

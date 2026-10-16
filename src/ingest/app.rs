@@ -2554,6 +2554,7 @@ end
         .chain(app.concern_model_items.keys().map(|id| id.0.as_str().to_string()))
         .collect();
     test_mixins.set_library_context(classless.iter().map(|p| p.display().to_string()), app_constants);
+    test_mixins.set_app_modules(app_modules_by_kind(&app));
     test_mixins.finish();
     let test_class_nestings = test_mixins.class_nestings();
     let test_class_extends = test_mixins.class_extends();
@@ -5463,6 +5464,25 @@ fn splice_concern_class_methods_into_includers(
     }
     app.concern_spliced_class_methods = spliced;
     app.class_methods_carrier_splices = carrier_splices;
+}
+
+/// Every module the app and its gems declare, by full name, with whether
+/// it `extend`s `ActiveSupport::Concern`: what a shared test module's
+/// `include` of one needs to be kept in its library body or deferred to
+/// each includer (`TestMixins::set_app_modules`). Only a file naming
+/// `ActiveSupport::Concern` is read for it.
+fn app_modules_by_kind(app: &App) -> Vec<(String, bool)> {
+    use crate::det::HashSet;
+    let mut concerns: HashSet<String> = HashSet::default();
+    for source in super::sources::snapshot().iter().filter(|s| s.path.ends_with(".rb") && s.text.contains("ActiveSupport::Concern")) {
+        let (carriers, _) = ingest_concern_class_method_spans(source.text.as_bytes(), &source.path);
+        concerns.extend(carriers.into_iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| c.owner.0.as_str().to_string()));
+    }
+    app.library_classes
+        .iter()
+        .filter(|lc| lc.is_module)
+        .map(|lc| (lc.name.0.as_str().to_string(), concerns.contains(lc.name.0.as_str())))
+        .collect()
 }
 
 /// `mixes_in_class_methods(M)` on a module a Concern depends on.
@@ -9376,7 +9396,9 @@ fn qualify_association_targets(app: &mut App) {
 /// (activerecord reflection.rb `source_reflection` / `klass`). The
 /// ingest reads the name-derived class; replace it with the source
 /// association's target when the derived one is no model and the
-/// through model's source association names one that is.
+/// through model's source association names one that is. The through
+/// association may be a `belongs_to` (`ProductPublication`'s `belongs_to
+/// :publication`), not only a `has_one` / `has_many`.
 fn resolve_has_one_through_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
     use crate::ident::{ClassId, Symbol};
@@ -9408,7 +9430,9 @@ fn resolve_has_one_through_targets(app: &mut App) {
                 continue;
             }
             let Some(thr_target) = model.associations().find_map(|a| match a {
-                Association::HasMany { name, target, .. } | Association::HasOne { name, target, .. }
+                Association::BelongsTo { name, target, .. }
+                | Association::HasMany { name, target, .. }
+                | Association::HasOne { name, target, .. }
                     if name == thr =>
                 {
                     Some(target)

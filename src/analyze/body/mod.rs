@@ -3802,6 +3802,15 @@ impl<'a> BodyTyper<'a> {
                     let mut arm_ctx = failed
                         .iter()
                         .fold(ctx.clone(), |c, p| narrowing::apply_narrowing(&c, p, false));
+                    // The `when` operand is an expression the source
+                    // resolves lexically like any other: a `when
+                    // PaymentAttemptCharge::FAILED` inside `module
+                    // PaymentsApi` reads `PaymentsApi::PaymentAttemptCharge`.
+                    // Left unanalyzed it stayed the bare spelling, which the
+                    // emit's shadow check then rooted as `::PaymentAttemptCharge`.
+                    if let Pattern::Expr { expr: pat } = &mut arm.pattern {
+                        self.analyze_expr(pat, ctx);
+                    }
                     let pred = match &arm.pattern {
                         Pattern::Expr { expr: pat } if arm.guard.is_none() => narrowing::case_when_class(
                             scrutinee,

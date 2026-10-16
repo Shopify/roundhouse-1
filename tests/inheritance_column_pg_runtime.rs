@@ -1,7 +1,8 @@
 //! `self.inheritance_column = ...` against native Rails 8.2 on the same
 //! local PostgreSQL database: a custom column carries the STI class name
 //! (type condition, stamp, hydration, `is_a?`, the serialization
-//! except); `nil` and a name the table lacks (`:_type_disabled`) turn
+//! except; `new` on the base class with the column's value builds that
+//! subclass); `nil` and a name the table lacks (`:_type_disabled`) turn
 //! STI off, so a `type` column is plain data and a subclass reads every
 //! row of the table.
 #[path = "support/emit_and_run.rs"]
@@ -104,6 +105,7 @@ const PROBE: &str = r##"class InheritanceColumnProbe
     Tile.create!(name: "t", type: "x")
     WideTile.create!(name: "w")
     out << "disabled: #{Tile.count} #{WideTile.count} #{WideTile.new.type.inspect} #{Tile.inheritance_column} #{Tile.order(:id).map { |t| t.class.name }.join(",")} #{WideTile.all.order(:id).map { |t| t.class.name }.join(",")}"
+    out << "base-new: #{Condition.new(attribute_name: "TitleCondition", value: "b").class.name} #{Condition.new("attribute_name" => "PriceCondition").class.name} #{Condition.create!(attribute_name: "PriceCondition", value: "pp").class.name} #{Condition.new(value: "x").class.name} #{Condition.new(attribute_name: "").class.name} #{TitleCondition.new(attribute_name: "TitleCondition").class.name}"
     out
   end
 end
@@ -111,7 +113,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 7] = [
+const EXPECTED: [&str; 8] = [
     "custom: 2 1 3 TitleCondition data TitleCondition attribute_name attribute_name",
     "hydrate: TitleCondition,PriceCondition,TitleCondition true false TitleCondition",
     "validates: true false",
@@ -119,6 +121,7 @@ const EXPECTED: [&str; 7] = [
     "nil: 2 2 png nil \"\" Asset,Asset true",
     "plain-class: BigAsset BigAsset BigAsset BigAsset BigAsset big b Asset big a,big b",
     "disabled: 2 2 nil _type_disabled Tile,Tile WideTile,WideTile",
+    "base-new: TitleCondition PriceCondition PriceCondition Condition Condition TitleCondition",
 ];
 
 /// What native Rails requires, in order.

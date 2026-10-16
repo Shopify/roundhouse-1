@@ -9632,6 +9632,25 @@ pub(crate) enum RootingScope {
     RuntimeOnly,
 }
 
+/// The full names of the `NAME = <expr>` constants the models' class
+/// bodies declare (`Cond::MatchType`), which are no library class's
+/// `constants` yet: a read through one (`Cond::MatchType::ANY` from a
+/// concern beside the model) has its target at run time.
+fn model_constant_names(app: &App) -> Vec<String> {
+    let mut names = Vec::new();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            if let ExprNode::Assign { target: crate::expr::LValue::Const { path }, .. } = &*expr.node
+                && let [name] = path.as_slice()
+            {
+                names.push(format!("{}::{}", model.name.0.as_str(), name.as_str()));
+            }
+        }
+    }
+    names
+}
+
 /// Root method-body constant references that emission would otherwise shadow,
 /// restricting candidate namespaces according to `scope`. A Data factory block
 /// retains its enclosing owner's lexical scope, not the generated class's scope.
@@ -9699,6 +9718,7 @@ pub(crate) fn apply_constant_rooting(
                 .chain(lcs.iter())
                 .flat_map(|c| c.constants.iter().map(move |(k, _)| format!("{}::{}", c.name.0.as_str(), k.as_str()))),
         )
+        .chain(model_constant_names(app))
         .collect();
     let known = |n: &str| class_names.contains(n);
     // The value constants alone (`MatchType = Collections::CollectionSource::
@@ -9709,6 +9729,7 @@ pub(crate) fn apply_constant_rooting(
         .iter()
         .chain(lcs.iter())
         .flat_map(|c| c.constants.iter().map(move |(k, _)| format!("{}::{}", c.name.0.as_str(), k.as_str())))
+        .chain(model_constant_names(app))
         .filter(|n| {
             !app.models.iter().any(|m| m.name.0.as_str() == n)
                 && !app.library_classes.iter().any(|c| c.name.0.as_str() == n)
