@@ -2483,6 +2483,8 @@ pub struct Ctx<'a> {
     pub plain_subclasses: &'a HashMap<ClassId, ClassId>,
     /// See [`Registries::shadowed`].
     pub shadowed: &'a HashSet<ClassId>,
+    /// See [`Registries::wrapped_inserts`].
+    pub wrapped_inserts: bool,
 }
 
 impl Ctx<'_> {
@@ -2583,6 +2585,7 @@ impl Ctx<'_> {
             track_targets: self.track_targets,
             plain_subclasses: self.plain_subclasses,
             shadowed: self.shadowed,
+            wrapped_inserts: self.wrapped_inserts,
         }
     }
 }
@@ -4200,7 +4203,7 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // the same read-then-write shape `increment!` already
                 // carries, and under single-threaded dispatch the window
                 // it opens is not observable. Ledgered with the rest.
-                if method.as_str() == "insert_all" && args.len() == 1 && block.is_none() {
+                if method.as_str() == "insert_all" && args.len() == 1 && block.is_none() && !ctx.wrapped_inserts {
                     let attrs = Symbol::from("__attrs");
                     let build = syn(
                         span,
@@ -4266,7 +4269,12 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 //
                 // Only a literal column list (Strings or Symbols) lowers;
                 // anything else declines.
-                if method.as_str() == "insert_all!" && !args.is_empty() && args.len() <= 2 && block.is_none() {
+                if method.as_str() == "insert_all!"
+                    && !args.is_empty()
+                    && args.len() <= 2
+                    && block.is_none()
+                    && !ctx.wrapped_inserts
+                {
                     let returning: Option<Vec<String>> = match args.get(1).map(|a| &*a.node) {
                         None => Some(vec!["id".to_string()]),
                         Some(ExprNode::Hash { entries, .. }) if entries.len() == 1 => {
@@ -5157,6 +5165,7 @@ fn rewrite_relation_taking_body(
         user_returns: &empty_returns,
         plain_subclasses: no_plain_subclasses(),
         shadowed: no_shadowed(),
+        wrapped_inserts: false,
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -5252,6 +5261,7 @@ pub fn rewrite_call_site_in(
         track_targets: regs.track_targets,
         plain_subclasses: regs.plain_subclasses,
         shadowed: regs.shadowed,
+        wrapped_inserts: regs.wrapped_inserts,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -5282,6 +5292,13 @@ pub struct Registries<'a> {
     /// Models whose bare constant a nested namespace shadows
     /// ([`shadowed_models`]): a rewrite writes them `::`-rooted.
     pub shadowed: &'a HashSet<ClassId>,
+    /// The app defines its own `insert_all` / `insert_all!` (Core's
+    /// `GenerateOid::ActiveRecordInsertPatch`, prepended on Relation to
+    /// allocate primary keys). A call site then stays the runtime's
+    /// `Model.insert_all!`, which reaches that wrapper through the
+    /// relation; inlined as `new(attrs)._insert_row` it ran around it and
+    /// left `id` NULL.
+    pub wrapped_inserts: bool,
 }
 
 /// No plain model subclasses: the registries of a caller with no app.
@@ -5570,6 +5587,7 @@ mod tests {
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
+            wrapped_inserts: false,
         }
     }
 
@@ -5593,6 +5611,7 @@ mod tests {
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
+            wrapped_inserts: false,
             user_returns: empty_returns(),
         }
     }
@@ -5976,6 +5995,7 @@ mod tests {
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
+            wrapped_inserts: false,
         }
     }
 

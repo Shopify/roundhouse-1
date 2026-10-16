@@ -1106,8 +1106,15 @@ module ActiveRecord
 
     def self._insert_rows(rows, skip_conflicts, unique_by, returning, record_timestamps)
       return Result.new([], [], nil, affected_rows: 0) if rows.length == 0
+      # `returning: %w[id]` / `[:id]` names columns, a String is raw SQL
+      # (`Arel.sql("id, (created_at = updated_at) AS was_inserted")`),
+      # false/nil asks for nothing.
+      returned = nil #: untyped
+      returned_names = [] #: Array[String]
       if returning
-        raise NotImplementedError, "#{name}.insert_all: RETURNING is not supported"
+        listed = returning.is_a?(Array) ? returning : [returning] #: untyped
+        returned = listed.map { |c| c.to_s }.join(", ")
+        returned_names = listed.map { |c| c.to_s } if returning.is_a?(Array)
       end
 
       # Rails stringifies the keys: `{"id" => nil}` from `attributes` and a
@@ -1158,6 +1165,11 @@ module ActiveRecord
         end
       end
       sql = "INSERT INTO #{table_name} (#{cols.join(", ")}) VALUES #{tuples.join(", ")}#{conflict}"
+      if returned
+        fetched = ActiveRecord.adapter.select_rows("#{sql} RETURNING #{returned}")
+        names = fetched.empty? ? returned_names : fetched[0].keys.map { |k| k.to_s }
+        return Result.new(names, fetched.map { |r| r.values }, nil, affected_rows: ActiveRecord.adapter.changes)
+      end
       ActiveRecord.adapter.execute_ddl(sql)
       Result.new([], [], nil, affected_rows: ActiveRecord.adapter.changes)
     end

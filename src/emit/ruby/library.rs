@@ -2703,6 +2703,9 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let unique_keys = crate::lower::scope_chain::build_unique_keys(&app.models, &app.schema);
     let shadowed =
         crate::lower::scope_chain::shadowed_models(&app.models, app.library_classes.iter().map(|c| c.name.0.as_str()));
+    let wrapped_inserts = app.library_classes.iter().any(|c| {
+        c.origin.is_none() && c.methods.iter().any(|m| matches!(m.name.as_str(), "insert_all" | "insert_all!"))
+    });
     let regs = crate::lower::scope_chain::Registries {
         scopes: &scopes,
         models: &models,
@@ -2713,6 +2716,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         track_targets,
         plain_subclasses: &plain_subclasses,
         shadowed: &shadowed,
+        wrapped_inserts,
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
@@ -10847,10 +10851,16 @@ fn emit_library_class_decl_inner(
         calls.extend(active_model_validation_calls(lc, app));
         calls
     };
+    // A body statement that mixes the app's module into a gem class
+    // (`Gem::Klass.prepend(Mod)`) runs as the body loads and reads `Mod`
+    // then: Core's SharedPoolPatch names its own nested
+    // UniqueConnectionPoolList, a file of its own.
     let replayed = |call: &&Expr| {
         replays_all
             || crate::ingest::sorbet_check::is_mixes_in(call)
             || own_calls.iter().any(|c| std::ptr::eq(*c, *call))
+            || (call.decisions & crate::expr::BODY_STATEMENT != 0
+                && crate::ingest::external_include::is_external_mixin(lc, call, app))
     };
     for call in lc.unknown_calls.iter().filter(|_| !railtie).filter(replayed) {
         let mut now: BTreeSet<Vec<String>> = BTreeSet::new();
@@ -15137,8 +15147,12 @@ fn calls_on_self(value: &Expr) -> bool {
 fn statement_mixes_in(call: &Expr) -> bool {
     let mut found = false;
     fn walk(e: &Expr, found: &mut bool) {
-        if let ExprNode::Send { method, .. } = &*e.node
+        // `Other.prepend(M)` on a named constant mixes into that class,
+        // not the one whose body this is, so it has no order against the
+        // body's own mixins.
+        if let ExprNode::Send { recv, method, .. } = &*e.node
             && matches!(method.as_str(), "include" | "extend" | "prepend")
+            && !recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Const { .. }))
         {
             *found = true;
         }

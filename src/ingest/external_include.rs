@@ -43,8 +43,15 @@ pub(super) fn carry(app: &mut App) {
     // Includes in a boot block: the module is a dependency of the target
     // and the statement stays where it runs.
     let mut dependencies: Vec<(ClassId, ClassId)> = Vec::new();
+    // A mixin of the app's module into a class it does not define: a
+    // body statement, run where the body loads.
+    let mut statements: Vec<(usize, usize)> = Vec::new();
     for (i, lc) in app.library_classes.iter().enumerate() {
         for (j, call) in lc.unknown_calls.iter().enumerate() {
+            if is_external_mixin(lc, call, app) {
+                statements.push((i, j));
+                continue;
+            }
             if let Some((target, module)) = include_on(call) {
                 let Some(target) = resolve(lc, &target, None, &app.library_classes) else { continue };
                 let Some(module) = resolve(lc, &module, Some(true), &app.library_classes) else { continue };
@@ -58,6 +65,9 @@ pub(super) fn carry(app: &mut App) {
                 dependencies.push((target.name.clone(), module.name.clone()));
             });
         }
+    }
+    for (i, j) in statements {
+        app.library_classes[i].unknown_calls[j].decisions |= crate::expr::BODY_STATEMENT;
     }
     for (i, j, target, module) in moves.into_iter().rev() {
         let Some(t) = app.library_classes.iter().position(|c| c.origin.is_none() && c.name == target) else {
@@ -104,6 +114,28 @@ fn boot_block_statements<'a>(call: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     if let ExprNode::Lambda { body, .. } = &*block.node {
         statements(body, f);
     }
+}
+
+/// `Gem::Klass.prepend(Mod)` (or `include`/`extend`) in a library class
+/// or module body, where `Mod` is one of the app's own modules and
+/// `Gem::Klass` is not one of the app's classes or models: a runtime or
+/// gem class the app patches. Core's `ActiveRecordTestHelper::
+/// SharedPoolPatch` ends with
+/// `ActiveRecord::ConnectionAdapters::ConnectionHandler.prepend(
+/// UniqueConnectionPoolList)`, which keeps `connection_pool_list` from
+/// answering one shared pool twice; dropped, the fixtures pinned that
+/// pool twice and a test's `open_transactions` read 2.
+pub(crate) fn is_external_mixin(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*call.node else { return false };
+    if !matches!(method.as_str(), "include" | "prepend" | "extend") || args.is_empty() {
+        return false;
+    }
+    let Some(target) = written(recv) else { return false };
+    let target = target.trim_start_matches("::");
+    if resolve(lc, target, None, &app.library_classes).is_some() || app.models.iter().any(|m| m.name.0.as_str() == target) {
+        return false;
+    }
+    args.iter().all(|arg| written(arg).is_some_and(|module| resolve(lc, &module, Some(true), &app.library_classes).is_some()))
 }
 
 /// `A::B.include(C::D)`: the written receiver and module.

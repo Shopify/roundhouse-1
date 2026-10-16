@@ -54,7 +54,7 @@ pub(crate) mod devise_routes;
 pub mod impersonates;
 pub(crate) mod inherited_alias;
 mod hook_class_attribute;
-mod external_include;
+pub(crate) mod external_include;
 pub mod invisible_captcha;
 pub mod generated_helpers;
 pub(crate) mod helper_surface;
