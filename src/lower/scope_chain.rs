@@ -3870,8 +3870,21 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
                 ExprNode::Send { method, .. } if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 => Some(method.clone()),
                 _ => None,
             };
-            let model = rewrite_send(expr, ctx, locals);
-            crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {
+// …and the lowering's hint on a send that stays the same call
+// (`lower::blank`'s `strip.empty?` is tagged `StringBlank`, which
+// the Ruby emitter writes back as `blank?`; losing it left
+// `strip` on a uuid attribute that holds an Integer).
+let kept = match &*expr.node {
+    ExprNode::Send { method, .. } => expr.hint.clone().map(|hint| (method.clone(), hint)),
+    _ => None,
+};
+let model = rewrite_send(expr, ctx, locals);
+if let Some((method, hint)) = kept {
+    if expr.hint.is_none() && matches!(&*expr.node, ExprNode::Send { method: m, .. } if *m == method) {
+        expr.hint = Some(hint);
+    }
+}
+crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {
                 is_relation_expr(rel, ctx, locals)
             });
             slot.restore(expr);
