@@ -109,7 +109,15 @@ pub struct FlatRoute {
     /// (`flatten_routes_for_helpers`): building a link needs no matcher,
     /// and a view that only links to the route must not lose the helper.
     pub refused: Option<(String, String)>,
+    /// `scope format: true`: Rails requires `.:format` on every route
+    /// inside, so the helper takes the format as a required last param.
+    /// The router still peels the suffix off like any other.
+    pub format_required: bool,
 }
+
+/// The `defaults` key that carries `scope format: true` through a
+/// [`RouteSpec::Scope`] (not a legal segment name, so it never fills one).
+pub const FORMAT_REQUIRED_KEY: &str = "format!";
 
 /// The `refused` parameter name of a route whose endpoint is Ruby code
 /// (`UNMODELED_ENDPOINT_CONTROLLER`); the value is the endpoint kind.
@@ -268,6 +276,10 @@ struct Ctx {
     /// unlike an ordinary scope's, which prefixes the whole nesting.
     within: ResourceScope,
     inner_path: String,
+    /// Inside a `nested`/`namespace` block of a resource: the resource's
+    /// nesting is already folded into the path and name prefix, but Rails
+    /// still has a `parent_resource`, which names no action-less route.
+    under_resource: bool,
 }
 
 /// One enclosing resource.
@@ -323,6 +335,10 @@ impl Ctx {
     /// route does. campfire's bot API is one such scope, and its
     /// inherited `update` answered the html branch (a redirect) to a
     /// bot's PATCH.
+    fn format_required(&self) -> bool {
+        self.param_defaults.iter().any(|(n, _)| n == FORMAT_REQUIRED_KEY)
+    }
+
     fn default_format(&self) -> Option<Symbol> {
         self.param_defaults
             .iter()
@@ -407,12 +423,15 @@ fn static_path_name(path: &str) -> Option<String> {
 /// scope's `as` prefix plus the route's own path, only when that path is
 /// plain words, `-` and `/` (`add_route`'s `/^[\w\-\/]+$/`) and the result
 /// starts with a letter or underscore. A path with a dynamic segment, a
-/// dot or a group names nothing.
-fn own_path_name(path: &str, name_prefix: &str) -> Option<String> {
-    if !path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/')) {
+/// dot or a group has no action to name it, so it takes the scope's own
+/// name (`get "preview-store/:shop_id"` in `namespace :auth` is `auth`);
+/// the caller keeps only the first route to claim a name.
+fn own_path_name(path: &str, name_prefix: &str, under_resource: bool) -> Option<String> {
+    let simple = path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/'));
+    if !simple && under_resource {
         return None;
     }
-    let own = path.trim_start_matches('/').replace(['/', '-'], "_");
+    let own = if simple { path.trim_start_matches('/').replace(['/', '-'], "_") } else { String::new() };
     // `get "/"` has no name of its own, so it takes the scope's.
     let name = if own.is_empty() {
         name_prefix.trim_end_matches('_').to_string()
@@ -442,6 +461,14 @@ fn singular_resource_actions() -> &'static [(&'static str, HttpMethod, &'static 
 fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
     match spec {
         RouteSpec::Explicit { method, path, controller, action, as_name, scope, constraints } => {
+            // A CANONICAL action (`get :index` in `collection`, `patch
+            // :update` in `member`; the ingester marks the path) routes at the resource's own path and,
+            // with no `as:`, takes the resource's name: Rails'
+            // `canonical_action?` drops the action from path and name alike.
+            let canonical = matches!(scope, ResourceScope::Member | ResourceScope::Collection)
+                && path == crate::ingest::routes::CANONICAL_ACTION_PATH;
+            let empty = String::new();
+            let path = if canonical { &empty } else { path };
             // `:format => "rss"` rides the constraints map at ingest
             // (it shapes the request, not the routing triple); surface
             // it as the route's forced response format.
@@ -497,19 +524,27 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             let scoped_name = match scope {
                 ResourceScope::Member | ResourceScope::Collection => {
                     ctx.member_and_collection_names().and_then(|(member, collection)| {
-                        static_path_name(path).map(|child| match scope {
-                            ResourceScope::Member => {
-                                format!("{child}_{}{member}", ctx.ancestor_name_prefix())
+                        let own = if canonical { Some(String::new()) } else { static_path_name(path) };
+                        own.map(|child| {
+                            let child = if child.is_empty() { child } else { format!("{child}_") };
+                            match scope {
+                                ResourceScope::Member => {
+                                    format!("{child}{}{member}", ctx.ancestor_name_prefix())
+                                }
+                                _ => format!("{child}{}{collection}", ctx.ancestor_name_prefix()),
                             }
-                            _ => format!("{child}_{}{collection}", ctx.ancestor_name_prefix()),
                         })
                     })
+                    // Rails skips a derived name an earlier route holds.
+                    .filter(|n| !canonical || !out.iter().any(|r| r.named && &r.as_name == n))
                 }
                 // A bare verb in the resources block is a nested route;
                 // it keeps the parent-first order, decided below.
                 ResourceScope::Nested => None,
             };
             let (derived_name, named) = match as_name.as_ref() {
+                // `as: nil`: no helper at all.
+                Some(s) if s.as_str().is_empty() => (action.as_str().to_string(), false),
                 // Where an explicit `as:` sits relative to the enclosing
                 // resource depends on the scope, and the two go OPPOSITE
                 // ways. Measured against Rails 8.1 inside
@@ -543,13 +578,20 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 }
                 None => match scoped_name {
                     Some(n) => (n, true),
+                    // A canonical action whose resource name an earlier route
+                    // holds is unnamed, not named from its path.
+                    None if canonical => (action.as_str().to_string(), false),
                     // Rails names a route outside any resource from the
                     // route's OWN path under the scope's `as` prefix, not
                     // from the full URL: `get "free_themes"` in
                     // `scope "api/:version_handle", as: :versioned` is
                     // `versioned_free_themes`, and a `scope "foo"` with no
                     // `as` adds nothing (`free_themes`).
-                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix) {
+                    // A derived name is skipped when an earlier route holds it
+                    // (`has_named_route?`).
+                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix, ctx.under_resource)
+                        .filter(|n| !out.iter().any(|r| r.named && &r.as_name == n))
+                    {
                         Some(n) => (n, true),
                         None => (action.as_str().to_string(), false),
                     },
@@ -664,6 +706,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     constraints,
                     seg_patterns,
                     refused,
+                    format_required: ctx.format_required(),
                 });
             }
         }
@@ -701,23 +744,27 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .as_ref()
                 .map(|s| format!("{}{}", ctx.name_prefix, s.as_str()))
                 .unwrap_or_else(|| format!("{}root", ctx.name_prefix));
+            // A root inside `scope "admin/api/:version_handle"` still
+            // carries the scope's dynamic segments.
+            let path_params = path_ordered_params(&path, &[]);
             out.push(FlatRoute {
                 method: HttpMethod::Get,
                 path,
                 controller: ClassId(Symbol::from(controller_class)),
                 action: Symbol::from(action_name),
                 as_name: if ctx.helpers_enabled { helper } else { String::new() },
-                path_params: vec![],
-                param_defaults: vec![],
+                required_params: path_params.len(),
+                param_defaults: defaults_for(ctx, &path_params),
+                path_params,
                 named: ctx.helpers_enabled,
                 helpers_enabled: ctx.helpers_enabled,
                 format: None,
-                required_params: 0,
                 required_path: None,
                 int_params: vec![],
                 constraints: vec![],
                 seg_patterns: vec![],
                 refused: None,
+                format_required: false,
             });
         }
         RouteSpec::Resources {
@@ -939,6 +986,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                                 .collect(),
                             seg_patterns: seg_patterns.clone(),
                             refused: refused.clone(),
+                            format_required: ctx.format_required(),
                         });
                     }
                 }
@@ -960,7 +1008,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             // scope and wrong for a `nested` one — campfire's bot API
             // is `/rooms/:room_id/:bot_key/messages`, not
             // `/:bot_key/rooms/:room_id/messages`.
-            if *nest && !child.parents.is_empty() {
+            if *nest && child.within.is_nested() && !child.parents.is_empty() {
                 let (nested_prefix, _) =
                     nest_path("", &child.parents, ResourceScope::Nested);
                 // `nest_path` slash-prefixes a bare path, so the empty
@@ -970,6 +1018,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 child.name_prefix =
                     format!("{}{}", child.name_prefix, child.parent_name_prefix());
                 child.parents.clear();
+                child.under_resource = true;
             }
             // Resource nesting SURVIVES a scope/namespace boundary —
             // measured against Rails 8.1, which is the only authority
@@ -995,7 +1044,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             if let Some(p) = path {
                 let segment = format!("/{}", p.trim_matches('/'));
                 if child.within.is_nested() {
-                    child.ns_path = prefix_path(&ctx.ns_path, &segment);
+                    child.ns_path = prefix_path(&child.ns_path, &segment);
                 } else {
                     child.inner_path = prefix_path(&ctx.inner_path, &segment);
                 }

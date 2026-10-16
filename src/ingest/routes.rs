@@ -197,6 +197,7 @@ pub(super) fn ingest_route_file(
         diagnostics: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
         scope_controller: RefCell::new(None),
+        method_scope: Cell::new(false),
         mounted_engines: RefCell::new(HashSet::default()),
     };
 
@@ -206,6 +207,7 @@ pub(super) fn ingest_route_file(
     // (`RetailComponent::Engine.routes.draw`) is a different set — its
     // helpers live on the engine, not on the app's `url_helpers` — so it
     // is not folded into this table.
+    ROUTE_PATH_LOCALS.with(|l| l.borrow_mut().clear());
     let mut draw_calls = top_level_app_draws(&root);
     if draw_calls.is_empty() && app_file {
         // A draw nested inside something else (a conditional, a
@@ -332,6 +334,8 @@ struct Ctx<'a> {
     diagnostics: RefCell<Vec<Diagnostic>>,
     /// Fixed runtime mounts cannot inherit path/constraint DSL wrappers.
     mount_scope_depth: Cell<usize>,
+    /// Inside a `member`/`collection` block (Rails' `resource_method_scope?`).
+    method_scope: Cell<bool>,
     /// The `controller:` of the enclosing `scope controller: :x do` /
     /// `controller :x do`: a verb route with no `to:` and no controller of
     /// its own dispatches to it (Rails' scope default).
@@ -344,6 +348,13 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// Walk with `controller` as the scope's default controller, restoring
     /// the enclosing one afterwards.
+    fn with_method_scope<T>(&self, on: bool, walk: impl FnOnce() -> T) -> T {
+        let previous = self.method_scope.replace(on);
+        let result = walk();
+        self.method_scope.set(previous);
+        result
+    }
+
     fn with_scope_controller<T>(&self, controller: Option<String>, walk: impl FnOnce() -> T) -> T {
         let previous = self.scope_controller.replace(controller);
         let result = walk();
@@ -445,21 +456,24 @@ fn refused_route_diagnostics(entries: &[RouteSpec], source: &[u8], file: &str) -
 }
 
 /// `format: true` on a scope makes `.:format` a REQUIRED suffix of every
-/// route inside. The router matches whole segments and the suffix is not
-/// composed into those routes, so name the scope instead of serving them
-/// without it.
+/// route inside. Record it for the helpers and name the part the router
+/// does not enforce.
 fn note_required_format(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
     cx: &Ctx<'_>,
     key: &str,
     value: &ruby_prism::Node<'_>,
+    defaults: &mut IndexMap<Symbol, String>,
 ) {
     if key != "format" || value.as_true_node().is_none() {
         return;
     }
-    let detail = "`format: true` (a required `.:format` suffix) is not modeled; the routes inside \
-                  are served and their helpers generated without the suffix";
+    // The helpers take the format as a required last param; the router peels
+    // it like an optional suffix, so a request without it is still served.
+    defaults.insert(Symbol::from(crate::lower::routes::FORMAT_REQUIRED_KEY), "true".to_string());
+    let detail = "`format: true` (a required `.:format` suffix) is only modeled in the route helpers; \
+                  the router also serves a request without the suffix";
     let location = call.location();
     cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
         Span {
@@ -628,6 +642,7 @@ fn ingest_literal_engine_mount(
             diagnostics: RefCell::new(Vec::new()),
             mount_scope_depth: Cell::new(1),
             scope_controller: RefCell::new(None),
+            method_scope: Cell::new(false),
             mounted_engines: RefCell::new(HashSet::default()),
         };
         match ingest_route_body(body, &engine.file, None, &engine_cx) {
@@ -656,6 +671,40 @@ fn ingest_literal_engine_mount(
         // Rails keeps them on a per-mount proxy, which remains unsupported.
         suppress_helpers: true, within: ResourceScope::Nested,
         entries,
+    })
+}
+
+/// A mount that is not composed still names a route when it has a literal
+/// `as:` (`mount SecurityReports::Engine, at: "/", as: :reports`, or the
+/// hashrocket `mount Engine => "/dashboard", as: :developer_dashboard`):
+/// keep its URL helper as an endpoint that is refused by name, so callers of
+/// the helper resolve while requests to the mount are not silently served.
+fn named_mount_endpoint(call: &ruby_prism::CallNode<'_>) -> Option<RouteSpec> {
+    let args = call.arguments()?;
+    let (mut at, mut as_name) = (None, None);
+    for arg in args.arguments().iter() {
+        let Some(hash) = arg.as_keyword_hash_node() else { continue };
+        for el in hash.elements().iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            match symbol_value(&assoc.key()).as_deref() {
+                Some("at") => at = string_value(&assoc.value()),
+                Some("as") => as_name = symbol_or_string_value(&assoc.value()),
+                // `Engine => "/path"`.
+                None => at = at.or_else(|| string_value(&assoc.value())),
+                Some(_) => {}
+            }
+        }
+    }
+    let path = at?;
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    Some(RouteSpec::Explicit {
+        method: HttpMethod::Get,
+        path,
+        controller: ClassId(Symbol::from(UNMODELED_ENDPOINT_CONTROLLER)),
+        action: Symbol::from("mounted Rack application"),
+        as_name: Some(Symbol::from(as_name?.as_str())),
+        constraints: IndexMap::new(),
+        scope: ResourceScope::Nested,
     })
 }
 
@@ -1233,6 +1282,13 @@ fn ingest_route_stmts<'pr>(
         if let Some(write) = stmt.as_local_variable_write_node() {
             let value = eval::value(&write.value()).unwrap_or(eval::RVal::Unknown);
             eval::bind(constant_id_str(&write.name()), value);
+            // `routes_path = Engine.root.join("config", "routes", "x")` — a
+            // later `load(routes_path.join("y.rb"))` names a route file.
+            let mut parts = Vec::new();
+            path_fragments(&write.value(), &mut parts);
+            ROUTE_PATH_LOCALS.with(|l| {
+                l.borrow_mut().insert(constant_id_str(&write.name()).to_string(), parts);
+            });
             continue;
         }
         // `case` / `case in`, and any other non-call, used to fall
@@ -1322,8 +1378,11 @@ fn ingest_route_stmts<'pr>(
             if let Some(block_node) = call.block() {
                 if let Some(block) = block_node.as_block_node() {
                     if let Some(inner_body) = block.body() {
+                        let in_method_scope = matches!(method.as_str(), "member" | "collection");
                         let mut inner = cx.with_mount_scope(cx.mount_scope_depth.get() + 1, || {
-                            ingest_route_body(inner_body, file, parent, cx)
+                            cx.with_method_scope(in_method_scope || cx.method_scope.get(), || {
+                                ingest_route_body(inner_body, file, parent, cx)
+                            })
                         })?;
                         let scope = match method.as_str() {
                             "member" => Some(ResourceScope::Member),
@@ -1839,6 +1898,11 @@ pub const REDIRECT_CONTROLLER: &str = "RoundhouseRedirectsController";
 /// dispatches a target-less `get "token"` in `namespace :reportify` to
 /// `reportify#token`. Lowering resolves it against the module prefix
 /// (`lower::routes::qualify_controller`).
+/// The path of a canonical action (`get :index` in `collection`): the
+/// resource's own path, which the flattener reads as "no segment, no name
+/// prefix". Not the empty path, which `match ""` also produces.
+pub const CANONICAL_ACTION_PATH: &str = "{canonical}";
+
 pub const MODULE_CONTROLLER: &str = "RoundhouseModuleController";
 
 /// The pseudo-controller of a route whose endpoint is Ruby the router
@@ -2120,7 +2184,7 @@ fn ingest_route_call(
             if cx.mount_scope_depth.get() == 0 && runtime_cable_mount(call) {
                 return Ok(None);
             }
-            Ok(ingest_literal_engine_mount(call, file, cx))
+            Ok(ingest_literal_engine_mount(call, file, cx).or_else(|| named_mount_endpoint(call)))
         }
         // `direct :fresh_user_avatar do |user, options| … end` — a
         // custom URL helper, not a route: it adds no path to the table,
@@ -2350,6 +2414,7 @@ fn ingest_namespace_route(
     // prefix with no URL segment.
     let (mut path, mut module, mut as_prefix) =
         (Some(name.clone()), Some(name.clone()), Some(name));
+    let mut defaults: IndexMap<Symbol, String> = IndexMap::new();
     if let Some(args) = call.arguments() {
         for arg in args.arguments().iter() {
             let Some(kh) = arg.as_keyword_hash_node() else { continue };
@@ -2357,7 +2422,7 @@ fn ingest_namespace_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
-                note_required_format(call, file, cx, key.as_str(), &value);
+                note_required_format(call, file, cx, key.as_str(), &value, &mut defaults);
                 let facet = if value.as_nil_node().is_some() { Some(None) } else { rname(&value).map(Some) };
                 let Some(facet) = facet else { continue };
                 let facet = facet.filter(|v| !v.trim_matches('/').is_empty());
@@ -2375,8 +2440,11 @@ fn ingest_namespace_route(
         path,
         module,
         as_prefix,
-        defaults: IndexMap::new(),
-        nest: false,
+        defaults,
+        // Rails' `namespace` inside a `resources` block is `nested { super }`:
+        // the parent's `/shops/:shop_id` (and `shop_` name) lands BEFORE the
+        // namespace's own segment, unlike a plain `scope`.
+        nest: true,
         suppress_helpers: false, within: ResourceScope::Nested,
         entries,
     })
@@ -2402,7 +2470,7 @@ fn ingest_scope_route(
                 let Some(assoc) = el.as_assoc_node() else { continue };
                 let Some(key) = symbol_value(&assoc.key()) else { continue };
                 let value = assoc.value();
-                note_required_format(call, file, cx, key.as_str(), &value);
+                note_required_format(call, file, cx, key.as_str(), &value, &mut defaults);
                 let val = rname(&value);
                 match key.as_str() {
                     "path" => path = val.or(path),
@@ -2554,8 +2622,19 @@ fn route_file_key(node: &Node<'_>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+thread_local! {
+    /// Path fragments of the route file's local variables, by name.
+    static ROUTE_PATH_LOCALS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::default());
+}
+
 fn path_fragments(node: &Node<'_>, out: &mut Vec<String>) {
-    if let Some(s) = string_value(node) {
+    if let Some(read) = node.as_local_variable_read_node() {
+        ROUTE_PATH_LOCALS.with(|l| {
+            if let Some(parts) = l.borrow().get(constant_id_str(&read.name())) {
+                out.extend(parts.iter().cloned());
+            }
+        });
+    } else if let Some(s) = string_value(node) {
         out.push(s.trim_matches('/').to_string());
     } else if let Some(sym) = symbol_value(node) {
         out.push(sym);
@@ -3120,6 +3199,12 @@ fn ingest_explicit_route(
     // where Rails serves `/searches/clear` (named `clear_searches`).
     let mut on_scope: Option<ResourceScope> = None;
     let mut constraints: IndexMap<Symbol, String> = IndexMap::new();
+    // The path came from a positional SYMBOL (`get :index`): in a
+    // member/collection scope Rails treats a canonical action as the
+    // resource's own path, which a string path never does.
+    let mut symbol_path = false;
+    // `get :token, path: "auth-token"`: the URL segment of a symbol verb.
+    let mut path_kwarg: Option<String> = None;
 
     for arg in args_node.arguments().iter() {
         if let Some(s) = rstring(&arg) {
@@ -3138,6 +3223,7 @@ fn ingest_explicit_route(
             // symbol appearing after a target can't be mistaken for one.
             if let Some(s) = symbol_value(&arg) {
                 path = Some(s);
+                symbol_path = true;
             }
         } else if let Some(kh) = arg.as_keyword_hash_node() {
             // Two shapes share KeywordHashNode here:
@@ -3196,7 +3282,13 @@ fn ingest_explicit_route(
                     "as" => {
                         as_name = rsymbol(value)
                             .map(Symbol::from)
-                            .or_else(|| rstring(value).map(Symbol::from));
+                            .or_else(|| rstring(value).map(Symbol::from))
+                            // `as: nil` / `as: false`: Rails names the route
+                            // nothing at all. The empty name carries that.
+                            .or_else(|| {
+                                (value.as_nil_node().is_some() || value.as_false_node().is_some())
+                                    .then(|| Symbol::from(""))
+                            });
                     }
                     "on" => {
                         on_scope = match symbol_value(value).as_deref() {
@@ -3208,6 +3300,7 @@ fn ingest_explicit_route(
                     // `post "suggest", :action => "submit_suggestions"` —
                     // the action override for a resource-scoped shortcut.
                     "action" => action_kwarg = rname(value),
+                    "path" => path_kwarg = rstring(value),
                     // `match :graphql, controller: "one/graphql", action:
                     // :query, via: :post` — the target spelled as two
                     // options where `to: "one/graphql#query"` is one.
@@ -3243,6 +3336,16 @@ fn ingest_explicit_route(
                 }
             }
         }
+    }
+
+    // A symbol verb with `path:` keeps the symbol as its action and name
+    // (`post :render_x, path: "x"` is `render_x`) and takes the option as
+    // its URL segment; a string verb ignores the option, as Rails does.
+    if let (true, Some(segment), Some(symbol)) = (symbol_path, path_kwarg, path.clone()) {
+        action_kwarg = action_kwarg.or_else(|| Some(symbol.replace('-', "_")));
+        as_name = as_name.or_else(|| Some(Symbol::from(symbol.replace('-', "_").as_str())));
+        path = Some(format!("/{}", segment.trim_start_matches('/')));
+        symbol_path = false;
     }
 
     // `scope controller: :x do get :y end` — the scope's controller is the
@@ -3377,6 +3480,15 @@ fn ingest_explicit_route(
         }
     };
 
+    let canonical = symbol_path
+        && (cx.method_scope.get() || on_scope.is_some())
+        && matches!(
+            path.as_deref().map(|p| p.trim_matches('/')),
+            Some("index" | "create" | "new" | "show" | "update" | "destroy")
+        );
+    if canonical {
+        path = Some(CANONICAL_ACTION_PATH.to_string());
+    }
     Ok(Some(RouteSpec::Explicit {
         method,
         path: path.unwrap_or_default(),
@@ -3466,10 +3578,24 @@ fn ingest_root_route(
         }));
     }
     if target.is_none() && unmodeled.is_none() {
-        if let (Some(action), Some(controller)) =
-            (action_kwarg, cx.scope_controller.borrow().clone())
-        {
-            target = Some(format!("{controller}#{action}"));
+        let scope_controller = cx.scope_controller.borrow().clone();
+        match (action_kwarg, scope_controller) {
+            (Some(action), Some(controller)) => target = Some(format!("{controller}#{action}")),
+            // `namespace :search do root action: "new", via: "get" end`:
+            // no controller of its own, so Rails takes the scope's module
+            // (`search#new`), as for a bare verb.
+            (Some(action), None) => {
+                return Ok(Some(RouteSpec::Explicit {
+                    method: HttpMethod::Get,
+                    path: "/".to_string(),
+                    controller: ClassId(Symbol::from(MODULE_CONTROLLER)),
+                    action: Symbol::from(action),
+                    as_name: Some(as_name.unwrap_or_else(|| Symbol::from("root"))),
+                    constraints: IndexMap::new(),
+                    scope: ResourceScope::default(),
+                }));
+            }
+            _ => {}
         }
     }
     if let Some(kind) = unmodeled {
@@ -3662,8 +3788,9 @@ fn ingest_resources_route(
 
     // A resource's block dispatches to the resource's controller, not an
     // enclosing `scope controller:`.
-    let mut nested =
-        cx.with_scope_controller(None, || block_entries(call, file, Some(name_str.as_str()), cx))?;
+    let mut nested = cx.with_scope_controller(None, || {
+        cx.with_method_scope(false, || block_entries(call, file, Some(name_str.as_str()), cx))
+    })?;
     if !concern_names.is_empty() {
         let none = eval::RVal::Hash(Vec::new());
         nested.extend(cx.with_mount_scope(cx.mount_scope_depth.get() + 1, || {
