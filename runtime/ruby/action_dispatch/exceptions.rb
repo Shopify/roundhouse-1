@@ -6,7 +6,14 @@
 # an exception passes through it, so an undefined name turns every
 # other error the action raises into a NameError that hides the real
 # one (lobsters' ApplicationController rescues both).
+#
+# MissingController is actionpack lib/action_dispatch.rb's: what
+# `request.controller_class` raises when the request's controller name
+# names no class. Core's CurrentRequest#entrypoint rescues it.
 module ActionDispatch
+  class MissingController < NameError
+  end
+
   module RemoteIp
     class IpSpoofAttackError < StandardError
     end

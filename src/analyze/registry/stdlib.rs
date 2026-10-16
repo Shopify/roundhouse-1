@@ -1308,6 +1308,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("allowed_tags", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
         ("allowed_attributes", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
     ], &[]);
+    // rails-html-sanitizer's vendor-neutral entry point (`Rails::Html` is the
+    // gem's alias of `Rails::HTML`): each finder answers the vendor's
+    // sanitizer class, which the caller instantiates. The gem loads on the
+    // CRuby tree (runtime/spinel/scaffold/ruby_overlay/runtime/action_view_sanitize.rb).
+    for name in ["Rails::Html::Sanitizer", "Rails::HTML::Sanitizer"] {
+        register_stdlib_class(classes, name, &[
+            ("safe_list_sanitizer", Ty::Untyped),
+            ("full_sanitizer", Ty::Untyped),
+            ("link_sanitizer", Ty::Untyped),
+            ("white_list_sanitizer", Ty::Untyped),
+        ], &[]);
+    }
     // `Set` is a value type: `Set.new` yields `Class { Set }` (via the
     // universal `.new`), then these instance methods dispatch on it.
     // Mutators return the receiver (self) for chaining; element-typed

@@ -1,4 +1,7 @@
 module ActionDispatch
+  class MissingController < NameError
+  end
+
   module RemoteIp
     class IpSpoofAttackError < StandardError
     end
