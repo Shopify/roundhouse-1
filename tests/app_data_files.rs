@@ -275,3 +275,63 @@ fn a_client_schema_beside_its_authored_class_file_is_also_beside_the_emitted_one
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, "\"type Query { position: Int }\\n\"\n");
 }
+
+/// A Ruby file the carried code reads as text, the manifest's `text_read`:
+/// Core's ServerIntents::FormContracts::ProductEditValidatorSource does
+/// `File.read(File.join(__dir__, "product_edit_validation_methods.rb"))`
+/// and evals the text. The file is compiled as the module it defines; its
+/// source is also carried raw at its path in the tree, where the emitted
+/// `__dir__` points (Errno::ENOENT without it). A Ruby file nothing reads
+/// as text is not copied.
+#[test]
+fn a_ruby_file_read_as_text_is_carried_raw_beside_its_compiled_copy() {
+    use roundhouse::diagnostic::Severity;
+    let base = std::env::temp_dir().join(format!("roundhouse-slice-rbtext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("slice/root");
+    let write = |rel: &str, content: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let methods = "module Forms\n  module Methods\n    def self.name_ok?(x) = !x.nil?\n  end\nend\n";
+    write("lib/forms/methods.rb", methods);
+    write("lib/forms/other.rb", "module Forms\n  module Other\n  end\nend\n");
+    write(
+        "lib/forms/source.rb",
+        "module Forms\n  module Source\n    PATH = File.join(__dir__, \"methods.rb\")\n    def self.text = File.read(PATH)\n  end\nend\n",
+    );
+    let entry = |path: &str, extra: &str| format!("{{\"role\": \"autoload\", \"core_path\": {path:?}, \"slice_path\": {path:?}{extra}}}");
+    let manifest = format!(
+        "{{\"files\": [{}, {}, {}]}}",
+        entry("lib/forms/source.rb", ""),
+        entry("lib/forms/methods.rb", ", \"text_read\": \"read as text by lib/forms/source.rb\""),
+        entry("lib/forms/other.rb", ""),
+    );
+    std::fs::write(base.join("slice/slice-manifest.json"), manifest).unwrap();
+
+    let mut app = roundhouse::ingest::ingest_app(&root).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, &root, roundhouse::project::BuildTarget::Ruby)
+    });
+    let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).map(|d| d.message.clone()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let files = files.expect("target files");
+    let raw: Vec<&(String, String)> = files.iter().filter(|(p, _)| p.starts_with("lib/forms/")).collect();
+    assert_eq!(raw.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["lib/forms/methods.rb"]);
+    assert_eq!(raw[0].1, methods);
+
+    let emitted = base.join("emitted");
+    roundhouse::project::write_to_dir(&files, &emitted).expect("write tree");
+    let out = emit_and_run::ruby()
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .args(["-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\nputs Forms::Source.text\n"])
+        .output()
+        .expect("ruby");
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, methods);
+}

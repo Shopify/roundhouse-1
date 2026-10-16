@@ -4878,10 +4878,13 @@ pub(super) fn rehome_carried(
             method.enclosing_class = Some(model.0.clone())
         }
         ModelBodyItem::ClassBody { expr, .. } | ModelBodyItem::Unknown { expr, .. } => {
-            // Not the concern itself: the includer reaches the concern's
-            // own constants through its ancestry, as Rails does.
+            // The block's lexical scope is the concern and what encloses
+            // it, innermost first: `Factories` in PaymentsApi::
+            // FixtureFactoryHelper's `included do` is that module's own,
+            // not the first `Factories` the includer's ancestry reaches
+            // (ShopifyPayments::FixtureFactoryHelper's, included after it).
             let segments: Vec<&str> = concern.0.as_str().split("::").collect();
-            let scopes: Vec<String> = (1..segments.len()).rev().map(|n| segments[..n].join("::")).collect();
+            let scopes: Vec<String> = (1..=segments.len()).rev().map(|n| segments[..n].join("::")).collect();
             qualify(expr, &scopes, defined);
         }
         _ => {}

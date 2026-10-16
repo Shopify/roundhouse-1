@@ -18399,10 +18399,20 @@ fn slice_named_data_files(root: &Path) -> std::collections::BTreeSet<String> {
     let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return named };
     for file in manifest.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
         let role = file.get("role").and_then(|r| r.as_str());
-        if let (Some("data" | "boot-config"), Some(path)) = (role, file.get("slice_path").and_then(|p| p.as_str())) {
+        let path = file.get("slice_path").and_then(|p| p.as_str());
+        if let (Some("data" | "boot-config"), Some(path)) = (role, path) {
             if !path.ends_with(".rb") {
                 named.insert(path.to_string());
             }
+        }
+        // A Ruby file the carried code reads as text (`File.read(File.join(
+        // __dir__, "product_edit_validation_methods.rb"))`, Core's
+        // ProductEditValidatorSource, which evals it): the slicer marks it
+        // `text_read`. It is compiled into the app as usual; its source
+        // text is also carried at its slice path, where the emitted
+        // `__dir__` resolves.
+        if let (Some(path), true) = (path, file.get("text_read").is_some()) {
+            named.insert(path.to_string());
         }
     }
     named
