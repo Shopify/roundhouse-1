@@ -732,18 +732,21 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .as_ref()
                 .map(|s| format!("{}{}", ctx.name_prefix, s.as_str()))
                 .unwrap_or_else(|| format!("{}root", ctx.name_prefix));
+            // A root inside `scope "admin/api/:version_handle"` still
+            // carries the scope's dynamic segments.
+            let path_params = path_ordered_params(&path, &[]);
             out.push(FlatRoute {
                 method: HttpMethod::Get,
                 path,
                 controller: ClassId(Symbol::from(controller_class)),
                 action: Symbol::from(action_name),
                 as_name: if ctx.helpers_enabled { helper } else { String::new() },
-                path_params: vec![],
-                param_defaults: vec![],
+                required_params: path_params.len(),
+                param_defaults: defaults_for(ctx, &path_params),
+                path_params,
                 named: ctx.helpers_enabled,
                 helpers_enabled: ctx.helpers_enabled,
                 format: None,
-                required_params: 0,
                 required_path: None,
                 int_params: vec![],
                 constraints: vec![],

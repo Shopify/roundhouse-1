@@ -3203,6 +3203,8 @@ fn ingest_explicit_route(
     // member/collection scope Rails treats a canonical action as the
     // resource's own path, which a string path never does.
     let mut symbol_path = false;
+    // `get :token, path: "auth-token"`: the URL segment of a symbol verb.
+    let mut path_kwarg: Option<String> = None;
 
     for arg in args_node.arguments().iter() {
         if let Some(s) = rstring(&arg) {
@@ -3292,6 +3294,7 @@ fn ingest_explicit_route(
                     // `post "suggest", :action => "submit_suggestions"` —
                     // the action override for a resource-scoped shortcut.
                     "action" => action_kwarg = rname(value),
+                    "path" => path_kwarg = rstring(value),
                     // `match :graphql, controller: "one/graphql", action:
                     // :query, via: :post` — the target spelled as two
                     // options where `to: "one/graphql#query"` is one.
@@ -3327,6 +3330,16 @@ fn ingest_explicit_route(
                 }
             }
         }
+    }
+
+    // A symbol verb with `path:` keeps the symbol as its action and name
+    // (`post :render_x, path: "x"` is `render_x`) and takes the option as
+    // its URL segment; a string verb ignores the option, as Rails does.
+    if let (true, Some(segment), Some(symbol)) = (symbol_path, path_kwarg, path.clone()) {
+        action_kwarg = action_kwarg.or_else(|| Some(symbol.replace('-', "_")));
+        as_name = as_name.or_else(|| Some(Symbol::from(symbol.replace('-', "_").as_str())));
+        path = Some(format!("/{}", segment.trim_start_matches('/')));
+        symbol_path = false;
     }
 
     // `scope controller: :x do get :y end` — the scope's controller is the
