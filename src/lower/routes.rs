@@ -536,6 +536,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 ResourceScope::Nested => None,
             };
             let (derived_name, named) = match as_name.as_ref() {
+                // `as: nil`: no helper at all.
+                Some(s) if s.as_str().is_empty() => (action.as_str().to_string(), false),
                 // Where an explicit `as:` sits relative to the enclosing
                 // resource depends on the scope, and the two go OPPOSITE
                 // ways. Measured against Rails 8.1 inside

@@ -3282,7 +3282,13 @@ fn ingest_explicit_route(
                     "as" => {
                         as_name = rsymbol(value)
                             .map(Symbol::from)
-                            .or_else(|| rstring(value).map(Symbol::from));
+                            .or_else(|| rstring(value).map(Symbol::from))
+                            // `as: nil` / `as: false`: Rails names the route
+                            // nothing at all. The empty name carries that.
+                            .or_else(|| {
+                                (value.as_nil_node().is_some() || value.as_false_node().is_some())
+                                    .then(|| Symbol::from(""))
+                            });
                     }
                     "on" => {
                         on_scope = match symbol_value(value).as_deref() {
