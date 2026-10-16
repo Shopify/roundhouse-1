@@ -199,7 +199,10 @@ module ActiveRecord
       # the file through ERB and then Psych reads the text, so the value
       # is the tag's `to_s` as YAML reads it: `"…".inspect` is the quoted
       # string's contents, JSON text a Hash, `5` an Integer, nothing nil.
+      # A Hash or Array is a structure a mapping or sequence field with tags
+      # inside already built (ingest/fixture.rs structured_source).
       def erb_scalar(value)
+        return value if value.is_a?(::Hash) || value.is_a?(::Array)
         text = value.to_s
         return nil if text.strip.empty?
         YAML.unsafe_load(text)

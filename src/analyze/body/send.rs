@@ -3085,7 +3085,12 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
     // takes relations of several models (`period(query)` called with
     // both `Story…` and `Comment…`), a union of model classes. Both
     // admit the relation-builder surface.
-    if is_model_relation_elem(elem) {
+    // `find { |x| .. }` with a block is `Enumerable#find` even on a
+    // relation (`FinderMethods#find` calls `super` when given a block):
+    // an element or nil. Only the block-less `find(id)` is the finder
+    // that answers the model or raises.
+    let enumerable_find = method.as_str() == "find" && block_ret.is_some();
+    if is_model_relation_elem(elem) && !enumerable_find {
         match method.as_str() {
             // Genuinely elem-dependent arms stay code — the catalog's
             // ReturnKind can't express their union-element cases

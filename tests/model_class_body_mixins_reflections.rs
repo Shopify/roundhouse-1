@@ -324,3 +324,40 @@ end
     let reflection = r#"HasManyReflection.new(:notes, "Note", "owner_id", { foreign_key: "owner_id" }, ::Shelf, unsupported: ["`as:` (not a literal)", "`extend:` (the declaration's block)"])"#;
     assert!(shelf.contains(reflection), "{shelf}");
 }
+
+/// Callback options (`before_add: proc { ... }`, method-name symbols) and a
+/// `class_name:` interpolating `self` are carried on the reflection as
+/// source, as Rails keeps them in `options`; a callable that reads a local
+/// of the class body around it cannot be rebuilt there and stays named.
+#[test]
+fn callable_association_options_are_carried_on_the_reflection() {
+    const SHELF: &str = r##"class Shelf < ApplicationRecord
+  limit = 3
+
+  has_many :notes, foreign_key: "owner_id", as: :owner,
+    before_add: proc { |_, note| note.body = "x" },
+    after_add: :note_added,
+    after_remove: [:note_removed, :note_gone],
+    before_remove: ->(shelf, note) { [shelf, note].compact.size }
+  has_many :other_notes, class_name: "#{self}Note", foreign_key: "owner_id",
+    before_add: proc { |_, note| note.body = limit.to_s }
+
+  def note_added(_note); end
+  def note_removed(_note); end
+  def note_gone(_note); end
+end
+"##;
+    let structure = format!(
+        "{STRUCTURE}CREATE TABLE shelves (\n    id bigserial NOT NULL,\n    CONSTRAINT shelves_pkey PRIMARY KEY (id)\n);\n"
+    );
+    let (emitted, errors) = overlay()
+        .write("db/structure.sql", &structure)
+        .write("app/models/shelf.rb", SHELF)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let shelf = std::fs::read_to_string(emitted.join("app/models/shelf.rb")).unwrap();
+    let carried = r#"{ foreign_key: "owner_id", as: :owner, before_add: proc { |_, note| note.body = "x" }, after_add: :note_added, after_remove: [:note_removed, :note_gone], before_remove: ->(shelf, note) { [shelf, note].compact.size } }, ::Shelf)"#;
+    assert!(shelf.contains(carried), "{shelf}");
+    let other = r##"{ class_name: "#{self}Note", foreign_key: "owner_id" }, ::Shelf, unsupported: ["`before_add:` (not a literal)"])"##;
+    assert!(shelf.contains(other), "{shelf}");
+}

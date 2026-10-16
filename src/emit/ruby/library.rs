@@ -4445,6 +4445,95 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 }
             })
     }
+    // An association option value the reflection table can rebuild from its
+    // source text: a `proc { |owner, record| ... }` / `lambda` / `->` that
+    // reads no local of the class body around it (the callback options,
+    // `before_add: proc { |_, bank| bank.assign_default_values }`; it runs
+    // with the model class as self, as the class body's would), or a
+    // string interpolating only carried expressions
+    // (`class_name: "#{self}Link"`, self the model class where the table is
+    // built, as in the concern's `included` block).
+    fn carried_option_value(node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(lambda) = node.as_lambda_node() {
+            return !reads_outer_local(&lambda.as_node());
+        }
+        if let Some(call) = node.as_call_node() {
+            let plain = call.receiver().is_none()
+                && call.arguments().is_none()
+                && matches!(call.name().as_slice(), b"proc" | b"lambda");
+            return plain && call.block().is_some_and(|b| b.as_block_node().is_some()) && !reads_outer_local(node);
+        }
+        if let Some(text) = node.as_interpolated_string_node() {
+            if text.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+                return false;
+            }
+            return text.parts().iter().all(|part| {
+                if part.as_string_node().is_some() {
+                    return true;
+                }
+                let Some(embedded) = part.as_embedded_statements_node() else { return false };
+                let Some(statements) = embedded.statements() else { return true };
+                let body: Vec<_> = statements.body().iter().collect();
+                body.len() == 1 && (body[0].as_self_node().is_some() || carried_expression(&body[0]))
+            });
+        }
+        false
+    }
+    // Whether `node` (a block or lambda, with its parameters; `level` counts
+    // the blocks entered, its own included) reads or
+    // writes a local that lives outside it.
+    fn reads_outer_local(node: &ruby_prism::Node<'_>) -> bool {
+        use ruby_prism::Visit;
+        struct Scan {
+            level: u32,
+            free: bool,
+        }
+        impl Scan {
+            fn local(&mut self, depth: u32) {
+                if depth >= self.level {
+                    self.free = true;
+                }
+            }
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+                self.level += 1;
+                ruby_prism::visit_block_node(self, node);
+                self.level -= 1;
+            }
+            fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+                self.level += 1;
+                ruby_prism::visit_lambda_node(self, node);
+                self.level -= 1;
+            }
+            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+            fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                self.local(node.depth());
+            }
+            fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+                self.local(node.depth());
+                ruby_prism::visit_local_variable_write_node(self, node);
+            }
+            fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+                self.local(node.depth());
+            }
+            fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+                self.local(node.depth());
+                ruby_prism::visit_local_variable_operator_write_node(self, node);
+            }
+            fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+                self.local(node.depth());
+                ruby_prism::visit_local_variable_or_write_node(self, node);
+            }
+            fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+                self.local(node.depth());
+                ruby_prism::visit_local_variable_and_write_node(self, node);
+            }
+        }
+        let mut scan = Scan { level: 0, free: false };
+        scan.visit(node);
+        scan.free
+    }
     fn call_options(call: &ruby_prism::CallNode<'_>) -> (String, Vec<String>) {
         let mut pairs: Vec<String> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
@@ -4469,7 +4558,7 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 match name {
                     Some(name) if label(&name) => {
                         let value = assoc.value();
-                        if literal(&value) {
+                        if literal(&value) || carried_option_value(&value) {
                             pairs.push(format!("{name}: {}", String::from_utf8_lossy(value.location().as_slice())));
                         } else {
                             unsupported.push(format!("`{name}:` (not a literal)"));
@@ -4813,7 +4902,18 @@ fn invalidate_on_fk_write(lc: &mut LibraryClass, name: &Symbol, fk: &Symbol, sta
     };
     let span = m.body.span;
     let n = name.as_str();
-    let (value, fk) = (m.params[0].name.as_str(), fk.as_str());
+    // The key as the writer stores it: the model's own `<fk>` reader (a
+    // class that overrides it, `PaymentAttemptCharge#payment_provider_id`
+    // deriving it from the instruction) is not what `value` is compared
+    // with, as Rails reads the attribute, not the method, to find the
+    // key changed.
+    let stores_ivar = |e: &Expr| matches!(&*e.node, ExprNode::Assign { target: LValue::Ivar { name }, .. } if name.as_str() == fk.as_str());
+    let writes_ivar = match &*m.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().any(stores_ivar),
+        _ => stores_ivar(&m.body),
+    };
+    let key = if writes_ivar { format!("@{}", fk.as_str()) } else { fk.as_str().to_string() };
+    let (value, fk) = (m.params[0].name.as_str(), key.as_str());
     let record = if stale_state {
         format!("    if @{n}_loaded\n      @{n}_stale_state = {fk}\n      @{n}_stale_loaded = true\n    end\n")
     } else {
