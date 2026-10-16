@@ -34,12 +34,7 @@ fn normalize_predicate(predicate: &mut Predicate, schema: &Schema) {
                 *expr = serialized_value_expr(expr, &column.col_type, nullable_value);
             }
             if nullable {
-                *ty = match ty {
-                    ValueType::Int | ValueType::IntOpt => ValueType::IntOpt,
-                    ValueType::Str | ValueType::StrOpt => ValueType::StrOpt,
-                    ValueType::Bool | ValueType::BoolOpt => ValueType::BoolOpt,
-                    ValueType::FloatOpt => ValueType::FloatOpt,
-                };
+                *ty = ty.nullable();
                 if nullable_column {
                     *predicate = Predicate::NullableEq(col.clone(), Value::Runtime { expr: expr.clone(), ty: *ty });
                 }

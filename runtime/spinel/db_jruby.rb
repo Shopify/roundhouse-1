@@ -940,6 +940,17 @@ module Db
     s.nil? ? "NULL" : escape_string(s)
   end
 
+  # A binary column's value. SQLite stores bytes by the string's own
+  # storage class (`escape_string`'s BLOB form); only PostgreSQL's bytea
+  # literal is column-typed.
+  def self.escape_binary(s)
+    escape_string(s.to_s)
+  end
+
+  def self.escape_binary_opt(s)
+    s.nil? ? "NULL" : escape_binary(s)
+  end
+
   def self.escape_int_opt(n)
     n.nil? ? "NULL" : escape_int(n)
   end

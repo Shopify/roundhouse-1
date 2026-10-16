@@ -704,6 +704,7 @@ fn value_type_for(col_type: &ColumnType) -> ValueType {
         | ColumnType::BigInt
         | ColumnType::Reference { .. } => ValueType::Int,
         ColumnType::Boolean => ValueType::Bool,
+        ColumnType::Binary => ValueType::Binary,
         _ => ValueType::Str,
     }
 }

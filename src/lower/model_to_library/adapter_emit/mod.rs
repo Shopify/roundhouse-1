@@ -1064,8 +1064,10 @@ fn reload_lookup(
     for (i, (column, value, ty)) in keys.iter().enumerate() {
         let lead = if i == 0 { select } else { " AND " };
         parts.push(arel_lit_str(format!("{lead}{} = ", dialect.ident(column.as_str()))));
-        let (bind_method, escape_method) = match ty {
+        let (bind_method, escape_method) = match ty.for_dialect(dialect) {
             ValueType::Str => ("bind_text", "escape_string"),
+            ValueType::Binary => ("bind_binary", "escape_binary"),
+            ValueType::BinaryOpt => ("bind_binary_opt", "escape_binary_opt"),
             ValueType::StrOpt => ("bind_text_opt", "escape_string_opt"),
             ValueType::IntOpt => ("bind_int_opt", "escape_int_opt"),
             _ => ("bind_int", "escape_int"),
@@ -1510,6 +1512,7 @@ fn bind_type(model: &Model, col: &crate::schema::Column) -> ValueType {
         ValueType::Int => ValueType::IntOpt,
         ValueType::Str => ValueType::StrOpt,
         ValueType::Bool => ValueType::BoolOpt,
+        ValueType::Binary => ValueType::BinaryOpt,
         other => other,
     }
 }
@@ -1556,6 +1559,13 @@ fn value_type_for_column(col: &crate::schema::Column) -> ValueType {
                 ValueType::FloatOpt
             } else {
                 ValueType::Str
+            }
+        }
+        _ if matches!(col.col_type, crate::schema::ColumnType::Binary) => {
+            if nullable {
+                ValueType::BinaryOpt
+            } else {
+                ValueType::Binary
             }
         }
         _ => {

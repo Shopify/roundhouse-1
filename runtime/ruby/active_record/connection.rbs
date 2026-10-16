@@ -216,6 +216,7 @@ module ActiveRecord
     def self._quoted_time: (::Time time) -> String
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
+    def self._bytea_value: (String name, untyped value) -> untyped
     def self._primary_key_from_database: (untyped value) -> untyped
     def update_column: (String | Symbol name, untyped value, ?touch: untyped) -> bool
     def update_columns: (Hash[String | Symbol, untyped] attributes) -> bool
