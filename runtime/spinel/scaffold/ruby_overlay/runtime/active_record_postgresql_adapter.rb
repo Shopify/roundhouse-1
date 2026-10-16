@@ -573,7 +573,14 @@ module ActiveRecord
 
       def quote(value)
         return Db.escape_bool(value) if value == true || value == false
+        return quoted_binary(value) if value.is_a?(ActiveModel::Type::Binary::Data)
         super(value)
+      end
+
+      # postgresql/quoting.rb: a binary value as the hex literal
+      # `escape_bytea` writes; the column's own type reads it as bytea.
+      def quoted_binary(value) # :nodoc:
+        "'\\x#{value.to_s.unpack1("H*")}'"
       end
 
       # postgresql/quoting.rb: an identifier, and a table name that may

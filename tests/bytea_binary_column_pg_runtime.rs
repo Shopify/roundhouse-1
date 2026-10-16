@@ -65,6 +65,8 @@ const PROBE: &str = r##"class ByteaProbe
     b.payload = nil
     b.save!
     out << "nil: #{b.reload.payload.inspect} #{Blob.where(payload: nil).count}"
+    data = ActiveModel::Type::Binary::Data.new(bytes)
+    out << "quote: #{Blob.connection.quoted_binary(data)} #{Blob.connection.quote(data)}"
     out
   end
 end
@@ -72,7 +74,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 9] = [
     r#"insert: "{\"attributes\":{\"k\":\"v\"}}" ASCII-8BIT "2c26b46b68ffc68ff99b453c1c30413413308e1d" "\x00\xC8\x01\xFF" """#,
     r#"update: "{\"attributes\":{\"k\":\"v\"}} changed" "\x00\xC8\x01\xFF""#,
     "where: 1 1 0",
@@ -81,6 +83,7 @@ const EXPECTED: [&str; 8] = [
     r#"insert_all: "{\"attributes\":{\"k\":\"v\"}}" """#,
     r#"update_all: "\x00\xC8\x01\xFF""#,
     "nil: nil 1",
+    r#"quote: '\x00c801ff' '\x00c801ff'"#,
 ];
 
 const FILES: [(&str, &str); 7] = [
