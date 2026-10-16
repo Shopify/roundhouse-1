@@ -289,6 +289,7 @@ module ActiveRecord
 
     def to_a: () -> Array[Base]
     def load_records: () -> Array[Base]
+    def loaded?: () -> bool
     def loaded_records: () -> Array[Base]
     def to_set: () -> Set[Base]
     def to_ary: () -> Array[Base]
@@ -436,6 +437,7 @@ module ActiveRecord
     def count_sql: () -> String
     def bound_count_sql: () -> String
     def distinct_count_columns: () -> String
+    def select_symbol_sql: (Symbol spec) -> String
     def exists_sql: (Integer n) -> String
     def reference_tables: (Hash[String | Symbol, untyped] hash) -> void
 # Join aliasing by a where hash's key reads dynamic reflections; the

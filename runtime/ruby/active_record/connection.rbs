@@ -329,6 +329,8 @@ module ActiveRecord
     def valid?: (?Symbol? context) -> bool
     def invalid?: (?Symbol? context) -> bool
     def _valid_with_caller_hooks?: (?untyped context) -> bool
+    def _valid_for_owner?: (?Symbol? context) -> bool
+    def _validated_for_owner?: () -> bool
     def validation_context: () -> Symbol?
     def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool
@@ -369,6 +371,7 @@ module ActiveRecord
     # Validations declared at run time (RuntimeValidations below).
     @marked_for_destruction: bool?
     @_validation_hooks_off: bool?
+    @_validated_for_owner: bool?
     def self.validate: (*untyped args) ?{ (?untyped) -> untyped } -> nil
     def self.validates: (*untyped attributes) -> nil
     def self.validates!: (*untyped attributes) -> nil
