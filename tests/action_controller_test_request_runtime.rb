@@ -110,6 +110,7 @@ show("ad host=", r.host)
 show("ad method=", r.request_method)
 show("ad post?", r.post?)
 show("ad path=", r.path)
+show("ad path_info", r.path_info)
 show("ad fullpath", r.fullpath)
 show("ad url", r.url)
 r.remote_addr = "10.0.0.1"
@@ -159,6 +160,13 @@ show("ac superclass", ActionController::TestRequest.superclass)
 show("ac controller_class", c.controller_class)
 show("ac host", c.host)
 show("ac path_info", c.get_header("PATH_INFO"))
+# Rack's `path_info` is the PATH_INFO header as a String, "" when absent:
+# Core's MultiSessionStore routes the request by it.
+show("ac path_info reader", c.path_info)
+c.path_info = "/orders/1/risks"
+show("ac path_info=", [c.path_info, c.get_header("PATH_INFO")])
+c.path = "/orders/2"
+show("ac path_info after path=", c.path_info)
 # Not `c.path`: with no PATH_INFO Rails answers "" (script_name +
 # path_info) where the overlay's Request answers "/", the root its CGI
 # dispatcher routes when the server omits PATH_INFO.

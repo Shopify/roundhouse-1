@@ -1513,4 +1513,19 @@ module ActiveSupport
     end
   end
   singleton_class.prepend(IndifferentParam)
+
+  # typed_parameters' reads (`permit_types`, `fetch_type`, `require_type`,
+  # `require_hash`) and `permit!` on the params a controller test hands the
+  # action: an indifferent Hash here, where Rails' `params=` wraps a Hash in
+  # ActionController::Parameters, which the gem prepends them to. The call
+  # answers what Parameters does for the same entries.
+  module ParametersSurface
+    %i[permit_types fetch_type require_type required_type require_hash permit!].each do |name|
+      define_method(name) do |*args|
+        parameters = ::ActionController::Parameters #: untyped
+        parameters.new(self).public_send(name, *args)
+      end
+    end
+  end
+  HashWithIndifferentAccess.include(ParametersSurface)
 end

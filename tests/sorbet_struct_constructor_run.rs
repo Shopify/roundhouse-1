@@ -50,3 +50,35 @@ fn a_lowered_struct_takes_a_positional_hash_and_optional_nilable_props() {
         .run_ruby(SCRIPT)
         .assert_passes();
 }
+
+const PROPS_STRUCT: &str = r#"module Skywatch
+  class Profile < T::Struct
+    const :id, Integer
+    const :name, String
+    prop :tags, T::Array[String], default: []
+    const :note, T.nilable(String)
+
+    def self.from_attributes(attributes, extra)
+      selected = attributes.with_indifferent_access.slice(*props.keys).merge({ tags: extra })
+      new(**selected)
+    end
+  end
+end
+"#;
+
+const PROPS_SCRIPT: &str = r#"
+raise "props names in declaration order: #{Skywatch::Profile.props.keys.inspect}" unless Skywatch::Profile.props.keys == %i[id name tags note]
+raise "const is immutable" unless Skywatch::Profile.props[:name][:immutable] == true && Skywatch::Profile.props[:tags][:immutable].nil?
+raise "nilable is flagged" unless Skywatch::Profile.props[:note][:_tnilable] == true
+profile = Skywatch::Profile.from_attributes({ "id" => 1, "name" => "n", "ignored" => 2 }, ["a"])
+raise "slice by props" unless profile.id == 1 && profile.name == "n" && profile.tags == ["a"] && profile.note.nil?
+puts "struct props passed"
+"#;
+
+#[test]
+fn a_lowered_struct_answers_props_by_name() {
+    emit_and_run::real_blog()
+        .write("app/services/skywatch_profile.rb", PROPS_STRUCT)
+        .run_ruby(PROPS_SCRIPT)
+        .assert_passes();
+}

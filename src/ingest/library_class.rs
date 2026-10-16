@@ -1441,6 +1441,12 @@ pub(super) fn library_class_and_struct_base(
         unknown_calls.retain(|call| !is_struct_declaration(call));
         includes.retain(|i| !i.0.as_str().starts_with("T::"));
         let mut synthesized = synth_sorbet_struct_methods(&owner, &members, comparable, true);
+        let declares_props = methods
+            .iter()
+            .any(|m| m.name.as_str() == "props" && matches!(m.receiver, MethodReceiver::Class));
+        if !declares_props && let Some(props) = synth_struct_props(&owner, &members) {
+            synthesized.push(props);
+        }
         synthesized.append(&mut methods);
         methods = synthesized;
         None
@@ -2257,6 +2263,54 @@ fn struct_hash_prologue(members: &[SorbetStructMember]) -> Option<Expr> {
     let program = node.as_program_node()?;
     let stmt = program.statements().body().iter().next()?;
     ingest_expr(&stmt, "(sorbet struct)").ok()
+}
+
+/// sorbet's `T::Props::ClassMethods#props`: the class's declared props by
+/// name, in declaration order. Core reads the names off one
+/// (`slice(*props.keys)` in a struct's `from_override_attributes`, a
+/// validator's `Range.props.keys`). Each value is a slice of the rules
+/// Hash sorbet keeps per prop: `immutable: true` for a `const`,
+/// `_tnilable: true` for a `T.nilable` one. The `:type` entries and the
+/// defaults are not carried, so a read of those answers nil.
+fn synth_struct_props(owner: &ClassId, members: &[SorbetStructMember]) -> Option<MethodDef> {
+    if members.is_empty() {
+        return None;
+    }
+    let sym = |name: &str| {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } })
+    };
+    let truth = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } });
+    let entries = members
+        .iter()
+        .map(|member| {
+            let mut rules = Vec::new();
+            if !member.writable {
+                rules.push((sym("immutable"), truth()));
+            }
+            if member.nilable {
+                rules.push((sym("_tnilable"), truth()));
+            }
+            let rules = Expr::new(Span::synthetic(), ExprNode::Hash { entries: rules, kwargs: false });
+            (sym(member.name.as_str()), rules)
+        })
+        .collect();
+    Some(MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from("props"),
+        receiver: MethodReceiver::Class,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }),
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    })
 }
 
 /// `include T::Struct::ActsAsComparable` gives a struct value equality.
