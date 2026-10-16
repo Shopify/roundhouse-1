@@ -7265,52 +7265,141 @@ pub type ConcernModelItems = (
 /// [`crate::app::App::concern_guarded_items`]).
 pub type ConcernGuardedItems = Vec<(ClassId, Vec<crate::app::ConcernGuardedItem>)>;
 
+/// `prepend(Mod)` / `include(Mod)` of a constant: a mixin the includer
+/// takes, which a guarded branch carries along with its declarations.
+fn is_module_mixin(item: &crate::dialect::ModelBodyItem) -> bool {
+    use crate::expr::ExprNode;
+    let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+    matches!(&*expr.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+        if matches!(method.as_str(), "prepend" | "include")
+            && !args.is_empty()
+            && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. })))
+}
+
+/// A branch of a guard on the includer: the guard and the statements it
+/// admits.
+type GuardedBranch<'pr> = (crate::app::IncluderGuard, Vec<ruby_prism::Node<'pr>>);
+
 /// `X if self == A`, `X unless self == A`, `X if self != A`,
-/// `X if in?([A, B])` (also `self.in?`, `A == self`), or the block form
-/// `if self == A ... end`: the guard and the guarded statements. `None`
-/// for any other `if` / `unless`, or one with an `else`.
-fn includer_guarded_stmts<'pr>(
-    stmt: &ruby_prism::Node<'pr>,
-    file: &str,
-) -> Option<(crate::app::IncluderGuard, Vec<ruby_prism::Node<'pr>>)> {
-    let (predicate, body, unless) = if let Some(n) = stmt.as_if_node() {
-        if n.subsequent().is_some() {
+/// `X if in?([A, B])` (also `self.in?`, `A == self`), `X if name == "A"`
+/// (the includer's full name), or the block form `if self == A ... end`,
+/// with an optional `else`; or `case name when "A", "B" ... else ... end`.
+/// The guarded statements of each branch, in source order. `None` for any
+/// other `if` / `unless` / `case`, an `elsif`, or an empty branch.
+///
+/// A `case` branch holds for the names its `when`s list, less those an
+/// earlier `when` took (the first match wins); its `else` for the names no
+/// `when` lists.
+fn includer_guarded_stmts<'pr>(stmt: &ruby_prism::Node<'pr>, file: &str) -> Option<Vec<GuardedBranch<'pr>>> {
+    use crate::app::IncluderGuard;
+    let nonempty = |s: Option<ruby_prism::StatementsNode<'pr>>| -> Option<Vec<ruby_prism::Node<'pr>>> {
+        let body: Vec<_> = s?.body().iter().collect();
+        (!body.is_empty()).then_some(body)
+    };
+    if let Some(case) = stmt.as_case_node() {
+        if !is_includer_name(&case.predicate()?) {
             return None;
         }
-        (n.predicate(), n.statements()?, false)
+        let mut taken: Vec<String> = Vec::new();
+        let mut branches = Vec::new();
+        for when in case.conditions().iter() {
+            let when = when.as_when_node()?;
+            let mut names = Vec::new();
+            for cond in when.conditions().iter() {
+                names.push(format!("::{}", cond.as_string_node()?.unescaped().iter().map(|b| *b as char).collect::<String>()));
+            }
+            let body = nonempty(when.statements())?;
+            let fresh: Vec<String> = names.iter().filter(|n| !taken.contains(n)).cloned().collect();
+            taken.extend(fresh.iter().cloned());
+            if !fresh.is_empty() {
+                branches.push((IncluderGuard { classes: fresh, negate: false }, body));
+            }
+        }
+        if let Some(els) = case.else_clause() {
+            branches.push((IncluderGuard { classes: taken, negate: true }, nonempty(els.statements())?));
+        }
+        return (!branches.is_empty()).then_some(branches);
+    }
+    let (predicate, then, otherwise, unless) = if let Some(n) = stmt.as_if_node() {
+        let otherwise = match n.subsequent() {
+            None => None,
+            Some(sub) => Some(sub.as_else_node()?.statements()),
+        };
+        (n.predicate(), n.statements(), otherwise, false)
     } else if let Some(n) = stmt.as_unless_node() {
-        if n.else_clause().is_some() {
-            return None;
-        }
-        (n.predicate(), n.statements()?, true)
+        (n.predicate(), n.statements(), n.else_clause().map(|e| e.statements()), true)
     } else {
         return None;
     };
-    let body: Vec<_> = body.body().iter().collect();
-    if body.is_empty() {
-        return None;
-    }
     let cond = super::expr::ingest_expr(&predicate, file).ok()?;
     let (classes, negate) = includer_guard_classes(&cond)?;
-    Some((crate::app::IncluderGuard { classes, negate: negate != unless }, body))
+    // `unless c` runs its body when `c` is false, and its `else` when true.
+    let negate = negate != unless;
+    let mut branches = vec![(IncluderGuard { classes: classes.clone(), negate }, nonempty(then)?)];
+    if let Some(otherwise) = otherwise {
+        branches.push((IncluderGuard { classes, negate: !negate }, nonempty(otherwise)?));
+    }
+    Some(branches)
+}
+
+/// `name` or `self.name`: the includer's full name, with `self` bound to it.
+fn is_includer_name(node: &ruby_prism::Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|c| {
+        constant_id_str(&c.name()) == "name"
+            && c.arguments().is_none()
+            && c.block().is_none()
+            && c.receiver().is_none_or(|r| r.as_self_node().is_some())
+    })
 }
 
 fn includer_guard_classes(cond: &crate::expr::Expr) -> Option<(Vec<String>, bool)> {
-    use crate::expr::ExprNode;
+    use crate::expr::{ExprNode, Literal};
     let const_name = |e: &crate::expr::Expr| match &*e.node {
         ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
         _ => None,
     };
     let is_self = |e: &crate::expr::Expr| matches!(&*e.node, ExprNode::SelfRef);
+    // `name` / `self.name` is the includer's full name, so a string it is
+    // compared with names exactly one class: rooted, like `::Account`.
+    let is_name = |e: &crate::expr::Expr| match &*e.node {
+        ExprNode::Send { recv, method, args, block: None, .. } => {
+            method.as_str() == "name" && args.is_empty() && recv.as_ref().is_none_or(|r| is_self(r))
+        }
+        _ => false,
+    };
+    let rooted = |e: &crate::expr::Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(format!("::{value}")),
+        _ => None,
+    };
     let ExprNode::Send { recv, method, args, block: None, .. } = &*cond.node else { return None };
     match (method.as_str(), recv, args.as_slice()) {
         ("==" | "!=", Some(r), [a]) => {
-            let name = if is_self(r) { const_name(a)? } else if is_self(a) { const_name(r)? } else { return None };
+            let name = if is_self(r) {
+                const_name(a)?
+            } else if is_self(a) {
+                const_name(r)?
+            } else if is_name(r) {
+                rooted(a)?
+            } else if is_name(a) {
+                rooted(r)?
+            } else {
+                return None;
+            };
             Some((vec![name], method.as_str() == "!="))
         }
         ("in?", r, [list]) if r.as_ref().is_none_or(|r| is_self(r)) => {
             let ExprNode::Array { elements, .. } = &*list.node else { return None };
             let names = elements.iter().map(const_name).collect::<Option<Vec<_>>>()?;
+            (!names.is_empty()).then_some((names, false))
+        }
+        ("in?", Some(r), [list]) if is_name(r) => {
+            let ExprNode::Array { elements, .. } = &*list.node else { return None };
+            let names = elements.iter().map(rooted).collect::<Option<Vec<_>>>()?;
+            (!names.is_empty()).then_some((names, false))
+        }
+        ("include?", Some(list), [n]) if is_name(n) => {
+            let ExprNode::Array { elements, .. } = &*list.node else { return None };
+            let names = elements.iter().map(rooted).collect::<Option<Vec<_>>>()?;
             (!names.is_empty()).then_some((names, false))
         }
         _ => None,
@@ -7578,27 +7667,37 @@ fn ingest_concern_hook_items(
                 // includers it admits. Every statement under the guard
                 // must be one of those items, or the guard is left to
                 // today's handling as a whole.
-                if let Some((guard, stmts)) = includer_guarded_stmts(&inner, file) {
-                    let parsed: Option<Vec<ModelBodyItem>> = stmts.iter().try_fold(Vec::new(), |mut acc, stmt| {
-                        let parsed = super::model::ingest_model_body_items(stmt, &id, file, Vec::new(), None).ok()?;
-                        let claimed = !parsed.is_empty()
-                            && parsed.iter().all(|item| matches!(item,
-                                ModelBodyItem::Association { .. }
-                                | ModelBodyItem::Scope { .. }
-                                | ModelBodyItem::Validation { .. }
-                                | ModelBodyItem::Callback { .. }));
-                        claimed.then(|| {
-                            acc.extend(parsed);
-                            acc
-                        })
-                    });
+                if let Some(branches) = includer_guarded_stmts(&inner, file) {
+                    let parsed: Option<Vec<(crate::app::IncluderGuard, Vec<ModelBodyItem>)>> =
+                        branches.iter().try_fold(Vec::new(), |mut all, (guard, stmts)| {
+                            let items = stmts.iter().try_fold(Vec::new(), |mut acc, stmt| {
+                                let parsed = super::model::ingest_model_body_items(stmt, &id, file, Vec::new(), None).ok()?;
+                                let claimed = !parsed.is_empty()
+                                    && parsed.iter().all(|item| {
+                                        matches!(item,
+                                            ModelBodyItem::Association { .. }
+                                            | ModelBodyItem::Scope { .. }
+                                            | ModelBodyItem::Validation { .. }
+                                            | ModelBodyItem::Callback { .. })
+                                            || is_module_mixin(item)
+                                    });
+                                claimed.then(|| {
+                                    acc.extend(parsed);
+                                    acc
+                                })
+                            })?;
+                            all.push((guard.clone(), items));
+                            Some(all)
+                        });
                     if let Some(parsed) = parsed {
                         let at = items.len();
-                        guarded.extend(parsed.into_iter().map(|item| crate::app::ConcernGuardedItem {
-                            guard: guard.clone(),
-                            item,
-                            at,
-                        }));
+                        for (guard, branch) in parsed {
+                            guarded.extend(branch.into_iter().map(|item| crate::app::ConcernGuardedItem {
+                                guard: guard.clone(),
+                                item,
+                                at,
+                            }));
+                        }
                         continue;
                     }
                 }

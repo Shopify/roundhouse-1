@@ -204,3 +204,31 @@ fn base_typed_receivers_answer_as_natively_on_postgresql() {
     );
     assert_eq!(emitted_lines, native, "emitted");
 }
+
+/// graphql-shopify's batch association loader asks `record.association(
+/// name).loaded?` of a parameter typed `::ActiveRecord::Base`: every model
+/// synthesizes `association`, so the send is a plain one. It was
+/// refused by name (`ActiveRecord::Base not supported: association`),
+/// which stubbed the call into a raise.
+#[test]
+fn base_typed_receivers_answer_association() {
+    const LOADER: &str = r#"class AssociationLoader
+  #: (Symbol name) -> void
+  def initialize(name)
+    @name = name
+  end
+
+  #: (::ActiveRecord::Base record) -> bool
+  def association_loaded?(record)
+    record.association(@name).loaded?
+  end
+end
+"#;
+    let mut files = FILES.to_vec();
+    files.push(("app/models/association_loader.rb", LOADER));
+    let (emitted, errors) = overlay(&files).emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{errors:#?}");
+    let loader = std::fs::read_to_string(emitted.join("app/models/association_loader.rb")).expect("emitted loader");
+    assert!(loader.contains("record.association(@name).loaded?"), "{loader}");
+    assert!(!loader.contains("not supported"), "{loader}");
+}

@@ -244,6 +244,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         for m in ["[]", "[]="] {
             base.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
         }
+        // `record.association(name)` on a receiver typed as the base
+        // (graphql-shopify's batch association loader takes an
+        // `::ActiveRecord::Base`): each model answers it, so the call
+        // reaches the model's own `association` at run time. The model
+        // registry seeds the same name per model (analyze/mod.rs).
+        base.instance_methods.entry(Symbol::from("association")).or_insert(Ty::Class {
+            id: ClassId(Symbol::from("ActiveRecord::Associations::Association")),
+            args: vec![].into(),
+        });
         // Association / ActionText macro helpers call these on the
         // literal Base (and on every model via the AR catalog). Seed
         // Base itself so concern bodies typed with `self =

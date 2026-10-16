@@ -186,3 +186,74 @@ puts "ok"
         )
         .assert_passes();
 }
+
+/// `case name when "Article" ... else ... end` in `included do` picks a
+/// branch by the includer's full name, as Rails runs it with `self` bound
+/// to each includer: the `when` branch to the class it names, the `else`
+/// branch (with its `prepend`) to every other. The whole statement used to
+/// vanish from every includer, so Core's TranslatableContent left every
+/// model without its `translations` association.
+#[test]
+fn a_case_on_the_includer_name_gives_each_includer_its_branch() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/concerns/remarkable.rb",
+            r#"
+module Remarkable
+  extend ActiveSupport::Concern
+
+  module Loud
+    def label
+      super.upcase
+    end
+  end
+
+  included do
+    case name
+    when "Article"
+      has_many :remarks, class_name: "Comment", dependent: :destroy
+    else
+      has_many :sibling_remarks, class_name: "Comment", foreign_key: :article_id, primary_key: :article_id
+      prepend(Loud)
+    end
+
+    if name == "Comment"
+      scope :first_ones, -> { where(body: "first") }
+    end
+  end
+
+  def label
+    "remark"
+  end
+end
+"#,
+        )
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  include Remarkable\n",
+        )
+        .edit(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n",
+            "class Comment < ApplicationRecord\n  include Remarkable\n",
+        )
+        .run_ruby(
+            r#"
+article = Article.create!(title: "Widget", body: "A sufficiently long body")
+first = Comment.create!(article_id: article.id, commenter: "Gadget", body: "first")
+Comment.create!(article_id: article.id, commenter: "Sprocket", body: "second")
+
+raise "when branch" unless article.remarks.to_a.size == 2
+raise "else branch" unless first.sibling_remarks.to_a.size == 2
+raise "else branch prepend: #{first.label}" unless first.label == "REMARK"
+raise "when branch has no prepend: #{article.label}" unless article.label == "remark"
+raise "name == guard" unless Comment.first_ones.to_a.size == 1
+raise "Article must not get the else branch" if article.respond_to?(:sibling_remarks)
+raise "Comment must not get the when branch" if first.respond_to?(:remarks)
+raise "Article must not get the Comment scope" if Article.respond_to?(:first_ones)
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
