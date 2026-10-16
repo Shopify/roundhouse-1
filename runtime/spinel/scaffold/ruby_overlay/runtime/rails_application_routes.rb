@@ -120,7 +120,8 @@ module Rails
         raise ActionController::RoutingError, "No route matches #{path.inspect}" if matched.nil?
 
         params = matched.path_params
-        controller = CONTROLLER_PATHS[matched.controller] || RouteTable::CONTROLLER_PATHS[matched.controller]
+        controller = CONTROLLER_PATHS[matched.controller] ||
+                     (defined?(::RouteTable) ? ::RouteTable::CONTROLLER_PATHS[matched.controller] : nil)
         recognized = { controller: controller || matched.controller.to_s, action: matched.action.to_s }
         params.each { |name, value| recognized[name.to_sym] = value unless name == "format" }
         recognized[:format] = params["format"] if params.key?("format")
@@ -141,14 +142,21 @@ module Rails
       # The table that the dispatcher composes, built once.
       # `RouteTable.table` makes new Route objects on each call. The
       # routes emit defines `RouteTable.root` only for an app with a
-      # root route. Rails `recognize_path` skips a redirect route and
-      # tries the later routes, so the table leaves the redirect routes
-      # out.
+      # root route, and no `RouteTable` for an app that draws none (Core
+      # keeps its routes in component files). Rails `recognize_path` skips
+      # a redirect route and tries the later routes, so the table leaves
+      # the redirect routes out.
       def self.table
-        @table ||= ((RouteTable.respond_to?(:root) ? [RouteTable.root] : []) +
-                    RouteTable.table + ActiveStorage::Routes.table)
+        @table ||= (drawn_table + ActiveStorage::Routes.table)
                    .reject { |route| route.controller == :roundhouse_redirects }
       end
+
+      def self.drawn_table
+        return [] unless defined?(::RouteTable)
+
+        (::RouteTable.respond_to?(:root) ? [::RouteTable.root] : []) + ::RouteTable.table
+      end
+      private_class_method :drawn_table
     end
 
     # `Rails.application.routes.url_helpers`: the module an app extends or
