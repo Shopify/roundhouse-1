@@ -1355,8 +1355,9 @@ pub fn emit_with_assertions(
             .collect();
         // A test body's `_url` answers absolute, on the session's host,
         // as the Ruby family's jbuilder `_url` does (see the pass).
+        let answered = crate::lower::shadowed_fixture_accessors(&app.test_modules, &app.library_classes);
         let test_modules =
-            crate::lower::test_module_to_library::ruby_family_absolute_test_urls(&app.test_modules);
+            crate::lower::test_module_to_library::ruby_family_absolute_test_urls(&app.test_modules, &answered);
         let mut test_lowered = crate::lower::test_module_to_library::lower_test_modules_with_assertions(
             &test_modules,
             &app.fixtures,
@@ -1367,7 +1368,7 @@ pub fn emit_with_assertions(
             // The CRuby / JRuby trees' has_many readers keep their
             // target (`library::apply_collection_memoization`).
             expr::native_keywords(),
-            &crate::lower::shadowed_fixture_accessors(&test_modules, &app.library_classes),
+            &answered,
         );
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
