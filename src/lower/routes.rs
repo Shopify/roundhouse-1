@@ -578,6 +578,9 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 }
                 None => match scoped_name {
                     Some(n) => (n, true),
+                    // A canonical action whose resource name an earlier route
+                    // holds is unnamed, not named from its path.
+                    None if canonical => (action.as_str().to_string(), false),
                     // Rails names a route outside any resource from the
                     // route's OWN path under the scope's `as` prefix, not
                     // from the full URL: `get "free_themes"` in
