@@ -10263,6 +10263,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 }
             }
         }
+        // Through a loop variable over a literal list
+        // (`ingest::initializer_programs`).
+        found.extend(app.autoload_callback_cpaths.iter().map(|c| c.trim_start_matches("::").to_string()));
         found
     };
     let mut callback_files: Vec<(String, String)> = Vec::new();

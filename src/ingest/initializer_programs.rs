@@ -528,6 +528,7 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
         let result = ruby_prism::parse(text.as_bytes());
         let root = result.node();
         let Some(program) = root.as_program_node() else { continue };
+        let constants = literal_constants(program.statements().body().iter().collect());
         let mut kept: Vec<Expr> = Vec::new();
         let mut carried = 0usize;
         for stmt in program.statements().body().iter() {
@@ -577,9 +578,16 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
                 }
                 continue;
             }
-            let scan = Scan::new(inputs, fired, &mut framework);
-            let mut scan = scan;
-            match scan.statement(&stmt) {
+            let mut scan = Scan::new(inputs, fired, &mut framework).with_constants(constants.clone());
+            let verdict = scan.statement(&stmt);
+            if !matches!(verdict, Verdict::Refused(_)) {
+                for cpath in std::mem::take(&mut scan.callback_cpaths) {
+                    if !app.autoload_callback_cpaths.contains(&cpath) {
+                        app.autoload_callback_cpaths.push(cpath);
+                    }
+                }
+            }
+            match verdict {
                 Verdict::Lifted => continue,
                 Verdict::Refused(reason) => {
                     super::initializers::refuse(&file, start, end, reason);
@@ -1051,11 +1059,44 @@ pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
     reason: Option<String>,
     /// An environment file's statement, not an initializer's.
     env: Option<EnvironmentRules<'s>>,
+    /// The file's literal-valued constants ([`literal_constants`]).
+    constants: LiteralConstants,
+    /// The block parameters of the enclosing loops over a literal list of
+    /// strings (`[...].each do |name|`), with the strings they take.
+    loop_vars: Vec<(String, Vec<String>)>,
+    /// The constant paths a Zeitwerk `on_load(<loop variable>)` of the
+    /// statement registers for ([`App::autoload_callback_cpaths`]).
+    callback_cpaths: Vec<String>,
+}
+
+/// A constant a file assigns a literal list to: an array's strings, or a
+/// hash's string keys.
+#[derive(Clone, Default)]
+pub(super) struct LiteralConstants {
+    arrays: BTreeMap<String, Vec<String>>,
+    hash_keys: BTreeMap<String, Vec<String>>,
 }
 
 impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
     fn new(inputs: &'s Inputs<'a, V>, fired: &'s FiredHooks, framework: &'s mut BTreeMap<String, FrameworkLoadHook>) -> Self {
-        Scan { inputs, fired, framework, in_hook: 0, in_lambda: 0, reason: None, env: None }
+        Scan {
+            inputs,
+            fired,
+            framework,
+            in_hook: 0,
+            in_lambda: 0,
+            reason: None,
+            env: None,
+            constants: LiteralConstants::default(),
+            loop_vars: Vec::new(),
+            callback_cpaths: Vec::new(),
+        }
+    }
+
+    /// The file's literal-valued constants, which a loop may walk.
+    fn with_constants(mut self, constants: LiteralConstants) -> Self {
+        self.constants = constants;
+        self
     }
 
     /// The admission rule for an environment file's statement.
@@ -1065,7 +1106,9 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         framework: &'s mut BTreeMap<String, FrameworkLoadHook>,
         rules: EnvironmentRules<'s>,
     ) -> Self {
-        Scan { inputs, fired, framework, in_hook: 0, in_lambda: 0, reason: None, env: Some(rules) }
+        let mut scan = Scan::new(inputs, fired, framework);
+        scan.env = Some(rules);
+        scan
     }
 
     pub(super) fn statement(&mut self, stmt: &Node<'_>) -> Verdict {
@@ -1127,6 +1170,35 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         }
     }
 
+    /// The strings a read of an enclosing loop's block parameter takes.
+    fn loop_paths(&self, node: &Node<'_>) -> Option<Vec<String>> {
+        let name = constant_id_str(&node.as_local_variable_read_node()?.name()).to_string();
+        self.loop_vars.iter().rev().find(|(var, _)| *var == name).map(|(_, values)| values.clone())
+    }
+
+    /// The strings `call`'s block parameter takes when `call` is
+    /// `<list>.each do |name| … end` / `<hash>.each_key do |name| … end`
+    /// (or `.keys.each`) over a literal array of strings, or a constant
+    /// of the file that is one, or a hash with string keys.
+    fn loop_binding(&self, call: &ruby_prism::CallNode<'_>) -> Option<(String, Vec<String>)> {
+        let method = constant_id_str(&call.name());
+        if !matches!(method, "each" | "each_key") || call.arguments().is_some() {
+            return None;
+        }
+        let block = call.block()?.as_block_node()?;
+        let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+        if params.optionals().iter().next().is_some() || params.rest().is_some() || params.keywords().iter().next().is_some() {
+            return None;
+        }
+        let mut required = params.requireds().iter();
+        let param = constant_id_str(&required.next()?.as_required_parameter_node()?.name()).to_string();
+        if required.next().is_some() {
+            return None;
+        }
+        let values = literal_strings(&call.receiver()?, method == "each_key", &self.constants)?;
+        Some((param, values))
+    }
+
     fn visit(&mut self, node: &Node<'_>) {
         let mut v = ScanVisit { scan: self };
         ruby_prism::Visit::visit(&mut v, node);
@@ -1165,8 +1237,17 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
                                emitted tree reports the load only of a constant a literal path names"
                         .into()),
                     [cpath] if cpath.as_string_node().is_some() => Ok(Hook::Autoload),
+                    // `names.each do |name| … on_load(name) … end` over a
+                    // literal list: each string is a literal path, which
+                    // `project` lists for its file to report its load.
+                    [cpath] if self.loop_paths(cpath).is_some() => {
+                        let paths = self.loop_paths(cpath).unwrap_or_default();
+                        self.callback_cpaths.extend(paths);
+                        Ok(Hook::Autoload)
+                    }
                     _ => Err("Zeitwerk `on_load` with a computed constant path; the emitted tree reports the load \
-                              only of a constant a literal path names"
+                              only of a constant a literal path (or a loop variable over a literal list of them) \
+                              names"
                         .into()),
                 };
             }
@@ -1218,6 +1299,85 @@ fn cap(text: &str, max: usize) -> String {
     if text.chars().count() > max {
         out.push('…');
     }
+    out
+}
+
+/// The strings of a literal list: an array of string literals, or with
+/// `keys` the string keys of a hash literal (what `each_key` and `keys`
+/// walk), directly, through `.freeze`/`.keys`, or as a constant the file
+/// assigns one to.
+fn literal_strings(node: &Node<'_>, keys: bool, constants: &LiteralConstants) -> Option<Vec<String>> {
+    if let Some(call) = node.as_call_node() {
+        let recv = call.receiver()?;
+        if call.arguments().is_some() || call.block().is_some() {
+            return None;
+        }
+        return match constant_id_str(&call.name()) {
+            "freeze" => literal_strings(&recv, keys, constants),
+            "keys" if !keys => literal_strings(&recv, true, constants),
+            _ => None,
+        };
+    }
+    if let Some(array) = node.as_array_node() {
+        return (!keys).then(|| array_strings(&array)).flatten();
+    }
+    if let Some(hash) = node.as_hash_node() {
+        return keys.then(|| hash_keys(&hash)).flatten();
+    }
+    let path = constant_path_segments_strs(node)?.join("::");
+    let path = path.trim_start_matches("::");
+    if keys { constants.hash_keys.get(path) } else { constants.arrays.get(path) }.cloned()
+}
+
+fn array_strings(array: &ruby_prism::ArrayNode<'_>) -> Option<Vec<String>> {
+    array
+        .elements()
+        .iter()
+        .map(|e| e.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+        .collect()
+}
+
+fn hash_keys(hash: &ruby_prism::HashNode<'_>) -> Option<Vec<String>> {
+    hash.elements()
+        .iter()
+        .map(|e| {
+            let key = e.as_assoc_node()?.key();
+            key.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+        })
+        .collect()
+}
+
+/// The constants a file's modules and classes (nested as written) and its
+/// top level assign a literal array of strings or hash with string keys
+/// to, by full path (`LedgerSharding::MODELS`), through `.freeze`.
+pub(super) fn literal_constants(stmts: Vec<Node<'_>>) -> LiteralConstants {
+    fn walk(stmts: Vec<Node<'_>>, nesting: &[String], out: &mut LiteralConstants) {
+        for stmt in stmts {
+            if let Some(module) = stmt.as_module_node() {
+                if let Some(path) = module_name_path(&module) {
+                    let mut inner = nesting.to_vec();
+                    inner.extend(path);
+                    walk(module.body().map(flatten_statements).unwrap_or_default(), &inner, out);
+                }
+            } else if let Some(class) = stmt.as_class_node() {
+                if let Some(path) = class_name_path(&class) {
+                    let mut inner = nesting.to_vec();
+                    inner.extend(path);
+                    walk(class.body().map(flatten_statements).unwrap_or_default(), &inner, out);
+                }
+            } else if let Some(write) = stmt.as_constant_write_node() {
+                let full = nesting.iter().cloned().chain([constant_id_str(&write.name()).to_string()]).collect::<Vec<_>>().join("::");
+                let none = LiteralConstants::default();
+                if let Some(values) = literal_strings(&write.value(), false, &none) {
+                    out.arrays.insert(full, values);
+                } else if let Some(values) = literal_strings(&write.value(), true, &none) {
+                    out.hash_keys.insert(full, values);
+                }
+            }
+        }
+    }
+    let mut out = LiteralConstants::default();
+    walk(stmts, &[], &mut out);
     out
 }
 
@@ -1320,10 +1480,18 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
                 }
             }
         }
+        let binding = self.scan.loop_binding(node);
+        let bound = binding.is_some();
+        if let Some(binding) = binding {
+            self.scan.loop_vars.push(binding);
+        }
         let lambda = name == "lambda" && node.receiver().is_none() && node.block().is_some_and(|b| b.as_block_node().is_some());
         self.scan.in_lambda += usize::from(lambda);
         ruby_prism::visit_call_node(self, node);
         self.scan.in_lambda -= usize::from(lambda);
+        if bound {
+            self.scan.loop_vars.pop();
+        }
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
         self.scan.in_lambda += 1;
