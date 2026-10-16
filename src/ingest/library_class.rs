@@ -2985,6 +2985,12 @@ fn literal_name_list(expr: &Expr, constants: &[(Symbol, Expr)], depth: usize) ->
                 out.extend(literal_name_list(other, constants, depth + 1)?);
                 Some(out)
             }
+            ("-", [other]) => {
+                let removed = literal_name_list(other, constants, depth + 1)?;
+                let mut out = literal_name_list(recv, constants, depth + 1)?;
+                out.retain(|name| !removed.contains(name));
+                Some(out)
+            }
             ("|", [other]) => {
                 let mut out: Vec<String> = Vec::new();
                 let left = literal_name_list(recv, constants, depth + 1)?;
@@ -3027,6 +3033,35 @@ fn literal_hash_keys(expr: &Expr, constants: &[(Symbol, Expr)], depth: usize) ->
             if args.is_empty() && matches!(method.as_str(), "freeze" | "dup") =>
         {
             literal_hash_keys(recv, constants, depth + 1)
+        }
+        // `HASH.reject { |key| [:a, :b].include?(key) }` (secure_headers'
+        // `attr_writer(*(CONFIG_ATTRIBUTES_TO_HEADER_CLASSES.reject { … }.keys))`).
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "reject" | "select" | "filter") =>
+        {
+            let keys = literal_hash_keys(recv, constants, depth + 1)?;
+            let member = include_predicate_list(block, constants, depth + 1)?;
+            let keep_members = method.as_str() != "reject";
+            Some(keys.into_iter().filter(|key| member.contains(key) == keep_members).collect())
+        }
+        _ => None,
+    }
+}
+
+/// The list `LIST` of a block `{ |key| LIST.include?(key) }` over a hash
+/// ([`literal_hash_keys`]): the block's first parameter is the key.
+fn include_predicate_list(block: &Expr, constants: &[(Symbol, Expr)], depth: usize) -> Option<Vec<String>> {
+    let ExprNode::Lambda { params, body, .. } = &*block.node else { return None };
+    let key = params.first()?;
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    let ExprNode::Send { recv: Some(list), method, args, block: None, .. } = &*body.node else { return None };
+    let [arg] = args.as_slice() else { return None };
+    match &*arg.node {
+        ExprNode::Var { name, .. } if method.as_str() == "include?" && name == key => {
+            literal_name_list(list, constants, depth)
         }
         _ => None,
     }

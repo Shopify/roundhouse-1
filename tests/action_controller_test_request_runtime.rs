@@ -56,7 +56,9 @@ const FILES: &[(&str, &str)] = &[
         "app/models/auth_probe.rb",
         "module AuthProbe\n  HEADER = ActionController::HttpAuthentication::Basic.encode_credentials(\"user\", \"pa:ss\")\n\n  \
 def self.build\n    request = ActionController::TestRequest.create(WidgetsController)\n    request.host = \"shop.example\"\n    \
-request.env[\"HTTP_AUTHORIZATION\"] = HEADER\n    [request, ActionController::HttpAuthentication::Basic.user_name_and_password(request)]\n  end\nend\n",
+request.env[\"HTTP_AUTHORIZATION\"] = HEADER\n    [request, ActionController::HttpAuthentication::Basic.user_name_and_password(request)]\n  end\n\n  \
+def self.suppress(controller, request)\n    request.remote_ip = \"203.0.113.9\"\n    request.request_id = \"req-1\"\n    \
+ActionController::RequestForgeryProtection::ProtectionMethods::NullSession.new(controller).handle_unverified_request\n  end\nend\n",
     ),
 ];
 
@@ -86,10 +88,13 @@ fn test_request_and_basic_auth_constants_resolve() {
         "HEADER = ActionController::HttpAuthentication::Basic.encode_credentials(\"user\", \"pa:ss\")",
         "request = ActionController::TestRequest.create(WidgetsController)",
         "request.env[\"HTTP_AUTHORIZATION\"] = AuthProbe::HEADER",
+        "request.remote_ip = \"203.0.113.9\"",
+        "ActionController::RequestForgeryProtection::ProtectionMethods::NullSession.new(controller).handle_unverified_request",
     ] {
         assert!(model.contains(expected), "missing {expected:?}:\n{model}");
     }
     let request = std::fs::read_to_string(root.join("out/runtime/action_dispatch_request.rb")).unwrap();
     assert!(request.contains("class TestRequest < ActionDispatch::TestRequest"), "{request}");
+    assert!(request.contains("class NullSession"), "{request}");
     let _ = std::fs::remove_dir_all(&root);
 }

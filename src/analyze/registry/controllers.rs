@@ -508,6 +508,26 @@ pub(in crate::analyze) fn register(
             .entry(ClassId(Symbol::from("ActionController::HttpAuthentication::Basic")))
             .or_insert(basic);
     }
+    // Rails' `ProtectionMethods` strategies (the CRuby overlay's
+    // runtime/action_dispatch_request.rb): what `protect_from_forgery
+    // with:` runs for an unverified request. Core's AdminAreaController
+    // builds `NullSession.new(self)` itself.
+    {
+        let mut methods = ClassInfo::default();
+        methods.is_module = true;
+        classes
+            .entry(ClassId(Symbol::from("ActionController::RequestForgeryProtection::ProtectionMethods")))
+            .or_insert(methods);
+        for name in ["NullSession", "ResetSession", "Exception"] {
+            let mut strategy = ClassInfo::default();
+            strategy.instance_methods.insert(Symbol::from("handle_unverified_request"), Ty::Untyped);
+            classes
+                .entry(ClassId(Symbol::from(format!(
+                    "ActionController::RequestForgeryProtection::ProtectionMethods::{name}"
+                ))))
+                .or_insert(strategy);
+        }
+    }
     app_ctrl.class_methods.insert(Symbol::from("response"), Ty::Untyped);
     // The response surface the shared runtime's Base defines on the
     // controller itself: `self.response_body = body` (campfire's

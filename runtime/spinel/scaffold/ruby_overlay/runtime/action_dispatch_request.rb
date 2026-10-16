@@ -254,8 +254,15 @@ module ActionDispatch
       "#{protocol}#{h}"
     end
 
+    # ActionDispatch::Request#remote_ip: the address the RemoteIp
+    # middleware stores under `action_dispatch.remote_ip`, else the
+    # Rack ip. Without that middleware (tests) a writer stands in for it.
     def remote_ip
-      @env["REMOTE_ADDR"] || "127.0.0.1"
+      (@env["action_dispatch.remote_ip"] || @env["REMOTE_ADDR"] || "127.0.0.1").to_s
+    end
+
+    def remote_ip=(address)
+      @env["action_dispatch.remote_ip"] = address
     end
 
     # Rack::Request#ip: the first REMOTE_ADDR address that is not a
@@ -778,6 +785,99 @@ module ActionController
     def self.session
       c = Current.controller
       c.nil? ? nil : c.session
+    end
+  end
+end
+
+# Rails' forgery-protection strategies (actionpack
+# action_controller/metal/request_forgery_protection.rb,
+# `ProtectionMethods`): what `protect_from_forgery with:` runs when a
+# request fails `verified_request?`. Core's AdminAreaController#suppress_session
+# calls `ProtectionMethods::NullSession.new(self).handle_unverified_request`
+# directly, and the essentials session middleware tests drive it with a
+# stub controller.
+module ActionController
+  # actionpack's `InvalidCrossOriginRequest < ActionControllerError`.
+  class InvalidCrossOriginRequest < ActionControllerError
+  end
+
+  module RequestForgeryProtection
+    module ProtectionMethods
+      # The session of a request that failed verification: empty, never
+      # loaded from the store, and (with `session_options[:skip]`, which
+      # the dispatcher honors) never written back.
+      class NullSessionHash < ActionDispatch::Session
+        # Rack's SessionHash#destroy is a no-op here, and the session
+        # reports it exists (Rails 8.2).
+        def destroy; end
+
+        def exists?
+          true
+        end
+
+        def enabled?
+          false
+        end
+      end
+
+      # The cookie jar of such a request: no inbound cookies are read and
+      # nothing written through it reaches the response.
+      class NullCookieJar < ActionController::CookieJar
+        def self.build(request, cookies)
+          new
+        end
+
+        def initialize(inbound = {})
+          super({})
+        end
+
+        def raw_set(key, value)
+          value.to_s
+        end
+      end
+
+      # `protect_from_forgery with: :null_session` (Rails' default for
+      # API-style endpoints): the request goes on, as a visitor with an
+      # empty session and no cookies.
+      class NullSession
+        def initialize(controller)
+          @controller = controller
+        end
+
+        def handle_unverified_request
+          request = @controller.request
+          session = NullSessionHash.new
+          request.session = session
+          request.session_options = { skip: true }
+          @controller.session = session
+          @controller.cookies = NullCookieJar.new
+          nil
+        end
+      end
+
+      # `with: :reset_session`: the session is discarded, the request goes on.
+      class ResetSession
+        def initialize(controller)
+          @controller = controller
+        end
+
+        def handle_unverified_request
+          @controller.reset_session
+        end
+      end
+
+      # `with: :exception`.
+      class Exception
+        attr_accessor :warning_message
+
+        def initialize(controller)
+          @controller = controller
+        end
+
+        def handle_unverified_request
+          raise ActionController::InvalidCrossOriginRequest, warning_message
+        end
+      end
     end
   end
 end

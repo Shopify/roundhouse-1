@@ -63,6 +63,9 @@ else
     FileUtils.mkdir_p(File.dirname(File.join(runtime, to)))
     FileUtils.cp(File.join(ROOT, from), File.join(runtime, to))
   end
+  # The controller base: `ProtectionMethods` reads and writes its session
+  # and cookies.
+  require File.join(ROOT, "runtime/ruby/action_controller/base")
   %w[active_support_core_ext action_controller_exceptions http_authentication action_controller/cookies action_dispatch_request].each do |file|
     require File.join(runtime, file)
   end
@@ -120,6 +123,13 @@ r.accept = ["text/html", "application/json"]
 show("ad remote_addr=", r.get_header("REMOTE_ADDR"))
 show("ad remote_addr= fresh", ActionDispatch::TestRequest.create.tap { |q| q.remote_addr = "10.0.0.2" }.remote_ip)
 show("ad user_agent=", r.user_agent)
+ip_probe = ActionDispatch::TestRequest.create("REMOTE_ADDR" => "192.168.1.1")
+show("ad remote_ip default", ip_probe.remote_ip)
+ip_probe.remote_ip = "203.0.113.9"
+show("ad remote_ip=", [ip_probe.remote_ip, ip_probe.get_header("action_dispatch.remote_ip").to_s, ip_probe.get_header("REMOTE_ADDR")])
+id_probe = ActionDispatch::TestRequest.create
+id_probe.request_id = "req-1"
+show("ad request_id=", [id_probe.request_id, id_probe.uuid, id_probe.get_header("action_dispatch.request_id")])
 show("ad headers", %w[HTTP_IF_NONE_MATCH HTTP_IF_MODIFIED_SINCE REQUEST_URI SERVER_PORT HTTP_ACCEPT].map { |k| r.get_header(k) })
 show("ad headers[]", r.headers["Accept"])
 r.headers["X-Ip-Metadata"] = "countryCode:CA"
@@ -184,6 +194,18 @@ c.content_type = "application/json"
 show("ac query_string=", c.query_string)
 show("ac content_type=", c.get_header("CONTENT_TYPE"))
 show("ac new_session", ActionController::TestRequest.new_session.class.name)
+
+# ProtectionMethods::NullSession: Core's AdminAreaController#suppress_session.
+null_controller = WidgetsController.new
+null_request = ActionController::TestRequest.create(WidgetsController)
+null_request.cookies["visitor"] = "v1"
+null_controller.request = null_request
+null_request.session["user_id"] = "7"
+null_controller.instance_variable_set(:@_request, null_request) if MODE == "native"
+show("null session before", null_request.session.to_hash)
+show("null session handle", outcome { ActionController::RequestForgeryProtection::ProtectionMethods::NullSession.new(null_controller).handle_unverified_request; :ok })
+show("null session after", [null_request.session.to_hash, null_request.session["user_id"], null_request.session_options[:skip]])
+show("null session exception", outcome { ActionController::RequestForgeryProtection::ProtectionMethods::Exception.new(null_controller).handle_unverified_request })
 
 # HttpAuthentication::Basic: Core's TaxesApi builds its Authorization
 # header from encode_credentials at load.

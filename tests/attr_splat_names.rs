@@ -48,6 +48,12 @@ const COUNTRY: &str = r#"module CountryDb
 
     attr_writer "label", *%i[note]
 
+    HEADER_CLASSES = { hsts: 1, csp: 2, referrer_policy: 3, csp_report_only: 4, cookies: 5 }.freeze
+    HEADER_KEYS = HEADER_CLASSES.keys.freeze
+    NOT_COOKIES = (HEADER_KEYS - [:cookies]).freeze
+    attr_writer(*(HEADER_CLASSES.reject { |key| [:csp, :csp_report_only].include?(key) }.keys))
+    attr_reader(*NOT_COOKIES)
+
     protected
 
     attr_writer(*IMMUTABLE)
@@ -62,6 +68,10 @@ const COUNTRY: &str = r#"module CountryDb
       @out_of_office = true
       @subject = "s"
       @uid = "u"
+      @hsts = 1
+      @csp = 2
+      @referrer_policy = 3
+      @csp_report_only = 4
     end
 
     def self.report
@@ -69,16 +79,19 @@ const COUNTRY: &str = r#"module CountryDb
       c.email = "e@x"
       c.label = "l"
       c.note = "n"
+      c.referrer_policy = "same-origin"
       [c.code, c.format_extended_v2, c.zones, c.a, c.b, c.id, c.email, c.out_of_office,
        c.subject, c.comment, c.uid, c.respond_to?(:uid=), c.protected_methods.sort,
-       c.instance_variable_get(:@label), c.instance_variable_get(:@note)].inspect
+       c.instance_variable_get(:@label), c.instance_variable_get(:@note),
+       c.hsts, c.csp, c.referrer_policy, c.csp_report_only, c.respond_to?(:cookies), c.respond_to?(:csp=),
+       c.respond_to?(:hsts=), c.respond_to?(:cookies=), c.respond_to?(:referrer_policy=)].inspect
     end
   end
 end
 "#;
 
 /// What CRuby prints for `CountryDb::Country.report`.
-const EXPECTED: &str = r#"["CA", "{firstName}{lastName}", [], 1, 2, 3, "e@x", true, "s", nil, "u", false, [:subject=, :uid=], "l", "n"]"#;
+const EXPECTED: &str = r#"["CA", "{firstName}{lastName}", [], 1, 2, 3, "e@x", true, "s", nil, "u", false, [:subject=, :uid=], "l", "n", 1, 2, "same-origin", 4, false, false, true, true, true]"#;
 
 fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect()
@@ -118,6 +131,9 @@ fn a_splat_of_a_literal_list_constant_declares_each_name() {
         "uid=",
         "label=",
         "note=",
+        "referrer_policy=",
+        "hsts=",
+        "cookies=",
     ] {
         assert!(instance.contains(&name), "{name} not declared: {instance:?}");
     }
