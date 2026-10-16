@@ -276,6 +276,10 @@ struct Ctx {
     /// unlike an ordinary scope's, which prefixes the whole nesting.
     within: ResourceScope,
     inner_path: String,
+    /// Inside a `nested`/`namespace` block of a resource: the resource's
+    /// nesting is already folded into the path and name prefix, but Rails
+    /// still has a `parent_resource`, which names no action-less route.
+    under_resource: bool,
 }
 
 /// One enclosing resource.
@@ -422,8 +426,11 @@ fn static_path_name(path: &str) -> Option<String> {
 /// dot or a group has no action to name it, so it takes the scope's own
 /// name (`get "preview-store/:shop_id"` in `namespace :auth` is `auth`);
 /// the caller keeps only the first route to claim a name.
-fn own_path_name(path: &str, name_prefix: &str) -> Option<String> {
+fn own_path_name(path: &str, name_prefix: &str, under_resource: bool) -> Option<String> {
     let simple = path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/'));
+    if !simple && under_resource {
+        return None;
+    }
     let own = if simple { path.trim_start_matches('/').replace(['/', '-'], "_") } else { String::new() };
     // `get "/"` has no name of its own, so it takes the scope's.
     let name = if own.is_empty() {
@@ -579,7 +586,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     // `as` adds nothing (`free_themes`).
                     // A derived name is skipped when an earlier route holds it
                     // (`has_named_route?`).
-                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix)
+                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix, ctx.under_resource)
                         .filter(|n| !out.iter().any(|r| r.named && &r.as_name == n))
                     {
                         Some(n) => (n, true),
@@ -1008,6 +1015,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 child.name_prefix =
                     format!("{}{}", child.name_prefix, child.parent_name_prefix());
                 child.parents.clear();
+                child.under_resource = true;
             }
             // Resource nesting SURVIVES a scope/namespace boundary —
             // measured against Rails 8.1, which is the only authority
