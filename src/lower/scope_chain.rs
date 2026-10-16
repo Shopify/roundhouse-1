@@ -3685,10 +3685,47 @@ fn alias_join_in_chain(expr: &mut Expr, plain: &str, aliased: &str) -> bool {
     if matches!(method.as_str(), "joins" | "left_outer_joins" | "left_joins") {
         let kind = if method.as_str() == "joins" { "INNER JOIN" } else { "LEFT OUTER JOIN" };
         for a in args.iter_mut() {
-            let ExprNode::Lit { value: Literal::Str { value } } = &mut *a.node else { continue };
-            if *value == format!("{kind} {plain}") {
-                *value = format!("{kind} {aliased}");
-                return true;
+            let span = a.span;
+            match &mut *a.node {
+                ExprNode::Lit { value: Literal::Str { value } } if *value == format!("{kind} {plain}") => {
+                    *value = format!("{kind} {aliased}");
+                    return true;
+                }
+                // A hop onto a default-scoped model: the tail, then
+                // `#{Model._join_scope_sql}`, whose conditions name the
+                // table, so they are re-qualified with the alias as the
+                // runtime's `reflection_join_sql` does.
+                ExprNode::StringInterp { parts } => {
+                    let table = plain.split(' ').next().unwrap_or(plain);
+                    let alias = aliased.split(' ').nth(1).unwrap_or(aliased);
+                    let Some(crate::expr::InterpPart::Text { value }) = parts.first_mut() else { continue };
+                    if *value != format!("{kind} {plain}") {
+                        continue;
+                    }
+                    *value = format!("{kind} {aliased}");
+                    for part in parts.iter_mut() {
+                        let crate::expr::InterpPart::Expr { expr } = part else { continue };
+                        let mut scope = expr.clone();
+                        for (from, to) in [(format!("\"{table}\"."), format!("\"{alias}\".")), (format!("{table}."), format!("{alias}."))] {
+                            scope = syn(
+                                span,
+                                ExprNode::Send {
+                                    recv: Some(scope),
+                                    method: Symbol::from("gsub"),
+                                    args: vec![
+                                        syn(span, ExprNode::Lit { value: Literal::Str { value: from } }),
+                                        syn(span, ExprNode::Lit { value: Literal::Str { value: to } }),
+                                    ],
+                                    block: None,
+                                    parenthesized: true,
+                                },
+                            );
+                        }
+                        *expr = scope;
+                    }
+                    return true;
+                }
+                _ => {}
             }
         }
     }
