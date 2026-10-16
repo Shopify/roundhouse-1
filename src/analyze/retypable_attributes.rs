@@ -84,7 +84,6 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         names.extend(call_names);
     }
     for lc in sti_descendants(model, app) {
-        names.extend(lc.unknown_calls.iter().filter_map(|e| sti_serialized_column(e, table)).map(|c| c.as_str().to_string()));
         // The typed_store gem's `typed_store :col`, run in the subclass (its
         // body, or a Concern's `included do`), or reached through an app macro
         // (Core's `redactable_typed_store`): it calls `decorate_attributes`
@@ -94,6 +93,15 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         // in `included_block_statements` rather than the body calls.
         let side = ClassSide::of_sti_subclass(lc, model, app);
         let carried = app.included_block_statements.get(&lc.name).into_iter().flatten().map(|(_, e)| e);
+        // A `serialize :col, coder: JSON` in the body, or in a Concern's `included do`
+        // (Core's Payments::Vault::Credential::Shared::*), runs on the subclass.
+        names.extend(
+            lc.unknown_calls
+                .iter()
+                .chain(carried.clone())
+                .filter_map(|e| sti_serialized_column(e, table))
+                .map(|c| c.as_str().to_string()),
+        );
         for (_, call_names) in calls_reaching(&side, lc.unknown_calls.iter().chain(carried), "typed_store", true) {
             names.extend(call_names.into_iter().take(1));
         }

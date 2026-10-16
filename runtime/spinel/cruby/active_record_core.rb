@@ -1062,6 +1062,37 @@ module ActiveRecord
         true
       end
 
+      # locking/optimistic.rb `class_attribute :lock_optimistically, default:
+      # true` and `locking_column` (default "lock_version"): the class's own
+      # value once assigned, else its superclass's.
+      def lock_optimistically
+        return @lock_optimistically if @__lock_optimistically_assigned
+        return true if equal?(ActiveRecord::Base)
+        superclass.lock_optimistically
+      end
+
+      def lock_optimistically=(value)
+        @__lock_optimistically_assigned = true
+        @lock_optimistically = value
+      end
+
+      def locking_column
+        return @locking_column if @__locking_column_assigned
+        return "lock_version" if equal?(ActiveRecord::Base)
+        superclass.locking_column
+      end
+
+      def locking_column=(value)
+        @__locking_column_assigned = true
+        @locking_column = value.to_s
+      end
+
+      # Optimistic#locking_enabled?: `lock_optimistically && columns_hash
+      # .key?(locking_column)`, so a table without the column is unlocked.
+      def locking_enabled?
+        lock_optimistically && !abstract_class? && schema_columns.include?(locking_column.to_sym) ? true : false
+      end
+
       def belongs_to_required_by_default=(value)
         @belongs_to_required_by_default = value
       end
@@ -1069,6 +1100,10 @@ module ActiveRecord
       def belongs_to_required_by_default?
         !!belongs_to_required_by_default
       end
+    end
+
+    def locking_enabled?
+      self.class.locking_enabled?
     end
 
     include ActiveModel::AttributeAssignment

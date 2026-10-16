@@ -253,7 +253,9 @@ fn declared_spec(ty: &Symbol) -> Expr {
         "value" => spec("value", None),
         "time" => spec("time", None),
         "json" => spec("json", None),
-        other => unported(&format!("the `:{other}` attribute type")),
+        // A type an app registers (`ActiveRecord::Type.register(:suid, ...)`):
+        // looked up in the type registry when first read.
+        other => sp(ExprNode::Array { elements: vec![sym("registered"), str_lit(other)], style: ArrayStyle::Brackets }),
     }
 }
 

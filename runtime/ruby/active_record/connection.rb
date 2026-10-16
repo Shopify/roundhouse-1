@@ -1840,6 +1840,7 @@ module ActiveRecord
       when :bytea then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Bytea.new
       when :immutable_string then ActiveRecord::Type::ImmutableString.new
       when :value then ActiveRecord::Type::Value.new
+      when :registered then ActiveRecord::Type.lookup(spec[1].to_sym, adapter: ActiveRecord::Type.adapter_name_from(self))
       when :enum
         # enum.rb's `_enum`: the label => stored value HashWithIndifferentAccess,
         # frozen, over the column's type.
