@@ -5411,13 +5411,13 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 continue;
             };
             let mut hop_scopes = Vec::new();
-            let Some((joins, edge_table, edge_fk)) =
+            let Some((joins, edge)) =
                 resolve_through_chain(&app.models, model, thr_name, target, 0, &mut hop_scopes)
             else {
                 continue;
             };
             let join_sql = joins.join(" ");
-            let where_sql = format!("{edge_table}.{edge_fk} = ?");
+            let where_sql = edge.owner_condition();
 
             let Some(m) =
                 lc.methods.iter_mut().find(|m| {
@@ -5429,7 +5429,15 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             let assoc_scope = assoc_scope
                 .as_ref()
                 .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
-            m.body = through_reader_body(name, target, &join_sql, &where_sql, &hop_scopes, &assoc_scope);
+            m.body = through_reader_body(
+                name,
+                target,
+                &join_sql,
+                &where_sql,
+                &edge.owner_bind(),
+                &hop_scopes,
+                &assoc_scope,
+            );
         }
         // `has_one :x, through: :y`: the same join answering the one row
         // (activerecord has_one_through_association.rb), under the
@@ -5442,7 +5450,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 continue;
             };
             let mut hop_scopes = Vec::new();
-            let Some((joins, edge_table, edge_fk)) =
+            let Some((joins, edge)) =
                 resolve_through_chain(&app.models, model, thr_name, target, 0, &mut hop_scopes)
             else {
                 continue;
@@ -5460,7 +5468,8 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             let relation = through_relation_chain(
                 target,
                 &joins.join(" "),
-                &format!("{edge_table}.{edge_fk} = ?"),
+                &edge.owner_condition(),
+                &edge.owner_bind(),
                 &hop_scopes,
                 &assoc_scope,
             );
@@ -5486,12 +5495,54 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
     }
 }
 
+/// Where a `through:` chain ties back to its owner.
+enum ThroughEdge {
+    /// `table.fk` holds the owner's id: the join model is a `has_many`
+    /// or `has_one` of the owner.
+    Child { table: String, fk: Symbol },
+    /// `table.id` is the key the OWNER's `owner_fk` column holds: the
+    /// join model is a `belongs_to` of the owner (Core's
+    /// `BalanceTransaction`, `has_one :sp_order, through: :charge`).
+    Parent { table: String, owner_fk: Symbol },
+}
+
+impl ThroughEdge {
+    /// The WHERE fragment binding the owner's key (one `?`).
+    fn owner_condition(&self) -> String {
+        match self {
+            ThroughEdge::Child { table, fk } => format!("{table}.{fk} = ?"),
+            ThroughEdge::Parent { table, .. } => format!("{table}.id = ?"),
+        }
+    }
+
+    /// The owner attribute the `?` binds: its id, or the foreign key of
+    /// a `belongs_to` first hop.
+    fn owner_bind(&self) -> Symbol {
+        match self {
+            ThroughEdge::Child { .. } => Symbol::from("id"),
+            ThroughEdge::Parent { owner_fk, .. } => owner_fk.clone(),
+        }
+    }
+
+    /// The ON condition that joins `joined` (the model this edge's
+    /// chain is read from, as a nested hop) to the edge's table.
+    fn join_condition(&self, joined: &str) -> String {
+        match self {
+            ThroughEdge::Child { table, fk } => format!("{joined}.id = {table}.{fk}"),
+            ThroughEdge::Parent { table, owner_fk } => format!("{joined}.{owner_fk} = {table}.id"),
+        }
+    }
+}
+
 /// Resolve the SQL join chain for a `has_many :through` on `model`
 /// reaching `target` via the sibling association named `thr_name`.
 /// Returns the INNER JOIN fragments (target-nearest first, ready to
-/// `join(" ")`) plus the WHERE edge `(table, fk)` that points back at
-/// the owner's id. One recursion per indirection: a first hop that is
+/// `join(" ")`) plus the [`ThroughEdge`] that ties the chain back to
+/// the owner. One recursion per indirection: a first hop that is
 /// itself `:through`, or a join-model source association that is.
+/// The first hop may be a `belongs_to` (`has_one :order, through:
+/// :order_transaction`), whose edge is the through table's `id` keyed
+/// by the owner's foreign key rather than the owner's id.
 /// `None` when a hop can't be proven — missing join model, no
 /// `belongs_to`/`has_many`/through source matching the target class —
 /// and for pathological depth (cyclic `through:` declarations).
@@ -5502,7 +5553,7 @@ fn resolve_through_chain(
     target: &ClassId,
     depth: usize,
     hop_scopes: &mut Vec<Expr>,
-) -> Option<(Vec<String>, String, Symbol)> {
+) -> Option<(Vec<String>, ThroughEdge)> {
     use crate::dialect::Association;
 
     if depth > 4 {
@@ -5511,19 +5562,32 @@ fn resolve_through_chain(
     // The through association on the owner (`:votes`, `:taggings`,
     // `:tags`): a has_many, or a has_one (`has_many :x, through:
     // :primary_entity`), whose rows tie back to the owner by the same
-    // foreign key. Its scope narrows the join rows, as Rails' through
-    // scope chain merges every reflection's scope.
-    let (thr_target, thr_fk, thr_through, as_interface, thr_scope) = model.associations().find_map(|a| match a {
-        Association::HasMany { name, target, foreign_key, through, as_interface, scope, .. }
-            if name == thr_name =>
-        {
-            Some((target, foreign_key, through.as_ref(), as_interface, scope))
-        }
-        Association::HasOne { name, target, foreign_key, as_interface, scope, .. } if name == thr_name => {
-            Some((target, foreign_key, None, as_interface, scope))
-        }
-        _ => None,
-    })?;
+    // foreign key, or a plain belongs_to (`has_one :order, through:
+    // :order_transaction`), whose row the owner's foreign key names.
+    // Its scope narrows the join rows, as Rails' through scope chain
+    // merges every reflection's scope.
+    let (thr_target, thr_fk, thr_through, as_interface, thr_scope, belongs_to) =
+        model.associations().find_map(|a| match a {
+            Association::HasMany { name, target, foreign_key, through, as_interface, scope, .. }
+                if name == thr_name =>
+            {
+                Some((target, foreign_key, through.as_ref(), as_interface, scope, false))
+            }
+            Association::HasOne { name, target, foreign_key, as_interface, scope, .. } if name == thr_name => {
+                Some((target, foreign_key, None, as_interface, scope, false))
+            }
+            // A polymorphic target has no one table to join, and a
+            // `primary_key:` names a column other than the `id` the
+            // edge compares.
+            Association::BelongsTo { name, target, foreign_key, polymorphic: false, primary_key: None, .. }
+                if name == thr_name =>
+            {
+                static NO_INTERFACE: Option<Symbol> = None;
+                static NO_SCOPE: Option<Expr> = None;
+                Some((target, foreign_key, None, &NO_INTERFACE, &NO_SCOPE, true))
+            }
+            _ => None,
+        })?;
     if let Some(scope) = thr_scope {
         // Only a SQL-string condition is portable onto the target's
         // relation: a hash `where(primary: true)` would be qualified by
@@ -5534,8 +5598,14 @@ fn resolve_through_chain(
     }
     // How the join model's rows tie back to the owner: directly by the
     // sibling's fk, or through the sibling's own chain.
-    let (back_joins, edge_table, edge_fk) = match thr_through {
-        None => (Vec::new(), model_table_name(models, thr_target), thr_fk.clone()),
+    let (back_joins, edge) = match thr_through {
+        None if belongs_to => {
+            (Vec::new(), ThroughEdge::Parent { table: model_table_name(models, thr_target), owner_fk: thr_fk.clone() })
+        }
+        None => (
+            Vec::new(),
+            ThroughEdge::Child { table: model_table_name(models, thr_target), fk: thr_fk.clone() },
+        ),
         Some(inner) => resolve_through_chain(models, model, inner, thr_target, depth + 1, hop_scopes)?,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
@@ -5553,7 +5623,7 @@ fn resolve_through_chain(
             "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
         )];
         joins.extend(back_joins);
-        return Some((joins, edge_table, edge_fk));
+        return Some((joins, edge));
     }
     // The source is a plain `has_many` (or `has_one`, `readonly_has_one`)
     // on the join model, so the foreign key is on the TARGET table and
@@ -5582,23 +5652,26 @@ fn resolve_through_chain(
             "INNER JOIN {thr_table} ON {thr_table}.id = {target_table}.{src_fk}{owner_type}"
         )];
         joins.extend(back_joins);
-        return Some((joins, edge_table, edge_fk));
+        return Some((joins, edge));
     }
     // Nested: the join model reaches the target through its own
-    // `:through` association. Resolve that chain (phrased from the same
-    // target table), then graft the join model onto its owner edge.
+    // `:through` association (a `has_many` or a `has_one`). Resolve that
+    // chain (phrased from the same target table), then graft the join
+    // model onto its owner edge.
     let src_through = thr_model.associations().find_map(|a| match a {
-        Association::HasMany { target: t, through: Some(thru), .. } if t == target => Some(thru),
+        Association::HasMany { target: t, through: Some(thru), .. }
+        | Association::HasOne { target: t, through: Some(thru), .. }
+            if t == target =>
+        {
+            Some(thru)
+        }
         _ => None,
     })?;
-    let (src_joins, src_edge_table, src_edge_fk) =
-        resolve_through_chain(models, thr_model, src_through, target, depth + 1, hop_scopes)?;
+    let (src_joins, src_edge) = resolve_through_chain(models, thr_model, src_through, target, depth + 1, hop_scopes)?;
     let mut joins = src_joins;
-    joins.push(format!(
-        "INNER JOIN {thr_table} ON {thr_table}.id = {src_edge_table}.{src_edge_fk}{owner_type}"
-    ));
+    joins.push(format!("INNER JOIN {thr_table} ON {}{owner_type}", src_edge.join_condition(&thr_table)));
     joins.extend(back_joins);
-    Some((joins, edge_table, edge_fk))
+    Some((joins, edge))
 }
 
 /// The table a model reads: its own (`self.table_name`, a namespace's
@@ -5655,11 +5728,12 @@ fn through_reader_body(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    bind: &Symbol,
     hop_scopes: &[Expr],
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
-    let chain = through_relation_chain(target, join_sql, where_sql, hop_scopes, assoc_scope);
+    let chain = through_relation_chain(target, join_sql, where_sql, bind, hop_scopes, assoc_scope);
     // Last in the chain, after any scope graft: the scope's conditions
     // belong to the QUERY, and this hands the finished relation the
     // records an eager load already fetched.
@@ -5690,6 +5764,7 @@ fn through_relation_chain(
     target: &ClassId,
     join_sql: &str,
     where_sql: &str,
+    bind: &Symbol,
     hop_scopes: &[Expr],
     assoc_scope: &Option<Expr>,
 ) -> Expr {
@@ -5742,7 +5817,7 @@ fn through_relation_chain(
                         value: crate::expr::Literal::Str { value: where_sql.to_string() },
                     },
                 ),
-                Expr::new(span(), ExprNode::Ivar { name: Symbol::from("id") }),
+                Expr::new(span(), ExprNode::Ivar { name: bind.clone() }),
             ],
             block: None,
             parenthesized: true,

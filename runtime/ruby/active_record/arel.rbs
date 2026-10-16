@@ -1,5 +1,5 @@
 module Arel
-  def self.sql: (String fragment) -> String
+  def self.sql: (String fragment) -> Arel::Nodes::SqlLiteral
 
   def self.star: () -> String
 
@@ -60,6 +60,9 @@ module Arel
       def expr: () -> untyped
 
       def to_sql: () -> String
+    end
+
+    class SqlLiteral < String
     end
 
     class BoundSqlLiteral < NodeExpression

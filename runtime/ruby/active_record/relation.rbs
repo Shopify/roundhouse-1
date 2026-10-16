@@ -206,8 +206,8 @@ module ActiveRecord
     def out_of_range?: () -> bool
     def next_page: () -> Integer?
     def prev_page: () -> Integer?
-    def group: (*(String | Symbol) parts) -> Relation
-    def group!: (*(String | Symbol) parts) -> Relation
+    def group: (*(String | Symbol | Array[String | Symbol]) parts) -> Relation
+    def group!: (*(String | Symbol | Array[String | Symbol]) parts) -> Relation
     def having: (String condition, *untyped args) -> Relation
     def having!: (String condition, *untyped args) -> Relation
     def joins: (untyped spec) -> Relation
@@ -382,7 +382,7 @@ module ActiveRecord
     def destroy_all: () -> Array[Base]
     def destroy_by: (Hash[Symbol, untyped] | String conditions) -> Array[Base]
     def delete_by: (Hash[Symbol, untyped] | String conditions) -> Integer
-    def update_all: (Hash[Symbol, untyped] | String updates) -> Integer
+    def update_all: (Hash[Symbol, untyped] | String | Array[untyped] updates) -> Integer
     def touch_all: (?Symbol? name) -> Integer
     # The WHERE a bulk write takes — a plain clause, or an
     # `IN (SELECT …)` subquery when the scope carries a join.

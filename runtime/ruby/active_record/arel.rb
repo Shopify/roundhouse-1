@@ -1,12 +1,14 @@
 # Arel — the raw-SQL corner of ActiveRecord's query surface, sized to the
 # string-composed Relation runtime: a "fragment" here IS its SQL text.
-# `Arel.sql(...)` marks a caller-authored fragment (identity — Relation
-# already treats string conditions as raw SQL), and `Relation#arel` wraps
+# `Arel.sql(...)` marks a caller-authored fragment (a String subclass,
+# `Arel::Nodes::SqlLiteral`, so it still reads as its text — Relation
+# already treats string conditions as raw SQL — while `order` can tell
+# it from a column name), and `Relation#arel` wraps
 # the relation's SELECT so `.exists` can splice it into an enclosing
 # WHERE as a correlated subquery (`where.not(<rel>.arel.exists)`).
 module Arel
   def self.sql(fragment)
-    fragment
+    Nodes::SqlLiteral.new(fragment)
   end
 
   # The `*` projection, for `arel_table.project(Arel.star)`.
@@ -99,6 +101,14 @@ module Arel
       def initialize(expr)
         @expr = expr
       end
+    end
+
+    # What `Arel.sql("…")` answers: the fragment itself, marked. Rails'
+    # `order` refuses a String that is not a column name but takes a
+    # SqlLiteral as written, however it reached the call (a constant
+    # `CREATION_ORDER = Arel.sql("COALESCE(a, 0) ASC, id ASC")`, not
+    # only a literal at the call site).
+    class SqlLiteral < String
     end
 
     # `(<expr>)`, its operand a SQL fragment or anything with `to_sql`.
