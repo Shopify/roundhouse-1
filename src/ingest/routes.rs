@@ -671,6 +671,40 @@ fn ingest_literal_engine_mount(
     })
 }
 
+/// A mount that is not composed still names a route when it has a literal
+/// `as:` (`mount SecurityReports::Engine, at: "/", as: :reports`, or the
+/// hashrocket `mount Engine => "/dashboard", as: :developer_dashboard`):
+/// keep its URL helper as an endpoint that is refused by name, so callers of
+/// the helper resolve while requests to the mount are not silently served.
+fn named_mount_endpoint(call: &ruby_prism::CallNode<'_>) -> Option<RouteSpec> {
+    let args = call.arguments()?;
+    let (mut at, mut as_name) = (None, None);
+    for arg in args.arguments().iter() {
+        let Some(hash) = arg.as_keyword_hash_node() else { continue };
+        for el in hash.elements().iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            match symbol_value(&assoc.key()).as_deref() {
+                Some("at") => at = string_value(&assoc.value()),
+                Some("as") => as_name = symbol_or_string_value(&assoc.value()),
+                // `Engine => "/path"`.
+                None => at = at.or_else(|| string_value(&assoc.value())),
+                Some(_) => {}
+            }
+        }
+    }
+    let path = at?;
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    Some(RouteSpec::Explicit {
+        method: HttpMethod::Get,
+        path,
+        controller: ClassId(Symbol::from(UNMODELED_ENDPOINT_CONTROLLER)),
+        action: Symbol::from("mounted Rack application"),
+        as_name: Some(Symbol::from(as_name?.as_str())),
+        constraints: IndexMap::new(),
+        scope: ResourceScope::Nested,
+    })
+}
+
 /// Reject helper calls that would require Rails' engine-specific route helper
 /// proxy. Scan host and engine sources separately so valid host helpers keep
 /// their meaning while engine and mounted-proxy helpers remain explicit gaps.
@@ -2147,7 +2181,7 @@ fn ingest_route_call(
             if cx.mount_scope_depth.get() == 0 && runtime_cable_mount(call) {
                 return Ok(None);
             }
-            Ok(ingest_literal_engine_mount(call, file, cx))
+            Ok(ingest_literal_engine_mount(call, file, cx).or_else(|| named_mount_endpoint(call)))
         }
         // `direct :fresh_user_avatar do |user, options| … end` — a
         // custom URL helper, not a route: it adds no path to the table,
