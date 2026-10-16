@@ -329,6 +329,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
     let path_params = if helpers.is_empty() {
         Default::default()
     } else {
+        super::route_url_options::bare_url_helper_receivers(app, &helpers);
         super::route_url_options::helper_path_params(app)
     };
     let enum_map = super::enum_symbols::Maps::of(app);

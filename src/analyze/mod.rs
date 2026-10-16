@@ -1755,6 +1755,9 @@ impl Analyzer {
                 // TimeHelpers) is resolved here and gated per target by
                 // `project` (report_unsupported_runtime_reads).
                 let known = self.classes.contains_key(included)
+                    // The ingest's marker for `include Rails.application.routes.
+                    // url_helpers`: the generated RouteHelpers module.
+                    || included.0.as_str() == "RouteHelpers"
                     || (!rooted && body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str())
                     // A Ruby-family runtime port's module

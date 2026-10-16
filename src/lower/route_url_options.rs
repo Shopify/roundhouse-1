@@ -95,6 +95,7 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
     if helpers.is_empty() {
         return;
     }
+    bare_url_helper_receivers(app, &helpers);
     let params = helper_path_params(app);
     super::for_each_hook_body(app, &mut |e| position_path_params(e, &params));
     for view in &mut app.views {
@@ -117,6 +118,56 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
         for m in &mut tm.helpers {
             rewrite(&mut m.body, &helpers);
         }
+    }
+}
+
+/// `UrlHelpers.admin_export_download_url(token: t, filename: f, host: h)`
+/// is the bare helper call: a class that singleton-includes
+/// `Rails.application.routes.url_helpers` (the include is recorded as
+/// RouteHelpers, Core's `UrlHelpers`) answers every named route helper, so
+/// the receiver adds nothing. Dropping it hands the call to the passes
+/// below that spell path params positionally and ground `host:` /
+/// `protocol:`; left qualified, the emit retargeted it to `RouteHelpers`
+/// afterwards and the keyword path params reached a positional helper.
+pub(crate) fn bare_url_helper_receivers(app: &mut App, helpers: &crate::det::HashSet<String>) {
+    let classes: crate::det::HashSet<Symbol> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers"))
+        .map(|lc| lc.name.0.clone())
+        .collect();
+    if classes.is_empty() {
+        return;
+    }
+    let strip = &mut |e: &mut Expr| strip_receivers(e, &classes, helpers);
+    super::for_each_hook_body(app, strip);
+    for view in &mut app.views {
+        strip_receivers(&mut view.body, &classes, helpers);
+    }
+    for tm in &mut app.test_modules {
+        if let Some(setup) = &mut tm.setup {
+            strip_receivers(setup, &classes, helpers);
+        }
+        for t in &mut tm.tests {
+            strip_receivers(&mut t.body, &classes, helpers);
+        }
+        for m in &mut tm.helpers {
+            strip_receivers(&mut m.body, &classes, helpers);
+        }
+    }
+}
+
+fn strip_receivers(
+    expr: &mut Expr,
+    classes: &crate::det::HashSet<Symbol>,
+    helpers: &crate::det::HashSet<String>,
+) {
+    expr.node.for_each_child_mut(&mut |c| strip_receivers(c, classes, helpers));
+    let ExprNode::Send { recv, method, .. } = &mut *expr.node else { return };
+    let Some(r) = recv else { return };
+    let ExprNode::Const { path } = &*r.node else { return };
+    if path.len() == 1 && classes.contains(&path[0]) && helpers.contains(method.as_str()) {
+        *recv = None;
     }
 }
 
