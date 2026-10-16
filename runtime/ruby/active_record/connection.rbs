@@ -157,7 +157,7 @@ module ActiveRecord
     def self.insert_all!: (Array[Hash[Symbol, untyped]] rows, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
     def self.insert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
     def self.insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
-    def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, untyped returning, bool? record_timestamps) -> ActiveRecord::Result
+    def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, (Array[String | Symbol] | String | false)? returning, bool? record_timestamps) -> ActiveRecord::Result
     def self._upsert_rows: (Array[Hash[Symbol, untyped]] rows, (String | Symbol | Array[Symbol])? unique_by, String? on_duplicate, (String | Symbol | Array[Symbol | String])? update_only, untyped returning, ?bool? record_timestamps) -> ActiveRecord::Result
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
@@ -216,7 +216,7 @@ module ActiveRecord
     def self._quoted_time: (::Time time) -> String
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
-    def self._bytea_value: (String name, untyped value) -> untyped
+    def self._bytea_column?: (String name) -> bool
     def self._primary_key_from_database: (untyped value) -> untyped
     def update_column: (String | Symbol name, untyped value, ?touch: untyped) -> bool
     def update_columns: (Hash[String | Symbol, untyped] attributes) -> bool

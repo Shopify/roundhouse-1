@@ -1109,12 +1109,13 @@ module ActiveRecord
       # `returning: %w[id]` / `[:id]` names columns, a String is raw SQL
       # (`Arel.sql("id, (created_at = updated_at) AS was_inserted")`),
       # false/nil asks for nothing.
-      returned = nil #: untyped
+      returned = nil #: String?
       returned_names = [] #: Array[String]
-      if returning
-        listed = returning.is_a?(Array) ? returning : [returning] #: untyped
-        returned = listed.map { |c| c.to_s }.join(", ")
-        returned_names = listed.map { |c| c.to_s } if returning.is_a?(Array)
+      if returning.is_a?(Array)
+        returned_names = returning.map { |c| c.to_s }
+        returned = returned_names.join(", ")
+      elsif returning.is_a?(String)
+        returned = returning
       end
 
       # Rails stringifies the keys: `{"id" => nil}` from `attributes` and a
@@ -1736,28 +1737,26 @@ module ActiveRecord
     
     def self._attribute_serialize(name, value)
       type = _declared_attribute_types[name]
-      return type ? _bind_type_cast(name, type.serialize(value)) : _bytea_value(name, value)
+      return type ? _bind_type_cast(name, type.serialize(value)) : (_bytea_column?(name) && !value.is_a?(ActiveModel::Type::Binary::Data) ? type_for_attribute(name).serialize(value) : value)
     end
 
     # A PostgreSQL bytea column with no declared type still writes and
     # compares as bytes (Binary::Data, which the adapter quotes as a bytea
     # literal); the column's type decides, never the String's encoding.
-    def self._bytea_value(name, value)
-      return value if value.nil? || value.is_a?(ActiveModel::Type::Binary::Data)
+    def self._bytea_column?(name)
       spec = begin
         schema_column_types[name]
       rescue NotImplementedError
         nil
       end
-      return value unless spec && spec[0] == :bytea
-      type_for_attribute(name).serialize(value)
+      !spec.nil? && spec[0] == :bytea
     end
     
     # A value from outside (a where/update_all/exists? argument): cast,
     # then serialized, as QueryAttribute#value_for_database does.
     def self._attribute_for_database(name, value)
       type = _declared_attribute_types[name]
-      return type ? _bind_type_cast(name, type.serialize(type.cast(value))) : _bytea_value(name, value)
+      return type ? _bind_type_cast(name, type.serialize(type.cast(value))) : (_bytea_column?(name) && !value.is_a?(ActiveModel::Type::Binary::Data) ? type_for_attribute(name).serialize(value) : value)
     end
     
     # predicate_builder.rb's `force_equality?` test for a hash condition
