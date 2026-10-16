@@ -73,7 +73,7 @@ module SequencedColumn
   private
 
   def _sequenced_log(message)
-    log = respond_to?(:logger) ? logger : nil
+    log = self.class.respond_to?(:logger) ? self.class.logger : nil
     log.info(message) if log
   end
 
