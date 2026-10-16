@@ -1164,7 +1164,7 @@ fn answer_file(
         if let Some(ResolvedConstant::Value { declaration, .. }) = &target
             && !path_reference
             && graph.names().get(reference.name_id())
-                .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None))
+                .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None | ParentScope::Some(_)))
         {
             bare_values.push((offset.start(), *reference.name_id(), *declaration));
         }
@@ -1520,7 +1520,11 @@ fn reresolve_own_value_reads(
             continue;
         }
         let Some(name) = graph.names().get(&name_id) else { continue };
-        match lookup_without(graph, name.str(), *name.nesting(), declaration) {
+        let lookup = match name.parent_scope() {
+            ParentScope::Some(parent) => lookup_scoped_without(graph, name.str(), *parent, declaration),
+            _ => lookup_without(graph, name.str(), *name.nesting(), declaration),
+        };
+        match lookup {
             Lookup::Found(id) => {
                 answers.references.insert(start, resolved_constant(graph, id, class_cache));
             }
@@ -1590,38 +1594,8 @@ enum Lookup {
 /// scopes, then the innermost scope's ancestors, then `Object`'s for a
 /// module or the top level) with `skip` left out of every scope.
 fn lookup_without(graph: &Graph, str_id: &StringId, nesting: Option<NameId>, skip: DeclarationId) -> Lookup {
-    let member = |namespace: &DeclarationId| {
-        graph.declarations().get(namespace)
-            .and_then(Declaration::as_namespace)
-            .and_then(|namespace| namespace.member(str_id))
-            .copied()
-            .filter(|member| *member != skip)
-    };
-    let ancestors = |namespace: &DeclarationId| {
-        let Some(chain) = graph.declarations().get(namespace).and_then(Declaration::as_namespace)
-            .map(|namespace| namespace.ancestors())
-        else {
-            return Lookup::Unknown;
-        };
-        let partial = matches!(chain, Ancestors::Partial(_));
-        for ancestor in chain.iter() {
-            match ancestor {
-                Ancestor::Complete(id) => {
-                    if let Some(found) = member(id) {
-                        return Lookup::Found(found);
-                    }
-                }
-                // Rubydex stops at an unresolved ancestor unless it is
-                // the name being looked up.
-                Ancestor::Partial(name) => {
-                    if partial && graph.names().get(name).is_none_or(|name| name.str() != str_id) {
-                        return Lookup::Unknown;
-                    }
-                }
-            }
-        }
-        if partial { Lookup::Unknown } else { Lookup::Missing }
-    };
+    let member = |namespace: &DeclarationId| member_without(graph, str_id, namespace, skip);
+    let ancestors = |namespace: &DeclarationId| ancestors_without(graph, str_id, namespace, skip);
     let object = DeclarationId::from("Object");
     let Some(innermost) = nesting else {
         return ancestors(&object);
@@ -1655,6 +1629,58 @@ fn lookup_without(graph: &Graph, str_id: &StringId, nesting: Option<NameId>, ski
         Some(Declaration::Namespace(Namespace::Module(_) | Namespace::Todo(_)))
     );
     if module { ancestors(&object) } else { Lookup::Missing }
+}
+
+/// `namespace`'s own member `str_id`, other than `skip`.
+fn member_without(graph: &Graph, str_id: &StringId, namespace: &DeclarationId, skip: DeclarationId) -> Option<DeclarationId> {
+    graph.declarations().get(namespace)
+        .and_then(Declaration::as_namespace)
+        .and_then(|namespace| namespace.member(str_id))
+        .copied()
+        .filter(|member| *member != skip)
+}
+
+/// The first of `namespace`'s ancestors (prepends first) that has a
+/// member `str_id` other than `skip`.
+fn ancestors_without(graph: &Graph, str_id: &StringId, namespace: &DeclarationId, skip: DeclarationId) -> Lookup {
+    let Some(chain) = graph.declarations().get(namespace).and_then(Declaration::as_namespace)
+        .map(|namespace| namespace.ancestors())
+    else {
+        return Lookup::Unknown;
+    };
+    let partial = matches!(chain, Ancestors::Partial(_));
+    for ancestor in chain.iter() {
+        match ancestor {
+            Ancestor::Complete(id) => {
+                if let Some(found) = member_without(graph, str_id, id, skip) {
+                    return Lookup::Found(found);
+                }
+            }
+            // Rubydex stops at an unresolved ancestor unless it is
+            // the name being looked up.
+            Ancestor::Partial(name) => {
+                if partial && graph.names().get(name).is_none_or(|name| name.str() != str_id) {
+                    return Lookup::Unknown;
+                }
+            }
+        }
+    }
+    if partial { Lookup::Unknown } else { Lookup::Missing }
+}
+
+/// The lookup of a qualified reference `Owner::Name` (`parent` names
+/// `Owner`) with `skip` left out: Owner's ancestors, as `Owner::Name`
+/// reads them. A module that `Owner` prepends is first among them, so
+/// `Semian::TaxService::ResourceBusyError = ::TaxServiceClient::ResourceBusyError`
+/// (TaxServiceClient prepends Semian::TaxService) otherwise resolves to
+/// the constant it is defining.
+fn lookup_scoped_without(graph: &Graph, str_id: &StringId, parent: NameId, skip: DeclarationId) -> Lookup {
+    let Some(owner) = graph.name_id_to_declaration_id(parent)
+        .map(|declaration| graph.resolve_alias(declaration).unwrap_or(*declaration))
+    else {
+        return Lookup::Unknown;
+    };
+    ancestors_without(graph, str_id, &owner, skip)
 }
 
 /// What Ruby binds an unresolved constant reference to through
