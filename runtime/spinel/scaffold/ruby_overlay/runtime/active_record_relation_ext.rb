@@ -167,6 +167,45 @@ module ActiveRecord
   end
   Relation.prepend(RelationJoinsValues)
 
+  # Rails' `Relation#from_clause`: always a FromClause (never nil), its
+  # `value` the source `from` was given (nil when the relation has none).
+  # Core's `Pagination::SqlPaginationBackend#ignore_index_for_id_sort`
+  # reads `scope.from_clause.value` to see whether an index hint is
+  # already spelled into the FROM. The shared relation keeps the source
+  # in `@from` (a subquery as its rendered SQL), so this answers it
+  # without a second copy.
+  module RelationFromClause
+    FromClause = Struct.new(:value) do
+      def empty?
+        value.nil?
+      end
+    end
+
+    def from_clause
+      FromClause.new(@from)
+    end
+  end
+  Relation.prepend(RelationFromClause)
+
+  # `relation.map` / `collect` with no block is the records' Enumerator
+  # (Rails delegates Enumerable to `records`), so `results.map.with_index
+  # { |row, i| ... }` (Core's `SqlPaginationBackend#raw_results_map_with_
+  # index`) numbers the rows. The shared relation's `map` is the blocked
+  # form only: with no block its `yield` raises LocalJumpError, or on an
+  # empty relation answers `[]`, which has no `with_index`.
+  module RelationBlocklessMap
+    def map(&block)
+      return loaded_records.map unless block
+      super
+    end
+
+    def collect(&block)
+      return loaded_records.map unless block
+      super
+    end
+  end
+  Relation.prepend(RelationBlocklessMap)
+
   # Join aliasing by a where hash's key. Reflections are dynamic in Rails
   # (an emitted per-model object answering `through_reflection?`,
   # `polymorphic?`, `klass`, ...) and the shared runtime does not type
@@ -185,6 +224,11 @@ module ActiveRecord
       return if @joins.empty? || !@model.respond_to?(:reflect_on_association)
       keys.each do |key|
         reflection = @model.reflect_on_association(key.to_sym)
+        # A key that is no association of this model may name a hop below
+        # the first (`joins(conditions: :owner_market_definition)` then
+        # `where.not(owner_market_definition: {...})`), as Rails finds it
+        # in its join dependencies.
+        alias_nested_join_hop(key.to_sym) if reflection.nil?
         next unless alias_join_reflection?(@model, reflection)
         ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
           plain = reflection_join_sql(@model, reflection, kind)
@@ -196,10 +240,79 @@ module ActiveRecord
       end
     end
 
+    # The pre-rendered join of a hop reached through other hops
+    # (`joins(a: :b)` expands to one SQL string at compile time, the hop
+    # `b` under its table name) is re-rendered aliased to `b`, in place,
+    # when a where hash then keys off `b`. The hop is found by walking the
+    # associations down from this model (as far as a `joins` hash nests in
+    # practice) for one named `name` whose plain SQL is in the join text.
+    def alias_nested_join_hop(name)
+      seen = [@model]
+      level = [@model]
+      3.times do
+        following = []
+        level.each do |owner|
+          next unless owner.respond_to?(:_association_names)
+          owner._association_names.each do |assoc|
+            reflection = owner.reflect_on_association(assoc)
+            next if reflection.nil?
+            target = joinable_target(reflection)
+            next if target.nil?
+            if assoc.to_sym == name && alias_join_reflection?(owner, reflection)
+              alias_join_hop(owner, reflection, name.to_s)
+            end
+            next if seen.include?(target)
+            seen << target
+            following << target
+          end
+        end
+        level = following
+      end
+    end
+
+    # The class a join through `reflection` lands on, or nil where the
+    # walk cannot go: a polymorphic or habtm association, a class the app
+    # does not define or has not loaded yet (the walk follows the joins
+    # already built, whose models are loaded, rather than loading the
+    # app's whole association graph), an option the compiler did not carry
+    # (each of which `joins` itself refuses by name when asked for).
+    def joinable_target(reflection)
+      return nil if reflection.macro == :has_and_belongs_to_many || reflection.polymorphic?
+      return nil unless loaded_constant?(reflection.class_name)
+      reflection.klass
+    rescue NameError, NotImplementedError
+      nil
+    end
+
+    def loaded_constant?(name)
+      scope = Object
+      name.to_s.delete_prefix("::").split("::").each do |part|
+        return false if !scope.const_defined?(part, false) || scope.autoload?(part)
+        scope = scope.const_get(part, false)
+      end
+      true
+    end
+
+    # The compiler writes a hop's tables unquoted (`INNER JOIN
+    # market_definitions ON market_definitions.id = ...`) where
+    # `reflection_join_sql` quotes them, so the hop is matched with its
+    # quotes optional.
+    def alias_join_hop(owner, reflection, key)
+      ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
+        plain = reflection_join_sql(owner, reflection, kind)
+        pattern = Regexp.new(Regexp.escape(plain).gsub('"', '"?'))
+        index = @joins.index { |frag| frag.match?(pattern) }
+        next if index.nil?
+        aliased = reflection_join_sql(owner, reflection, kind, key)
+        own_lists
+        @joins[index] = @joins[index].sub(pattern) { aliased }
+      end
+    end
+
     # A hop `where(<name>: {...})` can alias: a direct, unscoped,
     # non-polymorphic association whose name is not its table's.
     def alias_join_reflection?(owner, reflection)
-      return false if reflection.nil? || !owner.equal?(@model)
+      return false if reflection.nil?
       return false if reflection.through_reflection? || reflection.polymorphic?
       return false if reflection.macro == :has_and_belongs_to_many || reflection._roundhouse_scoped?
       reflection.name.to_s != reflection.klass.table_name.to_s

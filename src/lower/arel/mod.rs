@@ -222,6 +222,13 @@ fn is_id_finder(method: &str, args: &[Expr]) -> bool {
     method == "find" && !args.is_empty()
 }
 
+/// A bare `take` reads one record (`LIMIT 1`, no key order) and is the
+/// has_one reader's finder. Array answers `take(n)` only, so a chain
+/// hydrated for it would strand `take` on the Array (ArgumentError).
+fn is_bare_take(method: &str, args: &[Expr]) -> bool {
+    method == "take" && args.is_empty()
+}
+
 /// `find_by_<attr>` / `find_by_<attr>!` — Rails synthesizes one of these
 /// per column. `find_by_` alone (no attribute) isn't a real finder.
 fn is_dynamic_finder(method: &str) -> bool {
@@ -403,7 +410,8 @@ fn collect_relation_refined_names(
     if let ExprNode::Send { recv: Some(r), method, args, block, .. } = expr.node.as_ref() {
         if let ExprNode::Ivar { name } | ExprNode::Var { name, .. } = r.node.as_ref() {
             if requires_relation_receiver(method.as_str())
-                || (block.is_none() && is_id_finder(method.as_str(), args))
+                || (block.is_none()
+                    && (is_id_finder(method.as_str(), args) || is_bare_take(method.as_str(), args)))
             {
                 out.always.insert(name.clone());
             } else if scopes.contains(method) {
@@ -538,6 +546,7 @@ fn rewrite_arel_inner(
         ExprNode::Send { recv: Some(_), block: None, method, args, .. }
             if requires_relation_receiver_or_scope(method, scopes)
                 || is_id_finder(method.as_str(), args)
+                || is_bare_take(method.as_str(), args)
     );
     if unlifted_relation_consumer {
         let mut changed = normalize_dynamic_finder_send(expr, registry);

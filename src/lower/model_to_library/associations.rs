@@ -1011,7 +1011,12 @@ fn graft_scope(scope: &Expr, base: Expr) -> Expr {
 /// same load-once cache guard has_many uses so `includes` / `preload`
 /// and an assigned writer stash share one contract:
 /// `def moderation; return @moderation_cache if @moderation_loaded;
-/// Moderation.where(comment_id: @id).first; end`
+/// Moderation.where(comment_id: @id).take; end`
+///
+/// `take`, not `first`: Rails' singular association reads `LIMIT 1` with
+/// no key order of its own (`scope.take`), so a `-> { select(:subject_id)
+/// .distinct }` scope stays valid on PostgreSQL, which refuses the
+/// `ORDER BY <key>` that `first` adds to a SELECT DISTINCT.
 fn synth_has_one_reader(
     owner: &ClassId,
     name: &Symbol,
@@ -1062,7 +1067,7 @@ fn synth_has_one_reader(
         Span::synthetic(),
         ExprNode::Send {
             recv: Some(query),
-            method: Symbol::from("first"),
+            method: Symbol::from("take"),
             args: vec![],
             block: None,
             parenthesized: false,

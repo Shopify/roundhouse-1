@@ -153,8 +153,12 @@ module ActiveRecord
 
       # The in-place body: `order` spawns and calls it, `reorder!` clears
       # the orders and calls it, and default-scope lowering calls it.
+      #
+      # Rails flattens its arguments (`order([a.asc, b.desc])`, `order(*list)`
+      # alike), so an Array of nodes is read term by term.
       def order!(*parts)
-        return super unless parts.any? { |part| arel_tree?(part) }
+        parts = parts.flatten
+        return super(*parts) unless parts.any? { |part| arel_tree?(part) }
 
         parts.each do |part|
           if arel_tree?(part)
