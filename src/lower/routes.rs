@@ -407,12 +407,12 @@ fn static_path_name(path: &str) -> Option<String> {
 /// scope's `as` prefix plus the route's own path, only when that path is
 /// plain words, `-` and `/` (`add_route`'s `/^[\w\-\/]+$/`) and the result
 /// starts with a letter or underscore. A path with a dynamic segment, a
-/// dot or a group names nothing.
+/// dot or a group has no action to name it, so it takes the scope's own
+/// name (`get "preview-store/:shop_id"` in `namespace :auth` is `auth`);
+/// the caller keeps only the first route to claim a name.
 fn own_path_name(path: &str, name_prefix: &str) -> Option<String> {
-    if !path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/')) {
-        return None;
-    }
-    let own = path.trim_start_matches('/').replace(['/', '-'], "_");
+    let simple = path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/'));
+    let own = if simple { path.trim_start_matches('/').replace(['/', '-'], "_") } else { String::new() };
     // `get "/"` has no name of its own, so it takes the scope's.
     let name = if own.is_empty() {
         name_prefix.trim_end_matches('_').to_string()
@@ -549,7 +549,11 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     // `scope "api/:version_handle", as: :versioned` is
                     // `versioned_free_themes`, and a `scope "foo"` with no
                     // `as` adds nothing (`free_themes`).
-                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix) {
+                    // A derived name is skipped when an earlier route holds it
+                    // (`has_named_route?`).
+                    None if ctx.parents.is_empty() => match own_path_name(path, &ctx.name_prefix)
+                        .filter(|n| !out.iter().any(|r| r.named && &r.as_name == n))
+                    {
                         Some(n) => (n, true),
                         None => (action.as_str().to_string(), false),
                     },
@@ -960,7 +964,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             // scope and wrong for a `nested` one — campfire's bot API
             // is `/rooms/:room_id/:bot_key/messages`, not
             // `/:bot_key/rooms/:room_id/messages`.
-            if *nest && !child.parents.is_empty() {
+            if *nest && child.within.is_nested() && !child.parents.is_empty() {
                 let (nested_prefix, _) =
                     nest_path("", &child.parents, ResourceScope::Nested);
                 // `nest_path` slash-prefixes a bare path, so the empty
@@ -995,7 +999,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             if let Some(p) = path {
                 let segment = format!("/{}", p.trim_matches('/'));
                 if child.within.is_nested() {
-                    child.ns_path = prefix_path(&ctx.ns_path, &segment);
+                    child.ns_path = prefix_path(&child.ns_path, &segment);
                 } else {
                     child.inner_path = prefix_path(&ctx.inner_path, &segment);
                 }

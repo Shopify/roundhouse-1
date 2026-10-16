@@ -2376,7 +2376,10 @@ fn ingest_namespace_route(
         module,
         as_prefix,
         defaults: IndexMap::new(),
-        nest: false,
+        // Rails' `namespace` inside a `resources` block is `nested { super }`:
+        // the parent's `/shops/:shop_id` (and `shop_` name) lands BEFORE the
+        // namespace's own segment, unlike a plain `scope`.
+        nest: true,
         suppress_helpers: false, within: ResourceScope::Nested,
         entries,
     })
