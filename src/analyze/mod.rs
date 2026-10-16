@@ -9441,8 +9441,14 @@ pub(crate) fn controller_includes(controller: &Controller) -> Vec<ClassId> {
 /// accepted gap rather than a blocker: no controller in this
 /// codebase's fixtures collides that way.
 pub(crate) fn controller_include_groups(controller: &Controller) -> Vec<Vec<ClassId>> {
+    controller_include_positions(controller).into_iter().map(|(_, group)| group).collect()
+}
+
+/// The same groups with the body index of the `include` / `prepend`
+/// statement each came from.
+pub(crate) fn controller_include_positions(controller: &Controller) -> Vec<(usize, Vec<ClassId>)> {
     let mut out = Vec::new();
-    for item in &controller.body {
+    for (at, item) in controller.body.iter().enumerate() {
         let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
         if !matches!(method.as_str(), "include" | "prepend") {
@@ -9455,7 +9461,7 @@ pub(crate) fn controller_include_groups(controller: &Controller) -> Vec<Vec<Clas
             }
         }
         if !group.is_empty() {
-            out.push(group);
+            out.push((at, group));
         }
     }
     out

@@ -106,3 +106,35 @@ fn a_guarded_around_wraps_the_filters_after_it_under_its_guard() {
     assert!(guard < wrap && wrap < late, "{rooms}");
     assert_eq!(rooms.matches("late\n").count(), 2, "{rooms}");
 }
+
+/// A concern's `included do before_action … end` registers where the
+/// `include` stands, not ahead of the class body: Core's
+/// AdminAreaController writes `around_action :with_shop`, then
+/// `include LoginProtection` (whose `authenticate_request` is a before
+/// callback), so the authentication runs inside `with_shop`.
+#[test]
+fn a_concern_filter_registers_where_the_include_stands() {
+    let concern = "module Guarded\n  extend ActiveSupport::Concern\n\n  included do\n    before_action :authenticate\n  end\nend\n";
+    let rooms_src = "class RoomsController < BaseController\n  before_action :early\n  around_action :with_shop\n  include Guarded\n  before_action :late\n\n  def index\n  end\nend\n";
+    let files: Vec<(&str, &str)> = vec![
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+        ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+        ("app/controllers/base_controller.rb", BASE),
+        ("app/controllers/concerns/guarded.rb", concern),
+        ("app/controllers/rooms_controller.rb", rooms_src),
+        ("config/routes.rb", "Rails.application.routes.draw do\n  resources :rooms, only: [:index]\nend\n"),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        files.into_iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let rooms = ruby::emit_lowered_controllers(&app)
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("rooms_controller.rb"))
+        .map(|f| f.content.clone())
+        .expect("rooms_controller.rb");
+    let at = |needle: &str| rooms.find(needle).unwrap_or_else(|| panic!("{needle}\n{rooms}"));
+    let (early, shop, authenticate, late) =
+        (at("early"), at("with_shop do"), at("authenticate"), at("late"));
+    assert!(early < shop && shop < authenticate && authenticate < late, "{rooms}");
+}

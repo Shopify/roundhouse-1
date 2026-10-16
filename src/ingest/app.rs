@@ -5871,7 +5871,18 @@ fn splice_concerns_into_controllers(app: &mut App) {
         // `include AllowBrowser, Authentication, …, VersionHeaders`
         // therefore runs `set_version_headers` first and `allow_browser`
         // last; the chain used to list them the other way round.
-        let filter_order = filter_registration_order(&include_groups, &module_includes);
+        let positions = crate::analyze::controller_include_positions(controller);
+        // The modules each `include` statement registers: the order over
+        // the statements up to it, less what the earlier ones had.
+        let mut registered_at: HashMap<usize, Vec<crate::ident::ClassId>> = HashMap::default();
+        let mut registered = 0;
+        for (k, (at, _)) in positions.iter().enumerate() {
+            let groups: Vec<Vec<crate::ident::ClassId>> =
+                positions[..=k].iter().map(|(_, g)| g.clone()).collect();
+            let order = filter_registration_order(&groups, &module_includes);
+            registered_at.insert(*at, order[registered..].to_vec());
+            registered = order.len();
+        }
         // Transitive closure, in include order.
         let mut queue = includes;
         let mut seen: std::collections::BTreeSet<crate::ident::ClassId> =
@@ -5896,46 +5907,59 @@ fn splice_concerns_into_controllers(app: &mut App) {
             })
             .collect();
 
+        // Each concern's filters land right behind the `include` that
+        // brought them: an `around_action` the class wrote ahead of the
+        // include wraps them, one written after it sits inside them
+        // (ActiveSupport's chain is one list in registration order).
+        // `filters` is the finished body, so a block filter's sentinel
+        // below carries its final body index.
+        let mut body = std::mem::take(&mut controller.body);
         let mut filters: Vec<ControllerBodyItem> = Vec::new();
         let mut methods: Vec<ControllerBodyItem> = Vec::new();
-        for module in &filter_order {
-            for filter in app.concern_filters.get(module).into_iter().flatten() {
-                if let Some(call) = &filter.block {
-                    // A block-form filter goes back to being what a
-                    // controller's own is: an `Unknown` item holding the
-                    // call, which `block_form_filter` lowers and
-                    // `build_sourced_filter_chain` chains. Provenance
-                    // rides in the same map the spliced methods use,
-                    // under the sentinel name the chain builder derives
-                    // from the item's body index — these spliced items
-                    // occupy the head of the body, so the index is the
-                    // position here.
-                    let crate::expr::ExprNode::Send { method, .. } = &*call.node else { continue };
-                    let sentinel = crate::ident::Symbol::from(format!(
-                        "__{}_block_{}__",
-                        method.as_str(),
-                        filters.len()
-                    ));
-                    spliced_origin
-                        .entry(controller.name.clone())
-                        .or_default()
-                        .insert(sentinel, module.clone());
-                    filters.push(ControllerBodyItem::Unknown {
-                        expr: call.clone(),
+        let mut spliced_any = false;
+        for (at, item) in body.drain(..).enumerate() {
+            filters.push(item);
+            let Some(registered) = registered_at.get(&at) else { continue };
+            for module in registered {
+                for filter in app.concern_filters.get(module).into_iter().flatten() {
+                    spliced_any = true;
+                    if let Some(call) = &filter.block {
+                        // A block-form filter goes back to being what a
+                        // controller's own is: an `Unknown` item holding the
+                        // call, which `block_form_filter` lowers and
+                        // `build_sourced_filter_chain` chains. Provenance
+                        // rides in the same map the spliced methods use,
+                        // under the sentinel name the chain builder derives
+                        // from the item's body index — these spliced items
+                        // occupy the head of the body, so the index is the
+                        // position here.
+                        let crate::expr::ExprNode::Send { method, .. } = &*call.node else { continue };
+                        let sentinel = crate::ident::Symbol::from(format!(
+                            "__{}_block_{}__",
+                            method.as_str(),
+                            filters.len()
+                        ));
+                        spliced_origin
+                            .entry(controller.name.clone())
+                            .or_default()
+                            .insert(sentinel, module.clone());
+                        filters.push(ControllerBodyItem::Unknown {
+                            expr: call.clone(),
+                            leading_comments: Vec::new(),
+                            leading_blank_line: false,
+                        });
+                        continue;
+                    }
+                    let mut filter = filter.clone();
+                    // Provenance for the chain view: `defined_in` is the
+                    // module, not the controller that included it.
+                    filter.from_concern = Some(module.clone());
+                    filters.push(ControllerBodyItem::Filter {
+                        filter,
                         leading_comments: Vec::new(),
                         leading_blank_line: false,
                     });
-                    continue;
                 }
-                let mut filter = filter.clone();
-                // Provenance for the chain view: `defined_in` is the
-                // module, not the controller that included it.
-                filter.from_concern = Some(module.clone());
-                filters.push(ControllerBodyItem::Filter {
-                    filter,
-                    leading_comments: Vec::new(),
-                    leading_blank_line: false,
-                });
             }
         }
         for module in &queue {
@@ -6036,18 +6060,15 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 });
             }
         }
-        if filters.is_empty() && methods.is_empty() {
+        if !spliced_any && methods.is_empty() {
+            controller.body = filters;
             continue;
         }
-        // Filters first (Rails runs an included filter ahead of the
-        // includer's own), then the methods behind a private marker —
-        // they're helpers, never routable actions.
-        let has_private_marker = controller
-            .body
+        // The methods go behind a private marker — they're helpers,
+        // never routable actions.
+        let has_private_marker = filters
             .iter()
             .any(|i| matches!(i, ControllerBodyItem::PrivateMarker { .. }));
-        let mut body = std::mem::take(&mut controller.body);
-        filters.extend(body.drain(..));
         if !methods.is_empty() && !has_private_marker {
             filters.push(ControllerBodyItem::PrivateMarker {
                 leading_comments: Vec::new(),
