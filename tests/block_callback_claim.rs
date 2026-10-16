@@ -64,11 +64,19 @@ fn reports_unlowered(messages: &[String]) -> bool {
     })
 }
 
-/// `if:` is an option the block form does not lower; the callback used to
-/// count as claimed and vanish with no hook and no report.
+/// An `if:` naming a method lowers into a guard around the body.
 #[test]
-fn a_block_callback_with_an_if_option_reports_instead_of_vanishing() {
+fn a_block_callback_with_a_symbol_if_option_lowers() {
     let (messages, hooked) = lower_with("if", "  before_save(if: :title?) { self.body = \"x\" }");
+    assert!(hooked);
+    assert!(!reports_unlowered(&messages), "{messages:#?}");
+}
+
+/// A proc condition is not modeled; the callback used to count as claimed
+/// and vanish with no hook and no report.
+#[test]
+fn a_block_callback_with_a_proc_if_option_reports_instead_of_vanishing() {
+    let (messages, hooked) = lower_with("if-proc", "  before_save(if: -> { title? }) { self.body = \"x\" }");
     assert!(!hooked);
     assert!(reports_unlowered(&messages), "{messages:#?}");
 }

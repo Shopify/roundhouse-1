@@ -1634,27 +1634,63 @@ fn hook_method_name(hook: crate::dialect::CallbackHook) -> &'static str {
     }
 }
 
-/// The `on:` restriction from a block-form callback's option hash.
-/// None means "a shape this lowering won't run": not an `on:` hash at
-/// all, an unmodeled value, or extra options (`if:`/`unless:`) whose
-/// conditions would be silently dropped.
-fn block_callback_on(arg: &Expr) -> Option<crate::dialect::CallbackOn> {
+/// The options of a block-form callback's option hash: the `on:`
+/// restriction and one `if:`/`unless:` naming a method (`after_initialize
+/// -> { … }, if: :new_record?`), as `(on, (method, negated))`. None means
+/// "a shape this lowering won't run": a non-hash, an unmodeled value, a
+/// proc/array/second condition, or an unknown option whose effect would be
+/// silently dropped.
+fn block_callback_options(
+    arg: &Expr,
+) -> Option<(Option<crate::dialect::CallbackOn>, Option<(Symbol, bool)>)> {
     use crate::dialect::CallbackOn as On;
 
     let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
-    let [(k, v)] = &entries[..] else { return None };
-    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
-    let ExprNode::Lit { value: Literal::Sym { value: val } } = &*v.node else { return None };
-    if key.as_str() != "on" {
-        return None;
+    let (mut on, mut condition) = (None, None);
+    for (k, v) in entries {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
+        let ExprNode::Lit { value: Literal::Sym { value: val } } = &*v.node else { return None };
+        match key.as_str() {
+            "on" if on.is_none() => {
+                on = Some(match val.as_str() {
+                    "create" => On::Create,
+                    "update" => On::Update,
+                    "destroy" => On::Destroy,
+                    // `on: [:create, :update]` array form: not modeled.
+                    _ => return None,
+                })
+            }
+            "if" if condition.is_none() => condition = Some((val.clone(), false)),
+            "unless" if condition.is_none() => condition = Some((val.clone(), true)),
+            _ => return None,
+        }
     }
-    match val.as_str() {
-        "create" => Some(On::Create),
-        "update" => Some(On::Update),
-        "destroy" => Some(On::Destroy),
-        // `on: [:create, :update]` array form: not modeled.
-        _ => None,
-    }
+    Some((on, condition))
+}
+
+/// The `if:`/`unless:` guard of a block-form callback `block_callback_shape`
+/// accepted, as the self-call (negated for `unless:`) its body runs under.
+fn block_callback_guard(expr: &Expr) -> Option<Expr> {
+    let ExprNode::Send { args, block, .. } = &*expr.node else { return None };
+    let opts = match (block, &args[..]) {
+        (Some(_), [opts]) => opts,
+        (None, [_, opts]) => opts,
+        _ => return None,
+    };
+    let (_, (name, negated)) = block_callback_options(opts).and_then(|(on, c)| Some((on, c?)))?;
+    let span = expr.span;
+    let call = Expr::new(
+        span,
+        ExprNode::Send { recv: None, method: name, args: vec![], block: None, parenthesized: false },
+    );
+    Some(if negated {
+        Expr::new(
+            span,
+            ExprNode::Send { recv: Some(call), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        )
+    } else {
+        call
+    })
 }
 
 /// Rails means the same thing by both of these, and so does this —
@@ -1732,7 +1768,7 @@ pub(crate) fn block_callback_shape(
     // rejection for the symbol form.
     let on = match opt_args {
         [] => None,
-        [opts] => Some(block_callback_on(opts)?),
+        [opts] => block_callback_options(opts)?.0,
         _ => return None,
     };
     let hook = method.as_str();
@@ -2100,6 +2136,19 @@ fn push_block_callback(
                     args: Vec::new(),
                     block: None,
                     parenthesized: false,
+                },
+            );
+        }
+
+        // `if:`/`unless:` runs the body (or the call to its lifted method)
+        // only under its condition, evaluated at the callback's turn.
+        if let Some(cond) = block_callback_guard(expr) {
+            lambda_body = Expr::new(
+                expr.span,
+                ExprNode::If {
+                    cond,
+                    then_branch: lambda_body,
+                    else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
                 },
             );
         }

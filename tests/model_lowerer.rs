@@ -755,7 +755,7 @@ fn block_form_callbacks_honor_the_on_restriction() {
   before_save on: :create do
     never_lowers
   end
-  after_validation if: :active? do
+  after_validation if: -> { active? } do
     also_never_lowers
   end
 end
@@ -809,7 +809,8 @@ end
     );
 
     // Rails doesn't accept `on:` on before_save, and an `if:`
-    // condition drops the callback rather than run it unguarded.
+    // proc condition drops the callback rather than run it unguarded (a
+    // symbol condition lowers into a guard: `concern_after_initialize_lambda`).
     assert!(!names.contains(&"before_save"), "{names:?}");
     assert!(!names.contains(&"after_validation"), "{names:?}");
 }
