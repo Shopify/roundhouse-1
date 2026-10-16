@@ -151,7 +151,49 @@ module Rails
       end
     end
 
+    # `Rails.application.routes.url_helpers`: the module an app extends or
+    # includes to get the named route helpers. Every `<name>_path` the
+    # emitted RouteHelpers answers is answered here too, and `<name>_url`
+    # is that path under `protocol://host[:port]`, so a call on the module
+    # (`UrlHelpers.posts_path`) and one through a class or singleton that
+    # includes it agree. A name no drawn route explains is a NoMethodError
+    # as in Rails, or, when initializers appended route blocks this tree
+    # does not draw (`routes.append { … }`), a refusal that names them: the
+    # route may be in one of those, and the plain NoMethodError would read
+    # as a route that does not exist.
     module UrlHelpers
+      module Dispatch
+        URL_KEYS = %i[host protocol port only_path script_name].freeze
+
+        def method_missing(name, *args, **kwargs, &block)
+          text = name.to_s
+          return super unless text.end_with?("_path", "_url")
+          path_name = text.end_with?("_url") ? "#{text.delete_suffix("_url")}_path" : text
+          unless defined?(::RouteHelpers) && ::RouteHelpers.respond_to?(path_name)
+            undrawn = Rails::Application::RouteSet.appended_blocks.length + Rails::Application::RouteSet.prepended_blocks.length
+            return super if undrawn.zero?
+            raise NotImplementedError, "error[route_set_not_drawn]: #{text}: no route of this tree's drawn route set is named " \
+              "#{path_name.delete_suffix("_path")}, and #{undrawn} route block(s) added by Rails.application.routes.append/prepend " \
+              "are not drawn (drawing a route set at run time, ActionDispatch::Routing::Mapper, is not ported)"
+          end
+          path = ::RouteHelpers.public_send(path_name, *args, **kwargs.reject { |key, _| URL_KEYS.include?(key) })
+          return path if text == path_name || kwargs[:only_path]
+          host = kwargs[:host]
+          raise ArgumentError, "Missing host to link to! Please provide the :host parameter, set default_url_options[:host], or set :only_path to true" if host.nil?
+          port = kwargs[:port] ? ":#{kwargs[:port]}" : ""
+          "#{kwargs[:protocol] || "http"}://#{host}#{port}#{kwargs[:script_name]}#{path}"
+        end
+
+        def respond_to_missing?(name, include_private = false)
+          text = name.to_s
+          return super unless text.end_with?("_path", "_url")
+          path_name = text.end_with?("_url") ? "#{text.delete_suffix("_url")}_path" : text
+          (defined?(::RouteHelpers) && ::RouteHelpers.respond_to?(path_name)) || super
+        end
+      end
+      include Dispatch
+      extend Dispatch
+
       def self.root_url(host: "localhost", protocol: "http")
         "#{protocol}://#{host}#{RouteHelpers.root_path}"
       end
