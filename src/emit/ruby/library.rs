@@ -8364,6 +8364,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
             .filter_map(|c| c.name.0.as_str().rsplit("::").next().map(str::to_string))
             .collect(),
         self_returns: crate::det::HashMap::default(),
+        own_methods: None,
         local_records: crate::det::HashMap::default(),
         self_model: None,
     };
@@ -8437,7 +8438,16 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
         }
     }
-    for lc in lcs.iter_mut() {
+    let controller_classes: crate::det::HashSet<String> =
+        app.controllers.iter().map(|c| c.name.0.as_str().to_string()).collect();
+    let class_index: crate::det::HashMap<String, usize> =
+        lcs.iter().enumerate().map(|(i, lc)| (lc.name.0.as_str().to_string(), i)).collect();
+    let scopes: Vec<Option<crate::det::HashSet<String>>> = lcs
+        .iter()
+        .map(|lc| ancestry_methods(lc, lcs, &class_index, &controller_classes))
+        .collect();
+    for (lc, scope) in lcs.iter_mut().zip(scopes) {
+        sig.own_methods = scope;
         sig.self_model = Some(lc.name.0.as_str().to_string())
             .filter(|n| all_models.contains(n));
         for m in &mut lc.methods {
@@ -8706,6 +8716,13 @@ pub(crate) struct RecordSignals<'a> {
     /// recognized as the controller-method read it is.
     controller_names: crate::det::HashSet<String>,
     self_returns: crate::det::HashMap<String, String>,
+    /// The instance method names the class being rewritten and its
+    /// ancestors in the slice define. `None` when the class sits under a
+    /// controller, which reads methods the slice does not carry. A bare
+    /// call to a name outside it is not a call to `self_returns`' method
+    /// of that name: it is a gem's macro-defined reader (query_layer's
+    /// `delegate_field :token`) that merely shares the name.
+    own_methods: Option<crate::det::HashSet<String>>,
     /// Locals THE BODY BEING REWRITTEN binds to a resolvable record —
     /// campfire's `if last_room = last_room_visited` puts the record
     /// behind a name no other signal can read. Rebuilt per method;
@@ -8816,6 +8833,39 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             }
         }
     }
+}
+
+/// The instance method names `lc` and its ancestors (parents and
+/// includes, as far as the slice carries them) define; `None` when an
+/// ancestor is a controller.
+fn ancestry_methods(
+    lc: &LibraryClass,
+    lcs: &[LibraryClass],
+    index: &crate::det::HashMap<String, usize>,
+    controllers: &crate::det::HashSet<String>,
+) -> Option<crate::det::HashSet<String>> {
+    let mut names = crate::det::HashSet::default();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut pending = vec![lc.name.0.as_str().to_string()];
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if controllers.contains(&name) {
+            return None;
+        }
+        let Some(&i) = index.get(&name) else { continue };
+        let class = &lcs[i];
+        names.extend(
+            class
+                .methods
+                .iter()
+                .filter(|m| m.receiver == MethodReceiver::Instance)
+                .map(|m| m.name.as_str().to_string()),
+        );
+        pending.extend(class.parent.iter().chain(class.includes.iter()).map(|p| p.0.as_str().to_string()));
+    }
+    Some(names)
 }
 
 /// A record in a route helper's argument, as Rails renders it: the
@@ -9034,6 +9084,9 @@ fn arg_record_model(arg: &Expr, sig: &RecordSignals<'_>) -> Option<String> {
             // resolved through what that method's body answers.
             // `redirect_to room_path(last_room_visited)` is the shape:
             // the name is not a model's, and nothing upstream typed it.
+            if sig.own_methods.as_ref().is_some_and(|own| !own.contains(method.as_str())) {
+                return None;
+            }
             sig.self_returns.get(method.as_str()).cloned()
         }
         _ => None,
@@ -11503,6 +11556,20 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
+    // A `BasicObject` subclass has no `Object` in its ancestry, so a
+    // top-level constant in a flattened `def self.` is NameError
+    // ("uninitialized constant CheckoutShopUrl::Shopify"). The source's
+    // `class << self` body found it through Class's ancestors. Delegator
+    // does the same through its `const_missing`.
+    if !lc.is_module
+        && lc.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == "BasicObject")
+        && lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class)
+    {
+        writeln!(s, "{body_pad}def self.const_missing(name)").unwrap();
+        writeln!(s, "{body_pad}  ::Object.const_get(name)").unwrap();
+        writeln!(s, "{body_pad}end").unwrap();
+        writeln!(s).unwrap();
+    }
     for r in &in_body {
         writeln!(s, "{body_pad}{}", require_line(&out_dir, r, &self_anchor, app)).unwrap();
     }

@@ -82,3 +82,53 @@ fn a_lowered_struct_answers_props_by_name() {
         .run_ruby(PROPS_SCRIPT)
         .assert_passes();
 }
+
+/// Core's `Checkouts::One::Extensibility::Schema::CheckoutProfile`: a struct
+/// that makes `new` private builds itself from a string-keyed hash through a
+/// receiverless `new(**attrs)`. The call stays receiverless (a private `new`
+/// takes no receiver), so it must still be expanded against `initialize`'s
+/// keywords — splatted as it was, the hash's String keys bind no keyword and
+/// the constructor died `missing keywords: :id, :name, …`.
+const PRIVATE_NEW_STRUCT: &str = r#"module Skywatch
+  class Override < T::Struct
+    private_class_method :new
+
+    const :id, Integer
+    const :name, String
+    const :published, T::Boolean, default: false
+    const :seen_at, T.nilable(Time)
+    prop :tags, T::Array[String], default: []
+    const :edited_at, Time
+
+    class << self
+      #: (
+      #|   Hash[String, untyped] attributes,
+      #|   Array[String] tags
+      #| ) -> instance
+      def from_override_attributes(attributes, tags)
+        selected = attributes.with_indifferent_access.slice(*props.keys).merge({
+          tags: tags,
+        })
+
+        new(**selected)
+      end
+    end
+  end
+end
+"#;
+
+const PRIVATE_NEW_SCRIPT: &str = r#"
+now = Time.now
+profile = Skywatch::Override.from_override_attributes({ "id" => 1, "name" => "n", "edited_at" => now, "ignored" => 2 }, ["a"])
+raise "required keys read from the string-keyed hash" unless profile.id == 1 && profile.name == "n" && profile.edited_at == now
+raise "default kept, nilable nil, merged prop" unless profile.published == false && profile.seen_at.nil? && profile.tags == ["a"]
+puts "private new struct passed"
+"#;
+
+#[test]
+fn a_struct_with_private_new_builds_from_a_string_keyed_hash() {
+    emit_and_run::real_blog()
+        .write("app/services/skywatch_override.rb", PRIVATE_NEW_STRUCT)
+        .run_ruby(PRIVATE_NEW_SCRIPT)
+        .assert_passes();
+}

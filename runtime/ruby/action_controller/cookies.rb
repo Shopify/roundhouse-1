@@ -157,7 +157,11 @@ module ActionController
     # Removing a cookie is recorded as an empty write; the dispatcher emits a
     # cleared Set-Cookie. (No separate tombstone type keeps @out a plain
     # String→String map for the strict typer.)
-    def delete(key)
+    #
+    # Rails' `delete(name, options = {})` takes `domain:` / `path:` to name the
+    # cookie it removes; the jar keeps one value per name, so they are accepted
+    # and name nothing further (Core: `delete(NAME, domain: :all)`).
+    def delete(key, options = nil)
       @out[key.to_s] = ""
       @flag_expires.delete(key.to_s)
       ""
@@ -287,8 +291,8 @@ module ActionController
       ActionController::SignedCookieJar.new(@jar, true)
     end
 
-    def delete(key)
-      @jar.delete(key)
+    def delete(key, options = nil)
+      @jar.delete(key, options)
     end
 
     # The value out of either write form. Kept a class method with an
@@ -325,8 +329,8 @@ module ActionController
       ActionController::SignedCookieJar.new(@jar, true)
     end
 
-    def delete(key)
-      @jar.delete(key)
+    def delete(key, options = nil)
+      @jar.delete(key, options)
     end
   end
 
