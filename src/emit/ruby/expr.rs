@@ -180,6 +180,31 @@ pub(super) fn with_spliced_into<R>(out_path: &std::path::Path, f: impl FnOnce() 
     })
 }
 
+/// `**value, k: v` written as the ingest's `value.merge({ k: v })` where the
+/// analysis could not name `value` (a block parameter of an unsigned method:
+/// `schemas.map { |schema| X.new(**schema, k: v) }`). Ruby's `**` asks the
+/// value for `to_hash`, which a Hash answers as itself and a Component::Schema
+/// answers as its attributes; `merge` only the Hash has
+/// (`lower::indifferent_access::splat_base_to_hash` does this for a receiver
+/// typed as an object).
+fn untyped_splat_base_to_hash(e: &Expr) -> Option<ExprNode> {
+    if e.decisions & crate::expr::SPLAT_MERGE_BASE == 0 {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(recv), method, args, block, parenthesized } = &*e.node else { return None };
+    if method.as_str() != "merge" || args.len() != 1 {
+        return None;
+    }
+    if !matches!(recv.ty, None | Some(Ty::Untyped | Ty::Var { .. })) {
+        return None;
+    }
+    let to_hash = Expr::new(
+        recv.span,
+        ExprNode::Send { recv: Some(recv.clone()), method: Symbol::from("to_hash"), args: vec![], block: None, parenthesized: false },
+    );
+    Some(ExprNode::Send { recv: Some(to_hash), method: method.clone(), args: args.clone(), block: block.clone(), parenthesized: *parenthesized })
+}
+
 /// `__FILE__` / `__dir__` from a source file the Ruby family emits
 /// elsewhere. Ruby answers the loaded file's absolute path, so this is
 /// the source's app-relative path resolved from the emitted file's own
@@ -315,6 +340,9 @@ pub fn emit_expr(e: &Expr) -> String {
     }
     if let Some(path) = source_file_path(e) {
         return path;
+    }
+    if let Some(splatted) = untyped_splat_base_to_hash(e) {
+        return emit_node(&splatted);
     }
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));

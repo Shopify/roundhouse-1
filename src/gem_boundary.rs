@@ -244,10 +244,16 @@ impl GemSourceConstants {
             while let Some((outer, _)) = namespace.rsplit_once("::") {
                 namespace = outer;
                 let Some(gems) = self.declared.get(namespace) else { continue };
-                let native = gems.keys().find(|gem| {
-                    self.scans.get(*gem).is_some_and(|s| s.native)
-                        && namespace.match_indices("::").map(|(i, _)| &namespace[..i]).chain([namespace])
+                let native = gems.iter().find_map(|(gem, file)| {
+                    let owns = self.scans.get(gem).is_some_and(|s| s.native)
+                        && (namespace.match_indices("::").map(|(i, _)| &namespace[..i]).chain([namespace])
                             .any(|owned| namespace_named_after(owned, gem))
+                            // The gem's entry file opens the top-level
+                            // namespace: msgpack's `lib/msgpack.rb` is
+                            // `module MessagePack`, whose UnpackError the
+                            // C extension defines.
+                            || (!namespace.contains("::") && *file == format!("lib/{gem}.rb")));
+                    owns.then_some(gem)
                 });
                 if let Some(gem) = native {
                     return Some(SourceProvider::Native { namespace: namespace.to_string(), gem });
@@ -507,4 +513,33 @@ pub struct GemClass {
     /// rather than a name. A lookup that misses is then unknown, not
     /// wrong.
     pub dynamic: bool,
+}
+
+#[cfg(test)]
+mod native_provider_tests {
+    use super::*;
+
+    fn sources(gem: &str, namespace: &str, file: &str, native: bool) -> GemSourceConstants {
+        let mut out = GemSourceConstants::default();
+        out.declared.entry(namespace.to_string()).or_default().insert(gem.to_string(), file.to_string());
+        out.scans.insert(gem.to_string(), GemSourceScan { native, complete: true, ..GemSourceScan::default() });
+        out
+    }
+
+    #[test]
+    fn a_native_gems_entry_namespace_owns_what_its_extension_defines() {
+        // msgpack's `lib/msgpack.rb` opens `module MessagePack`; the C
+        // extension defines `MessagePack::UnpackError`.
+        let owned = sources("msgpack", "MessagePack", "lib/msgpack.rb", true);
+        let found = owned.provider("MessagePack::UnpackError", "Paquito");
+        assert_eq!(found, Some(SourceProvider::Native { namespace: "MessagePack".into(), gem: "msgpack" }));
+    }
+
+    #[test]
+    fn a_namespace_a_non_entry_file_opens_is_not_owned() {
+        let core = sources("msgpack", "Hash", "lib/msgpack/core_ext.rb", true);
+        assert_eq!(core.provider("Hash::Missing", ""), None);
+        let pure = sources("msgpack", "MessagePack", "lib/msgpack.rb", false);
+        assert_eq!(pure.provider("MessagePack::UnpackError", ""), None);
+    }
 }

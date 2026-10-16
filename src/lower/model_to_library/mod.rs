@@ -1526,10 +1526,19 @@ fn absorb_model_reopen(target: &mut Model, reopen: Model) {
         target.parent = reopen.parent;
         target.parent_span = reopen.parent_span;
     }
+    // Each declaration computed `composite_primary_key` on its own: the
+    // table's key unless it declares a `self.primary_key`. Rails runs every
+    // reopen against the one class, so a single-key declaration in any
+    // file keeps `id` the column (Core's `Event` declares `self.primary_key
+    // = :id` in event.rb, while its `event/*.rb` reopens declare nothing
+    // over the table's `(shop_id, id, island)`).
+    let declares_single_key = target.primary_key.is_some() || reopen.primary_key.is_some();
     if target.primary_key.is_none() {
         target.primary_key = reopen.primary_key;
     }
-    if target.composite_primary_key.is_empty() {
+    if declares_single_key {
+        target.composite_primary_key.clear();
+    } else if target.composite_primary_key.is_empty() {
         target.composite_primary_key = reopen.composite_primary_key;
     }
     if target.query_constraints.is_empty() {

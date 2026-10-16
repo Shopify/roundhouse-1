@@ -2343,6 +2343,13 @@ module ActiveRecord
       @errors.empty?
     end
 
+    # ActiveModel's `invalid?(context = nil)`: `!valid?(context)`. Core's
+    # BulkSqlOperations asks `record.invalid?(record.validation_context)`
+    # of records whose class writes no `validates`.
+    def invalid?(context = nil)
+      !valid?(context)
+    end
+
     def validation_context
       @validation_context
     end
