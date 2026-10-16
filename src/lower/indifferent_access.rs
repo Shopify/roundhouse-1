@@ -6,11 +6,103 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 pub fn apply_indifferent_access_lowering(app: &mut App) {
+    coerce_declared_params(app);
     super::for_each_hook_body(app, &mut lower);
     for view in &mut app.views {
         lower(&mut view.body);
     }
     super::for_each_test_body(app, &mut lower);
+}
+
+/// A library method's parameter declared `HashWithIndifferentAccess` that
+/// its body reads by a Symbol key (`input[:input][:publications]`): the
+/// rewrite below reads the string key an indifferent hash answers too, but
+/// a caller may hand the method a plain Symbol-keyed Hash, which the
+/// declaration does not stop (sorbet-runtime's check is off in the emitted
+/// tree) and which Ruby reads by Symbol: Core's `CollectionInput.
+/// check_access` is called with the Cardinal executor's `arguments`, a
+/// Hash of Symbol keys. The CRuby tree carries Rails' own class, so the
+/// parameter is converted on entry where it is not one already
+/// (`ActiveSupport.indifferent_param`), and reads either key. A
+/// parameter the body assigns keeps what it is given.
+fn coerce_declared_params(app: &mut App) {
+    // The PostgreSQL app is the CRuby tree, the only one that carries Rails' class.
+    if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+        return;
+    }
+    for lc in &mut app.library_classes {
+        for method in &mut lc.methods {
+            let names: Vec<Symbol> = method
+                .params
+                .iter()
+                .filter(|p| !p.rest && !p.forwarding && !p.name.as_str().is_empty())
+                .map(|p| p.name.clone())
+                .filter(|name| reads_indifferent_var(&method.body, name) && !assigns_var(&method.body, name))
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let span = method.body.span;
+            let mut stmts: Vec<Expr> = names
+                .iter()
+                .map(|name| {
+                    let var = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+                    let mut call = support_call(span, "indifferent_param", vec![var]);
+                    call.ty = Some(Ty::Untyped);
+                    let mut assign = Expr::new(
+                        span,
+                        ExprNode::Assign {
+                            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() },
+                            value: call,
+                        },
+                    );
+                    assign.ty = Some(Ty::Untyped);
+                    assign
+                })
+                .collect();
+            let mut body = std::mem::replace(&mut method.body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+            if let ExprNode::Seq { exprs } = &mut *body.node {
+                stmts.append(exprs);
+            } else {
+                stmts.push(body);
+                body = Expr::new(span, ExprNode::Seq { exprs: vec![] });
+            }
+            *body.node = ExprNode::Seq { exprs: stmts };
+            method.body = body;
+        }
+    }
+}
+
+fn reads_indifferent_var(expr: &Expr, name: &Symbol) -> bool {
+    let mut found = false;
+    visit(expr, &mut |e| {
+        if let ExprNode::Send { recv: Some(recv), .. } = &*e.node
+            && matches!(&*recv.node, ExprNode::Var { name: n, .. } if n == name)
+            && recv.ty.as_ref().is_some_and(is_indifferent_receiver)
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn assigns_var(expr: &Expr, name: &Symbol) -> bool {
+    let mut found = false;
+    visit(expr, &mut |e| {
+        let target = match &*e.node {
+            ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => Some(target),
+            _ => None,
+        };
+        if matches!(target, Some(crate::expr::LValue::Var { name: n, .. }) if n == name) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn visit<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+    f(expr);
+    expr.node.for_each_child(&mut |child| visit(child, f));
 }
 
 fn lower(body: &mut Expr) {
