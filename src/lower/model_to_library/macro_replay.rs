@@ -380,6 +380,72 @@ fn is_self_like(expr: &Expr, aliases: &[String]) -> bool {
     }
 }
 
+/// The new and old names of an `alias_method` call written with literal
+/// symbols or strings.
+fn alias_method_names(args: &[Expr]) -> Option<(String, String)> {
+    let literal = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let [new, old] = args else { return None };
+    Some((literal(new)?, literal(old)?))
+}
+
+/// A replayed `alias_method :new, :old` as `alias_method :new, :old if
+/// method_defined?(:old) || private_method_defined?(:old)`, with a
+/// warning otherwise. Rails raises NameError for an `old` the class does
+/// not answer, and where the lowered class lacks a method Rails generates
+/// that would drop the whole model at load; the warning names the alias
+/// that was not made, and its callers fail at the call.
+fn guard_alias_method(call: &Expr) -> Option<Expr> {
+    use crate::expr::{BoolOpKind, BoolOpSurface};
+    use crate::span::Span;
+    let ExprNode::Send { method, args, block: None, .. } = &*call.node else { return None };
+    if method.as_str() != "alias_method" {
+        return None;
+    }
+    let (new, old) = alias_method_names(args)?;
+    let class_send = |name: &str, arg: &Expr| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(super::self_ref()),
+                method: crate::ident::Symbol::from(name),
+                args: vec![arg.clone()],
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    let old_arg = args[1].clone();
+    let cond = Expr::new(
+        Span::synthetic(),
+        ExprNode::BoolOp {
+            op: BoolOpKind::Or,
+            surface: BoolOpSurface::Symbol,
+            left: class_send("method_defined?", &old_arg),
+            right: class_send("private_method_defined?", &old_arg),
+        },
+    );
+    let warning = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: None,
+            method: crate::ident::Symbol::from("warn"),
+            args: vec![super::lit_str(format!(
+                "roundhouse: alias_method :{new}, :{old} not applied: the compiled class has no `{old}`"
+            ))],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    Some(Expr::new(
+        call.span,
+        ExprNode::If { cond, then_branch: call.clone(), else_branch: warning },
+    ))
+}
+
 /// `extend M, ...` (bare or `self.`): its argument expressions.
 fn extend_args(call: &Expr) -> Option<&[Expr]> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
@@ -754,6 +820,22 @@ impl<'a> ClassSide<'a> {
         let ExprNode::Send { recv, method, args, block, .. } = &*call.node else { return None };
         if let Some(verdict) = self.self_mixin_verdict(recv.as_ref(), method.as_str(), args, block.is_some()) {
             return Some(verdict);
+        }
+        // `alias_method :flat_fee, :credit_card_flat_rate` (bare, `self.`,
+        // or on a local bound to `self`) of a method the compiled class
+        // answers but the body does not `def` (a column or money column
+        // reader, an association, a method a macro defines): ingest copies
+        // the def of one it does (`model_alias_method_copy`), and the rest
+        // reaches here. The emitted class has the target by the time its
+        // body statements run, so the statement is replayed
+        // ([`guard_alias_method`] keeps a missing target from raising).
+        if method.as_str() == "alias_method"
+            && block.is_none()
+            && alias_method_names(args).is_some()
+            && recv.as_ref().is_none_or(|r| is_self_like(r, &self.self_aliases))
+            && self.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+        {
+            return Some(MacroVerdict::Replay);
         }
         // The PostgreSQL CRuby tree's base answers `accepts_nested_attributes_for`
         // at class-body time (runtime/spinel/cruby/active_record_nested_attributes.rb),
@@ -1683,6 +1765,9 @@ pub fn replay_model_macros(app: &mut crate::App) {
                 let mut expr = expr.clone();
                 if expansion_refused(&expr) {
                     expr.diagnostic = None;
+                }
+                if let Some(guarded) = guard_alias_method(&expr) {
+                    expr = guarded;
                 }
                 *item = ModelBodyItem::ClassBody {
                     expr,

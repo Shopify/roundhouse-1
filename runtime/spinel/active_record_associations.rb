@@ -915,7 +915,11 @@ module ActiveRecord
         reader_scope = :"_#{@proxy_name}_association_scope"
         if @proxy_owner.respond_to?(reader_scope)
           relation = @proxy_owner.public_send(reader_scope)
-          relation.instance_variable_set(:@association, proxy_association) if @proxy_owner.respond_to?(:association)
+          # A `has_many ... extend: Ext` module reads Rails' `@association`
+          # (`@association.owner`); the extended scope is the proxy's.
+          if relation.is_a?(ActiveRecord::Relation) && @proxy_owner.respond_to?(:association)
+            relation.instance_variable_set(:@association, proxy_association)
+          end
           relation
         elsif @proxy_owner.respond_to?(:association)
           proxy_association.scope
