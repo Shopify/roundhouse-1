@@ -5941,6 +5941,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     let no_helpers: HashMap<Symbol, ClassId> = HashMap::default();
     let renames = helper_instance_renames(app);
     let reach = HelperReach::new(lcs, app, &helper_modules);
+    let mixed_elsewhere = mixed_in_outside_helpers(lcs, app, &helper_modules);
     // The declarations of each class declared more than once (a
     // reopening), for the own-method shadowing below.
     let mut declarations: crate::det::HashMap<&str, Vec<&LibraryClass>> = crate::det::HashMap::default();
@@ -6079,6 +6080,18 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 own_instance_side.extend(inherited);
             }
         }
+        // A helper module something else mixes in keeps its instance
+        // methods beside the flipped copies: an initializer's
+        // `UrlHelpers.singleton_class.prepend(OnlineStore::UrlHelpersExtension)`
+        // and a model's `include` take them as instance methods, and the
+        // flipped `def self.` copies give them nothing.
+        let instance_copies: Vec<MethodDef> = if is_helper_module
+            && mixed_elsewhere.contains(crate::naming::last_segment(lc.name.0.as_str()))
+        {
+            lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).cloned().collect()
+        } else {
+            Vec::new()
+        };
         for m in &mut lc.methods {
             // A singleton method body runs on the module, never on the
             // view: it reaches no helper bare, and none of this pass's
@@ -6175,6 +6188,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 rewrite_view_ivar_writes(&mut m.body, &view_ivars);
             }
         }
+        lc.methods.extend(instance_copies);
         // The other half: the reader the rewrite dispatches to. It goes
         // on the BASE controller, so every controller inherits one —
         // a helper runs under whichever controller is current, and
@@ -21297,4 +21311,57 @@ mod spliced_namespace_tests {
         assert!(!spliced.contains("require_relative \"leaf\""), "{spliced}");
         assert!(spliced.contains("Leaf.x"), "{spliced}");
     }
+}
+
+/// The last name segments of the modules something other than a helper
+/// module mixes in: a model's or library class's `include`, and an
+/// `include` / `prepend` / `extend` call anywhere (Core's initializer
+/// `UrlHelpers.singleton_class.prepend(OnlineStore::UrlHelpersExtension)`).
+/// A helper `include` is how a module got into the helper index at all
+/// (`ingest::app`), so it does not count. Matched by last segment, which
+/// errs toward keeping the instance side.
+fn mixed_in_outside_helpers(
+    lcs: &[LibraryClass],
+    app: &App,
+    helper_modules: &BTreeSet<ClassId>,
+) -> crate::det::HashSet<String> {
+    fn calls(e: &Expr, out: &mut crate::det::HashSet<String>) {
+        if let ExprNode::Send { method, args, .. } = &*e.node
+            && matches!(method.as_str(), "include" | "prepend" | "extend")
+        {
+            for arg in args {
+                if let ExprNode::Const { path } = &*arg.node
+                    && let Some(last) = path.last()
+                {
+                    out.insert(last.as_str().to_string());
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| calls(c, out));
+    }
+    let mut out = crate::det::HashSet::default();
+    for lc in app.library_classes.iter().chain(lcs.iter()) {
+        if !helper_modules.contains(&lc.name) {
+            for id in &lc.includes {
+                out.insert(crate::naming::last_segment(id.0.as_str()).to_string());
+            }
+        }
+        for call in &lc.unknown_calls {
+            calls(call, &mut out);
+        }
+        for m in &lc.methods {
+            calls(&m.body, &mut out);
+        }
+    }
+    for model in &app.models {
+        for id in crate::analyze::model_includes(model) {
+            out.insert(crate::naming::last_segment(id.0.as_str()).to_string());
+        }
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                calls(expr, &mut out);
+            }
+        }
+    }
+    out
 }

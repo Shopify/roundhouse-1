@@ -1533,6 +1533,16 @@ impl Analyzer {
         for declaration in &app.library_classes {
             if let Some(info) = classes.get_mut(&declaration.name) { info.is_module = declaration.is_module; }
         }
+        // A Concern's `class_methods do` builds its `ClassMethods` module
+        // (`App::class_methods_blocks`), which no source declaration or
+        // library class names: `Responder::ClassMethods` in a type alias
+        // (`T.all(T.class_of(ApplicationRecord), Responder::ClassMethods)`)
+        // read as an unmodeled constant. The module is real in the CRuby
+        // tree, so the lexical lookup finds it by its full name.
+        for owner in app.class_methods_blocks.keys() {
+            let carrier = ClassId(Symbol::from(format!("{}::ClassMethods", owner.0.as_str()).as_str()));
+            classes.entry(carrier).or_default().is_module = true;
+        }
         // A boot initializer's `on_load(:active_record) { include M }`:
         // M joins Base's ancestry, as the emitted boot runs it.
         registry::load_hook_mixins::register(app, &mut classes);
