@@ -3186,6 +3186,7 @@ end
     // The class side the splice leaves out: a Concern's `included do`
     // macros, run on the controller by a real `include`.
     super::controller_concern_blocks::carry(&mut app, &concern_class_method_spans, &framework_shadow_scopes);
+    super::controller_concern_blocks::keep_load_hook_includes(&mut app);
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
     // After the splice: a macro has to resolve against the concern's

@@ -3385,6 +3385,19 @@ impl Analyzer {
             for scope in model.scopes_mut() {
                 self.body_typer().analyze_expr(&mut scope.body, &class_ctx);
             }
+            // `validate do ... end` runs as a record method once the model
+            // lowering inlines it, so its body types as one: `errors` there
+            // is the record's ActiveModel::Errors, and `errors.added?` must
+            // reach the port (`expr::ERRORS_PORT_CALL`), not Array.
+            let mut block_ctx = class_ctx.clone();
+            block_ctx.instance_body = true;
+            for validation in model.validations_mut() {
+                for rule in validation.rules.iter_mut() {
+                    if let Some(body) = rule.block_body_mut() {
+                        self.body_typer().analyze_expr(body, &block_ctx);
+                    }
+                }
+            }
             let model_name = model.name.clone();
             for method in model.methods_mut() {
                 // A default is part of the parameter's type. Typed before
