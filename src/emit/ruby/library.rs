@@ -5312,8 +5312,20 @@ fn autosave_method(
                     // Rails saves a belongs_to in before_save, so
                     // validating the owner's records never saves the owner.
                     cond: and(
-                        send(cache(), "new_record?"),
-                        send(send(cache(), "_association_walk_in_progress?"), "!"),
+                        and(
+                            send(cache(), "new_record?"),
+                            send(send(cache(), "_association_walk_in_progress?"), "!"),
+                        ),
+                        send(
+                            syn(ExprNode::Send {
+                                recv: None,
+                                method: Symbol::from("_validated_for_owner?"),
+                                args: vec![],
+                                block: None,
+                                parenthesized: false,
+                            }),
+                            "!",
+                        ),
                     ),
                     then_branch: send(cache(), "save"),
                     else_branch: syn(ExprNode::Lit { value: Literal::Nil }),

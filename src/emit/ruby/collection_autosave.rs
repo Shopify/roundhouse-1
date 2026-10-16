@@ -470,7 +470,7 @@ fn validate_records_source(c: &Collection) -> String {
     records = @{n}_cache
     records = records.select {{ |record| record.new_record? }} unless new_record? || custom
 {inverse}    context = nil unless custom
-    valid = records.map {{ |record| record.destroyed? || record.valid?(context) }}
+    valid = records.map {{ |record| record.destroyed? || record._valid_for_owner?(context) }}
     if valid.include?(false)
       errors << _association_error({message:?})
     end

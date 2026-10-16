@@ -75,6 +75,15 @@ const PROBE: &str = r##"class QualifiedProbe
     out << "one: #{Member.joins(join).order(:id).pluck("members.label").inspect}"
     out << "raw: #{Member.order(:id).pluck(Arel.sql("upper(label)")).inspect}"
     out << "plain: #{Member.order(:id).pluck(:label, "score").inspect}"
+    # A fragment that names its own alias keeps it (Core's rollout
+    # repository plucks `Arel.sql("max(x) AS y")`).
+    out << "aliased: #{Member.order(:id).pluck(Arel.sql("upper(label) AS shout"), :score).inspect}"
+    out << "aliased quoted: #{Member.group(:label).order(:label).pluck(:label, Arel.sql(%q(count(*) AS "total"))).inspect}"
+    # `select(:sym)` of a column the model does not have is the bare
+    # column of the joined table, not `members.name`.
+    out << "joined select: #{Member.joins(join).order(:id).select(:name).map { |m| m[:name] }.inspect}"
+    rel = Member.order(:id)
+    out << "loaded: #{rel.loaded? ? true : false} #{rel.load.loaded?}"
     member = Member.first
     member.update!(label: "c")
     member.destroy!
@@ -84,11 +93,15 @@ const PROBE: &str = r##"class QualifiedProbe
 end
 "##;
 
-const EXPECTED: [&str; 5] = [
+const EXPECTED: [&str; 9] = [
     r#"joined: [["a", 1, "g"], ["b", nil, "g"]]"#,
     r#"one: ["a", "b"]"#,
     r#"raw: ["A", "B"]"#,
     r#"plain: [["a", 1], ["b", nil]]"#,
+    r#"aliased: [["A", 1], ["B", nil]]"#,
+    r#"aliased quoted: [["a", 1], ["b", 1]]"#,
+    r#"joined select: ["g", "g"]"#,
+    "loaded: false true",
     r#"actions: [[:create], [:create], [:update], [:destroy]]"#,
 ];
 

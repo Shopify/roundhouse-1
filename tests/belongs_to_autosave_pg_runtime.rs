@@ -29,8 +29,14 @@ const STRUCTURE: &str = r#"CREATE TABLE shops (
 CREATE TABLE products (
     id uuid NOT NULL,
     shop_id uuid NOT NULL,
+    supplier_id uuid,
     title character varying,
     CONSTRAINT products_pkey PRIMARY KEY (shop_id, id)
+);
+CREATE TABLE suppliers (
+    id uuid NOT NULL,
+    name character varying,
+    CONSTRAINT suppliers_pkey PRIMARY KEY (id)
 );
 "#;
 
@@ -67,12 +73,25 @@ const SHOP: &str = r#"class Shop < ApplicationRecord
 end
 "#;
 
+const SUPPLIER: &str = r#"class Supplier < ApplicationRecord
+  OID_BASE = 0x5250
+
+  uuid_attributes :id
+  before_create :generate_oid
+
+  def generate_oid
+    self.id ||= OID_BASE + Supplier.count + 1
+  end
+end
+"#;
+
 const PRODUCT: &str = r#"class Product < ApplicationRecord
   OID_BASE = 0x51500000000000000000
 
   self.primary_key = :id
-  uuid_attributes :id, :shop_id
+  uuid_attributes :id, :shop_id, :supplier_id
   belongs_to :shop
+  belongs_to :supplier, optional: true
   before_create :generate_oid
 
   def generate_oid
@@ -135,6 +154,14 @@ const PROBE: &str = r##"class AutosaveProbe
     kept = Product.create!(shop: saved, title: "k")
     out << "saved target: #{kept.shop_id == saved.id} #{Shop.find(saved.id).name} #{Shop.count}"
     out << "products: #{Product.count} #{Product.where(shop_id: 0x77).map(&:title).inspect}"
+    # An owner validating its new records never saves their belongs_to
+    # targets (Rails does that in the record's own before_save).
+    owner = Shop.new(name: "owner")
+    late = Supplier.new(name: "late")
+    pending = owner.products.build(title: "p", supplier: late)
+    out << "validated: #{owner.valid?} #{late.persisted?} #{Supplier.count}"
+    owner.save!
+    out << "saved: #{late.persisted?} #{Supplier.count} #{pending.reload.supplier_id == late.id}"
     out
   end
 end
@@ -142,32 +169,36 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 6] = [
+const EXPECTED: [&str; 8] = [
     "generated before: nil",
     "generated: true true generated",
     "assigned before: 119",
     "assigned: true true assigned",
     "saved target: true saved 3",
     r#"products: 3 ["a"]"#,
+    "validated: true false 0",
+    "saved: true 1 true",
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 6] = [
+const LOADS: [&str; 7] = [
     "lib/probe/uuid_as_integer",
     "config/initializers/uuid_types",
     "app/models/application_record",
     "app/models/shop",
+    "app/models/supplier",
     "app/models/product",
     "app/models/autosave_probe",
 ];
 
-const FILES: [(&str, &str); 10] = [
+const FILES: [(&str, &str); 11] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ("db/structure.sql", STRUCTURE),
     ("app/models/application_record.rb", APPLICATION_RECORD),
     ("app/models/shop.rb", SHOP),
+    ("app/models/supplier.rb", SUPPLIER),
     ("app/models/product.rb", PRODUCT),
     ("app/models/autosave_probe.rb", PROBE),
     ("lib/probe/uuid_as_integer.rb", UUID_AS_INTEGER),
@@ -202,6 +233,8 @@ fn belongs_to_autosave_keys_on_new_record() {
         "assign_attributes(attrs) if !(attrs.equal?(ActiveRecord::Base::HYDRATE_ATTRS))",
         "@shop_cache.save",
         "@shop_id = @shop_cache.id",
+        // Validating the record for its owner is not saving it.
+        "@shop_cache.new_record? && !(@shop_cache._association_walk_in_progress?) && !(_validated_for_owner?)",
     ] {
         assert!(model.contains(expected), "missing {expected:?} in:\n{model}");
     }

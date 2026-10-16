@@ -1837,7 +1837,7 @@ module ActiveRecord
       # Rails' `arel_columns` flat_maps the fields: `select(COLUMNS)` with
       # a column-list Array constant projects each column.
       specs.flatten.each do |spec|
-        cols << (spec.is_a?(Symbol) ? "#{@table}.#{spec}" : spec.to_s)
+        cols << (spec.is_a?(Symbol) ? select_symbol_sql(spec) : spec.to_s)
       end
       # Rails' `select_values |= fields`: a later `select` adds to the
       # projection (`.select(:id).left_joins(:x).select(sum_expr)`).
@@ -1846,6 +1846,17 @@ module ActiveRecord
       @select_sql = prior.nil? || prior.empty? ? added : "#{prior}, #{added}"
       self
     end
+
+    # `arel_column` for a Symbol: a column of this model is qualified with
+    # its table; any other name (a joined table's `driver_id` selected from
+    # a relation over a join) is the quoted bare name, which PostgreSQL
+    # resolves among the joined tables.
+    def select_symbol_sql(spec)
+      name = @model._attribute_name(spec.to_s)
+      return "#{@table}.#{spec}" if @model.schema_columns.include?(name.to_sym)
+      ActiveRecord.adapter.quote_column_name(spec.to_s)
+    end
+    private :select_symbol_sql
 
     def distinct
       spawn.distinct!
@@ -2015,6 +2026,13 @@ module ActiveRecord
     def load
       to_a
       self
+    end
+
+    # Rails' `loaded?`: whether the records are memoized. A caller
+    # (Core's AssociationPreloader) only adds a lazy `preload` when
+    # they are not.
+    def loaded?
+      !@records.nil?
     end
 
     # Rails' `load_async` schedules the query on a background pool and
@@ -3103,6 +3121,10 @@ module ActiveRecord
       # string is SQL as written.
       names = [] #: Array[String?]
       projections = [] #: Array[String]
+      # The result key each column is read by: `v<i>`, or the alias of a
+      # SQL fragment that names its own (`Arel.sql("t.c AS alias")`), which
+      # stays so an ORDER BY or HAVING over the alias still resolves.
+      keys = [] #: Array[String]
       cols.flatten.each_with_index do |col, i|
         text = col.to_s
         match = /\A(\w+)\.(\w+)\z/.match(text)
@@ -3111,13 +3133,22 @@ module ActiveRecord
           name = own ? @model._attribute_name(match[2]) : nil
           names << name
           projections << "#{own ? @table : ActiveRecord.adapter.quote_column_name(match[1])}.#{name || ActiveRecord.adapter.quote_column_name(match[2])} AS v#{i}"
+          keys << "v#{i}"
         elsif /\A\w+\z/.match?(text)
           name = @model._attribute_name(text)
           names << name
           projections << "#{@table}.#{name} AS v#{i}"
+          keys << "v#{i}"
         else
           names << nil
-          projections << "#{text} AS v#{i}"
+          aliased = /\A.*\S\s+AS\s+(?:"([^"]+)"|(\w+))\z/mi.match(text)
+          if aliased
+            projections << text
+            keys << (aliased[1] || aliased[2]&.downcase || "v#{i}").to_s
+          else
+            projections << "#{text} AS v#{i}"
+            keys << "v#{i}"
+          end
         end
       end
       @select_sql = projections.join(", ")
@@ -3125,11 +3156,12 @@ module ActiveRecord
       @select_sql = prior
       if names.length == 1
         name = names[0]
-        return rows.map { |row| name ? @model._attribute_deserialize(name, row["v0"]) : row["v0"] }
+        key = keys[0].to_s
+        return rows.map { |row| name ? @model._attribute_deserialize(name, row[key]) : row[key] }
       end
       rows.map do |row|
         values = []
-        names.each_with_index { |name, i| values << (name ? @model._attribute_deserialize(name, row["v#{i}"]) : row["v#{i}"]) }
+        names.each_with_index { |name, i| values << (name ? @model._attribute_deserialize(name, row[keys[i].to_s]) : row[keys[i].to_s]) }
         values
       end
     end

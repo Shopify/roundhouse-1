@@ -2343,6 +2343,24 @@ module ActiveRecord
       @errors.empty?
     end
 
+    # `valid?` as a parent's association validation runs it
+    # (`_validate_associated_records_for_*`). Rails saves a belongs_to
+    # target in the record's before_save, so validating the record for
+    # its owner never saves the target (`_validated_for_owner?`).
+    def _valid_for_owner?(context = nil)
+      previous = @_validated_for_owner
+      @_validated_for_owner = true
+      begin
+        valid?(context)
+      ensure
+        @_validated_for_owner = previous
+      end
+    end
+
+    def _validated_for_owner?
+      @_validated_for_owner == true
+    end
+
     # ActiveModel's `invalid?(context = nil)`: `!valid?(context)`. Core's
     # BulkSqlOperations asks `record.invalid?(record.validation_context)`
     # of records whose class writes no `validates`.
