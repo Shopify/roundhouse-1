@@ -42,6 +42,14 @@ pub(crate) fn normalizer_name(attr: &Symbol) -> Symbol {
     Symbol::from(format!("_normalize_{}", attr.as_str()))
 }
 
+/// The finder-side normalizing class method's name for `attr`: the
+/// normalizer applied to each element of an Array value (`where(handle:
+/// handles)` normalizes every handle, as Rails' predicate builder does),
+/// and to anything else as `_normalize_<attr>` would.
+pub(crate) fn query_normalizer_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("_query_{}_normalized", attr.as_str()))
+}
+
 /// Every attribute `model` declares a reproducible normalization for,
 /// with the lambda's parameter and body, in declaration order (an
 /// `IndexMap`: a repeated `normalizes :attr` keeps its first position
@@ -138,7 +146,57 @@ pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(value.clone())],
             body,
-            signature: Some(super::model_to_library::fn_sig(vec![(value, col_ty.clone())], col_ty.clone())),
+            signature: Some(super::model_to_library::fn_sig(vec![(value.clone(), col_ty.clone())], col_ty.clone())),
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+
+        // `Model._query_<attr>_normalized(value)`: an Array maps through
+        // the normalizer element by element, anything else is one value.
+        let query_name = query_normalizer_name(&attr);
+        let item = Symbol::from("item");
+        let item_ref = synthetic(ExprNode::Var { id: VarId(0), name: item.clone() });
+        let is_array = synthetic(ExprNode::Send {
+            recv: Some(read()),
+            method: Symbol::from("is_a?"),
+            args: vec![synthetic(ExprNode::Const { path: vec![Symbol::from("Array")] })],
+            block: None,
+            parenthesized: true,
+        });
+        let each_item = synthetic(ExprNode::Send {
+            recv: Some(read()),
+            method: Symbol::from("map"),
+            args: vec![],
+            block: Some(synthetic(ExprNode::Lambda {
+                signature: Default::default(),
+                extra_params: Vec::new(),
+                params: vec![item],
+                rest_param: None,
+                block_param: None,
+                body: call_normalizer(&model.name, &attr, item_ref),
+                block_style: crate::expr::BlockStyle::Brace,
+            })),
+            parenthesized: false,
+        });
+        let query_body = synthetic(ExprNode::If {
+            cond: is_array,
+            then_branch: each_item,
+            else_branch: call_normalizer(&model.name, &attr, read()),
+        });
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: query_name,
+            receiver: MethodReceiver::Class,
+            params: vec![Param::positional(value.clone())],
+            body: query_body,
+            signature: Some(super::model_to_library::fn_sig(vec![(value.clone(), Ty::Untyped)], Ty::Untyped)),
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
             kind: AccessorKind::Method,
@@ -223,15 +281,24 @@ fn rewrite(e: &mut Expr, normalized: &HashMap<ClassId, Vec<Symbol>>) {
             if !attrs.contains(key) || is_normalizer_call(v) {
                 continue;
             }
-            *v = call_normalizer(&class, key, v.clone());
+            *v = call_query_normalizer(&class, key, v.clone());
         }
     }
+}
+
+fn call_query_normalizer(model: &ClassId, attr: &Symbol, value: Expr) -> Expr {
+    let mut e = call_normalizer(model, attr, value);
+    let ExprNode::Send { method, .. } = &mut *e.node else { unreachable!() };
+    *method = query_normalizer_name(attr);
+    e
 }
 
 /// Already wrapped — the rewrite must be idempotent, since a body can be
 /// visited twice (a concern's copy and its includer's).
 fn is_normalizer_call(e: &Expr) -> bool {
-    matches!(&*e.node, ExprNode::Send { method, .. } if method.as_str().starts_with("_normalize_"))
+    matches!(&*e.node, ExprNode::Send { method, .. }
+        if method.as_str().starts_with("_normalize_")
+            || (method.as_str().starts_with("_query_") && method.as_str().ends_with("_normalized")))
 }
 
 fn synthetic(node: ExprNode) -> Expr {

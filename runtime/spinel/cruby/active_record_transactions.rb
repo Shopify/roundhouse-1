@@ -1403,9 +1403,13 @@ module ArTransactionChanges
     end
 
     # A timestamp column's snapshot is its stored text; the reader (and
-    # the gem's `_read_attribute`) answers the time.
+    # the gem's `_read_attribute`) answers the time. A typed_store
+    # column's is its serialized text; the gem's `_read_attribute`
+    # answers the store's Hash (`TypedStore.snapshot`, the generated
+    # `__rh_<column>_keys` marks the column as a store).
     def _transaction_change_value(name, value)
       return value unless value.is_a?(String)
+      return TypedStore.snapshot(self, name, value) if respond_to?(:"__rh_#{name}_keys", true)
       type = begin
         self.class.type_for_attribute(name)
       rescue NotImplementedError
