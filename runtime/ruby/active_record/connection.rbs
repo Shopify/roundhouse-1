@@ -120,6 +120,7 @@ module ActiveRecord
     def exec_query: (String sql, ?String? name, ?Array[untyped] binds, ?prepare: bool) -> Result
     def select_all: (String sql, ?String? name, ?Array[untyped] binds, ?preparable: bool?, ?async: bool) -> Result
     def _with_binds: (untyped sql, Array[untyped] binds) -> String
+    def _arel_substituted_sql: (untyped node) -> String
     def exec_update: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_delete: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_insert: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Result

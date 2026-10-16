@@ -4047,6 +4047,14 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     *expr = var_expr(span, rel);
                     return Some(self_model.clone());
                 }
+                // Bare `klass` in a scope body is the relation's own
+                // `klass` (the body runs `instance_exec`'d on it in
+                // Rails): the lowered class method has no such method
+                // on `self`, so read it off the threaded relation.
+                if method.as_str() == "klass" && args.is_empty() && block.is_none() {
+                    *expr = put(span, Some(var_expr(span, rel)), method, args, block, parenthesized);
+                    return None;
+                }
                 if ctx.scope_of(self_model, &method) {
                     let leading = ctx.scope_params(self_model, &method);
                     let keeps = ctx.scope_keeps_relation(self_model, &method);
