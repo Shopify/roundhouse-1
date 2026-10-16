@@ -168,6 +168,7 @@ fn tiny_blog_round_trips() {
         included_class_attributes: Default::default(),
         lifted_autoload_callbacks: Default::default(),
         autoload_callback_cpaths: Default::default(),
+        engine_autoload_roots: Default::default(),
         boot_native_requires: Vec::new(),
         gem_source_dirs: Vec::new(),
         initializer_filters: Vec::new(),
