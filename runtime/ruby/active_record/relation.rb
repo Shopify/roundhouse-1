@@ -1649,8 +1649,12 @@ module ActiveRecord
         child_ids[n.index] = {}
       end
       rows.each do |row|
+        # Keys read back as the model reads them: a `model_uuid_attributes`
+        # id comes off PostgreSQL as a uuid String, but the records
+        # `eager_records_by_key` loads are keyed by their Integer id.
         base = row["rh_eager_0"]
         next if base.nil?
+        base = @model._primary_key_from_database(base)
         bkey = base.to_s
         unless base_ids.key?(bkey)
           base_ids[bkey] = base
@@ -1660,6 +1664,8 @@ module ActiveRecord
           child = row["rh_eager_#{n.index}"]
           parent = n.parent.nil? ? base : row["rh_eager_#{n.parent.index}"]
           next if child.nil? || parent.nil?
+          child = n.klass._primary_key_from_database(child)
+          parent = n.parent.klass._primary_key_from_database(parent) unless n.parent.nil?
           ckey = child.to_s
           pkey = parent.to_s
           child_ids[n.index][ckey] = child
