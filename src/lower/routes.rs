@@ -442,6 +442,17 @@ fn singular_resource_actions() -> &'static [(&'static str, HttpMethod, &'static 
 fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
     match spec {
         RouteSpec::Explicit { method, path, controller, action, as_name, scope, constraints } => {
+            // A CANONICAL action (`get :index` in `collection`, `patch
+            // :update` in `member`) routes at the resource's own path and,
+            // with no `as:`, takes the resource's name: Rails'
+            // `canonical_action?` drops the action from path and name alike.
+            let canonical = matches!(scope, ResourceScope::Member | ResourceScope::Collection)
+                && matches!(
+                    path.trim_matches('/'),
+                    "index" | "create" | "new" | "show" | "update" | "destroy"
+                );
+            let empty = String::new();
+            let path = if canonical { &empty } else { path };
             // `:format => "rss"` rides the constraints map at ingest
             // (it shapes the request, not the routing triple); surface
             // it as the route's forced response format.
@@ -497,13 +508,19 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             let scoped_name = match scope {
                 ResourceScope::Member | ResourceScope::Collection => {
                     ctx.member_and_collection_names().and_then(|(member, collection)| {
-                        static_path_name(path).map(|child| match scope {
-                            ResourceScope::Member => {
-                                format!("{child}_{}{member}", ctx.ancestor_name_prefix())
+                        let own = if canonical { Some(String::new()) } else { static_path_name(path) };
+                        own.map(|child| {
+                            let child = if child.is_empty() { child } else { format!("{child}_") };
+                            match scope {
+                                ResourceScope::Member => {
+                                    format!("{child}{}{member}", ctx.ancestor_name_prefix())
+                                }
+                                _ => format!("{child}{}{collection}", ctx.ancestor_name_prefix()),
                             }
-                            _ => format!("{child}_{}{collection}", ctx.ancestor_name_prefix()),
                         })
                     })
+                    // Rails skips a derived name an earlier route holds.
+                    .filter(|n| !canonical || !out.iter().any(|r| r.named && &r.as_name == n))
                 }
                 // A bare verb in the resources block is a nested route;
                 // it keeps the parent-first order, decided below.

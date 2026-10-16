@@ -206,6 +206,7 @@ pub(super) fn ingest_route_file(
     // (`RetailComponent::Engine.routes.draw`) is a different set — its
     // helpers live on the engine, not on the app's `url_helpers` — so it
     // is not folded into this table.
+    ROUTE_PATH_LOCALS.with(|l| l.borrow_mut().clear());
     let mut draw_calls = top_level_app_draws(&root);
     if draw_calls.is_empty() && app_file {
         // A draw nested inside something else (a conditional, a
@@ -1233,6 +1234,13 @@ fn ingest_route_stmts<'pr>(
         if let Some(write) = stmt.as_local_variable_write_node() {
             let value = eval::value(&write.value()).unwrap_or(eval::RVal::Unknown);
             eval::bind(constant_id_str(&write.name()), value);
+            // `routes_path = Engine.root.join("config", "routes", "x")` — a
+            // later `load(routes_path.join("y.rb"))` names a route file.
+            let mut parts = Vec::new();
+            path_fragments(&write.value(), &mut parts);
+            ROUTE_PATH_LOCALS.with(|l| {
+                l.borrow_mut().insert(constant_id_str(&write.name()).to_string(), parts);
+            });
             continue;
         }
         // `case` / `case in`, and any other non-call, used to fall
@@ -2557,8 +2565,19 @@ fn route_file_key(node: &Node<'_>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+thread_local! {
+    /// Path fragments of the route file's local variables, by name.
+    static ROUTE_PATH_LOCALS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::default());
+}
+
 fn path_fragments(node: &Node<'_>, out: &mut Vec<String>) {
-    if let Some(s) = string_value(node) {
+    if let Some(read) = node.as_local_variable_read_node() {
+        ROUTE_PATH_LOCALS.with(|l| {
+            if let Some(parts) = l.borrow().get(constant_id_str(&read.name())) {
+                out.extend(parts.iter().cloned());
+            }
+        });
+    } else if let Some(s) = string_value(node) {
         out.push(s.trim_matches('/').to_string());
     } else if let Some(sym) = symbol_value(node) {
         out.push(sym);
@@ -3469,10 +3488,24 @@ fn ingest_root_route(
         }));
     }
     if target.is_none() && unmodeled.is_none() {
-        if let (Some(action), Some(controller)) =
-            (action_kwarg, cx.scope_controller.borrow().clone())
-        {
-            target = Some(format!("{controller}#{action}"));
+        let scope_controller = cx.scope_controller.borrow().clone();
+        match (action_kwarg, scope_controller) {
+            (Some(action), Some(controller)) => target = Some(format!("{controller}#{action}")),
+            // `namespace :search do root action: "new", via: "get" end`:
+            // no controller of its own, so Rails takes the scope's module
+            // (`search#new`), as for a bare verb.
+            (Some(action), None) => {
+                return Ok(Some(RouteSpec::Explicit {
+                    method: HttpMethod::Get,
+                    path: "/".to_string(),
+                    controller: ClassId(Symbol::from(MODULE_CONTROLLER)),
+                    action: Symbol::from(action),
+                    as_name: Some(as_name.unwrap_or_else(|| Symbol::from("root"))),
+                    constraints: IndexMap::new(),
+                    scope: ResourceScope::default(),
+                }));
+            }
+            _ => {}
         }
     }
     if let Some(kind) = unmodeled {
