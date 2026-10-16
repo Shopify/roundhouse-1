@@ -99,6 +99,52 @@ module ActionDispatch
       set_header(PARAMETERS_KEY, parameters.transform_keys(&:to_sym))
     end
 
+    # Rails' `controller_class` (actionpack request.rb): the class the
+    # route's `:controller` capture names, `PASS_NOT_FOUND` when the
+    # route captured none (a bare request outside a route), and
+    # MissingController when the name resolves to nothing. Core's
+    # CurrentRequest#entrypoint reads it on every background job. The
+    # lookup is a constant lookup by name, so it lives with the CRuby
+    # overlay.
+    PASS_NOT_FOUND = Class.new do
+      def self.action(_name)
+        proc { [404, { "X-Cascade" => "pass" }, []] }
+      end
+
+      def self.action_encoding_template(_action)
+        false
+      end
+    end
+
+    def controller_class
+      params = path_parameters
+      params[:action] ||= "index"
+      controller_class_for(params[:controller])
+    end
+
+    def controller_class_for(name)
+      return PASS_NOT_FOUND unless name
+
+      # Core's tree carries the full Inflector (its acronyms included:
+      # "graph_api" is `GraphApi`, "graph_ql" `GraphQL`); a tree with
+      # only the minimal one capitalizes each segment.
+      const_name =
+        if ActiveSupport::Inflector.respond_to?(:camelize) && ActiveSupport::Inflector.respond_to?(:underscore)
+          ActiveSupport::Inflector.camelize(ActiveSupport::Inflector.underscore(name.to_s)) + "Controller"
+        else
+          name.to_s.split("/").map { |part| part.split("_").map(&:capitalize).join }.join("::") + "Controller"
+        end
+      begin
+        Object.const_get(const_name)
+      rescue NameError => error
+        if const_name.split("::").include?(error.name.to_s)
+          raise ActionDispatch::MissingController.new(error.message, error.name)
+        else
+          raise
+        end
+      end
+    end
+
     # Rails' verb table (ActionDispatch::Request::HTTP_METHODS), which
     # `request_method=` checks a name against.
     HTTP_METHODS = %w[
