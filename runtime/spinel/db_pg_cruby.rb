@@ -1328,6 +1328,15 @@ module Db
     bind_bool(handle, index, value)
   end
 
+  # A bytea bind is the hex text form PostgreSQL's bytea input reads.
+  def self.bind_binary(handle, index, value)
+    bind_int(handle, index, value.nil? ? nil : "\\x#{value.to_s.unpack1('H*')}")
+  end
+
+  def self.bind_binary_opt(handle, index, value)
+    bind_binary(handle, index, value)
+  end
+
   # ── Request lifecycle hooks ──
   #
   # The Ruby-family dispatcher (main.rb `dispatch_core`), the Rack boot
@@ -1411,12 +1420,24 @@ module Db
     context[:capture]&.push(sql)
   end
 
+  # A text literal. Whether a value is text or bytes is the COLUMN's
+  # decision (`escape_binary`), never the string's encoding: a BINARY-
+  # encoded String compared with or stored in a varchar column is text, as
+  # quoting.rb's `_quote` writes it.
   def self.escape_string(value)
     string = value.to_s
-    # Binary storage is bytea; text containing NUL is invalid PostgreSQL
-    # text and must fail, rather than silently convert to a different type.
-    return "'\\x#{string.unpack1('H*')}'::bytea" if string.encoding == Encoding::BINARY
+    string = string.dup.force_encoding(Encoding::UTF_8) if string.encoding == Encoding::BINARY
     "'#{current_dbh.escape_string(string)}'"
+  end
+
+  # A bytea literal: a binary column's value (a String of bytes, or the
+  # ActiveModel::Type::Binary::Data its type serialized) in hex form.
+  def self.escape_binary(value)
+    "'\\x#{value.to_s.unpack1('H*')}'::bytea"
+  end
+
+  def self.escape_binary_opt(value)
+    value.nil? ? "NULL" : escape_binary(value)
   end
 
   def self.escape_int(value)

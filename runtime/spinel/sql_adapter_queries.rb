@@ -143,6 +143,9 @@ module SqlAdapterQueries
       Db.escape_bool(false)
     elsif v.nil?
       "NULL"
+    elsif defined?(ActiveModel::Type::Binary::Data) && v.is_a?(ActiveModel::Type::Binary::Data)
+      # A binary column's serialized value: bytes, whatever the encoding.
+      Db.escape_binary(v.to_s)
     elsif v.is_a?(Time)
       Db.escape_string(ActiveSupport.format_db_time(v).to_s)
     elsif defined?(Date) && v.is_a?(Date)

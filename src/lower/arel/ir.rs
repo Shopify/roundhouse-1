@@ -268,13 +268,41 @@ pub enum ValueType {
     StrOpt,
     FloatOpt,
     BoolOpt,
+    /// A binary column (PostgreSQL `bytea`). The column's schema type picks
+    /// it, never a value's encoding: a `bytea` literal for a bytea column
+    /// and text for every other, as Rails' Binary::Data serialize does.
+    /// Other dialects store bytes as text and lower it to `Str`.
+    Binary,
+    BinaryOpt,
 }
 
 impl ValueType {
     /// True for the nullable variants. Optional binds and inline escapes
     /// both preserve nil as SQL NULL.
     pub fn is_nullable(self) -> bool {
-        matches!(self, ValueType::IntOpt | ValueType::StrOpt | ValueType::FloatOpt | ValueType::BoolOpt)
+        matches!(self, ValueType::IntOpt | ValueType::StrOpt | ValueType::FloatOpt | ValueType::BoolOpt | ValueType::BinaryOpt)
+    }
+
+    /// What this type lowers to for `dialect`: only PostgreSQL has a bytea
+    /// literal; every other dialect stores a binary value as text.
+    pub fn for_dialect(self, dialect: super::visitor::SqlDialect) -> ValueType {
+        match (self, dialect) {
+            (_, super::visitor::SqlDialect::Postgres) => self,
+            (ValueType::Binary, _) => ValueType::Str,
+            (ValueType::BinaryOpt, _) => ValueType::StrOpt,
+            (other, _) => other,
+        }
+    }
+
+    /// The nullable counterpart.
+    pub fn nullable(self) -> ValueType {
+        match self {
+            ValueType::Int | ValueType::IntOpt => ValueType::IntOpt,
+            ValueType::Str | ValueType::StrOpt => ValueType::StrOpt,
+            ValueType::Bool | ValueType::BoolOpt => ValueType::BoolOpt,
+            ValueType::FloatOpt => ValueType::FloatOpt,
+            ValueType::Binary | ValueType::BinaryOpt => ValueType::BinaryOpt,
+        }
     }
 }
 

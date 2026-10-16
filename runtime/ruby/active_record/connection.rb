@@ -1034,7 +1034,7 @@ module ActiveRecord
       end
 
       tuples = rows.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        values = cols.map { |c| ActiveRecord.adapter.escape_value(known.include?(c.to_s) ? type_for_attribute(c).serialize(row[c]) : row[c]) }
         stamped.each { |_c| values.push(ActiveRecord.adapter.escape_value(now)) }
         "(" + values.join(", ") + ")"
       end
@@ -1724,14 +1724,28 @@ module ActiveRecord
     
     def self._attribute_serialize(name, value)
       type = _declared_attribute_types[name]
-      type ? _bind_type_cast(name, type.serialize(value)) : value
+      return type ? _bind_type_cast(name, type.serialize(value)) : _bytea_value(name, value)
+    end
+
+    # A PostgreSQL bytea column with no declared type still writes and
+    # compares as bytes (Binary::Data, which the adapter quotes as a bytea
+    # literal); the column's type decides, never the String's encoding.
+    def self._bytea_value(name, value)
+      return value if value.nil? || value.is_a?(ActiveModel::Type::Binary::Data)
+      spec = begin
+        schema_column_types[name]
+      rescue NotImplementedError
+        nil
+      end
+      return value unless spec && spec[0] == :bytea
+      type_for_attribute(name).serialize(value)
     end
     
     # A value from outside (a where/update_all/exists? argument): cast,
     # then serialized, as QueryAttribute#value_for_database does.
     def self._attribute_for_database(name, value)
       type = _declared_attribute_types[name]
-      type ? _bind_type_cast(name, type.serialize(type.cast(value))) : value
+      return type ? _bind_type_cast(name, type.serialize(type.cast(value))) : _bytea_value(name, value)
     end
     
     # predicate_builder.rb's `force_equality?` test for a hash condition

@@ -1181,6 +1181,14 @@ module Db
     current_conn.stmt(stmt).bind(idx, value)
   end
 
+  def self.bind_binary(stmt, idx, value)
+    bind_binary_opt(stmt, idx, value)
+  end
+
+  def self.bind_binary_opt(stmt, idx, value)
+    current_conn.stmt(stmt).bind(idx, value.nil? ? nil : bytea_hex(value))
+  end
+
   def self.bind_bool(stmt, idx, value)
     bind_bool_opt(stmt, idx, value)
   end
@@ -1321,6 +1329,28 @@ module Db
 
   def self.escape_string_opt(s)
     s.nil? ? "NULL" : escape_string(s)
+  end
+
+  # A bytea literal for a binary column: the bytes in PostgreSQL's hex form.
+  def self.bytea_hex(s)
+    digits = "0123456789abcdef"
+    text = s.to_s
+    out = "\\x"
+    i = 0
+    while i < text.bytesize
+      b = text.getbyte(i)
+      out = out + digits[b / 16] + digits[b % 16]
+      i += 1
+    end
+    out
+  end
+
+  def self.escape_binary(s)
+    "'" + bytea_hex(s) + "'::bytea"
+  end
+
+  def self.escape_binary_opt(s)
+    s.nil? ? "NULL" : escape_binary(s)
   end
 
   def self.escape_int_opt(n)

@@ -178,17 +178,19 @@ fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize, dialec
 
 /// Fixed-shape queries keep literal positions. Shaped queries consume the
 /// positions reserved during SQL construction, skipping nil predicates.
-fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize) -> Vec<Expr> {
+fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize, dialect: SqlDialect) -> Vec<Expr> {
     let db = ClassId(Symbol::from(DB_MOD));
     let shaped = has_shaped_predicates(binds);
     binds.iter().enumerate().filter(|(_, b)| b.parameterized).map(|(i, b)| {
-        let method = match b.ty {
+        let method = match b.ty.for_dialect(dialect) {
             ValueType::Int => "bind_int",
             ValueType::Str => "bind_text",
             ValueType::Bool => "bind_bool",
             ValueType::IntOpt => "bind_int_opt",
             ValueType::StrOpt => "bind_text_opt",
             ValueType::BoolOpt => "bind_bool_opt",
+            ValueType::Binary => "bind_binary",
+            ValueType::BinaryOpt => "bind_binary_opt",
             ValueType::FloatOpt => unreachable!("unserialized float in bind path"),
         };
         let position = if shaped {
@@ -360,7 +362,7 @@ fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool
     let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
     // stmt = prepare ; [bind …] ; result = nil ; if step? {…} ; finalize ; result
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(result_init);
     stmts.push(if_expr);
     stmts.push(finalize);
@@ -438,7 +440,7 @@ fn emit_multi_hydrate(
     // keep the inline `IN (…)` list (variable arity — not parameterized
     // here; see the note in `push_preload_stmts`).
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(finalize);
@@ -780,7 +782,7 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool,
     );
 
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
@@ -883,7 +885,7 @@ fn emit_group_count(
     );
 
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
@@ -913,7 +915,7 @@ fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> 
 
     // stmt = prepare ; [bind …] ; step? ; result = column_int ; finalize ; result
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(step);
     stmts.push(result_assign);
     stmts.push(finalize);
@@ -942,7 +944,7 @@ fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) ->
 
     // stmt = prepare ; [bind …] ; result = step? ; finalize ; result
     let mut stmts = prepare;
-    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id, dialect));
     stmts.push(result_assign);
     stmts.push(finalize);
     stmts.push(var_ref(&result));
@@ -1271,7 +1273,7 @@ fn push_value_segment(
 fn escape_value(db: &ClassId, val: &Value, dialect: SqlDialect) -> Expr {
     match val {
         Value::Runtime { expr, ty } => {
-            let method = match ty {
+            let method = match ty.for_dialect(dialect) {
                 ValueType::Int => "escape_int",
                 ValueType::Str => "escape_string",
                 ValueType::Bool => "escape_bool",
@@ -1282,6 +1284,8 @@ fn escape_value(db: &ClassId, val: &Value, dialect: SqlDialect) -> Expr {
                 ValueType::StrOpt => "escape_string_opt",
                 ValueType::FloatOpt => "escape_float_opt",
                 ValueType::BoolOpt => "escape_bool_opt",
+                ValueType::Binary => "escape_binary",
+                ValueType::BinaryOpt => "escape_binary_opt",
             };
             db_call(db, method, vec![expr.clone()])
         }
