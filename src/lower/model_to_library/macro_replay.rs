@@ -789,6 +789,27 @@ impl<'a> ClassSide<'a> {
                 Err(reason) => MacroVerdict::Refuse(reason),
             });
         }
+        // The sequenced_column gem's `sequenced_column(column, scope:, ...)`,
+        // when the boot requires the gem: the runtime port
+        // (runtime/spinel/sequenced_column.rb) includes `SequencedColumn`
+        // into ActiveRecord::Base, so the call records the column and
+        // registers the `before_create` / `after_rollback` hooks there.
+        // Dropped, the column stays NULL on create (`returns.number`).
+        if method.as_str() == "sequenced_column"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && self.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            && self.app.bundler_gems.iter().any(|g| {
+                g.name == "sequenced_column" && (g.envs.is_empty() || g.envs.iter().any(|e| e == "test"))
+            })
+        {
+            let mut walk = Walk::new(self, method.as_str());
+            let mut aliases = Vec::new();
+            let result = args.iter().chain(block.iter()).try_for_each(|arg| walk.expr(arg, &mut aliases));
+            return Some(match result {
+                Ok(()) => MacroVerdict::Replay,
+                Err(reason) => MacroVerdict::Refuse(reason),
+            });
+        }
         // `attribute :name, :type, default: x` on a class that includes the
         // ActiveModel::Attributes port runs there: its arguments run in
         // the class body.

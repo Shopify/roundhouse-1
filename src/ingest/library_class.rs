@@ -1704,7 +1704,9 @@ pub(super) fn literal_sorbet_members(
         let Some(write) = statement.as_constant_write_node() else { return true };
         let Some(call) = write.value().as_call_node() else { return true };
         call.receiver().is_some() || call.block().is_some()
-            || call.arguments().is_none_or(|args| {
+            // `Approved = new` serializes as the lowercased name (normalized
+            // above into the same projection); else one string literal.
+            || call.arguments().is_some_and(|args| {
                 let arguments: Vec<_> = args.arguments().iter().collect();
                 !matches!(arguments.as_slice(), [argument] if argument.as_string_node().is_some())
             })

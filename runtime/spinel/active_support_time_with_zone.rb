@@ -30,9 +30,10 @@
 #   required here: TimeWithZone#change (TimeZoneConverter#cast's) calls
 #   it, and active_support/all loads it natively with the zones.
 #   Time#+ and #- with a Duration are the overlay's
-#   (runtime/active_support_duration.rb). Of DateAndTime::Calculations
-#   only #past?, #future?, #today?, #tomorrow?, #yesterday?,
-#   #next_day? and #prev_day? are.
+#   (runtime/active_support_duration.rb); Date's are here (Date#+ and #-
+#   with a Duration, .yesterday, .tomorrow, #ago, #since, the
+#   beginning_of/end_of day methods, #change, #<=>), and
+#   DateAndTime::Calculations is whole.
 # - TimeFormats' lambdas are plain lambdas (the tree has no
 #   ActiveSupport::Ractors), and Time::DATE_FORMATS' deprecation is not
 #   ported.
@@ -61,6 +62,7 @@ require "json"
 require "yaml"
 require_relative "active_support_isolated_execution_state"
 require_relative "active_support_time_change"
+require_relative "active_support_tryable"
 
 # core_ext/object/acts_like.rb and the acts_like files.
 class Object
@@ -565,22 +567,41 @@ module DateAndTime
       end
   end
 
-  # core_ext/date_and_time/calculations.rb: the predicates TimeWithZone
-  # delegates to.
+  # core_ext/date_and_time/calculations.rb, verbatim; Rails' doc comments
+  # dropped.
   module Calculations
-    def yesterday?
-      prev_day.to_date == ::Date.current
+    DAYS_INTO_WEEK = {
+      sunday: 0,
+      monday: 1,
+      tuesday: 2,
+      wednesday: 3,
+      thursday: 4,
+      friday: 5,
+      saturday: 6
+    }
+    WEEKEND_DAYS = [ 6, 0 ]
+
+    def yesterday
+      advance(days: -1)
     end
-    alias :prev_day? :yesterday?
+
+    def tomorrow
+      advance(days: 1)
+    end
 
     def today?
       to_date == ::Date.current
     end
 
     def tomorrow?
-      next_day.to_date == ::Date.current
+      to_date == ::Date.current.tomorrow
     end
     alias :next_day? :tomorrow?
+
+    def yesterday?
+      to_date == ::Date.current.yesterday
+    end
+    alias :prev_day? :yesterday?
 
     def past?
       self < self.class.current
@@ -589,6 +610,221 @@ module DateAndTime
     def future?
       self > self.class.current
     end
+
+    def on_weekend?
+      WEEKEND_DAYS.include?(wday)
+    end
+
+    def on_weekday?
+      !WEEKEND_DAYS.include?(wday)
+    end
+
+    def this_week?
+      ::Date.current.all_week.include?(to_date)
+    end
+
+    def this_month?
+      ::Date.current.all_month.include?(to_date)
+    end
+
+    def this_year?
+      ::Date.current.all_year.include?(to_date)
+    end
+
+    def before?(date_or_time)
+      self < date_or_time
+    end
+
+    def after?(date_or_time)
+      self > date_or_time
+    end
+
+    def days_ago(days)
+      advance(days: -days)
+    end
+
+    def days_since(days)
+      advance(days: days)
+    end
+
+    def weeks_ago(weeks)
+      advance(weeks: -weeks)
+    end
+
+    def weeks_since(weeks)
+      advance(weeks: weeks)
+    end
+
+    def months_ago(months)
+      advance(months: -months)
+    end
+
+    def months_since(months)
+      advance(months: months)
+    end
+
+    def years_ago(years)
+      advance(years: -years)
+    end
+
+    def years_since(years)
+      advance(years: years)
+    end
+
+    def beginning_of_month
+      first_hour(change(day: 1))
+    end
+    alias :at_beginning_of_month :beginning_of_month
+
+    def beginning_of_quarter
+      first_quarter_month = month - (2 + month) % 3
+      beginning_of_month.change(month: first_quarter_month)
+    end
+    alias :at_beginning_of_quarter :beginning_of_quarter
+
+    def end_of_quarter
+      last_quarter_month = month + (12 - month) % 3
+      beginning_of_month.change(month: last_quarter_month).end_of_month
+    end
+    alias :at_end_of_quarter :end_of_quarter
+
+    def quarter
+      (month / 3.0).ceil
+    end
+
+    def beginning_of_year
+      change(month: 1).beginning_of_month
+    end
+    alias :at_beginning_of_year :beginning_of_year
+
+    def next_week(given_day_in_next_week = Date.beginning_of_week, same_time: false)
+      result = first_hour(weeks_since(1).beginning_of_week.days_since(days_span(given_day_in_next_week)))
+      same_time ? copy_time_to(result) : result
+    end
+
+    def next_weekday
+      if next_day.on_weekend?
+        next_week(:monday, same_time: true)
+      else
+        next_day
+      end
+    end
+
+    def next_quarter
+      months_since(3)
+    end
+
+    def prev_week(start_day = Date.beginning_of_week, same_time: false)
+      result = first_hour(weeks_ago(1).beginning_of_week.days_since(days_span(start_day)))
+      same_time ? copy_time_to(result) : result
+    end
+    alias_method :last_week, :prev_week
+
+    def prev_weekday
+      if prev_day.on_weekend?
+        copy_time_to(beginning_of_week(:friday))
+      else
+        prev_day
+      end
+    end
+    alias_method :last_weekday, :prev_weekday
+
+    def last_month
+      months_ago(1)
+    end
+
+    def prev_quarter
+      months_ago(3)
+    end
+    alias_method :last_quarter, :prev_quarter
+
+    def last_year
+      years_ago(1)
+    end
+
+    def days_to_week_start(start_day = Date.beginning_of_week)
+      start_day_number = DAYS_INTO_WEEK.fetch(start_day)
+      (wday - start_day_number) % 7
+    end
+
+    def beginning_of_week(start_day = Date.beginning_of_week)
+      result = days_ago(days_to_week_start(start_day))
+      acts_like?(:time) ? result.midnight : result
+    end
+    alias :at_beginning_of_week :beginning_of_week
+
+    def monday
+      beginning_of_week(:monday)
+    end
+
+    def end_of_week(start_day = Date.beginning_of_week)
+      last_hour(days_since(6 - days_to_week_start(start_day)))
+    end
+    alias :at_end_of_week :end_of_week
+
+    def sunday
+      end_of_week(:monday)
+    end
+
+    def end_of_month
+      last_day = ::Time.days_in_month(month, year)
+      last_hour(days_since(last_day - day))
+    end
+    alias :at_end_of_month :end_of_month
+
+    def end_of_year
+      change(month: 12).end_of_month
+    end
+    alias :at_end_of_year :end_of_year
+
+    def all_day
+      beginning_of_day..end_of_day
+    end
+
+    def all_week(start_day = Date.beginning_of_week)
+      beginning_of_week(start_day)..end_of_week(start_day)
+    end
+
+    def all_month
+      beginning_of_month..end_of_month
+    end
+
+    def all_quarter
+      beginning_of_quarter..end_of_quarter
+    end
+
+    def all_year
+      beginning_of_year..end_of_year
+    end
+
+    def next_occurring(day_of_week)
+      from_now = DAYS_INTO_WEEK.fetch(day_of_week) - wday
+      from_now += 7 unless from_now > 0
+      advance(days: from_now)
+    end
+
+    def prev_occurring(day_of_week)
+      ago = wday - DAYS_INTO_WEEK.fetch(day_of_week)
+      ago += 7 unless ago > 0
+      advance(days: -ago)
+    end
+
+    private
+      def first_hour(date_or_time)
+        date_or_time.acts_like?(:time) ? date_or_time.beginning_of_day : date_or_time
+      end
+
+      def last_hour(date_or_time)
+        date_or_time.acts_like?(:time) ? date_or_time.end_of_day : date_or_time
+      end
+
+      def days_span(day)
+        (DAYS_INTO_WEEK.fetch(day) - DAYS_INTO_WEEK.fetch(Date.beginning_of_week)) % 7
+      end
+
+      def copy_time_to(other)
+        other.change(hour: hour, min: min, sec: sec, nsec: try(:nsec))
+      end
   end
 end
 
@@ -636,10 +872,103 @@ class Date
   include DateAndTime::Calculations
 
   class << self
+    attr_accessor :beginning_of_week_default
+
+    def beginning_of_week
+      ::ActiveSupport::IsolatedExecutionState[:beginning_of_week] || beginning_of_week_default || :monday
+    end
+
+    def beginning_of_week=(week_start)
+      ::ActiveSupport::IsolatedExecutionState[:beginning_of_week] = find_beginning_of_week!(week_start)
+    end
+
+    def find_beginning_of_week!(week_start)
+      raise ArgumentError, "Invalid beginning of week: #{week_start}" unless ::Date::DAYS_INTO_WEEK.key?(week_start)
+      week_start
+    end
+
+    def yesterday
+      ::Date.current.yesterday
+    end
+
+    def tomorrow
+      ::Date.current.tomorrow
+    end
+
     def current
       ::Time.zone ? ::Time.zone.today : ::Date.today
     end
   end
+
+  def ago(seconds)
+    in_time_zone.since(-seconds)
+  end
+
+  def since(seconds)
+    in_time_zone.since(seconds)
+  end
+  alias :in :since
+
+  def beginning_of_day
+    in_time_zone
+  end
+  alias :midnight :beginning_of_day
+  alias :at_midnight :beginning_of_day
+  alias :at_beginning_of_day :beginning_of_day
+
+  def middle_of_day
+    in_time_zone.middle_of_day
+  end
+  alias :midday :middle_of_day
+  alias :noon :middle_of_day
+  alias :at_midday :middle_of_day
+  alias :at_noon :middle_of_day
+  alias :at_middle_of_day :middle_of_day
+
+  def end_of_day
+    in_time_zone.end_of_day
+  end
+  alias :at_end_of_day :end_of_day
+
+  # Date ± Duration → Date (Duration#since over Duration#sum's
+  # Date#advance), Rails' plus_with_duration and minus_with_duration.
+  def plus_with_duration(other) # :nodoc:
+    if ActiveSupport::Duration === other
+      other.since(self)
+    else
+      plus_without_duration(other)
+    end
+  end
+  alias_method :plus_without_duration, :+
+  alias_method :+, :plus_with_duration
+
+  def minus_with_duration(other) # :nodoc:
+    if ActiveSupport::Duration === other
+      plus_with_duration(-other)
+    else
+      minus_without_duration(other)
+    end
+  end
+  alias_method :minus_without_duration, :-
+  alias_method :-, :minus_with_duration
+
+  def change(options)
+    ::Date.new(
+      options.fetch(:year, year),
+      options.fetch(:month, month),
+      options.fetch(:day, day)
+    )
+  end
+
+  def compare_with_coercion(other)
+    if other.is_a?(Time)
+      to_datetime <=> other
+    else
+      compare_without_coercion(other)
+    end
+  end
+  alias_method :compare_without_coercion, :<=>
+  alias_method :<=>, :compare_with_coercion
 
   def to_time(form = :local)
     raise ArgumentError, "Expected :local or :utc, got #{form.inspect}." unless [:local, :utc].include?(form)

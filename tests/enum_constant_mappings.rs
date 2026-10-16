@@ -332,7 +332,10 @@ fn sorbet_mapping_refuses_dynamic_duplicate_and_reassigned_members() {
     for body in [
         "High = new(\"severe\"); High = new(\"mild\")",
         "High = new(\"severe\"); Low = new(\"severe\")",
-        "High = new(build_value)", "High = new", "High = new(1)",
+        // (A bare `High = new` is not a gap: sorbet-runtime serializes it as
+        // the lowercased name, `const_to_serialized_val`; see
+        // tests/om158_enum_interpolated_keys.rs.)
+        "High = new(build_value)", "High = new(1)",
         "High = new(:severe)", "High = new(\"severe\", \"extra\")",
         "High = new(\"sev#{suffix}\")", "High = new(\"severe\") if enabled?",
         "High = new(\"severe\"); mutate_members", "High = Other.new(\"severe\")",
