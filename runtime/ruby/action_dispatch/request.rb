@@ -141,6 +141,10 @@ module ActionDispatch
     # every target and names neither parser.
     attr_accessor :query_parameters
 
+    # Rack's `request.GET` / `request.POST`: the two readers above.
+    def GET = query_parameters
+    def POST = request_parameters
+
     def initialize
       @remote_ip = "127.0.0.1"
       @path = "/"

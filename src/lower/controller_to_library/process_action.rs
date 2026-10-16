@@ -80,6 +80,12 @@ pub(super) struct WrapFilters {
     /// Declaration order, inherited first — the first is OUTERMOST
     /// (ActiveSupport runs arounds in the order they were set).
     pub around: Vec<Filter>,
+    /// For each `around`, how many before filters (the preamble minus
+    /// its `Lead`) were registered ahead of it. An around callback wraps
+    /// every callback registered after it, the befores among them, so
+    /// `with_shop` declared above `authenticate_request` runs first and
+    /// the authentication runs inside it.
+    pub around_at: Vec<usize>,
     /// Declaration order; emitted REVERSED, since ActiveSupport runs
     /// after callbacks in reverse (`callbacks.rb`: "then runs the after
     /// callbacks in reverse order"). Named targets and block-form
@@ -203,10 +209,29 @@ pub(super) fn synthesize_process_action(
         stmts.push(runtime_hook("run_prepended_filters", param));
         stmts.push(halt_if_performed());
     };
+    // Around filters open a frame where they were registered: what
+    // follows them, before filters included, is their block.
+    let has_dispatch = !publics.is_empty() || !inherited.is_empty();
+    let mut frames: Vec<(Vec<Expr>, usize)> = Vec::new();
+    let mut next_around = 0usize;
+    let mut open_arounds = |stmts: &mut Vec<Expr>, registered: usize| {
+        while has_dispatch
+            && next_around < wraps.around.len()
+            && wraps.around_at.get(next_around).copied().unwrap_or(0) <= registered
+        {
+            frames.push((std::mem::take(stmts), next_around));
+            next_around += 1;
+        }
+    };
+    let mut registered = 0usize;
     for p in preamble {
         if !prepended_hooked && !matches!(p, PreambleStmt::Lead { .. }) {
             hook_prepended(&mut stmts);
             prepended_hooked = true;
+        }
+        if !matches!(p, PreambleStmt::Lead { .. }) {
+            open_arounds(&mut stmts, registered);
+            registered += 1;
         }
         let (stmt, halt_check) = match p {
             PreambleStmt::Call { filter, halt_check } => {
@@ -255,8 +280,9 @@ pub(super) fn synthesize_process_action(
         stmts.push(runtime_hook("run_appended_filters", param));
         stmts.push(halt_if_performed());
     }
+    open_arounds(&mut stmts, usize::MAX);
 
-    if !publics.is_empty() || !inherited.is_empty() {
+    if has_dispatch {
         // `around_action :m` — `m` runs the action by yielding, so the
         // dispatch becomes the block it is handed. Under the filter's
         // own guards; where they fail, the action runs unwrapped, which
@@ -280,7 +306,15 @@ pub(super) fn synthesize_process_action(
                 parenthesized: true,
             });
         }
-        for f in wraps.around.iter().rev() {
+        stmts.push(dispatch);
+        // Close the frames innermost first: each around's block is the
+        // statements that followed its registration.
+        while let Some((outer, idx)) = frames.pop() {
+            let f = &wraps.around[idx];
+            let inner = match stmts.len() {
+                1 => stmts.remove(0),
+                _ => syn(ExprNode::Seq { exprs: std::mem::take(&mut stmts) }),
+            };
             let wrapped = syn(ExprNode::Send {
                 recv: None,
                 method: f.target.clone(),
@@ -289,17 +323,18 @@ pub(super) fn synthesize_process_action(
                     params: vec![],
                     rest_param: None,
                     block_param: None,
-                    body: dispatch.clone(),
+                    body: inner.clone(),
                     block_style: crate::expr::BlockStyle::Do,
                 })),
                 parenthesized: false,
             });
-            dispatch = match filter_cond(f, param) {
-                Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: dispatch }),
+            let node = match filter_cond(f, param) {
+                Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: inner }),
                 None => wrapped,
             };
+            stmts = outer;
+            stmts.push(node);
         }
-        stmts.push(dispatch);
         // `after_action :m` — after the action returns (a halted chain
         // returned above; an action that raised is in the rescue).
         // Run-time after filters were declared after the lowered ones,
