@@ -1255,7 +1255,8 @@ module ActiveRecord
       # once a join brings in a second table carrying the same column
       # name. Raw strings (expressions, pre-qualified columns) ride
       # verbatim.
-      parts.each do |p|
+      # `group([:a, "b"])` is `group(:a, "b")`: Rails flattens its args.
+      parts.flatten.each do |p|
         @groups << (p.is_a?(Symbol) ? "#{@table}.#{p}" : p.to_s)
       end
       self
@@ -3007,6 +3008,11 @@ module ActiveRecord
           parts.push("#{key} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(key.to_s, val))}")
         end
         parts.join(", ")
+      elsif updates.is_a?(Array)
+        # `update_all(["col = COALESCE(col, 0) + ?", 1])` — Rails'
+        # sanitize_sql_for_assignment: the head is the fragment, the tail
+        # its binds.
+        substitute_binds(updates[0].to_s, updates[1..-1] || [])
       else
         updates.to_s
       end
@@ -4338,6 +4344,9 @@ module ActiveRecord
     def order_term(p)
       if p.is_a?(Hash)
         format_order_hash(p)
+      elsif p.is_a?(Arel::Nodes::SqlLiteral)
+        # `Arel.sql(…)` is the author's SQL, as `order_sql` takes it.
+        p.to_s
       else
         # A Symbol names an attribute, an alias its column
         # (`order(:subdomain)`); a String is SQL.
