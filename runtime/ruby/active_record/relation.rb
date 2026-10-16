@@ -359,10 +359,10 @@ module ActiveRecord
 
     # True when a hash condition contains an empty IN list (`id: []`).
     def hash_has_empty_in?(condition)
-      condition.each do |_key, val|
+      condition.each do |key, val|
         if val.is_a?(Array)
           return true if val.empty?
-        elsif val.is_a?(Hash)
+        elsif nested_hash?(key, val)
           return true if hash_has_empty_in?(val)
         end
       end
@@ -1424,7 +1424,7 @@ module ActiveRecord
     def reference_tables(hash)
       added = []
       hash.each do |key, val|
-        next unless val.is_a?(Hash)
+        next unless nested_hash?(key, val)
         added << key.to_s unless @referenced.include?(key.to_s)
       end
       return if added.empty?
@@ -3706,7 +3706,7 @@ module ActiveRecord
           predicate = tuple_predicate(key, val)
           parts << predicate
           named << [key.map { |k| k.to_s }.join(","), predicate]
-        elsif val.is_a?(Hash)
+        elsif nested_hash?(key, val)
           table, owner = nested_table(key)
           val.each do |col, v|
             predicate = column_predicate("#{table}.#{col}", v, false, owner)
@@ -3731,6 +3731,15 @@ module ActiveRecord
       end
       @hash_parts = named
       parts.join(" AND ")
+    end
+
+    # A Hash value nests a table only when the key is not a column of this
+    # model (predicate_builder `expand_from_hash`: `value.is_a?(Hash) &&
+    # !table.has_column?(key)`): `where(context: {a: 1})` on a serialized
+    # `context` column compares the column to the whole hash.
+    def nested_hash?(key, val)
+      return false unless val.is_a?(Hash)
+      !@model.schema_columns.include?(@model._attribute_name(key.to_s).to_sym)
     end
 
     # `[qualifier, model]` for a nested condition key (`where(payments_refunds:

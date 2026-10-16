@@ -90,10 +90,11 @@ fn a_non_nullable_boolean_column_coerces_too() {
 
 #[test]
 fn non_boolean_columns_keep_their_own_coercions() {
-    // Guard against the Bool arm swallowing neighbours.
+    // Guard against the Bool arm swallowing neighbours. A NOT NULL column
+    // a partial `select` left out stays nil (unloaded), not 0.
     let src = emitted_row_class(NULLABLE);
     assert!(
-        src.contains("(row[\"karma\"]).to_i"),
+        src.contains("row[\"karma\"]&.to_i"),
         "integer column should still use to_i:\n{src}"
     );
 }
