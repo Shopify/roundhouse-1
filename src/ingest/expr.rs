@@ -1408,18 +1408,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // `o` (once) flag is dropped: it only memoizes the first
         // interpolation, so re-evaluating is identical for
         // deterministic parts (and merely re-computes otherwise).
-        // Encoding flags (e/s/u/n) change match semantics and stay
-        // a (rarer) visible gap.
+        // The `u` flag is dropped too: Ruby source is UTF-8, so `/u` only
+        // pins the encoding the pattern already has (Core's identifications
+        // gem: `/[^[#{WORDS}‍#{EMOJI}]]+/u`). The other encoding
+        // flags (e/s/n) change match semantics and stay a (rarer) visible gap.
         n if n.as_interpolated_regular_expression_node().is_some() => {
             let r = n.as_interpolated_regular_expression_node().unwrap();
             if r.is_euc_jp()
                 || r.is_windows_31j()
-                || r.is_utf_8()
                 || r.is_ascii_8bit()
             {
                 return Err(IngestError::Unsupported {
                     file: file.into(),
-                    message: "interpolated regex with once/encoding flag not yet supported".into(),
+                    message: "interpolated regex with an e/s/n encoding flag not yet supported".into(),
                 });
             }
             let mut parts: Vec<InterpPart> = Vec::new();
