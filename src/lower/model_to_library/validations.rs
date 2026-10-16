@@ -1617,10 +1617,9 @@ fn inline_belongs_to_check(
         return if_with_nil_else(bool_op(BoolOpKind::Or, nil_check, zero_check), push_err);
     }
     // `!Target.exists?(@fk)`
-    let target_const = Expr::new(
-        Span::synthetic(),
-        ExprNode::Const { path: vec![target.0.clone()] },
-    );
+    // A resolved reference: a namespace-only `OnlineStore::Theme` beside
+    // the top-level `Theme` model must not capture the bare spelling.
+    let target_const = super::resolved_class_const(target);
     let exists_call = match lookup_pk {
         // `Target.exists?(uuid: @fk)`. Model_to_library synthesis runs
         // after the post-analyze `exists_conditions` rewrite, so that

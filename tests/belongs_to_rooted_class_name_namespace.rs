@@ -124,3 +124,28 @@ fn a_rooted_class_name_find_by_reader_is_not_captured_by_a_namespace_only_module
     );
     assert!(model.contains("::Theme.find_by(id: @theme_id)"), "{model}");
 }
+
+const REQUIRED_CONFIG: &str = r#"module OnlineStore
+  module VersionControl
+    class ThemeConfiguration < ApplicationRecord
+      self.table_name = "theme_configurations"
+      belongs_to :theme, class_name: "::Theme"
+    end
+  end
+end
+"#;
+
+/// A required belongs_to's inline existence check
+/// (`!Theme.exists?(@theme_id)`) names the same absolute class, not the
+/// namespace-only module: `module OnlineStore::Theme` has no `exists?`.
+#[test]
+fn a_required_belongs_to_existence_check_is_not_captured_by_a_namespace_only_module() {
+    let model = model(
+        base()
+            .write("db/structure.sql", STRUCTURE)
+            .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+            .write("app/models/online_store/version_control/theme_configuration.rb", REQUIRED_CONFIG),
+    );
+    assert!(model.contains("::Theme.exists?(@theme_id)"), "{model}");
+    assert!(!model.contains(" Theme.exists?") && !model.contains("(Theme.exists?"), "{model}");
+}
