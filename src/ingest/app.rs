@@ -5420,7 +5420,9 @@ fn splice_concern_class_methods_into_includers(
         }
     }
     for lc in &mut app.library_classes {
-        if lc.is_module {
+        // A Concern defers its includes to its own includer; a plain module
+        // that includes one is extended with its `ClassMethods` itself.
+        if lc.is_module && (concerns.contains(&lc.name) || lc.includes.is_empty()) {
             continue;
         }
         let taken = lc.methods.iter()

@@ -3081,19 +3081,39 @@ module ActiveRecord
       # (a column-list constant) plucks `:a` and `:b`.
       # A column with a declared type reads through it, as Rails' does; an
       # alias names its column.
-      names = cols.flatten.map { |col| @model._attribute_name(col.to_s) }
-      projections = []
-      names.each_with_index { |name, i| projections << "#{@table}.#{name} AS v#{i}" }
+      # A `"table.column"` name is qualified as Rails' `arel_column` does
+      # (a joined table's column answers as the database types it, one of
+      # this model's through its declared type); any other non-identifier
+      # string is SQL as written.
+      names = [] #: Array[String?]
+      projections = [] #: Array[String]
+      cols.flatten.each_with_index do |col, i|
+        text = col.to_s
+        match = /\A(\w+)\.(\w+)\z/.match(text)
+        if match
+          own = match[1] == @model.table_name
+          name = own ? @model._attribute_name(match[2]) : nil
+          names << name
+          projections << "#{own ? @table : ActiveRecord.adapter.quote_column_name(match[1])}.#{name || ActiveRecord.adapter.quote_column_name(match[2])} AS v#{i}"
+        elsif /\A\w+\z/.match?(text)
+          name = @model._attribute_name(text)
+          names << name
+          projections << "#{@table}.#{name} AS v#{i}"
+        else
+          names << nil
+          projections << "#{text} AS v#{i}"
+        end
+      end
       @select_sql = projections.join(", ")
       rows = ActiveRecord.adapter.select_rows(bound_sql)
       @select_sql = prior
       if names.length == 1
         name = names[0]
-        return rows.map { |row| @model._attribute_deserialize(name, row["v0"]) }
+        return rows.map { |row| name ? @model._attribute_deserialize(name, row["v0"]) : row["v0"] }
       end
       rows.map do |row|
         values = []
-        names.each_with_index { |name, i| values << @model._attribute_deserialize(name, row["v#{i}"]) }
+        names.each_with_index { |name, i| values << (name ? @model._attribute_deserialize(name, row["v#{i}"]) : row["v#{i}"]) }
         values
       end
     end

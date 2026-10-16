@@ -867,3 +867,65 @@ end
         "must not flatten onto Membership's room_loaded? for a Message recv:\n{src}"
     );
 }
+
+#[test]
+fn association_loaded_keeps_untyped_receiver_when_a_sibling_declares_the_name_polymorphic() {
+    // Core's Sale `belongs_to :source, polymorphic: true` beside another
+    // model's plain `:source`: `sales.each { |sale| sale.association(:source).loaded? }`
+    // in a service has an untyped block param, and the any-model gate
+    // flattened it to `sale.source_loaded?`, which Sale does not define.
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "messages", force: :cascade do |t|
+    t.integer "room_id"
+    t.string "room_type"
+  end
+  create_table "memberships", force: :cascade do |t|
+    t.integer "room_id"
+  end
+  create_table "rooms", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        (
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  belongs_to :room, polymorphic: true\nend\n",
+        ),
+        (
+            "app/models/membership.rb",
+            "class Membership < ApplicationRecord\n  belongs_to :room\nend\n",
+        ),
+        ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+        (
+            "test/models/room_linker_test.rb",
+            r#"require "test_helper"
+
+class RoomLinkerTest < ActiveSupport::TestCase
+  test "loaded ids" do
+    messages = [Message.new]
+    messages.each { |message| assert_not message.association(:room).loaded? }
+  end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = ruby::emit_spinel(&app);
+    let src = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().contains("room_linker"))
+        .map(|f| f.content.as_str())
+        .unwrap_or("");
+    assert!(src.contains("association(:room)"), "untyped receiver must keep association(:room).loaded?:\n{src}");
+    assert!(!src.contains("room_loaded?"), "must not flatten onto Membership's room_loaded?:\n{src}");
+}

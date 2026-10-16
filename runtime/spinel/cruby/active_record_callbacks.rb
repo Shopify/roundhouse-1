@@ -533,7 +533,7 @@ module ActiveRecord
             if (fire_on - TRANSACTION_ACTIONS).any?
               raise ArgumentError, ":on conditions for after_commit and after_rollback callbacks have to be one of #{TRANSACTION_ACTIONS}"
             end
-            options[:if] = [-> { _transaction_include_any_action?(fire_on) }, *options[:if]]
+            options[:if] = [-> { transaction_include_any_action?(fire_on) }, *options[:if]]
           end
           _set_callback(event, :after, args, options, block)
         end
@@ -778,7 +778,7 @@ module ActiveRecord
       end
 
       # Transactions#transaction_include_any_action?.
-      def _transaction_include_any_action?(actions)
+      def transaction_include_any_action?(actions)
         actions.any? do |action|
           case action
           when :create then _transaction_include_create?

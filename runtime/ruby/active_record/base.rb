@@ -1052,6 +1052,20 @@ module ActiveRecord
       @_trigger_destroy_callback
     end
 
+    # transactions.rb `transaction_include_any_action?`: whether the
+    # record's last transaction did any of `actions`, as an authored
+    # `after_commit` condition asks it.
+    def transaction_include_any_action?(actions)
+      actions.any? do |action|
+        case action
+        when :create then _transaction_include_create?
+        when :update then _transaction_include_update?
+        when :destroy then _transaction_include_destroy?
+        else false
+        end
+      end
+    end
+
     # A row inserted raw, as Rails' fixture loader (`insert_fixtures_set`)
     # and bulk inserts (`insert_all` / `insert_all!`) write one: no
     # validations and NO CALLBACKS. Timestamps the attributes left out

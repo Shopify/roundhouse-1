@@ -338,6 +338,7 @@ module ActiveRecord
     def _transaction_include_create?: () -> bool
     def _transaction_include_update?: () -> bool
     def _transaction_include_destroy?: () -> bool
+    def transaction_include_any_action?: (Array[Symbol] actions) -> bool
 
     def validate: () -> void
 

@@ -351,7 +351,7 @@ pub(crate) fn rewrite_node(
     if rewrite_association_target(expr, enclosing, sole_includer, readers) {
         return;
     }
-    if rewrite_association_loaded(expr, enclosing, sole_includer, flat_loaded) {
+    if rewrite_association_loaded(expr, enclosing, sole_includer, flat_loaded, &readers.declared) {
         return;
     }
     let ExprNode::Send {
@@ -554,6 +554,7 @@ fn rewrite_association_loaded(
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
     flat_loaded: &HashMap<ClassId, HashSet<Symbol>>,
+    declared: &HashMap<ClassId, HashSet<Symbol>>,
 ) -> bool {
     let ExprNode::Send { recv: Some(inner), method, args, .. } = &*expr.node else {
         return false;
@@ -593,7 +594,17 @@ fn rewrite_association_loaded(
                     flat_loaded.get(id).is_some_and(|n| n.contains(&name))
                 }
                 // Base / untyped / unknown: any declaring model is enough.
-                _ => any_model_declares_name(flat_loaded, &name),
+                // An untyped receiver may be the model whose `name` is a
+                // polymorphic `belongs_to` (Sale's `source`, beside another
+                // model's plain one): it has no flat predicate, so every
+                // model that declares `name` must have one.
+                _ => {
+                    any_model_declares_name(flat_loaded, &name)
+                        && declared
+                            .iter()
+                            .filter(|(_, names)| names.contains(&name))
+                            .all(|(id, _)| flat_loaded.get(id).is_some_and(|n| n.contains(&name)))
+                }
             };
             if allow {
                 let mut recv = base.clone();
@@ -620,6 +631,15 @@ fn rewrite_association_loaded(
                 return true;
             }
         }
+    }
+    // The unique-name fallback of an untyped receiver is no guess when a
+    // sibling model declares `name` without a flat predicate.
+    if owner.as_ref().is_some_and(|base| owner_from_typed_recv(base, flat_loaded, &name).is_none())
+        && declared
+            .iter()
+            .any(|(id, names)| names.contains(&name) && !flat_loaded.get(id).is_some_and(|n| n.contains(&name)))
+    {
+        return false;
     }
     let Some(owner_model) = resolve_owner_model(
         owner.as_ref(),
