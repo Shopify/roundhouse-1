@@ -132,7 +132,7 @@ fn readers_match_every_key_pair() {
         .join("\n");
     let draft_order = method_text(&out, "draft_order");
     assert!(draft_order.contains("active_order_id") && draft_order.contains("shop_id"), "{draft_order}");
-    assert!(!draft_order.contains("order_id: "), "the owner-derived `order_id` column is gone:\n{draft_order}");
+    assert!(!draft_order.contains("{ order_id: ") && !draft_order.contains(", order_id: "), "the owner-derived `order_id` column is gone:\n{draft_order}");
     let lines = method_text(&out, "order_lines");
     assert!(lines.contains("shop_id"), "{lines}");
     let order = method_text(&out, "order");
