@@ -263,6 +263,11 @@ struct Nesting {
     /// Plural helper-name segment, the name as written (`users`,
     /// `account`).
     plural: String,
+    /// What the resource is called in helper names: `singular` / `plural`,
+    /// or the resource's `as:` (`resources :mails, as: "mod_mails"` is
+    /// `mod_mail` / `mod_mails` in every name under it).
+    helper_singular: String,
+    helper_plural: String,
     /// Path segment: the name as written, or the resource's `path:`
     /// (`resources :users, path: "people"` nests at `/people/:user_id`).
     segment: String,
@@ -308,8 +313,40 @@ impl Ctx {
     fn parent_name_prefix(&self) -> String {
         self.parents
             .iter()
-            .map(|n| format!("{}_", n.singular))
+            .map(|n| format!("{}_", n.helper_singular))
             .collect()
+    }
+
+    /// The prefix a member/collection route's name carries before the
+    /// innermost resource: the scope `as`es, then every ENCLOSING
+    /// resource's singular (Rails' `@scope[:as]` at that point, which
+    /// `nested` extended with each parent's member name).
+    fn ancestor_name_prefix(&self) -> String {
+        let outer = self.parents.len().saturating_sub(1);
+        let ancestors: String = self.parents[..outer]
+            .iter()
+            .map(|n| format!("{}_", n.helper_singular))
+            .collect();
+        format!("{}{ancestors}", self.name_prefix)
+    }
+
+    /// The innermost resource's member name and collection name.
+    ///
+    /// Rails' `Resource#collection_name` is the plural, but the SAME word
+    /// with `_index` when singular and plural are spelled alike
+    /// (`resources :fulfillment_request` → `fulfillment_request_index`),
+    /// and a singleton resource's is its singular.
+    fn member_and_collection_names(&self) -> Option<(String, String)> {
+        self.parents.last().map(|n| {
+            let collection = if !n.has_id {
+                n.helper_singular.clone()
+            } else if n.helper_singular == n.helper_plural {
+                format!("{}_index", n.helper_plural)
+            } else {
+                n.helper_plural.clone()
+            };
+            (n.helper_singular.clone(), collection)
+        })
     }
 }
 
@@ -383,14 +420,23 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             // `requested_comments`. Member paths carry `:id` and so fall
             // through the static rule anyway, but both are decided here
             // to keep the scope rule in one place.
+            //
+            // A bare verb in a SINGULAR resource's block is a member route
+            // in Rails (`resource :account do get :foo end` → `foo_account`);
+            // only a plural resource's is nested.
+            let singleton_parent = ctx.parents.last().is_some_and(|n| !n.has_id);
+            let scope = &match scope {
+                ResourceScope::Nested if singleton_parent => ResourceScope::Member,
+                other => *other,
+            };
             let scoped_name = match scope {
                 ResourceScope::Member | ResourceScope::Collection => {
-                    ctx.parent_pair().and_then(|(parent, parent_plural)| {
+                    ctx.member_and_collection_names().and_then(|(member, collection)| {
                         static_path_name(path).map(|child| match scope {
                             ResourceScope::Member => {
-                                format!("{}{child}_{parent}", ctx.name_prefix)
+                                format!("{child}_{}{member}", ctx.ancestor_name_prefix())
                             }
-                            _ => format!("{}{child}_{parent_plural}", ctx.name_prefix),
+                            _ => format!("{child}_{}{collection}", ctx.ancestor_name_prefix()),
                         })
                     })
                 }
@@ -415,12 +461,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 // `room_at_message` and `room_bot_messages`.
                 Some(s) => {
                     let s = s.as_str();
-                    let n = match (scope, ctx.parent_pair()) {
-                        (ResourceScope::Member, Some((parent, _))) => {
-                            format!("{}{s}_{parent}", ctx.name_prefix)
+                    let n = match (scope, ctx.member_and_collection_names()) {
+                        (ResourceScope::Member, Some((member, _))) => {
+                            format!("{s}_{}{member}", ctx.ancestor_name_prefix())
                         }
-                        (ResourceScope::Collection, Some((_, plural))) => {
-                            format!("{}{s}_{plural}", ctx.name_prefix)
+                        (ResourceScope::Collection, Some((_, collection))) => {
+                            format!("{s}_{}{collection}", ctx.ancestor_name_prefix())
                         }
                         (ResourceScope::Nested, _) => {
                             format!("{}{}{s}", ctx.name_prefix, ctx.parent_name_prefix())
@@ -441,9 +487,10 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                         // `:story_id` that kept it out of the static rule
                         // above. Member/collection never reach here — they
                         // were decided by `scoped_name`.
-                        None => match ctx.parent_pair().and_then(|(parent, _)| {
-                            static_path_name(path)
-                                .map(|child| format!("{}{parent}_{child}", ctx.name_prefix))
+                        None => match ctx.parent_pair().and_then(|_| {
+                            static_path_name(path).map(|child| {
+                                format!("{}{}{child}", ctx.name_prefix, ctx.parent_name_prefix())
+                            })
                         }) {
                             Some(n) => (n, true),
                             None => (action.as_str().to_string(), false),
@@ -474,10 +521,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     && short.iter().zip(long.iter()).all(|(a, b)| a == b)
             };
             let required_count = {
-                let mut p = base_params.clone();
                 let shortest = if trailing_optionals { variants.last() } else { variants.first() };
-                extract_path_params(shortest.unwrap(), &mut p);
-                p.len()
+                path_ordered_params(shortest.unwrap(), &base_params).len()
             };
             // Only the canonical variant carries the helper name; the
             // shorter alternates would otherwise register a duplicate
@@ -502,8 +547,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .map(|(name, rx)| (name.as_str().to_string(), rx.clone()))
                 .collect();
             for (i, vpath) in variants.into_iter().enumerate() {
-                let mut params = base_params.clone();
-                extract_path_params(&vpath, &mut params);
+                let params = path_ordered_params(&vpath, &base_params);
                 let required_params = if i == 0 { required_count } else { params.len() };
                 // A shorter optional-group variant may not carry every
                 // constrained param — keep only the ones it captures.
@@ -676,6 +720,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     p.push(Nesting {
                         singular: singular_low.clone(),
                         plural: name.as_str().to_string(),
+                        helper_singular: helper_singular.clone(),
+                        helper_plural: helper_plural.clone(),
                         segment: segment.to_string(),
                         has_id: !*singular,
                         param: id_param.to_string(),
@@ -714,13 +760,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 // nesting's params, so read the scope's off `ns_path` —
                 // they sit in FRONT, which is where `prefix_path` just
                 // put them.
-                let mut params: Vec<String> = Vec::new();
-                extract_path_params(&ctx.ns_path, &mut params);
-                params.retain(|p| !nested_params.iter().any(|q| q == p));
-                params.extend(nested_params);
-                if suffix.contains(":id") && !params.iter().any(|p| p == id_param) {
-                    params.push(id_param.to_string());
-                }
+                let params = path_ordered_params(&full_path, &nested_params);
                 // Inherited block-level `constraints(id: /.../) do …
                 // end` (propagated onto this `Resources` node at
                 // ingest) applies only to the actions whose path
@@ -748,6 +788,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     &helper_plural,
                     &ctx.parent_name_prefix(),
                     &ctx.name_prefix,
+                    *singular,
                 );
                 // Same fail-closed rule as the `Explicit` arm: a
                 // requirement outside the supported subset refuses
@@ -979,6 +1020,11 @@ fn nest_path(
         // `get "pages/:page"` is `/comments/:id/pages/:page` and even a
         // leading-slash `get "/comments/:id" => …` comes out as
         // `/comments/:id/comments/:id` (measured against Rails 8.1).
+        // A SINGULAR resource has no id, so its member routes sit at
+        // `/subscription/extend_trial`.
+        ResourceScope::Member if !innermost.has_id => {
+            (format!("{prefix}{parent_plural}{path}"), params)
+        }
         ResourceScope::Member => {
             params.push(innermost.param.clone());
             (format!("{prefix}{parent_plural}/:{}{path}", innermost.param), params)
@@ -1055,6 +1101,22 @@ fn expand_optional_paths(path: &str) -> Vec<String> {
 /// Walk a Rails-shape path (`/posts/:id/edit`,
 /// `/articles/:article_id/comments`) and append any `:param`
 /// segment names not already in `params`.
+/// A route's helper parameters in the order its path reads them: Rails
+/// binds positional helper arguments to the path's dynamic segments left
+/// to right, so a scope's `:version_handle` in front of a nested
+/// `:fulfillment_order_id` is the FIRST argument. `known` are params the
+/// nesting contributed; any the path text does not show still count.
+fn path_ordered_params(path: &str, known: &[String]) -> Vec<String> {
+    let mut params = Vec::new();
+    extract_path_params(path, &mut params);
+    for k in known {
+        if !params.contains(k) {
+            params.push(k.clone());
+        }
+    }
+    params
+}
+
 fn extract_path_params(path: &str, params: &mut Vec<String>) {
     let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1093,8 +1155,12 @@ fn resource_as_name(
     plural: &str,
     parent_prefix: &str,
     ns_prefix: &str,
+    singleton: bool,
 ) -> String {
     match action {
+        "index" | "create" if singular_low == plural && !singleton => {
+            format!("{ns_prefix}{parent_prefix}{plural}_index")
+        }
         "index" | "create" => format!("{ns_prefix}{parent_prefix}{plural}"),
         "new" => format!("new_{ns_prefix}{parent_prefix}{singular_low}"),
         "edit" => format!("edit_{ns_prefix}{parent_prefix}{singular_low}"),
@@ -1111,6 +1177,8 @@ mod tests {
         vec![Nesting {
             singular: singular.to_string(),
             plural: plural.to_string(),
+            helper_singular: singular.to_string(),
+            helper_plural: plural.to_string(),
             segment: plural.to_string(),
             has_id: true,
             param: "id".to_string(),

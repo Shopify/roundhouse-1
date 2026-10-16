@@ -32,7 +32,7 @@ use super::library_class::{
     ingest_nested_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
-use super::routes::{EngineRouteSource, RouteHelperSource, ingest_routes_with_engines};
+use super::routes::{EngineRouteSource, RouteHelperSource, ingest_route_file, merge_route_files};
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
 use super::test::{ingest_test_bases, ingest_test_files};
@@ -2260,9 +2260,32 @@ end
     app.generated_helper_methods =
         super::generated_helpers::ingest_generated_helpers(&app, vfs, dir, &model_files);
 
-    let routes_path = dir.join("config/routes.rb");
-    if vfs.exists(&routes_path) {
-        if let Some(source) = read_or_ledger(vfs, &routes_path)? {
+    // The route files Rails loads into the application's route set: the
+    // app's `config/routes.rb`, then each in-repo engine's own. An engine
+    // draws into the app (`Rails.application.routes.draw`), so its named
+    // routes are the app's helpers: Core keeps none in its own
+    // `config/routes.rb` ("Please add any new routes to component or
+    // package engines instead") and draws every route from a component's.
+    // Rails unshifts each engine's file onto the reloader's paths in
+    // initializer order and the app's last, so the app's file leads and
+    // the engines follow in reverse load order.
+    let mut route_roots: Vec<PathBuf> = Vec::new();
+    if vfs.exists(&dir.join("config/routes.rb")) {
+        route_roots.push(dir.to_path_buf());
+    }
+    route_roots.extend(
+        engine_dirs
+            .iter()
+            .rev()
+            .filter(|engine| vfs.exists(&engine.join("config/routes.rb")))
+            .cloned(),
+    );
+    if !route_roots.is_empty() {
+        let block_wrappers = mapper_extension_block_methods(&app, vfs, dir, &engine_dirs);
+        let mut drawn = Vec::new();
+        for root in &route_roots {
+            let routes_path = root.join("config/routes.rb");
+            let Some(source) = read_or_ledger(vfs, &routes_path)? else { continue };
             // `draw(:name)` split files — Rails loads
             // `config/routes/<name>.rb` into the same DSL context, and
             // Mastodon-class apps keep most of their route table there.
@@ -2275,7 +2298,7 @@ end
             // the bare stem when it is unambiguous, for `draw(:name)` calls
             // written against a flat `config/routes/` layout.
             let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::default();
-            let routes_dir = dir.join("config/routes");
+            let routes_dir = root.join("config/routes");
             if vfs.is_dir(&routes_dir) {
                 for entry in read_rb_files(vfs, &routes_dir)? {
                     let Some(rel) = entry.strip_prefix(&routes_dir).ok().and_then(|p| p.to_str())
@@ -2287,8 +2310,8 @@ end
                     draw_files.insert(key, (split_source, entry.display().to_string()));
                 }
             }
-            let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
-            if let Some(routes) = unwrap_or_record(ingest_routes_with_engines(
+            if let Some(file_routes) = unwrap_or_record(ingest_route_file(
+                root == dir,
                 &source,
                 &routes_path.display().to_string(),
                 &draw_files,
@@ -2297,17 +2320,21 @@ end
                 &helper_sources,
                 &load_helper_sources,
             ))? {
-                // `to: redirect("/x")` routes point at actions nobody
-                // wrote, so write them: one controller, one action per
-                // redirect, each a `redirect_to <literal>, status: …`. It
-                // is the shape an app uses by hand for the same thing, and
-                // it keeps the redirect out of every emitter's route kind.
-                if !routes.redirects.is_empty() {
-                    app.controllers.push(synthesize_redirect_controller(&routes.redirects));
-                }
-                app.routes = routes;
-                synthesize_rails_health_controller(&mut app);
+                drawn.push(file_routes);
             }
+        }
+        if !drawn.is_empty() {
+            let routes = merge_route_files(drawn);
+            // `to: redirect("/x")` routes point at actions nobody
+            // wrote, so write them: one controller, one action per
+            // redirect, each a `redirect_to <literal>, status: …`. It
+            // is the shape an app uses by hand for the same thing, and
+            // it keeps the redirect out of every emitter's route kind.
+            if !routes.redirects.is_empty() {
+                app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+            }
+            app.routes = routes;
+            synthesize_rails_health_controller(&mut app);
         }
     }
 
@@ -15049,11 +15076,17 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
     app: &App,
     vfs: &V,
     dir: &Path,
+    engine_dirs: &[PathBuf],
 ) -> crate::det::HashSet<String> {
     const TARGET: &str = "Routing::Mapper";
     let mut modules: Vec<String> = Vec::new();
-    for sub in ["config/initializers", "lib"] {
-        let d = dir.join(sub);
+    // The app's own, then each in-repo engine's: Core prepends its
+    // `routing_method` / `database_name` annotations from the essentials
+    // component's lib.
+    let scanned = [dir].into_iter().chain(engine_dirs.iter().map(PathBuf::as_path)).flat_map(|root| {
+        ["config/initializers", "lib"].into_iter().map(move |sub| root.join(sub))
+    });
+    for d in scanned {
         if !vfs.is_dir(&d) {
             continue;
         }

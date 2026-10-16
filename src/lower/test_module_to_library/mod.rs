@@ -53,13 +53,19 @@ pub struct LoweredTestModule {
 /// two sides agree there too. The inner `x_path(…)` is left bare for
 /// `rewrite_route_helpers` to namespace and id-project as usual. A test
 /// class's own `*_url` helper shadows the route helper and is left
-/// alone.
-pub fn ruby_family_absolute_test_urls(modules: &[TestModule]) -> Vec<TestModule> {
+/// alone, as is one a parent test class or an included helper module
+/// defines (`answered`: `shadowed_fixture_accessors`, the instance methods
+/// the class answers).
+pub fn ruby_family_absolute_test_urls(
+    modules: &[TestModule],
+    answered: &crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>,
+) -> Vec<TestModule> {
     modules
         .iter()
         .map(|tm| {
-            let shadows: std::collections::HashSet<Symbol> =
+            let mut shadows: std::collections::HashSet<Symbol> =
                 tm.helpers.iter().map(|h| h.name.clone()).collect();
+            shadows.extend(answered.get(&tm.name).into_iter().flatten().cloned());
             let rewrite = |e: &Expr| absolute_test_url(e, &shadows);
             let mut tm = tm.clone();
             for t in &mut tm.tests {
@@ -248,7 +254,7 @@ pub fn lower_test_modules_with_assertions(
     let mut all_lcs: Vec<LibraryClass> = test_modules
         .iter()
         .map(|tm| {
-            let mut lc = build_library_class(tm, route_id_segments, assertion_mode);
+            let mut lc = build_library_class(tm, shadowed_fixture_accessors.get(&tm.name), route_id_segments, assertion_mode);
             // A name the class answers itself is no fixture reader here.
             let names: Vec<Symbol> = match shadowed_fixture_accessors.get(&tm.name) {
                 Some(shadowed) => fixture_names.iter().filter(|n| !shadowed.contains(*n)).cloned().collect(),
@@ -803,11 +809,12 @@ pub fn lower_test_module_to_library_class(
     tm: &TestModule,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> LibraryClass {
-    build_library_class(tm, route_id_segments, inline_assertions::AssertionMode::Inline)
+    build_library_class(tm, None, route_id_segments, inline_assertions::AssertionMode::Inline)
 }
 
 fn build_library_class(
     tm: &TestModule,
+    answered: Option<&crate::det::HashSet<Symbol>>,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
     assertion_mode: inline_assertions::AssertionMode,
 ) -> LibraryClass {
@@ -818,11 +825,13 @@ fn build_library_class(
     // controller before-action filter inlining (ticket 8).
     // A test class's own `*_path` / `*_url` helpers shadow the route
     // helpers of the same name — same rule the controller lowering
-    // applies to its ancestry.
+    // applies to its ancestry. A parent test class's and an included
+    // support module's count too (`answered`).
     let helper_shadows: crate::det::HashSet<Symbol> = tm
         .helpers
         .iter()
         .map(|h| h.name.clone())
+        .chain(answered.into_iter().flatten().cloned())
         .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
         .collect();
     let native_assertions = assertion_mode == inline_assertions::AssertionMode::Minitest;

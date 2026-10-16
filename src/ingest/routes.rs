@@ -122,6 +122,66 @@ pub(super) fn ingest_routes_with_engines(
     helper_sources: &OnceCell<Vec<RouteHelperSource>>,
     load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
 ) -> IngestResult<RouteTable> {
+    let file_routes = ingest_route_file(
+        true,
+        source,
+        file,
+        draws,
+        block_wrappers,
+        engine_routes,
+        helper_sources,
+        load_helper_sources,
+    )?;
+    Ok(merge_route_files(vec![file_routes]))
+}
+
+/// One route file's table, with the blocks the file gave
+/// `Rails.application.routes.prepend` / `append` kept apart: Rails draws a
+/// prepended block before every `draw` and an appended one after them all,
+/// whichever file adds it, so a table over several files orders them at
+/// [`merge_route_files`].
+pub(super) struct FileRoutes {
+    table: RouteTable,
+    prepended: Vec<RouteSpec>,
+    appended: Vec<RouteSpec>,
+}
+
+/// The route files of one route set (an app's `config/routes.rb` and each
+/// engine's), in the order Rails loads them, as one table: the prepended
+/// blocks first, then every file's drawn routes, then the appended blocks.
+pub(super) fn merge_route_files(files: Vec<FileRoutes>) -> RouteTable {
+    let mut table = RouteTable::default();
+    let mut prepended = Vec::new();
+    let mut appended = Vec::new();
+    for file in files {
+        prepended.extend(file.prepended);
+        table.entries.extend(file.table.entries);
+        table.direct_helpers.extend(file.table.direct_helpers);
+        table.redirects.extend(file.table.redirects);
+        table.diagnostics.extend(file.table.diagnostics);
+        appended.extend(file.appended);
+    }
+    prepended.extend(table.entries);
+    prepended.extend(appended);
+    table.entries = prepended;
+    table
+}
+
+/// `app_file` is the app's own `config/routes.rb`, which may draw inside a
+/// wrapper; an in-repo engine's file contributes only its top-level
+/// `Rails.application.routes.draw` / `prepend` / `append` blocks, since a
+/// `Engine.routes.draw` is the engine's own route set (composed at its
+/// mount).
+pub(super) fn ingest_route_file(
+    app_file: bool,
+    source: &[u8],
+    file: &str,
+    draws: &HashMap<String, (Vec<u8>, String)>,
+    block_wrappers: &HashSet<String>,
+    engine_routes: &HashMap<String, EngineRouteSource>,
+    helper_sources: &OnceCell<Vec<RouteHelperSource>>,
+    load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
+) -> IngestResult<FileRoutes> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -146,7 +206,7 @@ pub(super) fn ingest_routes_with_engines(
     // helpers live on the engine, not on the app's `url_helpers` — so it
     // is not folded into this table.
     let mut draw_calls = top_level_app_draws(&root);
-    if draw_calls.is_empty() {
+    if draw_calls.is_empty() && app_file {
         // A draw nested inside something else (a conditional, a
         // wrapper) — the first one found, as before.
         if let Some(call) = find_call_named(&root, "draw") {
@@ -176,28 +236,57 @@ pub(super) fn ingest_routes_with_engines(
     // table whatever scope the `load` call was written inside.
     entries.extend(cx.hoisted.take());
 
+    // `Rails.application.routes.prepend` / `append` blocks (Core's
+    // online_store catch-alls): the same DSL, drawn at the head or the
+    // tail of the route set.
+    let mut prepended = Vec::new();
+    let mut appended = Vec::new();
+    for call in top_level_app_route_blocks(&root, &["prepend", "append"]) {
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+        let Some(body) = block.body() else { continue };
+        direct_helpers.extend(collect_direct_helpers(&body, file)?);
+        let into = ingest_route_body(body, file, None, &cx)?;
+        if constant_id_str(&call.name()) == "prepend" {
+            prepended.extend(into);
+        } else {
+            appended.extend(into);
+        }
+    }
+
     let mut diagnostics = cx.diagnostics.take();
     diagnostics.extend(refused_route_diagnostics(&entries, source, file));
-    Ok(RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics })
+    diagnostics.extend(refused_route_diagnostics(&prepended, source, file));
+    diagnostics.extend(refused_route_diagnostics(&appended, source, file));
+    Ok(FileRoutes {
+        table: RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics },
+        prepended,
+        appended,
+    })
 }
 
 /// The `draw do … end` calls that are statements of the program itself
 /// and draw the APPLICATION's routes: `Rails.application.routes.draw`
 /// (or any `<something>.routes.draw` whose receiver is not an engine).
 fn top_level_app_draws<'pr>(root: &Node<'pr>) -> Vec<ruby_prism::CallNode<'pr>> {
+    top_level_app_route_blocks(root, &["draw"])
+}
+
+/// The top-level `<app>.routes.<method> do … end` calls for each of
+/// `methods` (`draw`, or the `prepend` / `append` an app adds blocks with).
+fn top_level_app_route_blocks<'pr>(root: &Node<'pr>, methods: &[&str]) -> Vec<ruby_prism::CallNode<'pr>> {
     let Some(program) = root.as_program_node() else { return Vec::new() };
     program
         .statements()
         .body()
         .iter()
         .filter_map(|stmt| stmt.as_call_node())
-        .filter(|call| is_app_route_draw(call))
+        .filter(|call| is_app_route_block(call, methods))
         .collect()
 }
 
-/// `<recv>.routes.draw do … end` where `<recv>` is not an `…::Engine`.
-fn is_app_route_draw(call: &ruby_prism::CallNode<'_>) -> bool {
-    if constant_id_str(&call.name()) != "draw" || call.block().is_none() {
+/// `<recv>.routes.<method> do … end` where `<recv>` is not an `…::Engine`.
+fn is_app_route_block(call: &ruby_prism::CallNode<'_>, methods: &[&str]) -> bool {
+    if !methods.contains(&constant_id_str(&call.name())) || call.block().is_none() {
         return false;
     }
     let Some(recv) = call.receiver() else { return false };
@@ -2125,11 +2214,37 @@ fn ingest_namespace_route(
             message: "namespace without a name".into(),
         });
     };
+    // `namespace :api, path: nil` / `path: ""` / `as: :x` / `module: nil`:
+    // Rails seeds the scope's path, module and `as` with the name and lets
+    // the options replace each (`nil` or an empty string drops the facet).
+    // Core's `namespace :api, path: ""` is a controller module and a helper
+    // prefix with no URL segment.
+    let (mut path, mut module, mut as_prefix) =
+        (Some(name.clone()), Some(name.clone()), Some(name));
+    if let Some(args) = call.arguments() {
+        for arg in args.arguments().iter() {
+            let Some(kh) = arg.as_keyword_hash_node() else { continue };
+            for el in kh.elements().iter() {
+                let Some(assoc) = el.as_assoc_node() else { continue };
+                let Some(key) = symbol_value(&assoc.key()) else { continue };
+                let value = assoc.value();
+                let facet = if value.as_nil_node().is_some() { Some(None) } else { rname(&value).map(Some) };
+                let Some(facet) = facet else { continue };
+                let facet = facet.filter(|v| !v.trim_matches('/').is_empty());
+                match key.as_str() {
+                    "path" => path = facet,
+                    "module" => module = facet,
+                    "as" => as_prefix = facet,
+                    _ => {}
+                }
+            }
+        }
+    }
     let entries = block_entries(call, file, None, cx)?;
     Ok(RouteSpec::Scope {
-        path: Some(name.clone()),
-        module: Some(name.clone()),
-        as_prefix: Some(name),
+        path,
+        module,
+        as_prefix,
         defaults: IndexMap::new(),
         nest: false,
         suppress_helpers: false,
