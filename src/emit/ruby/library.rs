@@ -7559,6 +7559,65 @@ fn rewrite_helper_calls(
         };
     }
 
+    // `RouteHelpers.<x>_path(…, params: h)` → `RouteHelpers.<x>_path(…) +
+    // RouteHelpers.query_suffix(h)`. `params:` is the query itself
+    // (Rails' `url_for` merges it into the query string) and the
+    // generated helper has no parameter for it. Controllers and tests
+    // render it where they qualify the call; a helper module reaches
+    // the receiver here, so the same rendering is owed here.
+    let params_query = match &*expr.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str().ends_with("_path")
+                && matches!(&*r.node, ExprNode::Const { path }
+                    if path.last().map(|s| s.as_str() == "RouteHelpers").unwrap_or(false)) =>
+        {
+            match args.last().map(|a| &*a.node) {
+                Some(ExprNode::Hash { entries, kwargs: true }) if entries.len() == 1 => {
+                    match &*entries[0].0.node {
+                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+                            if value.as_str() == "params" =>
+                        {
+                            Some(entries[0].1.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(query) = params_query {
+        let span = expr.span;
+        let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+        let ExprNode::Send { recv, method, mut args, block, parenthesized } = node else {
+            unreachable!()
+        };
+        args.pop();
+        let call = Expr::new(span, ExprNode::Send { recv, method, args, block, parenthesized });
+        let suffix = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Const { path: vec![Symbol::from("RouteHelpers")] },
+                )),
+                method: Symbol::from("query_suffix"),
+                args: vec![query],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        *expr.node = ExprNode::Send {
+            recv: Some(call),
+            method: Symbol::from("+"),
+            args: vec![suffix],
+            block: None,
+            parenthesized: false,
+        };
+        expr.ty = Some(crate::ty::Ty::Str);
+    }
+
     // `RouteHelpers.<x>_path(format: :rss)` → `RouteHelpers.<x>_path +
     // ".rss"`. Rails path helpers accept `format:` whether or not the
     // route spells `(.:format)`; the IR has no keyword params, so the

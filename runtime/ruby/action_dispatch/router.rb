@@ -191,11 +191,25 @@ module ActionDispatch
     def self.match_path(method, path, table, format)
       method_upcase = method.to_s.upcase
       path_parts = path.split("/")
-      hit = scan_routes(method_upcase, path_parts, table, format)
+      hit = scan_root_aware(method_upcase, path_parts, table, format)
       if hit.nil? && method_upcase == "HEAD"
-        return scan_routes("GET", path_parts, table, format)
+        return scan_root_aware("GET", path_parts, table, format)
       end
       hit
+    end
+
+    # `scan_routes`, retried once for the root path. `"/".split("/")` is
+    # empty, so no pattern with a `:name` segment can match it — but
+    # Rails compiles `/:path` with `constraints: { path: /.*/ }` (Core's
+    # storefront catch-all `match ":path"`) to `\A/(.*)\z`, which does
+    # match `/` with an empty capture. The retry reads `/` as one empty
+    # segment; `match_parts` accepts an empty value only where the
+    # route's own constraint admits it, so an unconstrained `/:id` or a
+    # `*glob` still refuses the root, as in Rails.
+    def self.scan_root_aware(method_upcase, path_parts, table, format)
+      hit = scan_routes(method_upcase, path_parts, table, format)
+      return hit unless hit.nil? && path_parts.empty?
+      scan_routes(method_upcase, ["", ""], table, format)
     end
 
     # One pass of the table for one verb, over the already-split path.
@@ -282,7 +296,10 @@ module ActionDispatch
         pp = pattern_parts[i]
         ap = path_parts[i]
         if pp.start_with?("*")
-          params[pp[1..]] = glob_rest(path_parts, i)
+          rest = glob_rest(path_parts, i)
+          # A glob is `(.+)` in Rails: it never binds the empty string.
+          return nil if rest.empty?
+          params[pp[1..]] = rest
         elsif pp.start_with?(":")
           name = pp[1..]
           # `seg = ap.to_s` (not `digits_only(ap)` directly): some strict
@@ -294,6 +311,9 @@ module ActionDispatch
             return nil
           end
           pattern_for_name = segment_pattern_for(seg_constraints, name)
+          # A dynamic segment is `[^/.?]+` unless the route constrains
+          # it: an empty value needs a constraint that admits it.
+          return nil if seg.empty? && pattern_for_name.empty?
           if !pattern_for_name.empty? && !segment_pattern_match(pattern_for_name, seg)
             return nil
           end

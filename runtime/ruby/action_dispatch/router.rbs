@@ -55,6 +55,14 @@ module ActionDispatch
       String format
     ) -> ::ActionDispatch::Router::MatchResult?
 
+    # `scan_routes`, retried once with the root read as one empty segment.
+    def self.scan_root_aware: (
+      String method_upcase,
+      Array[String] path_parts,
+      Array[::ActionDispatch::Router::Route] table,
+      String format
+    ) -> ::ActionDispatch::Router::MatchResult?
+
     # One pass of the table for one (already upcased) verb over the
     # already-split path; `match_path` makes a second, GET, pass for HEAD.
     def self.scan_routes: (

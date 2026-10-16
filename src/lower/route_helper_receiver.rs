@@ -102,7 +102,12 @@ pub(crate) fn answered_names(app: &App) -> HashSet<Symbol> {
 /// Add the `RouteHelpers.` receiver to bare calls naming a helper the
 /// emitted tree defines. Receiver-bearing sends are left exactly as
 /// they are — whatever put a receiver there meant it.
-pub(crate) fn qualify(body: &Expr, answered: &HashSet<Symbol>, shadowed: &HashSet<Symbol>) -> Expr {
+pub(crate) fn qualify(
+    body: &Expr,
+    answered: &HashSet<Symbol>,
+    shadowed: &HashSet<Symbol>,
+    id_segments: &HashMap<String, Vec<bool>>,
+) -> Expr {
     crate::lower::controller_to_library::util::map_expr(body, &|e: &Expr| {
         let ExprNode::Send { recv: None, method, args, block, parenthesized } = &*e.node else {
             return None;
@@ -110,7 +115,19 @@ pub(crate) fn qualify(body: &Expr, answered: &HashSet<Symbol>, shadowed: &HashSe
         if !answered.contains(&*method) || shadowed.contains(&*method) {
             return None;
         }
-        Some(Expr::new(
+        // `params: h` and an erased `**h` are the query string, which
+        // the generated helper has no parameter for: render them
+        // through `RouteHelpers.query_suffix`, as controllers and
+        // tests already do (`route_helper_query_splat_index`).
+        // Without it a concern's `shop_checkout_path(shop, token,
+        // params: h)` reached the helper as a third positional.
+        let splat_at = crate::lower::controller_to_library::rewrites::route_helper_query_splat_index(
+            method.as_str(),
+            args,
+            id_segments,
+        );
+        let kept = &args[..splat_at.unwrap_or(args.len())];
+        let call = Expr::new(
             e.span,
             ExprNode::Send {
                 recv: Some(crate::lower::controller_to_library::rewrites::const_path(
@@ -118,9 +135,39 @@ pub(crate) fn qualify(body: &Expr, answered: &HashSet<Symbol>, shadowed: &HashSe
                     e.span,
                 )),
                 method: method.clone(),
-                args: args.iter().map(|a| qualify(a, answered, shadowed)).collect(),
-                block: block.as_ref().map(|b| qualify(b, answered, shadowed)),
+                args: kept.iter().map(|a| qualify(a, answered, shadowed, id_segments)).collect(),
+                block: block.as_ref().map(|b| qualify(b, answered, shadowed, id_segments)),
                 parenthesized: *parenthesized,
+            },
+        );
+        let Some(i) = splat_at else { return Some(call) };
+        let splat = qualify(
+            crate::lower::controller_to_library::rewrites::route_helper_query_splat_value(&args[i]),
+            answered,
+            shadowed,
+            id_segments,
+        );
+        let suffix = Expr::new(
+            e.span,
+            ExprNode::Send {
+                recv: Some(crate::lower::controller_to_library::rewrites::const_path(
+                    &["RouteHelpers"],
+                    e.span,
+                )),
+                method: Symbol::from("query_suffix"),
+                args: vec![splat],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        Some(Expr::new(
+            e.span,
+            ExprNode::Send {
+                recv: Some(call),
+                method: Symbol::from("+"),
+                args: vec![suffix],
+                block: None,
+                parenthesized: false,
             },
         ))
     })
@@ -143,6 +190,7 @@ pub(crate) fn helper_module_shadows(app: &App) -> HashSet<Symbol> {
 /// first claim on the name.
 pub fn qualify_lcs(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
     let answered = answered_names(app);
+    let id_segments = crate::lower::routes::helper_id_segments(app);
     // A helper module's own `<x>_path` outranks a route of the same
     // name everywhere the emit resolves bare helper calls. The modules
     // in `lcs` count as well as the ones on `app`: the view pipeline
@@ -177,7 +225,7 @@ pub fn qualify_lcs(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
         .collect();
     for (lc, shadows) in lcs.iter_mut().zip(shadow_sets.iter()) {
         for m in &mut lc.methods {
-            m.body = qualify(&m.body, &answered, shadows);
+            m.body = qualify(&m.body, &answered, shadows, &id_segments);
         }
     }
 }

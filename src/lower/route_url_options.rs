@@ -217,6 +217,12 @@ pub(crate) fn rewrite_position_node(
     };
     let Some(names) = params.get(method.as_str()) else { return };
     let Some(last) = args.last() else { return };
+    let is_url = method.as_str().ends_with("_url");
+    if let Some(spread) = splat_options(last, args.len() - 1, names, is_url) {
+        args.pop();
+        args.extend(spread);
+        return;
+    }
     if let Some(spread) = spread_options_local(last, args.len() - 1, names) {
         args.pop();
         args.extend(spread);
@@ -246,6 +252,187 @@ pub(crate) fn rewrite_position_node(
     if !entries.is_empty() {
         args.push(Expr::new(last.span, ExprNode::Hash { entries, kwargs: true }));
     }
+}
+
+/// One link of an erased `**` chain: literal pairs, or a hash read.
+enum SplatPart<'a> {
+    Pairs(&'a [(Expr, Expr)]),
+    Spread(&'a Expr),
+}
+
+/// The links of `{ origin: o, **options }` — the `merge` chain the
+/// ingest desugar made of it — or of a lone Hash-typed local. `None`
+/// for anything else, so a record argument is never read as a splat.
+fn splat_parts(arg: &Expr, top: bool) -> Option<Vec<SplatPart<'_>>> {
+    match &*arg.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } => {
+            // A bare read is a splat only when it is a Hash: inside a
+            // chain `merge` already says so, standing alone the type
+            // must (a model local is a record, not options).
+            if top && !matches!(&arg.ty, Some(crate::ty::Ty::Hash { .. })) {
+                return None;
+            }
+            Some(vec![SplatPart::Spread(arg)])
+        }
+        ExprNode::Hash { entries, .. } if !top => Some(vec![SplatPart::Pairs(entries)]),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            let mut parts = splat_parts(base, false)?;
+            parts.extend(splat_parts(&args[0], false)?);
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+fn sym_key(key: &str, span: crate::span::Span) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(key) } })
+}
+
+/// `admin_export_download_url(**options)` where `options` holds the
+/// path params (`token:`, `filename:`) and the host: Rails fills a
+/// segment from an option hash as readily as from a positional
+/// argument, and Core's `CsvOutputCollector.download_url` builds one
+/// hash for two route helpers. The generated helper takes segments
+/// positionally, and the splat reached it as keywords it does not
+/// have.
+///
+/// Each segment slot the call left open is read off the chain
+/// (`options[:token]`; an earlier literal pair becomes the default,
+/// `options.fetch(:origin, o)`, since a later `**` wins as in Ruby).
+/// A `_url` spelling also reads `host:` and `protocol:` off it, which
+/// the host pass below turns into the absolute URL. Whatever the chain
+/// holds beyond the segments and the host options is the query, handed
+/// on as `params:` for `RouteHelpers.query_suffix`.
+///
+/// `anchor:` out of a splat is dropped, not rendered: it is a
+/// fragment, the query is not, and no Core call site puts one there.
+/// Ruby's `**` raises for a missing required key; the read here is nil.
+///
+/// Declines when the helper has no segments left to fill and is a
+/// `_path` (the existing trailing-splat rendering owns that), and for a
+/// lone Hash local that the older [`spread_options_local`] handles
+/// exactly — unless the helper is a `_url`, which needs the host.
+fn splat_options(arg: &Expr, index: usize, names: &[String], is_url: bool) -> Option<Vec<Expr>> {
+    let parts = splat_parts(arg, true)?;
+    let chain = matches!(&*arg.node, ExprNode::Send { .. });
+    let lone = !chain;
+    if index > names.len() || (index == names.len() && !is_url) {
+        return None;
+    }
+    if lone && !is_url && index != 0 {
+        return None;
+    }
+    let span = arg.span;
+    let value_ty = match &arg.ty {
+        Some(crate::ty::Ty::Hash { value, .. }) => Some((**value).clone()),
+        _ => None,
+    };
+    let read_ty = |e: &mut Expr| {
+        if let Some(v) = &value_ty {
+            e.ty = Some(crate::ty::Ty::Union { variants: vec![v.clone(), crate::ty::Ty::Nil].into() });
+        }
+    };
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let send = |recv: &Expr, method: &str, args: Vec<Expr>| {
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv.clone()),
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    // The value the chain gives `key`: last writer wins.
+    let read = |key: &str| -> Option<Expr> {
+        let mut acc: Option<Expr> = None;
+        for part in &parts {
+            match part {
+                SplatPart::Pairs(entries) => {
+                    if let Some((_, v)) = entries.iter().rev().find(|(k, _)| key_of(k).as_deref() == Some(key)) {
+                        acc = Some(v.clone());
+                    }
+                }
+                SplatPart::Spread(h) => {
+                    acc = Some(match acc.take() {
+                        None => {
+                            let mut e = send(h, "[]", vec![sym_key(key, span)]);
+                            read_ty(&mut e);
+                            e
+                        }
+                        Some(default) => send(h, "fetch", vec![sym_key(key, span), default]),
+                    });
+                }
+            }
+        }
+        acc
+    };
+    let nil = || Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    let mut out: Vec<Expr> = names[index..].iter().map(|n| read(n).unwrap_or_else(nil)).collect();
+    let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+    if is_url {
+        for key in ["host", "protocol"] {
+            if let Some(v) = read(key) {
+                kwargs.push((sym_key(key, span), v));
+            }
+        }
+    }
+    // The query: every key that is neither a segment nor reserved.
+    let reserved = |k: &str| {
+        names.iter().any(|n| n == k) || k == "anchor" || k == "params" || k == "format"
+            || HOST_ONLY_OPTIONS.contains(&k)
+    };
+    let has_spread = parts.iter().any(|p| matches!(p, SplatPart::Spread(_)));
+    let mut literal_query: Vec<(Expr, Expr)> = Vec::new();
+    for part in &parts {
+        if let SplatPart::Pairs(entries) = part {
+            for (k, v) in entries.iter() {
+                if key_of(k).is_some_and(|k| !reserved(&k)) {
+                    literal_query.push((k.clone(), v.clone()));
+                }
+            }
+        }
+    }
+    if !has_spread {
+        kwargs.extend(literal_query);
+    } else {
+        let excluded: Vec<Expr> = names
+            .iter()
+            .map(String::as_str)
+            .chain(["anchor", "params", "format"])
+            .chain(HOST_ONLY_OPTIONS.iter().copied())
+            .map(|k| sym_key(k, span))
+            .collect();
+        let mut rest: Option<Expr> = None;
+        for part in &parts {
+            let piece = match part {
+                SplatPart::Spread(h) => send(h, "except", excluded.clone()),
+                SplatPart::Pairs(_) => continue,
+            };
+            rest = Some(match rest {
+                None => piece,
+                Some(acc) => send(&acc, "merge", vec![piece]),
+            });
+        }
+        let mut rest = rest?;
+        if !literal_query.is_empty() {
+            let lit = Expr::new(span, ExprNode::Hash { entries: literal_query, kwargs: false });
+            rest = send(&lit, "merge", vec![rest]);
+        }
+        rest.ty = arg.ty.clone();
+        kwargs.push((sym_key("params", span), rest));
+    }
+    if !kwargs.is_empty() {
+        out.push(Expr::new(span, ExprNode::Hash { entries: kwargs, kwargs: true }));
+    }
+    Some(out)
 }
 
 /// `story_short_id_path(story, options)` where `options` is a local
