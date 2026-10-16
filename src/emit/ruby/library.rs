@@ -9078,16 +9078,30 @@ pub(crate) fn apply_hydration_nil_lowering(lcs: &mut [LibraryClass], app: &App) 
             .filter(|c| c.nullable && !c.primary_key && c.name.as_str() != "id")
             .map(|c| c.name.clone())
             .collect();
-        if nullable.is_empty() {
+        // A NOT NULL column is nil in a hydrated row only when the query
+        // left it out (`select(:id, :quantity)`): Rails leaves it
+        // unloaded, where the strict-target default would write 0 / "" and
+        // run it through the column's type (`ShopIdType#deserialize` of 0
+        // raises WrongShopAccess).
+        let present_slots: BTreeSet<Symbol> = table
+            .columns
+            .iter()
+            .filter(|c| !c.primary_key && c.name.as_str() != "id")
+            .map(|c| c.name.clone())
+            .collect();
+        if present_slots.is_empty() {
             continue;
         }
         let row_id = ClassId(Symbol::from(format!("{}Row", model.name.0.as_str())));
         if let Some(row_lc) = lcs.iter_mut().find(|lc| lc.name == row_id) {
             for m in &mut row_lc.methods {
                 if m.name.as_str() == "from_raw" {
-                    nil_guard_from_raw_slots(&mut m.body, &nullable);
+                    nil_guard_from_raw_slots(&mut m.body, &present_slots);
                 }
             }
+        }
+        if nullable.is_empty() {
+            continue;
         }
         let nullable_fks: BTreeSet<Symbol> = nullable
             .iter()
