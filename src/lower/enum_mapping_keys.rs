@@ -42,6 +42,19 @@ pub fn apply_enum_mapping_keys(app: &mut App) {
     for view in &mut app.views {
         rewrite(&mut view.body, &mappings, None);
     }
+    // A fixture's `<%= Model.states[:pending] %>` tag is the same read.
+    for fixture in &mut app.fixtures {
+        for expr in &mut fixture.preamble {
+            rewrite(expr, &mappings, None);
+        }
+        for row in fixture.records.values_mut() {
+            for value in row.values_mut() {
+                if let crate::dialect::FixtureValue::Ruby(expr) = value {
+                    rewrite(expr, &mappings, None);
+                }
+            }
+        }
+    }
 }
 
 fn rewrite(expr: &mut Expr, mappings: &HashSet<(String, String)>, own: Option<(&HashSet<String>, bool)>) {

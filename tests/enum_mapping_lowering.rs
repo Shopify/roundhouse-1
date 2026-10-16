@@ -223,3 +223,29 @@ fn hydration_skips_an_overridden_assign_attributes_on_the_empty_shell() {
     assert!(out.contains("instance = Trade.new(ActiveRecord::Base::HYDRATE_ATTRS)"), "{out}");
     assert!(out.contains("instance = Plain.new\n"), "{out}");
 }
+
+// Rails renders a fixture's ERB against the real model, where `states` is indifferent-access.
+#[test]
+fn a_fixture_erb_symbol_key_reads_the_string_label() {
+    use roundhouse::dialect::FixtureValue;
+    use roundhouse::Symbol;
+
+    let tree = [
+        ("db/schema.rb", SCHEMA.to_string()),
+        ("app/models/trade.rb", "class Trade < ApplicationRecord\n  enum :status, { pending: 0, held: 2 }\nend\n".to_string()),
+        (
+            "test/fixtures/trades.yml",
+            "one:\n  status: <%= Trade.statuses[:held] %>\n".to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.into_bytes()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let FixtureValue::Ruby(expr) = &app.fixtures[0].records[&Symbol::from("one")][&Symbol::from("status")] else {
+        panic!("expected a Ruby value")
+    };
+    let dump = format!("{expr:?}");
+    assert!(dump.contains("Str { value: \"held\" }") && !dump.contains("Sym {"), "the key is the String label: {dump}");
+}

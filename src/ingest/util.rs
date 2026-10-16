@@ -194,7 +194,12 @@ pub(super) fn primary_class_with_scope<'pr>(
     while is_namespace_wrapper(&primary.1) {
         let inside = primary.1.location();
         match classes.next() {
-            Some(next) if next.1.location().start_offset() < inside.end_offset() => primary = next,
+            Some(next)
+                if next.1.location().start_offset() < inside.end_offset()
+                    && wrapper_admits(&primary.1, &next.1) =>
+            {
+                primary = next
+            }
             _ => break,
         }
     }
@@ -202,13 +207,24 @@ pub(super) fn primary_class_with_scope<'pr>(
 }
 
 fn is_namespace_wrapper(class: &ruby_prism::ClassNode<'_>) -> bool {
-    if class.superclass().is_some() {
-        return false;
-    }
     let Some(body) = class.body() else { return false };
     let stmts = flatten_statements(body);
     stmts.iter().any(|stmt| stmt.as_class_node().is_some())
         && stmts.iter().all(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
+}
+
+/// A wrapper that names a superclass is only a namespace when its first
+/// nested class restates it: Core's `shipping_line/applied_discount.rb`
+/// writes `class ShippingLine < GlobalDB::ShopRecord; class AppliedDiscount
+/// < GlobalDB::ShopRecord`, the owner's header repeated so the file loads
+/// alone. A class that merely nests a differing one (`class Foo <
+/// ApplicationRecord; class Error < StandardError`) is itself the primary.
+fn wrapper_admits(wrapper: &ruby_prism::ClassNode<'_>, inner: &ruby_prism::ClassNode<'_>) -> bool {
+    match (wrapper.superclass(), inner.superclass()) {
+        (None, _) => true,
+        (Some(outer), Some(inner)) => outer.location().as_slice() == inner.location().as_slice(),
+        (Some(_), None) => false,
+    }
 }
 
 /// `find_all_classes_with_scope`, plus each class's lexical nesting at
