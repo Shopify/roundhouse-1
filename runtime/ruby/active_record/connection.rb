@@ -3819,12 +3819,18 @@ module ActiveRecord
       %i[map collect flat_map collect_concat filter_map select filter reject find detect find_index
          each_with_object each_with_index inject reduce group_by partition sort_by min_by max_by sum
          take_while drop_while tally uniq each_slice zip index_by index_with pluck first take drop].each do |reader|
-        define_method(reader) { |*args, &block| ::ActiveModel::ErrorAttributes.objects(self).public_send(reader, *args, &block) }
+        define_method(reader) do |*args, &block|
+          # A tree that records no error attributes (runtime/spinel/
+          # active_model_errors.rb is carried only where code asks for
+          # them) has the accumulator's messages as its only errors.
+          return super(*args, &block) unless defined?(::ActiveModel::ErrorAttributes)
+          ::ActiveModel::ErrorAttributes.objects(self).public_send(reader, *args, &block)
+        end
       end
 
       %i[any? none? all? one? count many?].each do |reader|
         define_method(reader) do |*args, &block|
-          return super(*args) if block.nil?
+          return super(*args) if block.nil? || !defined?(::ActiveModel::ErrorAttributes)
           ::ActiveModel::ErrorAttributes.objects(self).public_send(reader, *args, &block)
         end
       end
