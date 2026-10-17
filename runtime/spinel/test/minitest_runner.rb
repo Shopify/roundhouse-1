@@ -917,6 +917,32 @@ RequestDispatch.prepend(RoundhouseResponseAssertions) if defined?(RequestDispatc
 # methods/overrides and setup/teardown super chains retain their precedence.
 TestBase.prepend(RoundhouseMinitestAssertions)
 
+# Rails' `ActionDispatch::Integration::Session` includes
+# `Minitest::Assertions` (actionpack integration.rb), so a client built
+# with `Session.new(app)` asserts on its own (Core's
+# `Checkouts::One::Web::Client#graphql_request`:
+# `@session.assert_equal(200, response)`). It counts its own assertions,
+# as a Rails session does, and its verbs answer the response STATUS
+# (`Session#process` returns `status`), where the dispatch under the
+# test class answers the response.
+module RoundhouseIntegrationSessionAssertions
+  include Minitest::Assertions
+
+  attr_writer :assertions
+
+  def assertions
+    @assertions ||= 0
+  end
+
+  %i[get post patch put delete head].each do |verb|
+    define_method(verb) do |*args, **kwargs, &block|
+      super(*args, **kwargs, &block).status
+    end
+  end
+end
+
+ActionDispatch::Integration::Session.prepend(RoundhouseIntegrationSessionAssertions) if defined?(ActionDispatch::Integration::Session)
+
 # Minitest::Test::LifecycleHooks (minitest 5.27): the four hooks around
 # setup and teardown, empty at the bottom of the chain so a module's
 # override reaches them with `super`. Core's TestAccessBlocker, a Module

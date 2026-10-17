@@ -38,3 +38,22 @@ fn mime_all_is_the_wildcard_type() {
         "[\"*/*\", true, true, true, true, true, false, false, false, true, true, true, false]\n"
     );
 }
+
+/// actionpack's `Mime::Type#==` compares the type strings, so a String
+/// equals the type it names in both directions: Core's
+/// `request.media_type == Mime[:json]` is `String#==`, which defers to
+/// the type's `to_str`. It was `other.is_a?(Mime::Type) && …`, a 415 on
+/// every JSON post to a controller that checks the media type that way.
+#[test]
+fn a_string_equals_the_mime_type_it_names() {
+    let out = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .run_ruby(
+            "json = Mime[:json]\n\
+             p [json == \"application/json\", \"application/json\" == json,\n\
+             \x20  json == \"text/html\", \"text/html\" == json, json == nil, json == Mime[:json]]\n",
+        );
+    out.assert_passes();
+    assert_eq!(out.stdout, "[true, true, false, false, false, true]\n");
+}

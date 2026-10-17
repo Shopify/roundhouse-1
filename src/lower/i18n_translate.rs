@@ -260,17 +260,26 @@ fn parse_args(args: &[Expr], view: Option<&str>) -> Result<Call, String> {
 /// templates.
 pub fn apply_i18n_translate_lowering(app: &mut App) {
     let catalog = app.i18n.or_rails_default().clone();
-    super::for_each_hook_body(app, &mut |body| rewrite(body, &catalog, false, None));
-    super::for_each_test_body(app, &mut |body| rewrite(body, &catalog, false, None));
+    // On a tree that loads the i18n gem an `I18n.t` stays the gem's call: the
+    // catalog holds the default locale only, so folding it would answer
+    // `I18n.with_locale(:fr) { I18n.t("k") }` in English.
+    let gem = app.carries_i18n_gem();
+    super::for_each_hook_body(app, &mut |body| rewrite(body, &catalog, false, None, gem));
+    super::for_each_test_body(app, &mut |body| rewrite(body, &catalog, false, None, gem));
     for view in &mut app.views {
         let name = view.name.as_str().to_string();
-        rewrite(&mut view.body, &catalog, true, Some(&name));
+        rewrite(&mut view.body, &catalog, true, Some(&name), gem);
     }
 }
 
-fn rewrite(expr: &mut Expr, catalog: &Catalog, in_view: bool, view: Option<&str>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, catalog, in_view, view));
+fn rewrite(expr: &mut Expr, catalog: &Catalog, in_view: bool, view: Option<&str>, gem: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, catalog, in_view, view, gem));
     let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return };
+    let on_i18n = matches!(recv.as_ref().map(|r| &*r.node),
+        Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "I18n");
+    if gem && on_i18n {
+        return;
+    }
     let Some(parsed) = parse(recv.as_ref(), method.as_str(), args, block.as_ref(), in_view, view) else { return };
     if let Some((cond, then_args, else_args)) = split_key(args) {
         let resolved = resolves(catalog, recv.as_ref(), method.as_str(), args, block.as_ref(), in_view, view);
@@ -282,7 +291,7 @@ fn rewrite(expr: &mut Expr, catalog: &Catalog, in_view: bool, view: Option<&str>
             if let ExprNode::Send { args: a, .. } = &mut *e.node {
                 *a = args;
             }
-            rewrite(&mut e, catalog, in_view, view);
+            rewrite(&mut e, catalog, in_view, view, gem);
             e
         };
         let (then_branch, else_branch) = (branch(then_args), branch(else_args));
