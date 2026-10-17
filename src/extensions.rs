@@ -28,6 +28,10 @@
 //! # by owning gem, including constants whose RBIs supply known types.
 //! rails_dependent:
 //!   - {gem: "widget-engine", why: "requiring it loads Rails framework files"}
+//! # By default a Ruby-family target that reads one of those constants is
+//! # refused (no tree). A project that wants the tree anyway, with each
+//! # read raising by name at run time (`error[gem_requires_rails]`), says so.
+//! rails_dependent_by_name: true
 //! # (what an app/ body writes, gem that provides it). The emitted Gemfile
 //! # declares the gem when an app/ file names the constant or contains any
 //! # of the texts.
@@ -85,6 +89,10 @@ pub struct Extensions {
     pub lock_gated_requires: Vec<LockGatedRequire>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rails_dependent: Vec<RailsDependentGem>,
+    /// `rails_dependent_by_name: true` in some `gems.yml`: the Ruby-family
+    /// trees are still written, each refused read raising by name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rails_dependent_by_name: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_gems: Vec<RuntimeGem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -181,6 +189,7 @@ impl std::error::Error for ExtensionError {}
 struct GemsFile {
     lock_gated_requires: Vec<LockGatedRow>,
     rails_dependent: Vec<RailsDependentRow>,
+    rails_dependent_by_name: bool,
     runtime_gems: Vec<RuntimeGemRow>,
 }
 
@@ -326,6 +335,7 @@ fn load_gems(
         loads.push(Origin { gem: row.gem.clone(), key: "lock_gated_requires", file: file.to_string() });
         loaded.lock_gated_requires.push(LockGatedRequire { require: row.require, gem: row.gem });
     }
+    loaded.rails_dependent_by_name |= gems.rails_dependent_by_name;
     for row in gems.rails_dependent {
         if row.gem.is_empty() || row.why.is_empty() {
             return Err(bad("rails_dependent rows need a gem and the evidence (why)".into()));

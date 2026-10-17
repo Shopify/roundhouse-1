@@ -2257,7 +2257,18 @@ pub fn target_files(
         for diagnostic in refusals {
             emit::diagnostics::push(diagnostic);
         }
-        return Err(message);
+        // The emit body still runs for its refusals, which name each gem
+        // the tree does not load ("declared by the X gem"); its result is
+        // moot since this target is refused.
+        let by_name = app.extensions.rails_dependent_by_name && matches!(target, BuildTarget::Ruby | BuildTarget::Jruby);
+        if !by_name {
+            let _ = target_files_inner(app, fixture, target);
+            return Err(message);
+        }
+        // `rails_dependent_by_name`: the Ruby-family tree is still written.
+        // Each refused constant raises by name where it is read (the error
+        // diagnostics above fail the run) and the rest of the app runs, as
+        // Core's does with its Rails-dependent gems.
     }
     if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
         let (namespaces, includes) = if target == BuildTarget::Ruby {
@@ -4799,7 +4810,7 @@ fn ruby_family_files(
     gem_sources.extend(
         bundler_required_runtime_gems(&app.bundler_gems, app.gem_lock.as_ref(), &app.extensions).into_iter().map(|gem| gem.name.clone()),
     );
-    apply_runtime_gem_wiring(&mut files, app, &gem_sources);
+    apply_runtime_gem_wiring(&mut files, app, &gem_sources)?;
     // The PostgreSQL lane runs plain RubyGems over a pinned gem home, with
     // no Bundler: `apply_runtime_gem_wiring` activates the lock's gems
     // there, and the Gemfile pins below would only restate them.
@@ -16087,7 +16098,7 @@ pub(crate) fn gem_port_declaring(name: &str) -> Option<(&'static str, &'static s
 /// (`gem_source_dependency_block`), so a `GIT` gem in their closure is
 /// activated as a runtime gem's is: panama_client 3.2.3 requires
 /// grpc_fork_safety, which depends on Core's grpc fork.
-fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App, gem_sources: &[String]) {
+fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App, gem_sources: &[String]) -> Result<(), String> {
     let lock = app.gem_lock.as_ref();
     let mut needed: Vec<&'a str> = Vec::new();
     for (marker, gem) in runtime_gems(&app.extensions) {
@@ -16114,7 +16125,7 @@ fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App,
         .map(|l| lock_gated_pairs(&app.extensions).chain(APP_REQUIRED_GEMS.iter().copied()).map(|(_, gem)| gem).filter(|gem| l.has(gem) && !l.is_in_repo(gem)).collect())
         .unwrap_or_default();
     if needed.is_empty() && gated.is_empty() && gem_sources.is_empty() {
-        return;
+        return Ok(());
     }
     if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile").filter(|_| !needed.is_empty()) {
         let mut block = String::from(
@@ -16125,15 +16136,16 @@ fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App,
              # constants app/ actually names.\n",
         );
         for gem in &needed {
-            if gemfile.contains(&format!("gem {gem:?}")) || block.contains(&format!("gem {gem:?}")) {
-                continue;
-            }
             // A gem the lock resolves from a `GIT` source is declared with
             // that source and the locked revision: a bare `gem "dalli"`
-            // would resolve the rubygems.org release, not Core's fork.
-            match lock.and_then(|l| l.git_source_of(gem)) {
-                Some(git) => block.push_str(&format!("gem {gem:?}, git: {:?}, ref: {:?}\n", git.remote, git.revision)),
-                None => block.push_str(&format!("gem {gem:?}\n")),
+            // would resolve the rubygems.org release, not Core's fork. An
+            // incomplete Git source never becomes a published gem.
+            let declaration = runtime_gem_declaration(lock, gem, false)?;
+            if lock.is_some_and(|l| l.is_from_git(gem)) {
+                ensure_runtime_gem_declaration(gemfile, gem, &declaration);
+            } else if !(gemfile.contains(&format!("gem {gem:?}")) || block.contains(&format!("gem {gem:?}"))) {
+                block.push_str(&declaration);
+                block.push('\n');
             }
         }
         if block.contains("gem \"") {
@@ -16154,8 +16166,9 @@ fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App,
             activated.push(gem.as_str());
         }
     }
-    apply_git_gem_load_paths(files, &activated, lock);
+    apply_git_gem_load_paths(files, &activated, lock)?;
     apply_locked_bundled_gems(files, lock);
+    Ok(())
 }
 
 /// Ruby's bundled gems: the gems that left the default set (Ruby 4.0's
@@ -16262,66 +16275,91 @@ const TEST_HELPER_BUNDLED_GEMS: &str = "require_relative \"../runtime/bundled_ge
 /// load, since the runtime ports stand in for them.
 const RAILS_REPOSITORY_GEMS_RUBY: &str = "%w[rails railties activesupport activemodel activerecord activejob activestorage actionpack actionview actioncable actionmailer actionmailbox actiontext]";
 
-fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
-    let Some(lock) = lock else { return };
+/// Activate the locked Git checkouts before any guarded native requires,
+/// the way Bundler::Source::Git does. Never replace a missing checkout with
+/// a published gem of the same name: a missing or substituted one is a
+/// LoadError naming the gem, remote and revision.
+fn apply_git_gem_load_paths(
+    files: &mut Vec<(String, String)>,
+    needed: &[&str],
+    lock: Option<&crate::gems::Lockfile>,
+) -> Result<(), String> {
+    let Some(lock) = lock else { return Ok(()) };
     // The needed gems' whole dependency closure, not only the needed gems
     // themselves: panama_client is a GEM spec, but it depends on Core's
     // grpc fork, and RubyGems activating panama_client cannot find that
     // spec on its own. Dependencies first.
+    let git_gems = lock.git_specs_in_closure(needed);
+    if git_gems.is_empty() {
+        return Ok(());
+    }
     let mut entries = String::new();
-    for gem in lock.git_specs_in_closure(needed) {
-        if let Some(git) = lock.git_source_of(&gem) {
-            entries.push_str(&format!(
-                "  [{gem:?}, {:?}, {:?}, {:?}],\n",
-                git.checkout_dir(),
-                git.remote,
-                git.revision
-            ));
-        }
+    for gem in &git_gems {
+        let source = lock.git_source_of(gem).expect("Git closure member");
+        let declaration = runtime_gem_declaration(Some(lock), gem, false)?;
+        let Some((_, gemfile)) = files.iter_mut().find(|(path, _)| path == "Gemfile") else {
+            return Err("Ruby-family project has no Gemfile for Git gems".into());
+        };
+        ensure_runtime_gem_declaration(gemfile, gem, &declaration);
+        entries.push_str(&format!(
+            "  [{gem:?}, {:?}, {:?}, {:?}, {:?}],\n",
+            source.checkout_dir(), source.remote, source.revision,
+            source.glob.as_deref().unwrap_or("{,*,*/*}.gemspec"),
+        ));
     }
-    if entries.is_empty() {
-        return;
-    }
-    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
-    let body = format!(
-        "# Gems the app's Gemfile.lock resolves from a GIT source, activated the\n\
+    let mut body = format!(
+        "# frozen_string_literal: true\n\
+         # Gems the app's Gemfile.lock resolves from a GIT source, activated the\n\
          # way Bundler::Source::Git does: the checkout under\n\
          # <gem dir>/bundler/gems/<repo>-<revision[0, 12]>, its gemspec, its\n\
          # require paths and runtime dependencies. RubyGems alone never sees\n\
          # these, so runtime/gem_facades.rb requires this file first.\n\
          # Written by `project.rs::apply_git_gem_load_paths` from the lock.\n\
-         [\n{entries}].each do |name, checkout, remote, revision|\n  \
-           next if Gem.loaded_specs.key?(name)\n  \
-           dir = Gem.path.map {{ |root| File.join(root, \"bundler\", \"gems\", checkout) }}.find {{ |d| File.directory?(d) }}\n  \
-           spec = dir && Dir[File.join(dir, \"{{,*,*/*}}.gemspec\")].filter_map {{ |f| Gem::Specification.load(f) }}.find {{ |s| s.name == name }}\n  \
-           if spec.nil?\n    \
-             $stderr.puts \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
-             next\n  \
-           end\n  \
-           spec.full_gem_path = File.dirname(spec.loaded_from)\n  \
-           # Where Bundler builds a git gem's extensions\n  \
-           # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).\n  \
-           spec.extension_dir = File.join(File.dirname(dir), \"extensions\", Gem::Platform.local.to_s,\n    \
-             Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join(\"-\"))\n  \
-           spec.activate\n  \
-           # Rails' own components are activated, so a gem that depends on\n  \
-           # one resolves, but their files are taken off $LOAD_PATH: Rails'\n  \
-           # code cannot run over this tree's runtime ports (the ports\n  \
-           # answer for Rails). A gem's optional Rails integration then\n  \
-           # sees a LoadError, as it would without Rails — hashie's\n  \
-           # `require 'rails/railtie' if defined?(::Rails)` loaded the real\n  \
-           # railties, and actionpack-xml_parser then the real ActionDispatch.\n  \
-           next unless {rails}.include?(name)\n  \
-           paths = spec.full_require_paths\n  \
-           $LOAD_PATH.reject! {{ |path| paths.include?(path) }}\n\
-         end\n",
-        rails = RAILS_REPOSITORY_GEMS_RUBY
+         [\n{entries}"
     );
-    files.push(("runtime/git_gems.rb".to_string(), body));
-    let facades = &mut files[idx].1;
+    body.push_str(r##"].each do |name, checkout, remote, revision, glob|
+  directory = Gem.path.map { |root| File.join(root, "bundler", "gems", checkout) }.find { |path| File.directory?(path) }
+  unless directory
+    raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) has no checkout bundler/gems/#{checkout} on Gem.path"
+  end
+  if (loaded = Gem.loaded_specs[name])
+    root = File.expand_path(directory) + File::SEPARATOR
+    unless (File.expand_path(loaded.full_gem_path) + File::SEPARATOR).start_with?(root)
+      raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) is already loaded from #{loaded.full_gem_path}, not #{directory}"
+    end
+    next
+  end
+  spec = Dir[File.join(directory, glob)].filter_map { |file| Gem::Specification.load(file) }.find { |candidate| candidate.name == name }
+  unless spec
+    raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) has no gemspec in #{directory}"
+  end
+  spec.full_gem_path = File.dirname(spec.loaded_from)
+  # Where Bundler builds a git gem's extensions
+  # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).
+  spec.extension_dir = File.join(File.dirname(directory), "extensions", Gem::Platform.local.to_s,
+    Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join("-"))
+  spec.activate
+  # Rails' own components are activated, so a gem that depends on one
+  # resolves, but their files are taken off $LOAD_PATH: Rails' code cannot
+  # run over this tree's runtime ports (the ports answer for Rails). A
+  # gem's optional Rails integration then sees a LoadError, as it would
+  # without Rails.
+  next unless "##);
+    body.push_str(RAILS_REPOSITORY_GEMS_RUBY);
+    body.push_str(r##".include?(name)
+  paths = spec.full_require_paths
+  $LOAD_PATH.reject! { |path| paths.include?(path) }
+end
+"##);
+    let Some((_, facades)) = files.iter_mut().find(|(path, _)| path == "runtime/gem_facades.rb") else {
+        return Err("Ruby-family project has no gem facade loader for Git gems".into());
+    };
     if !facades.contains("require_relative \"git_gems\"") {
         facades.insert_str(0, "require_relative \"git_gems\"\n");
     }
+    files.push(("runtime/git_gems.rb".into(), body));
+    files.retain(|(path, _)| path != "Gemfile.lock");
+    Ok(())
 }
 
 /// Carry direct, unmodeled gems that the emitted CRuby app actually names.
