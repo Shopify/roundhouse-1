@@ -4462,14 +4462,15 @@ fn dependent_delete_all_delete_and_nullify_run_on_spinel() {
     assert_eq!(run.stdout, "ok\n");
 }
 
-/// A strict target loads no `runtime/ruby/active_record/preloading.rb`, so
-/// mixed-model records keep the call unsupported there rather than emit a
-/// call to nothing.
+/// A strict target ships no Preloader (`lower::preloader::LOWERS_TO_MODEL_LOADER`
+/// is off: the Ruby family runs the call on the runtime's own port, in
+/// `runtime/active_record_associations.rb`), so mixed-model records keep
+/// the call unsupported there rather than emit a call to nothing.
 #[test]
 fn mixed_records_preloading_is_unsupported_on_strict_targets() {
     let (_emitted, errors) = mixed_preload_app().emit(roundhouse::project::BuildTarget::Rust);
     assert!(
-        errors.iter().any(|e| e.contains("ActiveRecord::Preloading.records is only available on the ruby family and spinel")),
+        errors.iter().any(|e| e.contains("ActiveRecord::Associations::Preloader is declared by the Ruby-family runtime")),
         "{errors:#?}"
     );
 }
@@ -5190,7 +5191,7 @@ fn a_wrapped_float_array_literal_is_nullable_on_go() {
         .write("app/controllers/f_controller.rb", "class FController < ApplicationController\n  def show\n    r = 2.5\n    render json: { nested: [r, 1.0] }\n  end\nend\n")
         .emit(roundhouse::project::BuildTarget::Go);
     assert!(errors.is_empty(), "{errors:?}");
-    let controller = std::fs::read_to_string(emitted.join("app/v2/fcontroller.go")).expect("controller");
+    let controller = std::fs::read_to_string(emitted.join("app/v2/f_controller.go")).expect("controller");
     assert!(controller.contains("[]interface{}{JsonBuilder_finite_float(r), JsonBuilder_finite_float(1.0)}"), "{controller}");
 }
 
