@@ -4079,10 +4079,18 @@ module ActiveRecord
         # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
         # `mark_null!` from `none` / lasting positive `where` only.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
+        # A nil element is `IS NULL` beside the IN list (arel
+        # `ArrayHandler`: `col IN (1, 2) OR col IS NULL`), never a NULL
+        # inside it: `NOT (col IN (NULL, 1))` is NULL for every row, so
+        # `where.not(api_client_id: [nil, 1])` matched nothing.
+        has_nil = ids.any? { |x| x.nil? }
+        ids = ids.reject { |x| x.nil? } if has_nil
         ids = ids.map { |x| typed._attribute_for_database(tcol, x) } unless tcol.nil?
         # An empty list matches nothing: Arel renders `1=0` (`IN ()` is a
         # syntax error), which `where.not` negates to match everything.
+        return "#{qcol} IS NULL" if ids.empty? && has_nil
         return "1=0" if ids.empty?
+        return "(#{qcol} IN (#{escape_list(ids)}) OR #{qcol} IS NULL)" if has_nil
         "#{qcol} IN (#{escape_list(ids)})"
       elsif val.is_a?(Range)
         range_predicate(qcol, val, typed, tcol)
