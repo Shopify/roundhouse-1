@@ -161,6 +161,28 @@ module ActiveRecord
         nil
       end
 
+      # What a runtime-opened transaction's enlistment list (connection.rb)
+      # holds for an association save that joined it: on ROLLBACK
+      # `_rollback_enlisted` puts the frame back; on COMMIT it runs no
+      # callbacks.
+      class RollbackFrame
+        def initialize(frame)
+          @frame = frame
+        end
+
+        def record
+          self
+        end
+
+        def _restore_after_rollback(_kind)
+          Association.restore(@frame)
+        end
+
+        def _run_enlisted_commit(_kind)
+          nil
+        end
+      end
+
       def self.restore(frame)
         frame.reverse_each do |record, persisted, id|
           record.instance_variable_set(:@persisted, persisted)
@@ -203,7 +225,9 @@ module ActiveRecord
               # Joined: a ROLLBACK of the enclosing transaction (the
               # owner's `save` raising Rollback on this block's false)
               # restores the frame, where this runtime keeps the count.
-              ActiveRecord::Base._enlist_restore(frame) if ActiveRecord::Base.respond_to?(:_enlist_restore)
+              if ActiveRecord::Base.respond_to?(:_rollback_enlisted) && Db._txn_depth > 0
+                Db._txn_records << ActiveRecord::EnlistedRecord.new(RollbackFrame.new(frame), 3)
+              end
               status = status_of(&block)
             else
               begin

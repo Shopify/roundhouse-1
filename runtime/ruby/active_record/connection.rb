@@ -218,10 +218,7 @@ module ActiveRecord
   end
 
   # One write an open transaction holds the commit callbacks of: the
-  # record, and what the write was (0 create, 1 update, 2 destroy). Kind
-  # 3 holds no callbacks: its `record` is an association save's frame
-  # (`Associations::Association.within_transaction`), put back by a
-  # ROLLBACK and dropped by a COMMIT.
+  # record, and what the write was (0 create, 1 update, 2 destroy).
   # `Base.transaction` runs the held callbacks after its outermost
   # COMMIT and drops them on a ROLLBACK, restoring the record's
   # persisted state as Rails' `rolledback!` does.
@@ -1065,7 +1062,7 @@ module ActiveRecord
     def self._upsert_serialize(name, value)
       spec = schema_column_types[name.to_s]
       return value if spec && spec[0] == :unported
-      type_for_attribute(name).serialize(value)
+      type_for_attribute(name).serialize(value) #: Object?
     end
 
     # The write behind `Relation#upsert_all`, which Rails reaches from
@@ -2508,13 +2505,11 @@ module ActiveRecord
       records.clear
       seen = []
       held.each do |entry|
-        next if entry.kind == 3
         record = entry.record
         next if seen.any? { |other| other.equal?(record) }
         seen << record
         kind = entry.kind
         held.each do |other|
-          next if other.kind == 3
           next unless other.record.equal?(record)
           kind = other.kind if other.kind == 2 || (other.kind == 0 && kind == 1)
         end
@@ -2533,21 +2528,7 @@ module ActiveRecord
       return nil if records.length <= from
       undone = records[from, records.length - from]
       records.pop while records.length > from
-      undone.reverse_each do |entry|
-        if entry.kind == 3
-          ActiveRecord::Associations::Association.restore(entry.record)
-        else
-          entry.record._restore_after_rollback(entry.kind)
-        end
-      end
-      nil
-    end
-
-    # An association save that joined this runtime's open transaction
-    # (the owner's own `save`) has its frame put back if the
-    # transaction, or the savepoint it is in, rolls back.
-    def self._enlist_restore(frame)
-      Db._txn_records << ActiveRecord::EnlistedRecord.new(frame, 3)
+      undone.each { |entry| entry.record._restore_after_rollback(entry.kind) }
       nil
     end
 
