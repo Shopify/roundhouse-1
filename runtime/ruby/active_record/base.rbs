@@ -230,6 +230,7 @@ module ActiveRecord
     # not leave the readers as Ty::Var when a stem other than base.rb
     # is the only harvest surface for ActiveRecord::Base.
     @persisted: bool
+    @new_record: bool?
     @destroyed: bool
     def persisted?: () -> bool
     def new_record?: () -> bool

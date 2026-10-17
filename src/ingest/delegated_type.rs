@@ -417,6 +417,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
                 on: None,
                 condition: None,
                 on_any: Vec::new(),
+                on_contexts: Vec::new(),
                 object: None,
                 prepend: false,
             },

@@ -260,6 +260,7 @@ fn parse_sequel_association(
                 // `one_to_many` takes a dataset block, a different thing.
                 extension: Vec::new(),
                 skip_validation: false,
+                no_autosave: false,
                 autosave: false,
                 primary_key: None,
             }

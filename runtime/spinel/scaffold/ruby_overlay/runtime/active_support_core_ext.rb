@@ -1520,6 +1520,19 @@ module ActiveSupport
   end
   singleton_class.prepend(IndifferentParam)
 
+  # `value.with_indifferent_access` on a receiver the analysis cannot type
+  # lowers to `ActiveSupport.indifferent(value)`, the Hash call. An app
+  # object that defines its own (the country_db gem's Zone and Country, over
+  # their `to_h`) answers it, as the send would in Rails; HashWithIndifferentAccess
+  # built on the object would be an empty Hash defaulting to it.
+  module IndifferentReceiver
+    def indifferent(value)
+      return super if value.nil? || value.is_a?(::Hash) || !value.respond_to?(:with_indifferent_access)
+      value.with_indifferent_access
+    end
+  end
+  singleton_class.prepend(IndifferentReceiver)
+
   # typed_parameters' reads (`permit_types`, `fetch_type`, `require_type`,
   # `require_hash`) and `permit!` on the params a controller test hands the
   # action: an indifferent Hash here, where Rails' `params=` wraps a Hash in

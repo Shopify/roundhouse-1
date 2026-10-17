@@ -55,17 +55,23 @@ const PROBE: &str = r##"class UpsertTimestampsProbe
     Rate.upsert({ code: "gbp", value: 5, created_at: stamp, updated_at: stamp }, unique_by: :code)
     given = Rate.find_by(code: "gbp")
     out << "given: #{given.created_at.year} #{given.updated_at.year}"
+    # A row keyed by the strings of a record's `attributes`, with a symbol
+    # key merged over it (GenerateOid's `.merge(id: oid)`), names each
+    # column once.
+    Rate.upsert_all([{ "code" => "chf", "value" => 7 }.merge(value: 8)], unique_by: :code)
+    out << "mixed keys: #{Rate.find_by(code: "chf").value}"
     out
   end
 end
 "##;
 
-const EXPECTED: [&str; 5] = [
+const EXPECTED: [&str; 6] = [
     "insert: false false",
     "unchanged: true",
     "changed: 2 created true touched true",
     r#"upsert_all: [["eur", 4, false], ["usd", 3, false]]"#,
     "given: 2020 2020",
+    "mixed keys: 8",
 ];
 
 const FILES: [(&str, &str); 7] = [

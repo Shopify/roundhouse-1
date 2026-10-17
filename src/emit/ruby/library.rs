@@ -12510,6 +12510,51 @@ fn emit_library_class_decl_inner(
             tail_effects.sort_by_key(|e| e.span.start);
         }
     }
+    // A def the source has below a class-body macro that names it
+    // (`money_column(:variant_price)` above `def variant_price`) is the
+    // one that stands: the macro's `define_method` ran first. The macros
+    // are written below the methods, so such a def follows the macro that
+    // names it, instead of being replaced by what the macro defined.
+    let defs_named_below: Vec<(usize, &Expr)> = if railtie {
+        Vec::new()
+    } else {
+        let mut out: Vec<(usize, &Expr)> = Vec::new();
+        for e in late_inits.iter().copied().chain(tail_effects.iter().copied()) {
+            let ExprNode::Send { recv, args, .. } = &*e.node else { continue };
+            if e.span.is_synthetic() || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
+            for arg in args {
+                let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node else { continue };
+                let Some(index) = lc.methods.iter().position(|m| {
+                    m.name == *value
+                        && m.receiver == MethodReceiver::Instance
+                        && !m.name_span.is_synthetic()
+                        && m.name_span.file == e.span.file
+                        && m.name_span.start > e.span.start
+                }) else {
+                    continue;
+                };
+                let m = &lc.methods[index];
+                if !out.iter().any(|(i, _)| *i == index)
+                    && !carried_method(m)
+                    && !written_in_state.contains(&index)
+                    && !hoisted_hooks.contains(&index)
+                    && !lc.conditional_definitions.iter().any(|c| c.contains(m))
+                    && inherited_alias(lc, m).is_none()
+                {
+                    out.push((index, e));
+                }
+            }
+        }
+        out
+    };
+    let write_defs_named_by = |s: &mut String, effect: &Expr| {
+        for &(index, _) in defs_named_below.iter().filter(|(_, e)| std::ptr::eq(*e, effect)) {
+            writeln!(s).unwrap();
+            write_library_method(s, lc, index, &body_pad, &instance_form);
+        }
+    };
     // A carried railtie's body: its locals first (a statement's block
     // closes over a local an earlier statement writes), then each
     // statement under `run_body_statement`, which names one that fails
@@ -12646,6 +12691,8 @@ fn emit_library_class_decl_inner(
         }
 
         match conditional {
+            // After the macro that names it (`defs_named_below`).
+            None if defs_named_below.iter().any(|(i, _)| *i == index) => {}
             // After every def (below).
             None if inherited_alias(lc, m).is_some() => {}
             Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad, &instance_form),
@@ -12697,6 +12744,7 @@ fn emit_library_class_decl_inner(
                 writeln!(s, "{body_pad}{line}").unwrap();
             }
         }
+        write_defs_named_by(&mut s, effect);
     }
 
     // Named visibility for methods without a local definition (inherited,
@@ -12785,6 +12833,7 @@ fn emit_library_class_decl_inner(
         for line in super::emit_expr(init).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
+        write_defs_named_by(&mut s, init);
         for o in overrides_at(at + 1) {
             write_override(&mut s, o);
         }

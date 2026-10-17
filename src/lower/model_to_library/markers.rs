@@ -1601,7 +1601,9 @@ fn push_symbol_callback(
         ),
         None => seq(cb.targets.iter().map(self_call).collect()),
     };
-    if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
+    if !cb.on_contexts.is_empty() {
+        body = guard_validation_contexts(body, &cb.on_contexts, span);
+    } else if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
         // Validations never run on destroy; ingest rejects this.
         let Some(on) = cb.on else { return };
         let Some(guarded) = guard_validation_on(body, on, span) else { return };
@@ -1676,6 +1678,36 @@ fn guard_validation_on(
     );
     guarded.inherit_span(span);
     Some(guarded)
+}
+
+/// A validation hook's `on: [:create, :fulfillment]` (or custom context):
+/// the body runs when the record's `validation_context` is any of them,
+/// as Rails' `Array(on).intersect?(Array(validation_context))`.
+fn guard_validation_contexts(body: Expr, contexts: &[Symbol], span: Span) -> Expr {
+    let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>, parenthesized: bool| {
+        Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized })
+    };
+    let wanted = Expr::new(
+        span,
+        ExprNode::Array {
+            elements: contexts
+                .iter()
+                .map(|c| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: c.clone() } }))
+                .collect(),
+            style: crate::expr::ArrayStyle::Brackets,
+        },
+    );
+    let current = send(None, "Array", vec![send(None, "validation_context", vec![], false)], true);
+    let mut guarded = Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(wanted), "intersect?", vec![current], true),
+            then_branch: body,
+            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        },
+    );
+    guarded.inherit_span(span);
+    guarded
 }
 
 /// The runtime Base hook method a `CallbackHook` overrides when no

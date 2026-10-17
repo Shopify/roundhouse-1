@@ -290,6 +290,7 @@ module ActiveRecord
     def initialize_dup(other)
       super
       @persisted = false
+      @new_record = nil
       @destroyed = false
       @readonly = false
       @errors = _fresh_errors

@@ -435,10 +435,7 @@ fn convert_splatted_object(expr: &mut Expr, sigs: &Signatures) {
         return;
     }
     let Some(ty) = recv.ty.as_ref() else { return };
-    if !matches!(ty, Ty::Class { .. })
-        || callee_params(ty, method, sigs).is_some()
-        || callee_params(ty, &Symbol::from("to_hash"), sigs).is_none()
-    {
+    if !splatted_object_type(ty, method, sigs) {
         return;
     }
     let inner = recv.clone();
@@ -446,6 +443,20 @@ fn convert_splatted_object(expr: &mut Expr, sigs: &Signatures) {
         inner.span,
         ExprNode::Send { recv: Some(inner), method: Symbol::from("to_hash"), args: vec![], block: None, parenthesized: false },
     );
+}
+
+/// An app class that defines `to_hash` and no `merge`, or a union of them
+/// (a block parameter reassigned from a `new` that answers the base class
+/// is typed `Sub | Base`; either side is read through `to_hash`).
+fn splatted_object_type(ty: &Ty, method: &Symbol, sigs: &Signatures) -> bool {
+    let to_hash = Symbol::from("to_hash");
+    match ty {
+        Ty::Class { .. } => callee_params(ty, method, sigs).is_none() && callee_params(ty, &to_hash, sigs).is_some(),
+        Ty::Union { variants } => {
+            !variants.is_empty() && variants.iter().all(|variant| splatted_object_type(variant, method, sigs))
+        }
+        _ => false,
+    }
 }
 
 fn is_self_send(recv: Option<&Expr>) -> bool {
@@ -564,6 +575,18 @@ fn restore_kwrest_splat(args: &mut Vec<Expr>, params: &[Param]) {
 /// Replace the trailing positional bundle in `args` with the keyword
 /// list `splat` names, or ledger why not.
 fn expand(args: &mut Vec<Expr>, splat: ErasedSplat, diags: &mut Vec<Diagnostic>) {
+    if !expand_keywords(args, &splat, diags) {
+        // Not restated as keywords: the bundle is still a `**` Ruby needs
+        // (a `T::Struct.new({ .. }.compact)` hash, an erased merge chain).
+        // The ruby-family trees write it back as `**bundle`.
+        if let Some(bundle) = args.last_mut() {
+            bundle.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
+        }
+    }
+}
+
+/// Expand the trailing bundle into keywords; false when it was left alone.
+fn expand_keywords(args: &mut Vec<Expr>, splat: &ErasedSplat, diags: &mut Vec<Diagnostic>) -> bool {
     let hash = args.last().expect("erased_splat matched a trailing arg");
 
     if !splat.defaults_literal {
@@ -571,14 +594,14 @@ fn expand(args: &mut Vec<Expr>, splat: ErasedSplat, diags: &mut Vec<Diagnostic>)
             hash,
             "callee declares an optional keyword whose default is not a literal",
         ));
-        return;
+        return false;
     }
     let Some((read, literal, bundle_wins)) = splat_shape(hash) else {
         diags.push(residue(
             hash,
             "the splatted expression is not a local, ivar or constant read",
         ));
-        return;
+        return false;
     };
     let (read, literal): (Expr, Vec<(Expr, Expr)>) = (read.clone(), literal.to_vec());
     // `f(k: compute(), **h)` evaluates `compute()` even when `h` has
@@ -590,7 +613,7 @@ fn expand(args: &mut Vec<Expr>, splat: ErasedSplat, diags: &mut Vec<Diagnostic>)
             hash,
             "a keyword value beside a later splat is not a literal, so fetch would skip it",
         ));
-        return;
+        return false;
     }
 
     let hash = args.pop().expect("checked above");
@@ -628,6 +651,7 @@ fn expand(args: &mut Vec<Expr>, splat: ErasedSplat, diags: &mut Vec<Diagnostic>)
     let mut kwargs = Expr::new(hash.span, ExprNode::Hash { entries, kwargs: true });
     kwargs.ty = hash.ty.clone();
     args.push(kwargs);
+    true
 }
 
 /// The two halves of a splatted expression this pass can expand: the

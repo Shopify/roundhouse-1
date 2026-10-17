@@ -609,6 +609,12 @@ pub enum Association {
         /// loaded record, its errors nested under the association.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
+        /// `autosave: false`: the owner's save never saves the collection's
+        /// records, not even new ones (`save_collection_association`
+        /// inserts only when `autosave != false`), and its `validate`
+        /// still runs.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_autosave: bool,
         /// `primary_key: :source_id` — the OWNER column the foreign key
         /// matches (Rails' `join_primary_key`). `None` means the owner's
         /// own key, `id`. Every reader of this association must go
@@ -1180,6 +1186,12 @@ pub struct Callback {
     /// `parse_callback`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<CallbackOn>,
+    /// A validation hook's `on:` that is an array or names a custom
+    /// context (`before_validation :a, on: [:create, :fulfillment]`): the
+    /// callback runs when the record's `validation_context` is any of
+    /// them. Empty for every other callback; `on` stays None then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_contexts: Vec<Symbol>,
     pub condition: Option<Expr>,
     /// A transaction callback's actions (`CallbackHook::is_transaction`):
     /// `on: [:create, :update]`, or what a sugar spelling enforces

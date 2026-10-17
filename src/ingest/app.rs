@@ -4691,7 +4691,7 @@ fn splice_concerns_into_models_named(
         carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
     let mut dependencies: crate::det::HashMap<ClassId, Vec<ClassId>> = crate::det::HashMap::default();
     for lc in app.library_classes.iter().filter(|lc| lc.is_module && concerns.contains(&lc.name)) {
-        dependencies.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        dependencies.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     // `id` with its dependencies ahead of it, depth first, each concern
     // once per includer (`append_features` returns early for a module the
@@ -5247,7 +5247,7 @@ fn splice_concern_class_methods_into_includers(
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     if class_side.is_empty() {
         return;
@@ -5569,7 +5569,7 @@ fn splice_deferred_mixes_in_extends(app: &mut App, carriers: &[ConcernClassMetho
         carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     let mut direct: HashMap<ClassId, (Option<ClassId>, Vec<ClassId>)> = HashMap::default();
     for model in &app.models {
@@ -15428,4 +15428,16 @@ fn constructs_app_instance_answering(
             })
         })
     })
+}
+
+/// An include written `::X` names the top-level `X`. Ingest keeps the
+/// leading `::` when a namespace of the same name lies on the owner's
+/// lexical path (`include ::MutationGuard` inside
+/// `Returns::Internal::MutationGuard`), so the emitted include is not read
+/// as the nested module; a concern table is keyed by the plain name.
+fn unrooted(id: &crate::ident::ClassId) -> crate::ident::ClassId {
+    match id.0.as_str().strip_prefix("::") {
+        Some(top) => crate::ident::ClassId(crate::ident::Symbol::from(top)),
+        None => id.clone(),
+    }
 }

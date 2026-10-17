@@ -1006,6 +1006,16 @@ module ActiveRecord
       all.upsert_all(rows, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
     end
 
+    def self._string_keyed_rows(rows)
+      out = [] #: Array[Hash[String, untyped]]
+      rows.each do |row|
+        keyed = {} #: Hash[String, untyped]
+        row.each_key { |k| keyed[k.to_s] = row[k] }
+        out.push(keyed)
+      end
+      out
+    end
+
     # The write behind `Relation#upsert_all`, which Rails reaches from
     # the model through `all`: a patch prepended on Relation (Core's
     # GenerateOid allocates the ids there) runs first.
@@ -1015,7 +1025,11 @@ module ActiveRecord
         raise NotImplementedError, "#{name}.upsert_all: RETURNING is not supported"
       end
 
-      cols = rows[0].keys
+      # A row keyed `"id"` (a record's `attributes`) that GenerateOid then
+      # merges `:id => oid` into names one column, not two: Rails reads
+      # every row's keys as strings, the later one winning.
+      keyed = _string_keyed_rows(rows)
+      cols = keyed[0].keys
       target = unique_by.nil? ? primary_key : unique_by
       target_names = _conflict_target_columns(target.is_a?(Array) ? target.map { |c| c.to_s } : [target.to_s])
 
@@ -1034,7 +1048,7 @@ module ActiveRecord
         end
       end
 
-      tuples = rows.map do |row|
+      tuples = keyed.map do |row|
         values = cols.map { |c| ActiveRecord.adapter.escape_value(known.include?(c.to_s) ? type_for_attribute(c).serialize(row[c]) : row[c]) }
         stamped.each { |_c| values.push(ActiveRecord.adapter.escape_value(now)) }
         "(" + values.join(", ") + ")"
@@ -2292,6 +2306,21 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).take
     end
 
+    # `Model.first!` / `last!` / `take!`: the bang finders off a fresh
+    # Relation, raising RecordNotFound on an empty table (Core's
+    # `Shipping::Intent.last!` reads the record a mutation just wrote).
+    def self.first!
+      ActiveRecord::Relation.new(self).first!
+    end
+
+    def self.last!
+      ActiveRecord::Relation.new(self).last!
+    end
+
+    def self.take!
+      ActiveRecord::Relation.new(self).take!
+    end
+
     # The Relation load path's Hash fallback for a hand-written model
     # (one with its own `instantiate` and no lowerer-emitted
     # `_hydrate_all`): the adapter's rows through `instantiate`, which
@@ -2335,7 +2364,7 @@ module ActiveRecord
         # ActiveModel::Validations::Callbacks wraps the run, so a bare
         # `valid?` (Core's Metafields::BulkUpsert validating before it
         # writes) assigns what `before_validation` derives, as `save` does.
-        before_validation unless @_validation_hooks_off
+        _before_validation_without_saving_targets unless @_validation_hooks_off
         ActiveRecord::RuntimeValidations.run(self)
         after_validation unless @_validation_hooks_off
       ensure
@@ -2360,6 +2389,22 @@ module ActiveRecord
 
     def _validated_for_owner?
       @_validated_for_owner == true
+    end
+
+    # A bare `valid?` runs `before_validation` without the belongs_to
+    # autosave saving an unsaved target: Rails saves that target in the
+    # record's before_save, so `box.valid?` never gives the new `intent`
+    # it belongs to an id (Core's PersistIntents keys a Hash by the new
+    # intents and validates each box before the upsert; an id assigned by
+    # the validation changed the key's hash and lost the lookup).
+    def _before_validation_without_saving_targets
+      previous = @_validated_for_owner
+      @_validated_for_owner = true
+      begin
+        before_validation
+      ensure
+        @_validated_for_owner = previous
+      end
     end
 
     # ActiveModel's `invalid?(context = nil)`: `!valid?(context)`. Core's
