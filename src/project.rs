@@ -5296,6 +5296,22 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let test_fixtures = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/active_record_test_fixtures.rb")
         .map_err(|e| format!("read test fixtures runtime: {e}"))?;
     files.push(("runtime/active_record_test_fixtures.rb".into(), test_fixtures));
+    // Mime::Type.register, which an app's mime_types initializer calls
+    // while it boots: appended to the Mime port itself, which every file
+    // naming Mime loads, so it is in place before any initializer runs.
+    let mime_registry = crate::runtime_files::read_to_string("runtime/spinel/cruby/mime_registry.rb")
+        .map_err(|e| format!("read Mime registry runtime: {e}"))?;
+    let (_, mime) = files
+        .iter_mut()
+        .find(|(p, _)| p == "runtime/mime.rb")
+        .ok_or("PostgreSQL bootstrap: the tree carries no runtime/mime.rb for the Mime registry")?;
+    if !mime.ends_with('\n') {
+        mime.push('\n');
+    }
+    mime.push_str(&mime_registry);
+    let request_encoder = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/action_dispatch_request_encoder.rb")
+        .map_err(|e| format!("read request encoder runtime: {e}"))?;
+    files.push(("runtime/action_dispatch_request_encoder.rb".into(), request_encoder));
     files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
@@ -6903,6 +6919,7 @@ fn test_case_load_hooks_block() -> String {
          # named and the next runs (`project::test_case_load_hooks_block`).\n\
          # ActiveSupport::TestCase is TestBase.\n\
          require_relative \"../runtime/active_record_test_fixtures\"\n\
+         require_relative \"../runtime/action_dispatch_request_encoder\"\n\
          if defined?(ActiveSupport::LazyLoadHooks)\n  \
          ActiveSupport::LazyLoadHooks.naming_failures({site:?}) {{ ActiveSupport.run_load_hooks(:{hook}, TestBase) }}\n\
          end\n\
@@ -16506,7 +16523,14 @@ fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
         || carries_active_model_api(files)
         || carries_named(
             files,
-            &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError", "ActiveModel::Callbacks", "ActiveModel::EachValidator"],
+            &[
+                "ActiveModel::Validations",
+                "ActiveModel::Errors",
+                "ActiveModel::ValidationError",
+                "ActiveModel::Callbacks",
+                "ActiveModel::EachValidator",
+                "ActiveModel::Translation",
+            ],
         )
         || calls_runtime_validates(files);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"])
