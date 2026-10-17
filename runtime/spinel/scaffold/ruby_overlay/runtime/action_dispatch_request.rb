@@ -197,7 +197,8 @@ module ActionDispatch
     def filtered_parameters
       all = {}
       @params.each { |k, v| all[k] = v }
-      @path_parameters.to_h.each { |k, v| all[k] = v }
+      # The route's captures live in the env here (Symbol keys), not in an ivar.
+      path_parameters.each { |k, v| all[k.to_s] = v }
       ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
     end
 
