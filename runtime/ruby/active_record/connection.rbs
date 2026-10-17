@@ -266,6 +266,8 @@ module ActiveRecord
     def self.current_scope=: (untyped scope) -> untyped
     def self.global_current_scope: (?bool skip_inherited_scope) -> untyped
     def self.global_current_scope=: (untyped scope) -> untyped
+    def self.scope_attributes: () -> Hash[Symbol, untyped]
+    def self.scope_attributes?: () -> bool
     def self.scope_registry: () -> ::ActiveRecord::Scoping::ScopeRegistry
     # Declared by the emitted model or a class-level macro, not by a `def`
     # here: the contract the bodies in connection.rb are typed against.

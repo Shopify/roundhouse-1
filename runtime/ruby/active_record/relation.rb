@@ -1993,9 +1993,13 @@ module ActiveRecord
       spawn.merge!(other)
     end
 
+    # Rails' Merger carries the other relation's joins with its
+    # conditions (`merge_joins`): its WHEREs name the joined tables. The
+    # eager LEFT OUTER JOINs of its `includes` are its own load plan.
     def merge!(other)
       own_lists
       unload_records
+      other.join_clauses.each { |j| @joins << j unless @joins.include?(j) || other.eager_join?(j) }
       other.where_clauses.each do |w|
         push_where(w)
         @opaque_wheres = true
@@ -2006,6 +2010,10 @@ module ActiveRecord
 
     def where_clauses
       @wheres
+    end
+
+    def eager_join?(frag)
+      @eager_frags.include?(frag)
     end
 
     # `rel.arel` — the relation reified as its SELECT text, for the
@@ -3874,15 +3882,7 @@ module ActiveRecord
           named << [key.map { |k| k.to_s }.join(","), predicate]
         elsif val.is_a?(Hash) && nested_hash?(key, val)
           table, owner = nested_table(key)
-          val.each do |col, v|
-            # The nested table's own alias names its column
-            # (`where(condition_responders: {condition_id:})` over
-            # `alias_attribute :condition_id, :context_driver_group_id`).
-            name = nested_column_name(owner, col)
-            predicate = column_predicate("#{table}.#{name}", v, false, owner)
-            parts << predicate
-            named << ["#{table}.#{name}", predicate]
-          end
+          nested_conditions(table, owner, val, parts, named)
         else
           # An alias names its column (`where(subdomain:)`).
           column = @model._attribute_name(key.to_s)
@@ -3901,6 +3901,20 @@ module ActiveRecord
       end
       @hash_parts = named
       parts.join(" AND ")
+    end
+
+    # The conditions of one nested table (`where(story: {id: 1})`), each
+    # `table.col`.
+    def nested_conditions(table, owner, conditions, parts, named)
+      conditions.each do |col, v|
+        # The nested table's own alias names its column
+        # (`where(condition_responders: {condition_id:})` over
+        # `alias_attribute :condition_id, :context_driver_group_id`).
+        name = nested_column_name(owner, col)
+        predicate = column_predicate("#{table}.#{name}", v, false, owner)
+        parts << predicate
+        named << ["#{table}.#{name}", predicate]
+      end
     end
 
     # A Hash value (callers check `is_a?(Hash)`) nests a table only when the key is not a column of this

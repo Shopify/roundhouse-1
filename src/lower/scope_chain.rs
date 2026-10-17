@@ -3722,6 +3722,27 @@ fn lower_relation_args(
     aliases
 }
 
+/// A nested join spec's next hop (` INNER JOIN t ON t.fk = table.id ...`),
+/// its ON condition naming the previous hop's `table` as `alias`. Only
+/// the first hop's segment: a later hop is another table's.
+fn requalify_next_hop(text: &str, table: &str, alias: &str) -> String {
+    let end = text.match_indices("JOIN ").nth(1).map_or(text.len(), |(i, _)| i);
+    let (hop, later) = text.split_at(end);
+    let needle = format!("{table}.");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = hop;
+    while let Some(i) = rest.find(&needle) {
+        let boundary = rest[..i].chars().next_back().is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        out.push_str(&rest[..i]);
+        out.push_str(if boundary { alias } else { table });
+        out.push('.');
+        rest = &rest[i + needle.len()..];
+    }
+    out.push_str(rest);
+    out.push_str(later);
+    out
+}
+
 /// Re-emit an already-lowered `joins(:assoc)` in the receiver chain with
 /// the association-name alias Rails uses once a `where` hash keys off
 /// that name. Both spellings come from the registry, so the match is on
@@ -3738,6 +3759,16 @@ fn alias_join_in_chain(expr: &mut Expr, plain: &str, aliased: &str) -> bool {
                     *value = format!("{kind} {aliased}");
                     return true;
                 }
+                // A nested spec (`joins(variants: :inventory_item_variant)`):
+                // the next hop's ON names the aliased table by its alias.
+                ExprNode::Lit { value: Literal::Str { value } } if value.starts_with(&format!("{kind} {plain} {kind} ")) => {
+                    let table = plain.split(' ').next().unwrap_or(plain);
+                    let alias = aliased.split(' ').nth(1).unwrap_or(aliased);
+                    let head = format!("{kind} {plain}");
+                    let rest = requalify_next_hop(&value[head.len()..], table, alias);
+                    *value = format!("{kind} {aliased}{rest}");
+                    return true;
+                }
                 // A hop onto a default-scoped model: the tail, then
                 // `#{Model._join_scope_sql}`, whose conditions name the
                 // table, so they are re-qualified with the alias as the
@@ -3750,6 +3781,12 @@ fn alias_join_in_chain(expr: &mut Expr, plain: &str, aliased: &str) -> bool {
                         continue;
                     }
                     *value = format!("{kind} {aliased}");
+                    // The text after the first hop's scope is the next
+                    // hop of a nested spec, whose ON names the aliased
+                    // table.
+                    if let Some(crate::expr::InterpPart::Text { value }) = parts.get_mut(2) {
+                        *value = requalify_next_hop(value, table, alias);
+                    }
                     for part in parts.iter_mut() {
                         let crate::expr::InterpPart::Expr { expr } = part else { continue };
                         let mut scope = expr.clone();
@@ -5461,6 +5498,17 @@ mod tests {
 
     fn span() -> Span {
         Span::synthetic()
+    }
+
+    #[test]
+    fn requalify_next_hop_renames_only_the_first_hops_table() {
+        let text = " INNER JOIN gadget_stocks ON gadget_stocks.gadget_variant_id = gadget_variants.id INNER JOIN t ON t.x = gadget_variants.id";
+        assert_eq!(
+            requalify_next_hop(text, "gadget_variants", "variants"),
+            " INNER JOIN gadget_stocks ON gadget_stocks.gadget_variant_id = variants.id INNER JOIN t ON t.x = gadget_variants.id",
+        );
+        // A longer identifier ending in the table name is another table.
+        assert_eq!(requalify_next_hop(" ON old_gadget_variants.id = gadget_variants.id", "gadget_variants", "v"), " ON old_gadget_variants.id = v.id");
     }
     fn int_lit(n: i64) -> Expr {
         Expr::new(span(), ExprNode::Lit { value: Literal::Int { value: n } })
