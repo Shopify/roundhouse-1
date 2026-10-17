@@ -1,4 +1,5 @@
 module RoundhouseJsonColumn
   def self.load: (String? serialized) -> untyped
+  def self.snapshot: (String? serialized) -> untyped
   def self.dump: (untyped value) -> String?
 end

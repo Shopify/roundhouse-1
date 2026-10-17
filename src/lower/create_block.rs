@@ -49,6 +49,22 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
     )
 }
 
+/// `Tempfile.create(...) { |f| }` and its kin are Ruby's own block
+/// factories, not record factories: there is no `save` to call on what
+/// they yield, and the block's return value is theirs to manage.
+fn stdlib_factory(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), .. } = &*expr.node else {
+        return false;
+    };
+    let ExprNode::Const { path } = &*r.node else {
+        return false;
+    };
+    path.first().is_some_and(|root| {
+        crate::gem_boundary::RUBY_CORE.contains(&root.as_str())
+            || crate::gem_boundary::RUBY_STDLIB.contains(&root.as_str())
+    })
+}
+
 fn rewrite_create_block(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite_create_block(c, diags));
@@ -57,7 +73,7 @@ fn rewrite_create_block(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         ExprNode::Send { method, block: Some(_), .. }
             if matches!(method.as_str(), "create" | "create!")
     );
-    if !recognized {
+    if !recognized || stdlib_factory(expr) {
         return;
     }
     let matches = matches!(
