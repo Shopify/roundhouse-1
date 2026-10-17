@@ -62,6 +62,8 @@ const PROBE: &str = r##"class CompositePrimaryKeyProbe
     out << "assign: #{c.shop_id} #{c.id_value} #{c.island} #{Order.find([3, 11, 1]).name}"
     b.destroy
     out << "destroy: #{Order.count} #{Order.order(:shop_id).pluck(:name).inspect}"
+    d = a.dup
+    out << "dup: #{d.new_record?} #{d.shop_id.inspect} #{d.id_value.inspect} #{d.island.inspect} #{d.name}"
     out
   end
 end
@@ -69,7 +71,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 9] = [
+const EXPECTED: [&str; 10] = [
     r#"key: ["shop_id", "id", "island"] true ["shop_id", "id", "island"]"#,
     r#"id: [1, 10, 0] 10 10 "1_10_0" 10 "orders/[1, 10, 0]""#,
     r#"find: b ["a", "b"]"#,
@@ -79,6 +81,7 @@ const EXPECTED: [&str; 9] = [
     "first: a2 b2",
     "assign: 3 11 1 c",
     r#"destroy: 2 ["a2", "c"]"#,
+    "dup: true nil nil nil a2",
 ];
 
 /// What native Rails requires, in order.

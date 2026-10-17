@@ -164,6 +164,20 @@ impl EnumConstants {
             }) => self
                 .resolve_name(receiver, owners)
                 .is_some_and(|receiver| self.is_sorbet_read(&receiver, method)),
+            // A class with a superclass named as a value (`T.nilable(Contract)`,
+            // `is_a?(Contract)`, `-> { Contract }`, a stored or returned
+            // class) is a model/record class, not a module namespace: it
+            // answers records, like the finder calls below. Holding the
+            // class does not write or replace its nested enums; that takes
+            // a constant write (a Write fact) or a reflection call, which
+            // is refused where it is written. A module namespace stays
+            // conservative, because its alias exposes the enums beneath it.
+            SurfaceUse::Reference(_)
+                if matches!(self.values.get(name), Some(EnumConstant::Namespace))
+                    && self.parents.contains_key(name) =>
+            {
+                true
+            }
             SurfaceUse::Reference(_) | SurfaceUse::Override => false,
             SurfaceUse::Call { method, result, body_macro } => {
                 let member_owner = name.rsplit_once("::").map(|(owner, _)| owner).unwrap_or("");
