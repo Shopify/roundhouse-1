@@ -200,6 +200,10 @@ module ActiveRecord
             end
           elsif Db.current_dbh.respond_to?(:transaction_active?)
             if Db.current_dbh.transaction_active?
+              # Joined: a ROLLBACK of the enclosing transaction (the
+              # owner's `save` raising Rollback on this block's false)
+              # restores the frame, where this runtime keeps the count.
+              ActiveRecord::Base._enlist_restore(frame) if ActiveRecord::Base.respond_to?(:_enlist_restore)
               status = status_of(&block)
             else
               begin
