@@ -63,3 +63,77 @@ fn an_engines_eager_load_path_is_an_autoload_root_for_its_files_constants() {
     );
     assert!(!models.contains("[:Drops, "), "no `Drops` namespace under the app/liquid root");
 }
+
+// The lock names the `liquid` gem, so `app/liquid/lib` reads as `<gem>/lib`.
+const LIQUID_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    liquid (5.5.0)\n\nPATH\n  remote: engines/widgets\n  specs:\n    widgets (0.1.0)\n\nDEPENDENCIES\n  liquid\n  widgets!\n";
+
+const LIB_ENGINE: &str = r#"require "rails"
+
+module Widgets
+  class Engine < Rails::Engine
+    paths.add("app/liquid/lib", eager_load: true)
+  end
+end
+"#;
+
+const SECTION_TEMPLATE: &str = r#"class SectionTemplate
+  def self.parse(text)
+    "parsed #{text}"
+  end
+end
+"#;
+
+const VISITOR: &str = r#"module StaticAnalysis
+  module ParseTreeVisitor
+    def self.visit(text)
+      text.size
+    end
+  end
+end
+"#;
+
+const ASSET: &str = r#"class ThemeAsset
+  def parsed(text)
+    SectionTemplate.parse(text)
+  end
+
+  def analysed(text)
+    StaticAnalysis::ParseTreeVisitor.visit(text)
+  end
+end
+"#;
+
+/// Core's online_store roots `app/liquid/lib` (`SectionTemplate`,
+/// `BaseTemplate`), a directory named `lib`. It is an autoload root like
+/// `app/liquid/drops`, not a gem's `lib/` on the load path: a model that
+/// reads `SectionTemplate` only in a method body loads the file on first
+/// reference (v2-r52: `uninitialized constant AssetCloud::ThemeSectionAsset::
+/// SectionTemplate`, 3 ids).
+#[test]
+fn an_engines_lib_named_eager_load_root_autoloads_its_constants() {
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_engine_autoload_roots\n")
+        .write("Gemfile.lock", LIQUID_LOCK)
+        .write("engines/widgets/lib/widgets/engine.rb", LIB_ENGINE)
+        .write("engines/widgets/app/liquid/lib/section_template.rb", SECTION_TEMPLATE)
+        .write("engines/widgets/app/liquid/lib/static_analysis/parse_tree_visitor.rb", VISITOR)
+        .write("app/models/theme_asset.rb", ASSET)
+        .emit(BuildTarget::Ruby);
+    let own: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
+    assert!(own.is_empty(), "{own:?}");
+    let models = std::fs::read_to_string(emitted.join("app/models.rb")).expect("app/models.rb");
+    assert!(
+        models.contains("[:SectionTemplate, \"models/roundhouse_files/engines/widgets/app/liquid/lib/section_template\", false]")
+            || models.contains("[:SectionTemplate, \"models/section_template\", false]"),
+        "SectionTemplate is a top-level autoload:\n{}",
+        models.lines().filter(|l| l.contains("SectionTemplate") || l.contains("UNREACHED")).collect::<Vec<_>>().join("\n")
+    );
+    // The directory under the root is a top-level namespace too
+    // (`StaticAnalysis::ParseTreeVisitor`, read in a method body).
+    assert!(
+        models.contains("[:StaticAnalysis, "),
+        "StaticAnalysis is a top-level namespace:\n{}",
+        models.lines().filter(|l| l.contains("StaticAnalysis") || l.contains("ParseTreeVisitor")).collect::<Vec<_>>().join("\n")
+    );
+}
