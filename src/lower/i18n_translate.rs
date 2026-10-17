@@ -855,7 +855,7 @@ fn tree_call(span: Span, full: &str, options: Option<&Expr>) -> Expr {
     let hash_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
     let options = match options {
         Some(opts) => {
-            let mut opts = opts.clone();
+            let mut opts = positional_options(opts);
             if let ExprNode::Hash { kwargs, .. } = &mut *opts.node {
                 *kwargs = false;
             }
@@ -868,6 +868,17 @@ fn tree_call(span: Span, full: &str, options: Option<&Expr>) -> Expr {
     call
 }
 
+/// `**options` as the one positional Hash the runtime reads: spelled as keywords it would swallow the arguments that follow it.
+fn positional_options(opts: &Expr) -> Expr {
+    let mut opts = match &*opts.node {
+        ExprNode::KeywordSplat { value } => value.clone(),
+        _ => opts.clone(),
+    };
+    // An erased `**options` is written back as the splat; this one is a positional argument.
+    opts.decisions &= !(crate::expr::ERASED_KEYWORD_SPLAT | crate::expr::SOURCE_KEYWORD_ARG);
+    opts
+}
+
 fn runtime_call(span: Span, args: &[Expr], catalog: &Catalog, site: Site<'_>) -> Expr {
     RUNTIME_SITES.with(|r| {
         let mut r = r.borrow_mut();
@@ -876,7 +887,7 @@ fn runtime_call(span: Span, args: &[Expr], catalog: &Catalog, site: Site<'_>) ->
     });
     let options = match args.get(1) {
         Some(opts) => {
-            let mut opts = opts.clone();
+            let mut opts = positional_options(opts);
             // Left as keywords the hash would swallow the arguments that follow it.
             if let ExprNode::Hash { kwargs, .. } = &mut *opts.node {
                 *kwargs = false;
