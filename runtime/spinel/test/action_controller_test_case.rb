@@ -181,7 +181,7 @@ module ActionController
         begin
           # The lowered dispatcher's `case` is over Symbols (a router's
           # `matched.action`), where Rails' `process` takes the String.
-          controller.process_action(action.to_sym)
+          ::RequestDispatch.with_request_pod(merged, request) { controller.process_action(action.to_sym) }
         ensure
           finish_process(controller, request, xhr)
         end

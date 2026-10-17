@@ -1653,6 +1653,46 @@ module ActionCable
 end
 
 module RequestDispatch
+  # The pod a request runs in, selected the way Core's test environment
+  # selects it. Natively `ProcessWithNoPodSelected` unselects every pod
+  # around a test request and the mock sorting-hat router
+  # (`Podding::SortingHat::Router`, prepended to the controllers by
+  # config/environments/test.rb) routes it again from the route's
+  # `routing_method` annotation: the shop's `ShopRoute`, found by a numeric
+  # `shop_id`, `shop` or `id` parameter or by the
+  # request's host, headers
+  # `Podding::SortingHat::SelectorMiddleware` reads to select the pod
+  # (`ApplicationController#raise_if_pod_not_selected` raises
+  # `ShopMissingError` for a request that arrives with none). The route
+  # annotations are not carried into the emitted tree, so the shop is
+  # found by those two rules, parameters first. DIVERGENCE: a route that
+  # natively routes some other way (`main_pod`, a pod parameter) is routed
+  # by whichever rule finds a shop, and one that finds none runs as it
+  # came. A tree without the sorting hat or ShopRoute runs the block as is.
+  def self.with_request_pod(parameters, request, &block)
+    return block.call unless defined?(::Podding::SortingHat::SelectorMiddleware) && defined?(::ShopRoute)
+    shop_route = nil
+    ["shop_id", "shop", "id"].each do |key|
+      value = parameters[key]
+      if value.is_a?(Integer) || (value.is_a?(String) && value.match?(/\A(\d|[1-9]\d*)\z/))
+        shop_route = ::ShopRoute.find_by(shop_id: Integer(value))
+        break
+      end
+    end
+    host = request.host
+    shop_route = ::ShopRoute.find_by(host: host.to_s.downcase) if shop_route.nil? && host
+    return block.call if shop_route.nil?
+    selector = ::Podding::SortingHat::SelectorMiddleware
+    headers = {
+      selector::SECTION_HEADER => nil,
+      selector::POD_ID_HEADER => shop_route.pod_id,
+      selector::SHOP_ID_HEADER => shop_route.shop_id,
+    }
+    result = nil
+    selector.new(proc { result = block.call }).call(request.env.merge(headers))
+    result
+  end
+
   # NO `include ActionView` / `include ActionDispatch` here, though it
   # would shorten the two references below. Including a namespace makes
   # every class nested in it resolve as a BARE constant inside every
@@ -2044,7 +2084,7 @@ module RequestDispatch
       Db.query_cache_begin unless cached
       Db.read_snapshot_begin if snapshot
       begin
-        controller.process_action(matched.action)
+        RequestDispatch.with_request_pod(merged, controller.request) { controller.process_action(matched.action) }
       ensure
         Db.read_snapshot_end if snapshot
         Db.query_cache_end unless cached
@@ -2055,7 +2095,7 @@ module RequestDispatch
         Db.query_cache_begin unless cached
         Db.read_snapshot_begin if snapshot
         begin
-          controller.process_action(matched.action)
+          RequestDispatch.with_request_pod(merged, controller.request) { controller.process_action(matched.action) }
         ensure
           Db.read_snapshot_end if snapshot
           Db.query_cache_end unless cached
