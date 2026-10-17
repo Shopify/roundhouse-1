@@ -2429,7 +2429,9 @@ fn push_user_methods(
             }
             continue;
         }
-        methods.push(method.clone());
+        let mut source = method.clone();
+        validations::point_valid_super_at_base(&mut source, methods);
+        methods.push(source);
         selected_source_methods.insert(method.name_span);
     }
 }

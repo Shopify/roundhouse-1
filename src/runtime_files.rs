@@ -56,7 +56,10 @@ fn under(dir: &str) -> impl Iterator<Item = (&'static str, &'static str)> {
 /// and its test helper requires (project.rs `apply_postgres_bootstrap`):
 /// Rubydex indexes them for apps that carry that runtime
 /// (`App::carries_postgresql_runtime`), beside `ruby_sources`.
-pub(crate) const POSTGRESQL_TEST_PORTS: &[&str] = &["runtime/spinel/cruby/test/active_record_test_fixtures.rb"];
+pub(crate) const POSTGRESQL_TEST_PORTS: &[&str] = &[
+    "runtime/spinel/cruby/test/active_record_test_fixtures.rb",
+    "runtime/spinel/cruby/test/action_dispatch_request_encoder.rb",
+];
 
 pub(crate) fn postgresql_test_ruby_sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     FILES

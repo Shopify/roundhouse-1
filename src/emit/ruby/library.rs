@@ -16356,6 +16356,16 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
     for ancestor in app_library_ancestors(lc, app) {
         methods.extend(provided(ancestor));
     }
+    // `ActiveModel::Translation` (`human_attribute_name`, which
+    // `errors.full_messages` asks of the class) is in the validations port,
+    // which the PostgreSQL tree carries where app code names it
+    // (`project::active_model_ports_carried`) and which no gated name
+    // lists. Core's BulkOutputCollector extends it beside Naming.
+    let validations_port_extend = |name: &str| {
+        name.trim_start_matches("::") == "ActiveModel::Translation"
+            && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            && !app.library_classes.iter().any(|own| own.name.0.as_str() == "ActiveModel::Translation")
+    };
     let port_extend = |call: &Expr| -> bool {
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return false };
         method.as_str() == "extend"
@@ -16363,9 +16373,10 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
             && args.iter().all(|a| match &*a.node {
                 ExprNode::Const { path } => {
                     let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-                    port_module(&name)
-                        && crate::analyze::runtime_reads::ruby_family_runtime_names()
-                            .contains_key(name.trim_start_matches("::"))
+                    validations_port_extend(&name)
+                        || (port_module(&name)
+                            && crate::analyze::runtime_reads::ruby_family_runtime_names()
+                                .contains_key(name.trim_start_matches("::")))
                 }
                 _ => false,
             })

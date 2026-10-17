@@ -904,6 +904,60 @@ fn declares_before_validation(model: &Model) -> bool {
     })
 }
 
+/// The name the synthesized ActiveModel `valid?` goes by in a class whose
+/// own `valid?` calls `super`.
+pub(crate) const ACTIVE_MODEL_VALID_BASE: &str = "__roundhouse_active_model_valid?";
+
+/// The instance `valid?` the model body defines, when it calls `super`.
+fn source_valid_calls_super(model: &Model) -> bool {
+    model.body.iter().any(|item| {
+        matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "valid?"
+                && method.receiver == MethodReceiver::Instance
+                && contains_super(&method.body))
+    })
+}
+
+fn contains_super(expr: &Expr) -> bool {
+    let mut found = matches!(&*expr.node, ExprNode::Super { .. });
+    expr.node.for_each_child(&mut |child| found = found || contains_super(child));
+    found
+}
+
+/// Rewrites the `super` of the model's own `valid?` (`method`) to call the
+/// synthesized ActiveModel one (`ACTIVE_MODEL_VALID_BASE`, in `methods`),
+/// as Rails' `valid?` reaches `ActiveModel::Validations#valid?`. A no-op
+/// where the base was not synthesized (a class with a real superclass).
+pub(crate) fn point_valid_super_at_base(method: &mut MethodDef, methods: &[MethodDef]) {
+    if method.name.as_str() != "valid?" || method.receiver != MethodReceiver::Instance {
+        return;
+    }
+    let Some(base) = methods.iter().find(|m| m.name.as_str() == ACTIVE_MODEL_VALID_BASE) else { return };
+    let takes_context = !base.params.is_empty();
+    let own_context = method.params.first().filter(|p| !p.rest && !p.keyword).map(|p| p.name.clone());
+    fn rewrite(expr: &mut Expr, takes_context: bool, own_context: &Option<Symbol>) {
+        expr.node.for_each_child_mut(&mut |child| rewrite(child, takes_context, own_context));
+        let ExprNode::Super { args, block } = &*expr.node else { return };
+        let forwarded: Vec<Expr> = match args {
+            Some(args) => args.clone(),
+            None => own_context.iter().map(local_read).collect(),
+        };
+        let args = if takes_context { forwarded.into_iter().take(1).collect() } else { Vec::new() };
+        let parenthesized = !args.is_empty();
+        *expr = Expr::new(
+            expr.span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from(ACTIVE_MODEL_VALID_BASE),
+                args,
+                block: block.clone(),
+                parenthesized,
+            },
+        );
+    }
+    rewrite(&mut method.body, takes_context, &own_context);
+}
+
 /// `valid?` + `errors` mirroring the runtime Base implementations,
 /// for `include ActiveModel::Validations` classes with no superclass.
 pub(crate) fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Model) {
@@ -927,7 +981,18 @@ fn push_active_model_validation_surface_for(
     };
     let span = model.span;
     let errors_read = || Expr::new(span, ExprNode::Ivar { name: Symbol::from("errors") });
-    if !defines("valid?") {
+    // A `valid?` the source writes answers for the class, and its `super`
+    // reaches ActiveModel's: the class's own synthesized one stands under
+    // `ACTIVE_MODEL_VALID_BASE`, which `push_user_methods` points that
+    // `super` at (`point_valid_super_at_base`).
+    let valid_name = if !defines("valid?") {
+        Some("valid?")
+    } else if source_valid_calls_super(model) {
+        Some(ACTIVE_MODEL_VALID_BASE)
+    } else {
+        None
+    };
+    if let Some(valid_name) = valid_name {
         // `before_validation :sanitize_fields` runs INSIDE `valid?` for
         // an ActiveModel class (`ActiveModel::Validations::Callbacks`),
         // not on save — there is no save. The callback method is
@@ -1051,7 +1116,7 @@ fn push_active_model_validation_surface_for(
             unsupported_formals: None,
             has_anonymous_block: false,
             name_span: crate::span::Span::synthetic(),
-            name: Symbol::from("valid?"),
+            name: Symbol::from(valid_name),
             receiver: MethodReceiver::Instance,
             params,
             body,
