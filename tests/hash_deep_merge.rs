@@ -119,24 +119,42 @@ fn deep_merge_block_and_bang_forms_run_like_rails() {
     assert!(emitted.contains("ActiveSupport.deep_merge(left, right)"), "{emitted}");
 }
 
-#[test]
-fn deep_merge_with_an_untyped_argument_stays_unsupported() {
+fn deep_merge_errors(source: &str) -> Vec<String> {
     let (_, _, diagnostics) = emit_and_run::real_blog()
-        .write(
-            "app/models/hash_deep_merge_unsupported.rb",
-            "class HashDeepMergeUnsupported\n  def self.run(other)\n    left = { key: 1 }\n    left.deep_merge!(other)\n  end\nend\n",
-        )
+        .write("app/models/hash_deep_merge_unsupported.rb", source)
         .emit_with_app(roundhouse::project::BuildTarget::Ruby);
-    let errors: Vec<_> = diagnostics
+    diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
-        .filter(|diagnostic| {
-            matches!(
-                &diagnostic.kind,
-                roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
-                    if construct.as_str() == "Hash#deep_merge argument"
-            )
+        .filter_map(|diagnostic| match &diagnostic.kind {
+            roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                if construct.as_str().starts_with("Hash#deep_merge") =>
+            {
+                Some(construct.to_string())
+            }
+            _ => None,
         })
-        .collect();
-    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        .collect()
+}
+
+/// An argument known not to be a Hash is refused by name; one whose type is
+/// not known (an untyped parameter) is left to dispatch at run time.
+#[test]
+fn deep_merge_refuses_only_an_argument_known_not_to_be_a_hash() {
+    let untyped = "class HashDeepMergeUnsupported\n  def self.run(other)\n    left = { key: 1 }\n    left.deep_merge!(other)\n  end\nend\n";
+    assert!(deep_merge_errors(untyped).is_empty());
+    let string = "class HashDeepMergeUnsupported\n  def self.run\n    left = { key: 1 }\n    left.deep_merge!(\"x\")\n  end\nend\n";
+    assert_eq!(deep_merge_errors(string), ["Hash#deep_merge argument"]);
+}
+
+#[test]
+fn deep_merge_with_an_untyped_argument_runs_like_rails() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/hash_deep_merge_untyped.rb",
+            "class HashDeepMergeUntyped\n  def self.run(other)\n    left = { a: { b: 1 }, c: 1 }\n    left.deep_merge(other)\n  end\nend\n",
+        )
+        .run_ruby("p HashDeepMergeUntyped.run({ a: { d: 2 }, c: 3 })\n");
+    run.assert_passes();
+    assert_eq!(run.stdout.trim(), "{a: {b: 1, d: 2}, c: 3}", "{}", run.stdout);
 }

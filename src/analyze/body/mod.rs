@@ -3092,12 +3092,20 @@ impl<'a> BodyTyper<'a> {
                         "Hash#deep_merge arity",
                         "exactly one Hash argument is supported",
                     )),
+                    // An argument whose type is not known (an untyped parameter,
+                    // a union) is a Hash at run time as often as not: the call
+                    // stays as written and dispatches to the core_ext the
+                    // CRuby overlay reopens Hash with. Only an argument known
+                    // not to be a Hash is refused.
                     "deep_merge" | "deep_merge!"
-                        if !matches!(args.first().and_then(|arg| arg.ty.as_ref()), Some(Ty::Hash { .. })) =>
+                        if matches!(
+                            args.first().and_then(|arg| arg.ty.as_ref()),
+                            Some(Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Nil | Ty::Array { .. })
+                        ) =>
                     {
                         Some((
                             "Hash#deep_merge argument",
-                            "the supported form requires a statically typed Hash argument",
+                            "the argument is statically known not to be a Hash",
                         ))
                     }
                     _ => None,
