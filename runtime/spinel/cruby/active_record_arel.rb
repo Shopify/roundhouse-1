@@ -329,6 +329,11 @@ module ActiveRecord
         false
       end
 
+      # No model, so no `alias_attribute`: the key is the column.
+      def _attribute_name(name)
+        name
+      end
+
       def _attribute_for_database(name, value)
         column = uuid_column(name)
         column.nil? ? value : column.cast_type.serialize(value)
