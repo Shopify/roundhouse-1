@@ -9,7 +9,8 @@ require "set"
 require_relative "action_mailer"
 # Only an app whose tree carries Rescuable (the emit leaves it out of one
 # that rescues nothing) gets the handler registry.
-require_relative "active_support_rescuable" if File.exist?(File.join(__dir__, "active_support_rescuable.rb"))
+rescuable = File.join(__dir__, "active_support_rescuable.rb")
+require rescuable if File.exist?(rescuable)
 
 module ActionMailer
   class Base
