@@ -1293,6 +1293,11 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         if model.claimed_body_calls.contains(&expr.span) {
             continue;
         }
+        // A project extension's attribute macro: analysis refuses the
+        // declaration itself, once (`analyze::diagnostics`).
+        if matches!(&*expr.node, ExprNode::Send { recv: None, .. }) && app.extensions.attribute_macro(name).is_some() {
+            continue;
+        }
         let d = Diagnostic::unsupported(
             expr.span,
             None,
