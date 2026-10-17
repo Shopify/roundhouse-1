@@ -114,6 +114,47 @@ pub(super) fn sorbet_binds_class_object(node: &Node<'_>) -> bool {
         })
 }
 
+/// Whether the type a `#: self as Type` comment writes is a class
+/// object: `singleton(X)`, or a union of them, with or without
+/// parentheses (Core's `config/environments/test.rb` writes
+/// `(singleton(ActionController::Base) | singleton(ActionController::API))`
+/// above `prepend` and `include`, which only a class-object `self` takes
+/// as a mixin).
+fn binds_class_objects(written: &str) -> bool {
+    let mut ty = written.trim();
+    // Outer parentheses that enclose the whole type.
+    while let Some(inner) = ty.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        let mut depth = 0i32;
+        let encloses = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        });
+        if !encloses || depth != 0 {
+            break;
+        }
+        ty = inner.trim();
+    }
+    let mut arms = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (at, c) in ty.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '|' if depth == 0 => {
+                arms.push(&ty[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    arms.push(&ty[start..]);
+    arms.iter().all(|arm| arm.trim().starts_with("singleton("))
+}
+
 /// The `#: self as Type` comment directly above the statement starting
 /// at byte `start`, as the self binding it declares, spanning the
 /// comment. RBS inline's spelling of `T.bind(self, Type)`: written on
@@ -151,7 +192,7 @@ pub(super) fn leading_self_binding(file: &str, start: usize) -> Option<Expr> {
         start: at as u32,
         end: (at + len) as u32,
     };
-    let class_object = written.starts_with("singleton(");
+    let class_object = binds_class_objects(&written);
     let ty = rbs_type_with_vars(&written, &type_vars_at(file, start));
     let binding = bind_self(ascribe(Expr::new(span, ExprNode::SelfRef), ty), class_object);
     crate::expr::is_self_binding(&binding).then_some(binding)
@@ -447,4 +488,20 @@ fn type_param_names(sig: &str) -> Option<Vec<String>> {
         }
     }
     Some(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binds_class_objects;
+
+    #[test]
+    fn a_self_binding_of_class_objects_is_one_whatever_its_spelling() {
+        assert!(binds_class_objects("singleton(ActionController::Base)"));
+        assert!(binds_class_objects("singleton(A) | singleton(B)"));
+        assert!(binds_class_objects("(singleton(ActionController::Base) | singleton(ActionController::API))"));
+        assert!(!binds_class_objects("ActionController::Base"));
+        assert!(!binds_class_objects("(ActionController::Base | ActionController::API)"));
+        assert!(!binds_class_objects("singleton(A) | B"));
+        assert!(!binds_class_objects("(singleton(A)) | (B)"));
+    }
 }
