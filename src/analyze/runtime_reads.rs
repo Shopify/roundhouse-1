@@ -766,7 +766,12 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
             if let ExprNode::Const { path } = &*recv.node {
                 if !class_name(&recv.ty).is_some_and(|name| gated(name)) {
                     let receiver = written(path);
-                    let needs = class_name(&expr.ty).filter(|name| gated(name)).map(str::to_string).or_else(|| {
+                    // `Rails.env` is typed as the inquirer, but every target reads
+                    // the environment's name as the String it compares
+                    // (`lower::inquiry`): no class of the port is asked for. The
+                    // generated static-file headers program reads it on every target.
+                    let rails_env = receiver == "Rails" && method.as_str() == "env";
+                    let needs = class_name(&expr.ty).filter(|name| !rails_env && gated(name)).map(str::to_string).or_else(|| {
                         UNTYPED_SINGLETONS.iter()
                             .find(|(r, m, _)| receiver == *r && *m == method.as_str())
                             .map(|(_, _, name)| name.to_string())

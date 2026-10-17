@@ -225,9 +225,15 @@ fn local_value(value: &Expr, locals: &[(Symbol, Expr)]) -> Option<Expr> {
 pub(crate) fn push_typed_store_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
-    demanded: &crate::det::HashSet<Symbol>,
+    models: &[Model],
 ) {
     let stores = typed_store_decls(&model.body);
+    if stores.is_empty() {
+        return;
+    }
+    // Walked only for a model that declares a store: the shared body names
+    // stay unbuilt for apps without one.
+    let demanded = super::model_to_library::schema::demanded_names(models);
     for (col, attrs) in &stores {
         push_store_hash_methods(methods, model, col, attrs);
         for a in attrs {
@@ -319,7 +325,7 @@ pub(crate) fn push_typed_store_methods(
                 AccessorKind::Method,
                 true,
             );
-            push_dirty_methods(methods, model, col, a, demanded);
+            push_dirty_methods(methods, model, col, a, &demanded);
         }
     }
 }
