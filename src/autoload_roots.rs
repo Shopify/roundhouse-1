@@ -59,6 +59,12 @@ impl<'a> AutoloadRoots<'a> {
             || self.engine_roots.contains(dir.join("/").as_str())
     }
 
+    /// Is `rel` (relative to the app root) under a directory an engine's
+    /// `paths.add(…, eager_load: true)` roots?
+    pub fn is_engine_root_of(&self, rel: &str) -> bool {
+        self.engine_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/")))
+    }
+
     /// A directory a Zeitwerk loader collapses adds no namespace
     /// (`ingest::zeitwerk`): a source's path is read for its constant
     /// without those directories.

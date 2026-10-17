@@ -9511,6 +9511,13 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         if loader_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/"))) {
             return false;
         }
+        // An engine's `paths.add("app/liquid/lib", eager_load: true)` root is
+        // an autoload root, not the `lib/` of the lockfile's `liquid` gem its
+        // path reads as (`<gem>/lib`): Core's SectionTemplate and
+        // BaseTemplate there are autoloaded.
+        if roots.is_engine_root_of(rel) {
+            return false;
+        }
         gem_lib(source).is_some_and(|lib| !self_loading_libs.contains(&lib))
     };
     // Each source's answer, once: asked per source per model anchor,
