@@ -150,11 +150,7 @@ fn splat_base_to_hash(expr: &mut Expr) {
     if method.as_str() != "merge" {
         return;
     }
-    let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return };
-    if matches!(
-        id.0.as_str(),
-        "Hash" | "HashWithIndifferentAccess" | "ActiveSupport::HashWithIndifferentAccess" | "ActionController::Parameters"
-    ) {
+    if !recv.ty.as_ref().is_some_and(splatted_object) {
         return;
     }
     let span = recv.span;
@@ -165,6 +161,20 @@ fn splat_base_to_hash(expr: &mut Expr) {
     );
     to_hash.ty = Some(Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) });
     *recv = to_hash;
+}
+
+/// An object type a `**` reads through `to_hash`: a class that is not a
+/// Hash, or a union of them (a block parameter the body reassigns from a
+/// `new` of its subclass is typed `Base | Sub`; neither side has `merge`).
+fn splatted_object(ty: &Ty) -> bool {
+    match ty {
+        Ty::Class { id, .. } => !matches!(
+            id.0.as_str(),
+            "Hash" | "HashWithIndifferentAccess" | "ActiveSupport::HashWithIndifferentAccess" | "ActionController::Parameters"
+        ),
+        Ty::Union { variants } => !variants.is_empty() && variants.iter().all(splatted_object),
+        _ => false,
+    }
 }
 
 // Not a receiver of any other class (an app's own `with_indifferent_access`,

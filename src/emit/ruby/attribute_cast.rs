@@ -660,6 +660,18 @@ fn public_attributes(lc: &mut LibraryClass, model: &Model, table: &Table) {
     }
     let mut method = lc.methods[at].clone();
     lc.methods[at].name = Symbol::from("_attribute_snapshot");
+    // The baseline dirty tracking compares: stored text that is not JSON
+    // stays that text (Rails decodes lazily, so only the reader raises).
+    if let ExprNode::Hash { entries, .. } = &mut *lc.methods[at].body.node {
+        for (_, value) in entries.iter_mut() {
+            if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *value.node
+                && method.as_str() == "load"
+                && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "RoundhouseJsonColumn")
+            {
+                *method = Symbol::from("snapshot");
+            }
+        }
+    }
     let ty = method.body.ty.clone();
     method.body = sp(ExprNode::Hash { entries: public, kwargs: false });
     method.body.ty = ty;

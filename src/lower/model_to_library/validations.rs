@@ -1450,7 +1450,14 @@ fn validation_rule_to_calls(
     text: &ErrorText<'_>,
 ) -> Vec<Expr> {
     match rule {
-        ValidationRule::Presence => vec![inline_presence_check(attr, attr_ty, value, text)],
+        // A registered attribute type's slot holds the type's value (an
+        // `attribute :batch_id, :suid` holds a `Shopify::Uuid`, which has no
+        // `empty?`), not the String its column stores: Rails' `blank?`
+        // asks only what answers `empty?`.
+        ValidationRule::Presence => {
+            let slot_ty = attr_ty.filter(|_| !super::markers::has_registered_attribute_type(model, attr));
+            vec![inline_presence_check(attr, slot_ty, value, text)]
+        }
         ValidationRule::Absence => vec![inline_absence_check(value, text)],
         ValidationRule::Length { min, max, allow_nil, .. } => inline_length_check(
             value,

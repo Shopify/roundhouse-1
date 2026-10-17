@@ -537,6 +537,16 @@ pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Symbol
     out
 }
 
+/// `attribute :name, :custom_type` naming a type an app registers
+/// (`ActiveRecord::Type.register(:suid, ...)`) rather than one of Rails'
+/// own: the slot holds what that type casts to (a `Shopify::Uuid`), not
+/// what the column stores.
+pub(crate) fn has_registered_attribute_type(model: &Model, attr: &Symbol) -> bool {
+    const BUILT_IN: &[&str] =
+        &["integer", "big_integer", "string", "text", "boolean", "float", "binary", "immutable_string", "value", "time", "json"];
+    attribute_api_decls(&model.body).iter().any(|(name, ty)| name == attr && !BUILT_IN.contains(&ty.as_str()))
+}
+
 /// `attribute :name, :type, default: <literal>` declarations of a model
 /// whose table has no column `name`: typed virtual attributes that read
 /// their default until one is assigned (Core's `attribute

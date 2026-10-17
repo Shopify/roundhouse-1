@@ -17,6 +17,15 @@ module RoundhouseJsonColumn
     JSON.parse(serialized)
   end
 
+  # The dirty-tracking baseline: stored text that is not JSON hydrates
+  # as that text, as Rails' lazily decoded attribute does, so only the
+  # reader raises (an unrelated update leaves the column as stored).
+  def self.snapshot(serialized)
+    load(serialized)
+  rescue JSON::ParserError
+    serialized
+  end
+
   def self.dump(value)
     return nil if value.nil?
     JSON.generate(value)
