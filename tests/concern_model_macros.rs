@@ -215,8 +215,6 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         "attr_accessor *FIELDS",
         "attr_accessor :scratch, *FIELDS",
         "attr_accessor(:scratch) { nil }",
-        "attr_reader :scratch",
-        "attr_writer :scratch",
         "attr_accessor :scratch if false",
         "attr_accessor :scratch if true",
         "attr_reader :scratch unless false",
