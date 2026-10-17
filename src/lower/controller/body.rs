@@ -1006,6 +1006,8 @@ const RESPONSE_TERMINALS: &[&str] = &[
     "send_data",
     "send_file",
     "render_inertia_json",
+    // responders: GET renders, POST renders 201, the rest answer 204.
+    "respond_with",
 ];
 
 /// Rails' HTTP auth helpers that render the 401 challenge when the

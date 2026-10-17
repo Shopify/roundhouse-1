@@ -514,12 +514,24 @@ module ActiveRecord
     def association_key_predicates(reflection, val, note)
       pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
       return super if pairs.nil?
-      return composite_list_predicates(pairs, val.to_a) if val.is_a?(Array) || val.is_a?(Relation)
+      polymorphic = reflection.polymorphic?
+      if val.is_a?(Array) || val.is_a?(Relation)
+        raise NotImplementedError, "roundhouse: where(#{reflection.name}: [records]) over the polymorphic composite " \
+          "key #{pairs.map { |pair| pair[0] }.inspect} is not supported" if polymorphic
+        return composite_list_predicates(pairs, val.to_a)
+      end
       raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
         "#{pairs.map { |pair| pair[0] }.inspect} takes a record, a list of records or nil" unless val.nil? || val.is_a?(Base)
-      pairs.map do |pair|
+      out = pairs.map do |pair|
         [pair[0], column_predicate(pair[0], val.nil? ? nil : val.public_send(pair[1]), note)]
       end
+      # A polymorphic key names its type too (`ledger_type = 'Payments::Account'`),
+      # which also seeds the type of a record built through the relation.
+      if polymorphic
+        type = reflection.foreign_type.to_s
+        out.unshift([type, column_predicate(type, val.nil? ? nil : val.class.polymorphic_name, note)])
+      end
+      out
     end
 
     # A list of records over a composite key is Rails' tuple match: one
@@ -534,4 +546,23 @@ module ActiveRecord
     end
   end
   Relation.prepend(CompositeAssociationKeyPredicates)
+end
+
+module ActiveRecord
+  # Rails' `sanitize_forbidden_attributes` on a `where` condition: an
+  # `ActionController::Parameters` (anything answering `permitted?`) is
+  # unwrapped to its Hash when permitted and refused with
+  # `ForbiddenAttributesError` when not, so
+  # `milestones.where(milestone_params.slice(:name, :value))` filters by
+  # column rather than reaching the raw-SQL path as the object's `to_s`.
+  module RelationPermittedParametersCondition
+    def where(condition = nil, *args)
+      if !condition.nil? && condition.respond_to?(:permitted?)
+        raise ActiveModel::ForbiddenAttributesError unless condition.permitted?
+        condition = condition.to_h
+      end
+      super(condition, *args)
+    end
+  end
+  Relation.prepend(RelationPermittedParametersCondition)
 end

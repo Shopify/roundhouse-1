@@ -107,6 +107,7 @@ module Rack
 end
 
 class ActionResponse
+  attr_accessor request: ActionDispatch::Request?
   def status: () -> Integer
   def body: () -> String
   def location: () -> String?

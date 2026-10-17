@@ -805,6 +805,10 @@ class ActionResponse
   # same key normalization every other read goes through.
   attr_reader :status, :body, :location, :flash, :cookies, :content_type
 
+  # Rails' `TestResponse#request`: the request this response answered
+  # (set by the controller-test `process`; nil for a bare response).
+  attr_accessor :request
+
   def initialize(status:, body:, location:, flash:, cookies:, content_type: "text/html; charset=utf-8",
                  cache_control_max_age: 0, cache_control_public: false, cache_control_store: nil, headers: {})
     @status   = status
