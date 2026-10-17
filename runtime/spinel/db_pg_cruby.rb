@@ -1465,6 +1465,12 @@ module Db
     value.nil? ? "NULL" : escape_string(value)
   end
 
+  # A NOT NULL date/time column's INSERT value: a blank slot (nothing set
+  # it) is the column's DEFAULT, as Rails' partial insert leaves it out.
+  def self.escape_temporal(value)
+    value.to_s.empty? ? "DEFAULT" : escape_string(value)
+  end
+
   def self.escape_int_opt(value)
     value.nil? ? "NULL" : escape_int(value)
   end

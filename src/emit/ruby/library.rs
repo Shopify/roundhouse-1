@@ -21770,6 +21770,11 @@ enum PreloadKind {
 /// The composite-key `belongs_to` associations [`preload_targets`] leaves to
 /// the lazy reader: they still need the `_preload_<name>` setter.
 fn composite_belongs_to_setters(model: &crate::dialect::Model, app: &App) -> Vec<String> {
+    composite_belongs_to(model, app).into_iter().map(|(name, _)| name).collect()
+}
+
+/// [`composite_belongs_to_setters`] with each association's target class.
+fn composite_belongs_to(model: &crate::dialect::Model, app: &App) -> Vec<(String, String)> {
     use crate::dialect::Association;
 
     model
@@ -21778,7 +21783,7 @@ fn composite_belongs_to_setters(model: &crate::dialect::Model, app: &App) -> Vec
         .filter(|assoc| crate::lower::assoc_primary_key::unsupported_reason(model, &app.models, assoc).is_none())
         .filter_map(|assoc| match assoc {
             Association::BelongsTo { name, target, polymorphic: false, .. } if app.models.iter().any(|m| &m.name == target) => {
-                Some(name.as_str().to_string())
+                Some((name.as_str().to_string(), target.0.as_str().to_string()))
             }
             _ => None,
         })
@@ -22315,14 +22320,25 @@ end
     // through silently (lazy readers stay correct — mirrors what Rails
     // does for anything `includes` didn't name).
     src.push_str("\ndef self._preload_dispatch(records, name, nested)\n");
-    if targets.is_empty() && subclass_view {
+    // A composite-key belongs_to has no batch loader, but `includes` must
+    // still leave it loaded (`association(:x).loaded?`, which Core's entity
+    // conversion reads to tell an unloaded attribute from a nil one): each
+    // record's reader applies every key column and seats the cache.
+    let composites = composite_belongs_to(model, app);
+    if targets.is_empty() && composites.is_empty() && subclass_view {
         src.push_str("  super\nend\n");
         return src;
     }
-    if targets.is_empty() {
+    if targets.is_empty() && composites.is_empty() {
         src.push_str("  nil\nend\n");
     } else {
         src.push_str("  case name\n");
+        for (name, target) in &composites {
+            let _ = write!(
+                src,
+                "  when :{name}\n    loaded = []\n    records.each do |r|\n      found = r.{name}\n      loaded << found unless found.nil?\n    end\n    {target}.preload_associations(loaded, [nested]) unless nested.nil?\n"
+            );
+        }
         for (name, kind) in &targets {
             let target = match kind {
                 PreloadKind::BelongsTo { target, .. } => Some(target.as_str()),
