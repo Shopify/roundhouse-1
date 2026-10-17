@@ -4386,7 +4386,7 @@ fn ruby_family_files(
     // header; tests/action_dispatch_http_url_runtime.rs holds it to
     // native actionpack): carried where app code names the module, as
     // Core's WebUrlHelpersFactory does. gem_facades.rb requires it.
-    let carries_http_url = carries_named(&files, &["ActionDispatch::Http::URL"]);
+    let carries_http_url = carries_named(&files, &["ActionDispatch::Http::URL", "ActionDispatch::Journey"]);
     if carries_http_url {
         files.push((
             "runtime/action_dispatch_http_url.rb".to_string(),

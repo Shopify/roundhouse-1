@@ -55,7 +55,11 @@ end
 "##;
 
 fn probe_app(postgres: bool) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rh_http_url_{}_{postgres}", std::process::id()));
+    probe_app_in("", postgres)
+}
+
+fn probe_app_in(tag: &str, postgres: bool) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rh_http_url{tag}_{}_{postgres}", std::process::id()));
     let mut files = vec![
         (
             "app/controllers/application_controller.rb",
@@ -193,6 +197,56 @@ fn the_postgresql_ruby_tree_carries_the_port() {
         source("runtime/gem_facades.rb").contains("require_relative \"action_dispatch_http_url\""),
         "{}",
         source("runtime/gem_facades.rb")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Core's StorefrontUrlHelpers parses a route pattern with Journey and
+/// fills it from a params hash; the Journey port answers like actionpack.
+#[test]
+fn journey_route_patterns_parse_and_format() {
+    const JOURNEY_MODEL: &str = r##"class Probe < ApplicationRecord
+  def self.generate(pattern, params)
+    ast = ActionDispatch::Journey::Ast.new(ActionDispatch::Journey::Parser.parse(pattern), false)
+    formatter = ActionDispatch::Journey::Visitors::FormatBuilder.new.accept(ast.root)
+    route_params = params.dup.extract!(*ast.path_params)
+    [ast.path_params.map(&:to_s).join(","), formatter.evaluate(route_params), ast.root.to_s].join(" ")
+  end
+end
+"##;
+    let dir = probe_app_in("_journey", false);
+    std::fs::write(dir.join("app/models/probe.rb"), JOURNEY_MODEL).unwrap();
+    let (ok, text) = run(&dir, &["check"]);
+    assert!(ok, "check refused Journey: {text}");
+    assert!(
+        !text.contains("constant not supported") && !text.contains("no known method"),
+        "{text}"
+    );
+    let (ok, text) = run(&dir, &["--target", "ruby"]);
+    assert!(ok, "the ruby tree refused Journey: {text}");
+    let emitted = dir.join("emitted-ruby");
+    let script = r#"require File.expand_path("main", Dir.pwd)
+Main.configure_default_adapter!
+puts Probe.generate("(/:shop_route_locale)/account/login(/:legacy_cart_param)(.:format)", { shop_route_locale: "en", format: "json", extra: 1 })
+puts Probe.generate("(/:l)/gift_cards/:shop_id(.:format)/:token", { shop_id: 1, token: "a b" })
+puts Probe.generate("/x/:id", {}).inspect
+"#;
+    let out = Command::new("ruby")
+        .args(["-e", script])
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "shop_route_locale,legacy_cart_param,format /en/account/login.json (/:shop_route_locale)/account/login(/:legacy_cart_param)(.:format)\n\
+         l,shop_id,format,token /gift_cards/1/a%20b (/:l)/gift_cards/:shop_id(.:format)/:token\n\
+         \"id  /x/:id\"\n"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

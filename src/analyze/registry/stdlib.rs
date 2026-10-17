@@ -237,6 +237,25 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActionDispatch::Journey::Router::Utils", &[
         ("escape_path", Ty::Str), ("escape_segment", Ty::Str), ("escape_fragment", Ty::Str),
     ], &[]);
+    // The route-pattern half of Journey (the same file): a pattern parsed
+    // to a node tree, its `Ast`, and the `Format` a `FormatBuilder` makes
+    // of it. The nodes are only walked, so they stay untyped.
+    let journey_format = class("ActionDispatch::Journey::Format");
+    register_stdlib_class(classes, "ActionDispatch::Journey::Parser", &[
+        ("parse", Ty::Untyped), ("new", class("ActionDispatch::Journey::Parser")),
+    ], &[("parse", Ty::Untyped)]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Ast", &[
+        ("new", class("ActionDispatch::Journey::Ast")),
+    ], &[
+        ("root", Ty::Untyped), ("tree", Ty::Untyped),
+        ("path_params", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
+        ("names", str_arr.clone()), ("terminals", Ty::Untyped), ("wildcard_options", Ty::Untyped),
+        ("glob?", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Visitors::FormatBuilder", &[
+        ("new", class("ActionDispatch::Journey::Visitors::FormatBuilder")),
+    ], &[("accept", journey_format)]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Format", &[], &[("evaluate", Ty::Str)]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");
