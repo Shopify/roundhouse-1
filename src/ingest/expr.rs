@@ -1300,7 +1300,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     // One local per site: a shared name would hold a
                     // different type at each `&.` in a method, and a
                     // local that does is polymorphic on spinel.
-                    let temp = Symbol::from(format!("__safe_nav{}", r.span.start));
+                    let temp = safe_nav_temp(&r);
                     let read = Expr::new(
                         r.span,
                         ExprNode::Var { id: crate::ident::VarId(0), name: temp.clone() },
@@ -4555,7 +4555,7 @@ fn guard_safe_nav_write(safe: bool, recv: Expr, build: impl FnOnce(Expr) -> Expr
     let (left, target) = if is_plain_read(&recv) {
         (recv.clone(), recv)
     } else {
-        let temp = Symbol::from(format!("__safe_nav{}", recv.span.start));
+        let temp = safe_nav_temp(&recv);
         let read = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: temp.clone() });
         let bound = Expr::new(
             span,
@@ -4571,6 +4571,32 @@ fn guard_safe_nav_write(safe: bool, recv: Expr, build: impl FnOnce(Expr) -> Expr
         surface: crate::expr::BoolOpSurface::Symbol,
         left,
         right: Expr::new(span, build(target)),
+    }
+}
+
+/// The local a `&.` binds its receiver to, one per site.
+///
+/// A chain's outer receiver starts where its inner one does
+/// (`a.b&.c(x)&.d`: both begin at `a`), so the start offset alone gave
+/// both `&.` the same local; the outer then holds an Integer where the
+/// inner held a String, and the typer reads the first. Core's
+/// `country&.casecmp(code)&.zero?` came out as `__safe_nav == "zero"`
+/// through the inquiry fold. A receiver that already binds the
+/// start-keyed name takes the end offset too.
+fn safe_nav_temp(recv: &Expr) -> Symbol {
+    fn binds(e: &Expr, name: &Symbol) -> bool {
+        if matches!(&*e.node, ExprNode::Var { name: n, .. } if n == name) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || binds(c, name));
+        found
+    }
+    let temp = Symbol::from(format!("__safe_nav{}", recv.span.start));
+    if binds(recv, &temp) {
+        Symbol::from(format!("__safe_nav{}_{}", recv.span.start, recv.span.end))
+    } else {
+        temp
     }
 }
 
