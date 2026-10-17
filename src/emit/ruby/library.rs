@@ -5722,6 +5722,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             m.body = through_reader_body(
                 name,
                 target,
+                roots_target(&lc.name, target),
                 &join_sql,
                 &where_sql,
                 &edge.owner_bind(),
@@ -5757,6 +5758,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
             let relation = through_relation_chain(
                 target,
+                roots_target(&lc.name, target),
                 &joins.join(" "),
                 &edge.owner_condition(),
                 &edge.owner_bind(),
@@ -5783,6 +5785,14 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             }
         }
     }
+}
+
+/// A top-level target read from a namespaced owner is written rooted:
+/// the target is the resolved class (Rails' `class_name: "::Province"`),
+/// where a bare `Province` in `Delivery::Zone` is the lexical
+/// `Delivery::Province` when the namespace declares one.
+fn roots_target(owner: &ClassId, target: &ClassId) -> bool {
+    owner.0.as_str().contains("::") && !target.0.as_str().contains("::")
 }
 
 /// Where a `through:` chain ties back to its owner.
@@ -6047,6 +6057,7 @@ fn through_owner_type_predicate(table: &str, as_interface: &Option<Symbol>, owne
 fn through_reader_body(
     name: &Symbol,
     target: &ClassId,
+    rooted: bool,
     join_sql: &str,
     where_sql: &str,
     bind: &Symbol,
@@ -6054,7 +6065,7 @@ fn through_reader_body(
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
-    let chain = through_relation_chain(target, join_sql, where_sql, bind, hop_scopes, assoc_scope);
+    let chain = through_relation_chain(target, rooted, join_sql, where_sql, bind, hop_scopes, assoc_scope);
     // Last in the chain, after any scope graft: the scope's conditions
     // belong to the QUERY, and this hands the finished relation the
     // records an eager load already fetched.
@@ -6083,6 +6094,7 @@ fn through_reader_body(
 /// `through_reader_body`).
 fn through_relation_chain(
     target: &ClassId,
+    rooted: bool,
     join_sql: &str,
     where_sql: &str,
     bind: &Symbol,
@@ -6093,7 +6105,11 @@ fn through_relation_chain(
     let target_const = Expr::new(
         span(),
         ExprNode::Const {
-            path: target.0.as_str().split("::").map(Symbol::from).collect(),
+            path: rooted
+                .then(|| Symbol::from(""))
+                .into_iter()
+                .chain(target.0.as_str().split("::").map(Symbol::from))
+                .collect(),
         },
     );
     let seed = Expr::new(

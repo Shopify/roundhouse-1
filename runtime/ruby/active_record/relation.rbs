@@ -246,6 +246,7 @@ module ActiveRecord
     def merge!: (Relation other) -> Relation
     def where_clauses: () -> Array[String]
     def join_clauses: () -> Array[String]
+    def eager_join?: (String frag) -> bool
     def order_clauses: () -> Array[String]
     def cast_schema_date: (untyped value) -> untyped
     def cast_schema_value: (untyped value, Symbol column) -> untyped
@@ -484,6 +485,7 @@ def nested_column_name: (untyped owner, untyped col) -> String
     def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
     def nested_hash?: (String | Symbol key, Hash[untyped, untyped] val) -> bool
     def nested_table: (String | Symbol key) -> [String, untyped]
+    def nested_conditions: (String table, untyped owner, Hash[String | Symbol, untyped] conditions, Array[String] parts, Array[untyped] named) -> void
     def associated_model_by_table: (String name) -> untyped
     def tuple_predicate: (Array[untyped] columns, untyped val) -> String
     def hash_conditions: (Hash[String | Symbol, untyped] hash, ?bool note) -> String

@@ -516,8 +516,7 @@ module ActiveRecord
       return super if pairs.nil?
       polymorphic = reflection.polymorphic?
       if val.is_a?(Array) || val.is_a?(Relation)
-        raise NotImplementedError, "roundhouse: where(#{reflection.name}: [records]) over the polymorphic composite " \
-          "key #{pairs.map { |pair| pair[0] }.inspect} is not supported" if polymorphic
+        return polymorphic_composite_list_predicates(reflection, pairs, val.to_a, note) if polymorphic
         return composite_list_predicates(pairs, val.to_a)
       end
       raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
@@ -534,6 +533,19 @@ module ActiveRecord
       out
     end
 
+    # `where(ledger: [records])` over a polymorphic composite key: Rails'
+    # PolymorphicArrayValue groups the records by their class and matches
+    # each group by the type column and the key pairs, the groups ORed.
+    def polymorphic_composite_list_predicates(reflection, pairs, records, note)
+      type = reflection.foreign_type.to_s
+      groups = records.group_by { |record| record.class.polymorphic_name }.map do |name, group|
+        keys = composite_list_predicates(pairs, group)[0][1]
+        "(#{column_predicate(type, name, note)} AND #{keys})"
+      end
+      return [[pairs[0][0], "1=0"]] if groups.empty?
+      [[pairs[0][0], groups.length == 1 ? groups[0] : "(#{groups.join(" OR ")})"]]
+    end
+
     # A list of records over a composite key is Rails' tuple match: one
     # AND group of every key pair per record, ORed (an empty list matches
     # nothing).
@@ -546,6 +558,52 @@ module ActiveRecord
     end
   end
   Relation.prepend(CompositeAssociationKeyPredicates)
+
+  # `where(variants: { inventory_item_variants: { inventory_item_id: 1 } })`:
+  # a Hash value under a key that is no column of the nested model nests a
+  # further table (Rails' `associated_table` walking the hops), qualified by
+  # its own key and typed by the model of that hop. The dynamic walk lives
+  # here, outside the typed gate; the leaf conditions are the shared body's.
+  module RelationNestedHops
+    private
+
+    def nested_conditions(table, owner, conditions, parts, named)
+      return super unless conditions.any? { |col, v| v.is_a?(Hash) && nested_hop?(owner, col) }
+
+      conditions.each do |col, v|
+        if v.is_a?(Hash) && nested_hop?(owner, col)
+          inner, inner_owner = Relation.new(owner).send(:nested_table, col)
+          nested_conditions(inner, inner_owner, v, parts, named)
+        else
+          super(table, owner, { col => v }, parts, named)
+        end
+      end
+    end
+
+    def nested_hop?(owner, col)
+      owner.respond_to?(:schema_columns) && !owner.schema_columns.include?(owner._attribute_name(col.to_s).to_sym)
+    end
+  end
+  Relation.prepend(RelationNestedHops)
+
+  # Rails' `check_if_method_has_arguments!` drops blank order arguments
+  # (`compact_blank`): `reorder(nil)` clears the order and orders by nothing.
+  module RelationBlankOrder
+    def order!(*parts)
+      super(*parts.reject { |part| part.nil? || part == "" })
+    end
+  end
+  Relation.prepend(RelationBlankOrder)
+
+  # A PostgreSQL row already carries the Time its driver decoded.
+  module RelationDecodedTimes
+    def cast_schema_value(value, column)
+      return value if value.is_a?(Time) && @model.schema_time_columns.include?(column)
+
+      super
+    end
+  end
+  Relation.prepend(RelationDecodedTimes)
 
   # Rails' InsertAll takes the relation's create attributes
   # (`attributes.merge!(scope_attributes)`): an association's foreign key

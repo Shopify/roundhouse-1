@@ -2230,6 +2230,17 @@ module ActiveRecord
       ActiveRecord::Scoping::ScopeRegistry.instance
     end
 
+    # scoping.rb's `scope_attributes`: what a record built through the
+    # class starts with (`all.scope_attributes`). state_machines-
+    # activerecord's own `initialize` reads it on every `new`.
+    def self.scope_attributes
+      ActiveRecord::Relation.new(self).scope_attributes
+    end
+
+    def self.scope_attributes?
+      !scope_attributes.empty?
+    end
+
     # Called last by a default-scoped model's `initialize`: Rails' scope
     # attributes go in through the writers, and a given attribute wins.
     def _seed_default_scope_attributes(attrs)

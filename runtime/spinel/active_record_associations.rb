@@ -886,6 +886,11 @@ module ActiveRecord
         TargetArray.new(self)
       end
 
+      # Rails' CollectionProxy#records: the loaded target as an Array.
+      def records
+        to_a
+      end
+
       class TargetArray < Array
         def initialize(proxy)
           super(proxy)
