@@ -405,6 +405,19 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
                 // Folding either to never-blank would render
                 // errors_for-style guards unconditionally.
                 Container { nilable: false, whitespace: false }
+            } else if matches!(last, "Set" | "Queue" | "SizedQueue") {
+                // Stdlib containers that answer `empty?`: `Set.new.blank?`
+                // is true, not the never-blank fold.
+                Container { nilable: false, whitespace: false }
+            } else if matches!(raw, "Enumerable" | "Enumerator" | "Enumerator::Lazy") {
+                // An `Enumerable[T]` annotation names what the value does,
+                // not its class: an Array, a Set or a Hash answers
+                // `empty?`, a Range or an Enumerator does not. Core's
+                // `FindByAccessPath#find_by_access_paths` opens with
+                // `return {} if access_paths.blank?` over an
+                // `Enumerable[AccessPath]` (a Set of them), and the
+                // never-blank fold wrote `return {} if false`.
+                Runtime
             } else if last == "ParamValue" {
                 // Not a fold nor the method: a request value is a string, a hash or an array, and only the runtime predicate answers all three.
                 Runtime

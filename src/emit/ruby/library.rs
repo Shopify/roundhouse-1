@@ -4239,6 +4239,7 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             };
             if matches!(assoc, Association::HasMany { extension, .. } if !extension.is_empty())
                 && !unsupported.iter().any(|u| u.contains("block"))
+                && !options.contains("Module.new")
             {
                 unsupported.push("`extend:` (the declaration's block)".to_string());
             }
@@ -4539,6 +4540,24 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
         scan.visit(node);
         scan.free
     }
+    // A block whose statements are all `include`/`extend`/`prepend` of
+    // constants.
+    fn mixin_only_block(block: &ruby_prism::BlockNode<'_>) -> bool {
+        if block.parameters().is_some() {
+            return false;
+        }
+        let Some(body) = block.body() else { return true };
+        let Some(statements) = body.as_statements_node() else { return false };
+        statements.body().iter().all(|statement| {
+            let Some(call) = statement.as_call_node() else { return false };
+            call.receiver().is_none()
+                && call.block().is_none()
+                && matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend")
+                && call.arguments().is_some_and(|a| {
+                    a.arguments().iter().all(|arg| arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some())
+                })
+        })
+    }
     fn call_options(call: &ruby_prism::CallNode<'_>) -> (String, Vec<String>) {
         let mut pairs: Vec<String> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
@@ -4573,8 +4592,22 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 }
             }
         }
-        if call.block().is_some() {
-            unsupported.push("`extend:` (the declaration's block)".to_string());
+        // The declaration's block is an anonymous module Rails adds to
+        // `options[:extend]` (`options[:extend] = [*options[:extend],
+        // extension]`, builder/association.rb; an `extend:` the call names
+        // is not a carried value, so it is already named): rebuilt from the block's source where the table
+        // is built, as the other carried values are, when the block only
+        // mixes in constants (`include Sortable`): a `def` in it is not
+        // read back from the table's source, so a block with methods stays
+        // named.
+        if let Some(block) = call.block() {
+            match block.as_block_node().filter(|b| mixin_only_block(b)) {
+                Some(b) => {
+                    let module = format!("Module.new {}", String::from_utf8_lossy(b.location().as_slice()));
+                    pairs.push(format!("extend: [{module}]"));
+                }
+                None => unsupported.push("`extend:` (the declaration's block)".to_string()),
+            }
         }
         let hash = if pairs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", pairs.join(", ")) };
         (hash, unsupported)

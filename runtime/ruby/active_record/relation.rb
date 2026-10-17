@@ -2676,6 +2676,19 @@ module ActiveRecord
       rows
     end
 
+    # Rails' `take(n)`: up to n rows with no ordering imposed, as `take`
+    # leaves the order to the database. A terminal like `first_n`: the
+    # borrowed `@limit` is restored and the page is not left memoized.
+    def take_n(n)
+      n = sql_limit(n)
+      prior = @limit
+      @limit = n
+      rows = to_a
+      @limit = prior
+      unload_records
+      rows
+    end
+
     # Last n in relation order (Rails does not reverse the page).
     # Unloaded and unwindowed: reverse ORDER BY, LIMIT n, reverse rows.
     # Loaded or already LIMIT/OFFSET: in-memory tail of that window.
