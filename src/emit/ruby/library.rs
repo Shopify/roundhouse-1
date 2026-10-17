@@ -5905,10 +5905,41 @@ fn resolve_through_chain(
     // The source belongs_to on the join model (`Vote.belongs_to :story`)
     // — matched by target class, so `source:` renames resolve without a
     // name convention.
-    if let Some(src_fk) = thr_model.associations().find_map(|a| match a {
-        Association::BelongsTo { target: t, foreign_key, .. } if t == target => Some(foreign_key),
+    // A polymorphic source (`has_many :provinces, through: :zone_regions,
+    // source: :region, source_type: "Province"`, `ZoneRegion belongs_to
+    // :region, polymorphic: true`) names the target by `source_type:`, which
+    // the type column pins: `zone_regions.region_type = 'Province'`. The
+    // join model's one polymorphic `belongs_to` serves, or the one whose
+    // `as:` targets include this class.
+    let polymorphic_source = || {
+        let mut found = thr_model.associations().filter_map(|a| match a {
+            Association::BelongsTo { foreign_key, polymorphic: true, polymorphic_targets, foreign_type, name, .. } => {
+                Some((foreign_key, polymorphic_targets, foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{name}_type")))))
+            }
+            _ => None,
+        });
+        let first = found.next()?;
+        if found.next().is_some() && !first.1.contains(target) {
+            return None;
+        }
+        Some((first.0, first.2))
+    };
+    let direct_source = thr_model.associations().find_map(|a| match a {
+        Association::BelongsTo { target: t, foreign_key, polymorphic: false, .. } if t == target => {
+            Some((foreign_key.clone(), String::new()))
+        }
+        Association::BelongsTo { target: t, foreign_key, polymorphic: true, .. } if t == target => {
+            Some((foreign_key.clone(), String::new()))
+        }
         _ => None,
-    }) {
+    });
+    let source = direct_source.or_else(|| {
+        let (src_fk, type_column) = polymorphic_source()?;
+        let type_name = target.0.as_str().replace('\'', "''");
+        Some((src_fk.clone(), format!(" AND {thr_table}.{type_column} = '{type_name}'")))
+    });
+    if let Some((src_fk, source_type)) = source {
+        let owner_type = format!("{owner_type}{source_type}");
         let mut joins = vec![format!(
             "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
         )];

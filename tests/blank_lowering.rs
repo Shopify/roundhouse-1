@@ -545,3 +545,35 @@ end
     assert!(!out.contains("if false"), "never-blank fold on a Set:\n{out}");
     assert!(out.contains(".empty?"), "expected empty?-based form:\n{out}");
 }
+
+/// A parameter's scalar type is only what the analyzer saw handed in at
+/// call sites, so `value.blank?` must not fold to `value.nil?`
+/// (`publish_on=("")` is blank in Rails); a local the body assigns still
+/// folds.
+#[test]
+fn inferred_scalar_param_blank_takes_runtime_predicate() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Setter
+  def publish_on=(value)
+    return if value.blank?
+    @at = value
+  end
+
+  def local
+    n = 3
+    n.blank?
+  end
+
+  def caller_site
+    self.publish_on = Time.now
+    self.publish_on = nil
+  end
+end
+"#,
+    );
+    assert!(out.contains("ActiveSupport.blank?(value)"), "param takes the runtime predicate:\n{out}");
+    assert!(!out.contains("value.nil?"), "param must not fold to nil?:\n{out}");
+    assert!(!out.contains("n.blank?"), "assigned local still grounds:\n{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}

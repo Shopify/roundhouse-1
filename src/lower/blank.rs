@@ -512,11 +512,29 @@ pub(crate) fn is_effect_free_reader(e: &Expr) -> bool {
 struct CastBound {
     vars: HashSet<(crate::ident::VarId, Symbol)>,
     ivars: HashSet<Symbol>,
+    /// Locals this body assigns. A bare `Var` outside this set was
+    /// RECEIVED (a method or block parameter), so its static type is
+    /// only what the analyzer saw handed in.
+    assigned: HashSet<crate::ident::VarId>,
 }
 
 impl CastBound {
     fn collect(body: &Expr) -> Self {
         fn visit(e: &Expr, out: &mut CastBound) {
+            match &*e.node {
+                ExprNode::Assign { target: LValue::Var { id, .. }, .. }
+                | ExprNode::OpAssign { target: LValue::Var { id, .. }, .. } => {
+                    out.assigned.insert(*id);
+                }
+                ExprNode::MultiAssign { targets, .. } => {
+                    for t in targets {
+                        if let LValue::Var { id, .. } = t {
+                            out.assigned.insert(*id);
+                        }
+                    }
+                }
+                _ => {}
+            }
             let bound = match &*e.node {
                 ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. }
                     if is_unbacked_author_cast(value) =>
@@ -654,6 +672,29 @@ fn try_rewrite(
         // its own dispatch, and a refusal stays a refusal.
         let grounding =
             if bound.binds(r) { unbacked_grounding(grounding, r.ty.as_ref()) } else { grounding };
+        // A scalar type on a RECEIVED variable is not grounds for a
+        // fold either. A parameter's type is the union of the argument
+        // types the analyzer SAW at call sites, and a setter like
+        // `publish_on=(value)` reads `value.blank?` with `Time?`
+        // inferred while a form or test hands it `""`: folding to
+        // `value.nil?` answered false for the blank String, where
+        // Rails' `Object#blank?` answers true. The runtime predicate
+        // branches on the value and is right for every one.
+        let grounding = match (&grounding, &*r.node) {
+            (Grounding::NeverBlank { .. }, ExprNode::Var { id, .. })
+                if !bound.assigned.contains(id)
+                    && r.ty.as_ref().is_some_and(|t| match non_nil_of(t) {
+                        Ty::Int | Ty::Float | Ty::Sym | Ty::Time => true,
+                        Ty::Class { id, .. } => {
+                            matches!(id.0.as_str(), "Time" | "Date" | "DateTime" | "BigDecimal")
+                        }
+                        _ => false,
+                    }) =>
+            {
+                Grounding::Runtime
+            }
+            _ => grounding,
+        };
         (pred, grounding, r.ty.clone(), is_effect_free_reader(r))
     };
     // An ASSIGNMENT receiver — lobsters' login does
