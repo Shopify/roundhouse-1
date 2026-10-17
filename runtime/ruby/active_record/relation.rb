@@ -3862,9 +3862,13 @@ module ActiveRecord
         elsif val.is_a?(Hash) && nested_hash?(key, val)
           table, owner = nested_table(key)
           val.each do |col, v|
-            predicate = column_predicate("#{table}.#{col}", v, false, owner)
+            # The nested table's own alias names its column
+            # (`where(condition_responders: {condition_id:})` over
+            # `alias_attribute :condition_id, :context_driver_group_id`).
+            name = nested_column_name(owner, col)
+            predicate = column_predicate("#{table}.#{name}", v, false, owner)
             parts << predicate
-            named << ["#{table}.#{col}", predicate]
+            named << ["#{table}.#{name}", predicate]
           end
         else
           # An alias names its column (`where(subdomain:)`).

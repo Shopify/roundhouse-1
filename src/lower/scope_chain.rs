@@ -2522,6 +2522,8 @@ pub struct Ctx<'a> {
     pub shadowed: &'a HashSet<ClassId>,
     /// See [`Registries::wrapped_inserts`].
     pub wrapped_inserts: bool,
+    /// See [`Registries::stubbed_sends`].
+    pub stubbed_sends: &'a HashSet<(ClassId, Symbol)>,
 }
 
 impl Ctx<'_> {
@@ -2623,6 +2625,7 @@ impl Ctx<'_> {
             plain_subclasses: self.plain_subclasses,
             shadowed: self.shadowed,
             wrapped_inserts: self.wrapped_inserts,
+            stubbed_sends: self.stubbed_sends,
         }
     }
 }
@@ -4450,6 +4453,15 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     || method.as_str() == "all"
                     || CLASS_ROOT_TERMINALS.contains(&method.as_str())
                 {
+                    // A test stubs this class method (`ShopRoute.expects(:where)`):
+                    // the call stays on the constant, where the stub is.
+                    if ctx.stubbed_sends.contains(&(m.clone(), method.clone())) {
+                        if method.as_str() != "all" {
+                            let _ = lower_relation_args(&m, &method, &mut args, ctx);
+                        }
+                        *expr = put(span, Some(r), method, args, block, parenthesized);
+                        return Some(m);
+                    }
                     let seed = ctx.relation_new(span, &m);
                     if method.as_str() == "all" {
                         *expr = seed;
@@ -5213,6 +5225,7 @@ fn rewrite_relation_taking_body(
         plain_subclasses: no_plain_subclasses(),
         shadowed: no_shadowed(),
         wrapped_inserts: false,
+        stubbed_sends: no_stubbed_sends(),
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -5309,6 +5322,7 @@ pub fn rewrite_call_site_in(
         plain_subclasses: regs.plain_subclasses,
         shadowed: regs.shadowed,
         wrapped_inserts: regs.wrapped_inserts,
+        stubbed_sends: regs.stubbed_sends,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -5346,6 +5360,12 @@ pub struct Registries<'a> {
     /// relation; inlined as `new(attrs)._insert_row` it ran around it and
     /// left `id` NULL.
     pub wrapped_inserts: bool,
+    /// `(model, method)` pairs a test stubs on the model's CLASS
+    /// (`ShopRoute.expects(:where)`, [`stubbed_class_sends`]): a call site
+    /// of one stays a send to the constant, which the stub replaces,
+    /// instead of seeding `ActiveRecord::Relation.new(Model)`, which
+    /// bypasses it.
+    pub stubbed_sends: &'a HashSet<(ClassId, Symbol)>,
 }
 
 /// No plain model subclasses: the registries of a caller with no app.
@@ -5358,6 +5378,62 @@ pub fn no_plain_subclasses() -> &'static HashMap<ClassId, ClassId> {
 pub fn no_shadowed() -> &'static HashSet<ClassId> {
     static EMPTY: std::sync::OnceLock<HashSet<ClassId>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(HashSet::default)
+}
+
+/// No stubbed class sends: the registries of a caller with no app.
+pub fn no_stubbed_sends() -> &'static HashSet<(ClassId, Symbol)> {
+    static EMPTY: std::sync::OnceLock<HashSet<(ClassId, Symbol)>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashSet::default)
+}
+
+/// The `(constant, method)` pairs the app's tests stub on a class with
+/// mocha (`ShopRoute.expects(:where)`, `Order.stubs(:find_by)`). A model
+/// call site of one must stay a send to the constant: seeding
+/// `ActiveRecord::Relation.new(ShopRoute).where(…)` runs around the stub
+/// (mocha replaces the CLASS method), and the expectation is never met.
+pub fn stubbed_class_sends(app: &crate::app::App) -> HashSet<(ClassId, Symbol)> {
+    fn walk(e: &Expr, out: &mut HashSet<(ClassId, Symbol)>) {
+        if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
+            // `lower::mocha` hands a chain it does not serve on as data:
+            // `MochaBridge.chain("ShopRoute", :expects, :where, [...])`.
+            if method.as_str() == "chain" && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "MochaBridge") {
+                if let [name, kind, stubbed, ..] = args.as_slice() {
+                    if let (
+                        ExprNode::Lit { value: Literal::Str { value: name } },
+                        ExprNode::Lit { value: Literal::Sym { value: kind } },
+                        ExprNode::Lit { value: Literal::Sym { value: stubbed } },
+                    ) = (&*name.node, &*kind.node, &*stubbed.node)
+                    {
+                        if matches!(kind.as_str(), "expects" | "stubs") {
+                            out.insert((ClassId(Symbol::from(name.as_str())), stubbed.clone()));
+                        }
+                    }
+                }
+            }
+            if matches!(method.as_str(), "expects" | "stubs") {
+                if let (ExprNode::Const { path }, Some(first)) = (&*recv.node, args.first()) {
+                    if let ExprNode::Lit { value: Literal::Sym { value } } = &*first.node {
+                        let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                        out.insert((ClassId(Symbol::from(name.as_str())), value.clone()));
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = HashSet::default();
+    for tm in &app.test_modules {
+        if let Some(setup) = &tm.setup {
+            walk(setup, &mut out);
+        }
+        for t in &tm.tests {
+            walk(&t.body, &mut out);
+        }
+        for m in &tm.helpers {
+            walk(&m.body, &mut out);
+        }
+    }
+    out
 }
 
 /// The models whose first constant segment `A` is also the last segment
@@ -5635,6 +5711,7 @@ mod tests {
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
             wrapped_inserts: false,
+            stubbed_sends: no_stubbed_sends(),
         }
     }
 
@@ -5659,6 +5736,7 @@ mod tests {
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
             wrapped_inserts: false,
+            stubbed_sends: no_stubbed_sends(),
             user_returns: empty_returns(),
         }
     }
@@ -6043,6 +6121,7 @@ mod tests {
             plain_subclasses: no_plain_subclasses(),
             shadowed: no_shadowed(),
             wrapped_inserts: false,
+            stubbed_sends: no_stubbed_sends(),
         }
     }
 
@@ -6669,6 +6748,68 @@ mod tests {
         let field = crate::ty::Ty::Class { id: ClassId(Symbol::from("GraphApi::Field")), args: vec![].into() };
         let expr = rewrite_by_name_call(Some(field), None, "exists?", vec![]);
         assert!(kept_dynamic_call(&expr, "exists?"), "a stamped Field keeps its own method, got {:?}", expr.node);
+    }
+
+    /// `ShopRoute.where(host: h).any?` with a model `ShopRoute`, rewritten
+    /// with `stubbed` as the (model, method) pairs a test stubs on the class.
+    fn rewrite_model_where(stubbed: &[(&str, &str)]) -> String {
+        let route = ingest("class ShopRoute < ApplicationRecord\nend\n", "app/models/shop_route.rb");
+        let models_v = vec![route];
+        let scopes = build_scope_registry(&models_v);
+        let models = model_set(&models_v);
+        let assocs = build_assoc_registry(&models_v);
+        let stubbed: HashSet<(ClassId, Symbol)> =
+            stubbed.iter().map(|(c, m)| (ClassId(Symbol::from(*c)), Symbol::from(*m))).collect();
+        let host = Expr::new(span(), ExprNode::Hash { entries: vec![(sym_lit("host"), sym_lit("h"))], kwargs: true });
+        let konst = Expr::new(span(), ExprNode::Const { path: vec![Symbol::from("ShopRoute")] });
+        let where_ = Expr::new(
+            span(),
+            ExprNode::Send { recv: Some(konst), method: Symbol::from("where"), args: vec![host], block: None, parenthesized: true },
+        );
+        let mut expr = Expr::new(
+            span(),
+            ExprNode::Send { recv: Some(where_), method: Symbol::from("any?"), args: vec![], block: None, parenthesized: false },
+        );
+        let regs = Registries { stubbed_sends: &stubbed, ..regs(&scopes, &models, &assocs) };
+        rewrite_call_site(&mut expr, &regs, None, None);
+        format!("{:?}", expr.node)
+    }
+
+    /// A model class method a test stubs (`ShopRoute.expects(:where)`) keeps
+    /// its constant receiver, where mocha put the stub; unstubbed it seeds
+    /// `ActiveRecord::Relation.new(ShopRoute)`, which runs around one.
+    #[test]
+    fn stubbed_class_where_keeps_the_constant_receiver() {
+        let seeded = rewrite_model_where(&[]);
+        assert!(seeded.contains("\"Relation\""), "unstubbed `where` seeds a relation, got {seeded}");
+        let stubbed = rewrite_model_where(&[("ShopRoute", "where")]);
+        assert!(!stubbed.contains("\"Relation\""), "a stubbed `where` stays on the constant, got {stubbed}");
+        let other = rewrite_model_where(&[("ShopRoute", "find_by")]);
+        assert!(other.contains("\"Relation\""), "a stub of another method leaves `where` seeded, got {other}");
+    }
+
+    /// The pairs come off both spellings a test body has: mocha's own
+    /// `Const.expects(:m)` and the `MochaBridge.chain("Const", :expects, :m, …)`
+    /// `lower::mocha` hands an unserved chain on as.
+    #[test]
+    fn stubbed_class_sends_reads_expects_and_the_bridge_form() {
+        let konst = |name: &str| Expr::new(span(), ExprNode::Const { path: vec![Symbol::from(name)] });
+        let send = |recv: Expr, method: &str, args: Vec<Expr>| {
+            Expr::new(span(), ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block: None, parenthesized: true })
+        };
+        let str_lit = |s: &str| Expr::new(span(), ExprNode::Lit { value: Literal::Str { value: s.to_string() } });
+        let src = "class RouteTest < ActiveSupport::TestCase\n  test \"t\" do\n    ShopRoute.expects(:where)\n    Shop.any_instance.stubs(:save)\n  end\nend\n";
+        let mut mods = crate::ingest::test::ingest_test_files(src.as_bytes(), "t.rb").expect("ingest");
+        let mut tm = mods.remove(0);
+        let bridged = send(konst("MochaBridge"), "chain", vec![str_lit("Order"), sym_lit("stubs"), sym_lit("find_by"), sym_lit("x")]);
+        let instance = send(konst("MochaBridge"), "chain", vec![str_lit("Order"), sym_lit("any_instance_expects"), sym_lit("save"), sym_lit("x")]);
+        tm.setup = Some(Expr::new(span(), ExprNode::Seq { exprs: vec![bridged, instance] }));
+        let mut app = crate::app::App::new();
+        app.test_modules.push(tm);
+        let found = stubbed_class_sends(&app);
+        assert!(found.contains(&(ClassId(Symbol::from("ShopRoute")), Symbol::from("where"))));
+        assert!(found.contains(&(ClassId(Symbol::from("Order")), Symbol::from("find_by"))));
+        assert_eq!(found.len(), 2, "an any_instance stub is not a class send: {found:?}");
     }
 
     /// A stamped non-model type is the receiver's class, even inside a

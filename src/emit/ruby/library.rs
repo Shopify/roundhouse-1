@@ -2706,6 +2706,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let wrapped_inserts = app.library_classes.iter().any(|c| {
         c.origin.is_none() && c.methods.iter().any(|m| matches!(m.name.as_str(), "insert_all" | "insert_all!"))
     });
+    let stubbed_sends = crate::lower::scope_chain::stubbed_class_sends(app);
     let regs = crate::lower::scope_chain::Registries {
         scopes: &scopes,
         models: &models,
@@ -2717,6 +2718,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         plain_subclasses: &plain_subclasses,
         shadowed: &shadowed,
         wrapped_inserts,
+        stubbed_sends: &stubbed_sends,
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");

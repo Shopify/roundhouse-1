@@ -127,6 +127,7 @@ require_relative "runtime/active_record_store"
 require_relative "runtime/active_record_db_config"
 require_relative "runtime/active_record_serialization"
 require_relative "runtime/active_record_relation_ext"
+require_relative "runtime/active_record_errors_ext"
 # `Base.connection` as Rails' SQLite3 adapter class (see the file).
 require_relative "runtime/active_record_sqlite3_adapter"
 require_relative "config/schema"
