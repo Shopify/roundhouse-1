@@ -9117,8 +9117,9 @@ fn include_refusal(construct: &str, detail: String, span: crate::span::Span) -> 
 /// `PanamaMetadata::Schema < Hashie::Dash`, whose includes name a
 /// transitive gem's modules), failing boot on an include that worked.
 pub fn is_include_refusal(call: &crate::expr::Expr) -> bool {
-    call.span.is_synthetic()
-        && matches!(&*call.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
+    // The record carries the include's own span (`class.include_spans`)
+    // when ingest has one, so it is told by its node and diagnostic.
+    matches!(&*call.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
         && matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
             if matches!(construct.as_str(), "include" | "gem_requires_rails"))
 }

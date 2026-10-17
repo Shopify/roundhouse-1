@@ -253,5 +253,7 @@ fn a_read_the_source_declares_runs() {
     assert!(errors.iter().any(|e| e.contains("constant not supported (all targets): OpenTelemetry::Trace::Nope")), "{errors:#?}");
     let models = models(&dir);
     assert!(models.contains("TRACER = [Roaring::VERSION, OpenTelemetry::Trace::Tracer]"), "{models}");
-    assert!(models.contains("NOPE = (raise \"roundhouse: constant not supported (all targets)\")"), "{models}");
+    // The namespace is the locked gem's, so the read stays the gem's: Ruby raises NameError naming it.
+    assert!(models.contains("NOPE = OpenTelemetry::Trace::Nope"), "{models}");
+    assert!(!models.contains("NOPE = (raise"), "{models}");
 }
