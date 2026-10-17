@@ -306,8 +306,9 @@ module ActiveRecord
       instance_variables.each do |ivar|
         instance_variable_set(ivar, false) if ivar.end_with?("_loaded") && instance_variable_get(ivar) == true
       end
-      primary_key = self.class.primary_key
-      self[primary_key] = nil if primary_key.is_a?(String)
+      # A composite key (`primary_key = [:shop_id, :id]`) clears every
+      # column, as Rails' `@primary_key.each { |key| @attributes.reset(key) }`.
+      Array(self.class.primary_key).each { |key| self[key] = nil }
       columns = self.class.schema_columns
       [:created_at, :created_on, :updated_at, :updated_on].each do |column|
         self[column] = nil if columns.include?(column)

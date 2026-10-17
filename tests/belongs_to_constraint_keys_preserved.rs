@@ -27,6 +27,8 @@ const USER: &str = "class User < ApplicationRecord\nend\n";
 const OVERRIDES: &str = "class Permission < ApplicationRecord\n  belongs_to :creator, class_name: \"User\", foreign_key: :created_by, inverse_of: false,\n    yugabyte_overrides: { query_constraints: [:shop_id, :created_by], primary_key: [:shop_id, :id], foreign_key: :created_by }\nend\n";
 const PLAIN: &str = "class Permission < ApplicationRecord\n  belongs_to :creator, class_name: \"User\", foreign_key: [:shop_id, :created_by], primary_key: [:shop_id, :id], inverse_of: false\nend\n";
 
+const COVERING: &str = "class Permission < ApplicationRecord\n  belongs_to :creator, class_name: \"User\", foreign_key: [:shop_id, :created_by], inverse_of: false,\n    yugabyte_overrides: { query_constraints: [:created_by, :shop_id], primary_key: [:id, :shop_id], foreign_key: [:created_by, :shop_id] }\nend\n";
+
 fn emitted(permission: &str) -> String {
     let schema = ingest_schema(SCHEMA, "db/schema.rb").expect("ingest schema");
     let mut app = App::new();
@@ -75,4 +77,17 @@ fn a_plain_composite_list_still_writes_every_part() {
     assert!(writer.contains("@shop_id = value._read_attribute(:shop_id)"), "{writer}");
     // ... and a later `shop_id` write drops the loaded target.
     assert!(method_with(&out, "shop_id=(").contains("@creator_loaded = false"), "{out}");
+}
+
+/// Core's `ContractDiscount#contract_identity` lists every constraint column
+/// as the wrapper's writable `foreign_key`, so `replace_keys` writes both:
+/// `self.contract_identity ||= contract.contract_identity` must set
+/// `contract_identity_id` as well as `shop_id` (the row's NOT NULL column).
+#[test]
+fn a_foreign_key_list_covering_the_constraints_writes_every_part() {
+    let out = emitted(COVERING);
+    let writer = method_with(&out, "creator=(value)");
+    assert!(writer.contains("@created_by = value._read_attribute(:id)") || writer.contains("@created_by = value.id"), "{writer}");
+    assert!(writer.contains("@shop_id = value._read_attribute(:shop_id)"), "{writer}");
+    assert!(writer.contains("@shop_id = nil"), "{writer}");
 }

@@ -71,7 +71,16 @@ pub(crate) fn resolve(plain: &KeyOptions, overrides: Option<&KeyOptions>) -> Opt
                 p
             }
         };
-        let writable = fk.and_then(|f| f.columns.last().cloned());
+        // A list names every writable column (`foreign_key: [:contract_identity_id,
+        // :shop_id]`); the primary pair is the one meeting the referenced `id`,
+        // as without `query_constraints`, not merely the last column listed.
+        let writable = fk.and_then(|f| {
+            let meets_id = (f.columns.len() > 1)
+                .then(|| pairs.iter().find(|(c, parent)| parent == "id" && f.columns.contains(c)))
+                .flatten()
+                .map(|(c, _)| c.clone());
+            meets_id.or_else(|| f.columns.last().cloned())
+        });
         return split(pairs, writable.as_deref());
     }
 
@@ -100,6 +109,21 @@ pub(crate) fn resolve(plain: &KeyOptions, overrides: Option<&KeyOptions>) -> Opt
     // primary pair is the one meeting the referenced `id`, else the last.
     let writable = pairs.iter().find(|(_, parent)| parent == "id").or(pairs.last()).map(|(c, _)| c.clone());
     split(pairs, writable.as_deref())
+}
+
+/// Whether the declaration's `query_constraints` columns beyond the writable
+/// `foreign_key` are left as the owner has them. A `foreign_key` list that
+/// covers every constraint column (`query_constraints: [:contract_identity_id,
+/// :shop_id], foreign_key: [:contract_identity_id, :shop_id]`) leaves none:
+/// `replace_keys` writes every part.
+pub(crate) fn constraint_keys_preserved(opts: &KeyOptions) -> bool {
+    let Some(qc) = &opts.query_constraints else {
+        return false;
+    };
+    match &opts.foreign_key {
+        Some(fk) if fk.array => !qc.columns.iter().all(|c| fk.columns.contains(c)),
+        _ => true,
+    }
 }
 
 fn split(pairs: Vec<(String, String)>, writable: Option<&str>) -> Option<ResolvedKeys> {
@@ -161,6 +185,23 @@ mod tests {
         let r = resolve(&KeyOptions::default(), Some(&over)).unwrap();
         assert_eq!((r.foreign_key.as_str(), r.primary_key), ("user_id", None));
         assert_eq!(r.extra_keys, pairs(&[("shop_id", "shop_id")]));
+    }
+
+    #[test]
+    fn a_foreign_key_list_covering_the_constraints_writes_every_part() {
+        // ContractDiscount#contract_identity
+        let over = KeyOptions {
+            query_constraints: list(&["contract_identity_id", "shop_id"]),
+            primary_key: list(&["id", "shop_id"]),
+            foreign_key: list(&["contract_identity_id", "shop_id"]),
+        };
+        let r = resolve(&KeyOptions::default(), Some(&over)).unwrap();
+        assert_eq!((r.foreign_key.as_str(), r.primary_key), ("contract_identity_id", None));
+        assert_eq!(r.extra_keys, pairs(&[("shop_id", "shop_id")]));
+        assert!(!constraint_keys_preserved(&over));
+        // A scalar writable key leaves the other constraint columns alone.
+        let scalar_fk = KeyOptions { foreign_key: scalar("contract_identity_id"), ..over };
+        assert!(constraint_keys_preserved(&scalar_fk));
     }
 
     #[test]
