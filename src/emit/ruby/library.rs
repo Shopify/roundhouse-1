@@ -3670,9 +3670,11 @@ fn is_relation_chain(e: &Expr) -> bool {
 }
 
 /// Whether the Ruby-family through reader applies a source association's
-/// own scope (`resolve_through_chain`): one that reads no local.
+/// own scope with no doubt of the rows it keeps (`resolve_through_chain`):
+/// a plain call chain, which holds no hash condition and reads no local.
+/// A hash condition stays refused (`through_source_scope`).
 pub(crate) fn through_source_scope_applies(scope: &Expr) -> bool {
-    !reads_local(scope)
+    through_scope_graftable(scope)
 }
 
 /// Does `e` read a local variable (or a block parameter)?

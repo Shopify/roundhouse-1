@@ -9859,22 +9859,13 @@ fn resolve_has_one_through_targets(app: &mut App) {
     let mut resolved: Vec<(ClassId, Symbol, ClassId)> = Vec::new();
     for model in &app.models {
         for assoc in model.associations() {
-            // A `has_many` keeps no `source:` of its own; the ingest
-            // already camelized it (or the name) into `target`, so the
-            // through model's association is that class's snake name.
+            // A `has_many` through resolves in `resolve_through_targets`,
+            // by Rails' source reflection rules (`source:` as written, the
+            // singular name, the plural name; both is ambiguous).
             let (name, target, thr, source_names): (_, _, _, Vec<Symbol>) = match assoc {
                 Association::HasOne { name, target, through: Some(thr), source, .. } => {
                     (name, target, thr, vec![source.clone().unwrap_or_else(|| name.clone())])
                 }
-                Association::HasMany { name, target, through: Some(thr), .. } => (
-                    name,
-                    target,
-                    thr,
-                    vec![
-                        Symbol::from(crate::naming::underscore(target.0.as_str().rsplit("::").next().unwrap_or(""))),
-                        name.clone(),
-                    ],
-                ),
                 _ => continue,
             };
             if known.contains(target.0.as_str()) {
