@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # PostgreSQL implementation of the emitted Db primitive, using the pg gem.
 # SQL arrives in PostgreSQL dialect from shared lowering. This driver never
 # rewrites SQL, calls Rails, or substitutes another database adapter.

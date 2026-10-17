@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' adapter-error constructors on the CRuby tree (activerecord
 # 8.2.0.alpha errors.rb), loaded by the PostgreSQL and SQLite adapter
 # overlays. The classes are the shared runtime's: the roots in

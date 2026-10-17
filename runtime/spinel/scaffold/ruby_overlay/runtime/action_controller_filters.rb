@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Run-time controller filters (actionpack 8.x abstract_controller/callbacks.rb):
 # `before_action` / `prepend_before_action` / `after_action` /
 # `around_action` / `skip_*_action` called on a controller class AT RUN

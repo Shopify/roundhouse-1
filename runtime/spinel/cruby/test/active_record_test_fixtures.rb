@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveRecord::TestFixtures, ported from the Rails native Core runs
 # (Shopify/rails 5813559f4aed, 8.2.0.alpha,
 # activerecord/lib/active_record/test_fixtures.rb, with

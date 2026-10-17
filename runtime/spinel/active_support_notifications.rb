@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Ruby-family notification boundary. Events are delivered synchronously around
 # real operations; no Rails runtime or post-hoc query-log replay is involved.
 # Delivery order and the subscribe API follow the ActiveSupport native Core

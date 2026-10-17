@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActiveSupport.blank?(value)` on the CRuby and JRuby trees: Rails'
 # own dispatch, `value.blank?`.
 #

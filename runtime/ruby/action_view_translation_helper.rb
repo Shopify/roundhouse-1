@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActionView::Helpers::TranslationHelper` for a class that includes it
 # outside a view (Core's `Home::SafeTranslatable::Helper` includes it and
 # `ShopifyI18n::ActionViewSoftDegrade` then wraps `translate` with a bare

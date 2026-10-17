@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Ruby-family subscriber dispatch over our notification runtime. No native
 # ActiveSupport is loaded by the emitted application. Ported from the
 # ActiveSupport native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha):

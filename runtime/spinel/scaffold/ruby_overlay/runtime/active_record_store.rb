@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActiveRecord::Store` (activerecord 8.x active_record/store.rb): the
 # accessors over a serialized Hash column. `store_accessor(:settings,
 # :theme)` defines `theme`, `theme=`, `theme_changed?`, `theme_change`,

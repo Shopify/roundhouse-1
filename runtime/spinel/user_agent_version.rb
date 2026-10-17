@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `useragent` 0.16.11's UserAgent::Version (lib/user_agent/version.rb),
 # verbatim below this header, for the CRuby PostgreSQL tree.
 #

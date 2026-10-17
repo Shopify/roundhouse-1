@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `Rails.configuration` and `Rails.application.config` — railties'
 # application configuration (railties 8.1.4 rails.rb: `def
 # configuration; application.config; end`).

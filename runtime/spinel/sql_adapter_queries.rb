@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Shared query/row facade. Backend modules supply identifier quoting,
 # generated-insert identity and truncate semantics; Db owns driver I/O.
 module SqlAdapterQueries

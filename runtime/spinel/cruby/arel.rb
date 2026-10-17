@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Arel (Shopify/rails 5eb8c4c45bee, 8.2.0.alpha activerecord/lib/arel.rb and
 # arel/*), carried over as Rails ships it: the node classes, the
 # predication, math and expression mixins, the managers, the SQL string

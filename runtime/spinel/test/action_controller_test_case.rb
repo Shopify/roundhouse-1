@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionController::TestCase::Behavior's request half (actionpack 8.2
 # action_controller/test_case.rb): `process` and the verb helpers that
 # call it, `assigns`, `flash`, `cookies`, and the response helpers a

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Arel's node tree on this runtime's connection, models and Relation.
 #
 # runtime/arel.rb is Rails' Arel as it ships. Rails binds it to Active

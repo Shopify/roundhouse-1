@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # PostgreSQL hooks over the same row/query facade as SQLite.
 require_relative "sql_adapter_queries"
 require_relative "active_support_notifications"

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Runtime port of the sequenced_column gem (sequenced_column 1.2.1,
 # lib/sequenced_column/extension.rb), what a model body's
 # `sequenced_column :number, scope: :order` runs at class load.

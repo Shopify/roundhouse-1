@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActionController::Renderers` (actionpack 8.x
 # action_controller/metal/renderers.rb): the registry behind
 # `render json: obj` / `render xml:` / `render js:`, and the hooks gems

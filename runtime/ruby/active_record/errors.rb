@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # The Active Record error roots every target shares (activerecord
 # errors.rb and validations.rb, Rails 8.2.0.alpha). This file is also
 # transpiled for the strict targets (`runtime_loader`'s errors entries),

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Mime::Type.register and .register_alias (actionpack 8.2.0.alpha,
 # lib/action_dispatch/http/mime_type.rb) for the PostgreSQL CRuby tree.
 # runtime/ruby/mime.rb carries the frozen table actionpack's own

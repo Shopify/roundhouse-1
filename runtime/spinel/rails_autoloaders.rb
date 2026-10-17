@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `Rails.autoloaders` — railties 8.1.4 autoloaders.rb — over the emitted
 # tree's compiled autoloader (`RoundhouseAutoload`, app/models.rb), with
 # Zeitwerk's `on_load(cpath)` callbacks (zeitwerk 2.8.2, the version Core

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Runtime port of the database_documentation gem's model metadata
 # (database_documentation 3.2.0, the version Core's Gemfile pins with
 # "~> 3.0"): what a model body runs at class load.

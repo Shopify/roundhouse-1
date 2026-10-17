@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # semian 0.28.3 core (lib/semian.rb and the files it requires), ported for
 # the CRuby PostgreSQL tree. Shopify Core's essentials pg.rb initializer
 # installs `semian/activerecord_postgresql_adapter` (see

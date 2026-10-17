@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # The rest of Rails' Active Record exception hierarchy (activerecord
 # 8.2.0.alpha errors.rb and associations/errors.rb), on the Ruby-family
 # trees: each class under the superclass Rails gives it, with Rails'

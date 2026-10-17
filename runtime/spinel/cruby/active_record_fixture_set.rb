@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveRecord::FixtureSet, FixtureSet::File, FixtureSet::RenderContext
 # and ActiveRecord::Fixture, ported from the Rails native Core runs
 # (Shopify/rails 5813559f4aed, 8.2.0.alpha,

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # The helpers a folded `I18n.t` calls (`src/lower/i18n_translate.rs`),
 # over the i18n gem on the PostgreSQL CRuby tree: `runtime/ruby/i18n_locale.rb`
 # is the same set over a fixed `:en`, for trees without the gem. Here

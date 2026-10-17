@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActiveSupport::Cache.expand_cache_key` and `ActiveSupport::Cache::
 # MemoryStore` — ported from activesupport 8.1 (cache.rb,
 # cache/memory_store.rb) for the ruby family and spinel, where campfire's

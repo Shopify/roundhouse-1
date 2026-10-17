@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # sorbet-runtime's inline type check, the one `T.let`, `T.cast`,
 # `T.bind` and `T.assert_type!` perform (sorbet-runtime 0.6.13502:
 # lib/types/_types.rb, private/casts.rb, types/base.rb, types/simple.rb,

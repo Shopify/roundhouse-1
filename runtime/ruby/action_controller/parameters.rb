@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionController::Parameters, ported from actionpack 8.2.0.alpha
 # (Shopify/rails 5813559f4aed, the copy Core pins:
 # actionpack/lib/action_controller/metal/strong_parameters.rb), with the

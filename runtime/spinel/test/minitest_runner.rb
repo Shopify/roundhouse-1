@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby test harness only (packaged explicitly). No autorun and no Rails: application code still
 # executes entirely in the emitted project. Spinel and JRuby do not load this.
 require "minitest/test"

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `not_nil!` — type_toolkit's nil assertion (type_toolkit 0.0.5,
 # lib/type_toolkit/ext/nil_assertions.rb), Shopify Core's spelling of
 # Sorbet's `T.must`. Same behaviour as the gem: every object answers

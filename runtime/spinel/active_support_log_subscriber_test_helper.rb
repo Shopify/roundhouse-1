@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveSupport::LogSubscriber::TestHelper (the activesupport native Core runs,
 # Shopify/rails 5813559f4aed, 8.2.0.alpha), over the
 # Ruby-family notification and log-subscriber runtime. Test-only: the PostgreSQL

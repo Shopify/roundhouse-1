@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # PostgreSQL connection identity and transaction statements. Query and result
 # behavior stays in the shared Connection and SqlAdapterQueries framework.
 #

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 
 # Minitest's `capture_io`, for the CRuby tree only: it swaps the
 # `$stdout`/`$stderr` globals for StringIOs around the block, which the

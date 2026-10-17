@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Source locations of emitted code, answered with the authored paths.
 #
 # The emitted tree moves code: a test written in

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # globalid 1.4.0, ported for the CRuby tree: `GlobalID` as a value
 # (lib/global_id/global_id.rb), `GlobalID::Identification`
 # (identification.rb) and `URI::GID` (uri/gid.rb).

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only: `ActiveRecord::Base.connection` as Rails' SQLite3 adapter
 # class, with its transaction statements, and the statement errors this
 # tree's `Db` raises.

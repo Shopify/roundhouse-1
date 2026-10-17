@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # semian 0.28.3 `require "semian/activerecord_postgresql_adapter"`:
 # lib/semian/activerecord_adapter.rb and (semian_adapter.rb is lib/semian/adapter.rb)
 # lib/semian/activerecord_postgresql_adapter.rb, ported onto the

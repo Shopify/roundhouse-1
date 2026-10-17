@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Active Record's transactions on the PostgreSQL adapter, ported from the
 # Rails native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha):
 # connection_adapters/abstract/transaction.rb (TransactionState,
