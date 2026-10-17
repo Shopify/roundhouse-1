@@ -466,6 +466,8 @@ module ActiveRecord
 def alias_referenced_joins: (Array[String] keys) -> void
 %a{abstract}
 def aliased_join_sql: (untyped owner, untyped reflection, String kind) -> String
+%a{abstract}
+def nested_column_name: (untyped owner, untyped col) -> String
     def sync_eager_joins: () -> void
     def eager_loading?: () -> bool
     def referenced_collection_hop?: (untyped owner, untyped spec) -> bool

@@ -482,6 +482,15 @@ module ActiveRecord
 def aliased_join_sql(owner, reflection, kind)
   reflection_join_sql(owner, reflection, kind, join_alias_for(owner, reflection))
 end
+
+    # A nested where hash's column on its owner's table
+    # (`where(condition_responders: {condition_id:})`): the owner's own
+    # `alias_attribute` names the column, as `where(subdomain:)` does on
+    # the model itself. The shared `hash_conditions` calls this so the
+    # owner's untyped reflection stays out of the typed body.
+    def nested_column_name(owner, col)
+      owner.nil? ? col.to_s : owner._attribute_name(col.to_s)
+    end
   end
 end
 
