@@ -370,7 +370,7 @@ pub(super) fn lower_dry_validation(
         if has_schema(&name) && !built.contains_key(&name) {
             continue;
         }
-        lc.unknown_calls.retain(|call| !is_schema_definition(call) && !is_rule(call));
+        lc.unknown_calls.retain(|call| !is_schema_definition(call) && !is_rule(call) && !is_read_config(call));
         if let Some(methods) = built.remove(&name) {
             let mut methods = methods;
             methods.append(&mut lc.methods);
@@ -437,6 +437,25 @@ fn is_schema_definition(call: &Expr) -> bool {
         if matches!(method.as_str(), "params" | "json" | "schema"))
 }
 
+/// A class-body statement (`expr::BODY_STATEMENT`) this lowering reads
+/// from the sources itself: `config.messages.…` (`read_configs`) and
+/// `Dry::Validation.load_extensions(…)` (`dry_monads`). A lowered
+/// contract does not carry it, and it is no declaration to refuse.
+fn is_read_config(call: &Expr) -> bool {
+    if call.decisions & crate::expr::BODY_STATEMENT == 0 {
+        return false;
+    }
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*call.node else { return false };
+    if is_const(recv, "Dry::Validation") && method.as_str() == "load_extensions" {
+        return true;
+    }
+    let mut root = recv;
+    while let ExprNode::Send { recv: Some(inner), .. } = &*root.node {
+        root = inner;
+    }
+    matches!(&*root.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "config" && args.is_empty())
+}
+
 /// A contract's own schema (None for a contract declaring none).
 fn read_contract(
     lc: &LibraryClass,
@@ -448,6 +467,9 @@ fn read_contract(
     let mut schema: Option<Schema> = None;
     let mut rules = Vec::new();
     for call in &lc.unknown_calls {
+        if is_read_config(call) {
+            continue;
+        }
         let ExprNode::Send { recv, method, args, block, .. } = &*call.node else {
             return Err("a non-declaration expression in the class body".into());
         };

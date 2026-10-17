@@ -176,8 +176,8 @@ fn active_model_as_json_is_gated_to_its_ports() {
     let probe = std::fs::read_to_string(dir.join("emitted-ruby/app/models/probe.rb")).unwrap();
     // The plain read is answered from the record's `error_details` on every
     // tree (`lower::errors_index`); `as_json(options)` needs the port.
-    assert!(probe.contains("ActiveSupport.errors_to_hash(error_details)"), "{probe}");
-    assert!(probe.contains("ActiveModel::ErrorAttributes.as_json(errors, full_messages: true)"), "{probe}");
+    assert!(probe.contains("ActiveSupport.errors_to_hash(self.error_details)"), "{probe}");
+    assert!(probe.contains("ActiveModel::ErrorAttributes.as_json(self.errors, full_messages: true)"), "{probe}");
     // The strict targets carry neither port.
     let (ok, text) = run(&dir, &["--target", "rust"]);
     assert!(!ok, "rust accepted ActiveModel::Errors#as_json: {text}");

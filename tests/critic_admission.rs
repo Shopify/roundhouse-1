@@ -71,9 +71,11 @@ fn new_errors_api_requires_runtime_support() {
     for body in ["errors.slice!(:title)", "errors.group_by_attribute", "errors.copy!(errors)", "errors.generate_message(:title, :blank)", "f = title.to_sym; errors.full_message(f, \"is taken\")"] {
         refuses(body, "ActiveModel::Errors");
     }
-    // Not `ActiveModel::Error`: on emit, what an iteration yields is already the `ErrorDetail` the lowering iterates.
-    refuses("errors.first.options", "no known method `options`");
-    refuses("errors.of_kind?(title.to_sym, :blank)", "of_kind?");
+    // `Error#options` is ported in the same file (upstream refused it where
+    // only the lowering's `ErrorDetail` answered), and so is `of_kind?` of
+    // a computed field. An `ErrorDetail` index is still refused.
+    admits("errors.first.options");
+    admits("errors.of_kind?(title.to_sym, :blank)");
     refuses("errors.details[:title].map { |detail| detail[:count] }", "no known method `[]`");
 }
 
@@ -195,7 +197,9 @@ fn a_type_alias_is_carried_where_its_check_runs() {
     assert!(ok, "ruby refused the alias-typed check: {text}");
     let emitted = walk(&root.join("emitted-ruby"));
     assert!(emitted.contains("Title = SorbetRuntimeCheck.type_alias { SorbetRuntimeCheck.nilable(String) }"), "{emitted}");
-    assert!(emitted.contains("SorbetRuntimeCheck.cast(title, Probe::Title, \"T.let\""), "{emitted}");
+    // The model's implicit-self reader is typed against the model, which
+    // writes the receiver (`self.title`) the way every strict target needs.
+    assert!(emitted.contains("SorbetRuntimeCheck.cast(self.title, Probe::Title, \"T.let\""), "{emitted}");
     let (ok, text) = run(&root, &["--target", "typescript"]);
     assert!(!ok && text.contains("sorbet type check not supported"), "typescript lost the named refusal: {text}");
     std::fs::remove_dir_all(root).unwrap();

@@ -75,23 +75,27 @@ fn a_dropped_block_or_branch_value_checks_clean() {
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
-/// An application `tap` may answer its block's value, so the call stays a value.
+/// An application `tap` may answer its block's value, so the call stays a value,
+/// which the runtime's Preloader port answers (upstream refuses it, where no
+/// target ships the class).
 #[test]
-fn an_app_defined_tap_keeps_the_refusal() {
+fn an_app_defined_tap_runs_on_the_runtime_preloader() {
     let errors = constant_errors_with(
         "    Basket.new.tap { ActiveRecord::Associations::Preloader.new(records: Comment.all.to_a, associations: :article).call }\n    nil\n",
         &[("app/models/basket.rb", "class Basket\n  def tap\n    yield\n  end\nend\n")],
     );
-    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors.is_empty(), "{errors:#?}");
 }
 
-/// Any option beside `records:` and `associations:` (`scope:`) keeps the refusal.
+/// Any option beside `records:` and `associations:` (`scope:`) is the port's own
+/// keyword (`Preloader#initialize(records:, associations:, scope: nil, ...)`);
+/// upstream refuses it, as its model-loader rewrite cannot carry the scope.
 #[test]
-fn a_scope_option_keeps_the_refusal() {
+fn a_scope_option_runs_on_the_runtime_preloader() {
     let errors = constant_errors(
         "    ActiveRecord::Associations::Preloader.new(records: Comment.all.to_a, associations: :article, scope: Article.where(id: 1)).call\n    nil\n",
     );
-    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors.is_empty(), "{errors:#?}");
 }
 
 fn lowered_sends(body: &str) -> Vec<String> {

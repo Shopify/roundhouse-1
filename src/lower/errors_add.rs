@@ -255,7 +255,11 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
             };
             let mut message = baked_message(i18n, span, field.as_str(), args.next().map(fold_str_concat));
             message.ty = Some(crate::ty::Ty::Str);
-            let ExprNode::Send { recv: owner, .. } = *recv.expect("checked errors reader").node else { unreachable!() };
+            // A collection held in a local (`errors = record.errors`) has no record to build.
+            let owner = match *recv.expect("checked errors reader").node {
+                ExprNode::Send { recv: owner, .. } => owner,
+                _ => None,
+            };
             *expr = match owner {
                 // Not a Seq: an emitter hoists one out of `||` and `?:`, which would build the record where Rails does not.
                 Some(owner) if !reads_without_effect(&owner) => {
@@ -771,6 +775,11 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
         None
     };
     if let Some(reason) = reason {
+        // Left to the runtime's port (`ERRORS_PORT_CALL`), which answers any
+        // form on the trees that carry it; the others refuse it by name.
+        if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
+            return false;
+        }
         let mut d = crate::lower::residue_diagnostic(
             "errors_add",
             if method == "import" { "errors.import" } else { "errors.merge!" },
@@ -819,7 +828,8 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
         ExprNode::Send { recv: Some(support), method: Symbol::from(helper), args: call_args, block: None, parenthesized: true },
     );
     call.ty = Some(crate::lower::errors_index::error_array_ty());
-    *expr = call;
+    let orig = expr.clone();
+    *expr = crate::lower::errors_index::port_form(orig, call);
     true
 }
 

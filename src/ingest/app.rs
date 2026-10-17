@@ -10989,9 +10989,12 @@ fn gem_source_dirs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<(St
 }
 
 /// The facts of the extensions `roundhouse.yml` lists, loaded for this app
-/// alone (`crate::extensions`). Entries follow the `test_paths` rules, and
-/// listing order is load order, so an entry listed twice is refused rather
-/// than silently loaded twice or deduplicated.
+/// alone (`crate::extensions`). An entry follows the `test_paths` rules (an
+/// app-relative directory, no `..`, no symbolic links) or is an absolute
+/// directory, which is how a project outside the app, such as Core's
+/// harness, supplies its extension. Listing order is load order, so an
+/// entry listed twice is refused rather than silently loaded twice or
+/// deduplicated.
 fn project_extensions<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,
@@ -11001,13 +11004,18 @@ fn project_extensions<V: Vfs + ?Sized>(
     let refuse = |message: String| IngestError::Parse { file: config_path.display().to_string(), message };
     let mut dirs: Vec<PathBuf> = Vec::new();
     for entry in &config.extensions {
-        let Some(relative) = app_relative_dir(entry) else {
-            return Err(refuse(format!(
-                "extensions entries must be non-empty app-relative directories without '..': {entry:?}"
-            )));
+        let absolute = entry.is_absolute() && !entry.components().any(|c| matches!(c, Component::ParentDir));
+        let resolved = if absolute {
+            entry.clone()
+        } else {
+            let Some(relative) = app_relative_dir(entry) else {
+                return Err(refuse(format!(
+                    "extensions entries must be non-empty app-relative directories without '..': {entry:?}"
+                )));
+            };
+            dir.join(relative)
         };
-        let resolved = dir.join(relative);
-        if path_has_symlink_component(vfs, dir, &resolved) {
+        if !absolute && path_has_symlink_component(vfs, dir, &resolved) {
             return Err(refuse(format!("extensions entries must not contain symbolic links: {entry:?}")));
         }
         if dirs.contains(&resolved) {

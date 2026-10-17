@@ -11,7 +11,7 @@
 //! The expected answers are Rails 8.1.4's on the same app, booted
 //! in-process with `Rack::MockRequest`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 
 use roundhouse::ingest::routes::ingest_routes_with_draws;
 use roundhouse::ingest::{survey, IngestError};
@@ -23,7 +23,7 @@ mod emit_and_run;
 
 fn ingest(source: &str) -> Result<roundhouse::dialect::RouteTable, IngestError> {
     let (result, _) = roundhouse::ingest::prism::scope(|| {
-        ingest_routes_with_draws(source.as_bytes(), "config/routes.rb", &HashMap::new())
+        ingest_routes_with_draws(source.as_bytes(), "config/routes.rb", &HashMap::default())
     });
     result
 }

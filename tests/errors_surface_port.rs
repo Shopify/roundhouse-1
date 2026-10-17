@@ -381,26 +381,34 @@ fn unrecorded_options_raise_from_details() {
     );
 }
 
-/// Spinel emits no port and says so for each call.
+/// Spinel emits no port and says so for each call the errors lowering does
+/// not ground; the calls it grounds (`merge!` of a record, `details`, the
+/// iteration of the record's `error_details`) it answers itself.
 #[test]
 fn spinel_refuses_the_calls() {
     let (dir, errors) = app().emit(BuildTarget::Spinel);
+    let refused = |call: &str| {
+        errors.iter().any(|e| {
+            e.contains(&format!("{call}`"))
+                && e.contains("declared by the Ruby-family runtime (runtime/active_model_errors.rb), which spinel does not emit")
+        })
+    };
+    for call in [
+        "ActiveModel::Errors#group_by",
+        "ActiveModel::Errors#where",
+        "ActiveModel::Errors#delete",
+        "ActiveModel::Errors#import",
+    ] {
+        assert!(refused(call), "spinel {call}: {errors:#?}");
+    }
     for call in [
         "ActiveModel::Errors#merge!",
         "ActiveModel::Errors#details",
         "ActiveModel::Errors#each",
         "ActiveModel::Errors#map",
         "ActiveModel::Errors#first",
-        "ActiveModel::Errors#group_by",
-        "ActiveModel::Errors#where",
-        "ActiveModel::Errors#delete",
-        "ActiveModel::Errors#import",
     ] {
-        assert!(
-            errors.iter().any(|e| e.contains(call)
-                && e.contains("declared by the Ruby-family runtime (runtime/active_model_errors.rb), which spinel does not emit")),
-            "spinel {call}: {errors:#?}"
-        );
+        assert!(!refused(call), "spinel answers {call} from error_details: {errors:#?}");
     }
     assert!(!dir.join("runtime/active_model_errors.rb").exists());
 }
@@ -535,9 +543,9 @@ fn errors_surface_matches_native_rails_on_postgresql() {
     assert_eq!(emitted_lines, native, "emitted, port");
 }
 
-/// The blog's form iterates `article.errors.each do |error|` over the
-/// messages (the view lowering reads `error.full_message` as the
-/// message), on every target: no tree is refused the port for it, and
+/// The blog's form iterates `article.errors.each do |error|`, which every
+/// target answers from the record's `error_details` (the `ErrorDetail`
+/// reads `full_message` itself): no tree is refused the port for it, and
 /// the CRuby tree's form does not route it over the Errors.
 #[test]
 fn the_blogs_errors_each_needs_no_port() {
@@ -547,7 +555,7 @@ fn the_blogs_errors_each_needs_no_port() {
         assert!(refused.is_empty(), "{target:?}: {refused:#?}");
         if target == BuildTarget::Ruby {
             let form = std::fs::read_to_string(emitted.join("app/views/articles/_form.rb")).unwrap();
-            assert!(form.contains("article.errors.each do |error|"), "{form}");
+            assert!(form.contains("article.error_details.each do |error|"), "{form}");
             assert!(!form.contains("ErrorAttributes"), "{form}");
         }
     }

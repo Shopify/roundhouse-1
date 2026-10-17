@@ -1,7 +1,7 @@
 module JsonBuilder
   def self.encode_string: (String) -> String
   def self.escape_html_entities: (String) -> String
-  def self.encode_value: (untyped) -> String
+  def self.encode_value: (nil | bool | Integer | Float | String | Symbol | Array[untyped] | Hash[untyped, untyped]) -> String
   def self.finite_float: (Float?) -> Float?
   def self.encode_datetime: (String?) -> String
   def self.encode_string_array: (Array[String]) -> String

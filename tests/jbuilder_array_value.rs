@@ -8,7 +8,7 @@
 //! as Jbuilder writes `json.tags([{name: "b"}, [1, nil]])`.
 //! The Spinel side is `jbuilder_array_value_spinel.rs`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

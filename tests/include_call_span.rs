@@ -2,7 +2,7 @@
 //! itself, not at whichever argument happens to name the unresolved
 //! module — load-bearing when the module sits on a continuation line.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

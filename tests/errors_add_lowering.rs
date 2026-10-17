@@ -312,17 +312,20 @@ end
     );
     assert_eq!(out.matches("Draft.latest").count(), 2, "one read per statement:\n{out}");
     assert!(out.contains("error_record = Draft.latest\n    error_record.errors << \"Title is odd\""), "{out}");
-    assert!(out.contains(r#"error_record.error_details << ActiveRecord::ErrorDetail.new("title", "is odd", "is odd")"#), "{out}");
+    assert!(out.contains(r#"error_record.error_details << ActiveRecord::ErrorDetail.new("title", "is odd", "is odd", "Title is odd", false, true)"#), "{out}");
     assert!(out.contains("error_record.error_details.clear\n    error_record.errors.clear"), "{out}");
     assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
 fn each_push_records_the_error_rails_keeps() {
+    // `why` defaults to a String: a message of unknown type claims no type
+    // or options (`errors.details` raises for it), so only a typed one is
+    // "its own type".
     let (out, diags) = lower_and_emit(
         r#"
 class Draft
-  def validate_body(why)
+  def validate_body(why = "")
     errors.add(:title, :taken)
     errors.add(:title, why)
   end
@@ -358,7 +361,7 @@ end
     assert_eq!(out.matches("next_message").count(), 1, "{out}");
     assert!(out.contains("error_message = reason_for(record)\n    errors << \"Title #{error_message}\""), "{out}");
     assert!(
-        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", error_message, error_message)"#),
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", error_message, error_message, "Title #{error_message}", false, false)"#),
         "{out}"
     );
     assert!(diags.is_empty(), "{diags:?}");

@@ -1271,7 +1271,15 @@ fn every_runtime_method_body_concretely_typed() {
     // its additions since the merge-base (errors.rb statement errors, i18n_locale.rb,
     // transactional saves in connection.rb, mailer headers) are part of the count above
     // when this file is measured, not added to it. Do not raise the ceiling.
-    const CEILING: usize = 1985;
+    // Merge of origin/main at 298fd9a1c (2026-10-17): upstream's additions measured
+    // 2028 (+43: i18n_locale.rb's run-time lookup and plural rules +31,
+    // json_builder.rb's Array / Hash values +5, connection.rb +3, action_mailer.rb
+    // +1, active_support_ext.rb +2, action_dispatch/request.rb +1). Typed down, not
+    // ledgered: the parameters of i18n_locale.rb (`key`, `scope`, `count`, `default:`),
+    // `JsonBuilder.encode_value`, `query_pairs` (active_support_ext.rb) and
+    // `Message.addresses` are the unions their callers pass, where each read of an
+    // `untyped` one was a site. MEASURED 1982.
+    const CEILING: usize = 1982;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

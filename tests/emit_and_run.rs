@@ -3053,7 +3053,7 @@ fn dry_monads_results_run_lowered() {
 /// ingest.
 #[test]
 fn dry_monads_refusals_are_ledgered() {
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
         ("app/services/maybe_service.rb", "class MaybeService\n  include Dry::Monads[:maybe]\n\n  def one\n    Some (1)\n  end\nend\n"),
         ("app/services/typed_service.rb", "class TypedService\n  include Dry::Monads::Result(StandardError)\nend\n"),
         (
@@ -3093,7 +3093,7 @@ fn dry_validation_contracts_run_lowered() {
 /// refusal fails the ingest instead of passing as supported.
 #[test]
 fn dry_validation_load_paths_stay_in_the_app_and_refusals_fail_strict_ingest() {
-    let tree = |path: &str| -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+    let tree = |path: &str| -> roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> {
         [
             (
                 "app/contracts/far_contract.rb".to_string(),

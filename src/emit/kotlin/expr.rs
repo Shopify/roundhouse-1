@@ -883,7 +883,7 @@ fn try_string_builder(e: &Expr) -> Option<String> {
     match e.hint.as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
-        IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
+        IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 return Some(format!("val {} = StringBuilder()", camel(name.as_str())));

@@ -255,10 +255,10 @@ fn errors_hashes_run_like_rails() {
     // The lowering states each short message's start; none is unsplit.
     // A String message is its own type (`expr::ErrorDetail::Message`).
     assert!(
-        post.contains(r#"ActiveModel::ErrorAttributes.add(errors, :author_id, "Author must be set", "Author ", ActiveModel::ErrorAttributes::SHORT, {})"#),
+        post.contains(r#"ActiveModel::ErrorAttributes.add(self.errors, :author_id, "Author must be set", "Author ", ActiveModel::ErrorAttributes::SHORT, {})"#),
         "{post}"
     );
-    assert!(post.contains("ActiveModel::ErrorAttributes.add_humanized(errors, attribute, "), "{post}");
+    assert!(post.contains("ActiveModel::ErrorAttributes.add_humanized(self.errors, attribute, "), "{post}");
     assert_eq!(run.stdout, expected(), "emitted vs Rails' answers");
     assert_eq!(run.stdout, native(), "emitted vs native activerecord");
 }

@@ -4,7 +4,7 @@
 //! (`lower::as_json_poro`). The behavior against the gem's own output is
 //! pinned in `emit_and_run.rs`; these pin the shape and the declines.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
@@ -13,7 +13,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :articles do |t|\n    t.string :title\n    t.datetime :published_at\n  end\nend\n";
 
 fn tree(representer: &str, controller: &str) -> HashMap<PathBuf, Vec<u8>> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/article.rb"),

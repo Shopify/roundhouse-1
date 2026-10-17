@@ -8169,7 +8169,12 @@ fn ingest_concern_hook_items(
                                         // runs (a write through a carried
                                         // `class_attribute`, a replayed
                                         // inherited class-method call);
-                                        // the rest is reported there.
+                                        // the rest is reported there. The
+                                        // statement may still change a
+                                        // carried accessor's visibility
+                                        // or definition, so accessor
+                                        // admission stays conservative.
+                                        unclaimed = true;
                                         items.push(item);
                                     } else {
                                         unclaimed = true;

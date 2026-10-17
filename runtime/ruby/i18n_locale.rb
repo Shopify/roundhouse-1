@@ -101,6 +101,11 @@ module I18n
     out.join(".")
   end
 
+  # `translate_runtime`'s and `lower::i18n_translate`'s spelling of the same.
+  def self.normalize_key(key)
+    normalize_translation_key(key)
+  end
+
   # A run-time key that names a subtree, which `I18n.t` answers as a
   # Hash; no folded translation carries one.
   def self.subtree_translation(key)
@@ -155,7 +160,7 @@ module I18n
     count = options[:count]
     found = runtime_lookup(loc, full, count)
     considered = []
-    defaults = options[:default]
+    defaults = options[:default] #: (String | Symbol | Array[String | Symbol | nil])?
     if found.nil? && !defaults.nil?
       list = defaults.is_a?(Array) ? defaults : [defaults]
       list.each do |default|

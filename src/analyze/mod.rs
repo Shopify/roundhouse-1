@@ -1760,7 +1760,7 @@ impl Analyzer {
         // surface. Keep it in the class-body ledger even when no method is called.
         app.gem_boundary.refused_includes.clear();
         for class in &mut app.library_classes {
-            for written in &class.includes {
+            for (i, written) in class.includes.iter().enumerate() {
                 // `::A::B` (ingest keeps the root where `A` is shadowed)
                 // names the top-level `A::B`, with no lexical lookup.
                 let rooted = written.0.as_str().starts_with("::");
@@ -1773,7 +1773,7 @@ impl Analyzer {
                     if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
                         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                         if construct.as_str() == "gem_requires_rails" && old == &detail)) { continue; }
-                    class.unknown_calls.push(include_refusal("gem_requires_rails", detail));
+                    class.unknown_calls.push(include_refusal("gem_requires_rails", detail, crate::span::Span::synthetic()));
                     continue;
                 }
                 // A Ruby-family runtime module (ActiveSupport::Testing::
@@ -1811,7 +1811,12 @@ impl Analyzer {
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }
-                class.unknown_calls.push(include_refusal("include", detail));
+                // The call's own span, carried alongside `includes`
+                // (`Span::synthetic()` when ingest recorded none: a
+                // lowering-synthesized class). The whole-route planner
+                // blocks only the routes that reach that file.
+                let span = class.include_spans.get(i).copied().unwrap_or_default();
+                class.unknown_calls.push(include_refusal("include", detail, span));
             }
         }
         for model in &mut app.models {
@@ -9096,8 +9101,8 @@ fn class_ids_for_call_receiver(ty: &Ty) -> Vec<ClassId> {
 /// (an unresolved name raises NameError there natively; a
 /// `gem_requires_rails` one is replaced in place by its raise). See
 /// [`is_include_refusal`].
-fn include_refusal(construct: &str, detail: String) -> crate::expr::Expr {
-    let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
+fn include_refusal(construct: &str, detail: String, span: crate::span::Span) -> crate::expr::Expr {
+    let mut refusal = crate::expr::Expr::new(span,
         crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
     refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
         target: None, construct: Symbol::from(construct), detail,

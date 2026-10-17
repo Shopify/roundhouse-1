@@ -1954,8 +1954,18 @@ impl<'a> BodyTyper<'a> {
                     Some(Some(ResolvedConstant::Value { stdlib: true, runtime, .. })) => {
                         match exact_modeled_class(path) {
                             Ty::Var { .. } => {
-                                expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
-                                runtime.as_ref().map_or(Ty::Untyped, |ty| (**ty).clone())
+                                // The `File` path separators and open(2)
+                                // flags are values every target defines
+                                // (CRuby and Spinel answer the same), so
+                                // they are not names only CRuby owns.
+                                let name = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::");
+                                match file_value_constant(&name) {
+                                    Some(ty) => ty,
+                                    None => {
+                                        expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
+                                        runtime.as_ref().map_or(Ty::Untyped, |ty| (**ty).clone())
+                                    }
+                                }
                             }
                             modeled => modeled,
                         }
@@ -8398,5 +8408,16 @@ fn set_discarded(e: &mut Expr, discarded: bool) {
             }
         }
         _ => {}
+    }
+}
+
+/// The `File` value constants every target defines: the path separators
+/// (Strings) and the open(2) flags (Integers).
+fn file_value_constant(name: &str) -> Option<Ty> {
+    match name.strip_prefix("File::")? {
+        "SEPARATOR" | "PATH_SEPARATOR" | "NULL" => Some(Ty::Str),
+        "RDONLY" | "WRONLY" | "RDWR" | "CREAT" | "EXCL" | "TRUNC" | "APPEND" | "NOFOLLOW" | "NONBLOCK"
+        | "NOCTTY" | "SYNC" | "DSYNC" | "BINARY" | "LOCK_SH" | "LOCK_EX" | "LOCK_NB" | "LOCK_UN" => Some(Ty::Int),
+        _ => None,
     }
 }

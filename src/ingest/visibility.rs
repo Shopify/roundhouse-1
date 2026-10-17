@@ -804,17 +804,23 @@ impl Visibility {
     /// to that one message rather than surfacing a new, more specific
     /// one that would read as a second construct now being claimed
     /// supported.
-    fn walk_included(&mut self, body: Option<Node<'_>>, file: &str) -> IngestResult<()> {
+    fn walk_included(&mut self, node: &Node<'_>, body: Option<Node<'_>>, file: &str) -> IngestResult<()> {
+        // The refusals name the block the declaration sits in
+        // (`dynamic_declaration_message`), as a statement-level refusal of
+        // the block would.
         if body.as_ref().is_some_and(marker_mixed_with_unmodeled_call) {
-            return Err(Self::unsupported(
-                file,
-                "conditional or dynamic visibility declarations are not modeled",
-            ));
+            return Err(Self::unsupported(file, Self::dynamic_declaration_message(node)));
         }
         let mut included = Self::default();
         included
             .walk(body, false, file, None)
-            .map_err(|_| Self::unsupported(file, "conditional or dynamic visibility declarations are not modeled"))?;
+            .map_err(|_| Self::unsupported(file, Self::dynamic_declaration_message(node)))?;
+        // A named change of a method this block does not define would be
+        // an override on the includer's own entry, which a concern body
+        // cannot carry; refuse it rather than drop it.
+        if !included.overrides.is_empty() {
+            return Err(Self::unsupported(file, Self::dynamic_declaration_message(node)));
+        }
         self.values.extend(included.values);
         Ok(())
     }
@@ -1528,7 +1534,7 @@ impl Visibility {
                 // nothing to walk and falls back to the dynamic-marker
                 // check, same as any other unrecognized call.
                 if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
-                    self.walk_included(block.body(), file)?;
+                    self.walk_included(node, block.body(), file)?;
                 } else {
                     Self::reject_dynamic_declarations(node, file)?;
                 }

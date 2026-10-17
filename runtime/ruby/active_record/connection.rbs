@@ -354,6 +354,7 @@ module ActiveRecord
     @__touch_owner: Base?
     def _adopt_touch_owner: (Base owner) -> nil
     def _touch_owner: () -> nil
+    def _transaction_committed: () -> nil
     def self._commit_enlisted: () -> nil
     def self._rollback_enlisted: (Integer from) -> nil
     def _restore_after_rollback: (Integer kind) -> nil

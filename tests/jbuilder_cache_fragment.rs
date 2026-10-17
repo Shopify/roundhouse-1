@@ -16,7 +16,7 @@
 //! every time), which campfire's fragment test observed as no cache hits.
 //! A `cache!` beside other pairs stays transparent.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

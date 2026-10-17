@@ -314,6 +314,19 @@ pub const SPLAT_MERGE_BASE: u64 = 1 << 40;
 /// calls: it only ever runs in the view, so it is ActionView's `t`.
 pub const HELPER_COPY_TRANSLATE: u64 = 1 << 41;
 
+/// An `Expr` held by an [`IrHint`]. Hints compare by kind, so it is equal
+/// to any other: the expression is data for an emitter, not identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PortOriginal(pub Box<Expr>);
+
+impl PartialEq for PortOriginal {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PortOriginal {}
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -388,6 +401,12 @@ pub enum IrHint {
     /// (`error.full_message` read as `error`): it iterates the messages,
     /// so it is not Enumerable over the Errors (`errors_enumerable`).
     ErrorMessagesEach,
+    /// On the lowered read of an `errors` call the analyzer routed to the
+    /// runtime's port (`ERRORS_PORT_CALL`): the call as written
+    /// (`lower::errors_index::port_form`). The CRuby and JRuby trees that
+    /// carry `ActiveModel::ErrorAttributes` write it back; every other
+    /// emit writes the lowered read.
+    ErrorsPortOriginal(PortOriginal),
     /// On the reader send `lower::assoc_loaded` collapsed
     /// `record.association(:name).target` onto (`record.name`). Rails'
     /// `target` answers the loaded record(s), nil or [] when nothing has

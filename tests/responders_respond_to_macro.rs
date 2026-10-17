@@ -14,7 +14,7 @@
 //! (`unwrap_respond_to`/PR #843's negotiation), which is unrelated and
 //! carries a block — this call never reaches the blockless branch
 //! `respond_to_macro_is_consumed` guards.
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

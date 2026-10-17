@@ -45,6 +45,19 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 
+/// `new`, the lowered read of a call the analyzer routed to the runtime's
+/// `ActiveModel::ErrorAttributes` port (`expr::ERRORS_PORT_CALL`), keeping
+/// `orig`, the call as written. The trees that carry the port write it
+/// back (`emit::ruby::emit_expr`): it answers Rails' own `ActiveModel::
+/// Error`s, which the lowered read of the record's `error_details` does
+/// not. Every other target emits `new`.
+pub(crate) fn port_form(orig: Expr, mut new: Expr) -> Expr {
+    if orig.decisions & crate::expr::ERRORS_PORT_CALL != 0 && new.hint.is_none() {
+        new.hint = Some(crate::expr::IrHint::ErrorsPortOriginal(crate::expr::PortOriginal(Box::new(orig))));
+    }
+    new
+}
+
 /// Rewrite `errors[:field]` reads across every hook, test and view body.
 /// Returns the residue ledger:
 /// recognizable `errors[…]` sites left dynamic, with the reason.
@@ -409,6 +422,11 @@ fn rewrite_delete(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     }
     let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
     let (Some(field), true) = (delete_field(args), super::errors_add::owner_reads_once(owner.as_ref())) else {
+        // Left to the runtime's port (`ERRORS_PORT_CALL`), which answers it
+        // on the trees that carry it; the others refuse it by name.
+        if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
+            return;
+        }
         let mut d = crate::lower::residue_diagnostic(
             "errors_index",
             "errors.delete",
@@ -427,7 +445,8 @@ fn rewrite_delete(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     errors.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
     args.insert(0, errors);
     args.push(str_expr(span, &field));
-    *expr = call;
+    let orig = expr.clone();
+    *expr = port_form(orig, call);
 }
 
 /// The field, whether the type is a Symbol, and the type, when each is a literal.
@@ -460,6 +479,12 @@ fn rewrite_of_kind(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     // Rails' `added?` is `strict_match?`: the error's options, `count:` or `value:`, must be the ones asked, and none are.
     let strict = method.as_str() == "added?";
     let Some((field, symbolic, kind)) = of_kind_args(args) else {
+        // The analyzer routed it to the runtime's port (`ERRORS_PORT_CALL`),
+        // which answers any field and type; a tree without the port
+        // refuses it by name (`analyze::runtime_reads`).
+        if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
+            return;
+        }
         let mut d = crate::lower::residue_diagnostic(
             "errors_index",
             if strict { "errors.added?" } else { "errors.of_kind?" },
@@ -475,12 +500,15 @@ fn rewrite_of_kind(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
     if !symbolic {
         let messages = messages_on(owner.clone(), &field, span);
-        *expr = send(span, messages, "include?", vec![str_expr(span, &kind)], Ty::Bool);
-        let ExprNode::Send { parenthesized, .. } = &mut *expr.node else { unreachable!() };
+        let mut call = send(span, messages, "include?", vec![str_expr(span, &kind)], Ty::Bool);
+        let ExprNode::Send { parenthesized, .. } = &mut *call.node else { unreachable!() };
         *parenthesized = true;
+        let orig = expr.clone();
+        *expr = port_form(orig, call);
         return;
     }
-    *expr = details_filter(span, owner.clone(), "any?", &field, Some((symbolic, &kind)), strict, Ty::Bool);
+    let orig = expr.clone();
+    *expr = port_form(orig, details_filter(span, owner.clone(), "any?", &field, Some((symbolic, &kind)), strict, Ty::Bool));
 }
 
 /// `<owner>.error_details.<method> { |error| error.attribute == "field" && <type matches> }`, typed.
@@ -559,6 +587,11 @@ fn rewrite_where(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         return;
     }
     let Some((field, kind)) = where_args(args) else {
+        // Left to the runtime's port (`ERRORS_PORT_CALL`), which answers it
+        // on the trees that carry it; the others refuse it by name.
+        if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
+            return;
+        }
         let mut d = crate::lower::residue_diagnostic(
             "errors_index",
             "errors.where",
@@ -573,7 +606,8 @@ fn rewrite_where(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let span = expr.span;
     let ExprNode::Send { recv: owner, .. } = &*reader.node else { unreachable!("an errors reader") };
     let ty = expr.ty.clone().unwrap_or_else(error_array_ty);
-    *expr = details_filter(span, owner.clone(), "select", &field, kind.as_ref().map(|(s, k)| (*s, k.as_str())), false, ty);
+    let orig = expr.clone();
+    *expr = port_form(orig, details_filter(span, owner.clone(), "select", &field, kind.as_ref().map(|(s, k)| (*s, k.as_str())), false, ty));
 }
 
 pub(crate) fn error_array_ty() -> Ty {
@@ -609,7 +643,10 @@ fn rewrite_to_hash(expr: &mut Expr) {
         "details" if is_model_errors_read(reader) => ("errors_details", details_ty()),
         _ => return,
     };
-    *expr = details_call(expr.span, reader, helper, ty);
+    let call = details_call(expr.span, reader, helper, ty);
+    // `to_hash`, `as_json` and `attribute_names` were lowered for every tree
+    // before the port answered `details`; only that read keeps its call.
+    *expr = if method.as_str() == "details" { port_form(expr.clone(), call) } else { call };
 }
 
 // Not the Array of full messages, nor `errors_to_hash`: Rails' `render json:` writes `errors.as_json` keyed by attribute, and `Base#errors_json` reaches every target with String keys, which JSON writes the same.

@@ -19,6 +19,7 @@ module I18n
   end
 
   def self.normalize_translation_key: (String key) -> String
+  def self.normalize_key: (String key) -> String
   def self.subtree_translation: (String key) -> String
   def self.missing_raises: (bool raises, String flipped) -> bool
   def self.missing_translation: (String key, bool raises) -> String
@@ -30,13 +31,13 @@ module I18n
   class InvalidPluralizationData < ArgumentError
   end
 
-  def self.translate_runtime: (untyped key, Hash[Symbol, untyped] options, String lazy_scope, bool in_view, bool raises) -> String
-  def self.scope_text: (untyped scope) -> String
+  def self.translate_runtime: (String | Symbol key, Hash[Symbol, untyped] options, String lazy_scope, bool in_view, bool raises) -> String
+  def self.scope_text: ((String | Symbol | Array[String | Symbol])? scope) -> String
   def self.html_safe_key?: (String key) -> bool
-  def self.runtime_lookup: (String loc, String full, untyped count) -> String?
-  def self.plural_form: (Hash[String, String] leaves, String loc, String node, untyped count) -> String
+  def self.runtime_lookup: (String loc, String full, (Integer | Float | String)? count) -> String?
+  def self.plural_form: (Hash[String, String] leaves, String loc, String node, Integer | Float | String count) -> String
   def self.plural_rule: (String loc) -> Array[String]?
-  def self.plural_category: (Array[String] rule, untyped count) -> String
+  def self.plural_category: (Array[String] rule, Integer | Float | String count) -> String
   def self.plural_key: (Array[String] rule, Hash[String, Float] ops) -> String
   def self.plural_bool: (Array[String] rule, Hash[String, Float] ops) -> bool
   def self.plural_num: (Array[String] rule, Hash[String, Float] ops) -> Float

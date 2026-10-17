@@ -644,6 +644,15 @@ fn gated_method(expr: &Expr) -> Option<(&'static str, String)> {
 /// A routed call the accumulator answered before the port did (an
 /// iteration or question its Array answers over the messages): a tree
 /// without the port keeps that answer rather than refuse it, as it did.
+/// An iteration the errors lowering re-pointed at the record's
+/// `error_details` (`lower::errors_index::iterate_details`): every tree
+/// answers it, and the trees that carry the port write it back onto
+/// `errors` (`emit::ruby::expr::error_attribute_push`).
+fn lowered_iteration(expr: &Expr) -> bool {
+    expr.decisions & crate::expr::ERRORS_PORT_CALL != 0
+        && matches!(&*expr.node, ExprNode::Send { recv: Some(r), .. } if crate::emit::ruby::is_error_details_read(r))
+}
+
 fn accumulator_answers(expr: &Expr) -> bool {
     expr.decisions & crate::expr::ERRORS_PORT_CALL != 0
         && matches!(&*expr.node, ExprNode::Send { method, .. }
@@ -680,7 +689,13 @@ pub(crate) fn reads_error_attribute_names(app: &App) -> bool {
         if *found {
             return;
         }
-        if gated_method(e).is_some_and(|(needs, _)| needs == "ActiveModel::ErrorAttributes") {
+        // The lowered read of a call routed to the port is written back as
+        // the call on the trees that carry it (`lower::errors_index::port_form`).
+        let routed = match &e.hint {
+            Some(crate::expr::IrHint::ErrorsPortOriginal(original)) => &*original.0,
+            _ => e,
+        };
+        if gated_method(routed).is_some_and(|(needs, _)| needs == "ActiveModel::ErrorAttributes") {
             *found = true;
             return;
         }
@@ -727,7 +742,7 @@ fn inflector_rules_read(expr: &Expr) -> Option<String> {
 }
 
 fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut Vec<RuntimeRead>) {
-    if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs) && !accumulator_answers(expr)) {
+    if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs) && !accumulator_answers(expr) && !lowered_iteration(expr)) {
         out.push(RuntimeRead { span: expr.span, name: needs.to_string(), shown, in_test, declaration: false });
     }
     const INFLECTIONS: &str = "ActiveSupport::Inflector::Inflections";

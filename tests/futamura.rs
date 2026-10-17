@@ -455,13 +455,21 @@ fn ingest_gap_in_a_helper_module_blocks_every_route_that_renders_a_view() {
 end
 "#);
     write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
-    // Mixing a `cattr_accessor ... default:` with a source `@@` write
-    // is a recorded ingest gap (`class-variable initializer with
-    // non-nil value`), on `application_helper.rb` — a file nothing in
-    // `widgets#index`'s own reach ever calls into.
+    // A visibility marker under a load-time condition is a recorded
+    // ingest gap (`conditional or dynamic visibility declarations are
+    // not modeled`), on `application_helper.rb` — a file nothing in
+    // `widgets#index`'s own reach ever calls into. (The original
+    // `cattr_accessor ... default:` + source `@@` write shape is no
+    // longer a gap on r13: library classes keep native class variables
+    // with any initializer.)
     write(&src, "app/helpers/application_helper.rb", br#"module ApplicationHelper
-  cattr_accessor :locale, default: "en"
-  @@locale = "fr"
+  if ENV["PRIVATE_HELPERS"]
+    private
+  end
+
+  def helper_value
+    "en"
+  end
 end
 "#);
 
@@ -638,7 +646,9 @@ end
         .unwrap();
     assert!(run_ruby.status.success(), "{}", String::from_utf8_lossy(&run_ruby.stderr));
     let plain = fs::read_to_string(out_ruby.join("app/models/gadget_tools.rb")).unwrap();
-    assert!(plain.contains("include ExternalGem::Mixin\n") && !plain.contains("if defined?"), "{plain}");
+    // Not `!contains("if defined?")`: a file the app's autoloader may
+    // shadow opens with `return if defined?(RoundhouseAutoload) && …`.
+    assert!(plain.contains("include ExternalGem::Mixin\n") && !plain.contains("Mixin if defined?"), "{plain}");
 
     fs::remove_dir_all(&src).unwrap();
     fs::remove_dir_all(&out).unwrap();

@@ -350,16 +350,16 @@ module CrubyCleanupRegressions
         e
       end
       expected_class = operation == :step ? SQLite3::SQLException : SQLite3::RangeException
-      # A step error leaves as Rails' translation (`Db.translate`): a
-      # StatementInvalid naming the statement, whose `cause` is the
-      # driver's own exception object. Binds are not translated.
-      driver_error = error
+      # A failed statement leaves as Rails' translation: a StatementInvalid
+      # whose `cause` is the driver's own exception object. A step's
+      # (`Db.translate`) also names the statement; a bind's
+      # (`Db.raise_statement_error`) is keyed on SQLite's message alone.
+      check("#{operation}: translated as Rails' adapter does", error.instance_of?(ActiveRecord::StatementInvalid))
       if operation == :step
-        check("step: translated as Rails' adapter does", error.instance_of?(ActiveRecord::StatementInvalid))
         check("step: translation names the statement", error.sql == sql)
         check("step: translation names the driver error", error.message == "SQLite3::SQLException: #{original_error&.message}")
-        driver_error = error.cause
       end
+      driver_error = error.cause
       check("#{operation}: preserve the driver exception class", driver_error.instance_of?(expected_class))
       check("#{operation}: preserve the driver exception object", driver_error.equal?(original_error))
       check("#{operation}: cleanup closes the failed statement", raw.closed?)

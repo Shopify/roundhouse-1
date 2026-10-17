@@ -6,7 +6,7 @@
 //! and emission, so two apps never see each other's facts, whatever order
 //! or thread they are processed in. An app that lists none is unchanged.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 
@@ -106,7 +106,6 @@ fn extensions_load_from_roundhouse_yml_in_listing_order() {
 fn bad_extensions_entries_are_refused_with_the_config_path() {
     for (config, wanted) in [
         ("extensions: [\"../shared\"]\n", "extensions entries must be non-empty app-relative directories without '..': \"../shared\""),
-        ("extensions: [\"/opt/shared\"]\n", "extensions entries must be non-empty app-relative directories without '..': \"/opt/shared\""),
         ("extensions: [\"\"]\n", "extensions entries must be non-empty app-relative directories without '..': \"\""),
         ("extensions: [ext, ./ext]\n", "extensions entries must be listed once: \"./ext\""),
         ("extensions: ext\n", "invalid type"),
@@ -116,6 +115,36 @@ fn bad_extensions_entries_are_refused_with_the_config_path() {
         assert_eq!(file, "roundhouse.yml", "{config}");
         assert!(message.contains(wanted), "{config}: {message}");
     }
+}
+
+/// Core's harness lists its extension (outside the app) by absolute path, so
+/// an absolute entry is the directory itself, refused only when it is not
+/// one or climbs with `..`. Upstream refused every absolute entry; this
+/// branch's consumers (core-transpile's `extensions/core`) need them.
+#[test]
+fn an_absolute_extensions_entry_names_the_directory_itself() {
+    let root = std::env::temp_dir().join(format!("roundhouse_extension_absolute_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("gems.yml"), "runtime_gems:\n  - {constant: Widget, gem: widgets}\n").unwrap();
+    std::fs::write(app.join("roundhouse.yml"), format!("extensions: [{}]\n", shared.display())).unwrap();
+
+    let loaded = ingest_app(&app).expect("an absolute extension directory must load");
+    let gems: Vec<&str> = loaded.extensions.runtime_gems.iter().map(|row| row.gem.as_str()).collect();
+    assert_eq!(gems, ["widgets"]);
+
+    let missing = root.join("missing");
+    std::fs::write(app.join("roundhouse.yml"), format!("extensions: [{}]\n", missing.display())).unwrap();
+    let Err(IngestError::Parse { file, message }) = ingest_app(&app) else { panic!("a missing absolute directory must fail") };
+    assert_eq!((file, message.as_str()), (missing.display().to_string(), "not a directory"));
+
+    std::fs::write(app.join("roundhouse.yml"), format!("extensions: [{}/../shared]\n", shared.display())).unwrap();
+    let Err(IngestError::Parse { message, .. }) = ingest_app(&app) else { panic!("an absolute entry with '..' must fail") };
+    assert!(message.contains("extensions entries must be non-empty app-relative directories without '..'"), "{message}");
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

@@ -19,7 +19,7 @@ module ActiveSupport
   # `{ page: 2, q: params[:q] }.to_query` passes Symbols, and spinel
   # refuses a Symbol-keyed Hash against a declared `Hash[String, _]`.
   def self.to_query: (Hash[untyped, Roundhouse::ParamValue] value) -> String
-  def self.query_pairs: (Hash[untyped, Roundhouse::ParamValue] hash, String namespace) -> String
+  def self.query_pairs: (Hash[String | Symbol | Integer, Roundhouse::ParamValue] hash, String namespace) -> String
   def self.query_escape: (String text) -> String
   def self.query_value: (String name, Roundhouse::ParamValue item) -> String
   def self.presence: (untyped value) -> untyped

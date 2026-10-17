@@ -292,7 +292,14 @@ impl Overlay {
             roundhouse::project::target_files(&app, &source, target)
         });
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
-        let files = files.expect("target files");
+        let files = match files {
+            Ok(files) => files,
+            // A refusal at target level (`gems::extension_gem_refusals`) is
+            // also an error diagnostic; no tree is written, and the
+            // caller's assertions read `errors`.
+            Err(_) if !errors.is_empty() => return (emitted, app, errors),
+            Err(message) => panic!("target files: {message:?}"),
+        };
         roundhouse::project::write_to_dir(&files, &emitted).expect("write ruby target tree");
         // The verbatim passthrough the CLI writes after the tree.
         roundhouse::project::write_binary_assets(&app.binary_assets, &files, &emitted)

@@ -24,7 +24,7 @@ module ActionMailer
     @body: String
 
     def initialize: (Hash[Symbol, untyped] opts, ?String? text_body, ?String? html_body) -> void
-    def self.addresses: (untyped value) -> Array[String]?
+    def self.addresses: ((String | Array[String])? value) -> Array[String]?
     def to: () -> Array[String]?
     def from: () -> Array[String]?
     def cc: () -> Array[String]?

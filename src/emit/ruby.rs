@@ -40,6 +40,7 @@ pub mod source_markers;
 pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
+pub(crate) use expr::is_error_details_read;
 pub use expr::{emit_expr, with_error_attributes, with_native_keyword_splats, with_singleton_scoped};
 pub(crate) use expr::native_keywords;
 

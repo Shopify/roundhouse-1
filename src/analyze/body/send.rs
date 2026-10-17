@@ -725,6 +725,10 @@ impl<'a> BodyTyper<'a> {
             // ActiveModel::Errors iteration yields an Error to the block,
             // as the Array of its Errors does (`expr::errors_enumerable`).
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
+                if method.as_str() == "count" {
+                    let Ty::Array { elem } = active_model_error_objects() else { unreachable!() };
+                    return Some(vec![(*elem).clone()]);
+                }
                 self.block_params_for(Some(&active_model_error_objects()), method, class_object_receiver)
             }
             // Generic class-registry lookup: when the method is

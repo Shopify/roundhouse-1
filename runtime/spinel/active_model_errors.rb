@@ -351,6 +351,17 @@ module ActiveModel
         raw_type || :invalid
       end
 
+      # What the lowered iteration over an app's errors reads of each
+      # (`lower::errors_index`): the record `error_details` keeps its type
+      # as a String and whether it was a Symbol.
+      def symbolic
+        type.is_a?(Symbol)
+      end
+
+      def kind
+        type.is_a?(Symbol) ? type.to_s : type
+      end
+
       def options
         options = keyed![4]
         raise ErrorAttributes.unrecorded("options", @full, @record) if options.equal?(UNKNOWN)

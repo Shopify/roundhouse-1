@@ -523,6 +523,11 @@ fn rails_string_blank(e: &Expr) -> Option<String> {
     Some(emit_send_base(Some(value), &Symbol::from("blank?"), &[], false))
 }
 
+/// `<owner>.error_details`, the list the errors lowering iterates.
+pub(crate) fn is_error_details_read(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { method, args, block: None, .. } if method.as_str() == "error_details" && args.is_empty())
+}
+
 /// The error accumulator is an `Array[String]` of full messages, which
 /// drops the attribute each was added for and its short message; Rails'
 /// `errors.attribute_names`, `to_hash`, `as_json` and `messages` answer
@@ -548,6 +553,11 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
     if !ERROR_ATTRIBUTES.with(Cell::get) {
         return None;
     }
+    // The lowered read of a call routed to the port: the port answers the
+    // call as written (`lower::errors_index::port_form`).
+    if let Some(crate::expr::IrHint::ErrorsPortOriginal(original)) = &e.hint {
+        return Some(emit_expr(&original.0));
+    }
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return None };
     // Enumerable over Rails' collection (`expr::errors_enumerable`): the
     // same call over `ActiveModel::ErrorAttributes.objects(errors)`, the
@@ -560,12 +570,36 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
             span,
             ExprNode::Const { path: vec![Symbol::from("ActiveModel"), Symbol::from("ErrorAttributes")] },
         );
+        // The errors lowering re-points an iteration at the record's
+        // `error_details` (`lower::errors_index::iterate_details`) and
+        // reads its block's error as an `ErrorDetail` (`kind`,
+        // `symbolic`); the port yields Rails' own Errors, which answer
+        // both, so the iteration asks it of the `errors` it was written on.
+        let errors = match &*recv.node {
+            ExprNode::Send { recv: owner, method: reader, args: reader_args, block: None, .. }
+                if reader.as_str() == "error_details" && reader_args.is_empty() =>
+            {
+                let mut errors = Expr::new(
+                    recv.span,
+                    ExprNode::Send {
+                        recv: owner.clone(),
+                        method: Symbol::from("errors"),
+                        args: Vec::new(),
+                        block: None,
+                        parenthesized: false,
+                    },
+                );
+                errors.ty = Some(Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveModel::Errors")), args: vec![].into() });
+                errors
+            }
+            _ => recv.clone(),
+        };
         let objects = Expr::new(
             span,
             ExprNode::Send {
                 recv: Some(port),
                 method: Symbol::from("objects"),
-                args: vec![recv.clone()],
+                args: vec![errors],
                 block: None,
                 parenthesized: true,
             },

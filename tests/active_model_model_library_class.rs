@@ -105,7 +105,7 @@ end
     );
     assert!(
         src.contains(
-            "self.errors << \"Href can't be blank\"\n        self.error_details << ActiveRecord::ErrorDetail.new(\"href\", \"blank\", \"can't be blank\")"
+            "self.errors << \"Href can't be blank\"\n        self.error_details << ActiveRecord::ErrorDetail.new(\"href\", \"blank\", \"can't be blank\", \"Href can't be blank\", true, true)"
         ),
         "{src}"
     );

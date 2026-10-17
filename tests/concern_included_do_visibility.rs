@@ -19,7 +19,7 @@
 //! proof here is ingest succeeding where it used to fail loud, which is
 //! the whole of what `src/ingest/visibility.rs` controls.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

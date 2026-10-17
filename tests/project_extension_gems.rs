@@ -1,6 +1,6 @@
 //! Extension facts must describe the gem that runs, not just a typed name.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};

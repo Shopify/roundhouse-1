@@ -1506,9 +1506,10 @@ pub(crate) const CRUBY_ONLY_STDLIB: &[(&str, bool, &[(&str, fn() -> Ty)])] = &[
     ("Errno::ETIMEDOUT", true, &[]),
     ("Errno::EADDRINUSE", true, &[]),
     ("Errno::EHOSTUNREACH", true, &[]),
-    // Core since Ruby 3.2: an `IO#timeout` expiry (Essentials'
-    // OidService retries it).
-    ("IO::TimeoutError", true, &[]),
+    // `IO::TimeoutError` (Core since Ruby 3.2: an `IO#timeout` expiry,
+    // which Essentials' OidService retries) is registered with the
+    // standard exceptions above, which every runtime keeps, so it is not
+    // CRuby-only.
     ("Timeout", false, &[("timeout", untyped)]),
     ("Timeout::Error", true, &[]),
     ("Timeout::ExitException", true, &[]),

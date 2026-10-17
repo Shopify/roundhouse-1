@@ -13,7 +13,7 @@
 //! unescaped, as `h` leaves an html_safe String alone. `h(x)` keeps
 //! escaping everywhere else.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
