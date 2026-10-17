@@ -3217,7 +3217,8 @@ module ActiveRecord
     # whatever `_table_sql` spelled (bare for a plain SQLite name, already
     # quoted for a keyword or on PostgreSQL).
     def quoted_table
-      @table.start_with?("\"") ? @table : "\"#{@table}\""
+      name = @table.to_s
+      name.start_with?("\"") ? name : "\"" + name + "\""
     end
 
     # The WHERE clause a bulk WRITE takes — the one place `delete_all`
