@@ -1669,6 +1669,14 @@ impl<'s, 'a> Walk<'s, 'a> {
         };
         for line in text.lines() {
             let word: String = line.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            // The PostgreSQL CRuby tree's base registers a callback or
+            // validation when the string runs, as a direct call does (Core's
+            // `acts_as_list` string `before_create`s its hook).
+            if runtime_registers_at_class_body(&word)
+                && self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+            {
+                continue;
+            }
             if is_model_dsl(&word) {
                 return Err(format!(
                     "{}'s `class_eval` string calls `{word}`, which the lowered model declares statically from its body",
