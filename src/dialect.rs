@@ -609,6 +609,12 @@ pub enum Association {
         /// loaded record, its errors nested under the association.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
+        /// `autosave: false`: the owner's save never saves the collection's
+        /// records, not even new ones (`save_collection_association`
+        /// inserts only when `autosave != false`), and its `validate`
+        /// still runs.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_autosave: bool,
         /// `primary_key: :source_id` — the OWNER column the foreign key
         /// matches (Rails' `join_primary_key`). `None` means the owner's
         /// own key, `id`. Every reader of this association must go

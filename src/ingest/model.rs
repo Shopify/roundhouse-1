@@ -3367,6 +3367,7 @@ pub(super) fn parse_association(
             scope_owner,
             skip_validation: validate == Some(false),
             autosave: autosave == Some(true),
+            no_autosave: autosave == Some(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
             extra_keys,
         }),

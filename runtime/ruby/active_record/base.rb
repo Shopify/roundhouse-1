@@ -767,12 +767,15 @@ module ActiveRecord
     # is false for both a new and a destroyed record, so a destroyed one
     # is not new: `new_record?` stays false after `destroy`, as in Rails.
 
+    # Core's BulkSqlOperations::Create marks the rows it inserted with
+    # `record.instance_variable_set(:@new_record, false)`, Rails' own flag
+    # (the CRuby `initialize_dup` clears it again with `@persisted`).
     def persisted?
-      @persisted
+      @persisted || (@new_record == false && !@destroyed)
     end
 
     def new_record?
-      !@persisted && !@destroyed
+      !persisted? && !@destroyed
     end
 
     def destroyed?
