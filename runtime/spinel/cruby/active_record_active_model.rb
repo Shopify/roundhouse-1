@@ -225,5 +225,13 @@ module ActiveRecord # :nodoc:
     def _read_attribute(attr_name)
       self[attr_name]
     end
+
+    # attribute_methods.rb: whether the attribute holds a present value,
+    # not nil and not an empty String or collection (`source.capitalize!
+    # if attribute_present?("source")`).
+    def attribute_present?(attr_name)
+      value = _read_attribute(attr_name)
+      !value.nil? && !(value.respond_to?(:empty?) && value.empty?)
+    end
   end
 end

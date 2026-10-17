@@ -1478,11 +1478,15 @@ use crate::lower::arel::visitor::concat_chain as arel_concat;
 /// when that is part of the key, else its first column, is the one the
 /// INSERT answers (`composite_key::rekey` builds the tuple around it).
 fn key_column<'a>(model: &Model, table: &'a Table) -> Option<&'a crate::schema::Column> {
-    super::primary_key_column(table)
-        .or_else(|| {
-            let named = model.primary_key.as_ref()?;
-            table.columns.iter().find(|c| &c.name == named)
-        })
+    // `self.primary_key = :id` names the key over the column the table's
+    // primary key constraint is on (Core's `merchant_subscriptions_products`
+    // is keyed in the database on `uuid`, and in the model on `id`): Rails
+    // finds, writes and answers the record by the declared one.
+    model
+        .primary_key
+        .as_ref()
+        .and_then(|named| table.columns.iter().find(|c| &c.name == named))
+        .or_else(|| super::primary_key_column(table))
         .or_else(|| {
             let keys = &model.composite_primary_key;
             let named = keys.iter().find(|k| k.as_str() == "id").or(keys.first())?;

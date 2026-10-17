@@ -670,6 +670,41 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 block_param: None,
             });
         }
+        // `name?` (attribute_methods/query.rb) over a Boolean attribute:
+        // the reader's value. Other types answer a presence test the
+        // lowering does not claim.
+        let predicate = Symbol::from(format!("{}?", name.as_str()));
+        if is_bool && !methods.iter().any(|m| m.name == predicate) {
+            methods.push(MethodDef {
+                visibility: crate::dialect::MethodVisibility::Public,
+                unsupported_formals: None,
+                has_anonymous_block: false,
+                name_span: crate::span::Span::synthetic(),
+                name: predicate,
+                receiver: MethodReceiver::Instance,
+                params: Vec::new(),
+                body: with_ty(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send {
+                            recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                            method: name.clone(),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ),
+                    Ty::Bool,
+                ),
+                signature: Some(super::fn_sig(vec![], Ty::Bool)),
+                effects: EffectSet::default(),
+                enclosing_class: Some(model.name.0.clone()),
+                kind: AccessorKind::Method,
+                is_async: false,
+                mutates_self: false,
+                block_param: None,
+            });
+        }
         if !methods.iter().any(|m| m.name == setter) {
             let value = Symbol::from("value");
             let value_ref = Expr::new(
