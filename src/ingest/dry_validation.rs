@@ -362,6 +362,8 @@ pub(super) fn lower_dry_validation(
         }
     }
     let mut any = false;
+    // The statements this lowering read from the sources (`is_read_config`) are not ones the emitted file program drops.
+    let mut read_spans = Vec::new();
     for lc in &mut app.library_classes {
         let name = lc.name.0.as_str().to_string();
         if !parent_of.contains_key(&name) || !lowered(&name) {
@@ -370,7 +372,13 @@ pub(super) fn lower_dry_validation(
         if has_schema(&name) && !built.contains_key(&name) {
             continue;
         }
-        lc.unknown_calls.retain(|call| !is_schema_definition(call) && !is_rule(call) && !is_read_config(call));
+        lc.unknown_calls.retain(|call| {
+            let read = is_read_config(call);
+            if read {
+                read_spans.push(call.span);
+            }
+            !is_schema_definition(call) && !is_rule(call) && !read
+        });
         if let Some(methods) = built.remove(&name) {
             let mut methods = methods;
             methods.append(&mut lc.methods);
@@ -382,6 +390,8 @@ pub(super) fn lower_dry_validation(
         }
         any = true;
     }
+    app.file_statement_gaps.retain(|gap| !read_spans.contains(&gap.span));
+    drop_read_statements(app, &read_spans);
     for (constant, class, source) in &schema_classes {
         let (owner, local) = constant.rsplit_once("::").unwrap_or(("", constant));
         let Some(mut classes) = parse_classes(source) else { continue };
@@ -403,6 +413,33 @@ pub(super) fn lower_dry_validation(
         app.library_classes.extend(stand_ins(&used));
     }
     Ok(())
+}
+
+/// The file programs name what they cannot carry; a statement this lowering
+/// read from the sources is not one, and a program left with only its
+/// declarations is no program (`library_class::file_program`).
+fn drop_read_statements(app: &mut App, read_spans: &[crate::span::Span]) {
+    use crate::app::ProgramItem;
+    fn prune(items: &mut Vec<ProgramItem>, spans: &[crate::span::Span]) -> bool {
+        let before = items.len();
+        items.retain(|item| !matches!(item, ProgramItem::NotCarried { span, .. } if spans.contains(span)));
+        let mut changed = items.len() != before;
+        for item in items.iter_mut() {
+            if let ProgramItem::Branch { then_items, else_items, .. } = item {
+                changed |= prune(then_items, spans);
+                changed |= prune(else_items, spans);
+            }
+        }
+        changed
+    }
+    if read_spans.is_empty() {
+        return;
+    }
+    app.file_programs.retain_mut(|program| {
+        let changed = prune(&mut program.items, read_spans);
+        let runs = program.items.iter().any(|item| !matches!(item, ProgramItem::Declared(_)));
+        !changed || runs
+    });
 }
 
 /// `Dry::Schema.Params do ... end`, `.JSON`, `.define`: the processor and
@@ -442,12 +479,13 @@ fn is_schema_definition(call: &Expr) -> bool {
 /// `Dry::Validation.load_extensions(…)` (`dry_monads`). A lowered
 /// contract does not carry it, and it is no declaration to refuse.
 fn is_read_config(call: &Expr) -> bool {
-    if call.decisions & crate::expr::BODY_STATEMENT == 0 {
-        return false;
-    }
     let ExprNode::Send { recv: Some(recv), method, .. } = &*call.node else { return false };
+    // A call on a constant is captured as written, not as a body statement.
     if is_const(recv, "Dry::Validation") && method.as_str() == "load_extensions" {
         return true;
+    }
+    if call.decisions & crate::expr::BODY_STATEMENT == 0 {
+        return false;
     }
     let mut root = recv;
     while let ExprNode::Send { recv: Some(inner), .. } = &*root.node {
@@ -1879,15 +1917,17 @@ const LOWERED: &[(&str, &str, &[&str])] = &[
         &[],
     ),
     ("coerce_string", "def self.coerce_string(value)\n  String(value)\nrescue ArgumentError, TypeError\n  value\nend", &[]),
+    // `RangeError` is FloatDomainError's parent (a NaN or an infinity has no Integer); it is core on every
+    // target, where FloatDomainError is CRuby's own (`CRUBY_ONLY_STDLIB`).
     (
         "coerce_integer",
-        "def self.coerce_integer(value)\n  Integer(value)\nrescue ArgumentError, TypeError, FloatDomainError\n  value\nend",
+        "def self.coerce_integer(value)\n  Integer(value)\nrescue ArgumentError, TypeError, RangeError\n  value\nend",
         &[],
     ),
     ("coerce_float", "def self.coerce_float(value)\n  Float(value)\nrescue ArgumentError, TypeError\n  value\nend", &[]),
     (
         "params_integer",
-        "def self.params_integer(value)\n  value.is_a?(String) ? Integer(value, 10) : Integer(value)\nrescue ArgumentError, TypeError, FloatDomainError\n  value\nend",
+        "def self.params_integer(value)\n  value.is_a?(String) ? Integer(value, 10) : Integer(value)\nrescue ArgumentError, TypeError, RangeError\n  value\nend",
         &[],
     ),
     (
