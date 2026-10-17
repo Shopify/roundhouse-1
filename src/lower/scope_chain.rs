@@ -4585,13 +4585,17 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         return Some(m);
                     }
                     let seed = ctx.relation_new(span, &m);
+                    let ends_chain = CLASS_ROOT_TERMINALS.contains(&method.as_str());
                     if method.as_str() == "all" {
                         *expr = seed;
                     } else {
                         let _ = lower_relation_args(&m, &method, &mut args, ctx);
                         *expr = put(span, Some(seed), method, args, block, parenthesized);
                     }
-                    return Some(m);
+                    // A class-root terminal (`pluck`, `ids`, ...) answers an
+                    // Array or a count: no relation to thread, so a `take(n)`
+                    // after it stays `Array#take`.
+                    return (!ends_chain).then_some(m);
                 }
                 // `Developer.first(2)` / `.last(2)`: the counted forms are
                 // Relation terminals (`first_n` / `last_n`). The runtime's

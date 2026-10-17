@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only `ActionMailer::Rescuable` (actionmailer/lib/action_mailer/
 # rescuable.rb) and the `AbstractController::Base` class surface a mailer
 # class answers: a mailer class takes `rescue_from` handlers, and

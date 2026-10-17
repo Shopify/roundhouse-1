@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActiveRecord counter writes: `update_counters`,
 # `increment_counter` / `decrement_counter` and `increment!` /
 # `decrement!`, as Rails 8's counter_cache.rb, relation.rb

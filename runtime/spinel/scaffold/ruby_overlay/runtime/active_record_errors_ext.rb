@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveModel::Errors#include?(attribute) on the validation accumulator.
 #
 # Lives on the CRuby overlay, not shared runtime/ruby/active_record/

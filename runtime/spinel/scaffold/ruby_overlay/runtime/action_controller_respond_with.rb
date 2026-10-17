@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `respond_to` (actionpack `ActionController::MimeResponds`) and
 # `respond_with` (responders 3.1, `ActionController::RespondWith` and
 # `ActionController::Responder`): the controller calls Core's REST admin

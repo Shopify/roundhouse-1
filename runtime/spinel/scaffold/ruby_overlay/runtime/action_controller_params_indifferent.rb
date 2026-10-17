@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `params[:key]` and `params["key"]` read the same value in Rails. The
 # integration harness (and the dispatchers) assign the request parameters
 # as a plain String-keyed Hash, and a controller method the lowering does
