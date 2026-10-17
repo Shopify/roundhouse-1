@@ -105,9 +105,13 @@ const MODEL: &str = r##"class Template
     I18n.t("probe.wide.k#{n}")
   end
 
-  # Still folds: a literal key.
+  # A literal key: the gem's call, so the locale at call time decides.
   def folded
     I18n.t("probe.reasons.initial")
+  end
+
+  def localized
+    I18n.t("probe.platforms.other")
   end
 end
 "##;
@@ -130,13 +134,14 @@ const PROBE: &str = r##"class I18nProbe
     out << "plural many: #{t.shipped("shipped", "Ana", 3)}"
     out << "wide: #{t.wide(449)}"
     out << "folded: #{t.folded}"
+    out << "with_locale fr: #{I18n.with_locale(:fr) { t.localized }} #{t.localized}"
     out << "missing: #{Template.new("nope", "none").name}"
     out
   end
 end
 "##;
 
-const EXPECTED: [&str; 12] = [
+const EXPECTED: [&str; 13] = [
     r#"key: Translation missing: en.probe.templates.size.x.name"#,
     r#"key found: Color"#,
     r#"label: Manually adjusted Shopify"#,
@@ -148,6 +153,7 @@ const EXPECTED: [&str; 12] = [
     r#"plural many: Ana shipped 3 items"#,
     r#"wide: wide 449"#,
     r#"folded: Initial inventory"#,
+    r#"with_locale fr: Autre Other"#,
     r#"missing: Translation missing: en.probe.templates.nope.none.name"#,
 ];
 
@@ -191,11 +197,12 @@ fn an_unfoldable_translate_stays_the_gems_call() {
     assert!(model.contains("I18n.t(label_key, scope: \"probe.reasons\", default: I18n.t(label_key, scope: \"probe.platforms\"))"), "{model}");
     assert!(model.contains("I18n.t(code, scope: scope)"), "{model}");
     assert!(model.contains("locale: locale"), "{model}");
-    // A run-time key whose reach is small still folds, into the app's translation table
-    // (`I18n.translate_site`, the runtime answers it), and so does a literal key.
-    assert!(model.contains("I18n.translate_site(\"t2\""), "{model}");
+    // Nothing folds on the gem tree: the locale at call time decides.
+    assert!(model.contains("I18n.t(\"events.#{action}.by_staff\", scope: \"probe\", author: who, count: count)"), "{model}");
     assert!(model.contains("I18n.t(\"probe.wide.k#{n}\")"), "{model}");
-    assert!(model.contains("I18n.translate_site(\"t3\""), "{model}");
+    // A literal key stays the gem's call, so `I18n.with_locale(:fr) { I18n.t(k) }` answers in French.
+    assert!(model.contains("I18n.t(\"probe.reasons.initial\")"), "{model}");
+    assert!(!model.contains("\"Initial inventory\""), "{model}");
 }
 
 /// The gem tree's runtime/i18n_locale.rb loads the gem, then defines the

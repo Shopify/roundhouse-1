@@ -194,8 +194,15 @@ module Mime
       @symbol
     end
 
+    # actionpack compares the type strings, so a String is equal to the
+    # type it names in both directions (`request.media_type == Mime[:json]`
+    # reaches here through String#== on the type's `to_str`).
     def ==(other)
-      other.is_a?(Mime::Type) && to_s == other.to_s
+      case other
+      when String then to_s == other
+      when Mime::Type then to_s == other.to_s
+      else false
+      end
     end
 
     def eql?(other)

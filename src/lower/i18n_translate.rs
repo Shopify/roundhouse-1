@@ -707,6 +707,14 @@ fn rewrite_one(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
     }
     let in_view = site.in_view();
     let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { return };
+    // On a tree that loads the i18n gem an `I18n.t` stays the gem's call: the
+    // catalog holds the default locale only, so folding it would answer
+    // `I18n.with_locale(:fr) { I18n.t("k") }` in English.
+    if GEM_ANSWERS.with(|g| g.get())
+        && matches!(recv.as_ref().map(|r| &*r.node), Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "I18n")
+    {
+        return;
+    }
     let Some(parsed) = parse(recv.as_ref(), method.as_str(), args, block.as_ref(), site) else { return };
     if let Some((cond, then_args, else_args)) = split_key(args) {
         let resolved = resolves(catalog, recv.as_ref(), method.as_str(), args, block.as_ref(), site);
