@@ -4847,5 +4847,15 @@ pub(crate) fn generated_attribute_method_names(model: &Model, models: &[Model], 
     };
     let bare = Table { columns: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), ..table.clone() };
     let without = instance_names(&bare);
-    instance_names(table).into_iter().filter(|name| !without.contains(name)).collect()
+    let mut names: crate::det::HashSet<Symbol> =
+        instance_names(table).into_iter().filter(|name| !without.contains(name)).collect();
+    // `attribute :publish_on, :time` — the Attributes API's accessors
+    // are generated attribute methods too, so a module the model
+    // includes (`ResourcePublication#publish_on=`, declared by the same
+    // concern's `included` block) overrides them instead of being
+    // shadowed by a class-body def.
+    let mut attribute_api = Vec::new();
+    super::markers::push_attribute_api_methods(&mut attribute_api, model);
+    names.extend(attribute_api.into_iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name));
+    names
 }
