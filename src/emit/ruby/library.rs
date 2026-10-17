@@ -3670,6 +3670,15 @@ fn is_relation_chain(e: &Expr) -> bool {
         ExprNode::Send { recv: Some(inner), method, .. } if method.as_str() == "new" => {
             matches!(&*inner.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "Relation"))
         }
+        // A scope the model compiled to a class method taking the relation
+        // it narrows (`Credential.not_revoked(ActiveRecord::Relation.new(
+        // Credential).where(…))`, an association's `-> { not_revoked }`).
+        ExprNode::Send { recv: Some(inner), args, .. }
+            if matches!(&*inner.node, ExprNode::Const { .. })
+                && args.first().is_some_and(|base| matches!(&*base.node, ExprNode::Send { .. }) && is_relation_chain(base)) =>
+        {
+            true
+        }
         ExprNode::Const { .. } => true,
         _ => false,
     }
@@ -21982,4 +21991,33 @@ fn mixed_in_outside_helpers(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod association_scope_chain_tests {
+    use super::*;
+
+    fn chain(body: &str) -> bool {
+        let src = format!("def probe\n  {body}\nend\n");
+        let method = crate::runtime_src::parse_methods(&src).expect("parses").pop().expect("one method");
+        is_relation_chain(&method.body)
+    }
+
+    // A has_many's `-> { not_revoked }` (Core's payment_credentials) is the
+    // target's compiled scope applied to the key relation; the model must
+    // carry it as `_<name>_association_scope`, or `association(:name).scope`
+    // raises NotImplementedError.
+    #[test]
+    fn a_compiled_scope_applied_to_the_key_relation_is_a_relation() {
+        assert!(chain("::Credential.not_revoked(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id))"));
+        assert!(chain("::Credential.live(::Credential.not_revoked(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id)))"));
+        assert!(chain("::Credential.since(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id), 3)"));
+    }
+
+    #[test]
+    fn a_class_method_on_something_else_is_not() {
+        assert!(!chain("::Credential.find(@id)"));
+        assert!(!chain("::Credential.count_for(@id)"));
+        assert!(!chain("helper.not_revoked(ActiveRecord::Relation.new(::Credential))"));
+    }
 }
