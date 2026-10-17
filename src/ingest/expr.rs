@@ -1301,7 +1301,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     right: Expr::new(span, send),
                 },
                 (true, Some(r))
-                    if matches!(&*r.node, ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right, .. } if is_reader_chain(right)) =>
+                    if matches!(&*r.node, ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } if is_plain_read(left) && is_reader_chain(right)) =>
                 {
                     let mut send = send;
                     if let (

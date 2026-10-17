@@ -162,7 +162,7 @@ module ActiveModel
     # holds NestedErrors over them, whose full message is this record's
     # `"%{attribute} %{message}"`). Answers `other`'s errors, as Rails'
     # `other.errors.each` does.
-    def self.merge!(errors, other)
+    def self.merge!(errors, other, names = nil)
       unless errors.is_a?(Array)
         return errors.merge!(other) unless other.is_a?(Array)
         # A port record's collection (runtime/active_model_validations.rb)
@@ -180,16 +180,27 @@ module ActiveModel
       return objects(errors) if errors.equal?(other)
       if other.is_a?(Array)
         each_record(other) do |message, record|
+          if record && names && !record[2].equal?(UNSPLIT)
+            prefix = record[0] == :base ? "" : "#{imported_name(names, record[0].to_s)} "
+            message = "#{prefix}#{record[2]}"
+            record = record.dup
+            record[1] = message
+          end
           errors << message
           pairs_of(errors) << record.dup if record
         end
       else
-        other.errors.each do |error|
+        # A record's `errors` is the accumulator of messages: its Errors,
+        # as `objects` builds them; a port collection's are its own.
+        imported = other.errors
+        imported = objects(imported) if imported.is_a?(Array) && !(defined?(::ActiveModel::Errors) && other.is_a?(::ActiveModel::Errors))
+        imported.each do |error|
           name = error.attribute.to_s
           short = error.message
-          prefix = name == "base" ? "" : "#{ActiveSupport.humanize(name)} "
+          prefix = name == "base" ? "" : "#{imported_name(names, name)} "
           add(errors, error.attribute, "#{prefix}#{short}", prefix, error.raw_type, error.options)
         end
+        return imported
       end
       objects(other)
     end
@@ -274,7 +285,7 @@ module ActiveModel
     # NestedError, whose attribute and type the options may override,
     # with its raw type, options and short message, and this record's
     # full message for them. Answers the Errors.
-    def self.import(errors, error, override_options = {})
+    def self.import(errors, error, override_options = {}, names = nil)
       return errors.import(error, override_options) unless errors.is_a?(Array)
       override_options = override_options.dup
       [:attribute, :type].each do |key|
@@ -283,7 +294,7 @@ module ActiveModel
       attribute = override_options.fetch(:attribute) { error.attribute }
       raw_type, options = error.is_a?(Error) ? error.recorded_detail : [error.raw_type, error.options]
       short = error.message
-      prefix = attribute == :base ? "" : "#{ActiveSupport.humanize(attribute.to_s.tr(".", "_"))} "
+      prefix = attribute == :base ? "" : "#{imported_name(names, attribute.to_s.tr(".", "_"))} "
       add(errors, attribute, "#{prefix}#{short}", prefix, raw_type, options)
       if override_options.key?(:type)
         pairs_of(errors).last << override_options[:type]
@@ -293,6 +304,13 @@ module ActiveModel
       end
       objects(errors)
     end
+
+    # How the importing record names `attribute`: its translated name where
+    # the lowering carried one (`names`), the humanized attribute otherwise.
+    def self.imported_name(names, attribute)
+      (names && names[attribute]) || ActiveSupport.humanize(attribute)
+    end
+    private_class_method :imported_name
 
     # Rails' `normalize_arguments`: the attribute as a Symbol. A Proc type
     # is called with the record, which the accumulator does not keep.

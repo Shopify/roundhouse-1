@@ -820,6 +820,7 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
         call_args.push(error_details(merged_owner(args, &is_model).expect("checked above"), span));
         "errors_merge"
     };
+    let port_names = names.clone();
     call_args.extend([names, str_lit(span, &before), str_lit(span, &between), str_lit(span, &after)]);
     let mut support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
     support.ty = Some(crate::ty::Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveSupport")), args: vec![].into() });
@@ -828,7 +829,23 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
         ExprNode::Send { recv: Some(support), method: Symbol::from(helper), args: call_args, block: None, parenthesized: true },
     );
     call.ty = Some(crate::lower::errors_index::error_array_ty());
-    let orig = expr.clone();
+    let mut orig = expr.clone();
+    // The port names an imported error's attribute as the importing model does: its translated names go along.
+    if orig.decisions & crate::expr::ERRORS_PORT_CALL != 0 && matches!(&*port_names.node, ExprNode::Hash { entries, .. } if !entries.is_empty()) {
+        if let ExprNode::Send { args, .. } = &mut *orig.node {
+            if method == "import" {
+                match args.len() {
+                    1 => args.push(Expr::new(span, ExprNode::Hash { entries: vec![], kwargs: false })),
+                    _ => {
+                        if let ExprNode::Hash { kwargs, .. } = &mut *args[1].node {
+                            *kwargs = false;
+                        }
+                    }
+                }
+            }
+            args.push(port_names);
+        }
+    }
     *expr = crate::lower::errors_index::port_form(orig, call);
     true
 }

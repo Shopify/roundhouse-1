@@ -284,6 +284,14 @@ pub(crate) fn push_error_details(e: &mut Expr, i18n: &crate::i18n::ModelI18n) {
     let (before, after) = affixes(i18n, tag.attribute.as_str());
     let Some(bare) = without_affixes(&args[0], &before, &after) else { return };
     let span = e.span;
+    // The message shows the model's own text before the short one (a translated attribute name: "Remark can't be blank"),
+    // where `error_tag` looked for the humanized name.
+    let mut tag = tag.clone();
+    if tag.short == crate::expr::ErrorShort::Unknown && !before.is_empty() && after.is_empty() {
+        tag.short = crate::expr::ErrorShort::After(before);
+        e.hint = Some(crate::expr::IrHint::ErrorAttribute(tag.clone()));
+    }
+    let tag = &tag;
     // Rails' type for a String message is the message itself.
     let kind = match &tag.detail {
         crate::expr::ErrorDetail::Type { name, .. } => {

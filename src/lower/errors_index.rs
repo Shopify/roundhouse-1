@@ -115,8 +115,36 @@ pub(crate) fn reads_detail_type(args: &[Expr]) -> bool {
     matches!(args, [key] if sym_lit(key).is_some_and(|k| k.as_str() == "error"))
 }
 
+/// `errors.details` the analyzer routed to the runtime's port, as written or lowered.
+fn is_port_details(e: &Expr) -> bool {
+    fn written(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Send { method, args, block: None, .. } if method.as_str() == "details" && args.is_empty() => true,
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "[]" && args.len() == 1 => written(r),
+            _ => false,
+        }
+    }
+    match &e.hint {
+        Some(crate::expr::IrHint::ErrorsPortOriginal(original)) => written(&original.0),
+        _ => match &*e.node {
+            // `errors.details[:body]`, one attribute's entries.
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "[]" && args.len() == 1 => {
+                is_port_details(r)
+            }
+            _ => e.decisions & crate::expr::ERRORS_PORT_CALL != 0 && written(e),
+        },
+    }
+}
+
 /// `ActiveModel::Error#attribute` and `#type` over the `ErrorDetail` an iteration yields.
 fn read_errors(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
+    // The port's `details` yields Rails' own Hashes, whose `[:error]` already reads the type.
+    if let ExprNode::Send { recv: Some(r), block: Some(_), .. } = &mut *expr.node {
+        if is_port_details(r) {
+            read_errors(r, diags);
+            return;
+        }
+    }
     expr.node.for_each_child_mut(&mut |c| read_errors(c, diags));
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node else { return };
     let entry_type = method.as_str() == "[]" && is_details_entry(r) && reads_detail_type(args);
