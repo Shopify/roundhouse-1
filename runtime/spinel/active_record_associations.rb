@@ -975,6 +975,16 @@ module ActiveRecord
         scope.sum(*args)
       end
 
+      # `proxy.count` is a COUNT query, not the length of the records
+      # held: a record built on the association and not yet saved
+      # (`api_client.secrets.build`) is not in the count, and a new owner
+      # has none. The block form counts the records (`Enumerable#count`).
+      def count(*args, &block)
+        return super(*args, &block) if block || !args.empty?
+        return 0 if @proxy_owner.respond_to?(:new_record?) && @proxy_owner.new_record?
+        scope.count
+      end
+
       # `select(:id, :delta)` is the scope's column projection (Rails'
       # `Relation#select` with fields); the block form filters the
       # records held (`Enumerable#select`).
