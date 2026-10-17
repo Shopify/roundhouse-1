@@ -9456,7 +9456,10 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
         let at: Vec<&str> = lines.iter().filter(|(i, _)| *i == 2 * level).map(|(_, t)| *t).collect();
         if assigned_leaf && level + 1 == depth && depth == chain.len() {
             let closes = |t: &&str| t.starts_with([')', ']', '}']) || *t == "end" || t.starts_with("end.");
-            if at.is_empty() || !at[1..].iter().all(closes) {
+            // `X = Data.define(…)` is followed by the class's own reopen
+            // (`class X … end`), where the emitter writes its body.
+            let reopen = format!("class {}", chain[depth - 1].0);
+            if at.is_empty() || !at[1..].iter().all(|t| closes(t) || *t == reopen) {
                 return None;
             }
             continue;
