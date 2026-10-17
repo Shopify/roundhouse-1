@@ -96,3 +96,21 @@ module ActiveJob
     end
   end
 end
+
+module ActiveJob
+  class Base
+    # `ActiveJob::QueueAdapter`'s `queue_adapter_name` (class_attribute
+    # `_queue_adapter_name`): the name of the adapter the nearest class
+    # that assigned one holds, Rails' default `async` when none did.
+    # job-iteration's `interruption_adapter` looks its adapter up by it
+    # (`JobIteration::InterruptionAdapters.lookup`).
+    def self.queue_adapter_name
+      return @_queue_adapter_name if instance_variable_defined?(:@_queue_adapter_name)
+      superclass.respond_to?(:queue_adapter_name) ? superclass.queue_adapter_name : "async"
+    end
+
+    def queue_adapter_name
+      self.class.queue_adapter_name
+    end
+  end
+end

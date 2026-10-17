@@ -95,3 +95,63 @@ fn an_included_block_rescue_from_wraps_the_including_controller_s_dispatcher() {
         "handlers are matched in reverse declaration order:\n{src}"
     );
 }
+
+const BLOCK_CONSTANT_CONCERN: &str = r#"module AdminHandler
+  extend ActiveSupport::Concern
+
+  included do
+    INVALID_PARAMETERS = [ActionController::ParameterMissing].freeze
+    rescue_from(*INVALID_PARAMETERS) do |exception|
+      head(:bad_request)
+    end
+  end
+end
+"#;
+
+/// The constant a concern's `included do` block writes is the concern's
+/// (the block keeps its lexical scope), and the `rescue_from` spliced into
+/// each includer names it by the concern's path: the module has to carry
+/// it, def-less block or not
+/// (`AdminAreaControllerExceptionHandler::INVALID_PARAMETERS_EXCEPTIONS`:
+/// `uninitialized constant` out of every including controller's
+/// `process_action`).
+#[test]
+fn a_constant_written_in_a_defless_included_block_is_the_concern_s() {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        ("app/controllers/concerns/admin_handler.rb", BLOCK_CONSTANT_CONCERN),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include AdminHandler\nend\n",
+        ),
+        ("app/controllers/widgets_controller.rb", WIDGETS_CONTROLLER),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :widgets, only: [:create]\nend\n",
+        ),
+    ]
+    .into_iter()
+    .map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    let mut app = ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let controllers = roundhouse::emit::ruby::emit_lowered_controllers(&app);
+    let widgets = controllers
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("widgets_controller.rb"))
+        .expect("widgets controller");
+    assert!(
+        widgets.content.contains("rescue *AdminHandler::INVALID_PARAMETERS"),
+        "the splat reads the concern's constant:\n{}",
+        widgets.content
+    );
+    let models = roundhouse::emit::ruby::emit_library(&app);
+    let module = models
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("admin_handler.rb"))
+        .unwrap_or_else(|| panic!("module not emitted: {:?}", models.iter().map(|f| &f.path).collect::<Vec<_>>()));
+    assert!(
+        module.content.contains("INVALID_PARAMETERS = "),
+        "the module must define the constant its includers read:\n{}",
+        module.content
+    );
+}

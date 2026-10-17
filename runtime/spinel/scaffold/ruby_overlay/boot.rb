@@ -240,6 +240,8 @@ require_relative "runtime/action_controller_json_render"
 require_relative "runtime/schematized_json"
 require_relative "runtime/json_column"
 require_relative "runtime/action_mailer"
+# After it: the mailer class takes rescue_from and answers handle_exception.
+require_relative "runtime/action_mailer_rescuable"
 # App-code gem dependencies, guarded so apps that don't use them (the
 # blog) boot without the gems installed. The list itself lives in
 # runtime/gem_facades.rb — on a ruby-family tree that file IS the

@@ -4936,6 +4936,20 @@ fn walk_decl_body_in<'pr>(
                         // A constant written in the block is the
                         // concern's: the block keeps its lexical scope.
                         out.constants.extend(inner.constants);
+                    } else if let Some(block) = visibility::included_block(&call) {
+                        // No `def` in the block, but a constant written
+                        // directly in it is the concern's all the same
+                        // (`INVALID_PARAMETERS_EXCEPTIONS = [...]` beside
+                        // the `rescue_from(*INVALID_PARAMETERS_EXCEPTIONS)`
+                        // that reads it, spliced into each includer
+                        // qualified by the concern's name).
+                        for write in block.body().map(flatten_statements).unwrap_or_default() {
+                            let Some(cw) = write.as_constant_write_node() else { continue };
+                            if is_sorbet_type_alias(&cw.value()) {
+                                continue;
+                            }
+                            out.constants.push((Symbol::from(constant_id_str(&cw.name())), ingest_expr(&cw.value(), file)?));
+                        }
                     }
                 }
                 // `class_attribute :x, …` (`ingest::class_attribute`): its
