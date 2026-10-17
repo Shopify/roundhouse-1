@@ -4920,19 +4920,12 @@ fn splice_concerns_into_models_named(
     }
     defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
 
-    if app.concern_model_items.is_empty() && app.concern_guarded_items.is_empty() {
+    if app.concern_model_items.is_empty()
+        && app.concern_guarded_items.is_empty()
+        && app.concern_prepended_items.is_empty()
+    {
         return;
     }
-
-    // A carried statement keeps the concern's lexical constants.
-    let mut defined = crate::det::HashSet::default();
-    for class in &app.library_classes {
-        defined.insert(class.name.0.as_str().to_string());
-        for (name, _) in &class.constants {
-            defined.insert(format!("{}::{}", class.name.0.as_str(), name.as_str()));
-        }
-    }
-    defined.extend(app.models.iter().map(|model| model.name.0.as_str().to_string()));
 
     for model in &mut app.models {
         if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {

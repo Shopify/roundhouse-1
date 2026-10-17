@@ -3346,7 +3346,9 @@ fn attribute_names(model_class: &str, app: &App) -> Option<Vec<String>> {
         },
         _ => false,
     });
-    if changes_columns {
+    // Ingest reads `self.ignored_columns =` into the model (it is no longer
+    // a body statement for the scan above to see).
+    if changes_columns || !model.ignored_columns.is_empty() {
         return None;
     }
     let table = app.schema.tables.get(&model.table.0)?;
