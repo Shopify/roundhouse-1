@@ -231,7 +231,7 @@ fn library_classes(
     let declared: HashSet<ClassId> = top_level.iter().map(|class| class.name.clone()).collect();
     for class in top_level
         .iter_mut()
-        .filter(|class| synthesized.contains(&class.name) && !path_written.contains(&class.name))
+        .filter(|class| synthesized.contains(&class.name) && !path_written.contains(&class.name) && class.parent_span.is_synthetic())
     {
         let Some(parent) = &class.parent else { continue };
         let name = class.name.0.as_str();
@@ -1131,6 +1131,17 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     };
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
+    // `Class.new(::Parent)` names the top-level `Parent`: the span keeps
+    // where it is written, so neither the lexical resolution in
+    // `library_classes` nor the emitted header reads it as `Owner::Parent`
+    // (`ruby::library::written_parent`).
+    let rooted_span = match args.as_slice() {
+        [parent] => match &*parent.node {
+            ExprNode::Const { path } if path.first().is_some_and(|s| s.as_str().is_empty()) => parent.span,
+            _ => Default::default(),
+        },
+        _ => Default::default(),
+    };
     Some(LibraryClass {
         include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
@@ -1139,7 +1150,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
         parent: (!parent.is_empty()).then(|| ClassId(Symbol::from(parent.join("::")))),
-        parent_span: Default::default(),
+        parent_span: rooted_span,
         includes: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),

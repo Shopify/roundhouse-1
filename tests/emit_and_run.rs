@@ -4380,9 +4380,9 @@ fn bulk_writes_app() -> emit_and_run::Overlay {
             "  has_many :comments, dependent: :destroy\n",
             concat!(
                 "  has_many :comments, dependent: :destroy\n\n",
-                "  def rename_comments\n    Comment.where(article_id: @id).update_all(commenter: \"renamed\")\n    Comment.where(article_id: @id).touch_all\n  end\n\n",
-                "  def drop_comments\n    Comment.where(article_id: @id).delete_all\n  end\n\n",
-                "  def drop_self\n    Article.where(id: @id).destroy_all\n  end\n",
+                "  def rename_comments\n    Comment.where(article_id: id).update_all(commenter: \"renamed\")\n    Comment.where(article_id: id).touch_all\n  end\n\n",
+                "  def drop_comments\n    Comment.where(article_id: id).delete_all\n  end\n\n",
+                "  def drop_self\n    Article.where(id: id).destroy_all\n  end\n",
             ),
         )
 }

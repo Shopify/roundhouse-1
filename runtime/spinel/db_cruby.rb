@@ -453,15 +453,27 @@ module Db
   end
 
   # Rails' `check_all_foreign_keys_valid!`, which its fixture loader runs after a load (`verify_foreign_keys_for_fixtures`).
+  #
+  # One table at a time: SQLite (3.53) answers the unqualified pragma
+  # nothing for a table the handle has not read yet, so a fixture load
+  # left its violations unreported.
   def self.check_foreign_keys!
     tables = []
     on_lease do
-      st = Db.prepare("PRAGMA foreign_key_check")
+      names = []
+      st = Db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
       while Db.step?(st)
-        table = Db.column_text(st, 0)
-        tables << table unless tables.include?(table)
+        names << Db.column_text(st, 0)
       end
       Db.finalize(st)
+      names.each do |name|
+        st = Db.prepare("PRAGMA foreign_key_check(\"" + name.gsub("\"", "\"\"") + "\")")
+        while Db.step?(st)
+          table = Db.column_text(st, 0)
+          tables << table unless tables.include?(table)
+        end
+        Db.finalize(st)
+      end
     end
     raise ActiveRecord::StatementInvalid, "Foreign key violations found: " + tables.join(", ") unless tables.empty?
     nil

@@ -294,6 +294,17 @@ fn resolve_field_inner(
                         },
                     }]);
                 }
+                // A label the target's set does not define is still
+                // `identify(label)`, as Rails writes it: a row naming a
+                // parent that does not exist, which the fixture setup's
+                // foreign-key check reports. (A target with no fixture set
+                // at all stays unresolved, `unloaded_fixture_entries`.)
+                if referenced.is_some() && matches!(model.attributes.fields.get(foreign_key), Some(Ty::Int)) {
+                    return Some(vec![LoweredFixtureField {
+                        column: foreign_key.clone(),
+                        value: LoweredFixtureValue::Literal { ty: Ty::Int, raw: fixture_identify(value).to_string() },
+                    }]);
+                }
             }
         }
     }
