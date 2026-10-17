@@ -534,4 +534,40 @@ module ActiveRecord
     end
   end
   Relation.prepend(CompositeAssociationKeyPredicates)
+
+  # Rails' InsertAll takes the relation's create attributes
+  # (`attributes.merge!(scope_attributes)`): an association's foreign key
+  # and a default scope's `where(island: n)` go into every row of
+  # `owner.snapshots.insert_all!(rows)`, over the row's own value. The
+  # shared Relation hands the rows to the model as given, which left a
+  # default-scoped table's `island` NULL.
+  module InsertScopeAttributes
+    def insert_all(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    def insert_all!(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    def upsert_all(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    private
+
+    def _rows_with_scope_attributes(rows)
+      scope = scope_attributes
+      return rows if scope.empty?
+      rows.map do |row|
+        merged = row.dup
+        scope.each do |name, value|
+          merged.delete(name.to_s)
+          merged[name.to_sym] = value
+        end
+        merged
+      end
+    end
+  end
+  Relation.prepend(InsertScopeAttributes)
 end

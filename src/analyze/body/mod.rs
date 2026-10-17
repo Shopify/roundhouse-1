@@ -5212,7 +5212,7 @@ pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
 ///   Core, Persistence, Callbacks, ConnectionHandling, Transactions'
 ///   `current_transaction`);
 /// - the CRuby overlay's Active Record reopens the PostgreSQL boot loads
-///   (`active_record_bang.rb`, `_serialization`, `_relation_ext`,
+///   (`active_record_bang.rb`, `_serialization`, `_relation_ext`, `_counters`,
 ///   `_postgresql_adapter`, `_statement_errors`; not the SQLite adapter's);
 /// - the ActiveModel ports Base includes there that the bootstrap always
 ///   carries (`active_model_naming.rb`'s Conversion,
@@ -5633,6 +5633,7 @@ mod runtime_base {
         "active_record_store.rb",
         "active_record_serialization.rb",
         "active_record_relation_ext.rb",
+        "active_record_counters.rb",
         "active_record_postgresql_adapter.rb",
         "active_record_statement_errors.rb",
     ];
