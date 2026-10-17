@@ -10926,8 +10926,17 @@ fn emit_library_class_decl_inner(
             }
         }
         for f in declined.into_iter().flatten() {
-            if !copy.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == f.name) {
-                copy.methods.push(f.clone());
+            let taken = copy.methods.iter().position(|m| m.receiver == MethodReceiver::Instance && m.name == f.name);
+            match taken {
+                None => copy.methods.push(f.clone()),
+                // A `delegate` named like a column (`orders.total_received`)
+                // is written in the class, ahead of the generated attribute
+                // methods module: its forwarder replaces the synthesized
+                // accessor.
+                Some(i) if copy.methods[i].name_span.is_synthetic() && !f.name_span.is_synthetic() => {
+                    copy.methods[i] = f.clone();
+                }
+                Some(_) => {}
             }
         }
         // An `alias_method :to, :from` of a forwarder the ingest declined
