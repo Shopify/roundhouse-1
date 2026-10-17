@@ -44,10 +44,13 @@ module ActiveJob
     record_performed_for_tests(job_name)
   end
 
+  # Only a serving process drains in the background; a script or test that
+  # registered a drain itself (`ActiveJob.register_drain`) drains by hand,
+  # on its own connection, and counts what is pending.
   def self.enqueue(work)
-    start_drainer if @drain_pid != Process.pid
+    start_drainer if @serving && @drain_pid != Process.pid
     enqueue_locked(work)
-    @wake << true
+    @wake << true unless @wake.nil?
     nil
   end
 
