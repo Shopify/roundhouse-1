@@ -74,6 +74,15 @@ module ActionDispatch
 
     def delete_header(name) = @env.delete(name)
 
+    # ActionDispatch::Http::FilterParameters#parameter_filter: the
+    # filter over the env's "action_dispatch.parameter_filter" (railties'
+    # `env_config` puts it in every request's env, which this dispatcher
+    # does not build, so the app's config answers when the env has none).
+    def parameter_filter
+      filters = get_header("action_dispatch.parameter_filter") || Rails.application.env_config["action_dispatch.parameter_filter"]
+      ActiveSupport::ParameterFilter.new(filters || [])
+    end
+
     def add_header(key, value)
       if value.nil?
         get_header(key)
