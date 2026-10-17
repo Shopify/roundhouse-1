@@ -1327,6 +1327,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("allowed_tags", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
         ("allowed_attributes", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
     ], &[]);
+    // `Rails::HTML::SafeListSanitizer` is the gem's alias of the HTML4 safe-list
+    // sanitizer (`SafeListSanitizer = HTML4::SafeListSanitizer`), and `Rails::Html`
+    // of `Rails::HTML`; a caller instantiates it and sanitizes (`sanitize(html,
+    // scrubber:, tags:, attributes:)` answers the cleaned String, nil for nil).
+    for name in ["Rails::Html::SafeListSanitizer", "Rails::HTML::SafeListSanitizer"] {
+        register_stdlib_class(classes, name, &[
+            ("new", Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() }),
+        ], &[
+            ("sanitize", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
+        ]);
+    }
     // rails-html-sanitizer's vendor-neutral entry point (`Rails::Html` is the
     // gem's alias of `Rails::HTML`): each finder answers the vendor's
     // sanitizer class, which the caller instantiates. The gem loads on the
