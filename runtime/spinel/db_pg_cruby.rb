@@ -811,6 +811,18 @@ module Db
     nil
   end
 
+  # Rails' fixture setup runs with referential integrity off, then checks
+  # (test_helper.rb `with_foreign_keys_deferred`). Not PostgreSQL's DISABLE
+  # TRIGGER: the DDL here carries no foreign keys yet
+  # (emit::shared::schema_sql), so a fixture load has nothing to defer.
+  def self.without_foreign_keys
+    yield
+  end
+
+  def self.check_foreign_keys!
+    nil
+  end
+
   def self.current_dbh
     adapter = current_adapter
     adapter.raw_connection || adapter.valid_raw_connection

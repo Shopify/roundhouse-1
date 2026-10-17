@@ -50,7 +50,7 @@ class PostgreSQLRuntimeTest < Minitest::Test
   end
 
   def test_typed_values_null_escaping_and_real_returning
-    assert_equal 1, Db.insert_returning_int("INSERT INTO items(label,enabled,amount,payload,day) VALUES (#{Db.escape_string("l'été \\ hi")},TRUE,12345678901234567890.1234567890,#{Db.escape_string("a\0\xff".b)},'2026-10-06') RETURNING id")
+    assert_equal 1, Db.insert_returning_int("INSERT INTO items(label,enabled,amount,payload,day) VALUES (#{Db.escape_string("l'été \\ hi")},TRUE,12345678901234567890.1234567890,#{Db.escape_binary("a\0\xff".b)},'2026-10-06') RETURNING id")
     statement = Db.prepare("SELECT label,enabled,amount,payload,day FROM items")
     assert Db.step?(statement)
     assert_equal "l'été \\ hi", Db.column_text(statement, 0)

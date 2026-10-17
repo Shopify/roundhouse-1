@@ -101,11 +101,6 @@ module I18n
     out.join(".")
   end
 
-  # `translate_runtime`'s and `lower::i18n_translate`'s spelling of the same.
-  def self.normalize_key(key)
-    normalize_translation_key(key)
-  end
-
   # A run-time key that names a subtree, which `I18n.t` answers as a
   # Hash; no folded translation carries one.
   def self.subtree_translation(key)
@@ -156,7 +151,7 @@ module I18n
     scope = scope_text(options[:scope])
     name = key.to_s
     name = lazy_scope + name if name.start_with?(".") && !lazy_scope.empty?
-    full = normalize_key(scope.empty? ? name : scope + "." + name)
+    full = normalize_translation_key(scope.empty? ? name : scope + "." + name)
     count = options[:count]
     found = runtime_lookup(loc, full, count)
     considered = []
@@ -166,7 +161,7 @@ module I18n
       list.each do |default|
         next unless found.nil?
         if default.is_a?(Symbol)
-          k = normalize_key(scope.empty? ? default.to_s : scope + "." + default.to_s)
+          k = normalize_translation_key(scope.empty? ? default.to_s : scope + "." + default.to_s)
           considered << loc + "." + k
           found = runtime_lookup(loc, k, count)
         elsif !default.nil?

@@ -19,7 +19,6 @@ module I18n
   end
 
   def self.normalize_translation_key: (String key) -> String
-  def self.normalize_key: (String key) -> String
   def self.subtree_translation: (String key) -> String
   def self.missing_raises: (bool raises, String flipped) -> bool
   def self.missing_translation: (String key, bool raises) -> String

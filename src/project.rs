@@ -4963,6 +4963,71 @@ fn boot_native_requires_text(app: &App) -> String {
     out
 }
 
+/// The stand-in `runtime/ruby/i18n_locale.rb` as the i18n gem tree carries it
+/// after the gem's require: the table and run-time answers
+/// (`translate_site`, `translate_runtime`, `load_translation_table`, the
+/// generated locale block), without what the gem owns (`locale`,
+/// `default_locale`, ... and the exception classes) or the helpers file
+/// already supplies. `checked_locale`, `enter_locale` and `leave_locale` go through the gem's
+/// `I18n.locale=`, which holds the locale the stand-in keeps in its own
+/// thread variable.
+fn gem_tree_i18n_answers(stand_in: &str) -> String {
+    const GEM_OWNED: &[&str] = &[
+        "default_locale",
+        "available_locales",
+        "thread_locale_name",
+        "locale",
+        "locale=",
+        "enter_locale",
+        "leave_locale",
+        "checked_locale",
+        "missing_raises",
+        "normalize_translation_key",
+        "subtree_translation",
+        "missing_translation",
+        "missing_translation_tag",
+    ];
+    let mut out: Vec<&str> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in stand_in.split_inclusive('\n') {
+        if skipping {
+            if line == "  end\n" {
+                skipping = false;
+            }
+            continue;
+        }
+        if line.starts_with("  #") && !line.starts_with("  # >>>") && !line.starts_with("  # <<<") {
+            pending.push(line);
+            continue;
+        }
+        let owned = line
+            .strip_prefix("  def self.")
+            .map(|rest| rest.split(['(', ' ', '\n']).next().unwrap_or(""))
+            .is_some_and(|name| GEM_OWNED.contains(&name));
+        let owned_class = line == "  class InvalidLocale < ArgumentError\n"
+            || line == "  class MissingTranslationData < ArgumentError\n"
+            || line == "  class MissingInterpolationArgument < ArgumentError\n"
+            || line == "  class InvalidPluralizationData < ArgumentError\n";
+        if owned || owned_class {
+            pending.clear();
+            skipping = true;
+            continue;
+        }
+        out.append(&mut pending);
+        out.push(line);
+    }
+    out.append(&mut pending);
+    let body: String = out.concat();
+    // Only the module's body: the stand-in's header comment and `module I18n`
+    // line are the helpers' own.
+    let body = body.split_once("module I18n\n").map_or(body.as_str(), |(_, rest)| rest);
+    let body = body.strip_suffix("end\n").unwrap_or(body);
+    format!(
+        "module I18n\n  def self.checked_locale(value)\n    enforce_available_locales!(value)\n    value.to_s.to_sym\n  end\n\n  def self.enter_locale(value)\n    return nil if value.nil?\n    previous = locale.to_s\n    self.locale = value\n    previous\n  end\n\n  def self.leave_locale(previous)\n    self.locale = previous unless previous.nil?\n    nil\n  end\n{body}end\n"
+    )
+}
+
 fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
     // Boot resolves the app's own config/database.yml (ingest::database_yml);
     // a manifest, when present, is the cross-check, never the source.
@@ -5205,12 +5270,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 // The helpers a folded `I18n.t` calls follow the gem's require.
                 let helpers = crate::runtime_files::read_to_string("runtime/spinel/i18n_translation_helpers.rb")
                     .map_err(|e| format!("read I18n helpers runtime: {e}"))?;
+                let answers = gem_tree_i18n_answers(content);
                 *content = format!(
                     "# The i18n gem, as active_support/i18n.rb loads it — see\n\
-                     # `project::apply_postgres_bootstrap` — and the helpers a folded\n\
-                     # `I18n.t` calls. The stand-in at runtime/ruby/i18n_locale.rb is\n\
-                     # for trees without the gem.\n\
-                     require_relative \"active_support_i18n\"\n\n{helpers}"
+                     # `project::apply_postgres_bootstrap` — the helpers a folded\n\
+                     # `I18n.t` calls, and the stand-in's table and run-time answers\n\
+                     # (`translate_site`, `translate_runtime`) over the gem's locale.\n\
+                     # The stand-in at runtime/ruby/i18n_locale.rb is for trees without\n\
+                     # the gem.\n\
+                     require_relative \"active_support_i18n\"\n\n{helpers}\n{answers}"
                 );
             }
         }

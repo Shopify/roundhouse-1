@@ -1002,7 +1002,7 @@ fn table_site(call: &Call, locales: &[(String, Vec<(Plan, Vec<Variant>)>)], span
             let text = typed(Expr::new(span, ExprNode::StringInterp {
                 parts: std::iter::once(InterpPart::Text { value: base }).chain(parts.iter().cloned()).collect(),
             }));
-            typed(const_send(span, "I18n", "normalize_key", vec![text]))
+            typed(const_send(span, "I18n", "normalize_translation_key", vec![text]))
         }
         None => lit(span, String::new()),
     };

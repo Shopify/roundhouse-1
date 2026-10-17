@@ -3190,7 +3190,7 @@ module ActiveRecord
       # The table quoted, as Rails' Arel renders it (`UPDATE "memberships"
       # SET ...`): a test that picks the statement out of the SQL log
       # (campfire's creation-commit test) matches that spelling.
-      sql = "UPDATE \"#{@table}\" SET #{set_sql}#{scoped_write_where}"
+      sql = "UPDATE #{quoted_table} SET #{set_sql}#{scoped_write_where}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
     end
@@ -3209,8 +3209,15 @@ module ActiveRecord
       parts.push("updated_at = #{now}") if @model.schema_columns.include?(:updated_at)
       parts.push("#{name} = #{now}") unless name.nil?
       return 0 if parts.empty?
-      ActiveRecord.adapter.execute_ddl("UPDATE \"#{@table}\" SET #{parts.join(", ")}#{scoped_write_where}")
+      ActiveRecord.adapter.execute_ddl("UPDATE #{quoted_table} SET #{parts.join(", ")}#{scoped_write_where}")
       ActiveRecord.adapter.changes
+    end
+
+    # The table as Arel renders it in a statement's head: double-quoted,
+    # whatever `_table_sql` spelled (bare for a plain SQLite name, already
+    # quoted for a keyword or on PostgreSQL).
+    def quoted_table
+      @table.start_with?("\"") ? @table : "\"#{@table}\""
     end
 
     # The WHERE clause a bulk WRITE takes — the one place `delete_all`

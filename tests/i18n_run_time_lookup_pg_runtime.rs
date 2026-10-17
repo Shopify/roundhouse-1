@@ -208,7 +208,7 @@ fn the_gem_tree_carries_the_folded_call_helpers() {
     for helper in ["missing_raises", "normalize_translation_key", "subtree_translation", "missing_translation", "missing_translation_tag"] {
         assert!(anchor.contains(&format!("def self.{helper}")), "{helper}\n{anchor}");
     }
-    assert!(!anchor.contains("def self.locale"), "{anchor}");
+    assert!(!anchor.contains("def self.locale\n") && !anchor.contains("def self.locale="), "{anchor}");
 }
 
 /// Without the i18n gem in the lockfile the call is not the gem's: the
@@ -236,4 +236,20 @@ fn run_time_translations_answer_like_rails_on_postgresql() {
         pg_probe::native_and_emitted("i18n-run-time-lookup", &native_files, &emitted, "rh_e2e_i18n_run_time_lookup", "I18nProbe", &LOADS);
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted_lines, native, "emitted");
+}
+
+/// A folded call's table lookup and a run-time key's lookup run on the gem
+/// tree too: the anchor carries `translate_site` and `translate_runtime`
+/// over the gem's locale, and none of the stand-in's own locale state.
+#[test]
+fn the_gem_tree_carries_the_table_and_run_time_answers_without_shadowing_the_gem() {
+    let (emitted, _) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
+    let anchor = std::fs::read_to_string(emitted.join("runtime/i18n_locale.rb")).unwrap();
+    for method in ["translate_site", "translate_runtime", "load_translation_table", "app_default_locale", "enter_locale", "leave_locale"] {
+        assert!(anchor.contains(&format!("def self.{method}")), "{method}\n{anchor}");
+    }
+    assert!(!anchor.contains("Thread.current[:roundhouse_i18n_locale]"), "{anchor}");
+    assert!(!anchor.contains("class InvalidLocale"), "{anchor}");
+    assert_eq!(anchor.matches("def self.missing_translation(").count(), 1, "{anchor}");
+    assert_eq!(anchor.matches("module I18n").count(), 2, "{anchor}");
 }
