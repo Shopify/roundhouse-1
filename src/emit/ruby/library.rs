@@ -3669,6 +3669,12 @@ fn is_relation_chain(e: &Expr) -> bool {
     }
 }
 
+/// Whether the Ruby-family through reader applies a source association's
+/// own scope (`resolve_through_chain`): one that reads no local.
+pub(crate) fn through_source_scope_applies(scope: &Expr) -> bool {
+    !reads_local(scope)
+}
+
 /// Does `e` read a local variable (or a block parameter)?
 fn reads_local(e: &Expr) -> bool {
     let mut found = matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Lambda { .. });

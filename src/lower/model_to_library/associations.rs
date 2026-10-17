@@ -148,6 +148,19 @@ fn refuse_scoped_through_source(
     else {
         return false;
     };
+    // The Ruby family's through reader applies a plain source scope
+    // (`emit::ruby::library::resolve_through_chain`); every other
+    // target, a nested source and a scope reading a local do not.
+    if crate::emit::ruby::native_keywords()
+        && matches!(
+            source,
+            Association::HasMany { through: None, scope: Some(scope), .. }
+                | Association::HasOne { through: None, scope: Some(scope), .. }
+                if crate::emit::ruby::through_source_scope_applies(scope)
+        )
+    {
+        return false;
+    }
     crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
         span,
         None,
