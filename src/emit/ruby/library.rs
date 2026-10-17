@@ -14081,6 +14081,18 @@ fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr>
                     && args.len() == 2
                     && args.iter().all(symbol)
             }
+            // A bare call to a class-side method this class defines itself
+            // (carriers_db's `add_country_index`, which registers an index
+            // in `index_definitions`): written after the methods
+            // (`OwnClassCalls`), as Ruby ran it after its def.
+            ExprNode::Send { recv, method, block: None, .. }
+                if implicit_self(recv)
+                    && lc.methods.iter().any(|m| {
+                        m.receiver == MethodReceiver::Class && m.name == *method && !m.name_span.is_synthetic()
+                    }) =>
+            {
+                true
+            }
             _ => self_write_or_assign(call).is_some_and(|(name, reads)| {
                 let answers = |method: &str| {
                     crate::ingest::inherited_alias::answers(&app.library_classes, lc, method, MethodReceiver::Class)

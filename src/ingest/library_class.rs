@@ -7721,6 +7721,33 @@ pub(in crate::ingest) fn ingest_concern_prepended_items(
     ingest_concern_hook_items(source, file, enum_constants, "prepended").0
 }
 
+/// A callback object (`after_create Methods`) read in `concern`'s `included`
+/// block names its constant where the concern is written, not where the
+/// block is carried (the includer's class body): written in full when a
+/// module this file declares answers the lexical lookup, innermost scope
+/// first.
+fn qualify_callback_object(item: &mut crate::dialect::ModelBodyItem, concern: &ClassId, declared: &HashSet<String>) {
+    let crate::dialect::ModelBodyItem::Callback { callback, .. } = item else { return };
+    let Some(object) = &mut callback.object else { return };
+    let crate::expr::ExprNode::Const { path } = &*object.node else { return };
+    if path.is_empty() {
+        return;
+    }
+    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let mut scope: Vec<&str> = concern.0.as_str().split("::").collect();
+    loop {
+        let candidate = if scope.is_empty() { written.clone() } else { format!("{}::{written}", scope.join("::")) };
+        if declared.contains(&candidate) {
+            let path: Vec<Symbol> = candidate.split("::").map(Symbol::from).collect();
+            *object = crate::expr::Expr::new(object.span, crate::expr::ExprNode::Const { path });
+            return;
+        }
+        if scope.pop().is_none() {
+            return;
+        }
+    }
+}
+
 /// The model DSL of each module's `<hook> do ... end` block.
 fn ingest_concern_hook_items(
     source: &[u8],
@@ -7740,6 +7767,14 @@ fn ingest_concern_hook_items(
     let mut out = Vec::new();
     let mut enums_out = Vec::new();
     let mut guarded_out: ConcernGuardedItems = Vec::new();
+    let declared_modules: HashSet<String> = super::util::find_all_module_declarations_with_scope(&root)
+        .into_iter()
+        .filter_map(|(scope, module)| {
+            let mut path = scope;
+            path.extend(module_name_path(&module)?);
+            Some(path.join("::"))
+        })
+        .collect();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -7907,7 +7942,10 @@ fn ingest_concern_hook_items(
                                 ModelBodyItem::Association { .. }
                                 | ModelBodyItem::Scope { .. }
                                 | ModelBodyItem::Validation { .. }
-                                | ModelBodyItem::Callback { .. } => items.push(item),
+                                | ModelBodyItem::Callback { .. } => {
+                                    qualify_callback_object(&mut item, &id, &declared_modules);
+                                    items.push(item)
+                                }
                                 ModelBodyItem::Method { .. } | ModelBodyItem::ClassBody { .. }
                                     if class_attribute && is_direct && is_concern =>
                                 {

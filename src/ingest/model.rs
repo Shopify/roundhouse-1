@@ -2509,6 +2509,8 @@ fn parse_callback(
     };
     let args = call.arguments()?;
     let mut targets: Vec<Symbol> = Vec::new();
+    let mut object: Option<Expr> = None;
+    let mut prepend = false;
     let mut on: Option<CallbackOn> = None;
     let mut if_cond: Option<Expr> = None;
     let mut unless_cond: Option<Expr> = None;
@@ -2539,11 +2541,28 @@ fn parse_callback(
                     // at all, which is the wrong answer too.
                     "if" => if_cond = Some(callback_condition(&assoc.value(), file)?),
                     "unless" => unless_cond = Some(callback_condition(&assoc.value(), file)?),
-                    // `prepend:` and anything else: not modeled — reject
-                    // rather than run the callback in the wrong place.
+                    // `prepend: true` puts a before callback at the front of
+                    // its chain (an after callback already is: ActiveModel
+                    // sets `prepend` on every after callback it defines).
+                    "prepend" => {
+                        let value = assoc.value();
+                        prepend = if value.as_true_node().is_some() {
+                            true
+                        } else if value.as_false_node().is_some() {
+                            false
+                        } else {
+                            return None;
+                        };
+                    }
+                    // Anything else: not modeled — reject rather than run
+                    // the callback in the wrong place.
                     _ => return None,
                 }
             }
+        } else if (arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some()) && object.is_none() {
+            // A callback OBJECT naming a constant (`after_create Methods`):
+            // Rails sends it `<hook>(record)`.
+            object = Some(ingest_expr(&arg, file).ok()?);
         } else {
             // Lambda / block-pass target (`after_create -> { … }`):
             // stays an Unknown item (block-form bodies are handled by
@@ -2551,8 +2570,11 @@ fn parse_callback(
             return None;
         }
     }
-    if targets.is_empty() {
+    if targets.is_empty() == object.is_none() {
         return None;
+    }
+    if prepend && !matches!(hook, CallbackHook::BeforeValidation | CallbackHook::BeforeSave | CallbackHook::BeforeCreate | CallbackHook::BeforeUpdate | CallbackHook::BeforeDestroy) {
+        prepend = false;
     }
     // `on:` is only expressible where the runtime hook surface can
     // carry it — the validation hooks (new_record? guard). Rails
@@ -2571,7 +2593,7 @@ fn parse_callback(
         (Some(a), Some(b)) => Some(and_condition(a, negate_condition(b))),
     };
 
-    Some(Callback { hook, targets, on, condition, on_any: Vec::new(), object: None, prepend: false })
+    Some(Callback { hook, targets, on, condition, on_any: Vec::new(), object, prepend })
 }
 
 /// The transaction callbacks (activerecord transactions.rb, the Rails

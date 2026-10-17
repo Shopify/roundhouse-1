@@ -291,6 +291,7 @@ module ActiveRecord
     def save_after_validation: () -> bool
     def _insert_row: () -> bool
     def save!: () -> Base
+    def validate!: () -> bool
     def destroy: () -> Base
     def destroy!: () -> Base
     def reload: (?untyped options) -> Base

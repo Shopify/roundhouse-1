@@ -1335,6 +1335,14 @@ module ActiveRecord
       self
     end
 
+    # `record.validate!` — run the validations; raise RecordInvalid when
+    # one fails (Core's Markets::Platform::Service::Condition validates a
+    # market before `update_columns`).
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
+    end
+
     # `record.touch` — write the current time to `updated_at` and
     # UPDATE, skipping validations and save callbacks. The catalog has
     # typed this as an instance DbWrite returning Bool since before it
