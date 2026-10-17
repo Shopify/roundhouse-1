@@ -35,6 +35,6 @@ fn a_string_blank_beside_a_relation_chain_is_rails_blank() {
         .write("app/models/card.rb", CARD)
         .emit(roundhouse::project::BuildTarget::Ruby);
     let text = std::fs::read_to_string(emitted.join("app/models/card.rb")).expect("card.rb");
-    assert!(text.contains("(item_ref || \"\").blank?"), "{text}");
+    assert!(text.contains("(self.item_ref || \"\").blank?"), "{text}");
     assert!(!text.contains("strip.empty?"), "{text}");
 }

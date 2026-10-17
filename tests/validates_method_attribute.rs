@@ -178,7 +178,7 @@ fn method_attributes_validate_like_rails() {
     run.assert_passes();
     let document = std::fs::read_to_string(run.emitted.join("app/models/document.rb")).unwrap();
     assert!(!document.contains("@has_account?") && !document.contains("@shouting?"), "{document}");
-    assert!(document.contains("ActiveSupport.blank?(has_account?)"), "{document}");
+    assert!(document.contains("ActiveSupport.blank?(self.has_account?)"), "{document}");
     assert!(!document.contains("@label") && !document.contains("@pages_text"), "{document}");
     assert_eq!(run.stdout, expected(), "emitted vs Rails' answers");
     assert_eq!(run.stdout, native(), "emitted vs native activerecord");
