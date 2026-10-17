@@ -56,3 +56,33 @@ fn a_constant_option_does_not_stop_the_macro_replay() {
     assert!(out.contains("priced :amount, currency_column: :currency"), "{out}");
     assert!(out.contains("priced :total_price_usd, currency: Order::USD_CURRENCY_CODE"), "{out}");
 }
+
+/// The replayed option is written in full; inside `module Shipping`
+/// beside a class `Shipping::Shipping` that full path is rooted, or
+/// Ruby finds the sibling first (`uninitialized constant
+/// Shipping::Shipping::Claim`, Core's DeliveryPromise::PromiseClaim).
+#[test]
+fn a_constant_option_under_a_shadowed_namespace_is_rooted() {
+    let claim = r#"module Shipping
+  class Claim < ApplicationRecord
+    self.table_name = "orders"
+    USD_CURRENCY_CODE = "USD"
+
+    priced :total_price_usd, currency: USD_CURRENCY_CODE
+  end
+end
+"#;
+    let app = [
+        ("roundhouse.yml", "database_adapter: postgresql\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("db/structure.sql", STRUCTURE),
+        ("app/models/application_record.rb", APPLICATION_RECORD),
+        ("app/models/shipping/claim.rb", claim),
+        ("app/models/shipping/shipping.rb", "module Shipping\n  class Shipping\n  end\nend\n"),
+    ]
+    .iter()
+    .fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text));
+    let (emitted, _) = app.emit(roundhouse::project::BuildTarget::Ruby);
+    let out = std::fs::read_to_string(emitted.join("app/models/shipping/claim.rb")).expect("claim.rb emitted");
+    assert!(out.contains("priced :total_price_usd, currency: ::Shipping::Claim::USD_CURRENCY_CODE"), "{out}");
+}

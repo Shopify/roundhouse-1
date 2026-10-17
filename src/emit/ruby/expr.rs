@@ -97,7 +97,19 @@ pub(super) fn rooted_if_shadowed(written: &str, scopes: &[&str], paths: &crate::
     let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
         return written.to_string();
     };
-    if paths.contains(&format!("{scope}::{written}")) || !(paths.contains(written) || super::library::FRAMEWORK_ROOTS.contains(&first)) {
+    // A written path may end in a value constant (`DeliveryPromise::
+    // PromiseClaim::USD_CURRENCY`) that `paths` (classes and modules)
+    // does not list: its declared prefixes decide. The first segment is
+    // the shadowed one, so a deeper prefix decides the scope's own.
+    let segments: Vec<&str> = written.split("::").collect();
+    let prefix = |i: usize| segments[..i].join("::");
+    let scope_declares = if segments.len() == 1 {
+        paths.contains(&format!("{scope}::{written}"))
+    } else {
+        (2..=segments.len()).any(|i| paths.contains(&format!("{scope}::{}", prefix(i))))
+    };
+    let ours = (1..=segments.len()).any(|i| paths.contains(&prefix(i)));
+    if scope_declares || !(ours || super::library::FRAMEWORK_ROOTS.contains(&first)) {
         return written.to_string();
     }
     format!("::{written}")
@@ -2708,6 +2720,27 @@ mod tests {
 
     fn lit_str(s: &str) -> Expr {
         Expr::new(Span::default(), ExprNode::Lit { value: Literal::Str { value: s.to_string() } })
+    }
+
+    #[test]
+    fn a_value_constant_under_a_shadowed_namespace_is_rooted() {
+        // `module DeliveryPromise; class PromiseClaim` beside a class
+        // `DeliveryPromise::DeliveryPromise`: the written
+        // `DeliveryPromise::PromiseClaim::USD_CURRENCY` finds the sibling.
+        let paths: crate::det::HashSet<String> =
+            ["DeliveryPromise", "DeliveryPromise::PromiseClaim", "DeliveryPromise::DeliveryPromise"].iter().map(|s| s.to_string()).collect();
+        let scopes = ["DeliveryPromise", "DeliveryPromise::PromiseClaim"];
+        assert_eq!(
+            rooted_if_shadowed("DeliveryPromise::PromiseClaim::USD_CURRENCY", &scopes, &paths),
+            "::DeliveryPromise::PromiseClaim::USD_CURRENCY"
+        );
+        assert_eq!(rooted_if_shadowed("DeliveryPromise::PromiseClaim", &scopes, &paths), "::DeliveryPromise::PromiseClaim");
+        // A path the shadowing class itself declares stays as written.
+        let mut nested = paths.clone();
+        nested.insert("DeliveryPromise::DeliveryPromise::Returnability".to_string());
+        assert_eq!(rooted_if_shadowed("DeliveryPromise::Returnability::X", &scopes, &nested), "DeliveryPromise::Returnability::X");
+        // Not shadowed: as written.
+        assert_eq!(rooted_if_shadowed("Other::X", &scopes, &paths), "Other::X");
     }
 
     #[test]
