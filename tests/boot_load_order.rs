@@ -61,7 +61,7 @@ end
 }
 
 fn leading_requires(content: &str) -> Vec<&str> {
-    content.lines().take_while(|line| line.starts_with("require")).collect()
+    content.lines().skip_while(|line| line.starts_with('#')).take_while(|line| line.starts_with("require")).collect()
 }
 
 #[test]
