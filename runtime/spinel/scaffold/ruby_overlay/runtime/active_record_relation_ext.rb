@@ -167,6 +167,154 @@ module ActiveRecord
   end
   Relation.prepend(RelationJoinsValues)
 
+  # Rails' `build_joins` order. Association joins form ONE tree, rendered
+  # ahead of the string joins written after the first of them; the
+  # lowering renders every association join as a string at its call
+  # position, so `joins(:responders).joins("LEFT JOIN (...) AS d ON d.k =
+  # groups.k").joins(responders: :group)` reaches the relation as three
+  # fragments with the one naming `groups` before the one introducing it
+  # (PostgreSQL: missing FROM-clause entry), and the third repeating the
+  # first's `INNER JOIN responders ...` (table name specified more than
+  # once). Two repairs on each appended fragment, neither touching a query
+  # PostgreSQL would accept:
+  #
+  # * a clause already in the list is dropped from it (the tree joins a
+  #   hop once);
+  # * a fragment that names a table or alias a LATER fragment introduces
+  #   moves behind that fragment.
+  module RelationJoinOrdering
+    def joins!(spec)
+      before = @joins.length
+      super
+      settle_join_fragments(before)
+      self
+    end
+
+    def left_outer_joins!(spec)
+      before = @joins.length
+      super
+      settle_join_fragments(before)
+      self
+    end
+
+    private
+
+    def settle_join_fragments(before)
+      return if @joins.length <= before
+      frag = @joins.pop
+      clauses = join_clauses_of(frag)
+      kept = clauses.reject { |clause| join_clause_present?(clause) }
+      return if kept.empty?
+      frag = kept.join(" ")
+      return if @joins.include?(frag)
+      @joins << frag
+      return if @joins.length < 2
+      moves = 0
+      i = 0
+      while i < @joins.length - 1 && moves < 16
+        moved = false
+        j = i + 1
+        while j < @joins.length
+          if join_names_later_table?(@joins[i], @joins[j], i)
+            @joins.insert(j, @joins.delete_at(i))
+            moves += 1
+            moved = true
+            break
+          end
+          j += 1
+        end
+        i += 1 unless moved
+      end
+    end
+
+    # True when `clause` is one of the join clauses a listed fragment holds.
+    def join_clause_present?(clause)
+      @joins.any? { |j| j == clause || join_clauses_of(j).include?(clause) }
+    end
+
+    # The `JOIN` clauses of a fragment, split where a clause keyword starts
+    # outside any parenthesis (a joined subquery's own joins stay inside its
+    # clause). A fragment with no such start is one clause.
+    def join_clauses_of(frag)
+      clauses = []
+      depth = 0
+      start = 0
+      i = 0
+      n = frag.length
+      while i < n
+        ch = frag[i]
+        if ch == "("
+          depth += 1
+        elsif ch == ")"
+          depth -= 1
+        elsif depth == 0 && i > start && frag[i - 1] == " " && frag[i, 20].match?(/\A(?:INNER|LEFT|RIGHT|FULL|CROSS)\s+(?:OUTER\s+)?JOIN\b/i)
+          clauses << frag[start...(i - 1)]
+          start = i
+        end
+        i += 1
+      end
+      clauses << frag[start...n]
+      clauses
+    end
+
+    # True when `early` names a table or alias that `later` introduces (and
+    # `early`, the base table and the joins before `early` do not).
+    def join_names_later_table?(early, later, index)
+      introduced = join_introduced_names(later)
+      return false if introduced.empty?
+      own = join_introduced_names(early)
+      before = []
+      k = 0
+      while k < index
+        join_introduced_names(@joins[k]).each { |n| before << n }
+        k += 1
+      end
+      back = join_referenced_names(later)
+      early_refs = join_referenced_names(early)
+      return false if own.any? { |n| back.include?(n) }
+      introduced.any? do |n|
+        early_refs.include?(n) && !own.include?(n) && !before.include?(n) && n != @table.to_s
+      end
+    end
+
+    # The table names and aliases a join fragment puts in scope.
+    def join_introduced_names(frag)
+      names = []
+      frag.scan(/\bJOIN\s+"?([A-Za-z_][A-Za-z0-9_]*)"?(?:\s+(?:AS\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?)?\s+ON\b/i).each do |m|
+        names << m[0].downcase
+        names << m[1].downcase unless m[1].nil?
+      end
+      frag.scan(/\bAS\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\s+ON\b/i).each { |m| names << m[0].downcase }
+      names
+    end
+
+    # The `name.column` qualifiers a join fragment uses.
+    def join_referenced_names(frag)
+      names = []
+      frag.scan(/(?<![A-Za-z0-9_.])"?([A-Za-z_][A-Za-z0-9_]*)"?\.[A-Za-z_*"]/).each { |m| names << m[0].downcase }
+      names
+    end
+  end
+  Relation.prepend(RelationJoinOrdering)
+
+  # Rails' `pluck(catalogs: :id)` / `pluck(catalogs: [:id, :name])`: a
+  # table => column(s) Hash names `table.column`, as the string form does.
+  module RelationPluckHash
+    def pluck(*cols)
+      return super unless cols.any? { |col| col.is_a?(Hash) }
+      fields = []
+      cols.flatten.each do |col|
+        if col.is_a?(Hash)
+          col.each { |table, named| Array(named).each { |name| fields << "#{table}.#{name}" } }
+        else
+          fields << col
+        end
+      end
+      super(*fields)
+    end
+  end
+  Relation.prepend(RelationPluckHash)
+
   # Rails' `Relation#from_clause`: always a FromClause (never nil), its
   # `value` the source `from` was given (nil when the relation has none).
   # Core's `Pagination::SqlPaginationBackend#ignore_index_for_id_sort`
