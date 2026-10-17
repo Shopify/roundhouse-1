@@ -198,7 +198,7 @@ fn t_must_because_lowers_to_sorbets_nil_check() {
     let emitted = emitted(
         r#"class Gauge
   def label(kind)
-    T.must_because(kind) { |why| why.to_s }.to_s
+    T.must_because(kind) { "a kind" }.to_s
   end
 end
 "#,

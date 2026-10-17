@@ -1576,10 +1576,26 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
             .collect()
     };
 
-    // Strict mode (default): the statement holding the unsupported
-    // construct is refused at its own site (it raises if reached) and
-    // the rest of the app is ingested; it no longer aborts the ingest.
-    let strict = ingest_app_from_tree(tree()).expect("strict ingest keeps going past a refused statement");
+    // Strict mode (default) does not drop a view template it cannot
+    // ingest: the RABL view aborts the ingest, as `check`'s error gate
+    // requires.
+    let err = ingest_app_from_tree(tree()).expect_err("strict ingest aborts on the un-ingested RABL view");
+    assert!(
+        matches!(&err, IngestError::Unsupported { message, .. } if message.contains("view template not ingested: rabl")),
+        "{err:?}"
+    );
+
+    // Without it, the statement holding the unsupported construct is
+    // refused at its own site (it raises if reached) and the rest of the
+    // app is ingested; it no longer aborts the ingest.
+    let without_rabl = || -> HashMap<PathBuf, Vec<u8>> {
+        files
+            .iter()
+            .filter(|(p, _)| !p.ends_with(".rabl"))
+            .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
+            .collect()
+    };
+    let strict = ingest_app_from_tree(without_rabl()).expect("strict ingest keeps going past a refused statement");
     let refusals: Vec<_> = roundhouse::analyze::diagnose(&strict)
         .into_iter()
         .filter(|d| d.code() == "ingest_unsupported")
