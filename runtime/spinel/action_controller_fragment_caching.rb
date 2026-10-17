@@ -87,8 +87,7 @@ module ActionController
       store = cache_store
       return nil if store.nil?
       # An ActiveSupport store expands the key itself, as Rails hands it
-      # the combined key (the activesupport port, where the app names
-      # ActiveSupport::Cache, has no module-level `expanded_key`).
+      # the combined key.
       name = combined_fragment_cache_key(key)
       return store.read(name) if store.is_a?(ActiveSupport::Cache::MemoryStore)
       store.read_str(ActiveSupport::Cache.expanded_key(name))

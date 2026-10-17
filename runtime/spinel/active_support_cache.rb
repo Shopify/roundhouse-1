@@ -146,6 +146,12 @@ module ActiveSupport
         expanded_cache_key
       end
 
+      # `Store#expanded_key` for a caller with no store at hand: the fragment
+      # caching runtime files its keys the way a store does.
+      def expanded_key(key)
+        Store.allocate.send(:expanded_key, key)
+      end
+
       # Object#to_param from core_ext/object/to_param: nil, true and false
       # are themselves, an Array joins its members' params with "/", a
       # Hash is its query string, anything else answers its own
