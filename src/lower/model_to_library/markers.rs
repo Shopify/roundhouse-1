@@ -888,13 +888,27 @@ pub(super) fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
 /// fold preserves source order; broadcasts_to runs first so its calls
 /// lead any block-form callback bodies that the next pass would add.
 pub(crate) fn fold_into_or_push(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr) {
+    fold_into_or_push_at(methods, model, hook_name, call, false)
+}
+
+/// [`fold_into_or_push`] for a `prepend: true` callback: its statement runs
+/// before the ones already folded into the hook.
+pub(crate) fn fold_into_or_push_front(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr) {
+    fold_into_or_push_at(methods, model, hook_name, call, true)
+}
+
+fn fold_into_or_push_at(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr, front: bool) {
     let hook = Symbol::from(hook_name);
     if let Some(existing) = methods.iter_mut().find(|m| m.name == hook) {
         let mut stmts = match &*existing.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
             _ => vec![existing.body.clone()],
         };
-        stmts.push(call);
+        if front {
+            stmts.insert(0, call);
+        } else {
+            stmts.push(call);
+        }
         existing.body = seq(stmts);
     } else {
         methods.push(MethodDef {
@@ -1537,7 +1551,21 @@ fn push_symbol_callback(
         )
     };
 
-    let mut body = seq(cb.targets.iter().map(self_call).collect());
+    let mut body = match &cb.object {
+        // A callback object (`after_create Methods`) is sent
+        // `<hook>(record)`.
+        Some(object) => Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(object.clone()),
+                method: Symbol::from(hook_name),
+                args: vec![Expr::new(span, ExprNode::SelfRef)],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        None => seq(cb.targets.iter().map(self_call).collect()),
+    };
     if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
         // Validations never run on destroy; ingest rejects this.
         let Some(on) = cb.on else { return };
@@ -1560,7 +1588,11 @@ fn push_symbol_callback(
             },
         );
     }
-    fold_into_or_push(methods, model, hook_name, body);
+    if cb.prepend {
+        fold_into_or_push_front(methods, model, hook_name, body);
+    } else {
+        fold_into_or_push(methods, model, hook_name, body);
+    }
 }
 
 /// Wrap a validation-hook body in the `new_record?` guard its `on:`

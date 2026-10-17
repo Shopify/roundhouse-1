@@ -161,3 +161,38 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         }
     }
 }
+
+/// A model's own `@attributes` read (`@attributes["pristine_state"].value`
+/// in Core's Checkout) in an authored method, as the call that binds the
+/// record's attribute view (`ActiveRecord::Base#_attribute_set`,
+/// runtime/spinel/cruby/active_record_transactions.rb). The compiled model
+/// keeps its columns in slots, so the ivar is nil until something bound it.
+/// PostgreSQL CRuby tree only: it carries that runtime.
+pub(crate) fn bind_attribute_set(lcs: &mut [LibraryClass], app: &App) {
+    if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+        return;
+    }
+    for model in &app.models {
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        for m in lc.methods.iter_mut().filter(|m| !m.name_span.is_synthetic() && m.receiver == crate::dialect::MethodReceiver::Instance) {
+            read_attribute_set(&mut m.body);
+        }
+    }
+}
+
+fn read_attribute_set(e: &mut Expr) {
+    if !e.span.is_synthetic() && matches!(&*e.node, ExprNode::Ivar { name } if name.as_str() == "attributes") {
+        *e = Expr::new(
+            e.span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("_attribute_set"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| read_attribute_set(c));
+}

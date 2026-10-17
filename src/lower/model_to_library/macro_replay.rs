@@ -866,8 +866,12 @@ impl<'a> ClassSide<'a> {
         // into ActiveRecord::Base (`on_load(:active_record)`), so the call
         // runs there and sets the class's `token_prefix` and `before_create`
         // hook. Dropped, `generate_token_for` reads a nil prefix
-        // (`nil + SecureRandom.hex`).
-        if method.as_str() == "has_token"
+        // (`nil + SecureRandom.hex`). `has_handle(column = :handle, **opts)`
+        // is the same gem's other macro: it sets `handle_column` /
+        // `handle_options` (class attributes the gem's InstanceMethods
+        // declares when included) and the `before_create` hook that fills
+        // the handle. Dropped, `Product.create!` leaves `handle` nil.
+        if matches!(method.as_str(), "has_token" | "has_handle")
             && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
             && self.app.bundler_gems.iter().any(|g| g.name == "identifications")
         {
