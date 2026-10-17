@@ -428,11 +428,14 @@ fn guard_alias_method(call: &Expr) -> Option<Expr> {
             right: class_send("private_method_defined?", &old_arg),
         },
     );
+    // `STDERR.puts`, not `warn`: Core's StrictWarnings raises on a
+    // warning an app file emits (`StrictWarning::Offense` at load).
+    let stderr = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![crate::ident::Symbol::from("STDERR")] });
     let warning = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
-            recv: None,
-            method: crate::ident::Symbol::from("warn"),
+            recv: Some(stderr),
+            method: crate::ident::Symbol::from("puts"),
             args: vec![super::lit_str(format!(
                 "roundhouse: alias_method :{new}, :{old} not applied: the compiled class has no `{old}`"
             ))],
@@ -444,6 +447,11 @@ fn guard_alias_method(call: &Expr) -> Option<Expr> {
         call.span,
         ExprNode::If { cond, then_branch: call.clone(), else_branch: warning },
     ))
+}
+
+/// `alias_method :new, :old` written with literal names.
+fn is_alias_method_call(call: &Expr) -> bool {
+    matches!(&*call.node, ExprNode::Send { method, args, block: None, .. } if method.as_str() == "alias_method" && alias_method_names(args).is_some())
 }
 
 /// `extend M, ...` (bare or `self.`): its argument expressions.
@@ -1999,6 +2007,15 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
         .filter_map(|expr| {
             if !state_machine_answered && crate::lower::state_machines::is_state_machine_call(expr) {
                 return Some((expr, MacroVerdict::Replay));
+            }
+            // A model body's `alias_method` replays guarded
+            // (`guard_alias_method`, in `replay_model_macros`); an STI
+            // subclass's statements are emitted as written, and its target
+            // may be a method a dropped macro defines (openid_connect's
+            // `IdToken < ConnectObject`: `alias_method :subject, :sub` after
+            // `attr_required :sub`), which would raise NameError at boot.
+            if is_alias_method_call(expr) {
+                return None;
             }
             side.verdict(expr).map(|v| match v {
                 MacroVerdict::BelongsToRequiredByDefault(value) if !declares_belongs_to_after(lc, expr, app) => {

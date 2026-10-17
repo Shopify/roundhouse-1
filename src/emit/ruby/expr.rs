@@ -97,22 +97,27 @@ pub(super) fn rooted_if_shadowed(written: &str, scopes: &[&str], paths: &crate::
     let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
         return written.to_string();
     };
-    // A written path may end in a value constant (`DeliveryPromise::
-    // PromiseClaim::USD_CURRENCY`) that `paths` (classes and modules)
-    // does not list: its declared prefixes decide. The first segment is
-    // the shadowed one, so a deeper prefix decides the scope's own.
+    // Ruby walks the written segments from the shadowing scope's sibling:
+    // the deepest prefix declared there (`under`) against the deepest
+    // declared from the top (`top`). The whole path declared there is the
+    // scope's own. A path that ends in a value constant
+    // (`DeliveryPromise::PromiseClaim::USD_CURRENCY`; `paths` lists classes
+    // and modules) is the top's when the top declares more of it than the
+    // sibling does (`DeliveryPromise::PromiseClaim` against the sibling
+    // `DeliveryPromise::DeliveryPromise`), and the sibling's when not
+    // (`Activity::ADJUSTMENT` inside `GraphApi::Admin`, beside a top-level
+    // `Activity`, names `GraphApi::Admin::Activity`'s constant).
     let segments: Vec<&str> = written.split("::").collect();
     let prefix = |i: usize| segments[..i].join("::");
-    let scope_declares = if segments.len() == 1 {
-        paths.contains(&format!("{scope}::{written}"))
-    } else {
-        (2..=segments.len()).any(|i| paths.contains(&format!("{scope}::{}", prefix(i))))
-    };
-    let ours = (1..=segments.len()).any(|i| paths.contains(&prefix(i)));
-    if scope_declares || !(ours || super::library::FRAMEWORK_ROOTS.contains(&first)) {
+    let under = (1..=segments.len()).rev().find(|&i| paths.contains(&format!("{scope}::{}", prefix(i)))).unwrap_or(0);
+    let top = (1..=segments.len()).rev().find(|&i| paths.contains(&prefix(i))).unwrap_or(0);
+    if under == segments.len() {
         return written.to_string();
     }
-    format!("::{written}")
+    if top == segments.len() || super::library::FRAMEWORK_ROOTS.contains(&first) || top > under {
+        return format!("::{written}");
+    }
+    written.to_string()
 }
 
 /// Whether the tree being emitted binds keywords natively (ruby family).
@@ -2741,6 +2746,23 @@ mod tests {
         assert_eq!(rooted_if_shadowed("DeliveryPromise::Returnability::X", &scopes, &nested), "DeliveryPromise::Returnability::X");
         // Not shadowed: as written.
         assert_eq!(rooted_if_shadowed("Other::X", &scopes, &paths), "Other::X");
+        // The shadowing sibling's own value constant, written relative
+        // (`Activity::ADJUSTMENT` in `GraphApi::Admin` beside a top-level
+        // `Activity`): as written.
+        let admin: crate::det::HashSet<String> =
+            ["Activity", "GraphApi", "GraphApi::Admin", "GraphApi::Admin::Activity"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(rooted_if_shadowed("Activity::ADJUSTMENT", &["GraphApi", "GraphApi::Admin"], &admin), "Activity::ADJUSTMENT");
+        // A declared namespace under the sibling is not the whole path:
+        // `GraphApi::Admin::MarketConditionApplicationType` inside
+        // `BusinessCustomers::GraphApi::Admin` is the top-level class.
+        let bc: crate::det::HashSet<String> = [
+            "GraphApi", "GraphApi::Admin", "GraphApi::Admin::MarketConditionApplicationType",
+            "BusinessCustomers", "BusinessCustomers::GraphApi", "BusinessCustomers::GraphApi::Admin",
+        ].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            rooted_if_shadowed("GraphApi::Admin::MarketConditionApplicationType", &["BusinessCustomers", "BusinessCustomers::GraphApi", "BusinessCustomers::GraphApi::Admin"], &bc),
+            "::GraphApi::Admin::MarketConditionApplicationType"
+        );
     }
 
     #[test]
