@@ -406,3 +406,37 @@ end
     let other = r##"{ class_name: "#{self}Note", foreign_key: "owner_id" }, ::Shelf, unsupported: ["`before_add:` (not a literal)"])"##;
     assert!(shelf.contains(other), "{shelf}");
 }
+
+/// An `extend:` naming a module (Core's `has_many :article_tags, extend:
+/// Taggable::TagAssociationExtension`) or an array of them is carried on
+/// the reflection as written; the declaration's block is appended after
+/// them (`[*options[:extend], extension]`).
+#[test]
+fn a_constant_extend_option_is_carried_on_the_reflection() {
+    const SHELF: &str = r#"class Shelf < ApplicationRecord
+  module Ordered
+  end
+  module Tagged
+  end
+
+  has_many :notes, foreign_key: "owner_id", as: :owner, extend: Ordered
+  has_many :other_notes, class_name: "Note", foreign_key: "owner_id", extend: [Ordered, Tagged]
+  has_many :late_notes, class_name: "Note", foreign_key: "owner_id", extend: Ordered do
+    include Tagged
+  end
+end
+"#;
+    let structure = format!(
+        "{STRUCTURE}CREATE TABLE shelves (\n    id bigserial NOT NULL,\n    CONSTRAINT shelves_pkey PRIMARY KEY (id)\n);\n"
+    );
+    let (emitted, errors) = overlay()
+        .write("db/structure.sql", &structure)
+        .write("app/models/shelf.rb", SHELF)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let shelf = std::fs::read_to_string(emitted.join("app/models/shelf.rb")).unwrap();
+    assert!(shelf.contains("as: :owner, extend: Ordered }, ::Shelf)"), "{shelf}");
+    assert!(shelf.contains("foreign_key: \"owner_id\", extend: [Ordered, Tagged] }, ::Shelf)"), "{shelf}");
+    assert!(shelf.contains("extend: [*Ordered, (Module.new do include Tagged end)] }, ::Shelf)"), "{shelf}");
+    assert!(!shelf.contains("unsupported: [\"`extend:`"), "{shelf}");
+}

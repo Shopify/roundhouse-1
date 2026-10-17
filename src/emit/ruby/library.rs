@@ -4451,6 +4451,13 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 }
             })
     }
+    // An `extend:` naming its modules: a constant, or an array of constants
+    // (`extend: Taggable::TagAssociationExtension`), which names the same
+    // module where the reflection table is built.
+    fn extension_modules(node: &ruby_prism::Node<'_>) -> bool {
+        let constant = |n: &ruby_prism::Node<'_>| n.as_constant_read_node().is_some() || n.as_constant_path_node().is_some();
+        constant(node) || node.as_array_node().is_some_and(|a| a.elements().iter().all(|e| constant(&e)))
+    }
     // An association option value the reflection table can rebuild from its
     // source text: a `proc { |owner, record| ... }` / `lambda` / `->` that
     // reads no local of the class body around it (the callback options,
@@ -4582,7 +4589,7 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 match name {
                     Some(name) if label(&name) => {
                         let value = assoc.value();
-                        if literal(&value) || carried_option_value(&value) {
+                        if literal(&value) || carried_option_value(&value) || (name == "extend" && extension_modules(&value)) {
                             pairs.push(format!("{name}: {}", String::from_utf8_lossy(value.location().as_slice())));
                         } else {
                             unsupported.push(format!("`{name}:` (not a literal)"));
@@ -4604,7 +4611,14 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
             match block.as_block_node().filter(|b| mixin_only_block(b)) {
                 Some(b) => {
                     let module = format!("Module.new {}", String::from_utf8_lossy(b.location().as_slice()));
-                    pairs.push(format!("extend: [{module}]"));
+                    // The call's own `extend:` comes first (`[*options[:extend], extension]`).
+                    match pairs.iter().position(|p| p.starts_with("extend: ")) {
+                        Some(at) => {
+                            let named = pairs[at]["extend: ".len()..].to_string();
+                            pairs[at] = format!("extend: [*{named}, {module}]");
+                        }
+                        None => pairs.push(format!("extend: [{module}]")),
+                    }
                 }
                 None => unsupported.push("`extend:` (the declaration's block)".to_string()),
             }
