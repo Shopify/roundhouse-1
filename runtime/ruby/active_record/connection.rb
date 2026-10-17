@@ -1056,6 +1056,15 @@ module ActiveRecord
       all.upsert_all(rows, unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
     end
 
+    # An upserted value through its column's type, as the database stores
+    # it. A column whose type the port does not carry (SQLite's datetime
+    # with the time zone converter) is written as given.
+    def self._upsert_serialize(name, value)
+      spec = schema_column_types[name.to_s]
+      return value if spec && spec[0] == :unported
+      type_for_attribute(name).serialize(value)
+    end
+
     # The write behind `Relation#upsert_all`, which Rails reaches from
     # the model through `all`: a patch prepended on Relation (Core's
     # GenerateOid allocates the ids there) runs first.
@@ -1085,7 +1094,7 @@ module ActiveRecord
       end
 
       tuples = rows.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(known.include?(c.to_s) ? type_for_attribute(c).serialize(row[c]) : row[c]) }
+        values = cols.map { |c| ActiveRecord.adapter.escape_value(known.include?(c.to_s) ? _upsert_serialize(c, row[c]) : row[c]) }
         stamped.each { |_c| values.push(ActiveRecord.adapter.escape_value(now)) }
         "(" + values.join(", ") + ")"
       end
