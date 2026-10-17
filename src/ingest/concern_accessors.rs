@@ -30,8 +30,9 @@ pub(super) fn is_candidate(item: &ModelBodyItem) -> bool {
     matches!(item, ModelBodyItem::Unknown { expr, .. } if accessor(expr))
 }
 
-/// Computed/splat names retain concern lexical scope, and one-sided
-/// accessors need a separate analyzer fix. Neither is admitted here.
+/// Computed/splat names retain concern lexical scope; they are not admitted
+/// here. A one-sided `attr_reader` / `attr_writer` is: it defines only its
+/// own half, which `refusals` checks against the includer.
 pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     let ModelBodyItem::Unknown { expr, .. } = item else {
         return false;
@@ -46,7 +47,7 @@ pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     else {
         return false;
     };
-    method.as_str() == "attr_accessor"
+    matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")
         && !args.is_empty()
         && args.iter().all(|arg| {
             matches!(
@@ -699,7 +700,7 @@ fn refusals(
                 ));
                 continue;
             }
-            let ExprNode::Send { args, .. } = &*expr.node else {
+            let ExprNode::Send { method: declared, args, .. } = &*expr.node else {
                 unreachable!()
             };
             for arg in args {
@@ -709,7 +710,16 @@ fn refusals(
                 else {
                     unreachable!()
                 };
-                let writer = Symbol::from(format!("{name}="));
+                // The names this declaration defines: a one-sided one
+                // leaves the other half to the includer or the concern.
+                let named_writer = Symbol::from(format!("{name}="));
+                let (reader_name, writer) = match declared.as_str() {
+                    "attr_reader" => (name, name),
+                    "attr_writer" => (&named_writer, &named_writer),
+                    _ => (name, &named_writer),
+                };
+                let name = reader_name;
+                let writer = writer.clone();
                 let earlier = model.body[..index].iter().any(|item| {
                     matches!(item, ModelBodyItem::Method { method, .. } if method.receiver == MethodReceiver::Instance
                         && (method.name == *name || method.name == writer))

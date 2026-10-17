@@ -274,6 +274,13 @@ pub enum ValueType {
     /// Other dialects store bytes as text and lower it to `Str`.
     Binary,
     BinaryOpt,
+    /// A NOT NULL date/time column an INSERT writes (PostgreSQL only): a
+    /// slot nothing set holds `""`, which the column rejects as a
+    /// timestamp. Rails leaves such an attribute out of the INSERT, so the
+    /// column's DEFAULT applies (`active_at ... DEFAULT CURRENT_TIMESTAMP`);
+    /// this renders the `DEFAULT` keyword for the blank slot and the usual
+    /// text literal otherwise. Other dialects lower it to `Str`.
+    Temporal,
 }
 
 impl ValueType {
@@ -290,6 +297,7 @@ impl ValueType {
             (_, super::visitor::SqlDialect::Postgres) => self,
             (ValueType::Binary, _) => ValueType::Str,
             (ValueType::BinaryOpt, _) => ValueType::StrOpt,
+            (ValueType::Temporal, _) => ValueType::Str,
             (other, _) => other,
         }
     }
@@ -302,6 +310,7 @@ impl ValueType {
             ValueType::Bool | ValueType::BoolOpt => ValueType::BoolOpt,
             ValueType::FloatOpt => ValueType::FloatOpt,
             ValueType::Binary | ValueType::BinaryOpt => ValueType::BinaryOpt,
+            ValueType::Temporal => ValueType::StrOpt,
         }
     }
 }

@@ -186,6 +186,7 @@ fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize, dialect: SqlDi
             ValueType::Int => "bind_int",
             ValueType::Str => "bind_text",
             ValueType::Bool => "bind_bool",
+            ValueType::Temporal => "bind_text",
             ValueType::IntOpt => "bind_int_opt",
             ValueType::StrOpt => "bind_text_opt",
             ValueType::BoolOpt => "bind_bool_opt",
@@ -1286,6 +1287,7 @@ fn escape_value(db: &ClassId, val: &Value, dialect: SqlDialect) -> Expr {
                 ValueType::BoolOpt => "escape_bool_opt",
                 ValueType::Binary => "escape_binary",
                 ValueType::BinaryOpt => "escape_binary_opt",
+                ValueType::Temporal => "escape_temporal",
             };
             db_call(db, method, vec![expr.clone()])
         }

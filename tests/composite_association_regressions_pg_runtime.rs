@@ -106,6 +106,7 @@ const PROBE: &str = r##"class CompositeAssociationRegressionsProbe
     step(out, "where list") { OrderLine.where(order: [o1, o2]).pluck(:sku).sort.inspect }
     step(out, "where list one") { OrderLine.where(order: [o1]).pluck(:sku).sort.inspect }
     step(out, "includes") { OrderLine.includes(:order).order(:id).map { |l| l.order&.name }.inspect }
+    step(out, "includes loaded") { OrderLine.includes(:order).order(:id).map { |l| l.association(:order).loaded? }.inspect }
     step(out, "eager_load") { OrderLine.eager_load(:order).where(orders: { name: "one" }).pluck(:sku).sort.inspect }
     step(out, "inverse") do
       owner = Order.find(o1.id)
@@ -127,7 +128,7 @@ end
 "##;
 
 /// Native Rails 8.2 on the same PostgreSQL.
-const EXPECTED: [&str; 12] = [
+const EXPECTED: [&str; 13] = [
     "writer: [1, true]",
     "writer nil: [nil, nil]",
     "writer saved: [2, true, \"two\"]",
@@ -136,6 +137,7 @@ const EXPECTED: [&str; 12] = [
     "where list: [\"a\", \"b\", \"w\"]",
     "where list one: [\"a\"]",
     "includes: [\"one\", \"two\", nil, \"two\"]",
+    "includes loaded: [true, true, true, true]",
     "eager_load: [\"a\"]",
     "inverse: true 1",
     "query_foreign_key: [[\"order_id\", \"shop_id\"], [\"id\", \"shop_id\"]]",
@@ -252,4 +254,14 @@ fn an_update_addresses_the_row_by_its_stored_query_constraints() {
 fn a_named_inverse_of_seats_the_owner_on_a_built_record() {
     let out = emitted_model("order");
     assert!(out.contains("record.order = self"), "{out}");
+}
+
+#[test]
+fn a_composite_belongs_to_preload_dispatch_marks_the_association_loaded() {
+    let out = emitted_model("order_line");
+    // The composite reader has no batch loader, but `includes(:order)` must
+    // still leave `association(:order).loaded?` true (Core's entity loader
+    // reads it): `_preload_dispatch` walks the reader for the records.
+    assert!(out.contains("when :order"), "{out}");
+    assert!(out.contains("found = r.order"), "{out}");
 }

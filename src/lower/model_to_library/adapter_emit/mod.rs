@@ -353,7 +353,7 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
             column: c.name.clone(),
             value: Value::Runtime {
                 expr: column_bind_expr(model, c),
-                ty: bind_type(model, c),
+                ty: insert_bind_type(model, c),
             },
         })
         .collect();
@@ -374,7 +374,7 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
             .filter(|c| c.generated.is_none())
             .map(|c| Assignment {
                 column: c.name.clone(),
-                value: Value::Runtime { expr: column_bind_expr(model, c), ty: bind_type(model, c) },
+                value: Value::Runtime { expr: column_bind_expr(model, c), ty: insert_bind_type(model, c) },
             })
             .collect();
         (k, Insert { table: TableRef(table.name.clone()), assignments, returns_rowid: true })
@@ -1117,7 +1117,7 @@ fn reload_lookup(
         let lead = if i == 0 { select } else { " AND " };
         parts.push(arel_lit_str(format!("{lead}{} = ", dialect.ident(column.as_str()))));
         let (bind_method, escape_method) = match ty.for_dialect(dialect) {
-            ValueType::Str => ("bind_text", "escape_string"),
+            ValueType::Str | ValueType::Temporal => ("bind_text", "escape_string"),
             ValueType::Binary => ("bind_binary", "escape_binary"),
             ValueType::BinaryOpt => ("bind_binary_opt", "escape_binary_opt"),
             ValueType::StrOpt => ("bind_text_opt", "escape_string_opt"),
@@ -1610,6 +1610,20 @@ fn bind_type(model: &Model, col: &crate::schema::Column) -> ValueType {
         ValueType::Bool => ValueType::BoolOpt,
         ValueType::Binary => ValueType::BinaryOpt,
         other => other,
+    }
+}
+
+/// `bind_type` for a column an INSERT writes: a NOT NULL date/time column
+/// holding its blank slot is left to the column's DEFAULT, as Rails' partial
+/// insert leaves out an attribute nothing set (`ValueType::Temporal`).
+fn insert_bind_type(model: &Model, col: &crate::schema::Column) -> ValueType {
+    use crate::schema::ColumnType;
+    let ty = bind_type(model, col);
+    let temporal = matches!(col.col_type, ColumnType::Date | ColumnType::DateTime | ColumnType::Time);
+    if temporal && ty == ValueType::Str && !col.nullable && !col.primary_key {
+        ValueType::Temporal
+    } else {
+        ty
     }
 }
 

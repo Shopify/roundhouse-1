@@ -1331,6 +1331,12 @@ module Db
     s.nil? ? "NULL" : escape_string(s)
   end
 
+  # A NOT NULL date/time column's INSERT value: a blank slot (nothing set
+  # it) is the column's DEFAULT, as Rails' partial insert leaves it out.
+  def self.escape_temporal(s)
+    s.to_s.empty? ? "DEFAULT" : escape_string(s)
+  end
+
   # A bytea literal for a binary column: the bytes in PostgreSQL's hex form.
   def self.bytea_hex(s)
     digits = "0123456789abcdef"
