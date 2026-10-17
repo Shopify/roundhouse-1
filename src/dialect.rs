@@ -1180,6 +1180,12 @@ pub struct Callback {
     /// `parse_callback`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<CallbackOn>,
+    /// A validation hook's `on:` that is an array or names a custom
+    /// context (`before_validation :a, on: [:create, :fulfillment]`): the
+    /// callback runs when the record's `validation_context` is any of
+    /// them. Empty for every other callback; `on` stays None then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_contexts: Vec<Symbol>,
     pub condition: Option<Expr>,
     /// A transaction callback's actions (`CallbackHook::is_transaction`):
     /// `on: [:create, :update]`, or what a sugar spelling enforces

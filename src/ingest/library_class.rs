@@ -1448,8 +1448,20 @@ pub(super) fn library_class_and_struct_base(
             synthesized.push(props);
         }
         let declares_serialize = methods.iter().any(|m| m.name.as_str() == "serialize" && matches!(m.receiver, MethodReceiver::Instance));
-        if !declares_serialize && let Some(serialize) = synth_struct_serialize(&owner, &members) {
+        if let Some(serialize) = synth_struct_serialize(&owner, &members) {
             synthesized.push(serialize);
+        }
+        // A `serialize` override that calls `super` (Core's
+        // `CustomDiscountSignaturePayloadType`) reaches sorbet's own on
+        // the ancestor; one that does not simply replaces it.
+        route_super_to_synthesized(&mut synthesized, &mut methods).map_err(|name| IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "`super` in `{name}` with keyword, rest or forwarding parameters is not modeled for a T::Struct override"
+            ),
+        })?;
+        if declares_serialize {
+            synthesized.retain(|m| !(m.name.as_str() == "serialize" && matches!(m.receiver, MethodReceiver::Instance)));
         }
         synthesized.append(&mut methods);
         methods = synthesized;

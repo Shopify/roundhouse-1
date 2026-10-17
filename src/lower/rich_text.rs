@@ -207,6 +207,7 @@ pub fn synthesize_record_model(app: &mut App) {
                 on: None,
                 condition: None,
                 on_any: Vec::new(),
+                on_contexts: Vec::new(),
                 object: None,
                 prepend: false,
             },

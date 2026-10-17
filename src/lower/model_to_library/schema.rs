@@ -3497,6 +3497,30 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         }));
     }
 
+    // `Model.new { |m| .. }` — ActiveRecord::Core#initialize yields the
+    // record once the attributes are assigned, before the hook runs
+    // (Core's `Country.build_from_local_data` sets name and code there).
+    stmts.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: with_ty(
+                Expr::new(Span::synthetic(), ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("block_given?"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                }),
+                Ty::Bool,
+            ),
+            then_branch: Expr::new(
+                Span::synthetic(),
+                ExprNode::Yield { args: vec![Expr::new(Span::synthetic(), ExprNode::SelfRef)] },
+            ),
+            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        },
+    ));
+
     // `after_initialize` tail — Rails fires the hook after construction
     // (and after find; the hydration factories append their own call,
     // after the columns are set). Runs LAST so the hook observes the
