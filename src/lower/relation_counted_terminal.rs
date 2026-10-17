@@ -1,6 +1,7 @@
 //! Shared lowering: counted Relation terminals.
 //!
-//! Typed `first(n)` / `last(n)` rename to `first_n` / `last_n` — one
+//! Typed `first(n)` / `last(n)` / `take(n)` rename to `first_n` / `last_n`
+//! / `take_n` — one
 //! method cannot carry both a record and an Array on a strict target.
 //! Syntactic chains go through `scope_chain::counted_terminal`.
 //!
@@ -26,6 +27,7 @@ fn rewrite(e: &mut Expr) {
             let renamed = match method.as_str() {
                 "first" => "first_n",
                 "last" => "last_n",
+                "take" => "take_n",
                 _ => return,
             };
             *method = Symbol::from(renamed);
@@ -67,7 +69,7 @@ fn materializes_to_array(e: &Expr) -> bool {
     match method.as_str() {
         "select" | "filter" => block.is_some() && args.is_empty(),
         "reject" | "sort_by" | "map" | "collect" | "flat_map" | "filter_map" | "reverse" | "compact" | "uniq"
-        | "partition" | "group_by" | "take_while" | "drop_while" | "to_a" | "sort" | "shuffle" | "take" | "drop"
+        | "partition" | "group_by" | "take_while" | "drop_while" | "to_a" | "sort" | "shuffle" | "take" | "take_n" | "drop"
         | "min_by" | "max_by" => true,
         _ => false,
     }
@@ -207,5 +209,30 @@ mod tests {
         let mut e = first_two_after(select);
         rewrite(&mut e);
         assert_eq!(method_of(&e), "first_n");
+    }
+
+    /// `take(n)` is the counted form of `take`: Rails answers an Array.
+    #[test]
+    fn take_n_on_a_relation_is_renamed() {
+        let mut e = send(Some(base()), "take", vec![two()], None, None);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "take_n");
+    }
+
+    #[test]
+    fn bare_take_stays_one_record() {
+        let mut e = send(Some(base()), "take", Vec::new(), None, None);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "take");
+    }
+
+    /// `take(2)` answers an Array, so the `first(1)` after it is
+    /// `Array#first` and keeps its name.
+    #[test]
+    fn first_after_take_n_stays_array_first() {
+        let take = send(Some(base()), "take", vec![two()], None, Some(relation()));
+        let mut e = first_two_after(take);
+        rewrite(&mut e);
+        assert_eq!(method_of(&e), "first");
     }
 }

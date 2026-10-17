@@ -375,6 +375,7 @@ module ActiveRecord
     def third_to_last!: () -> Base
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
+    def take_n: (Integer | Float | String n) -> Array[Base]
     def count: () ?{ (Base) -> bool } -> Integer
     def sum: (?(String | Symbol | Integer | Float) expr) ?{ (Base) -> untyped } -> Float
     def minimum: (String | Symbol expr) -> untyped

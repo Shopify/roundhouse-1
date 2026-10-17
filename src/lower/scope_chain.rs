@@ -2818,7 +2818,7 @@ fn reader_array_answers(method: &str, args: &[Expr], block: Option<&Expr>) -> bo
     }
 }
 
-/// `first(n)` / `last(n)` on a relation are DIFFERENT METHODS from the
+/// `first(n)` / `last(n)` / `take(n)` on a relation are DIFFERENT METHODS from the
 /// bare forms — they answer an Array of up to n records where `first`
 /// answers one record or nil. The runtime splits them (`first_n` /
 /// `last_n`) instead of overloading on arity, because one method cannot
@@ -2840,6 +2840,8 @@ fn counted_terminal(method: &Symbol, args: &[Expr], block: Option<&Expr>) -> Opt
     match method.as_str() {
         "first" => Some(Symbol::from("first_n")),
         "last" => Some(Symbol::from("last_n")),
+        // `take(n)` is the same counted form: an Array of up to n rows.
+        "take" => Some(Symbol::from("take_n")),
         _ => None,
     }
 }

@@ -504,3 +504,44 @@ end
     );
     assert!(out.contains("empty?"), "Apps::Collection answers through its own empty?:\n{out}");
 }
+
+/// An `Enumerable[T]` annotation names behaviour, not a class: the value
+/// is an Array, a Set or a Hash, which answer `empty?`. Folding it to
+/// never-blank wrote Core's `return {} if access_paths.blank?` as
+/// `return {} if false`, so an empty set reached `reduce` (nil) and
+/// `not_nil!` raised.
+#[test]
+fn enumerable_annotated_receiver_is_grounded_on_the_value() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Util
+  def check(raw)
+    paths = raw #: Enumerable[Integer]
+    return "none" if paths.blank?
+    "some"
+  end
+end
+"#,
+    );
+    assert!(!out.contains("if false"), "never-blank fold on an Enumerable:\n{out}");
+    assert!(out.contains("ActiveSupport.blank?(paths)"), "expected the runtime predicate:\n{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// A `Set` answers `empty?`.
+#[test]
+fn set_annotated_receiver_grounds_through_empty() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+class Util
+  def check(raw)
+    paths = raw #: Set[Integer]
+    return "none" if paths.blank?
+    "some"
+  end
+end
+"#,
+    );
+    assert!(!out.contains("if false"), "never-blank fold on a Set:\n{out}");
+    assert!(out.contains(".empty?"), "expected empty?-based form:\n{out}");
+}
