@@ -90,10 +90,13 @@ fn check(source: &str) -> String {
 }
 
 fn check_with(source: &str, args: &[&str]) -> String {
+    // Tests run on parallel threads: a counter, not the source's length (two
+    // sources can be the same length), keeps their roots apart.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
         "roundhouse-body-locals-refusal-{}-{}",
         std::process::id(),
-        source.len()
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&root);
     for (path, text) in [

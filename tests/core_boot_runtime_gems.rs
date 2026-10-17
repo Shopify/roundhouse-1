@@ -428,7 +428,11 @@ const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  spec
 fn rails_dependent_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
     emit_and_run::empty_app()
-        .write("roundhouse.yml", &config(""))
+        .write("roundhouse.yml", &format!("{}  - ext\n", config("")))
+        // The tree is still written, each read raising by name at run time:
+        // the project's own opt-in, kept in the fixture so this test does not
+        // depend on whether Core's live gems.yml carries the key.
+        .write("ext/gems.yml", "rails_dependent_by_name: true\n")
         .write("Gemfile.lock", RAILS_DEPENDENT_LOCK)
         .write("sorbet/rbi/gems/secure_headers@5.2.0.rbi", &rbi("module SecureHeaders; end\nclass SecureHeaders::StrictTransportSecurity; end\nSecureHeaders::StrictTransportSecurity::HEADER_NAME = T.let(T.unsafe(nil), String)\n"))
         .write("sorbet/rbi/gems/shopify-money@4.1.1.rbi", &rbi("class Money\n  def initialize(value, currency); end\nend\n"))

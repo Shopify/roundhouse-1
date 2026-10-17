@@ -187,8 +187,13 @@ fn a_boot_file_nested_under_an_autoloaded_namespace_loads_after_the_namespace_fi
     assert_eq!(run.stdout.lines().collect::<Vec<_>>(), ["[:has_child, :has_parent]", ":has_child", ":none"], "{}", run.stdout);
     assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
     let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).expect("models.rb");
+    // The split child names one constant now (the Struct the class reopens
+    // for its constants), so it is the autoload of `FilterChildNode` in
+    // `ElasticSearch`, not a boot file under BOOT_NAMESPACES: the
+    // constant's lookup loads `Ast`'s file first, as Zeitwerk does.
     assert!(
-        models.contains("\"models/pagination/ast/elastic_search/filter_child_node\" => [\"Pagination::Ast\", \"Pagination::Ast::ElasticSearch\"],"),
+        models.contains("\"models/pagination/ast/elastic_search/filter_child_node\" => [[\"Pagination::Ast::ElasticSearch\", :FilterChildNode]],")
+            && models.contains("\"Pagination::Ast::ElasticSearch\" => [[:FilterChildNode, \"models/pagination/ast/elastic_search/filter_child_node\", false]],"),
         "{}",
         models.lines().filter(|l| l.contains("pagination")).collect::<Vec<_>>().join("\n")
     );
