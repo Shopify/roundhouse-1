@@ -1497,6 +1497,33 @@ fn coerce_to_s(expr: Expr) -> Expr {
 /// before the html_escape wrap, matching the convention every
 /// emitter would otherwise have to repeat.
 pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
+    // `x.presence` in a view's output (`<%= r[:title].presence || t(...) %>`):
+    // ActiveSupport's Object#presence, which only the CRuby overlay can
+    // reopen onto every value. `lower::blank` grounds it in app bodies but
+    // does not walk views (their conditions have their own predicate
+    // rewrite), so an output site stayed a dynamic call that the spinel
+    // binary answered with NoMethodError. It becomes the runtime predicate
+    // `lower::blank` uses for a receiver it cannot type:
+    // `ActiveSupport.presence(x)`.
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node {
+        if method.as_str() == "presence" && args.is_empty() {
+            let mut call = Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        e.span,
+                        ExprNode::Const { path: vec![crate::ident::Symbol::from("ActiveSupport")] },
+                    )),
+                    method: crate::ident::Symbol::from("presence"),
+                    args: vec![rewrite_helpers_in_expr(r, ctx)],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            call.ty = e.ty.clone();
+            return call;
+        }
+    }
     let new_node = match &*e.node {
         ExprNode::Send {
             recv: None,
@@ -1534,6 +1561,18 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
             if method.as_str() == "h" && args.len() == 1 {
                 let mut call = view_helpers_call(
                     "html_escape",
+                    vec![coerce_to_s(rewrite_helpers_in_expr(&args[0], ctx))],
+                );
+                call.inherit_span(e.span);
+                return call;
+            }
+            // `u(x)` / `url_encode(x)`: ERB::Util.url_encode, which a
+            // view reaches through ERB::Util (Rails includes it in every
+            // view). Percent-encoding with `%20` for a space, not
+            // `CGI.escape`'s `+` that the runtime's `url_encode` is.
+            if matches!(method.as_str(), "u" | "url_encode") && args.len() == 1 {
+                let mut call = view_helpers_call(
+                    "erb_url_encode",
                     vec![coerce_to_s(rewrite_helpers_in_expr(&args[0], ctx))],
                 );
                 call.inherit_span(e.span);

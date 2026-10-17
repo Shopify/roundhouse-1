@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Primitive Db surface — the layer that per-model adapter code sits on
 # top of. The contract is database-agnostic; this file is the SQLite-via-
 # the-cruby-`sqlite3`-gem implementation. Other backends (sqlite via
@@ -66,6 +67,10 @@ module Db
   # lease. See `start_checkpointer`.
   @checkpoint_wanted = false
   @checkpointer_pid  = nil
+  # True when a process of the server's own runs the checkpoints
+  # (`checkpoint_in_own_process!`): serving processes then start no
+  # checkpoint thread at all.
+  @checkpoint_external = false
   # The process-shared flock File while this process holds it. Retained
   # so `adopt_after_fork` can close the child's inherited copy without
   # LOCK_UN (parent keeps the lock). Cleared on release.
@@ -197,6 +202,8 @@ module Db
     # the read() copy. Harmless on :memory: (pages are already heap).
     db.execute("PRAGMA cache_size=-65536")
     db.execute("PRAGMA mmap_size=268435456")
+    # Not SQLite's default (off): Rails' DEFAULT_PRAGMAS turn it on, as db.rb's PRAGMAS do.
+    db.execute("PRAGMA foreign_keys=ON")
     # The gem's default is 0: a second writer fails at once with
     # SQLITE_BUSY. Rails' database.yml says `timeout: 5000`, and so do
     # the binary's PRAGMAS — the harness's file database (see
@@ -214,6 +221,11 @@ module Db
     # in an initializer), per connection as Rails' adapter registers
     # them. Defined only when the app has some (runtime/sql_functions.rb
     # is generated for it).
+    # The app's own `pragmas:` from config/database.yml, after the pins
+    # above so its value wins, as Rails merges them over DEFAULT_PRAGMAS
+    # (generated: `project::apply_database_pragmas`).
+    # >>> generated: database-pragmas
+    # <<< generated: database-pragmas
     SqlFunctions.install(db) if defined?(SqlFunctions)
     db
   end
@@ -304,6 +316,17 @@ module Db
 
   def self._txn_depth=(value)
     Fiber[:ar_txn_depth] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Fiber[:ar_txn_records]
+    if records.nil?
+      records = []
+      Fiber[:ar_txn_records] = records
+    end
+    records
   end
 
   # Request-scoped connection lease. Checks out a handle, binds it to
@@ -404,6 +427,44 @@ module Db
       end
       raise cleanup_error if cleanup_error && !request_failed
     end
+  end
+
+  # Rails' SQLite `disable_referential_integrity`: fixtures load and tables empty in any order. Not foreign_keys=OFF alone: that pragma is a no-op inside a transaction, where defer_foreign_keys moves the check to COMMIT instead.
+  def self.without_foreign_keys(&block)
+    on_lease { foreign_keys_off(&block) }
+  end
+
+  def self.foreign_keys_off
+    Db.exec("PRAGMA defer_foreign_keys = ON")
+    Db.exec("PRAGMA foreign_keys = OFF")
+    result = nil
+    begin
+      result = yield
+    ensure
+      Db.exec("PRAGMA defer_foreign_keys = OFF")
+      Db.exec("PRAGMA foreign_keys = ON")
+    end
+    result
+  end
+
+  # Not a lease of its own when the caller holds one: with a pool of one handle, the second checkout waits for the first forever.
+  def self.on_lease(&block)
+    in_lease? ? yield : Db.with_connection(&block)
+  end
+
+  # Rails' `check_all_foreign_keys_valid!`, which its fixture loader runs after a load (`verify_foreign_keys_for_fixtures`).
+  def self.check_foreign_keys!
+    tables = []
+    on_lease do
+      st = Db.prepare("PRAGMA foreign_key_check")
+      while Db.step?(st)
+        table = Db.column_text(st, 0)
+        tables << table unless tables.include?(table)
+      end
+      Db.finalize(st)
+    end
+    raise ActiveRecord::StatementInvalid, "Foreign key violations found: " + tables.join(", ") unless tables.empty?
+    nil
   end
 
   def self.with_connection
@@ -604,9 +665,8 @@ module Db
       begin
         names = stmt.columns
         rows = stmt.execute.to_a
-      rescue StandardError => e
-        raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
-        raise
+      rescue SQLite3::Exception => e
+        Db.raise_statement_error(e.message, e.is_a?(SQLite3::BusyException))
       ensure
         stmt.close
       end
@@ -848,6 +908,31 @@ module Db
     @checkpoint_wanted = true
   end
 
+  # CHECKPOINTS IN A PROCESS THAT SERVES NOTHING, for a server that can
+  # run one (falcon.rb). A checkpoint runs inside SQLite holding the GVL,
+  # so the thread above freezes its whole process while it copies the
+  # WAL and syncs, and its RESTART holds that process's write permit.
+  # Under Falcon a process is one event loop with all of its requests on
+  # it: the worker that won the checkpoint lock had half of the POST
+  # cell's stalls on the bench box (2026-10-15), and with no checkpointer
+  # at all the POST p99 fell to Puma's. Serving processes call this
+  # instead: their connections still leave checkpoints to someone else
+  # (wal_autocheckpoint=0), and no thread starts. The server runs
+  # `run_checkpointer` in a process of its own and restarts it if it dies.
+  def self.checkpoint_in_own_process!
+    @checkpoint_wanted = true
+    @checkpoint_external = true
+  end
+
+  # The checkpoint loop on the calling thread; it does not return. Takes
+  # the same flock as the per-worker thread, so it is still the only
+  # checkpointer. Nothing to do for a database with no file.
+  def self.run_checkpointer
+    path = @path
+    return if path.nil? || path == ":memory:" || path.start_with?("file:")
+    checkpoint_loop(path)
+  end
+
   # Rate-limited visibility for checkpoint_loop failures. Resets the
   # suppress window only by time, not by success — a later success simply
   # stops calling this. Private: the loop is the only production caller;
@@ -868,8 +953,13 @@ module Db
   private_class_method :warn_checkpoint_failure
 
   def self.prepare_for_checkpointer(conn)
-    start_checkpointer if @checkpointer_pid != Process.pid
-    return if @checkpointer_pid != Process.pid
+    if @checkpoint_external
+      path = @path
+      return if path.nil? || path == ":memory:" || path.start_with?("file:")
+    else
+      start_checkpointer if @checkpointer_pid != Process.pid
+      return if @checkpointer_pid != Process.pid
+    end
     return if conn.instance_variable_get(:@rh_manual_checkpoint)
     conn.execute("PRAGMA wal_autocheckpoint=0")
     conn.instance_variable_set(:@rh_manual_checkpoint, true)
@@ -997,9 +1087,8 @@ module Db
   # is mapped as Rails maps it; only memory mode turns on `PRAGMA
   # foreign_keys`, so on the file database SQLite never reports the
   # violation. NOT modeled:
-  # StatementTimeout for a `SQLite3::BusyException` (a StatementInvalid
-  # here, as its Rails parent is), and translation of any non-driver
-  # error.
+  # translation of any non-driver error. A `SQLite3::BusyException` is
+  # `StatementTimeout`, as Rails maps it.
   def self.translate(e, sql)
     m = e.message
     return e if m.match?(/called on a closed database/i)
@@ -1013,6 +1102,8 @@ module Db
         ActiveRecord::InvalidForeignKey
       elsif m.match?(/CHECK constraint failed: .*/i)
         ActiveRecord::CheckViolation
+      elsif e.is_a?(SQLite3::BusyException)
+        ActiveRecord::StatementTimeout
       else
         ActiveRecord::StatementInvalid
       end
@@ -1036,6 +1127,16 @@ module Db
   # their own `Db` and their own mapping; this is the ruby-family half.)
   def self.unique_violation?(message)
     message.to_s.include?("UNIQUE constraint failed")
+  end
+
+  # Not the driver's own exception: Rails translates every statement error into ActiveRecord's hierarchy (sqlite3_adapter `translate_exception`), keyed on SQLite's own message as `unique_violation?` is.
+  def self.raise_statement_error(message, busy)
+    raise ActiveRecord::RecordNotUnique, message if unique_violation?(message)
+    raise ActiveRecord::NotNullViolation, message if message.include?("NOT NULL constraint failed")
+    raise ActiveRecord::InvalidForeignKey, message if message.include?("FOREIGN KEY constraint failed")
+    raise ActiveRecord::CheckViolation, message if message.include?("CHECK constraint failed")
+    raise ActiveRecord::StatementTimeout, message if busy
+    raise ActiveRecord::StatementInvalid, message
   end
 
   # Prepared-statement cache (roundhouse#12). A SQLite3::Statement is bound
@@ -1103,6 +1204,8 @@ module Db
   def self.prepare(sql)
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
+  rescue SQLite3::Exception => e
+    Db.raise_statement_error(e.message, e.is_a?(SQLite3::BusyException))
   end
 
   # Prepare without re-entering prepare_marked. After lift_binds, the
@@ -1310,6 +1413,7 @@ module Db
     rescue StandardError
       # Failed closes remain owned until lease cleanup quarantines them.
     end
+    Db.raise_statement_error(error.message, error.is_a?(SQLite3::BusyException)) if error.is_a?(SQLite3::Exception)
     raise error
   end
 

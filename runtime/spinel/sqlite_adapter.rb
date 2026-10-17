@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # SQLite backend hooks for the shared query facade.
 require_relative "sql_adapter_queries"
 

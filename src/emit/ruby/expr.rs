@@ -46,6 +46,16 @@ thread_local! {
     /// (`rooted_if_shadowed`). `None` outside a class emit.
     static LEXICAL_SCOPE: std::cell::RefCell<Option<(Vec<String>, std::rc::Rc<crate::det::HashSet<String>>)>> =
         const { std::cell::RefCell::new(None) };
+    /// True while emitting the futamura whole-route box's own internal
+    /// copy of the `ruby` target (`project::futamura_whole_route`). An
+    /// include the analyzer could not resolve is guarded there
+    /// (`include X if defined?(X)`) rather than written plain: the
+    /// planner blocks only the routes that reach the including file, so
+    /// the box must still LOAD when such a route is never served from
+    /// it. The CLI's own `--target ruby` leaves this off and stays
+    /// fail-loud — an app meant to run on its own should not silently
+    /// swallow a mixin it could not resolve.
+    static FUTAMURA_BOX: Cell<bool> = const { Cell::new(false) };
     /// Direct, locked unknown-gem namespaces admitted by the Ruby project
     /// emitter. Other targets retain their constant refusal.
     static EXTERNAL_GEM_NAMESPACES: RefCell<std::collections::BTreeSet<String>> = const {
@@ -258,6 +268,19 @@ pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
     let r = f();
     IN_CORE_CLASS_REOPEN.with(|c| c.set(prev));
     r
+}
+
+/// Run `f` while emitting futamura's internal `ruby` copy. See
+/// `FUTAMURA_BOX`.
+pub(crate) fn with_futamura_box<R>(f: impl FnOnce() -> R) -> R {
+    let prev = FUTAMURA_BOX.with(|c| c.replace(true));
+    let r = f();
+    FUTAMURA_BOX.with(|c| c.set(prev));
+    r
+}
+
+pub(super) fn in_futamura_box() -> bool {
+    FUTAMURA_BOX.with(Cell::get)
 }
 
 pub(super) fn with_external_gem_namespaces<R>(
@@ -1032,7 +1055,9 @@ fn emit_node(n: &ExprNode) -> String {
             // group so the assign value is the last expression — bare
             // newlines end the statement after the first line.
             let rhs = emit_expr(value);
-            let rhs = if is_multi_seq(value) {
+            // `x = (y if c)`: bare, `x = y if c` assigns only when `c`
+            // holds, where the `if` without an else gives nil.
+            let rhs = if is_multi_seq(value) || assigns_as_modifier_if(value) {
                 format!("({rhs})")
             } else {
                 rhs
@@ -1049,6 +1074,9 @@ fn emit_node(n: &ExprNode) -> String {
             // operator reads the bound temporary, not the result.
             let emit_value = || {
                 let v = emit_expr(value);
+                // `x ||= (y if c)`, every form below: bare, the modifier
+                // guards the assignment.
+                let v = if assigns_as_modifier_if(value) { format!("({v})") } else { v };
                 if is_multi_seq(value) { format!("({v})") } else { v }
             };
             // `ENV[k] ||= v`: spinel models ENV only as a call receiver,
@@ -1748,6 +1776,13 @@ fn renders_as_trailing_modifier(e: &Expr) -> bool {
     }
 }
 
+/// Does `e` emit as a modifier `if`? On an assignment's right it would
+/// guard the assignment itself (`x = y if c`); `rescue` does not, Ruby
+/// binds it to the value.
+fn assigns_as_modifier_if(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::If { .. }) && renders_as_trailing_modifier(e)
+}
+
 /// Would `r`, emitted as a bare method-call receiver (`<r>.method`),
 /// mis-associate the trailing `.method`? Lower-precedence-than-`.`
 /// forms bind the `.method` to their tail rather than the whole
@@ -2096,7 +2131,11 @@ pub(super) fn emit_send_base(
             format!("{}.{attr} = {}", emit_postfix_recv(r), args_s[0])
         }
         (None, _) => {
-            if args_s.is_empty() {
+            // A capitalized name without parens reads as a constant:
+            // `Success()` is a call, `Success` is not.
+            if args_s.is_empty() && method.as_str().starts_with(|c: char| c.is_ascii_uppercase()) {
+                format!("{method}()")
+            } else if args_s.is_empty() {
                 method.to_string()
             } else if parenthesized || first_arg_opens_block(m, &args_s) {
                 format!("{method}({})", args_s.join(", "))
@@ -2818,6 +2857,47 @@ mod tests {
         assert_eq!(emit_expr(&command(Some(send(None, "cfg", vec![])), regex("x"))), "cfg.add_filter(/x/)");
         // An ordinary first argument keeps the paren-less spelling.
         assert_eq!(emit_expr(&command(None, lit_sym("a"))), "add_filter :a");
+    }
+
+    /// A modifier `if` on an assignment's right is parenthesized in every
+    /// form: bare, it would guard the assignment (`x = y if c` leaves `x`
+    /// as it was where the `if` gives nil).
+    #[test]
+    fn an_assigned_modifier_if_is_parenthesized() {
+        let modifier = || {
+            Expr::new(
+                Span::default(),
+                ExprNode::If {
+                    cond: send(None, "c", vec![]),
+                    then_branch: lit_str("y"),
+                    else_branch: Expr::new(Span::default(), ExprNode::Lit { value: Literal::Nil }),
+                },
+            )
+        };
+        let var = || crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from("x") };
+        let assign = Expr::new(Span::default(), ExprNode::Assign { target: var(), value: modifier() });
+        assert_eq!(emit_expr(&assign), "x = (\"y\" if c)");
+        let env = Expr::new(
+            Span::default(),
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Index {
+                    recv: Expr::new(Span::default(), ExprNode::Const { path: vec![Symbol::from("ENV")] }),
+                    index: lit_str("K"),
+                },
+                op: crate::expr::OpAssignOp::OrOr,
+                value: modifier(),
+            },
+        );
+        assert!(emit_expr(&env).contains("(ENV[\"K\"] = (\"y\" if c))"), "got {}", emit_expr(&env));
+        let attr = Expr::new(
+            Span::default(),
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Attr { recv: self_ref(), name: Symbol::from("n") },
+                op: crate::expr::OpAssignOp::Add,
+                value: modifier(),
+            },
+        );
+        assert!(emit_expr(&attr).ends_with("+ (\"y\" if c)"), "got {}", emit_expr(&attr));
     }
 
     fn self_ref() -> Expr {

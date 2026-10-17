@@ -15,10 +15,39 @@ end
 # The app runtime defines these (runtime/ruby/active_record/errors.rb);
 # pg_errors.rb raises them.
 module ActiveRecord
-  class RecordNotUnique < StandardError
+  class ActiveRecordError < StandardError
   end
-
-  class ValueTooLong < StandardError
+  class StatementInvalid < ActiveRecordError
+  end
+  class WrappedDatabaseException < StatementInvalid
+  end
+  class RecordNotUnique < WrappedDatabaseException
+  end
+  class InvalidForeignKey < WrappedDatabaseException
+  end
+  class ValueTooLong < StatementInvalid
+  end
+  class RangeError < StatementInvalid
+  end
+  class NotNullViolation < StatementInvalid
+  end
+  class CheckViolation < StatementInvalid
+  end
+  class ExclusionViolation < StatementInvalid
+  end
+  class TransactionRollbackError < StatementInvalid
+  end
+  class SerializationFailure < TransactionRollbackError
+  end
+  class Deadlocked < TransactionRollbackError
+  end
+  class QueryAborted < StatementInvalid
+  end
+  class LockWaitTimeout < StatementInvalid
+  end
+  class StatementTimeout < QueryAborted
+  end
+  class QueryCanceled < QueryAborted
   end
 
   # Real ActiveRecord::Rollback (runtime/ruby/active_record/connection.rb);
@@ -28,14 +57,15 @@ module ActiveRecord
   end
 end
 
-def sqlstate_of
-  code = ""
+# Not the SQLSTATE: the shim raises ActiveRecord's class, as Rails does, and spinel's exceptions keep no `cause` to read it from.
+def statement_error_of
+  message = ""
   begin
     yield
-  rescue PG::Error => e
-    code = e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s
+  rescue ActiveRecord::StatementInvalid => e
+    message = e.message
   end
-  code
+  message
 end
 
 # A copy, not a require, of ActiveRecord::Base.transaction's control
@@ -470,8 +500,13 @@ def case_12(s, schema)
   end
   Db.finalize(h)
   check("23505 from a bound statement", dup.include?("duplicate key"))
-  check_str("unmapped codes stay PG::Error", "23502",
-            sqlstate_of { Db.exec("INSERT INTO " + s + "tags (name) VALUES (NULL)") })
+  null_violation = ""
+  begin
+    Db.exec("INSERT INTO " + s + "tags (name) VALUES (NULL)")
+  rescue ActiveRecord::NotNullViolation => e
+    null_violation = e.message
+  end
+  check("23502 raises NotNullViolation", null_violation.include?("null value"))
   nil
 end
 
@@ -499,7 +534,7 @@ def case_13(s, schema)
     end
     check("duplicate inside a transaction", dup != "")
     check_int("failed transaction status", PG::PQTRANS_INERROR, conn.status)
-    check_str("the next statement is refused", "25P02", sqlstate_of { Db.exec("SELECT 1") })
+    check("the next statement is refused (25P02)", statement_error_of { Db.exec("SELECT 1") }.include?("current transaction is aborted"))
     Db.exec("ROLLBACK")
     check_int("idle after ROLLBACK", PG::PQTRANS_IDLE, conn.status)
     Db.exec("INSERT INTO " + s + "tags (name) VALUES ('blu')")
@@ -528,7 +563,7 @@ def case_14(s, schema)
   Db.with_connection do
     leased = Db.current_conn
     Db.exec("BEGIN")
-    sqlstate_of { Db.exec("SELECT 1/0") }
+    statement_error_of { Db.exec("SELECT 1/0") }
   end
   check_int("failed transaction returns idle", PG::PQTRANS_IDLE, leased.status)
   nil
@@ -578,10 +613,10 @@ def case_17(s, schema)
   failed = false
   begin
     Db.exec("SELEC 1")
-  rescue PG::Error => e
+  rescue ActiveRecord::StatementInvalid => e
     failed = e.message.include?("syntax error")
   end
-  check("server error surfaces as PG::Error", failed)
+  check("a server error with no class of its own is StatementInvalid", failed)
   h = Db.prepare("SELECT $1::int + 1")
   Db.bind_int(h, 1, 41)
   check("usable after an error", Db.step?(h))
@@ -739,14 +774,15 @@ def case_23(s, schema)
     # ROLLBACK, the old one without a new Parse.
     Db.exec("BEGIN")
     check("cached read in a transaction", cached_read(s, 2))
-    check_str("an error fails the transaction", "22012", sqlstate_of { Db.exec("SELECT 1/0") })
-    check_str("the named statement is refused", "25P02", sqlstate_of { cached_read(s, 1) })
+    check("an error fails the transaction (22012)", statement_error_of { Db.exec("SELECT 1/0") }.include?("division by zero"))
+    check("the named statement is refused (25P02)", statement_error_of { cached_read(s, 1) }.include?("current transaction is aborted"))
     fresh = "SELECT id FROM " + s + "widgets WHERE name = $1"
-    check_str("a new shape is refused", "25P02", sqlstate_of do
+    refused = statement_error_of do
       h = Db.prepare(fresh)
       Db.bind_text(h, 1, "third")
       Db.step?(h)
-    end)
+    end
+    check("a new shape is refused (25P02)", refused.include?("current transaction is aborted"))
     check("a refused Parse is not cached", !conn.named?(fresh))
     Db.exec("ROLLBACK")
     named = server_named
@@ -761,7 +797,7 @@ def case_23(s, schema)
     # and the entry is forgotten, so after ROLLBACK it parses again.
     Db.exec("BEGIN")
     Db.exec("DEALLOCATE ALL")
-    check_str("a vanished statement inside a transaction", "26000", sqlstate_of { cached_read(s, 1) })
+    check("a vanished statement inside a transaction (26000)", statement_error_of { cached_read(s, 1) }.include?("does not exist"))
     check("forgotten", !conn.named?(shape))
     Db.exec("ROLLBACK")
     check("re-parsed after ROLLBACK", cached_read(s, 1))

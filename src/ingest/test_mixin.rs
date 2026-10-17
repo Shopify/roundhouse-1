@@ -4104,6 +4104,7 @@ fn synth_method(name: &str, body: Expr, class: &ClassId) -> MethodDef {
 /// A module holding the definitions a `super` in the class reaches.
 fn super_module(name: ClassId, methods: Vec<MethodDef>) -> crate::dialect::LibraryClass {
     crate::dialect::LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),

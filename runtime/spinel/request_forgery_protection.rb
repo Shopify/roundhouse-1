@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' request forgery check: Origin / Action Cable helpers, and the
 # ruby-family reopen of `verified_request?` that adds the Origin rule
 # the shared Base cannot (it has no Request). Token matching is
@@ -77,28 +78,41 @@ module ActionController
       (tls ? "https://" : "http://") + bare
     end
 
-    # Action Cable's `allow_request_origin?`, the check a `/cable`
-    # handshake passes before any connection code runs. Rails' defaults
-    # (`allow_same_origin_as_host` true, and `allowed_request_origins`
-    # set to `/https?:\/\/localhost:\d+/` in development only):
+    # The origin Action Cable compares a handshake's Origin with:
+    # `"#{proto}://#{env['HTTP_HOST']}"`, the scheme from the same TLS
+    # evidence `base_url_for` reads and the Host header as sent. Unlike
+    # `base_url_for`, a standard port the client wrote stays: Rails
+    # builds this string from the raw header, so `Host: example.com:443`
+    # is not `https://example.com`.
+    def self.host_origin_for(host, https, forwarded_proto, url_scheme)
+      tls = base_url_for(host, https, forwarded_proto, url_scheme).start_with?("https://")
+      (tls ? "https://" : "http://") + host
+    end
+
+    # Action Cable's `allow_request_origin?` (actioncable 8.1.4,
+    # `ActionCable::Connection::Base`), the check a `/cable` handshake
+    # passes before any connection code runs, over the app's
+    # `config.action_cable` settings as `Rails.application` answers them
+    # (Rails' defaults in runtime/ruby/rails.rb, the app's assignments
+    # lifted at ingest):
     #
-    # * the Origin must be the request's own base URL --
-    #   `"#{proto}://#{env['HTTP_HOST']}" == env["HTTP_ORIGIN"]`, scheme
-    #   included, as `valid_origin?` above compares it;
-    # * in development, any `localhost` port is allowed besides;
-    # * an ABSENT Origin is refused. This is where the socket check and
-    #   the form check differ in Rails too: `env["HTTP_ORIGIN"]` is nil,
-    #   and nil equals no allowed origin.
+    # * `disable_request_forgery_protection` allows every handshake;
+    # * with `allow_same_origin_as_host` (default true) the Origin may be
+    #   `host_origin`, the request's own scheme and Host header;
+    # * otherwise, or besides, it must be `===` one of
+    #   `allowed_request_origins` (a String equal to it, a Regexp
+    #   matching it anywhere): `action_cable_origin_listed?`, which in
+    #   development defaults to any `localhost` port.
     #
-    # Not modeled: `config.action_cable.allowed_request_origins` and
-    # `disable_request_forgery_protection` as an app sets them (ingest
-    # reads no `config.action_cable` key). The localhost pattern is
-    # anchored, where Rails' `===` is not, so `http://localhost:1.evil`
-    # passes Rails in development and fails here.
-    def self.cable_origin_allowed?(origin, base_url, development)
+    # An ABSENT Origin ("" here) is refused unless the check is disabled:
+    # Rails compares `env["HTTP_ORIGIN"]`, nil, which equals no host and
+    # no listed String and matches no Regexp.
+    def self.cable_origin_allowed?(origin, host_origin)
+      app = Rails.application
+      return true if app.action_cable_disable_request_forgery_protection
       return false if origin.empty?
-      return true if valid_origin?(origin, base_url)
-      development && origin.match?(/\Ahttps?:\/\/localhost:\d+\z/)
+      return true if app.action_cable_allow_same_origin_as_host && origin == host_origin
+      app.action_cable_origin_listed?(origin)
     end
 
     # Constant-time unmask + compare (AuthenticityToken).

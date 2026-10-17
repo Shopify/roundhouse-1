@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Pure string ActiveSupport helpers for the Ruby/Spinel scaffold.
 # `active_support_ext.rb` keeps blank?/present?/… (`is_a?` dispatch
 # that AOT targets cannot host) and requires this file so scaffold

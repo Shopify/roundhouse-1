@@ -47,12 +47,17 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
         return Vec::new();
     }
     let module_path = vec![Symbol::from("RouteTable")];
-    // Same partition the per-target Spinel emit used: path "/" goes
-    // to `RouteTable.root`, everything else to `RouteTable.table`. Callers
-    // typically combine them at use site (`[RouteTable.root] +
-    // RouteTable.table`).
-    let (root_routes, table_routes): (Vec<&FlatRoute>, Vec<&FlatRoute>) =
-        flat.iter().partition(|r| r.path == "/");
+    // The first route on path "/" (the `root`, when the app has one)
+    // goes to `RouteTable.root`, every other route to `RouteTable.table`.
+    // Callers combine them at use site (`[RouteTable.root] +
+    // RouteTable.table`). Only the first: Rails matches on verb AND
+    // path, so a `match "/", via: %i[post delete]` beside a `root` (or
+    // the second verb of that `match`) is a route of its own, and it
+    // stays in the table in declaration order.
+    let root_index = flat.iter().position(|r| r.path == "/");
+    let root_routes: Vec<&FlatRoute> = root_index.map(|i| &flat[i]).into_iter().collect();
+    let table_routes: Vec<&FlatRoute> =
+        flat.iter().enumerate().filter(|(i, _)| Some(*i) != root_index).map(|(_, r)| r).collect();
 
     let route_class_id = ClassId(Symbol::from("ActionDispatch::Router::Route"));
     let route_ty = Ty::Class {
@@ -923,6 +928,10 @@ fn build_helper_function(
         .enumerate()
         .filter(|(_, p)| !keyworded(p))
         .map(|(i, p)| {
+            // Not `param_ty` for a defaulted segment: its default is the route table's text, so the type follows that `Str`, as the keyword half below does.
+            if seg_default(p).is_some() {
+                return (Symbol::from(p.clone()), Ty::Str);
+            }
             let base = param_ty(p, slug_params.contains(p.as_str()));
             let ty = if i < required {
                 base
@@ -1619,8 +1628,11 @@ fn for_each_route_call_site(app: &App, f: &mut impl FnMut(&Expr)) {
 fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
     let mut out = path;
     for (i, key) in keys.iter().enumerate() {
+        // Not `var_ref`'s own type: an omitted key is nil, and a `nil?` on a non-nilable receiver folds to `false` on Rust.
         let is_nil = |k: &str| -> Expr {
-            send_method(var_ref(k), "nil?", Vec::new())
+            let var = var_ref(k);
+            let ty = var.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil].into() });
+            with_ty(send_method(Expr { ty, ..var }, "nil?", Vec::new()), Ty::Bool)
         };
         let key_name = key.name.as_str();
         // `?` only while nothing earlier was rendered. The first key
@@ -1641,31 +1653,37 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                     },
                 );
             }
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::If {
-                    cond,
-                    then_branch: lit_str("?".to_string()),
-                    else_branch: lit_str("&".to_string()),
-                },
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond,
+                        then_branch: lit_str("?".to_string()),
+                        else_branch: lit_str("&".to_string()),
+                    },
+                ),
+                Ty::Str,
             )
             })
         };
         let url_encode = |value: Expr| -> Expr {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Send {
-                    recv: Some(Expr::new(
-                        Span::synthetic(),
-                        ExprNode::Const {
-                            path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
-                        },
-                    )),
-                    method: Symbol::from("url_encode"),
-                    args: vec![send_method(value, "to_s", Vec::new())],
-                    block: None,
-                    parenthesized: true,
-                },
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Const {
+                                path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
+                            },
+                        )),
+                        method: Symbol::from("url_encode"),
+                        args: vec![with_ty(send_method(value, "to_s", Vec::new()), Ty::Str)],
+                        block: None,
+                        parenthesized: true,
+                    },
+                ),
+                Ty::Str,
             )
         };
         // Rails renders an Array option as one `k[]=v` pair per
@@ -1709,7 +1727,7 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                 Some(sep) => parts.push(InterpPart::Expr { expr: sep }),
             }
             parts.push(InterpPart::Expr { expr: joined });
-            Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
         } else {
             let mut parts: Vec<InterpPart> = Vec::new();
             match separator {
@@ -1720,17 +1738,20 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                 }
             }
             parts.push(InterpPart::Expr { expr: url_encode(var_ref(key_name)) });
-            Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
         };
-        let arm = Expr::new(
-            Span::synthetic(),
-            ExprNode::If {
-                cond: send_method(var_ref(key_name), "nil?", Vec::new()),
-                then_branch: lit_str(String::new()),
-                else_branch: pair,
-            },
+        let arm = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: is_nil(key_name),
+                    then_branch: lit_str(String::new()),
+                    else_branch: pair,
+                },
+            ),
+            Ty::Str,
         );
-        out = send_method(out, "+", vec![arm]);
+        out = with_ty(send_method(out, "+", vec![arm]), Ty::Str);
     }
     out
 }

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `Mime::Type` — the slice of actionpack's MIME registry the corpus
 # reaches, ported rather than derived.
 #

@@ -164,6 +164,9 @@ pub struct Analyzer {
     i18n: crate::i18n::Catalog,
     /// The tree loads the real i18n gem (`App::carries_i18n_gem`).
     i18n_gem: bool,
+    /// `app/helpers` modules, whose bodies run in a view and take
+    /// ActionView's `t`.
+    helper_modules: crate::det::HashSet<ClassId>,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
     ///
@@ -186,6 +189,9 @@ pub struct Analyzer {
     /// What the natively loaded gems' installed sources declare
     /// (`GemBoundary::source_constants`).
     gem_sources: std::sync::Arc<crate::gem_boundary::GemSourceConstants>,
+    /// The app's project extensions (`crate::extensions`): which gems are
+    /// `rails_dependent`.
+    extensions: std::sync::Arc<crate::extensions::Extensions>,
     /// Inferred values keyed by Rubydex declaration IDs, not by names.
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
@@ -773,7 +779,10 @@ impl Analyzer {
             if let Some(table) = app.schema.tables.get(&model.table.0) {
                 register_store_accessors(&model.body, table, &mut cls.instance_methods);
             }
-            register_attribute_macros(&model.body, &mut cls.instance_methods);
+            // A project extension's attribute macros (`crate::extensions`):
+            // gem column DSLs whose attributes read back as the DSL's own
+            // value object.
+            register_attribute_macros(&model.body, &app.extensions, &mut cls.instance_methods);
             // `attribute :name, :type` virtual attributes (ActiveModel) —
             // backed by something other than a schema column, so absent
             // from `model.attributes` above.
@@ -1364,6 +1373,10 @@ impl Analyzer {
             if !includes.is_empty() {
                 cls.includes = includes;
             }
+            for sibling in &controller.sibling_classes {
+                let id = ClassId(sibling.name.clone());
+                classes.entry(id).or_default().parent = Some(ClassId(sibling.parent.clone()));
+            }
         }
 
         // Classes a locked gem's RBI declares. After everything the app
@@ -1399,6 +1412,11 @@ impl Analyzer {
         // Before signatures resolve: `#: -> IdentityAccountFields` inside
         // `IdentityAccount` names the Struct constant's class.
         data::register_blockless_structs(app, &const_resolver, &mut classes);
+        for sibling in app.controllers.iter().flat_map(|c| &c.sibling_classes) {
+            if let Some(info) = classes.get_mut(&ClassId(sibling.name.clone())) {
+                info.app_declared = true;
+            }
+        }
         let by_name: HashMap<&ClassId, &crate::dialect::LibraryClass> =
             app.library_classes.iter().map(|lc| (&lc.name, lc)).collect();
         for lc in &app.library_classes {
@@ -1591,9 +1609,11 @@ impl Analyzer {
                 .collect(),
             i18n: app.i18n.clone(),
             i18n_gem: app.carries_i18n_gem(),
+            helper_modules: app.helper_method_index.values().cloned().collect(),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
             gem_sources: std::sync::Arc::new(app.gem_boundary.source_constants.clone()),
+            extensions: std::sync::Arc::new(app.extensions.clone()),
             typed_constants: IdentityHashMap::default(),
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
@@ -1620,11 +1640,12 @@ impl Analyzer {
         let typer = BodyTyper::new(&self.classes)
             .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
-            .with_i18n(&self.i18n)
+            .with_i18n(&self.i18n, &self.helper_modules)
             .with_i18n_gem(self.i18n_gem)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories)
-            .with_gem_sources(self.gem_sources.clone());
+            .with_gem_sources(self.gem_sources.clone())
+            .with_extensions(self.extensions.clone());
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
@@ -1686,6 +1707,10 @@ impl Analyzer {
     /// analysis (the registry rebuilt to include them) and taken back
     /// after, leaving the file programs as ingested.
     pub fn analyze(&mut self, app: &mut App) {
+        crate::lower::i18n_translate::with_plan_cache(|| self.analyze_cached(app))
+    }
+
+    fn analyze_cached(&mut self, app: &mut App) {
         let carried = app.library_classes.len();
         let guarded = guarded_declarations(&app.file_programs);
         if !guarded.is_empty() {
@@ -1741,7 +1766,7 @@ impl Analyzer {
                 let rooted = written.0.as_str().starts_with("::");
                 let top = ClassId(Symbol::from(written.0.as_str().trim_start_matches("::")));
                 let included = &top;
-                if let Some(detail) = rails_dependent_include(&self.classes, included, &class.name) {
+                if let Some(detail) = rails_dependent_include(&self.classes, &self.extensions, included, &class.name) {
                     app.gem_boundary.refused_includes.push(crate::gem_boundary::RefusedInclude {
                         class: class.name.clone(), include: included.clone(), detail: detail.clone(),
                     });
@@ -1803,7 +1828,7 @@ impl Analyzer {
                     let ExprNode::Const { path } = &*arg.node else { return None };
                     let id = mixin_path_id(path);
                     let name = id.0.as_str().to_string();
-                    if let Some(detail) = rails_dependent_include(&self.classes, &id, &model.name) {
+                    if let Some(detail) = rails_dependent_include(&self.classes, &self.extensions, &id, &model.name) {
                         refused.push(crate::gem_boundary::RefusedInclude { class: model.name.clone(), include: id, detail });
                         return None;
                     }
@@ -2218,19 +2243,6 @@ impl Analyzer {
             }
         }
 
-        if let Ok(names) = std::env::var("RH_DEBUG_CLASS") {
-          for name in names.split(',') {
-            let id = ClassId(Symbol::from(name));
-            if let Some(ci) = self.classes.get(&id) {
-                for ((c, m, side), v) in &self.inferred_params {
-                    if c == &id {
-                        let sep = if *side == MethodReceiver::Class { "." } else { "#" };
-                    }
-                }
-            } else {
-            }
-        }
-        }
         // Direct-helper bodies last: they are the one app-authored
         // expression the fixpoint above never touches, and typing them
         // needs the registry it produces.
@@ -2491,17 +2503,12 @@ impl Analyzer {
                     .iter()
                     .enumerate()
                     .map(|(i, p)| {
-                        // A rest slot stays untyped. `collect_send_sites`
-                        // records argument types BY POSITION, so the
-                        // slot under a `*streams` sees only whatever
-                        // landed in that one position — the second and
-                        // later varargs of the same call are recorded
-                        // against positions that have no param at all.
-                        // `Utils.silence_stream(STDOUT, STDERR)` unified
-                        // to `*STDERR streams`, a declaration about
-                        // every vararg made from one of them.
+                        // Not the slot's own position alone: the second
+                        // and later varargs of a call land on positions
+                        // past it, so `Utils.silence_stream(STDOUT,
+                        // STDERR)` once declared `*STDERR streams`.
                         let ty = if p.rest {
-                            Ty::Untyped
+                            rest_element(inferred.map(|v| v.get(i..).unwrap_or_default()).unwrap_or_default())
                         } else {
                             param_ty_with_default(inferred.and_then(|v| v.get(i)).cloned(), p)
                                 .unwrap_or(Ty::Untyped)
@@ -2745,9 +2752,26 @@ impl Analyzer {
         }
         entries.extend(nested);
 
+        // An admitted file-level `X = Data.define(…)` has no constant
+        // value in the IR: its library class is the value. Each round
+        // starts with it, so a constant built from the class
+        // (`HOME = Breadcrumb.new(…)`) can read it.
+        let data_classes: Vec<(DeclarationId, Ty)> = app
+            .library_classes
+            .iter()
+            .filter_map(|lc| {
+                let span = lc.data_define()?.1;
+                let ty = self.data_factories.get(&span)?;
+                Some((
+                    rubydex::model::ids::declaration_id_from_lookup_name(lc.name.0.as_str()),
+                    ty.clone(),
+                ))
+            })
+            .collect();
+        let seeded = || -> IdentityHashMap<DeclarationId, Ty> { data_classes.iter().cloned().collect() };
         let mut map: HashMap<Symbol, Ty> = HashMap::default();
         let mut ambiguous: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
-        let mut resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
+        let mut resolved = seeded();
         // The class registry does not change while this runs, so a
         // value whose constant reads all answer as they did when it was
         // last typed types the same again: each round after the first
@@ -2839,14 +2863,15 @@ impl Analyzer {
                 }
             }
             let mut next: HashMap<Symbol, Ty> = HashMap::default();
-            let mut next_resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
+            let mut next_resolved = seeded();
             let shared = body::ConstScope::global(map.clone());
             let typer = BodyTyper::new(&self.classes)
                 .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories)
-                .with_gem_sources(self.gem_sources.clone());
+                .with_gem_sources(self.gem_sources.clone())
+                .with_extensions(self.extensions.clone());
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
             for (index, (self_ty, name, id, source, production)) in entries.iter().enumerate() {
                 let clean = last[index]
@@ -5566,8 +5591,14 @@ impl Analyzer {
                 continue;
             }
             let declared = self.declared_param_ty(class_id, &method.name, ctx.class_side, positional, &param.name);
-            let from_sites = observed.and_then(|v| v.get(i)).cloned();
-            let seeded = param_ty_with_default(from_sites, param);
+            let seeded = if param.rest && !param.keyword && !param.forwarding {
+                match rest_element(observed.map(|v| v.get(i..).unwrap_or_default()).unwrap_or_default()) {
+                    Ty::Untyped => None,
+                    elem => Some(Ty::Array { elem: std::sync::Arc::new(elem) }),
+                }
+            } else {
+                param_ty_with_default(observed.and_then(|v| v.get(i)).cloned(), param)
+            };
             let ty = rest_param_ty(param, declared.clone(), seeded.clone())
                 .or_else(|| prefer_declared(declared, seeded));
             if let Some(ty) = ty {
@@ -6840,6 +6871,17 @@ impl Analyzer {
     ) -> Vec<(ParamKey, Vec<Ty>)> {
         let mut out = Vec::with_capacity(sites.len());
         for (class_id, method, side, arg_tys, kw_tys) in sites {
+            // `Job.perform_later(x)` runs `Job#perform(x)`: ActiveJob serializes the arguments and hands them back as they were.
+            let method = match method.as_str() {
+                "perform_later" | "perform_now"
+                    if side == MethodReceiver::Class
+                        && !defined.contains(&(class_id.clone(), method.clone(), MethodReceiver::Class))
+                        && self.classes.get(&class_id).is_some_and(|c| c.class_methods.contains_key(&method)) =>
+                {
+                    Symbol::from("perform")
+                }
+                _ => method,
+            };
             let written = (class_id, method, side);
             let (class_id, side, shapes) = match placed.get(&written) {
                 Some(hit) => hit.clone(),
@@ -7543,9 +7585,15 @@ impl Analyzer {
                     });
                 }
                 if !recv_classes.is_empty() {
+                    // Past a `*list` the positions are unknown: its elements land wherever its length puts them.
+                    let spread = args.iter().position(|a| matches!(&*a.node, ExprNode::Splat { .. })).unwrap_or(args.len());
                     let arg_tys: Vec<Ty> = args
                         .iter()
-                        .map(|a| {
+                        .enumerate()
+                        .map(|(at, a)| {
+                            if at >= spread {
+                                return Ty::Untyped;
+                            }
                             let t = a.ty.clone().unwrap_or(Ty::Var { var: crate::ident::TyVar(0) });
                             // Template call sites are evidence of what
                             // callers pass; an `Untyped` arg there
@@ -8773,6 +8821,17 @@ pub(super) fn bound_param_row(row: &mut [Ty]) {
     }
 }
 
+/// What every vararg a `*rest` slot collects was observed as: the join
+/// of the positions from the slot on, `Untyped` when any is unknown or
+/// none was seen.
+fn rest_element(observed: &[Ty]) -> Ty {
+    let seen: Vec<&Ty> = observed.iter().filter(|t| !matches!(t, Ty::Var { .. })).collect();
+    if seen.is_empty() || seen.iter().any(|t| matches!(t, Ty::Untyped)) {
+        return Ty::Untyped;
+    }
+    seen.into_iter().cloned().reduce(unify_param_ty).unwrap_or(Ty::Untyped)
+}
+
 pub(crate) fn fold_param_observations(
     rows: &mut HashMap<ParamKey, Vec<Ty>>,
     observations: Vec<(ParamKey, Vec<Ty>)>,
@@ -9066,14 +9125,19 @@ pub fn is_include_refusal(call: &crate::expr::Expr) -> bool {
 /// it, so the include can only fail. The name resolves as Ruby's
 /// constant lookup does (`body::lexical_class`): innermost enclosing
 /// scope of the includer first, so a module the app nests there wins.
-fn rails_dependent_include(classes: &HashMap<ClassId, ClassInfo>, included: &ClassId, class: &ClassId) -> Option<String> {
+fn rails_dependent_include(
+    classes: &HashMap<ClassId, ClassInfo>,
+    extensions: &crate::extensions::Extensions,
+    included: &ClassId,
+    class: &ClassId,
+) -> Option<String> {
     let resolved = body::lexical_class(included, class.0.as_str(), body::Classes::new(classes, None))?;
     let info = classes.get(&resolved).filter(|info| !info.app_declared && !info.gem_loaded)?;
     let gem = info.gem.as_deref()?;
     if crate::project::gem_port_file(gem, resolved.0.as_str()).is_some() {
         return None;
     }
-    let reason = crate::project::gem_requires_rails(gem)?;
+    let reason = crate::project::gem_requires_rails(extensions, gem)?;
     Some(format!(
         "{} includes {}, declared by the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree loads it natively",
         class.0, included.0
@@ -9360,11 +9424,9 @@ fn prefer_declared(declared: Option<Ty>, observed: Option<Ty>) -> Option<Ty> {
 /// read of the parameter (`names.each`, `names.empty?`) an untyped site.
 ///
 /// - `*names`: a declared `*T names` (RBS, which stores `Array[T]`)
-///   wins; otherwise `Array[_]`. Call-site observations are NOT read:
-///   `collect_send_sites` records arguments by position, so the slot
-///   under a rest parameter sees one vararg (or a splatted Array), never
-///   the bundle — the same reason the stamped signature leaves it
-///   untyped.
+///   wins; otherwise the Array of the varargs observed from the slot's
+///   position on (`rest_element`, as the stamped signature has it), or
+///   `Array[_]` where none is known.
 /// - `**options` (and the positional `from_kwrest` slot ingest flattens
 ///   one into): a Hash the declaration or the call sites supply wins,
 ///   since a site binds the keyword group to exactly this slot;
@@ -9381,7 +9443,7 @@ fn rest_param_ty(param: &crate::dialect::Param, declared: Option<Ty>, seeded: Op
         return Some(match declared {
             Some(ty @ Ty::Array { .. }) => ty,
             Some(elem) => Ty::Array { elem: std::sync::Arc::new(elem) },
-            None => Ty::Array { elem: unknown() },
+            None => seeded.unwrap_or_else(|| Ty::Array { elem: unknown() }),
         });
     }
     if (param.rest && param.keyword) || param.from_kwrest {
@@ -10698,25 +10760,30 @@ fn register_serialized_columns(body: &[ModelBodyItem], methods: &mut HashMap<Sym
 }
 
 /// A project extension's `attribute_macros` (`crate::extensions`): a
-/// class-body DSL call like `money_column :amount, currency_column:
-/// :currency` or `money_bags(attributes: [:total_price, …])` whose symbol
-/// arguments name attributes. The schema holds a decimal/integer, the
-/// attribute reads back as the DSL's value object (`total_price.shop_money`),
-/// which is not modeled here: an unmodeled gem boundary, hence gradual
-/// rather than the storage number.
-fn register_attribute_macros(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) {
-    let extensions = crate::extensions::active();
+/// class-body DSL call such as `price_column :amount, currency: :usd` or
+/// `bag_columns attributes: [:total, :tax]` whose symbol arguments name
+/// attributes. The schema holds a number, but the attribute reads back as
+/// the DSL's value object, which is not modeled here. That is an unmodeled
+/// gem boundary, so the reader and writer are gradual rather than the
+/// storage type. `insert`, as for `serialize`: this deliberately overrides
+/// the schema-derived type.
+fn register_attribute_macros(
+    body: &[ModelBodyItem],
+    extensions: &crate::extensions::Extensions,
+    methods: &mut HashMap<Symbol, Ty>,
+) {
+    use crate::extensions::MacroAttributes;
     if extensions.attribute_macros.is_empty() {
         return;
     }
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-        let Some(spec) = extensions.attribute_macros.iter().find(|m| m.name == method.as_str()) else { continue };
+        let Some(spec) = extensions.attribute_macro(method.as_str()) else { continue };
         let mut names: Vec<Symbol> = Vec::new();
-        match spec.attributes {
-            crate::extensions::MacroAttributes::Positional => names.extend(args.iter().map_while(symbol_arg).cloned()),
-            crate::extensions::MacroAttributes::HashKey(key) => {
+        match &spec.attributes {
+            MacroAttributes::Positional => names.extend(args.iter().map_while(symbol_arg).cloned()),
+            MacroAttributes::HashKey(key) => {
                 for arg in args {
                     let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
                     for (k, v) in entries {
@@ -11191,12 +11258,12 @@ fn snapshot_rebuild(e: &Expr) -> bool {
 
 /// Locals every assignment of which in `body` is a bare `yield` — a
 /// method's own copy of its block's value (`records = yield; …; records`).
-fn yield_only_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
+fn yield_only_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
     fn walk(
         e: &Expr,
-        yields: &mut std::collections::HashSet<Symbol>,
-        other: &mut std::collections::HashSet<Symbol>,
-        shadowed: &std::collections::HashSet<Symbol>,
+        yields: &mut crate::det::HashSet<Symbol>,
+        other: &mut crate::det::HashSet<Symbol>,
+        shadowed: &crate::det::HashSet<Symbol>,
     ) {
         match &*e.node {
             ExprNode::Lambda { extra_params, params, rest_param, body, .. } => {
@@ -11231,9 +11298,9 @@ fn yield_only_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
             _ => e.node.for_each_child(&mut |c| walk(c, yields, other, shadowed)),
         }
     }
-    let mut yields = std::collections::HashSet::new();
-    let mut other = std::collections::HashSet::new();
-    walk(body, &mut yields, &mut other, &std::collections::HashSet::new());
+    let mut yields = crate::det::HashSet::default();
+    let mut other = crate::det::HashSet::default();
+    walk(body, &mut yields, &mut other, &crate::det::HashSet::default());
     yields.retain(|n| !other.contains(n));
     yields
 }

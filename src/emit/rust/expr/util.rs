@@ -67,6 +67,8 @@ pub(crate) fn value_narrowing_coercion(narrowed: &crate::ty::Ty) -> Option<&'sta
         crate::ty::Ty::Bool => Some("as_bool().unwrap()"),
         crate::ty::Ty::Int => Some("as_i64().unwrap()"),
         crate::ty::Ty::Float => Some("as_f64().unwrap()"),
+        crate::ty::Ty::Array { .. } => Some("as_array().unwrap().clone()"),
+        crate::ty::Ty::Hash { .. } => Some("as_object().unwrap().clone()"),
         _ => None,
     }
 }

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::Broadcast -- in-process fan-out.
 #
 # A registry of (topic, fd, mode) subscriptions on the Tep::APP

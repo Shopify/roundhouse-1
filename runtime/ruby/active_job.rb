@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveJob under the transpiled runtime: the adapter is `:inline` —
 # there is no queue daemon in-process, so the class-side entries
 # (`perform_later`, `set(...).perform_later`) are synthesized by

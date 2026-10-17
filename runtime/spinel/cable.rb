@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Cable — Action Cable (actioncable-v1-json) WebSocket endpoint for the
 # spinel target, built on the Tep::WebSocket codec + Tep::Broadcast fan-out
 # under Tep::Server::Threaded.
@@ -582,10 +583,9 @@ module Cable
     # runs, and the CRuby overlay's config.ru answers it the same way.
     unless ActionController::RequestForgeryProtection.cable_origin_allowed?(
         req.req_headers.fetch("origin", ""),
-        ActionController::RequestForgeryProtection.base_url_for(
+        ActionController::RequestForgeryProtection.host_origin_for(
           req.req_headers.fetch("host", ""), "",
-          req.req_headers.fetch("x-forwarded-proto", ""), ""),
-        Rails.env.development?)
+          req.req_headers.fetch("x-forwarded-proto", ""), ""))
       res.status = 404
       res.body = "Page not found"
       return true

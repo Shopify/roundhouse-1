@@ -1053,6 +1053,7 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![callee, forwarder],
             nullable_columns: Vec::new(),
             origin: None,

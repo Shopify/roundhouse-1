@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActiveSupport::Duration.
 #
 # Rails adds duration builders to Integer/Numeric (`70.days`, `1.week`) plus

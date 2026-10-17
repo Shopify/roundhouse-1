@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "../test_helper"
 
 # Rails 8.1.4 public-interface cases for both number-helper surfaces.

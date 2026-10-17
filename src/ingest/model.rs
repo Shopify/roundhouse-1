@@ -3282,6 +3282,13 @@ pub(super) fn parse_association(
         })
         .unwrap_or_default();
 
+    // Rails takes the class of a `through:` association from its source
+    // association when no `class_name:` or `source_type:` names it.
+    // Ingest reads one model at a time, so app assembly does the
+    // lookup (`resolve_through_targets`).
+    let class_explicit = class_name.is_some() || source_type.is_some();
+    let source_name = source.as_deref().map(Symbol::from);
+
     match method {
         "has_many" => Some(Association::HasMany {
             name: name.clone(),
@@ -3311,6 +3318,12 @@ pub(super) fn parse_association(
             // would otherwise be the polymorphic association name
             // ("Reference") — a phantom class. Already CamelCase, so no
             // transform.
+            //
+            // The camelized name is only a first guess for a `through:`
+            // association: `resolve_through_targets` replaces it with
+            // the class of the source association once every model is
+            // ingested (`source: :remarks` on `has_many :remarks,
+            // class_name: "Comment"` → Comment, not Remark).
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
                 .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
@@ -3327,6 +3340,8 @@ pub(super) fn parse_association(
             foreign_key_explicit,
             inverse_of: inverse_of.as_deref().map(Symbol::from),
             through: through.map(|s| Symbol::from(s.as_str())),
+            source: source_name,
+            class_explicit,
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,

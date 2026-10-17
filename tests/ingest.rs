@@ -625,6 +625,237 @@ end
     );
 }
 
+/// `devise_for :widgets, path: "auth", format: false` under `scope
+/// module: :auth` — the Top-3 reduction for ranked gaps #1 and #2.
+/// Devise::Mapping uses `options[:path] || name` as the path segment
+/// and substitutes the enclosing scope's module for its own `"devise"`
+/// default: `auth/sessions#new`, not `auth/devise/sessions#new` and not
+/// `devise/sessions#new` (that would drop the scope entirely). Checked
+/// against the real Devise 5 routes this mirrors (`devise/rails/routes.rb`,
+/// `devise/mapping.rb`). Fails to ingest on main (`unsupported
+/// devise_for option \`path\``).
+#[test]
+fn devise_for_with_scope_module_and_path_matches_real_devise_routes() {
+    let source = br#"Rails.application.routes.draw do
+  scope module: :auth do
+    devise_for :widgets, path: "auth", format: false
+  end
+  resources :widgets, only: %i[index show]
+end
+"#;
+    roundhouse::ingest::survey::activate();
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let gaps = roundhouse::ingest::survey::drain();
+    let table = result.expect("ingest");
+    assert!(
+        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
+        "devise_for path:/format: must not survey: {gaps:?}"
+    );
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+
+    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(new_session.path, "/auth/sign_in");
+    assert_eq!(new_session.controller.0.as_str(), "Auth::SessionsController");
+    let destroy_session =
+        by_name.get("destroy_widget_session").expect("destroy_widget_session");
+    assert_eq!(destroy_session.path, "/auth/sign_out");
+
+    let new_registration =
+        by_name.get("new_widget_registration").expect("new_widget_registration");
+    assert_eq!(new_registration.path, "/auth/sign_up");
+    assert_eq!(
+        new_registration.controller.0.as_str(),
+        "Auth::RegistrationsController"
+    );
+    let create_registration =
+        by_name.get("widget_registration").expect("widget_registration");
+    assert_eq!(create_registration.path, "/auth");
+
+    let new_password = by_name.get("new_widget_password").expect("new_widget_password");
+    assert_eq!(new_password.path, "/auth/password/new");
+    assert_eq!(new_password.controller.0.as_str(), "Auth::PasswordsController");
+
+    let new_confirmation =
+        by_name.get("new_widget_confirmation").expect("new_widget_confirmation");
+    assert_eq!(new_confirmation.path, "/auth/confirmation/new");
+    assert_eq!(
+        new_confirmation.controller.0.as_str(),
+        "Auth::ConfirmationsController"
+    );
+
+    // The sibling `resources :widgets`, OUTSIDE the `scope module:`
+    // block, must not pick up the Devise scope's module.
+    let index = by_name.get("widgets").expect("widgets index");
+    assert_eq!(index.path, "/widgets");
+    assert_eq!(index.controller.0.as_str(), "WidgetsController");
+}
+
+/// Same scope-module substitution bug (ranked gap #1's second half), with
+/// no `path:` override, so it isolates the controller-naming half of the
+/// fix: the sessions controller resolves as `auth/sessions`, not
+/// `auth/devise/sessions` (what the un-fixed route lowering's blind
+/// module-prefix concatenation produces) and not bare `devise/sessions`
+/// (dropping the scope entirely). Fails (wrong controller) on main.
+#[test]
+fn devise_for_under_scope_module_resolves_controller_in_place_of_devise() {
+    let source = br#"Rails.application.routes.draw do
+  scope module: :auth do
+    devise_for :widgets
+  end
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let table = result.expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(session.path, "/widgets/sign_in");
+    assert_eq!(session.controller.0.as_str(), "Auth::SessionsController");
+    let registration =
+        by_name.get("new_widget_registration").expect("new_widget_registration");
+    assert_eq!(
+        registration.controller.0.as_str(),
+        "Auth::RegistrationsController"
+    );
+}
+
+/// `controllers:` overrides are absolute in real Devise
+/// (`with_devise_exclusive_scope` resets the scope's module to `nil`
+/// before applying them) — an enclosing `scope module:` must not
+/// re-qualify them on top of what `controllers:` already names.
+#[test]
+fn devise_for_controllers_override_ignores_enclosing_scope_module() {
+    let source = br#"Rails.application.routes.draw do
+  scope module: :auth do
+    devise_for :widgets, controllers: { sessions: "widgets/sessions" }
+  end
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let table = result.expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(session.controller.0.as_str(), "Widgets::SessionsController");
+}
+
+/// `devise_for format: true` would need the `(.:format)` optional
+/// suffix this table never models; it fails loud instead of silently
+/// matching `format: false`'s (already-modeled) behavior.
+#[test]
+fn devise_for_rejects_format_true() {
+    let source = br#"Rails.application.routes.draw do
+  devise_for :widgets, format: true
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let err = result.expect_err("format: true is not modeled");
+    assert!(format!("{err:?}").contains("format: true"));
+}
+
+/// `path_names:` overrides the stock segment names
+/// (`Devise::Mapping#default_path_names`), merged over the defaults.
+#[test]
+fn devise_for_path_names_override() {
+    let source = br#"Rails.application.routes.draw do
+  devise_for :widgets, path_names: { sign_in: "login", sign_out: "logout" }
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let table = result.expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(new_session.path, "/widgets/login");
+    let destroy_session =
+        by_name.get("destroy_widget_session").expect("destroy_widget_session");
+    assert_eq!(destroy_session.path, "/widgets/logout");
+}
+
+/// `devise_for :widgets, path: ""` is a common Devise idiom (mount the
+/// whole table at the resource's own root segment). `base_path` is
+/// empty, so naive `"/{base_path}"` prefixing produces `"/"`, and
+/// joining that with a suffix that already starts with `"/"` doubles
+/// it into `"//sign_in"`. Real Devise (`Mapping#fullpath`:
+/// `"/#{path_prefix}/#{@path}".squeeze("/")`) gives `/sign_in`,
+/// `/sign_out`, `/password...`, `/sign_up`, and `/` for the
+/// registration root (create/update/destroy). Fails on b6379ca9
+/// (produces `"//sign_in"` etc., and `""` for the registration root).
+#[test]
+fn devise_for_empty_path_does_not_double_the_leading_slash() {
+    let source = br#"Rails.application.routes.draw do
+  devise_for :widgets, path: ""
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let table = result.expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(new_session.path, "/sign_in");
+    let destroy_session =
+        by_name.get("destroy_widget_session").expect("destroy_widget_session");
+    assert_eq!(destroy_session.path, "/sign_out");
+    let new_password = by_name.get("new_widget_password").expect("new_widget_password");
+    assert_eq!(new_password.path, "/password/new");
+    let new_registration =
+        by_name.get("new_widget_registration").expect("new_widget_registration");
+    assert_eq!(new_registration.path, "/sign_up");
+    let create_registration =
+        by_name.get("widget_registration").expect("widget_registration");
+    assert_eq!(create_registration.path, "/");
+}
+
+/// `path: "/auth"` (a leading slash on the segment itself) must not
+/// double up with the suffix's own leading slash either. Fails on
+/// b6379ca9 (produces `"//auth/sign_in"`).
+#[test]
+fn devise_for_path_with_a_leading_slash_does_not_double_it() {
+    let source = br#"Rails.application.routes.draw do
+  devise_for :widgets, path: "/auth"
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let table = result.expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
+    assert_eq!(new_session.path, "/auth/sign_in");
+}
+
 /// A route omission is an error on the recovered table, not a fatal parse.
 #[test]
 fn routes_mount_diagnostic_preserves_siblings_in_every_mode() {

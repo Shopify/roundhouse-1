@@ -201,13 +201,18 @@ pub struct WholeRoute {
     pub lowered: App,
     pub files: Vec<(String, String)>,
     pub diags: Vec<crate::diagnostic::Diagnostic>,
+    /// Recorded ingest gaps as `(file, message)` — survey mode's
+    /// `IngestError::Unsupported` entries, which carry no span and never
+    /// become a diagnostic, but whose file still belongs to a route
+    /// (`routes::plan`'s gap blocking turns them back into one).
+    pub gaps: Vec<(String, String)>,
 }
 
 /// Add whole-route replacement to `files`: the lowered tree, the bridge,
 /// and an initializer naming the actions `routes::plan` cleared. With no
 /// action cleared nothing is added, and the app stays plain Rails.
 pub fn whole_route(files: &mut Vec<(String, String)>, wr: &WholeRoute) -> Result<routes::RoutePlan, String> {
-    let plan = routes::plan(&wr.lowered, &wr.diags);
+    let plan = routes::plan(&wr.lowered, &wr.diags, &wr.gaps);
     if plan.actions.is_empty() {
         return Ok(plan);
     }

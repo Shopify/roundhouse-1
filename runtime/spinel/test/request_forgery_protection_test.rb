@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Minitest-shaped, like hash_to_query_test.rb: a CRuby-only framework
 # test of the ruby family's forgery check
 # (runtime/request_forgery_protection.rb over the shared
@@ -12,11 +13,15 @@ require_relative "../runtime/request_forgery_protection"
 class RequestForgeryProtectionTest < Minitest::Test
   # The harness turns the check off for app suites, as Rails' test.rb
   # does; this file is the one that tests it.
+  # The app's own strategy is pinned away: an app on `header_only` (Rails 8.2's default) never reaches the token cases below.
   def setup
     ActionController::Base.allow_forgery_protection = true
+    @app_strategy = Rails::Application.instance_method(:forgery_protection_verification_strategy)
+    Rails::Application.define_method(:forgery_protection_verification_strategy) { "header_or_legacy_token" }
   end
 
   def teardown
+    Rails::Application.define_method(:forgery_protection_verification_strategy, @app_strategy)
     ActionController::Base.allow_forgery_protection = false
     ActionController::Current.controller = nil
     ActionController::Current.request = nil
@@ -100,20 +105,29 @@ class RequestForgeryProtectionTest < Minitest::Test
     assert controller(method: "POST", params: ok, headers: explicit, session_token: secret).verified_request?
   end
 
-  # Action Cable's handshake check: same host, or any localhost port in
-  # development; an absent Origin is refused, unlike the form check.
+  # Action Cable's handshake check with Rails' defaults: same host, or
+  # any localhost port in development; an absent Origin is refused,
+  # unlike the form check.
   def test_a_cable_handshake_must_come_from_its_own_host
     rfp = ActionController::RequestForgeryProtection
-    base = rfp.base_url_for("chat.example.com:3000", "", "", "")
-    assert rfp.cable_origin_allowed?("http://chat.example.com:3000", base, false)
-    refute rfp.cable_origin_allowed?("https://chat.example.com:3000", base, false)
-    refute rfp.cable_origin_allowed?("https://evil.example", base, false)
-    refute rfp.cable_origin_allowed?("http://chat.example.com:4000", base, false)
-    refute rfp.cable_origin_allowed?("", base, false)
-    refute rfp.cable_origin_allowed?("null", base, false)
-    tls = rfp.base_url_for("chat.example.com", "", "https", "")
-    assert rfp.cable_origin_allowed?("https://chat.example.com", tls, false)
-    refute rfp.cable_origin_allowed?("http://chat.example.com", tls, false)
+    with_env("production") do
+      host = rfp.host_origin_for("chat.example.com:3000", "", "", "")
+      assert_equal "http://chat.example.com:3000", host
+      assert rfp.cable_origin_allowed?("http://chat.example.com:3000", host)
+      refute rfp.cable_origin_allowed?("https://chat.example.com:3000", host)
+      refute rfp.cable_origin_allowed?("https://evil.example", host)
+      refute rfp.cable_origin_allowed?("http://chat.example.com:4000", host)
+      refute rfp.cable_origin_allowed?("", host)
+      refute rfp.cable_origin_allowed?("null", host)
+      tls = rfp.host_origin_for("chat.example.com", "", "https", "")
+      assert rfp.cable_origin_allowed?("https://chat.example.com", tls)
+      refute rfp.cable_origin_allowed?("http://chat.example.com", tls)
+      # The Host header as sent: Rails compares with
+      # "#{proto}://#{env['HTTP_HOST']}", standard port and all.
+      explicit = rfp.host_origin_for("chat.example.com:443", "", "https", "")
+      assert_equal "https://chat.example.com:443", explicit
+      refute rfp.cable_origin_allowed?("https://chat.example.com", explicit)
+    end
     assert_equal "https://chat.example.com", rfp.base_url_for("chat.example.com", "on", "", "")
     assert_equal "https://chat.example.com", rfp.base_url_for("chat.example.com:443", "", "https", "")
     assert_equal "http://chat.example.com", rfp.base_url_for("chat.example.com:80", "", "", "")
@@ -124,14 +138,31 @@ class RequestForgeryProtectionTest < Minitest::Test
     assert_equal "http://chat.example.com", rfp.base_url_for("chat.example.com", "", "http", "https")
   end
 
+  # Action Cable's engine sets `allowed_request_origins` to
+  # `/https?:\/\/localhost:\d+/` in development, and `===` on a Regexp
+  # is unanchored: Rails lets `http://localhost:3000.evil.example`
+  # through too.
   def test_development_also_allows_any_localhost_port
     rfp = ActionController::RequestForgeryProtection
-    base = rfp.base_url_for("chat.example.com", "", "", "")
-    refute rfp.cable_origin_allowed?("http://localhost:3000", base, false)
-    assert rfp.cable_origin_allowed?("http://localhost:3000", base, true)
-    assert rfp.cable_origin_allowed?("https://localhost:8443", base, true)
-    refute rfp.cable_origin_allowed?("http://localhost:3000.evil.example", base, true)
-    refute rfp.cable_origin_allowed?("", base, true)
+    host = rfp.host_origin_for("chat.example.com", "", "", "")
+    with_env("production") do
+      refute rfp.cable_origin_allowed?("http://localhost:3000", host)
+    end
+    with_env("development") do
+      assert rfp.cable_origin_allowed?("http://localhost:3000", host)
+      assert rfp.cable_origin_allowed?("https://localhost:8443", host)
+      assert rfp.cable_origin_allowed?("http://localhost:3000.evil.example", host)
+      refute rfp.cable_origin_allowed?("http://localhost", host)
+      refute rfp.cable_origin_allowed?("", host)
+    end
+  end
+
+  def with_env(name)
+    original = Rails.env_name
+    Rails.env_name = name
+    yield
+  ensure
+    Rails.env_name = original
   end
 
   # Rails main's Fetch Metadata rule, ahead of the token.

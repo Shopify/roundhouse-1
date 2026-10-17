@@ -72,7 +72,6 @@ pub fn tiny_blog_uuid() -> Overlay {
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    std::fs::create_dir_all(&base).expect("mkdir");
     Overlay { base, scratch_base: true, edits: Vec::new() }
 }
 
@@ -230,7 +229,8 @@ impl Overlay {
         (emitted, errors)
     }
 
-    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+    /// Copy the fixture and apply the edits: the scratch dir and the app in it.
+    fn materialize(self) -> (PathBuf, PathBuf) {
         let scratch = scratch_dir();
         let source = scratch.join("app");
         copy_tree(&self.base, &source);
@@ -263,6 +263,19 @@ impl Overlay {
             }
         }
 
+        (scratch, source)
+    }
+
+    /// The warnings ingesting the overlaid app reports.
+    pub fn ingest_warnings(self) -> Vec<String> {
+        let (scratch, source) = self.materialize();
+        let (_app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source).expect("ingest the overlaid fixture"));
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).map(|d| d.message).collect()
+    }
+
+    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+        let (scratch, source) = self.materialize();
         let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
         let mut lower_diags = roundhouse::session::analyze_and_lower(&mut app);
         if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
@@ -392,13 +405,22 @@ pub fn ruby() -> Command {
 /// A fresh directory per run: tests in one binary run in parallel.
 fn scratch_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-emit-and-run-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    loop {
+        // Resolved, so paths a child Ruby reports (`__dir__` is a realpath)
+        // match on macOS, where $TMPDIR sits under /var -> /private/var.
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "roundhouse-emit-and-run-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Combined suites contain independent copies of this module. Reserve
+        // the path atomically instead of deleting another copy's live tree.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create scratch directory {}: {error}", dir.display()),
+        }
+    }
 }
 
 fn copy_tree(src: &Path, dst: &Path) {

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Instance-method form of ActiveSupport::NumberHelper. Kept separate from
 # the module-function stem because the runtime source checker matches methods
 # by their short class name and cannot distinguish the two forms in one file.

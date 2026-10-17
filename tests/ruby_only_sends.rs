@@ -1,5 +1,5 @@
 //! Sends the analyzer types for every target but only the Ruby family can
-//! run: `Array#fetch`, `each_slice`, `each_cons`, an enumerator's
+//! run: `Array#fetch`, `each_slice`, `each_cons`, `lazy`, an enumerator's
 //! `with_object`, `Array[...]`, `Hash[...]`, `include?` on a `Class` value,
 //! Kernel's `Rational(...)` (what a rational literal ingests as) and
 //! Kernel's `Integer(...)` and `Float(...)`.
@@ -27,6 +27,11 @@ const MODEL: &str = r#"class Article < ApplicationRecord
   #: (Array[Integer]) -> Integer
   def self.pairs(nums)
     nums.each_cons(2).to_a.length
+  end
+
+  #: (Array[Integer]) -> untyped
+  def self.first_even(nums)
+    nums.lazy.filter_map { |n| n * 10 if n.even? }.first
   end
 
   #: (Array[Integer]) -> Array[Integer]
@@ -60,10 +65,11 @@ const MODEL: &str = r#"class Article < ApplicationRecord
 end
 "#;
 
-const REFUSED: [&str; 10] = [
+const REFUSED: [&str; 11] = [
     "Array#fetch",
     "Array#each_slice",
     "Array#each_cons",
+    "Array#lazy",
     "Enumerator#with_object",
     "Array[]",
     "Hash[]",

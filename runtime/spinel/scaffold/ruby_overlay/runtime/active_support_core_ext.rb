@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActiveSupport core extensions (Object / String / Array /
 # Hash / Enumerable / Module).
 #
@@ -195,6 +196,21 @@ class String
     gsub!(/[[:space:]]+/, " ")
     strip!
     self
+  end
+
+  # AS `truncate` (core_ext/string/filters.rb) for a receiver the
+  # lowering could not prove a String. A typed one is grounded to
+  # `ActiveSupport.truncate`; this reopen also takes Rails' Regexp
+  # separator, which CRuby's `rindex` answers.
+  def truncate(truncate_to, options = {})
+    return dup unless length > truncate_to
+
+    omission = options[:omission] || "..."
+    room = truncate_to - omission.length
+    return omission.dup if room <= 0
+
+    stop = options[:separator] ? (rindex(options[:separator], room) || room) : room
+    +"#{self[0, stop]}#{omission}"
   end
 
   # `html_safe` promotes to the marked type; plain strings answer

@@ -631,6 +631,23 @@ impl ConstResolver {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// App and runtime sources define this reference; RBI declarations do
+    /// not enter this graph and cannot establish source ownership.
+    pub(crate) fn has_definition(&self, span: Span, path: &[Symbol]) -> bool {
+        self.reference(span, path).is_some_and(|resolved| resolved.is_some())
+    }
+
+    /// Exact resolved source names for declaration edges without expression
+    /// spans. The borrowed identifiers remain owned by this snapshot.
+    pub(crate) fn defined_names(&self) -> HashSet<&str> {
+        self.files.iter().flatten().flat_map(|file| file.references.values()).filter_map(|resolved| {
+            match resolved.as_ref()? {
+                ResolvedConstant::Namespace { class, .. } => Some(class.0.as_str()),
+                ResolvedConstant::Value { name, .. } => Some(name.0.as_str()),
+            }
+        }).collect()
+    }
+
     /// Exact source-resolved namespace, also used by ingest admission gates
     /// that must distinguish lexical namesakes from the activated concern.
     pub(crate) fn namespace(&self, span: Span, path: &[Symbol]) -> Option<&ClassId> {
@@ -1743,6 +1760,35 @@ mod tests {
                 .replace("prepend Mixins", "prepen_ Mixins")
         );
         assert!(dynamic_mixin_projection("class A\n  include B\n  extend C::D\n  extend self\nend\n").is_none());
+    }
+
+    #[test]
+    fn source_namespace_index_matches_original_file_and_runtime_alias_scan() {
+        for reopen in [false, true] {
+            let mut sources = vec![
+                SourceFile { path: "nested.rb".into(), text: "module Catalog\n class Reader; end\nend\n".into() },
+                SourceFile { path: "alias.rb".into(), text: "DataAlias = Data\nValue = 3\n".into() },
+            ];
+            if reopen {
+                sources.push(SourceFile { path: "reopen.rb".into(), text: "class DataAlias\n def marker; 1; end\nend\n".into() });
+            }
+            let resolver = ConstResolver::from_app_sources(&sources);
+            let mut queries = vec!["Catalog", "Catalog::Reader", "DataAlias", "Data", "Value", "Missing"];
+            queries.extend(resolver.files.iter().flatten().flat_map(|file|
+                file.namespace_definitions.iter().map(|name| name.as_ref())));
+            queries.extend(resolver.files.iter().flatten().flat_map(|file|
+                file.runtime_namespace_aliases.values().map(|name| name.as_ref())));
+            for name in queries {
+                let scanned = resolver.files.iter().flatten().any(|file| file.namespace_definitions.contains(name))
+                    || resolver.files.iter().flatten().any(|file| {
+                        file.runtime_namespace_aliases.iter().any(|(alias, target)| {
+                            target.as_ref() == name && resolver.files.iter().flatten()
+                                .any(|source| source.class_definitions.contains(alias.as_ref()))
+                        })
+                    });
+                assert_eq!(resolver.has_source_namespace(name), scanned, "{name}, reopen={reopen}");
+            }
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveSupport::NumberHelper — shared Ruby-family implementation.
 #
 # Keeping the formatter here gives CRuby and Spinel one implementation

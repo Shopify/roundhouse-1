@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Net::HTTP, reopened over spinel's bundled `packages/net` so the stub
 # table (`runtime/http_stub.rb`) is consulted BEFORE any socket opens.
 #
@@ -224,7 +225,7 @@ module Net
       connect if @socket.nil?
       begin_transport(req)
       write_request(req)
-      read_response(req.method)
+      read_response(req.method, req.decode_content)
     end
 
     # The package connects direct or not at all (`Net::HTTP.new` raises

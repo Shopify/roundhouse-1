@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Action Text's value layer: the HTML fragment a `has_rich_text`
 # attribute holds, and the attachment nodes embedded in it.
 #
@@ -645,6 +646,8 @@ module ActionText
       @pending_removals = []
       @last_pending_start = nil
       @last_pending_finish = nil
+      @plain_text = nil
+      @plain_text_for = nil
     end
 
     # Rails' `ActionText::Fragment.wrap` — a Fragment passes through, a
@@ -672,9 +675,19 @@ module ActionText
     # conversion ActionText::Content uses. Keep conversion in Content's
     # shared parser so entities, block boundaries, and Action Text nodes
     # have the same behavior instead of maintaining a second HTML scanner.
+    #
+    # Memoized against the markup it was taken from: campfire asks a
+    # message for its plain text twice per render (its tag's data and
+    # its `/play` check), and the conversion walks every character. A
+    # write through `css`/`at_css` changes `@html`, which misses.
     def to_plain_text
       flush_pending_removals
-      Content.new(@html, canonicalize: false).convert_html_to_plain_text
+      cached = @plain_text
+      return cached if !cached.nil? && @plain_text_for == @html
+      text = Content.new(@html, canonicalize: false).convert_html_to_plain_text
+      @plain_text_for = @html.dup
+      @plain_text = text
+      text
     end
 
     # Elements matching `selector`, in document order — detached nodes,
@@ -903,6 +916,11 @@ module ActionText
       flush_pending_removals
       out = []
       matcher = Fragment.parse_selector(selector)
+      # A named element whose tag never opens in the markup matches
+      # nothing; answer that without walking every element (campfire
+      # asks each message for its `action-text-attachment`s to learn it
+      # has none). Tag names compare downcased, as `tag_name_of` reads them.
+      return out if matcher.kind == "name" && !@html.downcase.include?("<" + matcher.name)
       i = 0
       n = @html.length
       while i < n
@@ -1263,13 +1281,21 @@ module ActionText
       @html = html.to_s
       @canonicalize = canonicalize
       @plain_text = nil
+      @fragment = nil
     end
 
     # `ActionText::Content#fragment` — the element view a
     # `Content::Filter` works through (campfire's filter base is
     # `delegate :fragment, to: :content`).
+    #
+    # One per Content, as Rails' is: a Content's markup never changes, and
+    # a fresh Fragment per call threw away the plain text it had taken.
     def fragment
-      ActionText::Fragment.new(@html)
+      found = @fragment
+      return found unless found.nil?
+      made = ActionText::Fragment.new(@html)
+      @fragment = made
+      made
     end
 
     # The stored markup, unchanged — `to_html` is the FRAGMENT, which

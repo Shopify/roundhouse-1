@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActionDispatch::Request over the CGI env.
 #
 # The request-object surface controllers and filters reach
@@ -189,6 +190,15 @@ module ActionDispatch
         end
         set_header(key, parsed)
       end
+    end
+
+    # `request.filtered_parameters` - see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
     end
 
     # Rails' `request.cookie_jar`: the jar over this request's cookies,

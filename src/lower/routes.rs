@@ -1125,9 +1125,22 @@ fn qualify_controller(module_prefix: &str, controller: &ClassId) -> ClassId {
             format!("{outer}::{inner}Controller")
         }));
     }
+    // `devise_for`'s default (no `controllers:` override) is a
+    // placeholder, not a qualified class: Devise substitutes the
+    // enclosing scope's module for its own `"devise"` default
+    // (`Devise::Mapping#default_controllers`) rather than nesting under
+    // it, which the generic concatenation below would do.
+    if let Some(resolved) =
+        crate::ingest::devise_routes::resolve_default_controller(module_prefix, controller.0.as_str())
+    {
+        return ClassId(Symbol::from(resolved));
+    }
     // A leading `::` is a target written with a leading slash
     // (`to: "/errors#routing"`): Rails resolves it from the top level,
-    // outside the enclosing `namespace`.
+    // outside the enclosing `namespace`. `devise_for … controllers:`
+    // overrides are marked the same way — Devise resets the scope's
+    // module before applying them, so no enclosing scope re-qualifies
+    // them either.
     if let Some(absolute) = controller.0.as_str().strip_prefix("::") {
         return ClassId(Symbol::from(absolute));
     }

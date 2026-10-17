@@ -1,5 +1,5 @@
-//! FileUtils, GC, OpenSSL::HMAC, CSV::MalformedCSVError, Enumerator::Product
-//! and Enumerator::Lazy resolve, and the emitted program answers what
+//! FileUtils, GC, OpenSSL::HMAC, CSV::MalformedCSVError, Enumerator::Product,
+//! Enumerator::Lazy and Enumerator::Chain resolve, and the emitted program answers what
 //! plain Ruby answers.
 
 use super::stdlib_rnp_contract as contract;
@@ -15,7 +15,7 @@ fn stdlib_constants_an_api_uses_execute_after_emission() {
 #[test]
 fn strict_targets_ledger_the_stdlib_constants() {
     let (_tree, errors) = contract::overlay().emit(roundhouse::project::BuildTarget::Crystal);
-    for name in ["FileUtils", "GC", "OpenSSL::HMAC", "CSV::MalformedCSVError", "Enumerator::Product", "Enumerator::Lazy"] {
+    for name in ["FileUtils", "GC", "OpenSSL::HMAC", "CSV::MalformedCSVError", "Enumerator::Product", "Enumerator::Lazy", "Enumerator::Chain"] {
         assert!(
             errors.iter().any(|e| e.contains(&format!("{name} is not available as a class/module value on crystal"))),
             "{name} not ledgered on Crystal: {errors:#?}"

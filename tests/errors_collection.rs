@@ -44,3 +44,15 @@ fn unimplemented_errors_operations_are_refused() {
         assert!(!diags.iter().any(|d| d.contains(name)), "{name}: {diags:?}");
     }
 }
+
+// The forms of those operations that carry a count or a type are still
+// refused by name where no port answers them.
+#[test]
+fn errors_operations_with_option_forms_are_refused() {
+    let diags = dispatch_failures(
+        "    errors.added?(:base, :blank, count: 1)\n    errors.import(other.errors.first)\n    errors.merge!(other.errors)\n    errors.delete(:base, :blank)\n    errors.where(:base, :blank, count: 1).any?\n    errors.details[:base].first[:count]\n    errors.map(&:type).include?(:x)\n    errors.errors[0].options[:code]\n    errors.messages",
+    );
+    for name in ["added?", "import", "merge!", "delete", "where", "`[]`"] {
+        assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
+    }
+}

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::BroadcastSubscription -- one entry in the Tep::Broadcast
 # subscriber registry. Pairs a topic name with an output: the
 # connection's Tep::WebSocket::Driver for framed delivery, or a bare

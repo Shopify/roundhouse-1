@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Arel — the raw-SQL corner of ActiveRecord's query surface, sized to the
 # string-composed Relation runtime: a "fragment" here IS its SQL text.
 # `Arel.sql(...)` marks a caller-authored fragment (a String subclass,

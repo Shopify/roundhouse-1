@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Minimal Base64 shim — provides only the surface called from
 # framework Ruby. The Ruby target's `require_relative "runtime/base64"`
 # resolves here uniformly; under CRuby this module is also reachable

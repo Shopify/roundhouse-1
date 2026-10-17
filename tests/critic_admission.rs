@@ -71,6 +71,20 @@ fn new_errors_api_requires_runtime_support() {
     for body in ["errors.slice!(:title)", "errors.group_by_attribute", "errors.copy!(errors)", "errors.generate_message(:title, :blank)", "f = title.to_sym; errors.full_message(f, \"is taken\")"] {
         refuses(body, "ActiveModel::Errors");
     }
+    // Not `ActiveModel::Error`: on emit, what an iteration yields is already the `ErrorDetail` the lowering iterates.
+    refuses("errors.first.options", "no known method `options`");
+    refuses("errors.of_kind?(title.to_sym, :blank)", "of_kind?");
+    refuses("errors.details[:title].map { |detail| detail[:count] }", "no known method `[]`");
+}
+
+#[test]
+fn errors_merge_details_and_added_are_admitted() {
+    admits("errors.merge!(errors); errors.details[:title].map { |detail| detail[:error] }; errors.added?(:title, :blank)");
+}
+
+#[test]
+fn errors_where_on_a_literal_field_is_admitted() {
+    admits("errors.where(:title, :blank).map(&:full_message)");
 }
 
 #[test]
@@ -80,8 +94,8 @@ fn errors_full_message_on_a_literal_field_is_admitted() {
 }
 
 #[test]
-fn errors_full_message_on_a_computed_receiver_is_refused() {
-    refuses("Probe.create!(title: \"x\").errors.full_message(:title, \"is taken\")", "ActiveModel::Errors");
+fn errors_full_message_on_a_computed_receiver_is_admitted() {
+    admits("Probe.create!(title: \"x\").errors.full_message(:title, \"is taken\").upcase");
 }
 
 #[test]

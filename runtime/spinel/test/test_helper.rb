@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Copied verbatim to <out>/test/test_helper.rb (by `make ruby-transpile`
 # or `tests/ruby_toolchain.rs`). `__dir__` is `<out>/test/`, so the
 # `require_relative` paths walk up one level to reach `runtime/`, `config/`,
@@ -28,6 +29,11 @@
 # (LocalSecret treats "" as unset) and a secret inherited from the
 # parent process would sign the vectors with a different key.
 ENV["SECRET_KEY_BASE"] = "roundhouse-test-secret"
+# Rails' own test_helper opens with `ENV["RAILS_ENV"] ||= "test"`, and
+# boot.rb parks it as `Rails.env`. Without it a test process reads as
+# development: `Rails.env.test?` gates (campfire's WAL checkpointer
+# `start(enabled: !Rails.env.test?)`) take the serving branch.
+ENV["RAILS_ENV"] = "test" if ENV["RAILS_ENV"].nil?
 require_relative "../runtime/base64"
 require_relative "../runtime/json_impl"
 require_relative "../runtime/db"
@@ -162,9 +168,11 @@ module SchemaSetup
   # ActiveRecord::TestFixtures loads its fixtures once, and each test
   # rolls back.
   def self.reset!
-    Article._adapter_truncate if defined?(Article)
-    Comment._adapter_truncate if defined?(Comment)
-    FixtureLoader.load_all!
+    FixtureLoader.with_foreign_keys_deferred do
+      Article._adapter_truncate if defined?(Article)
+      Comment._adapter_truncate if defined?(Comment)
+      FixtureLoader.load_all!
+    end
   end
 end
 
@@ -201,6 +209,17 @@ module FixtureLoader
   # Filter by `*Fixtures` suffix BEFORE `const_get` so deprecated
   # constants like Ruby 3.4's `SortedSet` (which raises on access via
   # autoload) don't get touched while scanning for fixture modules.
+  # Rails' fixture setup: loaded with referential integrity off, then checked (`verify_foreign_keys_for_fixtures`). Not Db's alone: a framework test runs this helper with no Db loaded.
+  def self.with_foreign_keys_deferred
+    if defined?(Db)
+      Db.without_foreign_keys { yield }
+      Db.check_foreign_keys!
+    else
+      yield
+    end
+    nil
+  end
+
   def self.load_all!
     Object.constants.sort.each do |c|
       next unless c.to_s.end_with?("Fixtures")
@@ -942,18 +961,10 @@ end
 # give the test the settings it reads and restores. A fresh
 # `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
 # a `Rails::Cache`, so it can stand in for `Rails.cache` (whose writer
-# is in runtime/ruby/rails.rb).
-module ActionView
-  class PartialRenderer
-    def self.collection_cache
-      @collection_cache
-    end
-
-    def self.collection_cache=(store)
-      @collection_cache = store
-    end
-  end
-end
+# is in runtime/ruby/rails.rb). The third knob,
+# `ActionView::PartialRenderer.collection_cache`, is the runtime's own
+# (runtime/spinel/action_controller_fragment_caching.rb): the store
+# cached collections really read.
 
 # Rails' test environment does not cache fragments
 # (`config.action_controller.perform_caching = false` in a generated
@@ -1913,6 +1924,7 @@ module RequestDispatch
     # after the body parse. campfire's fetch-metadata test posts
     # `_method: "delete"` cross-site and expects the DELETE route's
     # forgery refusal, not "No route matches POST".
+    wire_method = method
     if method == "POST" && params.is_a?(Hash)
       override = (params[:_method] || params["_method"]).to_s.upcase
       method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
@@ -1933,40 +1945,49 @@ module RequestDispatch
     # check is inline at the call site (not inside stringify_keys) so
     # the helper itself stays strictly typed as `(Hash) -> Hash`.
     #
-    # `stringify_keys(matched.path_params)` (rather than `path_params
-    # .dup`) seeds `merged` as `Hash[String, untyped]` — needed so the
-    # nested-Hash branch of the ternary below has a slot wide enough
-    # to hold a Hash value. `path_params.dup` keeps the StrStrHash
-    # shape, which spinel then refuses to assign a Hash into.
-    merged = stringify_keys(matched.path_params)
+    # `stringify_keys({})` (rather than `path_params.dup` or `{}`)
+    # seeds each Hash below as `Hash[String, untyped]` — needed so the
+    # nested-Hash branch has a slot wide enough to hold a Hash value.
+    # `path_params.dup` keeps the StrStrHash shape, which spinel then
+    # refuses to assign a Hash into.
     # `post url, params: "Hello Bot World!"` — Rails' integration tests
     # take a STRING `params:` as the raw request BODY, not as a
     # parameter hash. campfire's bot endpoint is written that way (a bot
     # POSTs plain text and the controller reads `request.body`), and the
     # harness iterated it: `undefined method 'each' for an instance of
     # String`, every test in the file.
-    # Query-string pairs are parameters too, and they arrive UNDER the
-    # explicit `params:` — Rails merges the request's own parameters
-    # first and lets the caller's hash win on a collision.
     # `CgiIo.parse_form_into` — THE SAME PARSER the production
     # dispatcher uses on `QUERY_STRING` (`parse_request` calls it on
     # exactly this string), so the harness cannot disagree with
     # production about what a query string means. Not `CGI.parse`: Ruby
     # 4.0 no longer ships it, and a hand-rolled split would be a second
     # copy of a table this tree already owns.
-    CgiIo.parse_form_into(query, merged) unless query.empty?
+    from_query = stringify_keys({})
+    CgiIo.parse_form_into(query, from_query) unless query.empty?
+    from_caller = stringify_keys({})
     request_body = +""
     if params.is_a?(String)
       request_body = params.to_s
     else
       params.each do |k, v|
         if v.is_a?(Hash)
-          merged[k.to_s] = stringify_keys(v)
+          from_caller[k.to_s] = stringify_keys(v)
         else
-          merged[k.to_s] = v
+          from_caller[k.to_s] = v
         end
       end
     end
+    # Not one order for every verb: Rack::Test appends a GET's `params:` to its query string, so they win there, while any other verb sends them as the body and Rails' `request_parameters.merge(query_parameters)` lets the query win.
+    merged = stringify_keys({})
+    if wire_method == "GET"
+      from_query.each { |k, v| merged[k] = v }
+      from_caller.each { |k, v| merged[k] = v }
+    else
+      from_caller.each { |k, v| merged[k] = v }
+      from_query.each { |k, v| merged[k] = v }
+    end
+    # Rails' `params.merge!(path_parameters)`: the route's own segments win over both.
+    matched.path_params.each { |k, v| merged[k.to_s] = v }
     controller.params  = merged
     controller.path_parameters = matched.path_params
     controller.session = @__session ||= ActionDispatch::Session.new
@@ -2368,6 +2389,16 @@ module RequestDispatch
     else
       body = selector_or_root.to_s
       selector = content_or_opts
+      content_or_opts = opts
+      opts = nil
+    end
+    # Rails' substitution values: a `?` in an attribute predicate
+    # (`"#row[data-n=?]", value`) takes the argument after the selector,
+    # and the equality test, if any, is the argument after that. Read as
+    # the content string instead, the value was looked for in the
+    # element's text and the predicate matched a literal "?".
+    if selector.to_s.include?("=?]") && content_or_opts.is_a?(String)
+      selector = selector.to_s.sub("=?]", "=\"#{content_or_opts}\"]")
       content_or_opts = opts
       opts = nil
     end

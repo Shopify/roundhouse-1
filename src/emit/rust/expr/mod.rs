@@ -76,7 +76,7 @@ pub(super) fn mark_local_var_ty(name: &str, ty: crate::ty::Ty) {
 /// the same `.clone().unwrap()` Option-unwrap fires for `params =
 /// match_pattern(...)` locals as for function params declared
 /// `Option<T>` in RBS.
-fn var_decl_ty(name: &str) -> Option<crate::ty::Ty> {
+pub(super) fn var_decl_ty(name: &str) -> Option<crate::ty::Ty> {
     param_ty(name).or_else(|| local_var_ty(name))
 }
 
@@ -1138,6 +1138,9 @@ fn emit_expr_inner(e: &Expr) -> String {
                             );
                             let iter_chain = if was_option {
                                 ".iter().flatten()"
+                            } else if matches!(&*r.node, ExprNode::Ivar { .. }) {
+                                // `into_iter` would move the field out of `self`, which the method only borrows.
+                                ".iter().cloned()"
                             } else {
                                 ".into_iter()"
                             };

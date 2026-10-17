@@ -1267,6 +1267,10 @@ fn every_runtime_method_body_concretely_typed() {
     // om160's join aliasing (`alias_referenced_joins` and its reflection
     // reads) lives in the ruby overlay's active_record_relation_ext.rb, outside
     // this gate: back to 1985 (om162; om160 had measured 2013).
+    // Upstream (rubys/roundhouse) tracks its own ceiling of 781 for the same gate;
+    // its additions since the merge-base (errors.rb statement errors, i18n_locale.rb,
+    // transactional saves in connection.rb, mailer headers) are part of the count above
+    // when this file is measured, not added to it. Do not raise the ceiling.
     const CEILING: usize = 1985;
     assert!(
         total_gradual <= CEILING,

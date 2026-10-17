@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only Rails::Application#routes surface.
 #
 # Lobsters' config/application.rb composes absolute URLs via
@@ -48,6 +49,7 @@ module Rails
       # `RouteTable::CONTROLLER_PATHS` holds the app's namespaced ones.
       CONTROLLER_PATHS = {
         active_storage_blobs_redirect: "active_storage/blobs/redirect",
+        active_storage_blobs_proxy: "active_storage/blobs/proxy",
         active_storage_representations_redirect: "active_storage/representations/redirect",
         active_storage_disk: "active_storage/disk",
         active_storage_direct_uploads: "active_storage/direct_uploads"

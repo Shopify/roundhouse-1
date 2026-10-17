@@ -66,7 +66,7 @@
 //! app, one reason each. An entry matches only when every argument is a
 //! plain literal, so a side effect cannot hide in the value.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;
@@ -77,14 +77,14 @@ use crate::span::{SourceFile, Span};
 use crate::vfs::Vfs;
 
 use super::app::{
-    default_locale_line, declares_rails_engine, extract_autoload_lib_ignores,
+    available_locales_line, default_locale_line, declares_rails_engine, fallbacks_line, extract_autoload_lib_ignores,
     extract_autoload_path_roots, extract_config_assignments, extract_config_time_zone,
-    extract_initializer_filters, extract_module_mixins, extract_session_cookie_key,
+    extract_collection_cache_store, extract_config_filter_parameters, extract_initializer_filters, extract_module_mixins, extract_session_cookie_key,
     extract_time_formats, extract_variable_content_type_exclusions,
     extract_video_preview_arguments, extract_video_previewer_replacement,
     extract_vips_loader_policy, forgery_strategy_line, kaminari_default_per_page,
     load_defaults_version, raise_on_missing_line, read_rb_files, wrap_parameters_line,
-    InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
+    FilterParametersLine, InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
 };
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
@@ -138,6 +138,9 @@ struct Probe<'a> {
     /// stays attached and the slice parses on its own).
     text: &'a str,
     node: &'a Node<'a>,
+    /// The whole file: `node`'s offsets index this, not `text`, which
+    /// starts at the statement.
+    src: &'a str,
     /// The initializer's file name (`session_store.rb`).
     file_name: &'a str,
     /// `config.autoload_lib(ignore: …)` directories, before any filtering.
@@ -184,6 +187,12 @@ const RECOGNIZERS: &[Recognizer] = &[
         origins: INIT,
         levels: TOP_HOOK,
         reads: |p| mapper_extension(p),
+    },
+    Recognizer {
+        name: "collection_cache (ActionView::PartialRenderer.collection_cache = Store.reader)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| extract_collection_cache_store(p.text.as_bytes(), PROBE).is_some(),
     },
     Recognizer {
         name: "initializer_filters (X.before_action :m, only:)",
@@ -234,6 +243,15 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| config_lift(p),
     },
     Recognizer {
+        name: "filter_parameters (config.filter_parameters += / = a Symbol or String list)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| {
+            let lines = extract_config_filter_parameters(p.text.as_bytes());
+            !lines.is_empty() && lines.iter().all(|l| matches!(l, FilterParametersLine::Literal { .. }))
+        },
+    },
+    Recognizer {
         name: "active_storage variable_content_types (config.active_storage.variable_content_types -=)",
         origins: INIT,
         levels: ANY,
@@ -275,6 +293,12 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| code_lines(p.text).any(|l| forgery_strategy_line(l).is_some()),
     },
     Recognizer {
+        name: "action_cable origins (config.action_cable.allowed_request_origins / allow_same_origin_as_host / disable_request_forgery_protection =)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| super::action_cable_config::assignment(p.node).is_some(),
+    },
+    Recognizer {
         name: "autoload ignore (initializer that explicitly requires an ignored lib/ directory)",
         origins: INIT,
         levels: TOP,
@@ -309,6 +333,19 @@ const RECOGNIZERS: &[Recognizer] = &[
         origins: APP,
         levels: ANY,
         reads: |p| code_lines(p.text).any(|l| default_locale_line(l).is_some()),
+    },
+    Recognizer {
+        name: "i18n available_locales (config.i18n.available_locales =)",
+        origins: APP,
+        levels: ANY,
+        // A computed list is not read (the locales come from the app's files), so it stays reported.
+        reads: |p| code_lines(p.text).any(|l| matches!(available_locales_line(l), Some(Ok(_)))),
+    },
+    Recognizer {
+        name: "i18n fallbacks (config.i18n.fallbacks =)",
+        origins: APP,
+        levels: ANY,
+        reads: |p| code_lines(p.text).any(|l| fallbacks_line(l, "").is_some()),
     },
     Recognizer {
         name: "i18n raise_on_missing_translations",
@@ -391,10 +428,10 @@ fn mapper_extension(p: &Probe<'_>) -> bool {
         return false;
     }
     let Some(recv) = call.receiver() else { return false };
-    let Some(target) = super::app::constant_text(&recv, p.text) else { return false };
+    let Some(target) = super::app::constant_text(&recv, p.src) else { return false };
     target.trim_start_matches("::") == "ActionDispatch::Routing::Mapper"
         && call.arguments().is_some_and(|a| {
-            a.arguments().iter().any(|arg| super::app::constant_text(&arg, p.text).is_some())
+            a.arguments().iter().any(|arg| super::app::constant_text(&arg, p.src).is_some())
         })
 }
 
@@ -407,7 +444,7 @@ fn content_helper_assignment(p: &Probe<'_>) -> bool {
         return false;
     }
     let Some(recv) = call.receiver() else { return false };
-    if super::app::constant_text(&recv, p.text).as_deref() != Some("ActionText::ContentHelper") {
+    if super::app::constant_text(&recv, p.src).as_deref() != Some("ActionText::ContentHelper") {
         return false;
     }
     call.arguments().is_some_and(|a| a.arguments().iter().count() == 1)
@@ -417,7 +454,6 @@ fn content_helper_assignment(p: &Probe<'_>) -> bool {
 /// inert for the COMPILED app: ingest never reads it, and the thing it
 /// configures does not exist in the emitted program.
 pub const INERT: &[(&str, &str)] = &[
-    ("config.filter_parameters", "redacts parameter values in Rails' request log lines; the emitted runtime logs no parameters, and its ParameterFilter (active_support_reporters.rb) reads only `Rails.event` payloads, not this setting"),
     ("config.action_dispatch.cookies_serializer", "selects how Rails encodes cookie payloads on the wire (:json / :marshal); the emitted runtime owns one session codec and never reads the setting"),
     ("config.assets.version", "salts the asset digest Sprockets/Propshaft compute; the emitted app serves its own assets and does not read it"),
     ("config.generators", "consulted only by `rails generate`, which is not part of a compiled app (a block here only calls `g.<option>`)"),
@@ -634,6 +670,7 @@ fn judge(origin: Origin, st: &Stmt<'_>, file_name: &str, lib_ignores: &[String],
     let probe = Probe {
         text: st.text,
         node: &st.node,
+        src,
         file_name,
         lib_ignores,
     };

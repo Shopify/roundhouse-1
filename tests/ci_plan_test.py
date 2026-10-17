@@ -32,7 +32,8 @@ def git_repository():
     ):
         env.pop(name, None)
     with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
+        # Resolved: macOS's temp dir is a symlink, and git reports the real path.
+        root = Path(directory).resolve()
 
         def git(*args):
             return (
@@ -90,6 +91,7 @@ class Routing(unittest.TestCase):
             ci.BASE,
             [
                 "generate-fixture",
+                "unit-build",
                 "unit",
                 "build-roundhouse",
                 "store-check",
@@ -224,6 +226,7 @@ class Routing(unittest.TestCase):
         needs = {
             "plan": {"result": "success"},
             "generate-fixture": {"result": "success"},
+            "unit-build": {"result": "success"},
             "unit": {"result": "success"},
             "build-roundhouse": {"result": "success"},
             "store-check": {"result": "success"},
@@ -996,8 +999,10 @@ class Results(unittest.TestCase):
                         "default": "success",
                         "minor-gc": "success",
                         "verify-gen": "success",
-                        "parity": "success",
-                        "rest": "success",
+                        "shard-0": "success",
+                        "shard-1": "success",
+                        "shard-2": "success",
+                        "shard-3": "success",
                     },
                 }
                 for j in plan["jobs"]
@@ -1040,7 +1045,7 @@ class Results(unittest.TestCase):
 
     def test_speculative_success_cannot_hide_unit_or_compiler_failure(self):
         plan = ci.select([])
-        for job in ["unit", "build-roundhouse"]:
+        for job in ["unit-build", "unit", "build-roundhouse"]:
             for result in ["failure", "cancelled", "skipped", None]:
                 with self.subTest(job=job, result=result):
                     needs = self.needs(plan)
@@ -1105,11 +1110,11 @@ class Results(unittest.TestCase):
                     self.assertEqual(ci.check_results(plan, needs), ([], False))
 
     def test_each_spinel_toolchain_shard_must_actually_pass_for_completion(self):
-        # The suite is a two-shard matrix; each shard writes its own output
+        # The suite is a four-shard matrix; each shard writes its own output
         # key, so one shard's success cannot stand in for the other's.
         plan = ci.select([], spinel_lane=True)
         self.assertIn("spinel-toolchain", plan["jobs"])
-        for shard in ["parity", "rest"]:
+        for shard in ["shard-0", "shard-1", "shard-2", "shard-3"]:
             for status in ["failure", "cancelled", "", None]:
                 with self.subTest(shard=shard, status=status):
                     needs = self.needs(plan)
@@ -1119,6 +1124,139 @@ class Results(unittest.TestCase):
                     else:
                         outputs[shard] = status
                     self.assertEqual(ci.check_results(plan, needs), ([], False))
+
+    def test_each_spinel_framework_shard_must_actually_pass_for_completion(self):
+        plan = ci.select([], spinel_lane=True)
+        self.assertEqual(len(plan["spinel_framework_shards"]), 4)
+        for shard in ["shard-0", "shard-1", "shard-2", "shard-3"]:
+            for status in ["failure", "cancelled", "", None]:
+                with self.subTest(shard=shard, status=status):
+                    needs = self.needs(plan)
+                    outputs = needs["spinel-framework"]["outputs"]
+                    if status is None:
+                        del outputs[shard]
+                    else:
+                        outputs[shard] = status
+                    self.assertEqual(ci.check_results(plan, needs), ([], False))
+
+    def test_spinel_toolchain_shards_cover_each_test_once_and_split_the_heavy_ones(self):
+        tests = [f"t{i:02}" for i in range(50)] + list(ci.SPINEL_TOOLCHAIN_SECONDS)
+        shards = [ci.spinel_toolchain_shard(tests, k) for k in range(ci.SPINEL_TOOLCHAIN_SHARDS)]
+        self.assertEqual(sorted(t for s in shards for t in s), sorted(tests))
+        self.assertTrue(all(s == sorted(s) for s in shards))
+        heavy = [sum(t in ci.SPINEL_TOOLCHAIN_SECONDS for t in s) for s in shards]
+        self.assertEqual(max(heavy), 1)
+        loads = [
+            sum(ci.SPINEL_TOOLCHAIN_SECONDS.get(t, ci.SPINEL_TOOLCHAIN_DEFAULT_SECONDS) for t in s)
+            for s in shards
+        ]
+        loads[-1] += ci.SPINEL_TOOLCHAIN_TAIL_SECONDS * ci.SPINEL_TOOLCHAIN_THREADS
+        self.assertLess(max(loads) - min(loads), max(ci.SPINEL_TOOLCHAIN_SECONDS.values()))
+
+    def test_toolchain_shard_prints_nothing_for_an_empty_selection(self):
+        out = subprocess.run(
+            ["python3", spec.origin, "toolchain-shard", "--shard", "0"],
+            input="", capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(out, "")
+
+    def test_recorded_seconds_balance_shards_and_the_tables_cover_the_rest(self):
+        timings = ci.load_spinel_timings(json.dumps({
+            "toolchain": {"t00": 900, "t01": "slow", "t02": -1, "t03": True, "t04": float("inf"), "t05": 10**1000, ci.SPINEL_TOOLCHAIN_TAIL: 1},
+            "framework": {"spinel_pg_db": 2000},
+            "other": {"x": 1},
+        }))
+        self.assertEqual(timings, {"toolchain": {"t00": 900, ci.SPINEL_TOOLCHAIN_TAIL: 1}, "framework": {"spinel_pg_db": 2000}})
+        self.assertEqual(ci.spinel_toolchain_seconds("t00", timings), 900)
+        self.assertEqual(ci.spinel_toolchain_seconds("t01", timings), ci.SPINEL_TOOLCHAIN_DEFAULT_SECONDS)
+        self.assertEqual(
+            ci.spinel_toolchain_seconds("real_blog_spinel_tests_pass", timings),
+            ci.SPINEL_TOOLCHAIN_SECONDS["real_blog_spinel_tests_pass"],
+        )
+        tests = [f"t{i:02}" for i in range(12)]
+        shards = [ci.spinel_toolchain_shard(tests, k, timings=timings) for k in range(4)]
+        self.assertEqual(sorted(t for s in shards for t in s), tests)
+        self.assertIn(["t00"], shards)
+        alone = [s for s in ci.spinel_framework_shards(ci.SPINEL_TESTS, timings=timings) if "spinel_pg_db" in s["tests"]]
+        self.assertEqual(alone[0]["tests"], ["spinel_pg_db"])
+        for raw in ["", "not json", "[]", '{"toolchain": []}']:
+            with self.subTest(raw=raw):
+                self.assertEqual(ci.load_spinel_timings(raw), {})
+                self.assertEqual(
+                    ci.spinel_toolchain_shard(tests, 0, timings=ci.load_spinel_timings(raw)),
+                    ci.spinel_toolchain_shard(tests, 0),
+                )
+
+    def test_merge_averages_passing_records_into_the_last_seconds(self):
+        merged = ci.merge_timings(
+            {"toolchain": {"a": 100, "b": 50}},
+            [
+                {"kind": "toolchain", "name": "a", "seconds": 200, "ok": True},
+                {"kind": "toolchain", "name": "b", "seconds": 5, "ok": False},
+                {"kind": "toolchain", "name": "c", "seconds": 0, "ok": True},
+                {"kind": "framework", "name": "d", "seconds": 30, "ok": True},
+                {"kind": "elsewhere", "name": "e", "seconds": 30, "ok": True},
+                {"kind": "framework", "name": "f", "seconds": "30", "ok": True},
+                {"kind": "framework", "name": "g", "seconds": float("nan"), "ok": True},
+                {"kind": [], "name": "h", "seconds": 30, "ok": True},
+            ],
+        )
+        self.assertEqual(merged, {"toolchain": {"a": 150, "b": 50}, "framework": {"d": 30}})
+
+    def test_timing_commands_record_runs_and_keep_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "CI_SPINEL_TIMINGS_OUT": f"{tmp}/runs/toolchain-0.jsonl"}
+            run = subprocess.run(
+                ["python3", spec.origin, "run-tests", "--kind", "toolchain", "--parallel", "2",
+                 "--", "sh", "-c", '[ "$2" != b ]', "sh", "--exact"],
+                input="a\nb\n", capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(run.returncode, 1)
+            self.assertIn("::error::b failed", run.stdout)
+            timed = subprocess.run(
+                ["python3", spec.origin, "timed", "--kind", "toolchain", "--name", "tail",
+                 "--", "sh", "-c", "sleep 1"],
+                env=env,
+            )
+            self.assertEqual(timed.returncode, 0)
+            records = [json.loads(line) for line in Path(env["CI_SPINEL_TIMINGS_OUT"]).read_text().splitlines()]
+            self.assertEqual(
+                sorted((r["name"], r["ok"]) for r in records),
+                [("a", True), ("b", False), ("tail", True)],
+            )
+            self.assertTrue(all(r["seconds"] >= 1 for r in records))
+            Path(f"{tmp}/previous.json").write_text('{"toolchain": {"tail": 3}}')
+            for previous in [f"{tmp}/previous.json", f"{tmp}/missing.json"]:
+                with self.subTest(previous=previous):
+                    subprocess.run(
+                        ["python3", spec.origin, "merge-timings", "--previous", previous,
+                         "--records", f"{tmp}/runs", "--out", f"{tmp}/out/merged.json"],
+                        check=True, capture_output=True,
+                    )
+                    merged = json.loads(Path(f"{tmp}/out/merged.json").read_text())
+                    self.assertEqual(merged["toolchain"]["tail"], 2 if previous.endswith("previous.json") else 1)
+
+    def test_toolchain_tests_run_outside_cargo_with_its_stack_size(self):
+        import tomllib
+        root = Path(__file__).parents[1]
+        stack = tomllib.loads((root / ".cargo/config.toml").read_text())["env"]["RUST_MIN_STACK"]
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        job = re.search(r"(?ms)^  spinel-toolchain:\n(.*?)(?=^  [\w-]+:|\Z)", workflow).group(1)
+        self.assertIn("run-tests --kind toolchain", job)
+        self.assertIn(f'RUST_MIN_STACK: "{stack}"', job)
+
+    def test_spinel_framework_shards_cover_each_selected_suite_once(self):
+        shards = ci.spinel_framework_shards(ci.SPINEL_TESTS)
+        self.assertEqual([s["shard"] for s in shards], [0, 1, 2, 3])
+        self.assertEqual(
+            sorted(t for s in shards for t in s["tests"]), sorted(ci.SPINEL_TESTS)
+        )
+        loads = [sum(map(ci.spinel_test_seconds, s["tests"])) for s in shards]
+        self.assertLess(max(loads) - min(loads), max(ci.SPINEL_TEST_SECONDS.values()))
+        self.assertEqual(
+            ci.spinel_framework_shards(["spinel_pg_db"]),
+            [{"shard": 0, "tests": ["spinel_pg_db"]}],
+        )
 
     def test_advisory_ledger_extras_never_claim_complete_under_coe(self):
         # continue-on-error makes needs.*.result=success even when a matrix

@@ -511,6 +511,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // Date/DateTime/Time column accessors coerce to/from real `Time`
     // (no-op for apps with no temporal columns).
     library::apply_datetime_lowering(&mut lcs, app);
+    library::apply_rich_text_content_memo(&mut lcs);
+    // `ActionText::RichText belongs_to :record, touch: true`: a saved
+    // rich text touches the record it was read through.
+    library::apply_rich_text_record_touch(&mut lcs, app);
     // has_secure_password (authenticate + plaintext accessors, bcrypt
     // contract) and typed_store virtual-attribute accessors are
     // synthesized by the shared model lowering
@@ -1369,6 +1373,9 @@ pub fn emit_with_assertions(
             // The CRuby / JRuby trees' has_many readers keep their
             // target (`library::apply_collection_memoization`).
             expr::native_keywords(),
+            // An association constructor hands its owner object to the
+            // automatic inverse.
+            true,
             &answered,
         );
         // A test body writes the same relation chains an app body does —
@@ -1404,6 +1411,14 @@ pub fn emit_with_assertions(
             // into a seeded Relation. See the module.
             crate::lower::records_to_relation_arg::rewrite_test_classes(&mut test_lcs, app);
             library::apply_scope_lowering(&mut test_lcs, app);
+            // A route-helper argument as the helper's SIGNATURE takes
+            // it, as app bodies get it: a String-typed segment (a slug,
+            // or one typed by its `scope defaults:` text) takes
+            // `id.to_s`, not the Integer `project_route_helper_ids`
+            // left. campfire's `user_profile_url(users(:jason))` reached
+            // `?String user_id` as an Integer, and Spinel refused the
+            // contradicted seed.
+            library::apply_route_param_lowering(&mut test_lcs, app);
             // `1.minute.ago` in a class a test file carries (campfire's
             // `PushServiceTestHelper.sign`), as library classes get it.
             library::apply_duration_lowering(&mut test_lcs, app);
@@ -2000,8 +2015,13 @@ fn render_autorun_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[
         // that fails to load is a per-test error in Rails. Outside
         // the guard it would abort the file and hide every test
         // behind it — the exact failure mode this shim exists to end.
-        for line in reset_lines {
-            writeln!(s, "  {line}").unwrap();
+        // Rails' fixture setup: loaded with referential integrity off, then checked. Not around an empty list: a framework test has nothing to reset and loads neither Db nor the helper.
+        if !reset_lines.is_empty() {
+            writeln!(s, "  FixtureLoader.with_foreign_keys_deferred do").unwrap();
+            for line in reset_lines {
+                writeln!(s, "    {line}").unwrap();
+            }
+            writeln!(s, "  end").unwrap();
         }
         writeln!(s, "  __t.setup").unwrap();
         writeln!(s, "  __t.{tm}").unwrap();
@@ -2563,8 +2583,8 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], reset: &TestReset, minitest:
 
     // (2) Per-test isolation. `_adapter_truncate` exists only on models
     // with a backing schema table; the caller applies that gate.
-    const TRUNCATE_BLOCK: &str = "    Article._adapter_truncate if defined?(Article)
-    Comment._adapter_truncate if defined?(Comment)";
+    const TRUNCATE_BLOCK: &str = "      Article._adapter_truncate if defined?(Article)
+      Comment._adapter_truncate if defined?(Comment)";
 
     // (3) Fixture loading — spinel's AOT model has no runtime constant
     // table, so the scan is materialized at emit time.
@@ -2631,18 +2651,18 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], reset: &TestReset, minitest:
     match reset {
         TestReset::Truncate(truncate_lines) => {
             let truncate = if truncate_lines.is_empty() {
-                String::from("    # no table-backed models")
+                String::from("      # no table-backed models")
             } else {
                 truncate_lines
                     .iter()
-                    .map(|line| format!("    {line}"))
+                    .map(|line| format!("      {line}"))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
             out = out.replace(TRUNCATE_BLOCK, &truncate);
         }
         TestReset::FixtureSets(_) => {
-            let reset_body = format!("{TRUNCATE_BLOCK}\n    FixtureLoader.load_all!\n");
+            let reset_body = format!("{TRUNCATE_BLOCK}\n      FixtureLoader.load_all!\n");
             debug_assert!(
                 out.contains(&reset_body),
                 "runtime/spinel/test/test_helper.rb SchemaSetup.reset! body \
@@ -2650,11 +2670,11 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], reset: &TestReset, minitest:
             );
             out = out.replace(
                 &reset_body,
-                "    # The PostgreSQL tree truncates and reloads nothing per test:\n\
-                 \x20   # ActiveRecord::TestFixtures#setup_fixtures (runtime/\n\
-                 \x20   # active_record_test_fixtures.rb) loads FixtureLoader.fixture_sets\n\
-                 \x20   # once per process, before the test's transaction, which rolls\n\
-                 \x20   # back after it.\n",
+                "      # The PostgreSQL tree truncates and reloads nothing per test:\n\
+                 \x20     # ActiveRecord::TestFixtures#setup_fixtures (runtime/\n\
+                 \x20     # active_record_test_fixtures.rb) loads FixtureLoader.fixture_sets\n\
+                 \x20     # once per process, before the test's transaction, which rolls\n\
+                 \x20     # back after it.\n",
             );
         }
     }

@@ -50,6 +50,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods: std::mem::take(&mut colored),
         nullable_columns: Vec::new(),
         origin: None,
@@ -810,7 +811,8 @@ fn walk_collect_ivar_reads(
             walk_collect_ivar_reads(body, written, order, observed);
         }
         ExprNode::Return { value } => walk_collect_ivar_reads(value, written, order, observed),
-        _ => {}
+        // Not only the shapes above: a read inside a local's value (`article = Article.find(@params[:id])`) is a read too.
+        _ => e.node.for_each_child(&mut |child| walk_collect_ivar_reads(child, written, order, observed)),
     }
 }
 

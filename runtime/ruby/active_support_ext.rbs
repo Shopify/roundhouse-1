@@ -4,6 +4,10 @@ module ActiveSupport
     def self.decode: (String text) -> untyped
     def self.jsonable: (untyped value) -> untyped
     def self.time_json: (::Time t) -> String
+    def self.time_fragment: (::Time? t) -> String
+    def self.written: (String text) -> String
+    def self.utc_zone?: () -> bool
+    UTC_ZONE_NAMES: Array[String]
   end
   def self.deep_dup: (untyped value) -> untyped
   def self.blank?: (untyped value) -> bool
@@ -11,8 +15,11 @@ module ActiveSupport
   def self.present?: (untyped value) -> bool
   def self.to_param: (untyped value) -> String
 
-  def self.to_query: (Hash[String, Roundhouse::ParamValue] value) -> String
-  def self.query_pairs: (Hash[String, Roundhouse::ParamValue] hash, String namespace) -> String
+  # Any key, as Rails' `Hash#to_query` (each is `to_s`'d): a literal
+  # `{ page: 2, q: params[:q] }.to_query` passes Symbols, and spinel
+  # refuses a Symbol-keyed Hash against a declared `Hash[String, _]`.
+  def self.to_query: (Hash[untyped, Roundhouse::ParamValue] value) -> String
+  def self.query_pairs: (Hash[untyped, Roundhouse::ParamValue] hash, String namespace) -> String
   def self.query_escape: (String text) -> String
   def self.query_value: (String name, Roundhouse::ParamValue item) -> String
   def self.presence: (untyped value) -> untyped
@@ -24,6 +31,10 @@ module ActiveSupport
   def self.errors_to_hash: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_messages: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_attribute_names: (Array[ActiveRecord::ErrorDetail] details) -> Array[Symbol]
+  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute) -> Array[String]?
+  def self.errors_details: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_import: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, ActiveRecord::ErrorDetail error, String? attribute, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
 
   # Rails' name for "this signed value does not verify" — see the .rb.
   class MessageVerifier
@@ -51,6 +62,7 @@ module ActiveSupport
   def self.cast_boolean: (untyped value) -> bool?
   def self.squish: (String text) -> String
   def self.squish!: (String text) -> String
+  def self.truncate: (String text, Integer truncate_to, String? omission, String? separator) -> String
   # `untyped`, and this one was learned the hard way: it said
   # `Array[untyped]` for a day, on the reasoning that the only receiver
   # is a channel's `streams`, a plain Array. It is — an
@@ -127,6 +139,8 @@ module ActiveSupport
   end
   def self.parse_tz_rule: (String spec) -> Array[Integer]
   def self.posix_seconds: (String text) -> Integer
+  DEFAULT_ZONE: Array[TimeZoneData]
+  def self.set_default_zone: (String name) -> nil
   def self.current_zone: () -> TimeZoneData?
   def self.use_zone: (String? zone) { () -> untyped } -> untyped
   def self.present: (Time t) -> Time

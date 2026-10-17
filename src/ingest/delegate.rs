@@ -239,6 +239,7 @@ fn lower_model_delegates(
     };
     let declarations = calls.clone();
     let mut lc = LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),

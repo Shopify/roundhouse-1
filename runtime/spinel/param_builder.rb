@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' request-parameter builder, for the spinel lane: a query string
 # or urlencoded body into the nested params a controller reads.
 #

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Spinel-subset temporal intrinsics: ActiveSupport.parse_db_time /
 # db_now. Sibling of the CRuby/JRuby overlay's
 # ruby_overlay/runtime/active_support_time_parsing.rb, which shadows
@@ -22,27 +23,6 @@
 module ActiveSupport
   # Date-only parse/format live in `active_support_date_parsing.rb`,
   # loaded only when `app_uses_date` (matz/spinel#7334).
-
-  # Rails zone name → IANA identifier. TWIN of the constant in the
-  # CRuby/JRuby overlay's sibling file, which shadows this whole file on
-  # those trees — the two must agree, so extend both together. Names not
-  # listed pass through unchanged, since a valid IANA string works as-is
-  # in TZ. Consumed by main.rb's boot-time ENV["TZ"] pin.
-  RAILS_TZ_TO_IANA = {
-    "UTC" => "UTC",
-    "Eastern Time (US & Canada)" => "America/New_York",
-    "Central Time (US & Canada)" => "America/Chicago",
-    "Mountain Time (US & Canada)" => "America/Denver",
-    "Pacific Time (US & Canada)" => "America/Los_Angeles",
-    "Arizona" => "America/Phoenix",
-    "Hawaii" => "Pacific/Honolulu",
-    "Alaska" => "America/Anchorage",
-    "London" => "Europe/London",
-    "Paris" => "Europe/Paris",
-    "Berlin" => "Europe/Berlin",
-    "Tokyo" => "Asia/Tokyo",
-    "Sydney" => "Australia/Sydney",
-  }.freeze
 
   # ---- THE TEST CLOCK ------------------------------------------------
   #
@@ -103,8 +83,9 @@ module ActiveSupport
 
   # Hydrate the stored UTC instant, then land it in the app's zone —
   # Rails presents every AR temporal value in `config.time_zone`
-  # REGARDLESS of the host's zone, and main.rb has pinned ENV["TZ"] to
-  # that zone before any render, so `getlocal` resolves against it.
+  # REGARDLESS of the host's zone; `ActiveSupport.present` lands it in
+  # that zone, which the boot sets as the runtime's default
+  # (`ActiveSupport.set_default_zone`).
   # Doing the shift HERE rather than at each render site is what makes
   # strftime, iso8601 and pubDate agree without every call site knowing
   # about zones — the same seam the CRuby overlay's twin uses.

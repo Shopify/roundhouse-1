@@ -148,13 +148,15 @@ fn transpile_inner(json_in: &str) -> String {
         analyzer.analyze(&mut app);
         Vec::new()
     } else {
-        analyzer.analyze(&mut app);
+        roundhouse::lower::i18n_translate::with_plan_cache(|| {
+            analyzer.analyze(&mut app);
 
-        // Same post-analyze shared lowerings as the CLI transpile driver
-        // (bin/roundhouse): the playground emits from the same IR the CLI
-        // does. Residue joins the diagnostics below; synthetic spans drop
-        // out in the existing filter.
-        roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry())
+            // Same post-analyze shared lowerings as the CLI transpile driver
+            // (bin/roundhouse): the playground emits from the same IR the CLI
+            // does. Residue joins the diagnostics below; synthetic spans drop
+            // out in the existing filter.
+            roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry())
+        })
     };
 
     // Analyzer diagnostics + gap-attributed coverage notes (Info severity),

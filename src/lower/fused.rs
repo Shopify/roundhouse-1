@@ -332,7 +332,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
         super::route_url_options::bare_url_helper_receivers(app, &helpers);
         super::route_url_options::helper_path_params(app)
     };
-    let enum_map = super::enum_symbols::Maps::of(app);
+    let enum_map = super::enum_symbols::enum_columns(app);
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);
@@ -403,7 +403,7 @@ fn rewrite_mid_node(
     helpers: &crate::det::HashSet<String>,
     path_params: &crate::det::HashMap<String, Vec<String>>,
     position_path: bool,
-    enum_map: &super::enum_symbols::Maps,
+    enum_map: &super::enum_symbols::EnumMap,
     json_map: &super::has_json::HasJsonColumns,
     sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
@@ -425,7 +425,7 @@ fn rewrite_mid_node(
         }
     }
     if !enum_map.is_empty() {
-        super::enum_symbols::rewrite_node(e, enum_map);
+        super::enum_symbols::rewrite_node(e, enum_map, enclosing);
     }
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);

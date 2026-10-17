@@ -82,22 +82,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `errors[:title]` returns an Array<String> of messages for that attribute.
         ("[]", str_arr()),
         ("messages_for", str_arr()),
-        // `details`: each attribute's Errors as `{error: type, **options}`,
-        // which the accumulator keeps only where the push recorded them
-        // (runtime/spinel/active_model_errors.rb); recorded and refused
-        // as `attribute_names` is.
-        (
-            "details",
-            Ty::Hash {
-                key: std::sync::Arc::new(Ty::Sym),
-                value: std::sync::Arc::new(Ty::Array {
-                    elem: std::sync::Arc::new(Ty::Hash {
-                        key: std::sync::Arc::new(Ty::Sym),
-                        value: std::sync::Arc::new(Ty::Untyped),
-                    }),
-                }),
-            },
-        ),
+        ("details", crate::lower::errors_index::details_ty()),
         ("messages", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),
         // `.each` yields an Error — registered via block_params_for below.
         ("each", error_ty.clone()),
@@ -198,7 +183,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("full_message", Ty::Str),
         ("message", Ty::Str),
         ("attribute", Ty::Sym),
-        ("type", Ty::Sym),
+        ("type", Ty::Union { variants: vec![Ty::Sym, Ty::Str].into() }),
         // The type as added (a Symbol, or the message added as text),
         // its options, and `details` (`{error: raw_type, **options}`):
         // runtime/spinel/active_model_errors.rb's Error answers them
@@ -216,4 +201,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ClassId(Symbol::from("ActiveModel::Error")),
         error_cls,
     );
+    // Not a Hash: only its `[:error]` is grounded, which analyze types where it is asked.
+    classes.insert(ClassId(Symbol::from(crate::lower::errors_index::DETAILS_ENTRY)), ClassInfo::default());
 }

@@ -1236,14 +1236,17 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
     // hand-written `RhDateTime.parse` (runtime/elixir/v2/rh_datetime.ex),
     // not a transpiled `ActiveSupport` module (no such unit exists).
     // `ActiveRecord::ErrorDetail` (runtime/ruby/active_record/base.rb) is a map here: the Elixir model keeps no transpiled Base.
-    if method == "new" && args.len() == 3 {
+    if method == "new" && args.len() == 6 {
         if let Some(ExprNode::Const { path }) = recv.map(|r| &*r.node) {
             if path.iter().map(|s| s.as_str()).eq(["ActiveRecord", "ErrorDetail"]) {
                 return format!(
-                    "%{{attribute: {}, kind: {}, message: {}}}",
+                    "%{{attribute: {}, kind: {}, message: {}, full_message: {}, symbolic: {}, optionless: {}}}",
                     emit_expr(&args[0]),
                     emit_expr(&args[1]),
                     emit_expr(&args[2]),
+                    emit_expr(&args[3]),
+                    emit_expr(&args[4]),
+                    emit_expr(&args[5]),
                 );
             }
         }
@@ -1546,11 +1549,24 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 _ if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Float)) => {
                     format!(":math.fmod({ls}, {rs})")
                 }
+                // Not `rem/2` for two Integers: it takes the dividend's sign, where Ruby's takes the divisor's.
+                _ if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Int))
+                    && matches!(arg.ty.as_ref(), Some(crate::ty::Ty::Int)) =>
+                {
+                    format!("Integer.mod({ls}, {rs})")
+                }
                 _ => format!("rem({ls}, {rs})"),
             };
         }
         if method == "**" {
             return format!(":math.pow({}, {})", emit_expr(r), emit_expr(arg));
+        }
+        // Not `div/2`: it truncates toward zero, where Ruby's Integer#/ floors.
+        if method == "/"
+            && matches!(r.ty.as_ref(), Some(crate::ty::Ty::Int))
+            && matches!(arg.ty.as_ref(), Some(crate::ty::Ty::Int))
+        {
+            return format!("Integer.floor_div({}, {})", emit_expr(r), emit_expr(arg));
         }
         if is_infix(method) {
             return format!("{} {method} {}", emit_expr(r), emit_expr(arg));
@@ -2623,6 +2639,7 @@ mod tests {
                 parent: None,
                 parent_span: Default::default(),
                 includes: vec![],
+                include_spans: Vec::new(),
                 methods: vec![],
                 nullable_columns: Vec::new(),
                 origin: None,
@@ -2753,6 +2770,7 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![render, resolve],
             nullable_columns: Vec::new(),
             origin: None,
@@ -2995,6 +3013,7 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![truncate],
             nullable_columns: Vec::new(),
             origin: None,
@@ -3351,7 +3370,7 @@ fn emit_string_interp(parts: &[InterpPart]) -> String {
 /// characters json_builder's `ESCAPES` keys carry as raw bytes
 /// (backspace `\b` 0x08, form feed `\f` 0x0c, …). Other control chars
 /// fall back to `\xHH`.
-fn push_escaped(out: &mut String, value: &str) {
+pub(super) fn push_escaped(out: &mut String, value: &str) {
     for c in value.chars() {
         match c {
             '"' => out.push_str("\\\""),

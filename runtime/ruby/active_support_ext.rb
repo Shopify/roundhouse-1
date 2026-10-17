@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveSupport blank-predicate reopen — ruby-family surface only
 # (inflector_ext.rb pattern): shipped to the scaffold trees via the
 # project.rs stems list, NOT in the runtime_loader tables, so the
@@ -104,8 +105,28 @@ module ActiveSupport
     # taken to be UTC (Rails writes `+00:00` for a non-UTC zone at offset
     # zero, such as London in winter).
     def self.time_json(t)
-      zone = t.utc_offset == 0 ? "Z" : t.strftime("%:z")
+      zone = t.zone == "UTC" || (t.utc_offset == 0 && ActiveSupport::JSON.utc_zone?) ? "Z" : t.strftime("%:z")
       t.strftime("%Y-%m-%dT%H:%M:%S") + format(".%03d", t.usec / 1000) + zone
+    end
+
+    # Not inlined at the call site: a strict target has built no written-down encoder, and this ruby-family/spinel seam is what reports it unsupported there.
+    def self.written(text)
+      text
+    end
+
+    # Not offset zero alone: Rails writes `Z` only when the zone is UTC itself, and `+00:00` for London in winter.
+    def self.utc_zone?
+      zone = ActiveSupport.current_zone
+      name = zone.nil? ? Rails.application.config_time_zone : zone.name
+      UTC_ZONE_NAMES.include?(name)
+    end
+
+    UTC_ZONE_NAMES = ["UTC", "Etc/UTC", "Universal", "Etc/Universal", "Zulu", "Etc/Zulu", "UCT", "Etc/UCT"].freeze
+
+    # Not `time_json` at the call site: a nil Time is `null`, and a written-down encoder would otherwise read its value twice.
+    def self.time_fragment(t)
+      return "null" if t.nil?
+      "\"" + ActiveSupport::JSON.time_json(t) + "\""
     end
   end
 
@@ -297,6 +318,59 @@ module ActiveSupport
     out.freeze
   end
 
+  # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
+  def self.errors_delete(errors, details, attribute)
+    deleted = []
+    i = details.length - 1
+    while i >= 0
+      if details[i].attribute == attribute
+        deleted.unshift(details[i].message)
+        details.delete_at(i)
+        errors.delete_at(i)
+      end
+      i -= 1
+    end
+    deleted.empty? ? nil : deleted
+  end
+
+  # Rails' `details`: each attribute's errors, in the order of its first
+  # one. `lower::errors_index` reads an entry's `[:error]` as the type.
+  def self.errors_details(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out.default = [].freeze
+    out.freeze
+  end
+
+  # Rails' `errors.import(error, attribute:)`: the error under
+  # `attribute` (its own when nil), its full message named as the
+  # importing model names that attribute. `names` is the importing
+  # model's translated attribute names, folded from the locale; any other
+  # is humanized, as `human_attribute_name` falls back to.
+  def self.errors_import(errors, details, error, attribute, names, before, between, after)
+    name = attribute.nil? ? error.attribute : attribute
+    full = error.message
+    unless name == "base"
+      human = names.key?(name) ? names[name].to_s : humanize(name.tr(".", "_"))
+      full = before + human + between + error.message + after
+    end
+    errors << full
+    details << ActiveRecord::ErrorDetail.new(name, error.kind, error.message, full, error.symbolic, error.optionless)
+    details
+  end
+
+  # Rails' `errors.merge!(other)`: each of the other record's errors
+  # imported under its own attribute, and nothing when it is these errors.
+  def self.errors_merge(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
+    others
+  end
+
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed
   # value that does not verify raises. Rails hangs it off the verifier
   # class, and the NAME is the whole point: a controller that rescues it
@@ -394,6 +468,31 @@ module ActiveSupport
     text.gsub!(/[[:space:]]+/, " ")
     text.strip!
     text
+  end
+
+  # AS `String#truncate(truncate_to, omission: "...", separator: nil)`
+  # (core_ext/string/filters.rb), with the options positional: the
+  # result is at most `truncate_to` characters including the omission,
+  # unless the omission alone is longer, in which case it is the
+  # omission. A separator cuts at its last occurrence that still leaves
+  # room for the omission; when it does not occur there, the cut is
+  # where it would have been without one. `nil` for either option means
+  # what Rails' `options[:omission] || "..."` and `if
+  # options[:separator]` make it mean. A String reopen the transpiled
+  # runtimes cannot host - same home and same rule as `squish` above.
+  def self.truncate(text, truncate_to, omission, separator)
+    return text.dup unless text.length > truncate_to
+
+    mark = omission || "..."
+    room = truncate_to - mark.length
+    return mark.dup if room <= 0
+
+    stop = room
+    if separator
+      found = text.rindex(separator, room)
+      stop = found if found
+    end
+    text[0, stop] + mark
   end
 
   # AS `Enumerable#sole`: THE one element, and a raise for any other
@@ -980,8 +1079,32 @@ module ActiveSupport
     sign * (h * 3600 + mi * 60 + s)
   end
 
+  # The app's `config.time_zone` (Rails' default `Time.zone`), set once at
+  # boot by `set_default_zone`; empty until then, which presents in the
+  # host's zone. Rails keeps the process zone alone: `Time.now` is the
+  # host's local time and only `Time.current` and Active Record values are
+  # in the configured zone. The boot used to pin `ENV["TZ"]` to the
+  # configured zone instead, which made `Time.now` the configured zone
+  # too (an app that names a file after `Time.now.strftime` on a Warsaw
+  # host gets the Warsaw time from Rails).
+  DEFAULT_ZONE = []
+
+  # UTC needs no tzdata: a zone with no transitions and offset 0, so a
+  # container without /usr/share/zoneinfo still boots on Rails' default.
+  def self.set_default_zone(name)
+    iana = ZONE_NAMES[name.to_s] || name.to_s
+    DEFAULT_ZONE.clear
+    if iana == "UTC" || iana == "Etc/UTC" || iana == "Etc/UCT" || iana == "GMT" || iana == "Etc/GMT"
+      DEFAULT_ZONE << TimeZoneData.new("UTC", [], [], 0, [], [])
+    else
+      DEFAULT_ZONE << find_zone!(name)
+    end
+    nil
+  end
+
   def self.current_zone
-    Thread.current[:rh_time_zone]
+    zone = Thread.current[:rh_time_zone]
+    zone.nil? ? DEFAULT_ZONE[0] : zone
   end
 
   def self.use_zone(zone)

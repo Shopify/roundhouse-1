@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Pay — first-slice surface for Jumpstart Pro / pay gem apps.
 #
 # Roundhouse models the exception classes apps rescue (`Pay::Error`,

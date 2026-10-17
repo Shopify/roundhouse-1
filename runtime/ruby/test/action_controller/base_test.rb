@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "../test_helper"
 
 # Direct unit tests for `runtime/ruby/action_controller/base.rb`.
@@ -61,6 +62,20 @@ class ActionControllerBaseTest < Minitest::Test
   def test_response_content_type_can_be_assigned
     @controller.response.content_type = "text/vnd.turbo-stream.html"
     assert_equal "text/vnd.turbo-stream.html", @controller.content_type
+  end
+
+  def test_response_redirect_predicate_matches_redirect_statuses
+    [301, 302, 303, 307, 308].each do |status|
+      controller = TestController.new
+      controller.instance_variable_set(:@status, status)
+      assert controller.response.redirect?, "status #{status}"
+    end
+
+    [200, 204, 299, 300, 304, 305, 306, 309, 399, 400, 500].each do |status|
+      controller = TestController.new
+      controller.instance_variable_set(:@status, status)
+      refute controller.response.redirect?, "status #{status}"
+    end
   end
 
   def test_media_type_drops_the_content_type_parameters

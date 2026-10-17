@@ -1,5 +1,5 @@
 //! `errors.add` grounding: `errors.add(:field, "msg")` →
-//! `errors << "Field msg"` and `error_details << ActiveRecord::ErrorDetail.new("field", "msg", "msg")`,
+//! `errors << "Field msg"` and `error_details << ActiveRecord::ErrorDetail.new("field", "msg", "msg", "Field msg", false, true)`,
 //! so the accumulator keeps what Rails keeps for each message; `errors.clear`
 //! empties both.
 //!
@@ -32,8 +32,9 @@
 //! `errors.full_message(:field, msg)` bakes the same text without touching
 //! the accumulator: Rails answers the humanized field before the message
 //! (the bare message for `:base`), which is a pure function of the two
-//! arguments. Only that shape is typed (`full_message_bakes`); any other
-//! spelling keeps analyze's Errors gap.
+//! arguments. A record that is not a plain read is still built before the
+//! text, as `User.new && "Email is invalid"`. Only that shape is typed
+//! (`full_message_bakes`); any other spelling keeps analyze's Errors gap.
 //!
 //! Purely shape-directed; runs on the post-analyze hook
 //! (`apply_post_analyze_lowerings`) with its siblings so every target
@@ -252,11 +253,26 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
             let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
                 unreachable!()
             };
-            let message = baked_message(i18n, span, field.as_str(), args.next().map(fold_str_concat));
-            *expr = message;
-            expr.ty = Some(crate::ty::Ty::Str);
+            let mut message = baked_message(i18n, span, field.as_str(), args.next().map(fold_str_concat));
+            message.ty = Some(crate::ty::Ty::Str);
+            let ExprNode::Send { recv: owner, .. } = *recv.expect("checked errors reader").node else { unreachable!() };
+            *expr = match owner {
+                // Not a Seq: an emitter hoists one out of `||` and `?:`, which would build the record where Rails does not.
+                Some(owner) if !reads_without_effect(&owner) => {
+                    let mut built = Expr::new(
+                        span,
+                        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: crate::expr::BoolOpSurface::Symbol, left: owner, right: message },
+                    );
+                    built.ty = Some(crate::ty::Ty::Str);
+                    built
+                }
+                _ => message,
+            };
             return;
         }
+    }
+    if rewrite_import(expr, labels, diags) {
+        return;
     }
     if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node {
         if method.as_str() == "clear" && args.is_empty() {
@@ -470,6 +486,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         }
         (None, Some(_)) => crate::expr::ErrorDetail::Unknown,
     };
+    let (symbolic, optionless) = detail_flags(&detail);
     if let Some(text) = translated {
         msg = Some(str_lit(span, text));
     }
@@ -621,7 +638,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
                     Ty::Str,
                 ),
             };
-            attributed_push_field(push_message, owner, field, kind, bare, span)
+            attributed_push_field(push_message, owner, field, kind, symbolic, optionless, bare, span)
         }
     };
     if !hoists.is_empty() {
@@ -629,6 +646,17 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         hoists.push(expr.clone());
         *expr = Expr::new(span, ExprNode::Seq { exprs: hoists });
         expr.ty = ty;
+    }
+}
+
+/// What an `ErrorDetail` record keeps of the push's type: whether it is a
+/// Symbol (a String message is its own type) and whether the error has no
+/// options beside the callback and `message:` ones.
+pub(crate) fn detail_flags(detail: &crate::expr::ErrorDetail) -> (bool, bool) {
+    match detail {
+        crate::expr::ErrorDetail::Type { options, .. } => (true, options.as_ref().is_some_and(|o| o.is_empty())),
+        crate::expr::ErrorDetail::Message => (false, true),
+        crate::expr::ErrorDetail::Unknown => (false, false),
     }
 }
 
@@ -657,17 +685,157 @@ fn errors_owner(expr: &mut Expr) -> &mut Option<Expr> {
     owner
 }
 
-/// `<errors> << msg` followed by `<owner>.error_details << ActiveRecord::ErrorDetail.new("field", type, message)`,
+fn is_errors_ty(e: &Expr) -> bool {
+    matches!(&e.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+}
+
+fn is_error_ty(e: &Expr) -> bool {
+    matches!(&e.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Error")
+}
+
+/// The attribute `errors.import` files the error under: `None` for the error's own, else the `attribute:` override.
+fn import_attribute(args: &[Expr]) -> Option<Option<&Expr>> {
+    match args {
+        [error] if is_error_ty(error) => Some(None),
+        [error, options] if is_error_ty(error) => match &*options.node {
+            ExprNode::Hash { entries, .. } => match entries.as_slice() {
+                [(key, value)]
+                    if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "attribute")
+                        && matches!(value.ty, Some(crate::ty::Ty::Sym)) =>
+                {
+                    Some(Some(value))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The record whose errors `errors.merge!` imports: an `errors` read, or a record.
+fn merged_owner(args: &[Expr], is_model: &dyn Fn(&crate::ident::ClassId) -> bool) -> Option<Option<Expr>> {
+    let [other] = args else { return None };
+    match &*other.node {
+        ExprNode::Send { recv, method, args, block: None, .. } if method.as_str() == "errors" && args.is_empty() && is_errors_ty(other) => {
+            Some(recv.clone())
+        }
+        _ if matches!(&other.ty, Some(crate::ty::Ty::Class { id, .. }) if is_model(id)) => Some(Some(other.clone())),
+        _ => None,
+    }
+}
+
+/// Shared with analyze, which types `import` and `merge!` only when this holds.
+pub(crate) fn import_grounds(method: &str, args: &[Expr], is_model: &dyn Fn(&crate::ident::ClassId) -> bool) -> bool {
+    match method {
+        "import" => import_attribute(args).is_some(),
+        "merge!" => merged_owner(args, is_model).is_some(),
+        _ => false,
+    }
+}
+
+/// `errors.format` around the attribute's name and the message, when it names each once, in that order.
+fn format_pieces(format: &str) -> Option<(String, String, String)> {
+    let (before, rest) = format.split_once("%{attribute}")?;
+    let (between, after) = rest.split_once("%{message}")?;
+    (!before.contains("%{") && !between.contains("%{") && !after.contains("%{"))
+        .then(|| (before.to_string(), between.to_string(), after.to_string()))
+}
+
+/// `errors.import(error, attribute: :field)` → `ActiveSupport.errors_import(…)` and
+/// `errors.merge!(other)` → `ActiveSupport.errors_merge(…)`, with the importing model's
+/// translated attribute names: Rails names an imported error's attribute as the importer does.
+fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>) -> bool {
+    let ExprNode::Send { recv: Some(reader), method, args, block: None, .. } = &*expr.node else { return false };
+    let method = method.as_str();
+    if !matches!(method, "import" | "merge!") || !is_errors_ty(reader) {
+        return false;
+    }
+    let ExprNode::Send { recv: owner, method: em, args: ea, .. } = &*reader.node else { return false };
+    if em.as_str() != "errors" || !ea.is_empty() {
+        return false;
+    }
+    let i18n = labels.model(reader);
+    let pieces = format_pieces(i18n.errors_format());
+    let is_model = |id: &crate::ident::ClassId| labels.data.models.contains_key(id);
+    let reason = if !import_grounds(method, args, &is_model) {
+        Some(match method {
+            "import" => "an error and an `attribute:` Symbol are grounded, no other option",
+            _ => "only another record or its `errors` is grounded",
+        })
+    } else if !owner_reads_once(owner.as_ref()) {
+        Some("the record is not a plain read, and the import reads it twice")
+    } else if pieces.is_none() {
+        Some("`errors.format` does not name the attribute and then the message, once each")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        let mut d = crate::lower::residue_diagnostic(
+            "errors_add",
+            if method == "import" { "errors.import" } else { "errors.merge!" },
+            expr.span,
+            reason,
+            format!("`errors.{method}` is not grounded: {reason}"),
+        );
+        d.severity = crate::diagnostic::Severity::Error;
+        diags.push(d);
+        return true;
+    }
+    let span = expr.span;
+    let (before, between, after) = pieces.expect("checked above");
+    let names: Vec<(Expr, Expr)> =
+        i18n.translated_attribute_names().into_iter().map(|(attr, name)| (str_lit(span, &attr), str_lit(span, &name))).collect();
+    let mut names = Expr::new(span, ExprNode::Hash { entries: names, kwargs: false });
+    names.ty = Some(crate::ty::Ty::Hash { key: std::sync::Arc::new(crate::ty::Ty::Str), value: std::sync::Arc::new(crate::ty::Ty::Str) });
+    let mut errors = reader.clone();
+    errors.ty = Some(crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Str) });
+    let mut call_args = vec![errors, error_details(owner.clone(), span)];
+    let helper = if method == "import" {
+        let attribute = import_attribute(args).expect("checked above").map(|a| match &*a.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => str_lit(span, value.as_str()),
+            _ => {
+                let mut s = Expr::new(span, ExprNode::Send { recv: Some(a.clone()), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+                s.ty = Some(crate::ty::Ty::Str);
+                s
+            }
+        });
+        call_args.push(args[0].clone());
+        call_args.push(attribute.unwrap_or_else(|| {
+            let mut nil = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+            nil.ty = Some(crate::ty::Ty::Nil);
+            nil
+        }));
+        "errors_import"
+    } else {
+        call_args.push(error_details(merged_owner(args, &is_model).expect("checked above"), span));
+        "errors_merge"
+    };
+    call_args.extend([names, str_lit(span, &before), str_lit(span, &between), str_lit(span, &after)]);
+    let mut support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
+    support.ty = Some(crate::ty::Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveSupport")), args: vec![].into() });
+    let mut call = Expr::new(
+        span,
+        ExprNode::Send { recv: Some(support), method: Symbol::from(helper), args: call_args, block: None, parenthesized: true },
+    );
+    call.ty = Some(crate::lower::errors_index::error_array_ty());
+    *expr = call;
+    true
+}
+
+/// `<errors> << msg` followed by `<owner>.error_details << ActiveRecord::ErrorDetail.new("field", type, message, msg, symbolic, optionless)`,
 /// so the accumulator keeps what Rails keeps for each message.
 pub(crate) fn attributed_push(
     push_message: Expr,
     owner: Option<Expr>,
     field: &str,
     kind: Expr,
+    symbolic: bool,
+    optionless: bool,
     message: Expr,
     span: crate::span::Span,
 ) -> Expr {
-    attributed_push_field(push_message, owner, str_lit(span, field), kind, message, span)
+    attributed_push_field(push_message, owner, str_lit(span, field), kind, symbolic, optionless, message, span)
 }
 
 /// [`attributed_push`] for a field read at run time (an attribute in a local).
@@ -676,9 +844,13 @@ fn attributed_push_field(
     owner: Option<Expr>,
     field: Expr,
     kind: Expr,
+    symbolic: bool,
+    optionless: bool,
     message: Expr,
     span: crate::span::Span,
 ) -> Expr {
+    let ExprNode::Send { args, .. } = &*push_message.node else { unreachable!("an `errors <<` push") };
+    let full_message = typed_str(args[0].clone());
     let error_ty = crate::ty::Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveRecord::ErrorDetail")), args: vec![].into() };
     let mut class = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("ErrorDetail")] });
     class.ty = Some(error_ty.clone());
@@ -687,7 +859,7 @@ fn attributed_push_field(
         ExprNode::Send {
             recv: Some(class),
             method: Symbol::from("new"),
-            args: vec![field, typed_str(kind), typed_str(message)],
+            args: vec![field, typed_str(kind), typed_str(message), full_message, bool_lit(span, symbolic), bool_lit(span, optionless)],
             block: None,
             parenthesized: true,
         },
@@ -723,6 +895,12 @@ pub(crate) fn error_details(owner: Option<Expr>, span: crate::span::Span) -> Exp
         ExprNode::Send { recv: owner, method: Symbol::from("error_details"), args: Vec::new(), block: None, parenthesized: false },
     );
     e.ty = Some(error_details_ty());
+    e
+}
+
+fn bool_lit(span: crate::span::Span, value: bool) -> Expr {
+    let mut e = Expr::new(span, ExprNode::Lit { value: Literal::Bool { value } });
+    e.ty = Some(crate::ty::Ty::Bool);
     e
 }
 
@@ -818,7 +996,7 @@ pub(crate) fn full_message_bakes(recv: Option<&Expr>, args: &[Expr], block: Opti
         && !matches!(&*args[1].node, ExprNode::Hash { .. })
         && recv.is_some_and(|r| match &*r.node {
             ExprNode::Send { recv: owner, method, args, .. } => {
-                method.as_str() == "errors" && args.is_empty() && owner.as_ref().is_none_or(reads_without_effect)
+                method.as_str() == "errors" && args.is_empty() && owner.as_ref().is_none_or(|o| reads_without_effect(o) || is_record(o))
             }
             // `errors = record.errors`: the collection in a local, of a record no model is known for.
             ExprNode::Var { .. } => {
@@ -826,6 +1004,11 @@ pub(crate) fn full_message_bakes(recv: Option<&Expr>, args: &[Expr], block: Opti
             }
             _ => false,
         })
+}
+
+/// A record built for its `errors`, which `&&` evaluates before the text and which is never falsy.
+fn is_record(e: &Expr) -> bool {
+    matches!(&e.ty, Some(crate::ty::Ty::Class { .. }))
 }
 
 /// Folding drops the receiver, so only one whose evaluation does nothing.

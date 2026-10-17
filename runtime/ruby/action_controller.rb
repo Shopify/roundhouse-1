@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "action_controller/base"
 # `ActionController::API`, the base an API app's ApplicationController
 # names: Base under the API name.
@@ -29,6 +30,10 @@ require_relative "action_controller/cookies"
 # transpiles everywhere; this Hash-subscript surface over it does
 # not).
 require_relative "action_controller/cache_control"
+# Rack::ETag and Rack::ConditionalGet over the buffered response
+# (`commit_conditional_get!`), the step after `commit_cache_control!`
+# in both wire paths. Ruby-family only, as the file above.
+require_relative "action_controller/conditional_get"
 # The error `Params.require_key` raises; travels with its consumer for
 # the same reason message_digest does.
 require_relative "action_controller/parameter_missing"

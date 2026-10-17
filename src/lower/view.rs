@@ -168,10 +168,16 @@ pub enum RenderPartial<'a> {
         /// `cached: true` — Rails' collection cache. The concatenated
         /// partials are stored under one key (each element's
         /// `cache_key_with_version`) so a warm campfire room page is
-        /// one `read_str`, not 40 fragment lookups. A proc / non-true
-        /// value is declined: that shape customizes the key and is
-        /// not modeled.
+        /// one `read_str`, not 40 fragment lookups.
         cached: bool,
+        /// `cached: ->(item) { key }` — Rails' collection cache with a
+        /// callable key: each element's fragment is stored under the
+        /// key the lambda answers, and the collection is preloaded
+        /// first because the key may read associations (campfire's
+        /// `message_fragment_cache_key`). Any other non-true value (a
+        /// `{ key:, expires_in: }` hash) is not modeled and renders
+        /// uncached.
+        cached_key: Option<&'a Expr>,
     },
     /// `render partial: @above` — the partial NAME is a runtime value
     /// (an ivar/local), not a literal, so it can't be resolved to one
@@ -379,6 +385,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
     let mut first_local: Option<&Expr> = None;
     let mut locals_entries: Option<&[(Expr, Expr)]> = None;
     let mut cached = false;
+    let mut cached_key: Option<&Expr> = None;
     for (k, v) in entries {
         match key_of(k).as_deref() {
             Some("partial") => match &*v.node {
@@ -402,9 +409,11 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
                     as_name = Some(value.as_str());
                 }
             }
-            Some("cached") => {
-                cached = matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } });
-            }
+            Some("cached") => match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: true } } => cached = true,
+                ExprNode::Lambda { params, .. } if params.len() == 1 => cached_key = Some(v),
+                _ => {}
+            },
             // An explicit `locals: {…}` hash — keep the entries so the
             // emitter can bind record + extra locals by name.
             Some("locals") => {
@@ -448,6 +457,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
             as_name,
             locals: locals_entries,
             cached,
+            cached_key,
         })
     } else {
         Some(RenderPartial::Named {
@@ -706,10 +716,14 @@ pub fn renders_through_view_path(format: &str) -> bool {
     // `<action>_txt`. Paired with the ingest gate in `ingest::app`'s
     // `walk_erb` the same way `svg`/`json` are: a format admitted only
     // here or only there is silently dropped in between.
+    // `css`: joins them the same way — a CSS responder with no html
+    // sibling (Mastodon's `custom_css#show`), as `<action>_css`.
+    // `text`: a mailer's plain-text part and its layout, as
+    // `<action>_text`, which `lower::mailer_templates` renders.
     matches!(
         format,
         "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "xls" | "json" | "js" | "pdf"
-            | "csv" | "txt"
+            | "csv" | "txt" | "css" | "md" | "text"
     )
 }
 

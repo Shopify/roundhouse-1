@@ -337,6 +337,14 @@ fn self_send(method: &str) -> Expr {
     )
 }
 
+/// `self.<method>()`, parenthesized as a method call.
+pub(super) fn self_call(method: &str) -> Expr {
+    with_ty(
+        send(Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)), method, vec![], true),
+        Ty::Untyped,
+    )
+}
+
 fn if_then(cond: Expr, then_stmts: Vec<Expr>) -> Expr {
     Expr::new(
         Span::synthetic(),

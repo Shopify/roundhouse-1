@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # concurrent-ruby's thread pools, barrier and Map, over spinel's own threads.
 #
 # THE RUBY FAMILY NEVER LOADS THIS FILE. `project::ruby_runtime_files`

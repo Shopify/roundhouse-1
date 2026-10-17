@@ -13,7 +13,8 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :widgets do |t|\n    t.string :type\n    t.string :name\n    t.integer :count\n    t.boolean :live\n    t.date :due_on\n    t.timestamps\n  end\n  \
     create_table :prices do |t|\n    t.decimal :amount, precision: 8, scale: 2\n  end\n  \
     create_table :notes do |t|\n    t.text :data\n  end\n  \
-    create_table :events do |t|\n    t.datetime :starts_at\n  end\nend\n";
+    create_table :events do |t|\n    t.datetime :starts_at\n  end\n  \
+    create_table :pairs do |t|\n    t.string :a\n    t.string :b_c\n    t.string :a_b\n    t.string :c\n  end\nend\n";
 
 const CONTROLLER: &str = r#"class WidgetsController < ApplicationController
   def show
@@ -35,6 +36,22 @@ const CONTROLLER: &str = r#"class WidgetsController < ApplicationController
   def event
     render json: Event.find(params[:id])
   end
+
+  def included
+    render json: Widget.find(params[:id]), include: :things
+  end
+
+  def price_id
+    render json: Price.find(params[:id]), only: :id
+  end
+
+  def pair_one
+    render json: Pair.find(params[:id]), only: [:a_b, :c]
+  end
+
+  def pair_two
+    render json: Pair.find(params[:id]), only: [:a, :b_c]
+  end
 end
 "#;
 
@@ -43,6 +60,7 @@ fn emitted() -> (String, String) {
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/widget.rb"), b"class Widget < ApplicationRecord\nend\n".to_vec());
     tree.insert(PathBuf::from("app/models/price.rb"), b"class Price < ApplicationRecord\nend\n".to_vec());
+    tree.insert(PathBuf::from("app/models/pair.rb"), b"class Pair < ApplicationRecord\nend\n".to_vec());
     tree.insert(
         PathBuf::from("app/models/note.rb"),
         b"class Note < ApplicationRecord\n  serialize :data, coder: JSON\nend\n".to_vec(),
@@ -53,7 +71,7 @@ fn emitted() -> (String, String) {
     );
     tree.insert(
         PathBuf::from("config/routes.rb"),
-        b"Rails.application.routes.draw do\n  resources :widgets do\n    get :price, on: :member\n    get :note, on: :member\n    get :event, on: :member\n  end\nend\n".to_vec(),
+        b"Rails.application.routes.draw do\n  resources :widgets do\n    get :price, on: :member\n    get :note, on: :member\n    get :event, on: :member\n    get :included, on: :member\n  end\nend\n".to_vec(),
     );
     tree.insert(PathBuf::from("app/controllers/widgets_controller.rb"), CONTROLLER.as_bytes().to_vec());
     let mut app = ingest_app_from_tree(tree).expect("ingest");
@@ -102,9 +120,9 @@ fn the_render_sites_serve_the_writer_text() {
 #[test]
 fn a_decimal_column_or_a_serialized_attribute_keeps_the_runtime_encoder() {
     let (models, controller) = emitted();
-    assert!(!class_body(&models, "Price").contains("as_json_str"));
+    assert!(!class_body(&models, "Price").contains("def as_json_str\n"));
     assert!(!class_body(&models, "Note").contains("as_json_str"));
-    let price = &controller[controller.find("def price").expect("price")..];
+    let price = &controller[controller.find("def price").expect("price")..controller.find("def note").expect("note")];
     assert!(price.contains("JsonRender") && !price.contains("as_json_str"), "{price}");
 }
 
@@ -112,6 +130,29 @@ fn a_decimal_column_or_a_serialized_attribute_keeps_the_runtime_encoder() {
 fn an_overridden_temporal_reader_keeps_the_runtime_encoder() {
     let (models, controller) = emitted();
     assert!(!class_body(&models, "Event").contains("as_json_str"));
-    let event = &controller[controller.find("def event").expect("event")..];
+    let event = &controller[controller.find("def event").expect("event")..controller.find("def included").expect("included")];
     assert!(event.contains("JsonRender") && !event.contains("as_json_str"), "{event}");
+}
+
+
+#[test]
+fn an_option_the_writer_does_not_read_keeps_the_runtime_encoder() {
+    let (_, controller) = emitted();
+    let included = &controller[controller.find("def included").expect("included")..controller.find("def price_id").expect("price_id")];
+    assert!(included.contains("JsonRender") && !included.contains("as_json_str"), "{included}");
+}
+
+#[test]
+fn only_leaving_out_a_declined_column_still_gets_a_writer() {
+    let (models, controller) = emitted();
+    assert!(class_body(&models, "Price").contains("def as_json_str__only_2id"), "{models}");
+    let price_id = &controller[controller.find("def price_id").expect("price_id")..controller.find("def pair_one").expect("pair_one")];
+    assert!(price_id.contains("as_json_str__only_2id") && !price_id.contains("JsonRender"), "{price_id}");
+}
+
+#[test]
+fn option_lists_that_join_alike_get_writers_of_their_own() {
+    let (models, _) = emitted();
+    let pair = class_body(&models, "Pair");
+    assert!(pair.contains("def as_json_str__only_3a_b_1c") && pair.contains("def as_json_str__only_1a_3b_c"), "{pair}");
 }

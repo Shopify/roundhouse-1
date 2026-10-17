@@ -8,7 +8,7 @@
 //! Hook bodies, test bodies and views all reach it (form headers and
 //! table columns call it from templates).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 module ActiveSupport
   # Shared implementation used by the typed Hash#deep_merge call lowering.
   # Recursively combine only Hash/Hash value pairs; any other pair is the

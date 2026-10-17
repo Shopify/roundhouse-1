@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Which database this process is connected to, and whether it is inside
 # a transaction — the Rails API campfire's SQLite-observer caches read
 # (rubys/roundhouse#698), answered from the Db shim the tree loaded

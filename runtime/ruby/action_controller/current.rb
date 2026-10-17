@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Per-request context reachable from module-function helpers. Rails
 # helpers run in the view context, which delegates `request` to the
 # controller; the emitted helpers are module functions with no such

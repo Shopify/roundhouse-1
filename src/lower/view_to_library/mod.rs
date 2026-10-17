@@ -340,12 +340,44 @@ impl<'a> ViewLowerCtx<'a> {
     }
 
     pub fn lower(&self, view: &View) -> LibraryClass {
-        build_library_class(view, self, /*type_body=*/ true)
+        plain_text(view, build_library_class(view, self, /*type_body=*/ true))
     }
 
     pub(crate) fn lower_untyped(&self, view: &View) -> LibraryClass {
-        build_library_class(view, self, /*type_body=*/ false)
+        plain_text(view, build_library_class(view, self, /*type_body=*/ false))
     }
+}
+
+/// A text/plain template (`.text.erb`, `.txt.erb`) writes `<%= x %>` as
+/// it is: Rails' ERB handler escapes every other format but this one
+/// (`escape_ignore_list`), so the walker's `html_escape` comes back off.
+fn plain_text(view: &View, mut lc: LibraryClass) -> LibraryClass {
+    if !matches!(view.format.as_str(), "text" | "txt") {
+        return lc;
+    }
+    fn unescape(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| unescape(c));
+        let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { return };
+        let helpers = matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ActionView", "ViewHelpers"]));
+        if !helpers || method.as_str() != "html_escape" || args.len() != 1 {
+            return;
+        }
+        let arg = args[0].clone();
+        let span = e.span;
+        let already_string = matches!(&*arg.node, ExprNode::Send { method, args, .. } if method.as_str() == "to_s" && args.is_empty())
+            || matches!(arg.ty, Some(crate::ty::Ty::Str));
+        *e = if already_string {
+            arg
+        } else {
+            let mut s = Expr::new(span, ExprNode::Send { recv: Some(arg), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+            s.ty = Some(crate::ty::Ty::Str);
+            s
+        };
+    }
+    for m in &mut lc.methods {
+        unescape(&mut m.body);
+    }
+    lc
 }
 
 pub fn lower_view_to_library_class(view: &View, app: &App) -> LibraryClass {
@@ -860,6 +892,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods: vec![method],
         nullable_columns: Vec::new(),
         origin: None,
@@ -1104,6 +1137,24 @@ pub fn insert_db_stub(
     db_info.class_methods.insert(
         Symbol::from("_txn_depth="),
         fn_sig(vec![(Symbol::from("value"), Ty::Int)], Ty::Int),
+    );
+    // Whether the connection holds a transaction — one ActiveRecord
+    // opened or one opened beneath it (connection.rb's
+    // `self.transaction` joins the latter instead of nesting a BEGIN).
+    db_info.class_methods.insert(Symbol::from("transaction_open?"), fn_sig(vec![], Ty::Bool));
+    // The open transaction's enlisted writes (connection.rb's
+    // `_commit_enlisted`), boxed per thread the same way.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_records"),
+        fn_sig(
+            vec![],
+            Ty::Array {
+                elem: std::sync::Arc::new(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveRecord::EnlistedRecord")),
+                    args: vec![].into(),
+                }),
+            },
+        ),
     );
     classes.insert(ClassId(Symbol::from("Db")), db_info);
 
@@ -2746,12 +2797,20 @@ fn view_key_of(v: &View) -> Option<ViewKey> {
 /// generic dispatch previously wrapped layouts body-only; a layout
 /// reading @user had no way to receive it there.)
 pub fn layout_wrap_expr(app: &crate::App, inner: Expr) -> Option<Expr> {
+    layout_wrap_expr_with(app, &view_ivar_closures(&app.views, &app.controllers), inner)
+}
+
+/// `layout_wrap_expr` over closures the caller computed once for every render it wraps.
+pub(crate) fn layout_wrap_expr_with(
+    app: &crate::App,
+    closures: &crate::det::HashMap<ViewKey, Vec<Symbol>>,
+    inner: Expr,
+) -> Option<Expr> {
     let key: ViewKey = ("Layouts".to_string(), "application".to_string());
     let layout = app
         .views
         .iter()
         .find(|v| v.format.as_str() == "html" && view_key_of(v).as_ref() == Some(&key))?;
-    let closures = view_ivar_closures(&app.views, &app.controllers);
     let ivars = closures.get(&key).cloned().unwrap_or_default();
     let span = inner.span;
     let ivar = |name: &Symbol| Expr::new(span, ExprNode::Ivar { name: name.clone() });
@@ -3485,7 +3544,7 @@ fn infer_view_arg_raw(stem: &str, dir: &str, is_partial: bool, _known_models: &[
 
 /// One view's ivar name → the local that stands for it in the lowered
 /// method (`class` → `class_`). See [`ivar_local_names`].
-pub(crate) type IvarLocals = std::collections::HashMap<String, String>;
+pub(crate) type IvarLocals = crate::det::HashMap<String, String>;
 
 /// Name a local for each of one view's ivars. An ivar keeps its own
 /// name unless it is a reserved word, which gets a trailing `_` as in
@@ -3503,9 +3562,9 @@ pub(crate) fn ivar_local_names<'a>(ivars: impl IntoIterator<Item = &'a str>) -> 
             names.push(n);
         }
     }
-    let mut taken: std::collections::HashSet<String> =
+    let mut taken: crate::det::HashSet<String> =
         names.iter().map(|n| n.to_string()).collect();
-    let mut out = IvarLocals::new();
+    let mut out = IvarLocals::default();
     for n in &names {
         let mut local = crate::naming::safe_local(n);
         if local != *n {

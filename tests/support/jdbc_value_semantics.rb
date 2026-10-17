@@ -5,6 +5,7 @@ raise "JRuby required" unless RUBY_ENGINE == "jruby"
 
 require "json"
 source = ENV.fetch("ROUNDHOUSE_SOURCE") { File.expand_path("../..", __dir__) }
+require File.join(source, "runtime/ruby/active_record/errors")
 require File.join(source, "runtime/spinel/db_jruby")
 require File.join(source, "runtime/spinel/scaffold/ruby_overlay/runtime/active_support_time_parsing")
 
@@ -255,7 +256,8 @@ module JdbcValueSemantics
           Db.public_send(method, stmt, 1, value)
           raise "#{method} swallowed the setter failure"
         rescue StandardError => actual
-          truth("#{method}/#{setter}: preserve driver exception", actual.equal?(error))
+          truth("#{method}/#{setter}: translate as Rails does", actual.instance_of?(ActiveRecord::StatementInvalid))
+          truth("#{method}/#{setter}: keep the driver exception as the cause", actual.cause.equal?(error))
           truth("#{method}/#{setter}: evict failed checkout", !Db.current_dbh.stmt_cache.key?(sql))
           truth("#{method}/#{setter}: failed disposal stays owned", Db.current_dbh.open_statements.key?(ps))
         ensure

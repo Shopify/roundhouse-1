@@ -1000,8 +1000,11 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("campfire-ci {}-{unique}", std::process::id()));
+        // Canonical: macOS's temp dir is a symlink, and the script reports the real path.
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("campfire-ci {}-{unique}", std::process::id()));
         let source = root.join("build/campfire-compare-spinel");
         fs::create_dir_all(source.join("app/models")).unwrap();
         fs::create_dir_all(source.join("sig")).unwrap();

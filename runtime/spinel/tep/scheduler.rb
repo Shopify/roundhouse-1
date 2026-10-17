@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::Scheduler -- a tiny fiber-based cooperative scheduler.
 #
 # Spinel ships Fiber today (ucontext-based, GC-aware, ivars persist

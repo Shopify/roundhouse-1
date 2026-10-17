@@ -144,7 +144,13 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
 /// autoloads it): with the `require` refused and gone, every schema's
 /// `trace_with(OpenTelemetry::Instrumentation::GraphQL::Tracers::
 /// GraphQLTrace)` raised `uninitialized constant ...::Tracers`.
-pub fn locked_gem_owns<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, feature: &str) -> bool {
+pub fn locked_gem_owns<V: Vfs + ?Sized>(
+    vfs: &V,
+    home: &Path,
+    lock: &Lockfile,
+    extensions: &crate::extensions::Extensions,
+    feature: &str,
+) -> bool {
     let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
     if rb.starts_with('/') || rb.contains("..") {
         return false;
@@ -152,7 +158,7 @@ pub fn locked_gem_owns<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, f
     let mut installed = None;
     lock.specs.iter().map(|(name, _)| name.as_str()).any(|gem| {
         if lock.is_in_repo(gem)
-            || crate::project::gem_requires_rails(gem).is_some()
+            || crate::project::gem_requires_rails(extensions, gem).is_some()
             || crate::project::gem_port_files(gem).is_some()
             || lock_reaches_rails(lock, gem)
         {
@@ -325,7 +331,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
         let port_answered = PORT_ANSWERED_RAILS_DEPENDENTS.contains(&gem);
         if sources.scans.contains_key(gem)
             || lock.is_in_repo(gem)
-            || crate::project::gem_requires_rails(gem).is_some()
+            || crate::project::gem_requires_rails(&app.extensions, gem).is_some()
             || crate::project::gem_port_files(gem).is_some()
             || (reaches_rails(gem) && !port_answered)
         {

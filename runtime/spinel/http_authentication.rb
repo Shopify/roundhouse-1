@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' HTTP Token and Basic authentication helpers
 # (`ActionController::HttpAuthentication::Token::ControllerMethods` and
 # `::Basic::ControllerMethods`), which actionpack mixes into every

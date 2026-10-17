@@ -18,7 +18,7 @@
 //! (`%i[...]`, `[:a, :b]`, optionally `.freeze`). Anything else under
 //! the splat is left alone.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{Action, Controller};
 use crate::expr::{Expr, ExprNode, Literal};

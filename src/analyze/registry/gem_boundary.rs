@@ -255,6 +255,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
     let reopened: Vec<&ClassId> = declared
         .keys()
         .filter(|id| !fresh.contains(*id) && !app_owned.contains(*id) && classes.contains_key(*id))
+        .filter(|id| !app.extensions.is_rails_dependent(&declared[*id].gem))
         .filter(|id| {
             let name = id.0.as_str();
             !RUBY_CORE.contains(&name.split("::").next().unwrap_or(name))

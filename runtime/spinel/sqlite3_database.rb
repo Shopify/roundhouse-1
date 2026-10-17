@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `SQLite3::Database` — the sqlite3 gem's connection class, for the
 # spinel binary, over the libsqlite3 FFI `runtime/db.rb` declares
 # (`SQL`). The ruby family loads the gem itself under this file's path

@@ -469,6 +469,7 @@ pub(super) fn factory_class(
         });
     }
     Ok(LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
@@ -536,6 +537,7 @@ fn class_new_class(
     }
     let (owner, body) = factory_body(path, block, "Class", file)?;
     Ok(LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),

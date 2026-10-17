@@ -124,6 +124,12 @@ impl Server {
         Response { status, headers: response_headers, body }
     }
 
+    /// Any verb, with exactly the given headers and body (no session).
+    pub fn request(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
+        let (status, _, response_headers, body) = self.send(method, path, headers, body);
+        Response { status, headers: response_headers, body }
+    }
+
     /// A POST with neither cookie nor token.
     pub fn post_without_session(&self, path: &str, content_type: &str, body: &str) -> Response {
         let headers = [("Content-Type", content_type), ("Accept", "application/json")];

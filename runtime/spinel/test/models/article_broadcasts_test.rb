@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Minitest-shaped: this is a CRuby-only framework test, quarantined
 # out of the spin shape by `project.rs::spin_shape` (it is not a spin
 # test program and gets no snapshot). It therefore loads its own
@@ -8,7 +9,7 @@ require_relative "../test_helper"
 require "models/article"
 require "models/article_params"
 require "models/comment"
-require "broadcasts"
+# `Broadcasts` comes in through `test_helper`'s boot chain, as in `broadcasts_test.rb`.
 
 class ArticleBroadcastsTest < Minitest::Test
   def setup

@@ -247,7 +247,7 @@ promise in the API prose.
 | Routing | `resources`/`resource` (nested, `only:`/`except:`, `member`/`collection`), `namespace`/`scope`, `root`, `get`/`post`/…, `constraints`, format suffixes, Active Storage's mounted engine, Devise's `devise_for` (static default four: session/registration/password/confirmation + `controllers:` overrides for those mappings only — not model-module-driven), `devise_scope` as a path-transparent wrapper, and `with_options` (its options deep-merged into each block-free route call inside, the call's own keys winning; a child with its own block, a block parameter, or two hash values under one key is declined). Not: Devise `authenticate`/`authenticated`/`unauthenticated` route guards (unsupported because Warden constraints are not enforced; strict ingest fails, while survey mode records a gap and omits their route blocks), `concern`, `direct` (a custom URL helper with an arbitrary body — dropped), `mount` of any other engine, Doorkeeper's DSL, Devise OmniAuth callback routes, Devise `skip:`/`only:`/`path:` options, model-driven module narrowing. |
 | Configuration | `config.x.*`, initializers that define constants or mix modules into models, `Rails.application.config` reads, the app's inflections. Not: `Rails.application.credentials`. |
 | Caching | Fragment caching (`cache` in views, keyed by record) and `Rails.cache.fetch`, in-process. |
-| Gems | The census names what is modeled. Modeled today: bcrypt, devise (route helpers + static `devise_for`; no Warden route guards), image_processing/ruby-vips (Spinel), inertia_rails (`render inertia:` with a literal component and props, `inertia_share`, optional and deferred props written inline as `InertiaRails.optional { }` or `InertiaRails.defer { }`, partial reloads, the version check, `inertia: { errors: }` redirects; no SSR, no merge/scroll/once props, no dot-path partial keys, no optional or deferred wrapper returned from a helper method), invisible_captcha, pretender, rqrcode, useragent, web-push, net-http-persistent, concurrent-ruby's thread pool, importmap-rails, turbo-rails, stimulus-rails, tailwindcss-rails, jbuilder, propshaft. Everything else in a Gemfile is either infrastructure (never enters the analysis) or unknown. |
+| Gems | The census names what is modeled. Modeled today: bcrypt, devise (route helpers + static `devise_for`; no Warden route guards), image_processing/ruby-vips (Spinel), inertia_rails (`render inertia:` with a literal component and props, `inertia_share`, optional and deferred props written inline as `InertiaRails.optional { }` or `InertiaRails.defer { }`, partial reloads, the version check, `inertia: { errors: }` redirects; no SSR, no merge/scroll/once props, no dot-path partial keys, no optional or deferred wrapper returned from a helper method), invisible_captcha, pretender, representable (`Representable::Decorator` with `include Representable::JSON`: `property` / `collection`, rendered as JSON; Roar is not), rqrcode, useragent, web-push, net-http-persistent, concurrent-ruby's thread pool, importmap-rails, turbo-rails, stimulus-rails, tailwindcss-rails, jbuilder, propshaft. Everything else in a Gemfile is either infrastructure (never enters the analysis) or unknown. |
 
 ## What is not lowered, anywhere
 
@@ -344,14 +344,20 @@ What differs from Rails, and why:
   handler.** Those strategies are recognized as forgery filters but are
   not modeled as empty-session / wipe pass-throughs. `prepend:` and a
   custom `store:` remain unmodeled.
-- **Action Cable's Origin check uses Rails' defaults only.** On the
-  ruby family, a `/cable` handshake must carry an `Origin` naming the
-  request's own host (compared by host, as above), or in development
-  any `localhost` port. Otherwise the answer is Rails' 404 and the app's
-  `connect` never runs; a handshake with no `Origin` is refused, as in
-  Rails. An app's own `config.action_cable.allowed_request_origins` and
-  `disable_request_forgery_protection` are not read. The strict
-  targets' sockets check no Origin.
+- **Action Cable's Origin check follows the app's `config.action_cable`.**
+  On the ruby family, a `/cable` handshake passes Rails'
+  `allow_request_origin?`: everything when
+  `disable_request_forgery_protection` is set; else an `Origin` naming
+  the request's own scheme and `Host` (unless `allow_same_origin_as_host`
+  is false), or one `===` an entry of `allowed_request_origins` (in
+  development, any `localhost` port unless the app lists its own).
+  Otherwise the answer is Rails' 404 and the app's `connect` never runs;
+  a handshake with no `Origin` is refused, as in Rails. The settings are
+  read per environment from `config/application.rb`,
+  `config/environments/*.rb` and initializers; a list that is not a
+  literal or an Array literal (it might be an Array at run time) is
+  refused at build time. Listed values are evaluated per handshake, not
+  once at boot. The strict targets' sockets check no Origin.
 
 The strict targets issue no token (`form_authenticity_token` is empty
 there) and check none: an app emitted for them is not protected

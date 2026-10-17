@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveSupport::Duration for the spinel (AOT) tree.
 #
 # The value class HALF of the CRuby overlay's

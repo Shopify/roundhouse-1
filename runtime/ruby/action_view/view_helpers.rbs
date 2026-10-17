@@ -45,11 +45,23 @@ module ActionView
   def self.h: (untyped value) -> String
     # Percent-encoding for a query-string value; ASCII-only (see the .rb).
     def self.url_encode: (String s) -> String
+    def self.erb_url_encode: (String s) -> String
+    def self.erb_url_byte: (Array[Integer] bytes, Integer i) -> Integer
     # `Hash#to_query`: one string per value, `&`-joined. Scalar values
     # in insertion order here; runtime/spinel/hash_to_query.rb reopens
     # both with the nested bracket grammar and Rails' per-level sort.
     def self.fragment_read: (String key) -> String?
     def self.fragment_write: (String key, String value, Integer ttl) -> String
+    def self.collection_caching?: () -> bool
+    def self.collection_fragment_key: (String partial, untyped key) -> String
+    def self.collection_fragment_read: (String name) -> String?
+    def self.collection_fragment_write: (String name, String value) -> String
+    def self.collection_fragment_read_multi: (Array[String] names) -> Array[String?]
+    def self.collection_rendered: (String identifier, Array[String?] hits) -> nil
+    def self.jbuilder_caching?: () -> bool
+    def self.jbuilder_cache_key: (String template, untyped key) -> String
+    def self.jbuilder_fragment_read: (String key) -> String?
+    def self.jbuilder_fragment_write: (String key, String value) -> String
     def self.to_query: (Hash[Symbol, untyped] params) -> String
     def self.to_query_pairs: (Hash[Symbol, untyped] params, String namespace) -> String
     def self.to_query_value: (String name, untyped value) -> String
@@ -63,7 +75,8 @@ module ActionView
     # nil/non-String coercion explicitly. Real-blog's only caller
     # passes `article.body` (typed String per the model RBS) so the
     # contraction lands without source churn.
-    def self.truncate: (String s, ?length: Integer, ?omission: String) -> String
+    def self.truncate: (String s, ?length: Integer, ?omission: String, ?separator: String?) -> String
+    def self.rindex_at_or_before: (String s, String sub, Integer pos) -> Integer
     def self.word_wrap: (
       String text,
       ?line_width: Integer,

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActiveRecord::Base extensions: `find_by!` + record equality.
 #
 # Lives on the CRuby overlay, not shared runtime/ruby/active_record/base.rb:

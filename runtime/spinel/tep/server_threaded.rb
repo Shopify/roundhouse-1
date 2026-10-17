@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::Server::Threaded -- a green thread per connection.
 #
 # The connection is a `Thread`. spinel's Thread is a green thread on an

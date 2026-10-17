@@ -309,6 +309,8 @@ mod tests {
             foreign_key_explicit: false,
             inverse_of: None,
             through: None,
+            source: None,
+            class_explicit: false,
             dependent: Dependent::None,
             as_interface: None,
             scope: None,

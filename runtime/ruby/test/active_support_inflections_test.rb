@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Load the gem before test_helper prepends runtime/ruby, whose local i18n.rb
 # intentionally shadows the Rails dependency for transpiled applications.
 require "rubygems"

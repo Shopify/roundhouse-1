@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails 8.1.4 ActionController::Head#head(status, options = nil).
 # This options-hash implementation is used by the Ruby family and Spinel;
 # strict non-Ruby targets retain the smaller typed keyword implementation

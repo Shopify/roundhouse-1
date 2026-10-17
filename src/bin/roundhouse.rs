@@ -354,7 +354,7 @@ fn run_transpile(
     // lowering of the same app, from the ingest shape; built before the
     // analysis below mutates `app`.
     let whole_route = if target == BuildTarget::Futamura {
-        Some(project::futamura_whole_route(&app, input)?)
+        Some(project::futamura_whole_route(&app, input, &survey_gaps)?)
     } else {
         None
     };
@@ -392,9 +392,12 @@ fn run_transpile(
     // identifies its gem and the defining source has a matching literal
     // top-level require. Keep check's source diagnostic and all strict-target
     // refusals unchanged.
-    if target == BuildTarget::Ruby {
-        let supported_includes = roundhouse::gems::statically_resolved_external_includes(&app);
-        let external_namespaces = roundhouse::gems::locked_external_gem_namespaces(&app);
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+        let (external_namespaces, supported_includes) = if target == BuildTarget::Ruby {
+            (roundhouse::gems::locked_external_gem_namespaces(&app), roundhouse::gems::statically_resolved_external_includes(&app))
+        } else {
+            (roundhouse::gems::native_extension_gem_namespaces(&app), Default::default())
+        };
         analyze_diags.retain(|diagnostic| match &diagnostic.kind {
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 construct, detail, ..

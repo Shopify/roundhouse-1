@@ -841,3 +841,165 @@ fn a_factory_class_reopened_by_a_class_body_ingests() {
         assert!(classes.len() >= 2, "{source}: the reopening is kept: {classes:?}");
     }
 }
+
+/// A file whose only declaration is one top-level `Data.define`
+/// constant, named after the file as Zeitwerk expects.
+fn ingest_top_level(action: &str) -> roundhouse::App {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            PathBuf::from("app/models/breadcrumb.rb"),
+            b"Breadcrumb = Data.define(:name, :path)\n".to_vec(),
+        ),
+        (
+            PathBuf::from("app/controllers/data_probe_controller.rb"),
+            format!("class DataProbeController < ApplicationController\n  def index\n    @result = {action}\n  end\nend\n").into_bytes(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest")
+}
+
+#[test]
+fn a_top_level_data_factory_file_registers_its_class() {
+    let mut app = ingest_top_level("Breadcrumb.new(name: \"Posts\", path: \"/posts\").path");
+    let id = ClassId(Symbol::from("Breadcrumb"));
+    {
+        let analyzer = Analyzer::new(&app);
+        let class = &analyzer.class_registry()[&id];
+        assert_eq!(
+            class.class_methods.get(&Symbol::from("new")),
+            Some(&Ty::Class { id: id.clone(), args: vec![].into() })
+        );
+        for member in ["name", "path"] {
+            assert_eq!(class.instance_methods.get(&Symbol::from(member)), Some(&Ty::Untyped));
+            assert!(!class.instance_methods.contains_key(&Symbol::from(format!("{member}="))));
+        }
+    }
+    roundhouse::session::analyze_and_lower(&mut app);
+    let errors: Vec<_> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn top_level_files_outside_the_data_define_shape_are_not_admitted() {
+    for source in [
+        "Weird = Data.define(:a) do |klass|\n  def doubled = a * 2\nend\n",
+        "Weird = Data.members(:a)\n",
+        "record::Weird = Data.define(:a)\n",
+        "Weird = Other.define(:a)\n",
+    ] {
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("app/models/weird.rb"), source.as_bytes().to_vec())]
+                .into_iter()
+                .collect();
+        let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+        assert!(
+            app.library_classes.iter().all(|lc| lc.data_define().is_none()),
+            "{source:?} was admitted as a Data class"
+        );
+    }
+}
+
+fn ingest_block(body: &str, reader: &str) -> Result<roundhouse::App, roundhouse::ingest::IngestError> {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            PathBuf::from("app/models/timeframe.rb"),
+            format!("Timeframe = Data.define(:id, :label_text) do\n{body}end\n").into_bytes(),
+        ),
+        (
+            PathBuf::from("app/models/timeframe_report.rb"),
+            format!("class TimeframeReport\n  def self.read = {reader}\nend\n").into_bytes(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    roundhouse::ingest::ingest_app_from_tree(tree)
+}
+
+fn errors(app: &mut roundhouse::App) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    roundhouse::session::analyze_and_lower(app);
+    roundhouse::analyze::diagnose(app)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .collect()
+}
+
+#[test]
+fn a_data_define_block_is_the_body_of_its_class() {
+    let body = "  OPTIONS = { \"all\" => \"All time\" }.freeze\n\n  def self.find(id) = new(id, nil)\n  def label_text = OPTIONS.fetch(id)\n";
+    let mut app = ingest_block(body, "[OPTIONS.size, Timeframe.find(\"all\").label_text]").expect("ingest");
+    let class = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Timeframe").unwrap();
+    assert_eq!(class.constants.len(), 1, "{:?}", class.constants);
+    assert_eq!(class.methods.len(), 2, "{:?}", class.methods);
+    let errors = errors(&mut app);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_qualified_data_factory_file_registers_the_qualified_class() {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (PathBuf::from("app/models/reports/line.rb"), b"Reports::Line = Data.define(:label, :count)\n".to_vec()),
+        (
+            PathBuf::from("app/models/line_report.rb"),
+            b"class LineReport\n  def self.count = Reports::Line.new(\"a\", 2).count\nend\n".to_vec(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let id = ClassId(Symbol::from("Reports::Line"));
+    let class = app.library_classes.iter().find(|lc| lc.name == id).expect("Reports::Line");
+    assert!(class.data_define().is_some(), "{:?}", class.origin);
+    let errors = errors(&mut app);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_data_define_block_constant_is_not_a_constant_of_the_class() {
+    let mut app = ingest_block("  OPTIONS = {}.freeze\n", "Timeframe::OPTIONS.size").expect("ingest");
+    let errors = errors(&mut app);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(format!("{:?}", errors[0].kind).contains("Timeframe::OPTIONS"), "{errors:?}");
+}
+
+#[test]
+fn a_class_inside_a_data_define_block_is_rejected() {
+    let Err(roundhouse::ingest::IngestError::Unsupported { message, .. }) =
+        ingest_block("  class Inner\n  end\n", "Timeframe")
+    else {
+        panic!("a class in a Data.define block was admitted");
+    };
+    assert!(message.contains("Data.define block"), "{message}");
+}
+
+#[test]
+fn a_top_level_data_factory_is_rejected_before_unverified_target_emission() {
+    use roundhouse::diagnostic::{DiagnosticKind, Severity};
+    use roundhouse::project::{BuildTarget, target_files};
+
+    let mut app = ingest_top_level("Breadcrumb.new(\"Posts\", \"/posts\")");
+    roundhouse::session::analyze_and_lower(&mut app);
+    for &target in BuildTarget::TRANSPILE {
+        // Futamura's residue is the app itself, run by Ruby: nothing to refuse.
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Futamura) {
+            continue;
+        }
+        let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+            target_files(&app, std::path::Path::new("not-a-fixture"), target)
+        });
+        assert!(result.is_err(), "{target:?} silently emitted a Data factory");
+        assert_eq!(diagnostics.len(), 1, "{target:?}: {diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(!diagnostic.span.is_synthetic(), "{diagnostic:?}");
+        assert!(
+            matches!(&diagnostic.kind, DiagnosticKind::Unsupported { construct, target: Some(name), .. }
+            if construct.as_str() == "Data.define" && name.as_str() == target.as_str()),
+            "{diagnostic:?}"
+        );
+    }
+}

@@ -36,6 +36,7 @@ type Modeler interface {
 	AdapterUpdate()
 	AdapterTouch()
 	AdapterDelete()
+	FillTimestamps(creating bool)
 	// Validations + callbacks — Save() drives `valid?` →
 	// `self.validate`, then `after_create_commit` (or update/destroy).
 	// Subclasses define real bodies; Base's stubs are empty.

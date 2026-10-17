@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # HttpStub — the table that `WebMock.stub_request(...).to_return(...)`
 # lowers to (`lower::webmock`), and the seam `runtime/net_http.rb`'s
 # reopened `Net::HTTP#request` consults before it touches a socket.

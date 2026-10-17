@@ -672,7 +672,14 @@ cmd_socket_seed() {
     local seed_cookies="${SEED_COOKIES:-$REPO_ROOT/build/campfire-socket-cookies.txt}"
     mkdir -p "$(dirname "$seed_db")" "$(dirname "$seed_cookies")"
 
-    if [[ -f "$seed_db" && -s "$seed_cookies" ]] && (( FORCE == 0 )); then
+    # The cache is keyed by the oracle's db/schema.rb. Keyed by nothing,
+    # the 2026-09-04 seed outlived the edbc779 repin, which added
+    # rooms.messages_count: the emit lanes queried a column the cached
+    # database did not have, and every socket-phase page answered 500.
+    local seed_stamp="$seed_db.schema-sha256" want_stamp
+    want_stamp="$(shasum -a 256 "$OUT/db/schema.rb" | cut -d' ' -f1)"
+    if [[ -f "$seed_db" && -s "$seed_cookies" ]] && (( FORCE == 0 )) \
+        && [[ "$(cat "$seed_stamp" 2>/dev/null)" == "$want_stamp" ]]; then
         step "socket seed already built ($(wc -l < "$seed_cookies") cookies) — $seed_db"
         echo "$seed_db"; return 0
     fi
@@ -714,6 +721,7 @@ cmd_socket_seed() {
     cp "$SS_DEV" "$SS_PROD"; rm -f "$SS_PROD-wal" "$SS_PROD-shm"
     COUNT="$su" COOKIE_FILE="$seed_cookies" cmd_cookies || die "socket seed: minting failed"
     cp "$SS_DEV" "$seed_db"
+    echo "$want_stamp" > "$seed_stamp"
     step "socket seed ready: $seed_db ($(wc -l < "$seed_cookies") cookies)"
     echo "$seed_db"
 }

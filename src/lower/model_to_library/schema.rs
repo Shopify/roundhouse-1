@@ -2422,6 +2422,16 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
     ]
 }
 
+#[cfg(test)]
+pub(crate) mod lookup_test_support {
+    use std::cell::Cell;
+    thread_local! {
+        pub(crate) static UNCACHED: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static BUILDS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static MODEL_VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
 /// [`model_body_names`] of one models slice, shared by every
 /// [`push_schema_methods`] over that slice while a
 /// [`share_model_body_names`] guard lives. Computed per call, the names
@@ -2459,6 +2469,8 @@ pub(crate) fn share_model_body_names<'a>(models: &'a [Model], cache: &ModelBodyN
 /// [`model_body_names`] of `models`: the shared names when `models` is
 /// the shared slice.
 pub(crate) fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSet<Symbol>> {
+    #[cfg(test)]
+    if lookup_test_support::UNCACHED.get() { return std::rc::Rc::new(model_body_names(models)); }
     let shared = MODEL_BODY_NAMES.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -2480,12 +2492,16 @@ pub(crate) fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSe
 /// `<col>_changed?` is not seen; that is a runtime NoMethodError, the
 /// state every such call was in before this synthesis existed.
 fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
+    #[cfg(test)]
+    lookup_test_support::BUILDS.with(|n| n.set(n.get() + 1));
     use crate::dialect::ModelBodyItem;
     let walk = walk_names;
     let mut out: crate::det::HashSet<Symbol> = LIBRARY_DEMAND
         .with(|slot| slot.borrow().as_ref().map(|names| (**names).clone()))
         .unwrap_or_default();
     for model in models {
+        #[cfg(test)]
+        lookup_test_support::MODEL_VISITS.with(|n| n.set(n.get() + 1));
         for item in &model.body {
             match item {
                 ModelBodyItem::Method { method, .. } => walk(&method.body, &mut out),

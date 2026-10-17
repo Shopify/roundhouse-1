@@ -186,3 +186,71 @@ fn index_with_returns_a_hash_and_durations_stay_typed() {
     let decimal = find(&typed, "to_d").expect("to_d");
     assert!(matches!(&decimal.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "BigDecimal"), "{:?}", decimal.ty);
 }
+
+/// `ActiveSupport.truncate` (the grounded module function) and the CRuby
+/// overlay's `String#truncate` against Rails' own `String#truncate`, case
+/// by case: the documented examples, a separator that does not occur, an
+/// omission longer than the limit, `nil` options, multibyte text.
+#[test]
+fn string_truncate_matches_rails_814() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require "active_support"
+require "active_support/core_ext/string/filters"
+load ARGV.fetch(0)
+
+def assert(value, message)
+  raise message unless value
+end
+
+long = "Once upon a time in a world far far away"
+cases = [
+  [long, 27, {}],
+  [long, 27, { separator: " " }],
+  [long, 27, { separator: "far" }],
+  [long, 27, { omission: nil, separator: nil }],
+  [long, 40, {}],
+  [long, 39, {}],
+  ["And they found that many people were sleeping better.", 25, { omission: "... (continued)" }],
+  ["And they found that many people were sleeping better.", 4, { omission: "... (continued)" }],
+  ["Hello World!", 10, { omission: "[...]" }],
+  ["Hello World!", 10, { omission: "" }],
+  ["Hello World!", 3, {}],
+  ["Hello World!", 0, {}],
+  ["Supercalifragilistic", 10, { separator: " " }],
+  ["abc def", 6, { separator: " " }],
+  ["abc def", 6, { separator: "" }],
+  ["żółć gęślą jaźń", 8, { omission: "…" }],
+  ["żółć gęślą jaźń", 12, { separator: " " }],
+  ["", 5, {}],
+]
+expected = cases.map { |text, n, options| text.truncate(n, options) }
+cases.zip(expected).each do |(text, n, options), rails|
+  runtime = ActiveSupport.truncate(text, n, options[:omission], options[:separator])
+  assert(runtime == rails, "ActiveSupport.truncate(#{text.inspect}, #{n}, #{options}) = #{runtime.inspect}, Rails #{rails.inspect}")
+  assert(!runtime.equal?(text), "truncate returns a new String")
+end
+regexp_expected = long.truncate(27, separator: /\s/)
+
+load ARGV.fetch(1)
+cases.zip(expected).each do |(text, n, options), rails|
+  overlay = text.truncate(n, options)
+  assert(overlay == rails, "overlay #{text.inspect}.truncate(#{n}, #{options}) = #{overlay.inspect}, Rails #{rails.inspect}")
+end
+assert(long.truncate(27, separator: /\s/) == regexp_expected, "overlay Regexp separator")
+puts "String#truncate 8.1.4 contracts passed"
+"#;
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .arg(root.join("runtime/ruby/active_support_ext.rb"))
+        .arg(root.join("runtime/spinel/scaffold/ruby_overlay/runtime/active_support_core_ext.rb"))
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("contracts passed"),
+        "Rails 8.1.4 String#truncate contract failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}

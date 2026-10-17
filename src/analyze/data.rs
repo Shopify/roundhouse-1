@@ -1,4 +1,5 @@
-//! Class identities for literal Data.define constants on source library classes.
+//! Class identities for literal Data.define constants on source library classes,
+//! and for library classes that a file-level Data.define creates.
 
 use crate::det::{HashMap, HashSet};
 
@@ -76,21 +77,8 @@ pub(super) fn register(
         {
             return;
         }
-        let instance = Ty::Class {
-            id: id.clone(),
-            args: vec![].into(),
-        };
         let mut info = classes.remove(&id).unwrap_or_default();
-        info.class_methods
-            .insert(Symbol::from("new"), instance.clone());
-        info.declares_constructor = true;
-        // A member declaration establishes a reader, not its value type.
-        // Data has no generated writers. A block method of the same name
-        // overrides the reader, as it does in Ruby.
-        for member in members {
-            info.instance_methods.entry(member).or_insert(Ty::Untyped);
-        }
-        info.instance_methods.entry(Symbol::from("with")).or_insert(instance.clone());
+        let instance = add_data_methods(&mut info, &id, members);
         classes.insert(id, info);
         factories.insert(value.span, instance);
     };
@@ -98,6 +86,17 @@ pub(super) fn register(
         for (name, value) in &class.constants {
             register(&class.name, name, value);
         }
+    }
+    // A file-level `X = Data.define(…)` is already a library class of
+    // its own. Its factory adds `new` and the readers to that class.
+    for class in &app.library_classes {
+        let Some((members, span)) = class.data_define() else { continue };
+        if !members.iter().all(|member| reader_name(member.as_str())) {
+            continue;
+        }
+        let Some(info) = classes.get_mut(&class.name) else { continue };
+        let instance = add_data_methods(info, &class.name, members.iter().cloned());
+        factories.insert(span, instance);
     }
     factories
 }
@@ -267,6 +266,26 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         }
     }
     diagnostics
+}
+
+/// `new`, `with` and one reader per member, on the class that a
+/// factory creates. The result is the instance type.
+fn add_data_methods(info: &mut ClassInfo, id: &ClassId, members: impl IntoIterator<Item = Symbol>) -> Ty {
+    let instance = Ty::Class {
+        id: id.clone(),
+        args: vec![].into(),
+    };
+    info.class_methods
+        .insert(Symbol::from("new"), instance.clone());
+    info.declares_constructor = true;
+    // A member declaration establishes a reader, not its value type.
+    // Data has no generated writers. A block method of the same name
+    // overrides the reader, as it does in Ruby.
+    for member in members {
+        info.instance_methods.entry(member).or_insert(Ty::Untyped);
+    }
+    info.instance_methods.entry(Symbol::from("with")).or_insert(instance.clone());
+    instance
 }
 
 fn reader_name(member: &str) -> bool {

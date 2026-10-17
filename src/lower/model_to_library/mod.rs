@@ -645,6 +645,10 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
         parent_span: Default::default(),
         // Mixins and constants must survive in every model projection.
         includes,
+        // A model's own includes stay `ModelBodyItem::Unknown` with a
+        // real span (`analyze/mod.rs`'s model loop uses it directly,
+        // not this projection), so this envelope needs none.
+        include_spans: Vec::new(),
         methods,
         nullable_columns: nullable_column_names(table),
         origin: None,
@@ -3281,6 +3285,8 @@ fn build_class_info_with_finder_inputs(
                     **elem,
                     Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool
                 ),
+                // A scalar has neither to repeat, and a caller reading it on implicit `self` is typed from here.
+                Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool => true,
                 _ => false,
             })
         else {
@@ -3776,6 +3782,10 @@ fn type_method_body(
             id: ClassId(enclosing.clone()),
             args: vec![].into(),
         });
+    } else if let Some(model) = model.filter(|_| method.receiver == MethodReceiver::Instance) {
+        // A `def` from the model's source carries no enclosing class; `self` in it is still the model.
+        ctx.self_ty = Some(Ty::Class { id: model.name.clone(), args: vec![].into() });
+        ctx.instance_body = true;
     }
     // Seed ivar_bindings from schema columns so bare `@title` reads
     // resolve to the column type. Same source the synthesizers used

@@ -31,6 +31,11 @@ module ActionController
       emit_json(jsonify(value))
     end
 
+    # Not in `encode`: Inertia's props encode a String, and only the json renderer sends one as it is.
+    def self.body(value)
+      value.is_a?(String) ? value : encode(value)
+    end
+
     def self.jsonify(value)
       # A custom as_json wins, whatever the object (Rails semantics).
       # Guard on arity-tolerant call: Rails' as_json takes an options

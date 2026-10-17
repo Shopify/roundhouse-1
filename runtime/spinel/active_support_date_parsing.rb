@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Date-only ActiveSupport intrinsics for Spinel. Loaded only with the
 # bounded Date package (`app_uses_date`) — Campfire and other date-free
 # apps must not see `Date` / `Date?` in the always-on time-parsing seam

@@ -231,8 +231,9 @@ module ActiveRecord
     # shape, so a strict target that needs it has a spelling.
     def select: (*(String | Symbol) specs) ?{ (Base) -> bool } -> Relation
     def select!: (*(String | Symbol) specs) -> Relation
-    def distinct: () -> Relation
-    def distinct!: () -> Relation
+    def distinct: (?(bool | Symbol | String) value) -> Relation
+    def distinct!: (?(bool | Symbol | String) value) -> Relation
+    def all: () -> Relation
     def includes: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
     def includes!: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
     def preload: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
@@ -394,7 +395,8 @@ module ActiveRecord
     def one?: (*untyped pattern) ?{ (Base) -> bool } -> bool
     def many?: () ?{ (Base) -> bool } -> bool
     def all?: () { (Base) -> bool } -> bool
-    def exists?: (?(Integer | String | Hash[String | Symbol, untyped] | nil | false) condition) -> bool
+    # Not `?condition`: the def takes `*conditions`, and spinel types a positional field by the def's own slot.
+    def exists?: (*(Integer | String | Hash[String | Symbol, untyped] | nil | false) conditions) -> bool
     def probe_existence: (Integer n) -> Integer
     def more_than?: (Integer n) -> bool
     def length: () -> Integer

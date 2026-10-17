@@ -330,11 +330,11 @@ end
 "#,
     );
     assert!(
-        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", "taken", "has already been taken")"#),
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", "taken", "has already been taken", "Title has already been taken", true, true)"#),
         "a Symbol message is the error type:\n{out}"
     );
     assert!(
-        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", why, why)"#),
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", why, why, "Title #{why}", false, true)"#),
         "a String message is its own type:\n{out}"
     );
     assert!(diags.is_empty(), "{diags:?}");

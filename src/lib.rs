@@ -21,6 +21,8 @@ pub mod effect;
 pub mod emit;
 pub mod erb;
 pub mod expr;
+/// Project extensions: gem and DSL facts an app lists in `roundhouse.yml`
+/// and keeps in its own tree, carried on [`App::extensions`].
 pub mod extensions;
 pub mod facades;
 /// The generated Rails fixtures (`fixtures/real-blog`, `fixtures/store`)

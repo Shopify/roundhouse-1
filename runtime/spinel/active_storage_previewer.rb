@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `ActiveStorage::Previewer.poster` over ffmpeg — the ruby family's
 # reopen of the shared definition (runtime/ruby/active_storage.rb),
 # which raises. Rails' nested `Previewer::VideoPreviewer` is the

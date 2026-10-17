@@ -61,7 +61,8 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 /// skipped: the first two are already the analyzer's catalog (a second,
 /// partial, description of them would only disagree), and the last never
 /// enters the analysis at all. A gem an emitted tree loads natively
-/// (`crate::project::ruby_tree_loads_gem`) is read whatever its fate:
+/// (`crate::project::ruby_tree_loads_gem`, which includes
+/// the gems a project extension declares as runtime gems) is read whatever its fate:
 /// the analyzer has no model of it, and its constants run as the gem's.
 /// So is one this app's lock routes to Bundler.require
 /// (`GemBoundary::loaded`): opentelemetry-api is "infrastructure" by
@@ -73,14 +74,19 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
     dir: &Path,
     lock: &Lockfile,
     bundler: &[crate::app::BundlerGem],
+    extensions: &crate::extensions::Extensions,
 ) -> GemBoundary {
-    let mut boundary = GemBoundary { loaded: crate::project::lock_loaded_gems(lock, bundler), ..GemBoundary::default() };
+    let mut boundary = GemBoundary {
+        loaded: crate::project::lock_loaded_gems(lock, bundler, extensions),
+        extension_runtime_gems: extensions.runtime_gems.iter().map(|row| row.gem.clone()).collect(),
+        ..GemBoundary::default()
+    };
     let loaded = boundary.loaded.clone();
     read_gem_rbis(vfs, dir, lock, &mut boundary, |name| {
         matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled)
-            || crate::project::ruby_tree_loads_gem(name)
+            || crate::project::ruby_tree_loads_gem(extensions, name)
             || loaded.contains(name)
-            || crate::project::gem_requires_rails(name).is_some()
+            || crate::project::gem_requires_rails(extensions, name).is_some()
     });
     boundary
 }
@@ -212,7 +218,7 @@ fn gem_names_namespace(gem: &str, class: &str) -> bool {
 impl Reader<'_> {
     fn class_entry(&mut self, name: &str, is_module: bool) -> &mut GemClass {
         let gem = self.gem;
-        let lock_loaded = &self.out.loaded;
+        let (lock_loaded, extension_gems) = (&self.out.loaded, &self.out.extension_runtime_gems);
         let entry = self.out.classes.entry(ClassId(Symbol::new(name))).or_default();
         if entry.gem.is_empty() {
             entry.gem = gem.to_string();
@@ -222,7 +228,9 @@ impl Reader<'_> {
             // reopens minitest's `Minitest::Result`); otherwise the gem
             // named after its namespace does (hedwig reopens redis's
             // `Redis::CommandError`).
-            let loaded = |g: &str| crate::project::ruby_tree_loads_gem(g) || lock_loaded.contains(g);
+            let loaded = |g: &str| {
+                crate::project::base_tree_loads_gem(g) || extension_gems.contains(g) || lock_loaded.contains(g)
+            };
             let (held, offered) = (loaded(&entry.gem), loaded(gem));
             if (offered && !held)
                 || (offered == held && !gem_names_namespace(&entry.gem, name) && gem_names_namespace(gem, name))

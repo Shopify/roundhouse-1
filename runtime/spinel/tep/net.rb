@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # All FFI plumbing lives at the top level so spinel's name resolver
 # finds it from anywhere in the Tep tree (nested modules confuse it).
 #

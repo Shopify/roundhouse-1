@@ -68,7 +68,7 @@ pub fn ingest_library_classes(
     source: &[u8],
     file: &str,
 ) -> IngestResult<Vec<LibraryClass>> {
-    library_classes(source, file, false, true)
+    library_classes(source, file, false, None)
 }
 
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
@@ -82,7 +82,7 @@ pub fn ingest_app_library_classes(
     source: &[u8],
     file: &str,
 ) -> IngestResult<Vec<LibraryClass>> {
-    library_classes(source, file, true, true)
+    library_classes(source, file, true, None)
 }
 
 /// Like [`ingest_library_classes`], but only classes/modules NESTED
@@ -102,18 +102,26 @@ pub fn ingest_app_library_classes(
 /// top-level declarations avoids that spurious failure entirely,
 /// rather than chasing down every way the library walk might refuse
 /// something the model walk already accepted.
+///
+/// The one top-level declaration it does take is a compact name under
+/// the model, `module Outer::Uploads` written beside `class Outer`:
+/// nested by name, though not by lexical scope. Writebook's
+/// `ActionText::Markdown::Uploads` concern is written this way.
 pub fn ingest_nested_library_classes(
     source: &[u8],
     file: &str,
+    outer: &str,
 ) -> IngestResult<Vec<LibraryClass>> {
-    library_classes(source, file, false, false)
+    library_classes(source, file, false, Some(outer))
 }
 
+/// `nested_in`: `None` walks every declaration; `Some(outer)` walks
+/// only nested ones and top-level compact names under `outer`.
 fn library_classes(
     source: &[u8],
     file: &str,
     constant_files: bool,
-    include_top_level: bool,
+    nested_in: Option<&str>,
 ) -> IngestResult<Vec<LibraryClass>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
@@ -122,7 +130,15 @@ fn library_classes(
     // (`file_program`), which Ruby runs only when the guard does not
     // return.
     let guard = file_guard_offset(&root).unwrap_or(usize::MAX);
-    let mut out = declared_classes_in(&root, file, guard, &[], include_top_level)?;
+    let mut out = declared_classes_in(&root, file, guard, &[], nested_in)?;
+    // `X = Data.define(:a)` alone in a file is the class `X`
+    // (`file_data_class`); the rest of this walk would carry it as a
+    // file-level constant.
+    if out.is_empty() {
+        if let Some(lc) = file_data_class(&root, file)? {
+            return Ok(vec![lc]);
+        }
+    }
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
     // parser's `rule(:stopword)` reads it. Ruby binds these on Object, so
@@ -238,7 +254,7 @@ fn library_classes(
 /// classes: classes, then modules, a `Class.new` constant right after
 /// its owner (the file-level walk adds the rest).
 fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> IngestResult<Vec<LibraryClass>> {
-    declared_classes_in(node, file, before, &[], true)
+    declared_classes_in(node, file, before, &[], None)
 }
 
 /// Every class and module the declaration `node` makes, itself and
@@ -250,26 +266,34 @@ pub(super) fn declared_classes_under(
     file: &str,
     outer: &[String],
 ) -> IngestResult<Vec<LibraryClass>> {
-    declared_classes_in(node, file, usize::MAX, outer, true)
+    declared_classes_in(node, file, usize::MAX, outer, None)
 }
 
 /// [`declared_classes`] for `node` written inside the body of `outer`
 /// (its qualified segments): a declaration in a load-time conditional
-/// of that body (`ConditionalArm::declarations`). Without
-/// `include_top_level`, only what is nested inside another class or
-/// module body (the model walk's second pass over a model file).
+/// of that body (`ConditionalArm::declarations`). With `nested_in`
+/// (`Some(outer)`), only what is nested inside another class or module
+/// body, and top-level compact names under `outer` (the model walk's
+/// second pass over a model file).
 fn declared_classes_in(
     node: &ruby_prism::Node<'_>,
     file: &str,
     before: usize,
     outer: &[String],
-    include_top_level: bool,
+    nested_in: Option<&str>,
 ) -> IngestResult<Vec<LibraryClass>> {
+    let walked = |scope: &[String], path: Option<Vec<String>>| match nested_in {
+        None => true,
+        Some(_) if !scope.is_empty() => true,
+        Some(outer) => path.is_some_and(|path| {
+            path.join("::").strip_prefix(outer).is_some_and(|rest| rest.starts_with("::"))
+        }),
+    };
     let mut out = Vec::new();
     let within = |scope: Vec<String>| -> Vec<String> { outer.iter().cloned().chain(scope).collect() };
     for (scope, class) in find_all_classes_with_scope(node)
         .into_iter()
-        .filter(|(scope, _)| include_top_level || !scope.is_empty())
+        .filter(|(scope, class)| walked(scope, class_name_path(class)))
     {
         if class.location().start_offset() >= before {
             continue;
@@ -294,7 +318,7 @@ fn declared_classes_in(
     }
     for (scope, module) in find_all_module_declarations_with_scope(node)
         .into_iter()
-        .filter(|(scope, _)| include_top_level || !scope.is_empty())
+        .filter(|(scope, module)| walked(scope, module_name_path(module)))
     {
         if module.location().start_offset() >= before {
             continue;
@@ -349,7 +373,7 @@ fn conditionally_declared(
         for (_, statements) in &conditional.arms {
             for stmt in statements {
                 if visibility::is_declaration(stmt) {
-                    out.extend(declared_classes_in(stmt, file, usize::MAX, outer, true)?);
+                    out.extend(declared_classes_in(stmt, file, usize::MAX, outer, None)?);
                 } else if let Some(nested) = visibility::conditional_definition(stmt) {
                     walk(&nested, file, outer, out)?;
                 }
@@ -1037,6 +1061,7 @@ fn program_branch(
 /// first constant is `first`.
 pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
     LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
@@ -1107,6 +1132,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
@@ -1123,6 +1149,141 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
         class_ivar_initializers: Vec::new(),
         visibility_overrides: Vec::new(),
     })
+}
+
+/// The class that a file with the one statement `X = Data.define(:a,
+/// :b)` creates. This is the Zeitwerk shape of a value class: Ruby
+/// creates the class when it assigns the constant, so it is a library
+/// class, not a file-level constant that is hoisted into another class.
+/// Only distinct literal Symbol members are admitted. Other factories
+/// stay unresolved constants.
+///
+/// A `do … end` block is the class body: Ruby runs it with `self` as
+/// the new class. A `class` or `module` in the block belongs to the
+/// enclosing scope, which the emitted reopen of `X` cannot express, so
+/// the file is rejected.
+fn file_data_class(root: &ruby_prism::Node<'_>, file: &str) -> IngestResult<Option<LibraryClass>> {
+    let Some((name, call)) = file_data_factory(root) else { return Ok(None) };
+    let Some(members) = data_members(&call) else { return Ok(None) };
+    let owner = ClassId(Symbol::from(name));
+    let body = || call.block().and_then(|block| block.as_block_node()).and_then(|block| block.body());
+    if let Some(body) = body() {
+        if flatten_statements(body)
+            .iter()
+            .any(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
+        {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "class or module inside a Data.define block".into(),
+            });
+        }
+    }
+    let DeclBody {
+        includes,
+        include_spans,
+        mut methods,
+        constants,
+        unknown_calls,
+        class_initializers,
+        visibility_overrides,
+        method_aliases,
+        conditional_definitions,
+        class_attribute_effects,
+        class_attr_seeds,
+        discarded,
+        ..
+    } = walk_decl_body(body(), &owner, file, false)?;
+    note_discarded(file, discarded);
+    admit_nameless_rest(&mut methods);
+    let class_initializers = with_class_body_ivar_writes(class_initializers, body(), file)?;
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attribute_effects);
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attr_seeds);
+    Ok(Some(LibraryClass {
+        conditional_definitions,
+        method_aliases,
+        top_level_constants: Vec::new(),
+        name: owner,
+        is_module: false,
+        parent: None,
+        parent_span: Span::synthetic(),
+        includes,
+        include_spans,
+        methods,
+        nullable_columns: Vec::new(),
+        origin: Some(crate::dialect::LibraryClassOrigin::DataDefine {
+            members,
+            span: super::util::node_span(&call.as_node(), file),
+        }),
+        constants,
+        unknown_calls,
+        class_ivar_initializers: class_initializers,
+        visibility_overrides,
+    }))
+}
+
+/// The constant name and the `Data.define` call of a file whose only
+/// statement is `X = Data.define(…)` or `A::X = Data.define(…)`, with no
+/// block or with a `do … end` block that takes no parameters.
+fn file_data_factory<'pr>(
+    root: &ruby_prism::Node<'pr>,
+) -> Option<(String, ruby_prism::CallNode<'pr>)> {
+    let statements = root.as_program_node()?.statements().body();
+    let mut iter = statements.iter();
+    let (Some(statement), None) = (iter.next(), iter.next()) else {
+        return None;
+    };
+    let (name, value) = match statement.as_constant_write_node() {
+        Some(write) => (constant_id_str(&write.name()).to_string(), write.value()),
+        None => {
+            let write = statement.as_constant_path_write_node()?;
+            (static_constant_path(&write.target().as_node())?.join("::"), write.value())
+        }
+    };
+    let call = value.as_call_node()?;
+    if call.name().as_slice() != b"define" {
+        return None;
+    }
+    if let Some(block) = call.block() {
+        if block.as_block_node()?.parameters().is_some() {
+            return None;
+        }
+    }
+    if constant_path_of(&call.receiver()?)? != ["Data"] {
+        return None;
+    }
+    Some((name, call))
+}
+
+/// The segments of a constant path in which every part is a constant.
+/// `constant_path_of` drops a part that is not one, so it would read
+/// `record::X` as `X`.
+fn static_constant_path(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+    if let Some(read) = node.as_constant_read_node() {
+        return Some(vec![constant_id_str(&read.name()).to_string()]);
+    }
+    let path = node.as_constant_path_node()?;
+    let mut segments = match path.parent() {
+        Some(parent) => static_constant_path(&parent)?,
+        None => Vec::new(),
+    };
+    segments.push(constant_id_str(&path.name()?).to_string());
+    Some(segments)
+}
+
+/// The members of a `Data.define` call when each one is a distinct
+/// Symbol literal.
+fn data_members(call: &ruby_prism::CallNode<'_>) -> Option<Vec<Symbol>> {
+    let mut members = Vec::new();
+    if let Some(args) = call.arguments() {
+        for arg in args.arguments().iter() {
+            let member = Symbol::from(symbol_value(&arg)?);
+            if members.contains(&member) {
+                return None;
+            }
+            members.push(member);
+        }
+    }
+    Some(members)
 }
 
 /// `NAME = <expr>` statements at the top level of a file, in source
@@ -1403,6 +1564,7 @@ pub(super) fn library_class_and_struct_base(
 
     let DeclBody {
         mut includes,
+        mut include_spans,
         mut methods,
         mut constants,
         mut unknown_calls,
@@ -1439,7 +1601,13 @@ pub(super) fn library_class_and_struct_base(
         // emitted as calls; the sorbet mixins have nothing left to
         // provide.
         unknown_calls.retain(|call| !is_struct_declaration(call));
-        includes.retain(|i| !i.0.as_str().starts_with("T::"));
+        // Keep `include_spans` aligned: both vecs are parallel and
+        // `retain` alone would desync them if applied separately.
+        let keep: Vec<bool> = includes.iter().map(|i| !i.0.as_str().starts_with("T::")).collect();
+        let mut k = keep.iter();
+        includes.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        include_spans.retain(|_| *k.next().unwrap());
         let mut synthesized = synth_sorbet_struct_methods(&owner, &members, comparable, true);
         let declares_props = methods
             .iter()
@@ -1525,6 +1693,7 @@ pub(super) fn library_class_and_struct_base(
                 source_parent_span
             },
             includes,
+            include_spans,
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -2567,6 +2736,7 @@ fn struct_class(
         parent: None,
         parent_span: Span::synthetic(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: Some(origin),
@@ -2722,6 +2892,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let visibility = Visibility::resolve_library(module.body().as_ref(), file, Some(&owner))?;
     let DeclBody {
         includes,
+        include_spans,
         mut methods,
         constants,
         unknown_calls,
@@ -2756,6 +2927,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         parent: None,
         parent_span: Span::synthetic(),
         includes,
+        include_spans,
         methods,
         nullable_columns: Vec::new(),
         origin: None,
@@ -2843,6 +3015,7 @@ fn concerning_modules(
             },
         );
         out.push(LibraryClass {
+            include_spans: Vec::new(),
             conditional_definitions,
             method_aliases,
             top_level_constants: Vec::new(),
@@ -2983,6 +3156,9 @@ pub(crate) fn reads_instance_variable(expr: &Expr) -> bool {
 #[derive(Default)]
 struct DeclBody {
     includes: Vec<ClassId>,
+    /// Parallel to `includes`: the span of each `include` call, so an
+    /// unresolved one can be pointed at.
+    include_spans: Vec<Span>,
     methods: Vec<MethodDef>,
     constants: Vec<(Symbol, Expr)>,
     unknown_calls: Vec<Expr>,
@@ -3362,6 +3538,7 @@ fn body_statement(node: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> {
 impl DeclBody {
     fn extend(&mut self, other: Self) {
         self.includes.extend(other.includes);
+        self.include_spans.extend(other.include_spans);
         self.methods.extend(other.methods);
         self.constants.extend(other.constants);
         self.unknown_calls.extend(other.unknown_calls);
@@ -5058,6 +5235,12 @@ fn walk_decl_body_in<'pr>(
                                     });
                                     let root = if rooted { "::" } else { "" };
                                     out.includes.push(ClassId(Symbol::from(format!("{root}{}", path.join("::")))));
+                                    // The `include` call's own span, not
+                                    // the argument's: a refusal should
+                                    // point at `include` even when the
+                                    // module name sits on a continuation
+                                    // line (`include\n  X`).
+                                    out.include_spans.push(super::util::node_span(&stmt, file));
                                 } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,
@@ -5069,6 +5252,7 @@ fn walk_decl_body_in<'pr>(
                                     // ruby emit rewrites `X.<helper>` call
                                     // sites through RouteHelpers.
                                     out.includes.push(ClassId(Symbol::from("RouteHelpers")));
+                                    out.include_spans.push(super::util::node_span(&stmt, file));
                                 }
                             }
                         }
@@ -7199,6 +7383,8 @@ pub fn ingest_concern_filters(
                                     "controller concern macro not recognized: `{name}` (its effect is dropped from the output)"
                                 ),
                             });
+                        } else {
+                            record_concern_csp_divergence(&inner, file);
                         }
                     }
                 }
@@ -7263,6 +7449,40 @@ fn block_form_concern_filter(stmt: &ruby_prism::Node<'_>, file: &str) -> Option<
         block: Some(expr),
         prepend: false,
     })
+}
+
+/// A `content_security_policy do |p| … end` statement inside a
+/// concern's `included do` block, read the same way a controller's own
+/// class-body declaration is (`ingest::app::csp_block_is_recognized`) —
+/// INTERIM, rubys/roundhouse#58 CSP option 2: until CSP is modelled, a
+/// block whose directives this ingest can read is a recorded
+/// divergence rather than a silent drop, and never blocks a route (no
+/// item from it is spliced into any includer's body, so there is
+/// nothing here for `routes::plan`'s gap-blocking to attribute to one —
+/// see that module's doc comment on concern-only gaps). A stranger
+/// form is left exactly as every OTHER statement this loop doesn't
+/// recognize: dropped with no gap, unchanged from today.
+fn record_concern_csp_divergence(stmt: &ruby_prism::Node<'_>, file: &str) {
+    let Some(call) = stmt.as_call_node() else { return };
+    // `arguments().is_some()` excludes `content_security_policy only:
+    // :player do … end` — Rails scopes that policy to one action,
+    // which this ingest doesn't model, so it keeps today's (silent)
+    // drop regardless of how plain the block looks.
+    if call.receiver().is_some()
+        || constant_id_str(&call.name()) != "content_security_policy"
+        || call.arguments().is_some()
+        || call.block().is_none()
+    {
+        return;
+    }
+    let Ok(expr) = ingest_expr(stmt, file) else { return };
+    let crate::expr::ExprNode::Send { block: Some(blk), .. } = &*expr.node else { return };
+    if super::app::csp_block_is_recognized(blk) {
+        super::survey::record(&super::IngestError::Unsupported {
+            file: file.to_string(),
+            message: super::app::CSP_DIVERGENCE_MESSAGE.to_string(),
+        });
+    }
 }
 
 /// Model DSL declared inside a concern module's `included do` block —
@@ -7920,8 +8140,9 @@ fn ingest_concern_hook_items(
                                 // items; keep the ones the callback
                                 // lowering understands so the concern
                                 // splice carries them into each
-                                // includer. Other Unknowns stay with the
-                                // module.
+                                // includer. Unclaimed direct statements
+                                // also run on an ActiveSupport::Concern's
+                                // includer, not on the module.
                                 ModelBodyItem::Unknown { .. } => {
                                     // The shape refusal (models only) is
                                     // recorded after the block's context

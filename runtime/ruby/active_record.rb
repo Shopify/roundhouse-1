@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "active_record/errors"
 # The rest of Rails' exception hierarchy, Ruby-family only (not on the
 # strict-target transpile tables, unlike errors.rb).
@@ -20,6 +21,7 @@ require_relative "active_record/token_for"
 require_relative "active_record/friendly_id"
 require_relative "active_record/arel"
 require_relative "active_record/relation"
+require_relative "active_record/preloading"
 
 # activerecord gem_version.rb and version.rb, from Shopify/rails
 # 5813559f4aed (8.2.0.alpha), which is the Rails Core runs

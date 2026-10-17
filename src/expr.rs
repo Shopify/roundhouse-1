@@ -310,6 +310,9 @@ pub const RAW_ATTRIBUTE_READ: u64 = 1 << 39;
 /// answering `to_hash`) has no `merge` of its own: the lowering converts it
 /// first (`lower::indifferent_access`).
 pub const SPLAT_MERGE_BASE: u64 = 1 << 40;
+/// A `t` in a controller's copy of an `app/helpers` method no controller
+/// calls: it only ever runs in the view, so it is ActionView's `t`.
+pub const HELPER_COPY_TRANSLATE: u64 = 1 << 41;
 
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
@@ -2055,7 +2058,7 @@ mod tests {
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
             FROM_PARAMS_EXPECT, CONSTRUCTOR_KEYWORDS_AS_WRITTEN,
-            DISCARDED_VALUE, ADMITTED_PRELOADER_CALL, UNINDEXED_SCOPE_CONST_REF, REVERSE_MERGE, CLASS_METHODS_BLOCK_STATEMENT, RAW_ATTRIBUTE_READ, SPLAT_MERGE_BASE,
+            DISCARDED_VALUE, ADMITTED_PRELOADER_CALL, UNINDEXED_SCOPE_CONST_REF, REVERSE_MERGE, CLASS_METHODS_BLOCK_STATEMENT, RAW_ATTRIBUTE_READ, SPLAT_MERGE_BASE, HELPER_COPY_TRANSLATE,
             crate::emit::rust::decide::bits::STR_TO_OWNED, crate::emit::rust::decide::bits::STR_BORROW,
             crate::emit::rust::decide::bits::CLONE_AT,
         ];

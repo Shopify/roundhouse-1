@@ -1039,7 +1039,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         body: syn(ExprNode::Seq {
             exprs: vec![
                 syn(ExprNode::Assign {
-                    target: crate::expr::LValue::Ivar { name: cache },
+                    target: crate::expr::LValue::Ivar { name: cache.clone() },
                     value: var(&att),
                 }),
                 syn(ExprNode::Lit { value: Literal::Nil }),
@@ -1053,6 +1053,47 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         mutates_self: true,
         block_param: None,
     });
+
+    // `def <attr>_attachment_loaded?; !@<attr>_cache.nil?; end` — Rails'
+    // `association(:<attr>_attachment).loaded?`, the flat predicate
+    // `lower::assoc_loaded` rewrites that spelling onto. The proxy is
+    // cached by the preload and by the first read, both of which Rails
+    // counts as loading the attachment.
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: attachment_loaded_name(attr),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body: syn(ExprNode::Send {
+            recv: Some(syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::Ivar { name: cache })),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            })),
+            method: Symbol::from("!"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        }),
+        signature: Some(super::model_to_library::fn_sig(vec![], Ty::Bool)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
+/// `<attr>_attachment_loaded?` — the flat loaded flag of a
+/// `has_one_attached :<attr>`.
+pub fn attachment_loaded_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("{}_loaded?", attachment_assoc_name(attr).as_str()))
 }
 
 /// ```ruby

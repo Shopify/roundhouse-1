@@ -296,6 +296,7 @@ fn accessor_contexts_fail_strict_ingest_and_are_not_carried_in_survey() {
         ("attr_accessor :scratch\n    private :scratch", "include DraftState"),
         ("with_options if: false do\n      attr_accessor :scratch\n    end", "include DraftState"),
         ("attr_accessor :scratch\n    def scratch\n      'included override'\n    end", "include DraftState"),
+        ("attr_accessor :scratch\n    unknown_macro :scratch", "include DraftState"),
         ("attr_accessor :scratch", "def scratch\n    'earlier'\n  end\n  include DraftState"),
         ("attr_accessor :scratch", "def scratch=(value)\n    @scratch = value\n  end\n  include DraftState"),
         ("attr_accessor :body", "include DraftState"),

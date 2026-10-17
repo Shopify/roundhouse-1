@@ -293,9 +293,10 @@ pub(crate) fn push_error_details(e: &mut Expr, i18n: &crate::i18n::ModelI18n) {
         crate::expr::ErrorDetail::Unknown => return,
     };
     let attribute = tag.attribute.clone();
+    let (symbolic, optionless) = crate::lower::errors_add::detail_flags(&tag.detail);
     // The push keeps its hint: the CRuby and JRuby trees record it too.
     let push = e.clone();
-    *e = crate::lower::errors_add::attributed_push(push, None, attribute.as_str(), kind, bare, span);
+    *e = crate::lower::errors_add::attributed_push(push, None, attribute.as_str(), kind, symbolic, optionless, bare, span);
 }
 
 /// `errors << msg; error_details << ErrorDetail.new(..)`, the pair

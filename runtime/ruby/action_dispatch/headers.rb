@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 module ActionDispatch
   module Http
     # `request.headers` — Rails' `ActionDispatch::Http::Headers`: reads a

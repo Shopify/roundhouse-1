@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Minitest-shaped, like hash_to_query_test.rb: a CRuby-only framework
 # test of the ruby family's Array attribute-value reopen
 # (runtime/attr_value_text.rb over the shared runtime/action_view). The

@@ -319,6 +319,26 @@ pub(super) fn dispatch_method_by_recv_ty(
             "sort" if args.is_empty() => Some(format!(
                 "{{ let mut __v = {recv_s}.clone(); __v.sort(); __v }}"
             )),
+            // Not `Vec::join` alone: it joins only strings, where Ruby's `join` writes each element's `to_s`, nil as "".
+            "join" if args.len() <= 1 && !matches!(**elem, Ty::Str) => {
+                let sep = args_s.first().cloned().unwrap_or_else(|| "\"\"".to_string());
+                let to_s = match &**elem {
+                    Ty::Int | Ty::Bool => "v.to_string()",
+                    Ty::Nil => "String::new()",
+                    // Only a `map` result: a runtime Array declared `Array[String?]` is a `Vec<String>` in Rust.
+                    Ty::Union { variants }
+                        if matches!(&*recv.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "map" | "collect"))
+                            && variants.len() == 2
+                            && variants.iter().any(|v| matches!(v, Ty::Nil))
+                            && variants.iter().any(|v| matches!(v, Ty::Str)) =>
+                    {
+                        "v.clone().unwrap_or_default()"
+                    }
+                    // Not Float: `f64`'s `to_string` writes 1.0 as "1", so it stays a build error rather than a wrong string.
+                    _ => return Some(format!("{recv_s}.join({sep})")),
+                };
+                Some(format!("{recv_s}.iter().map(|v| {to_s}).collect::<Vec<String>>().join(&{sep})"))
+            }
             "join" if args.is_empty() => Some(format!("{recv_s}.join(\"\")")),
             "join" if args.len() == 1 => Some(format!("{recv_s}.join({})", args_s[0])),
             // `arr.include?(x)` — Ruby's Array membership test. Rust's

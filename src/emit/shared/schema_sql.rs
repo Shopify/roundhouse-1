@@ -239,6 +239,26 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
             }
             lines.push(line);
         }
+        // Not on PostgreSQL yet: Rails adds its constraints with ALTER TABLE, and the fixture loader there must disable triggers to load out of order.
+        if dialect == Dialect::Sqlite {
+            for fk in &table.foreign_keys {
+                if !schema.tables.contains_key(&fk.to_table.0) {
+                    continue;
+                }
+                let mut line = format!(
+                    "  FOREIGN KEY ({}) REFERENCES {} ({})",
+                    dialect.ident(fk.from_column.as_str()),
+                    dialect.ident(fk.to_table.0.as_str()),
+                    dialect.ident(fk.to_column.as_str())
+                );
+                for (verb, action) in [("DELETE", &fk.on_delete), ("UPDATE", &fk.on_update)] {
+                    if let Some(sql) = referential_action_sql(action) {
+                        line.push_str(&format!(" ON {verb} {sql}"));
+                    }
+                }
+                lines.push(line);
+            }
+        }
         writeln!(s, "{}", lines.join(",\n")).unwrap();
         s.push(')');
         out.push(s);
@@ -264,6 +284,17 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
         }
     }
     Ok(out)
+}
+
+fn referential_action_sql(action: &crate::schema::ReferentialAction) -> Option<&'static str> {
+    use crate::schema::ReferentialAction::*;
+    match action {
+        NoAction => None,
+        Restrict => Some("RESTRICT"),
+        Cascade => Some("CASCADE"),
+        SetNull => Some("SET NULL"),
+        SetDefault => Some("SET DEFAULT"),
+    }
 }
 
 /// Reject a schema that a target dialect cannot represent. Current

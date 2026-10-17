@@ -29,15 +29,10 @@ use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 
-/// Synthesize class-side wrappers on every mailer class. Returns the
-/// residue ledger: instance methods left unwrapped, with the reason.
-pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
-
-    // Transitive parent-chain closure: ApplicationMailer names
-    // ActionMailer::Base directly, BanNotification names
-    // ApplicationMailer. Iterate to fixpoint since ingest order is
-    // arbitrary.
+/// Every mailer class: transitive parent-chain closure, since
+/// ApplicationMailer names ActionMailer::Base directly, BanNotification
+/// names ApplicationMailer, and ingest order is arbitrary.
+pub(crate) fn mailer_names(app: &App) -> BTreeSet<String> {
     let mut mailers: BTreeSet<String> = BTreeSet::new();
     loop {
         let mut changed = false;
@@ -58,6 +53,15 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             break;
         }
     }
+    mailers
+}
+
+/// Synthesize class-side wrappers on every mailer class. Returns the
+/// residue ledger: instance methods left unwrapped, with the reason.
+pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    let mailers = mailer_names(app);
     if mailers.is_empty() {
         return diags;
     }

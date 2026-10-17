@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "errors"
 require "time"
 
@@ -186,16 +187,24 @@ module ActiveRecord
 
   # One error as Rails' `ActiveModel::Error` holds it: the attribute, the
   # error type (the message itself when `errors.add` was given a String),
-  # and the message without the attribute's name.
+  # the message without the attribute's name, the full message
+  # `errors` lists for it, whether the type is a Symbol, and whether
+  # Rails' `details` keeps nothing beside the type (no `count:` or `value:`).
   # Not `ActiveModel::Error`: the strict targets emit the class unqualified, beside their own `Error`.
   class ErrorDetail
     # `kind`, not Rails' `type`: a field named `type` does not compile in Rust or Go
-    attr_reader :attribute, :kind, :message
+    attr_reader :attribute, :kind, :message, :full_message, :symbolic, :optionless
 
-    def initialize(attribute, kind, message)
+    # The runtime's own pushes (`ActiveModel::ErrorAttributes.sync`, the
+    # CRuby overlay's `blank` check) name the first three: the rest default
+    # to the message as its full text, a Symbol type, and no options.
+    def initialize(attribute, kind, message, full_message = message, symbolic = true, optionless = true)
       @attribute = attribute
       @kind = kind
       @message = message
+      @full_message = full_message
+      @symbolic = symbolic
+      @optionless = optionless
     end
   end
 
@@ -1013,10 +1022,16 @@ module ActiveRecord
       _transaction_committed
     end
 
-    # transactions.rb `committed!`. The commit-hook overrides a model
-    # can still carry (broadcasts_to, an STI subclass's symbol
-    # callbacks) run after the lowered chain.
+    # transactions.rb `committed!`. The ruby-family connection.rb reopen
+    # overrides this to hold the callbacks while a transaction is open
+    # and run them (`_transaction_committed_now`) at its outermost COMMIT.
     def _transaction_committed
+      _transaction_committed_now
+    end
+
+    # The commit-hook overrides a model can still carry (broadcasts_to,
+    # an STI subclass's symbol callbacks) run after the lowered chain.
+    def _transaction_committed_now
       if _trigger_transactional_callbacks?
         @_committed_already_called = true
         _run_commit_hooks
@@ -1366,7 +1381,9 @@ module ActiveRecord
     # is registered on `after_touch` — so without this call the
     # cascade stops one level short and a room's `updated_at` never
     # moves. The commit callbacks run as Rails runs them: an update
-    # when the model has an `updated_at` to touch.
+    # when the model has an `updated_at` to touch (the ruby-family
+    # reopen in connection.rb holds them until the enclosing
+    # transaction's COMMIT, and drops them on its ROLLBACK).
     # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
     # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     #

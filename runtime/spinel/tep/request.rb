@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require "json"
 # Tep::Request -- what the handler reads off the wire.
 module Tep

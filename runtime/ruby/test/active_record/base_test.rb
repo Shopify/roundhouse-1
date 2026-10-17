@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "../test_helper"
 
 # Skip entirely when `Db` / `SqliteAdapter` aren't loaded — the requires

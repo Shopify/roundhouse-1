@@ -108,19 +108,38 @@ fn t_must_because_rules_nil_out() {
 
 #[test]
 fn t_must_because_without_a_plain_reason_block_is_refused() {
+    // A forwarded `&blk`: the message comes from calling it, not in hand
+    // at the call site. A reason taking parameters: sorbet's `yield`
+    // passes none. `next`/`break` are defined relative to the block;
+    // inlined into the raise they are inside no block at all.
+    let forwarded = "class CartController < ApplicationController\n  def show(&blk)\n    T.must_because(Line.find_by(id: 1), &blk).bogus_after\n  end\nend\n";
     for line in [
-        "T.must_because(Line.find_by(id: 1)) { |x| \"a line\" }.bogus_after",
-        "T.must_because(Line.find_by(id: 1)) { next \"a line\" }.bogus_after",
+        action("T.must_because(Line.find_by(id: 1)) { |x| \"a line\" }.bogus_after"),
+        action("T.must_because(Line.find_by(id: 1)) { next \"a line\" }.bogus_after"),
+        action("T.must_because(Line.find_by(id: 1)) { break \"a line\" }.bogus_after"),
+        forwarded.to_string(),
     ] {
-        let failed = failed_sends(&action(line));
+        let line = line.as_str();
+        let failed = failed_sends(line);
         assert!(failed.iter().any(|(construct, detail)| construct == "non-nil assertion" && detail.contains("parameterless literal block")), "{line}: {failed:?}");
         // The refusal is the site's one row: the `not_nil!` standing for
         // the refused check is no second "no known method" failure.
         assert_eq!(failed.len(), 1, "{line}: {failed:?}");
         // Nil is not ruled out: the refused check's value still admits it.
-        let receiver = refused_check_receiver(&analyzed(&action(line)));
+        let receiver = refused_check_receiver(&analyzed(line));
         assert!(receiver.contains("Nil"), "{line}: {receiver}");
     }
+}
+
+#[test]
+fn t_must_because_allows_control_flow_owned_by_a_nested_block() {
+    // The `next` belongs to the inner iterator, not to the reason, so
+    // the inline keeps its boundary and the lowering stands.
+    let nested = receivers(&action(
+        "T.must_because(Line.find_by(id: 1)) { [1].map { |n| next n }.join }.bogus_after",
+    ));
+    assert_eq!(nested.len(), 1, "{nested:?}");
+    assert!(nested[0].contains("Line") && !nested[0].contains("Nil"), "{nested:?}");
 }
 
 #[test]

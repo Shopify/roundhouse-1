@@ -13,7 +13,10 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TARGETS = [
@@ -41,6 +44,7 @@ FLOOR_SMOKE_TARGETS = ["rust", "typescript", "ruby", "jruby"]
 # compare, WASM, and Spinel are not in this list.
 BASE = [
     "generate-fixture",
+    "unit-build",
     "unit",
     "build-roundhouse",
     "store-check",
@@ -88,9 +92,71 @@ SPINEL_TESTS = [
     "open_telemetry_stub_spinel",
     "around_block_filter_spinel",
     "plain_class_optional_keywords_spinel",
+    "jbuilder_array_value_spinel",
     "active_job_payload",
     "render_json_encoder_spinel",
+    "url_helpers_absolute_spinel",
+    "jbuilder_extract_attributes_spinel",
+    "hash_to_query_symbol_keys_spinel",
+    "storage_proxy_path_spinel",
+    "filter_block_params_spinel",
 ]
+# Seconds each suite took in spinel-framework (main run 38936441376, its
+# test binary's compile included), for balancing its shards; a suite not
+# listed counts as one Spinel build.
+SPINEL_TEST_SECONDS = {
+    "spinel_transaction_connection": 501,
+    "spinel_stmt_cache_lru": 203,
+    "param_binds": 181,
+    "not_found_parity_spinel": 169,
+    "param_binds_values": 126,
+    "param_binds_cleanup": 86,
+    "framework_tests_spinel": 78,
+    "date_columns_spinel": 62,
+    "postgres_json_types_spinel": 61,
+    "around_block_filter_spinel": 57,
+    "pessimistic_locking": 54,
+    "render_json_encoder_spinel": 54,
+    "jbuilder_array_value_spinel": 52,
+    "jbuilder_extract_attributes_spinel": 52,
+    "hash_to_query_symbol_keys_spinel": 51,
+    "open_telemetry_stub_spinel": 50,
+    "storage_proxy_path_spinel": 46,
+    "plain_class_optional_keywords_spinel": 41,
+    "url_helpers_absolute_spinel": 38,
+    "routes_segment_pattern_spinel": 37,
+    "generated_columns_spinel": 36,
+    "db_sqlite_concurrency": 23,
+    "spinel_pg_db": 19,
+    "spinel_net_http_start": 10,
+    **dict.fromkeys(
+        [
+            "spinel_web_push_crypto",
+            "spinel_db_lease",
+            "param_binds_planner",
+            "spinel_param_builder",
+            "rails_compat_vectors_spinel",
+            "active_job_payload",
+        ],
+        5,
+    ),
+}
+SPINEL_TEST_DEFAULT_SECONDS = 40
+SPINEL_FRAMEWORK_SHARDS = 4
+# Not balanced by count: these three take two to three times a typical test (local run, 2026-10-17).
+SPINEL_TOOLCHAIN_SECONDS = {
+    "real_blog_spinel_tests_pass": 265,
+    "identical_cli_emission_reuses_native_build_but_changed_ruby_rebuilds": 187,
+    "finite_concern_class_configuration_runs_natively": 133,
+}
+SPINEL_TOOLCHAIN_DEFAULT_SECONDS = 80
+SPINEL_TOOLCHAIN_SHARDS = 4
+SPINEL_TOOLCHAIN_THREADS = 4
+# tiny_api's gate runs alone after the suite on the last shard, so its seconds count once per test thread.
+SPINEL_TOOLCHAIN_TAIL = "tiny_api"
+SPINEL_TOOLCHAIN_TAIL_SECONDS = 111
+# The tables above are seeds and the fallback only: main's runs keep measured seconds in the Actions cache (ci.yml spinel-timings).
+SPINEL_TIMING_KINDS = ("framework", "toolchain")
 # Inputs of the ActiveJob payload gate (tests/active_job_payload.rs):
 # the files its driver loads beside it.
 ACTIVE_JOB_PAYLOAD_INPUTS = {
@@ -638,6 +704,113 @@ def select(
     )
 
 
+def positive_seconds(value):
+    # A bound, not math.isfinite: a huge JSON integer overflows its float conversion; NaN and inf fail it too.
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 86400
+
+
+def load_spinel_timings(raw):
+    """Recorded seconds per kind and test; anything malformed counts as unrecorded."""
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        kind: {
+            name: seconds
+            for name, seconds in data[kind].items()
+            if positive_seconds(seconds)
+        }
+        for kind in SPINEL_TIMING_KINDS
+        if isinstance(data.get(kind), dict)
+    }
+
+
+def spinel_timings_from_env():
+    path = os.environ.get("CI_SPINEL_TIMINGS_FILE", "")
+    try:
+        raw = Path(path).read_text() if path else os.environ.get("CI_SPINEL_TIMINGS", "")
+    except (OSError, UnicodeError):
+        raw = ""
+    return load_spinel_timings(raw)
+
+
+def spinel_test_seconds(test, timings=None):
+    recorded = (timings or {}).get("framework", {}).get(test)
+    return recorded or SPINEL_TEST_SECONDS.get(test, SPINEL_TEST_DEFAULT_SECONDS)
+
+
+def spinel_toolchain_seconds(test, timings=None):
+    recorded = (timings or {}).get("toolchain", {}).get(test)
+    return recorded or SPINEL_TOOLCHAIN_SECONDS.get(test, SPINEL_TOOLCHAIN_DEFAULT_SECONDS)
+
+
+def spinel_framework_shards(tests, count=SPINEL_FRAMEWORK_SHARDS, timings=None):
+    """Longest suite first onto the lightest shard; each shard keeps SPINEL_TESTS order."""
+    shards = [[] for _ in range(min(count, len(tests)) or 1)]
+    loads = [0] * len(shards)
+    for test in sorted(tests, key=lambda t: -spinel_test_seconds(t, timings)):
+        i = loads.index(min(loads))
+        shards[i].append(test)
+        loads[i] += spinel_test_seconds(test, timings)
+    return [{"shard": i, "tests": [t for t in tests if t in shard]} for i, shard in enumerate(shards)]
+
+
+def spinel_toolchain_shard(tests, shard, count=SPINEL_TOOLCHAIN_SHARDS, timings=None):
+    """This shard's tests: longest first onto the lightest shard, by name order within it."""
+    loads = [0] * count
+    tail = (timings or {}).get("toolchain", {}).get(SPINEL_TOOLCHAIN_TAIL, SPINEL_TOOLCHAIN_TAIL_SECONDS)
+    loads[-1] = tail * SPINEL_TOOLCHAIN_THREADS
+    mine = []
+    for test in sorted(tests, key=lambda t: (-spinel_toolchain_seconds(t, timings), t)):
+        i = loads.index(min(loads))
+        loads[i] += spinel_toolchain_seconds(test, timings)
+        if i == shard:
+            mine.append(test)
+    return sorted(mine)
+
+
+def record_timing(kind, name, seconds, ok):
+    if out := os.environ.get("CI_SPINEL_TIMINGS_OUT"):
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "a") as f:
+            f.write(json.dumps({"kind": kind, "name": name, "seconds": max(round(seconds), 1), "ok": ok}) + "\n")
+
+
+def run_timed(kind, name, command):
+    start = time.monotonic()
+    status = subprocess.run(command).returncode
+    record_timing(kind, name, time.monotonic() - start, status == 0)
+    return status
+
+
+def run_tests(kind, tests, parallel, command):
+    """Each test in its own process, so each one's seconds can be recorded."""
+    with ThreadPoolExecutor(max_workers=max(parallel, 1)) as pool:
+        statuses = list(pool.map(lambda t: run_timed(kind, t, [*command, t]), tests))
+    failed = [t for t, status in zip(tests, statuses) if status != 0]
+    print(f"{len(tests) - len(failed)} passed, {len(failed)} failed")
+    for test in failed:
+        print(f"::error::{test} failed")
+    return bool(failed)
+
+
+def merge_timings(previous, records, weight=0.5):
+    """Each passing test's seconds averaged into its last value; failures keep the last value."""
+    merged = {kind: dict(previous.get(kind, {})) for kind in SPINEL_TIMING_KINDS}
+    for record in records:
+        kind, name, seconds = record.get("kind"), record.get("name"), record.get("seconds")
+        if not isinstance(kind, str) or kind not in merged or not isinstance(name, str):
+            continue
+        if record.get("ok") is not True or not positive_seconds(seconds):
+            continue
+        last = merged[kind].get(name)
+        merged[kind][name] = round(last + (seconds - last) * weight) if last else round(seconds)
+    return merged
+
+
 def finish(
     jobs,
     extra,
@@ -692,6 +865,7 @@ def finish(
         "site": site,
         "spinel": spinel,
         "spinel_tests": spinel_tests or [],
+        "spinel_framework_shards": spinel_framework_shards(spinel_tests or []),
         "publish": publish,
         "extras_advisory": extras_advisory,
         "spinel_advisory": spinel_advisory,
@@ -846,12 +1020,12 @@ def check_results(plan, needs, *, compact=False):
     advisory = set(plan["advisory"]) if "advisory" in plan else set(ADVISORY)
     tracked = required if compact else plan["jobs"]
     complete = not failures and all(
-        _advisory_complete(j, needs.get(j, {}), advisory) for j in tracked
+        _advisory_complete(j, needs.get(j, {}), advisory, plan) for j in tracked
     )
     return failures, complete
 
 
-def _advisory_complete(job, need, advisory):
+def _advisory_complete(job, need, advisory, plan=None):
     """Whether one selected job counts as actually finished.
 
     Under continue-on-error, GitHub reports needs.*.result=success even when
@@ -869,7 +1043,12 @@ def _advisory_complete(job, need, advisory):
         return False
     keys = {
         "campfire-spinel-compare": ["default", "minor-gc", "verify-gen"],
-        "spinel-toolchain": ["parity", "rest"],
+        "spinel-toolchain": [f"shard-{i}" for i in range(SPINEL_TOOLCHAIN_SHARDS)],
+        "spinel-framework": [
+            f"shard-{s['shard']}"
+            for s in (plan or {}).get("spinel_framework_shards", [])
+        ]
+        or ["execution"],
     }.get(job, ["execution"])
     return all(need.get("outputs", {}).get(key) == "success" for key in keys)
 
@@ -888,8 +1067,50 @@ def write_outputs(values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["plan", "gate", "compact-gate"])
-    args = parser.parse_args()
+    parser.add_argument(
+        "command",
+        choices=["plan", "gate", "compact-gate", "toolchain-shard", "timed", "run-tests", "merge-timings"],
+    )
+    parser.add_argument("--shard", type=int)
+    parser.add_argument("--kind", choices=SPINEL_TIMING_KINDS)
+    parser.add_argument("--name")
+    parser.add_argument("--parallel", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("--previous")
+    parser.add_argument("--records")
+    parser.add_argument("--out")
+    argv = sys.argv[1:]
+    split = argv.index("--") if "--" in argv else len(argv)
+    args = parser.parse_args(argv[:split])
+    command = argv[split + 1 :]
+    if args.command == "toolchain-shard":
+        tests = [line.strip() for line in sys.stdin if line.strip()]
+        for test in spinel_toolchain_shard(tests, args.shard, timings=spinel_timings_from_env()):
+            print(test)
+        return False
+    if args.command == "timed":
+        return run_timed(args.kind, args.name, command) != 0
+    if args.command == "run-tests":
+        tests = [line.strip() for line in sys.stdin if line.strip()]
+        return run_tests(args.kind, tests, args.parallel, command)
+    if args.command == "merge-timings":
+        try:
+            previous = load_spinel_timings(Path(args.previous).read_text())
+        except (OSError, UnicodeError):
+            previous = {}
+        records = []
+        for path in sorted(Path(args.records).glob("*.jsonl")) if Path(args.records).is_dir() else []:
+            for line in path.read_text().splitlines():
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+        merged = merge_timings(previous, records)
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(merged, indent=1, sort_keys=True) + "\n")
+        print(f"merged {len(records)} records: " + ", ".join(f"{k} {len(v)}" for k, v in merged.items()))
+        return False
     if args.command != "plan":
         raw_plan = os.environ.get("CI_PLAN", "")
         if not raw_plan.strip():
@@ -976,6 +1197,10 @@ def main():
     )
     if reason:
         plan["reasons"].append(reason)
+    timings = spinel_timings_from_env()
+    plan["spinel_framework_shards"] = spinel_framework_shards(plan["spinel_tests"] or [], timings=timings)
+    if not any(timings.values()):
+        plan["reasons"].append("No recorded Spinel test seconds: shards balanced by the static tables")
     spinel = os.environ.get("CI_SPINEL_REVISION", "")
     if plan["spinel"] and not spinel:
         try:
@@ -1011,6 +1236,8 @@ def main():
             "extra-compare": plan["extra_compare"],
             "compare": plan["compare"],
             "spinel-tests": plan["spinel_tests"],
+            "spinel-framework-shards": plan["spinel_framework_shards"],
+            "spinel-timings": {"toolchain": timings.get("toolchain", {})},
             "smoke": plan["smoke"],
             "smoke-extra": plan["smoke_extra"],
             "extras-advisory": plan["extras_advisory"],

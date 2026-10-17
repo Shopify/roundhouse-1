@@ -306,3 +306,46 @@ end
     assert!(out.contains("errors.include?(:timeout)"), "{out}");
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+#[test]
+fn iterating_errors_iterates_the_error_details() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  include ActiveModel::Validations
+
+  def problems
+    errors.map { |error| [error.attribute, error.full_message] }
+  end
+
+  def base_problem
+    Draft.new.errors.find { |error| error.attribute == :base }
+  end
+
+  def first_attribute
+    errors.first.attribute
+  end
+end
+"#,
+    );
+    assert!(out.contains("error_details.map { |error| [error.attribute.to_sym, error.full_message] }"), "{out}");
+    assert!(out.contains("Draft.new.error_details.find { |error| error.attribute.to_sym == :base }"), "{out}");
+    assert!(out.contains("error_details.first.attribute.to_sym"), "{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn a_blockless_count_or_question_stays_on_the_messages() {
+    let (out, _) = lower_and_emit(
+        r#"
+class Draft
+  include ActiveModel::Validations
+
+  def summary
+    [errors.count, errors.any?, errors.count { |error| error.attribute == :base }]
+  end
+end
+"#,
+    );
+    assert!(out.contains("[errors.count, errors.any?, error_details.count { |error| error.attribute.to_sym == :base }]"), "{out}");
+}

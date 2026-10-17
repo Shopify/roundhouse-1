@@ -1141,6 +1141,18 @@ impl<'a> BodyTyper<'a> {
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
+        // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
+        if let Some(Ty::Class { id, .. }) = recv_ty {
+            if id.0.as_str() == "ActiveModel::Errors"
+                && crate::lower::errors_index::ERROR_ITERATORS.contains(&method.as_str())
+                && !self.classes().get(id).is_some_and(|c| c.instance_methods.contains_key(method))
+            {
+                let as_array = Ty::Array {
+                    elem: std::sync::Arc::new(Ty::Class { id: ClassId(Symbol::from("ActiveModel::Error")), args: vec![].into() }),
+                };
+                return self.dispatch(Some(&as_array), method, block_ret, args);
+            }
+        }
         // `self[:generated_at]` / `read_attribute(:generated_at)` read
         // the attribute TYPECAST, so `Time?` for a datetime column and
         // `BigDecimal?` for a decimal one -- the same value the
@@ -3256,6 +3268,9 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         "exclude?" | "intersect?" => Ty::Bool,
         // `Set` isn't parameterized, so the element type can't be carried.
         "to_set" => Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() },
+        // `ids.lazy.filter_map { … }.first` stops at the first hit; the
+        // lazy filters are registered on Enumerator::Lazy (stdlib.rs).
+        "lazy" => Ty::Class { id: ClassId(Symbol::from("Enumerator::Lazy")), args: vec![].into() },
         // JSON serialization of a collection is a String whatever the
         // elements are.
         "to_json" => Ty::Str,

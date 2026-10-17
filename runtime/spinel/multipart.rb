@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `multipart/form-data` for the ruby family: the parser, and the
 # `ActionDispatch::Http::UploadedFile` a file part becomes.
 #

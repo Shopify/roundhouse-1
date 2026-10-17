@@ -1,9 +1,9 @@
 //! Ruby's `Integer#/` floors (`-7 / 2 == -4`) and `Integer#%` takes the
-//! sign of the divisor (`-7 % 3 == 2`). TypeScript and Python `/` yield
-//! a float, and Rust's `/`/`%` and JS's `%` truncate toward zero, so
-//! each emitter renders an Int/Int pair in its floored form. Rust also
-//! had no operator arm for `%` and emitted `x.%(y)`, which does not
-//! parse.
+//! sign of the divisor (`-7 % 3 == 2`). TypeScript, Python and Elixir `/`
+//! yield a float, Elixir's `rem` takes the dividend's sign, and Rust's
+//! `/`/`%` and JS's `%` truncate toward zero, so each emitter renders
+//! an Int/Int pair in its floored form. Rust also had no operator arm
+//! for `%` and emitted `x.%(y)`, which does not parse.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -77,5 +77,14 @@ fn python_int_div_is_floor_div() {
     // Python's `%` already follows the divisor's sign.
     assert!(out.contains("a % 3"), "{out}");
     assert!(out.contains("a % -3"), "neg-divisor mod missing:\n{out}");
+    assert!(out.contains("7.0 / 2.0"), "Float / Float should stay `/`:\n{out}");
+}
+
+#[test]
+fn elixir_floors_int_div_and_mod() {
+    let out = emitted(BuildTarget::Elixir, "lib/article.ex");
+    assert!(out.contains("Integer.floor_div(a, 2)"), "Int / Int not floored:\n{out}");
+    assert!(out.contains("Integer.mod(a, 3)"), "Int % Int not floored:\n{out}");
+    assert!(out.contains("Integer.mod(a, -3)"), "neg-divisor mod missing:\n{out}");
     assert!(out.contains("7.0 / 2.0"), "Float / Float should stay `/`:\n{out}");
 }

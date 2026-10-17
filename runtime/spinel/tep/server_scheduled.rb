@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::Server::Scheduled -- Falcon-shape fiber-per-connection HTTP
 # server, built on Tep::Scheduler + sp_net non-blocking accept/recv.
 #

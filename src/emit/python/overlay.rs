@@ -290,6 +290,8 @@ fn emit_models(models: &[LibraryClass]) -> Result<String, String> {
         ("RecordNotFound", "from app.errors import RecordNotFound\n"),
         ("RecordInvalid", "from app.errors import RecordInvalid\n"),
         ("ErrorDetail(", "from app.active_record_base import ErrorDetail\n"),
+        // The written-down `render json:` encoder (`lower::as_json_writer`).
+        ("JsonBuilder.", "from app import json_builder as JsonBuilder\n"),
         // The temporal intrinsics (`ActiveSupport.db_now` et al)
         // render as `Roundhouse.RhDateTime.*` — same content-scan
         // import the legacy model emit makes.
@@ -638,7 +640,8 @@ fn emit_dispatch(
          \x20                request_format=fmt, query_string=qs)\n\
          \x20   location = c.location or \"\"\n\
          \x20   persisted = c.flash.to_persisted()\n\
-         \x20   if fmt != \"html\":\n\
+         \x20   # Not only the request's format: `render json:` / `render plain:` on an HTML request are not laid out either.\n\
+         \x20   if fmt != \"html\" or \"html\" not in (c.content_type or \"text/html\"):\n\
          \x20       ct = c.content_type or \"application/json; charset=utf-8\"\n\
          \x20       return _http.ActionResponse(body=c.body, status=c.status,\n\
          \x20                                   location=location,\n\

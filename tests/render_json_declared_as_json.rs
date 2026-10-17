@@ -164,7 +164,7 @@ fn the_json_arm_serves_each_records_writer() {
     let src = file(ruby::emit_lowered_controllers(&app), "stories_controller");
     assert!(src.contains("request_format == :json"), "the json arm was dropped:\n{src}");
     assert!(
-        src.contains(r#""[" + @stories.map { |record| record.as_json_str }.join(",") + "]""#),
+        src.contains(r#""[" + @stories.map { |item| item.as_json_str }.join(",") + "]""#),
         "{src}"
     );
     assert!(src.contains(r#"content_type: "application/json""#), "{src}");

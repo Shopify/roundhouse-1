@@ -452,11 +452,49 @@ fn untyped_subexpressions_baseline() {
     // find_or_create_by, Relation's, meta-PR #802's exists? arms). The
     // merged ceiling below is ours (786) plus that +25, PROVISIONAL: not
     // measured on the merged tree; re-measure with the probe and lower it.
+    // #818 AssociationReflection + `reflect_on_association`: 578 -> 583,
+    // MEASURED — initialize ivar writes and the name/assoc loop under
+    // raw inference (no RBS on this probe).
+    // `Model.find_or_initialize_by` / `find_or_create_by` / `find_or_create_by!`
+    // and Relation's `find_or_initialize_by` / `find_or_create_by!`:
+    // 578 -> 592, MEASURED over that commit.
+    // Meta-PR #802 (exists? arity / where-seed / related Relation arms):
+    // 592 -> 603, MEASURED on tip 86936194's CI unit shard.
+    // Remount remeasure after #818 merge: 603 -> 608.
+    // `ErrorDetail`'s full message: 608 -> 610, MEASURED — its
+    // initialize ivar write, untyped here like the other three fields'.
+    // `ErrorDetail#symbolic`: 610 -> 612, MEASURED — the same write.
+    // `ErrorDetail#optionless`: 612 -> 614, MEASURED — the same write.
+    // `ActiveRecord::Preloading.records` / `Base#_preload_as_group` (mixed-model
+    // `Associations::Preloader`): 614 -> 632, MEASURED — 16 + 2, every
+    // read of the `records`/`specs`/`group` parameters, untyped here
+    // without the RBS the runtime gate reads them with.
+    // `param_ty_with_default` no longer types a `= nil` parameter as
+    // always-`Nil` when no call site gives it a type: 632 -> 677,
+    // MEASURED — every read of such a parameter (Arel::Table/Attribute
+    // column/qualified/subquery/fragment, ErrorDetail's five ivar
+    // writes, etc.) is now a real inference var instead of a folded
+    // `Nil`, which is the honest "unknown" the RBS already says
+    // (`?untyped`) rather than a type that silently zeroed `presence`.
+
     // This uncalled API adds 27 nodes without its String parameter RBS.
     // Keep the existing-method ceiling and RBS-aware typing gates intact.
     const LIKE_CEILING: usize = 27;
     let existing_untyped = all_untyped.len() - like_untyped;
     eprintln!("inference-only ledger: existing={existing_untyped}, sanitize_sql_like={like_untyped}");
+    // Transactional saves (connection.rb: `save`/`destroy`/`touch` in a
+    // transaction, commit callbacks enlisted until the outermost COMMIT):
+    // 676 -> 757, MEASURED against origin/main 57f9521d3's runtime. The
+    // new `_commit_enlisted` (37), `_rollback_enlisted` (23),
+    // `_save_committed`/`_destroy_committed` (6), `_touch_owner` /
+    // `_adopt_touch_owner` (6), `_restore_after_rollback` (2) and the
+    // `transaction` / `update_attribute` / `changes_to_save` additions
+    // all read the enlisted list through `Db._txn_records` (or the
+    // owner slot) — unmodeled `Db` here, as the depth counter's reads
+    // above are; the RBS-paired gate types them all.
+    // Merge of origin/main 298fd9a1c into r13-merge: upstream measured 757 for its
+    // side alone; ours (811) already includes the same connection.rb port. PROVISIONAL:
+    // re-measure with the probe after the merged tree builds and lower it.
     const CEILING: usize = 811;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,

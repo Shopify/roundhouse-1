@@ -222,6 +222,35 @@ impl Model {
         })
     }
 
+    /// The association on this model, the `through:` model, that
+    /// supplies the rows of `through_assoc`. This is Rails'
+    /// `source_reflection_names`: the `source:` name when it is given,
+    /// and otherwise the singular name, then the name itself. `None`
+    /// when no candidate is declared here, or when both are (Rails
+    /// raises `AmbiguousSourceReflectionForThroughAssociation`). Never
+    /// match the source by class: a model can have two associations to
+    /// one class, and each one gives other rows.
+    pub fn through_source(&self, through_assoc: &Association) -> Option<&Association> {
+        let (Association::HasMany { name, source, .. } | Association::HasOne { name, source, .. }) = through_assoc
+        else {
+            return None;
+        };
+        let mut candidates = match source {
+            Some(source) => vec![source.clone()],
+            None => vec![Symbol::from(crate::naming::singularize(name.as_str())), name.clone()],
+        };
+        candidates.dedup();
+        // A later declaration of a name replaces an earlier one, as in Rails.
+        let found = candidates
+            .iter()
+            .filter_map(|c| self.associations().filter(|a| a.name() == c).last())
+            .collect::<Vec<_>>();
+        match found.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
     /// Like `associations()`, but paired with each declaration's source
     /// span — for lowerers that stamp synthesized methods with the
     /// `has_many`/`belongs_to` line they came from.
@@ -567,6 +596,17 @@ pub enum Association {
         /// app assembly once the target model is known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inverse_of: Option<Symbol>,
+        /// The `source:` option as written. It names the association on
+        /// the `through:` model that supplies the rows. Read it through
+        /// [`Model::through_source`], which also covers an omitted
+        /// `source:`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
+        /// Written with `class_name:` or `source_type:`. Otherwise app
+        /// assembly sets the `target` of a `through:` association to the
+        /// class of its source association, as Rails does.
+        #[serde(default, skip_serializing_if = "is_false")]
+        class_explicit: bool,
         dependent: Dependent,
         /// `has_many :notifications, as: :notifiable` — this side is
         /// one implementor of the named polymorphic interface; rows
@@ -704,6 +744,16 @@ impl Association {
             | Association::HasMany { name, .. }
             | Association::HasOne { name, .. }
             | Association::HasAndBelongsToMany { name, .. } => name,
+        }
+    }
+
+    /// The class the association points at.
+    pub fn target(&self) -> Option<&ClassId> {
+        match self {
+            Association::BelongsTo { target, .. }
+            | Association::HasMany { target, .. }
+            | Association::HasOne { target, .. }
+            | Association::HasAndBelongsToMany { target, .. } => Some(target),
         }
     }
 
@@ -1616,6 +1666,15 @@ pub struct LibraryClass {
     /// (e.g. `Enumerable`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub includes: Vec<ClassId>,
+    /// Span of each `include` call in `includes`, same length and
+    /// order. Ingest drops the call's own span once it resolves the
+    /// name (most of the time it's never needed again), so an
+    /// unresolved include had nowhere to point a diagnostic at; this
+    /// gives it one. Synthesized classes and a literal `LibraryClass`
+    /// built by a lowering (not ingested from source) carry an empty
+    /// vec, same as a missing `parent_span`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_spans: Vec<Span>,
     /// All instance + class methods in the class. `attr_reader` /
     /// `attr_writer` / `attr_accessor` are lowered to synthetic
     /// `MethodDef`s at ingest time (not preserved as attr declarations
@@ -1832,6 +1891,15 @@ pub struct TopLevelConstant {
 }
 
 impl LibraryClass {
+    /// The members and the `Data.define` span of a class that a
+    /// file-level `X = Data.define(…)` creates.
+    pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
+        match &self.origin {
+            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            _ => None,
+        }
+    }
+
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
     /// need source-ordered emission. Synthetic `mattr_*` / `cattr_*` `@@`
     /// seeds and other framework initialization stay on the partitioned
@@ -1851,6 +1919,18 @@ impl LibraryClass {
                 )
         })
     }
+}
+
+/// One property of a [`LibraryClassOrigin::RepresentableDecorator`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepresentableField {
+    /// The property name; its value is read by `representable_<name>`.
+    pub name: Symbol,
+    /// The JSON key (`as:`, else the name).
+    pub key: String,
+    /// The representer `extend:` names, when the value is rendered by
+    /// another one.
+    pub nested: Option<ClassId>,
 }
 
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to
@@ -1873,6 +1953,15 @@ pub enum LibraryClassOrigin {
     /// alone. This remains a source library class, not a model/params sibling.
     AlbaResource {
         declaration_span: Span,
+    },
+    /// A `Representable::Decorator` expanded to ordinary methods before
+    /// inference (`ingest::representable`): `representable_<name>`
+    /// readers, `to_hash`, `as_json_str`. `fields` lets
+    /// `lower::as_json_poro` settle each value's JSON encoder from its
+    /// analyzed type.
+    RepresentableDecorator {
+        declaration_span: Span,
+        fields: Vec<RepresentableField>,
     },
     /// Per-resource params holder synthesized from a controller's
     /// `permit([:f1, :f2, …])` declaration. `resource` is the singular
@@ -1929,6 +2018,23 @@ pub enum LibraryClassOrigin {
     /// (a class alias resolves to its target through the source index),
     /// and the Ruby family writes only the constants.
     FileConstants,
+    /// A `Dry::Validation::Contract` given its `call`, a `Dry::Schema`
+    /// constant's class, or what they share (`ingest::dry_validation`).
+    DryValidation,
+    /// dry-monads' Result and do-notation stand-ins (`ingest::dry_monads`).
+    DryMonads,
+    /// The class a file-level `X = Data.define(:a, :b)` creates, in a
+    /// file that declares nothing else. `members` are the literal
+    /// Symbol members in declaration order; `span` is the
+    /// `Data.define` call. The statements of a `do … end` block are the
+    /// class body, and its constants are the class's `constants`. Ruby
+    /// runs the block with `self` as the class, but with the top level
+    /// as its lexical scope. Ruby and Spinel emit the factory again;
+    /// other targets have no Data representation and reject it.
+    DataDefine {
+        members: Vec<Symbol>,
+        span: Span,
+    },
 }
 
 impl LibraryClassOrigin {
@@ -2811,9 +2917,10 @@ pub struct View {
     /// for the overwhelmingly common headerless partial/view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_locals: Option<Vec<Param>>,
-    /// Ingested for the analyzer only — a mailer's `.text.erb` variant
-    /// and the mailer layout: templates whose Ruby the type checks and
-    /// the IDE should see, but which no emitter renders yet.
+    /// Ingested for the analyzer only: a template whose Ruby the type
+    /// checks and the IDE should see, but which no emitter renders. No
+    /// ingest sets it today (a mailer's `.text.erb` renders, through
+    /// `lower::mailer_templates`).
     /// `session::analyze_and_lower` drops them before lowering;
     /// `check`, the LSP and the MCP keep them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

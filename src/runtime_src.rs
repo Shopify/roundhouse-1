@@ -814,30 +814,21 @@ fn seed_well_known_classes(
 /// (`ret` stripped); `block_params_for` needs the Fn. Non-block entries
 /// already present in `classes` still win (registry-seeded returns).
 ///
-/// When the caller registry lacks the enclosing class, `or_default`
-/// would otherwise build a sparse `ClassInfo` with only block-bearing
-/// methods — `send(name)` then unions to `Nil` instead of `Untyped`,
-/// and `{ (instance) -> void }` siblings stay unresolved. For those
-/// classes, also fill non-block local signatures with `or_insert`.
-/// Never mutates `classes`.
+/// Non-block local signatures fill in with `or_insert` for every
+/// enclosing class, not only one that declares a block: a sparse
+/// `ClassInfo` with only block-bearing methods unions `send(name)` to
+/// `Nil` instead of `Untyped`, and a module function's call to a
+/// sibling (`erb_url_encode` reading `erb_url_byte`) types unknown
+/// without it. Never mutates `classes`.
 fn typing_classes_with_local_block_contracts(
     classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     methods: &[MethodDef],
 ) -> crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
-    let declares_block: crate::det::HashSet<&Symbol> = methods
-        .iter()
-        .filter(|m| matches!(m.signature, Some(Ty::Fn { block: Some(_), .. })))
-        .filter_map(|m| m.enclosing_class.as_ref())
-        .collect();
-
     let mut typing_classes = classes.clone();
     for m in methods {
         let (Some(enclosing), Some(sig)) = (&m.enclosing_class, &m.signature) else {
             continue;
         };
-        if !declares_block.contains(enclosing) {
-            continue;
-        }
         let info = typing_classes
             .entry(crate::ident::ClassId(enclosing.clone()))
             .or_default();

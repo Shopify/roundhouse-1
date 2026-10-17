@@ -450,12 +450,13 @@ module ActiveModel
     def self.sync(value, errors, owner)
       return value unless errors.is_a?(Array) && defined?(::ActiveRecord::ErrorDetail) && owner.respond_to?(:error_details)
       details = []
-      each_record(errors) do |_message, pair|
+      each_record(errors) do |message, pair|
         next unless pair
         short = pair[2]
         type = pair[3]
         next if short.equal?(UNSPLIT) || type.equal?(UNKNOWN)
-        details << ::ActiveRecord::ErrorDetail.new(pair[0].to_s, type.to_s, short)
+        # A String message is its own type; any other type is a Symbol.
+        details << ::ActiveRecord::ErrorDetail.new(pair[0].to_s, type.to_s, short, message, type.to_s != short)
       end
       owner.error_details.replace(details)
       value

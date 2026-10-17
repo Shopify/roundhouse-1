@@ -171,6 +171,8 @@ pub(super) struct Inputs<'a, V: Vfs + ?Sized> {
     /// `require` of a file one of them owns is kept, for the emitted
     /// program to load it as Ruby does.
     pub gems: Option<(&'a Path, &'a crate::gems::Lockfile)>,
+    /// The app's project extensions: which gems are `rails_dependent`.
+    pub extensions: &'a crate::extensions::Extensions,
 }
 
 /// The app's load hooks: those the app's own code fires (hook → base),
@@ -752,6 +754,7 @@ fn lifted_registration(cpath: &str, site: &str, span: crate::span::Span) -> Resu
 
 pub(super) fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
     LibraryClass {
+        include_spans: Vec::new(),
         conditional_definitions: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(name)),
@@ -999,7 +1002,7 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
         // gem's entry does not itself require: the emitted `require`
         // loads it from the gem home.
         if target.is_none()
-            && inputs.gems.is_some_and(|(home, lock)| super::gem_source_constants::locked_gem_owns(inputs.vfs, home, lock, &feature))
+            && inputs.gems.is_some_and(|(home, lock)| super::gem_source_constants::locked_gem_owns(inputs.vfs, home, lock, inputs.extensions, &feature))
         {
             return;
         }

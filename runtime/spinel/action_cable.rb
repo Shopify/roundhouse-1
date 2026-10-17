@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionCable — the spinel-subset sibling of the CRuby overlay's
 # `ruby_overlay/runtime/action_cable.rb`.
 #

@@ -158,10 +158,14 @@ pub(super) fn try_recv_typed_method(
             // through `.get(...).unwrap_or(...)` instead — nullable
             // columns dropped the default and hit the panicking index.
             if map_holds_json_value(recv_ty) {
+                // A `Value` narrowed by `is_a?(Hash)` reads as a `serde_json::Map`, whose `get` borrows its String key.
+                let narrowed_object = matches!(&*r.node, ExprNode::Var { name, .. }
+                    if matches!(super::super::var_decl_ty(name.as_str()), Some(crate::ty::Ty::Untyped)));
+                let key = emit_expr(&args[0]);
+                let key = if narrowed_object { format!("&*{key}") } else { key };
                 return Some(format!(
-                    "{}.get({}).cloned().unwrap_or(serde_json::Value::Null)",
+                    "{}.get({key}).cloned().unwrap_or(serde_json::Value::Null)",
                     emit_expr(r),
-                    emit_expr(&args[0])
                 ));
             }
             if matches!(&*r.node, ExprNode::Const { .. }) {

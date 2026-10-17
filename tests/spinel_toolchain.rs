@@ -32,6 +32,10 @@ use roundhouse::ingest::ingest_app;
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/string_truncate.rs"]
+mod string_truncate;
+#[path = "spinel_toolchain/string_truncate.rs"]
+mod string_truncate_native;
 #[path = "support/array_excluding.rs"]
 mod array_excluding;
 #[path = "spinel_toolchain/array_excluding.rs"]
@@ -46,8 +50,20 @@ mod dry_initializer;
 mod data_factory;
 #[path = "support/dry_struct.rs"]
 mod dry_struct;
+#[path = "support/dry_validation.rs"]
+mod dry_validation;
+#[path = "support/dry_monads.rs"]
+mod dry_monads;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/cable_allowed_origins.rs"]
+mod cable_allowed_origins_contract;
+#[path = "spinel_toolchain/cable_allowed_origins.rs"]
+mod cable_allowed_origins;
+#[path = "support/public_file_server_headers.rs"]
+mod public_file_server_headers_contract;
+#[path = "spinel_toolchain/public_file_server_headers.rs"]
+mod public_file_server_headers;
 #[path = "support/cable_actions.rs"]
 mod cable_actions_contract;
 #[path = "spinel_toolchain/cable_actions.rs"]
@@ -60,6 +76,18 @@ mod cable_broadcast_json;
 mod index_with_contract;
 #[path = "spinel_toolchain/index_with.rs"]
 mod index_with;
+#[path = "support/send_data_filename.rs"]
+mod send_data_filename_contract;
+#[path = "spinel_toolchain/send_data_filename.rs"]
+mod send_data_filename;
+#[path = "support/vary_accept.rs"]
+mod vary_accept_contract;
+#[path = "spinel_toolchain/vary_accept.rs"]
+mod vary_accept;
+#[path = "support/erb_template.rs"]
+mod erb_template_contract;
+#[path = "spinel_toolchain/erb_template.rs"]
+mod erb_template;
 #[path = "support/anonymous_keywords.rs"]
 mod anonymous_keywords;
 #[path = "support/lambda_signatures.rs"]
@@ -70,6 +98,10 @@ mod lambda_signatures;
 mod native_http;
 #[path = "spinel_toolchain/action_controller_head.rs"]
 mod action_controller_head;
+#[path = "support/conditional_get.rs"]
+mod conditional_get_contract;
+#[path = "spinel_toolchain/conditional_get.rs"]
+mod conditional_get;
 #[path = "spinel_toolchain/action_dispatch_request_put.rs"]
 mod action_dispatch_request_put;
 #[path = "spinel_toolchain/strong_params.rs"]
@@ -86,6 +118,10 @@ mod json_params;
 mod io_process_constants_contract;
 #[path = "spinel_toolchain/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "support/class_side_default.rs"]
+mod class_side_default_contract;
+#[path = "spinel_toolchain/class_side_default.rs"]
+mod class_side_default;
 #[path = "spinel_toolchain/action_text_sanitize.rs"]
 mod action_text_sanitize;
 #[path = "support/campfire_caches.rs"]
@@ -98,8 +134,16 @@ mod ordinalize;
 mod params_helper_no_permit;
 #[path = "spinel_toolchain/rails_parity.rs"]
 mod rails_parity;
+#[path = "spinel_toolchain/api_parity_round3.rs"]
+mod api_parity_round3;
+#[path = "spinel_toolchain/api_parity_round4.rs"]
+mod api_parity_round4;
 #[path = "spinel_toolchain/server_binding.rs"]
 mod server_binding;
+#[path = "support/request_id_runtime.rs"]
+mod request_id_runtime_contract;
+#[path = "spinel_toolchain/request_id_runtime.rs"]
+mod request_id_runtime;
 
 /// Compile and execute the shared custom Data factory contract with Spinel;
 /// successful Ruby emission alone does not establish native target support.
@@ -116,6 +160,10 @@ fn custom_data_factories_run_natively() {
 mod stdlib_rnp_contract;
 #[path = "spinel_toolchain/stdlib_rnp.rs"]
 mod stdlib_rnp;
+#[path = "support/representable_decorator.rs"]
+mod representable_decorator;
+#[path = "spinel_toolchain/representable.rs"]
+mod representable;
 
 /// The native counterpart of the generic emitted-Ruby regression test.
 #[test]
@@ -493,4 +541,58 @@ fn identical_cli_emission_reuses_native_build_but_changed_ruby_rebuilds() {
     );
     assert!(fs::metadata(&executable).unwrap().modified().unwrap() > built_at);
     fs::remove_dir_all(scratch).unwrap();
+}
+
+/// The native half of `emit_and_run::dry_validation_contracts_run_lowered`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn dry_validation_contracts_run_lowered_natively() {
+    let run = dry_validation::overlay().run_spinel(&dry_validation::assertions());
+    run.assert_passes();
+    assert!(run.stdout.contains("dry-validation contract passed"));
+}
+
+/// The native half of `emit_and_run::dry_monads_results_run_lowered`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn dry_monads_results_run_lowered_natively() {
+    let run = dry_monads::overlay().run_spinel(&dry_monads::assertions());
+    run.assert_passes();
+    assert!(run.stdout.contains("dry-monads contract passed"));
+}
+
+/// The native half of `emit_and_run::named_capture_matches_assign_their_locals`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn named_capture_matches_assign_their_locals_natively() {
+    let run = emit_and_run::real_blog()
+        .write("lib/matcher.rb", r##"class Matcher
+  def self.map_name(html)
+    /usemap=\s*['"]#(?<map_name>\S+?)['"]/m =~ html
+    map_name
+  end
+
+  def self.pair(text)
+    if /(?<a>\d+)-(?<b>\d+)/ =~ text
+      [a, b]
+    else
+      [a, b, :none]
+    end
+  end
+
+  def self.index(text)
+    /(?<w>x)/ =~ text
+  end
+end
+"##)
+        .run_spinel(r##"raise "map" unless Matcher.map_name(%(<img usemap="#m1">)) == "m1"
+raise "map none" unless Matcher.map_name("none").nil?
+raise "pair" unless Matcher.pair("1-2") == ["1", "2"]
+raise "pair none" unless Matcher.pair("x") == [nil, nil, :none]
+raise "index" unless Matcher.index("abx") == 2
+raise "index none" unless Matcher.index("q").nil?
+puts "named captures passed"
+"##);
+    run.assert_passes();
+    assert!(run.stdout.contains("named captures passed"));
 }

@@ -116,6 +116,8 @@ module ActionText
     @pending_removals: Array[Array[Integer]]
     @last_pending_start: Integer?
     @last_pending_finish: Integer?
+    @plain_text: String?
+    @plain_text_for: String?
     def initialize: (String html) -> void
     def self.wrap: (untyped value) -> Fragment
     def to_s: () -> String
@@ -153,6 +155,7 @@ module ActionText
     @html: String
     @canonicalize: bool
     @plain_text: String?
+    @fragment: ActionText::Fragment?
     def initialize: (?String html, ?canonicalize: bool) -> void
     def fragment: () -> ActionText::Fragment
     def to_html: () -> String

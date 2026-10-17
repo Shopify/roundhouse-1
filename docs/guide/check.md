@@ -51,6 +51,13 @@ a `Rails::Engine` subclass.
 Roundhouse identifies that superclass from the Ruby syntax tree.
 It does not require a folder named `components`, `packs`, or `lib`.
 
+An optional [`roundhouse.yml`](roundhouse-yml.md) at the app root adds
+test folders and lists project extensions. An extension can declare a
+gem's attribute macros, such as `price_column :amount`. The attributes
+then read untyped, and `check` reports one error at the macro rather
+than a `send_dispatch_failed` at every use of the value object. A
+mistake in the file or an extension stops ingest, and `check` exits 2.
+
 Roundhouse rejects paths outside the application and paths with parent-directory references.
 It accepts absolute paths inside the application.
 It excludes symbolic links throughout selected path gem trees.
@@ -136,7 +143,11 @@ same table:
   they wrap so its own inferred type flows on; the annotation on those is discarded.
   `T.must(x)` lowers to the check sorbet-runtime makes, `x` unless it
   is nil and a `TypeError` otherwise, so what follows reads `x` with nil
-  removed; `T.must_because` stays refused.
+  removed. `T.must_because(x) { reason }` lowers the same way, with
+  sorbet's message — `"Unexpected `nil` because "` followed by the
+  block's value — and the reason evaluated only on the nil path. A
+  reason that is not a literal block, a forwarded `&blk` or one taking
+  parameters, has no message to inline and stays refused.
   `T.bind(self, Type)`, and its RBS inline form, a `#: self as Type`
   line, give `self` that type from that statement to the end of the
   enclosing body, blocks inside it included: sends on `self`, implicit

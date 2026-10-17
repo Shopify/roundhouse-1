@@ -30,6 +30,18 @@ fn rewrite(expr: &mut Expr, zone_port: bool) {
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr, zone_port: bool) {
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node {
+        let time_class = matches!(&*r.node, ExprNode::Const { path }
+            if path.last().is_some_and(|s| s.as_str() == "Time")
+                && path.iter().rev().skip(1).all(|s| s.as_str().is_empty()));
+        if time_class && method.as_str() == "find_zone" && args.len() == 1 {
+            *r = Expr::new(r.span, ExprNode::Const {
+                path: vec![Symbol::from("ActiveSupport"), Symbol::from("TimeZone")],
+            });
+            *method = Symbol::from("lookup");
+            return;
+        }
+    }
     // Not `TimeZone[name]`: a class-side index is an operator on the strict targets; the runtime port answers it as `lookup`.
     if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node {
         if method.as_str() == "[]" && args.len() == 1 && is_time_zone_class(r) {

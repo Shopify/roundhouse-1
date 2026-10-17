@@ -71,6 +71,11 @@ pub struct GemBoundary {
     /// never in here.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub loaded: BTreeSet<String>,
+    /// The gems the app's project extensions declare as runtime gems
+    /// (`crate::extensions::Extensions::runtime_gems`): every CRuby tree
+    /// loads them, like the compiler's own (`project::base_tree_loads_gem`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub extension_runtime_gems: BTreeSet<String>,
     /// Each `include` of a module only a Rails-dependent gem declares
     /// (error[gem_requires_rails]): no emitted tree loads that gem, so
     /// the include cannot run. Written by analysis, which decides it
@@ -303,15 +308,18 @@ impl GemBoundary {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
+        self.classes.is_empty() && self.loaded.is_empty()
     }
 
     /// Whether an emitted tree loads `gem`, so the constants its RBI
     /// declares run as the gem's: one the runtime loads on every tree
-    /// with that gem (`crate::project::ruby_tree_loads_gem`), or one this
-    /// app's lock routes to Bundler.require.
+    /// with that gem (`crate::project::ruby_tree_loads_gem`, which includes
+    /// a project extension's runtime gems), or one this app's lock routes
+    /// to Bundler.require.
     pub fn loads(&self, gem: &str) -> bool {
-        crate::project::ruby_tree_loads_gem(gem) || self.loaded.contains(gem)
+        crate::project::base_tree_loads_gem(gem)
+            || self.extension_runtime_gems.contains(gem)
+            || self.loaded.contains(gem)
     }
 
     /// The gem class or module an app declaration of `name` reopens: a

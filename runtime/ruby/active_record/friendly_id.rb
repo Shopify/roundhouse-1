@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # friendly_id's finder rule that is not a query: whether a String that
 # matched no slug could still be a primary key.
 #

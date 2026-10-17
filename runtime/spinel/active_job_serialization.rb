@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveJob payloads on the Ruby-family lanes: job arguments written in
 # ActiveJob's wire format, and read back when the drain runs the job.
 #

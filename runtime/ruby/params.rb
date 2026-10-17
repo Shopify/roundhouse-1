@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Narrowing accessors for the recursive request-params tree.
 #
 # `Roundhouse::ParamValue` is `String | Integer | Float | bool | nil |

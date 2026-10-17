@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # RQRCode — QR-code rendering. campfire's `QrCodeController#show` renders
 # a room's join URL as an SVG through it (`RQRCode::QRCode.new(url)
 # .as_svg(viewbox: true, fill: :white, color: :black)`), and lobsters

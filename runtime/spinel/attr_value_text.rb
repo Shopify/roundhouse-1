@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # An attribute value that is an ARRAY, for the ruby family: Rails'
 # `tag_option` joins it with spaces, and for `class:` first runs
 # `build_tag_values` — its conditional-class form, where a String is

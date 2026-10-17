@@ -1425,7 +1425,13 @@ pub(super) fn emit_send(
     if method == "keys" && args.is_empty() {
         if let Some(r) = recv {
             let recv_s = emit_expr(ctx, r);
-            let (k_ty, _v_ty) = hash_kv_go_tys(r.ty.as_ref());
+            let (mut k_ty, _v_ty) = hash_kv_go_tys(r.ty.as_ref());
+            // An `is_a?(Hash)` assertion binds a `map[string]any`, whatever key type the analyzer left untyped.
+            let asserted_map = matches!(&*r.node, ExprNode::Var { name, .. }
+                if ctx.var_renames.get(name.as_str()).map(String::as_str) == Some(assert_ident_for("map[string]any")));
+            if asserted_map {
+                k_ty = "string".to_string();
+            }
             return format!(
                 "func() []{k_ty} {{\n\
                  \t_ks := make([]{k_ty}, 0, len({recv_s}))\n\
@@ -1894,7 +1900,7 @@ pub(super) fn emit_send(
     // through the Self back-pointer so subclass overrides fire — same
     // mechanism as `self.class.X` above and `self[k]=v` / `self[k]`
     // earlier in this function. Modeler membership gates which methods
-    // qualify; non-polymorphic methods (Save, NewRecord, FillTimestamps,
+    // qualify; non-polymorphic methods (Save, NewRecord,
     // OpResolveStatus) stay on the static binding because they're not
     // overridden by subclasses.
     if let Some(r) = recv {
@@ -2218,6 +2224,12 @@ pub(super) fn emit_send(
                 // call sites that omit parens still resolve
                 // definitionally.
                 if is_known_class_method(method) {
+                    return format!("{recv_s}.{go_m}()");
+                }
+                // Not a field: the written-down `render json:` encoder is a method on every model it serializes.
+                if method == crate::lower::JSON_WRITER_METHOD
+                    || method.starts_with(&format!("{}__", crate::lower::JSON_WRITER_METHOD))
+                {
                     return format!("{recv_s}.{go_m}()");
                 }
                 // Temporal-reader read (`article.created_at`, stamped
@@ -3175,6 +3187,8 @@ fn is_modeler_member(name: &str) -> bool {
             | "_adapter_update"
             | "_adapter_touch"
             | "_adapter_delete"
+            // Not Base's: a model's own keeps a timestamp already set, as Rails does, and writes the stored text Base's `self[:col] = now` loses in Go's `time.Time` assertion.
+            | "fill_timestamps"
             // Validation + callbacks — Save() drives `valid?` →
             // `self.validate`; create/update/destroy paths drive
             // `after_*_commit` and `before_destroy`. Subclasses (Article,

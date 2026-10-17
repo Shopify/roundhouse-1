@@ -10,7 +10,7 @@
 //! `.constrained`, `.fallback`, `.meta`, `.default`; a constant holding
 //! any of these.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
@@ -252,44 +252,10 @@ pub(super) fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 let holder = full.rsplit_once("::").map_or("", |(h, _)| h);
                 return dry_type(value, &Scope { owner: holder, depth: scope.depth + 1, ..*scope });
             };
-            let base = match rest.as_slice() {
-                ["Coercible", "String"] => Base::Coerce("String"),
-                ["Coercible", "Integer"] => Base::Coerce("Integer"),
-                ["Coercible" | "Params", "Float"] => Base::Coerce("Float"),
-                ["Coercible", "Hash"] => Base::Coerce("Hash"),
-                ["Coercible", "Symbol"] => Base::CoerceSymbol,
-                ["Params", "Integer"] => Base::ParamsInteger,
-                ["Params", "Bool"] => Base::ParamsBool,
-                ["Params", "Decimal"] => Base::ParamsDecimal,
-                ["Coercible", "Decimal"] => Base::Coerce("BigDecimal"),
-                ["JSON", "Hash"] => Base::Strict("Hash"),
-                ["JSON", "Array"] => Base::Strict("Array"),
-                ["Params" | "JSON", "Date"] => Base::Parse("Date"),
-                ["Params" | "JSON", "DateTime"] => Base::Parse("DateTime"),
-                ["Params" | "JSON", "Time"] => Base::Parse("Time"),
-                ["Strict", t @ ("String" | "Integer" | "Float" | "Hash" | "Array" | "Symbol" | "Range")] => {
-                    Base::Strict(match *t {
-                        "String" => "String",
-                        "Integer" => "Integer",
-                        "Float" => "Float",
-                        "Hash" => "Hash",
-                        "Symbol" => "Symbol",
-                        "Range" => "Range",
-                        _ => "Array",
-                    })
-                }
-                ["Strict", "Bool"] => Base::StrictBool,
-                ["Strict", "Time"] => Base::Instance("::Time".into()),
-                ["Strict", "DateTime"] => Base::Instance("::DateTime".into()),
-                ["Strict", "Date"] => Base::Instance("::Date".into()),
-                ["Any"] => Base::Nominal,
-                ["Nominal", t]
-                    if matches!(*t, "String" | "Integer" | "Float" | "Bool" | "Hash" | "Array" | "Any" | "Symbol" | "Range") =>
-                {
-                    Base::Nominal
-                }
+            let base = match named_base(&rest) {
+                Some(base) => base,
                 // A constant of the app's own in a `Types` module.
-                _ => {
+                None => {
                     let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
                     let full = resolve_in(scope.owner, &name, scope.names)?;
                     let value = scope.constants.get(&full)?;
@@ -362,6 +328,28 @@ pub(super) fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 dry_type(recv, scope)?
             };
             plain(Base::Constructor { param: param.clone(), body: next_to_return(body), then: Box::new(then) })
+        }
+        // `Dry::Types["strict.bool"]`: the registry, by key.
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if method.as_str() == "[]"
+                && matches!(&*recv.node, ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>() == ["Dry", "Types"]) =>
+        {
+            let [key] = args.as_slice() else { return None };
+            let ExprNode::Lit { value: Literal::Str { value: key } } = &*key.node else { return None };
+            let parts: Vec<String> = key
+                .split('.')
+                .map(|part| match part {
+                    "json" => "JSON".to_string(),
+                    "date_time" => "DateTime".to_string(),
+                    other => other.split('_').map(|w| {
+                        let mut c = w.chars();
+                        c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+                    }).collect(),
+                })
+                .collect();
+            let parts: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            plain(named_base(&parts)?)
         }
         ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => match method.as_str() {
             "optional" if args.is_empty() => {
@@ -543,6 +531,49 @@ fn uncallable(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
     Some(DryType::of(Base::Uncallable(full)))
 }
 
+/// A dry-types name after its `Types` module (`Coercible::String`), or a
+/// registry key's parts (`Dry::Types["coercible.string"]`).
+fn named_base(rest: &[&str]) -> Option<Base> {
+    Some(match rest {
+        ["Coercible", "String"] => Base::Coerce("String"),
+        ["Coercible", "Integer"] => Base::Coerce("Integer"),
+        ["Coercible" | "Params", "Float"] => Base::Coerce("Float"),
+        ["Coercible", "Hash"] => Base::Coerce("Hash"),
+        ["Coercible", "Symbol"] => Base::CoerceSymbol,
+        ["Params", "Integer"] => Base::ParamsInteger,
+        ["Params", "Bool"] => Base::ParamsBool,
+        ["Params", "Decimal"] => Base::ParamsDecimal,
+        ["Coercible", "Decimal"] => Base::Coerce("BigDecimal"),
+        ["JSON", "Hash"] => Base::Strict("Hash"),
+        ["JSON", "Array"] => Base::Strict("Array"),
+        ["Params" | "JSON", "Date"] => Base::Parse("Date"),
+        ["Params" | "JSON", "DateTime"] => Base::Parse("DateTime"),
+        ["Params" | "JSON", "Time"] => Base::Parse("Time"),
+        ["Strict", t @ ("String" | "Integer" | "Float" | "Hash" | "Array" | "Symbol" | "Range")] => {
+            Base::Strict(match *t {
+                "String" => "String",
+                "Integer" => "Integer",
+                "Float" => "Float",
+                "Hash" => "Hash",
+                "Symbol" => "Symbol",
+                "Range" => "Range",
+                _ => "Array",
+            })
+        }
+        ["Strict", "Bool"] => Base::StrictBool,
+        ["Strict", "Time"] => Base::Instance("::Time".into()),
+        ["Strict", "DateTime"] => Base::Instance("::DateTime".into()),
+        ["Strict", "Date"] => Base::Instance("::Date".into()),
+        ["Any"] => Base::Nominal,
+        ["Nominal", t]
+            if matches!(*t, "String" | "Integer" | "Float" | "Bool" | "Hash" | "Array" | "Any" | "Symbol" | "Range") =>
+        {
+            Base::Nominal
+        }
+        _ => return None,
+    })
+}
+
 /// The part of `path` after a `Types` module: `Coercible::String` from
 /// `::Randewoo::Types::Coercible::String`. The `...::Types` prefix has to
 /// name a module that includes `Dry.Types()` as Ruby resolves it from
@@ -663,7 +694,7 @@ pub(super) fn plain_constants(
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut plain: HashSet<String> = HashSet::new();
+    let mut plain: HashSet<String> = HashSet::default();
     loop {
         let found: Vec<String> = classes
             .iter()

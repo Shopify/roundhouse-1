@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionView's public number-helper facade over the shared ActiveSupport
 # formatter. SafeBuffer is not part of the emitted Ruby runtime, so this
 # facade returns escaped Strings for valid values; emitted templates use the

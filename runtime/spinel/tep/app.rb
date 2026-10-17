@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::App -- per-process singleton holding the fan-out registries the
 # connection threads share.
 #

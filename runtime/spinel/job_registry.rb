@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # The app's ActiveJob payload jobs, by name: how each one's arguments
 # are written at `perform_later` and read back when the drain runs it.
 #

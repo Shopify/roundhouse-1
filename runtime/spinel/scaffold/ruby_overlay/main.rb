@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Top-level entry point for the CRuby (Puma/Rack) target.
 #
 # Dispatch lives in `Main.dispatch_core`, which returns a response
@@ -62,6 +63,21 @@ module Main
     @route_table ||= [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
   end
 
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. The spinel twin is `Main.render_not_found`.
+  def self.not_found_response(format_param, path, request, env)
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         request.fetch(:accept, "").to_s, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s)
+      return [404, %({"status":404,"error":"Not Found"}), "application/json; charset=UTF-8", nil, {}, {}, {}, {}, {}]
+    end
+    [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+  end
+
   def self.dispatch_core(env, stdin)
     # Rails wraps every request in the AR query cache: identical
     # SELECTs within one request replay the first result; any write
@@ -124,7 +140,9 @@ module Main
     matched = ActionDispatch::Router.match(request[:method], request_path,
                            route_table)
     if matched.nil?
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.not_found_response).
+      return not_found_response(request[:params]["format"].to_s, request_path, request, env)
     end
     # A `(.:format)` EXTENSION the router stripped off the path
     # (`/rooms/3/refresh.turbo_stream`). The `.json` sniff above runs
@@ -245,13 +263,19 @@ module Main
     # comma is read as html.
     accept = request.fetch(:accept, "").to_s
     controller.accepts_any_format = !accept.include?(",") && accept.split(";", 2)[0].to_s.strip == "*/*"
+    # Rails' `Vary: Accept` on a render whose format came from the Accept
+    # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
+    # dispatcher decides it.
+    controller.vary_on_accept = ActionDispatch::MimeNegotiation.should_apply_vary_header?(
+      accept, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s,
+      merged.key?("format") || !matched.req_format.nil?)
     # The full request object (CRuby overlay class) — filters read
     # `request.remote_ip` / `request.env` / `request[:format]`. `env.to_h`
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
-    controller.request.path_parameters = matched.path_params
+    controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
     # Same object, module-reachable — helpers are module functions with
@@ -264,7 +288,10 @@ module Main
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? merged["format"].to_s : request_format.to_s
+      return not_found_response(format_param, request_path, request, env)
     rescue ActionController::ParameterMissing, ActionController::BadRequest
       # `params.expect` / `params.require` refused the request and the app
       # did not rescue it: Rails' rescue_responses answer :bad_request.
@@ -337,6 +364,11 @@ module Main
     # header store, right before it is copied below — a no-op unless
     # the action or one of its filters touched the store.
     controller.commit_cache_control!
+    # Rails' Rack::ETag and Rack::ConditionalGet
+    # (action_controller/conditional_get.rb): the body ETag, the default
+    # Cache-Control, and a 304 for a matching If-None-Match, on the
+    # controller's status, body and headers before they are read below.
+    controller.commit_conditional_get!(env["REQUEST_METHOD"].to_s, env["HTTP_IF_NONE_MATCH"].to_s)
     # Headers the action set beyond Content-Type/Location — a
     # `Content-Disposition` on a download, the Cache-Control a blob
     # route asks for — ride as the tuple's sixth element.
@@ -406,6 +438,7 @@ module Main
   # entry per cookie) and reuses `CgiIo.url_encode` so values match the
   # CGI path exactly.
   def self.run_rack(env)
+    started = ActionDispatch::Runtime.clock_time
     status, body, content_type, location, set_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies =
       dispatch_core(env, env["rack.input"] || StringIO.new(""))
     headers = {}
@@ -433,6 +466,12 @@ module Main
       end
     end
     headers["set-cookie"] = cookies unless cookies.empty?
+    # Rails' ActionDispatch::RequestId and Rack::Runtime around the whole
+    # request (runtime/action_dispatch/request_id.rb), as the spinel
+    # dispatcher stamps them: X-Request-Id always, X-Runtime unless the
+    # app set one. config.ru serves static and public files before this.
+    headers["x-request-id"] = ActionDispatch::RequestId.make(env["HTTP_X_REQUEST_ID"].to_s)
+    headers["x-runtime"] = ActionDispatch::Runtime.header_value(started) unless headers.key?("x-runtime")
     [status, headers, [body]]
   end
 
@@ -447,6 +486,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # First-time setup. Idempotent: skips when already configured (so

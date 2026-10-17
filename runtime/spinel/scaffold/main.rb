@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Top-level entry point for the spinel-blog application.
 #
 # Reads a CGI request from ENV + $stdin, dispatches through the router
@@ -39,6 +40,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # The controller's params, built the way Rails builds them
@@ -208,7 +222,33 @@ module Main
       return nil
     end
     res.headers["Content-Type"] = Main.asset_content_type(path)
+    # `config.public_file_server.headers`, as ActionDispatch::Static
+    # sends them on every public/ and /assets/ file.
+    Rails.application.public_file_server_headers.each do |name, value|
+      res.headers[name] = value
+    end
     res.send_file(disk)
+    nil
+  end
+
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. `format_param` is the request's `format` parameter, ""
+  # when it has none.
+  def self.render_not_found(res, format_param, path, req)
+    res.status = 404
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         req.req_headers.fetch("accept", ""), req.req_headers.fetch("x-requested-with", ""),
+         req.req_headers.fetch("content-type", ""))
+      res.headers["Content-Type"] = "application/json; charset=UTF-8"
+      res.body = "{\"status\":404,\"error\":\"Not Found\"}"
+    else
+      res.body = "<h1>404 Not Found</h1>"
+    end
     nil
   end
 
@@ -302,9 +342,28 @@ module Main
     0
   end
 
+  # Rails' Rack::Runtime and ActionDispatch::RequestId around the whole
+  # request (runtime/action_dispatch/request_id.rb): every response the
+  # app answers carries X-Request-Id and X-Runtime, its error pages
+  # included. They sit behind ActionDispatch::Static, so a file sent
+  # from static/ or public/ carries neither, and the /cable upgrade is
+  # left as Action Cable answers it.
+  def self.dispatch(req, res)
+    started = ActionDispatch::Runtime.clock_time
+    Main.dispatch_request(req, res)
+    return nil if res.file_path.length > 0 || res.upgrading_ws
+    res.headers[ActionDispatch::RequestId::HEADER] =
+      ActionDispatch::RequestId.make(req.req_headers.fetch("x-request-id", ""))
+    # Rack::Runtime leaves a value the app set itself.
+    unless res.headers.keys.any? { |k| k.downcase == "x-runtime" }
+      res.headers[ActionDispatch::Runtime::HEADER] = ActionDispatch::Runtime.header_value(started)
+    end
+    nil
+  end
+
   # Serve static files or dispatch the complete request path through Router,
   # preserving literal suffix routes while negotiating the response format.
-  def self.dispatch(req, res)
+  def self.dispatch_request(req, res)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
     # Under RH_SQL_TRACE the request line brackets its queries, so a
@@ -365,8 +424,9 @@ module Main
 
     matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
     if matched.nil?
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.render_not_found).
+      Main.render_not_found(res, req.req_params.fetch("format", ""), request_path, req)
       return
     end
     # A `(.:format)` EXTENSION the router stripped off the path
@@ -434,7 +494,11 @@ module Main
     request_obj.remote_ip = req.remote_host
     request_obj.referer = req.req_headers.fetch("referer", "")
     request_obj.host = req.req_headers.fetch("host", "localhost")
-    request_obj.path_parameters = matched.path_params
+    request_obj.path_parameters = Main.route_parameters(controller, matched)
+    # The controller's params, copied into the request's own slot (as
+    # `Request.for` copies, see runtime/action_dispatch/request.rb):
+    # `request.filtered_parameters` reads them.
+    params.each { |k, v| request_obj.params[k] = v }
     fmt_name = "html"
     fmt_name = "json" if request_format == :json
     fmt_name = "rss" if request_format == :rss
@@ -529,12 +593,22 @@ module Main
     controller.flash = ActionDispatch::Flash.new(inbound_flash)
     controller.request_format = request_format
     controller.accepts_any_format = Main.accepts_any_format?(req.req_headers.fetch("accept", ""))
+    # Rails' `Vary: Accept` on a render whose format came from the Accept
+    # header (runtime/action_dispatch/mime_negotiation.rb). A `format`
+    # param - the path extension, `?format=`, a route's own format -
+    # is read instead of Accept.
+    controller.vary_on_accept = ActionDispatch::MimeNegotiation.should_apply_vary_header?(
+      req.req_headers.fetch("accept", ""), req.req_headers.fetch("x-requested-with", ""),
+      req.req_headers.fetch("content-type", ""),
+      controller.params.key?("format") || !matched.req_format.nil?)
 
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? req.req_params.fetch("format", "") : fmt_name
+      Main.render_not_found(res, format_param, request_path, req)
       return
     rescue ActionController::ParameterMissing, ActionController::BadRequest
       # `params.expect` / `params.require` refused the request and the app
@@ -548,6 +622,17 @@ module Main
       res.body = "<h1>422 Unprocessable Content</h1>"
       return
     end
+
+    # Compose `Cache-Control` from whatever `response.cache_control`
+    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
+    # header store - a no-op unless the action or one of its filters
+    # touched the store. Then Rails' Rack::ETag and Rack::ConditionalGet
+    # (action_controller/conditional_get.rb): the body ETag, the default
+    # Cache-Control, and a 304 for a matching If-None-Match. Both run
+    # before the status, body and headers are copied below, since a 304
+    # changes all three.
+    controller.commit_cache_control!
+    controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""))
 
     res.status = controller.status
     # The layout wrap happens at the controller's render call sites
@@ -579,11 +664,6 @@ module Main
     elsif controller.content_type != "text/html; charset=utf-8"
       res.headers["Content-Type"] = controller.content_type
     end
-    # Compose `Cache-Control` from whatever `response.cache_control`
-    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
-    # header store, right before it is copied below — a no-op unless
-    # the action or one of its filters touched the store.
-    controller.commit_cache_control!
     # Headers the action set beyond those two — a `Content-Disposition`
     # on a download, the Cache-Control a blob route asks for. A nil
     # value is a header the app UNSET (campfire's `X-Rev` is

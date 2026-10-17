@@ -189,6 +189,24 @@ impl OwnerIndex {
         }
     }
 
+    /// Whether and how `class.side` defines `method`, distinguishing
+    /// "does not define this at all" (any dispatch to it raises
+    /// `NoMethodError` regardless of what a caller rewrites) from
+    /// "defines it, but not with a flattened keyword ABI a caller can
+    /// safely respell against" (a real keyword, `rest`, forwarding
+    /// parameter, or no keywords at all — already binds correctly as
+    /// written). Callers outside the owner-relative walk that need this
+    /// distinction (a typed-receiver nilable union, `Gadget | Nil`) use
+    /// this instead of `lookup`, which collapses both into `Ok(None)`.
+    pub(super) fn defines(&self, class: &str, side: Side, method: &Symbol) -> Defined<'_> {
+        match self.resolve(class, side, method) {
+            Resolved::Flattened(slots) => Defined::Flattened(slots),
+            Resolved::Unflattened => Defined::Unflattened,
+            Resolved::Missing => Defined::Missing,
+            Resolved::Ambiguous => Defined::Ambiguous,
+        }
+    }
+
     /// The definition `method` resolves to on every class or module that
     /// can be `self` in `class`'s body: its subclasses and its includers,
     /// and theirs, transitively, each resolved through its own full
@@ -220,6 +238,19 @@ impl OwnerIndex {
 }
 
 enum Resolved<'a> {
+    Flattened(&'a Vec<Slot>),
+    Unflattened,
+    Missing,
+    Ambiguous,
+}
+
+/// `OwnerIndex::defines`'s result: see its doc comment. `Flattened`
+/// carries the slots so a caller that only reaches this definition
+/// through an ancestor or included module — not keyed directly in its
+/// own `params.slots`-style map, which only ever holds each class's OWN
+/// direct definitions — can still use its shape instead of wrongly
+/// treating "defined, only inherited" as "cannot be resolved".
+pub(super) enum Defined<'a> {
     Flattened(&'a Vec<Slot>),
     Unflattened,
     Missing,

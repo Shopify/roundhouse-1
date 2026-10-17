@@ -70,6 +70,7 @@ fn a_defaulted_segment_is_an_optional_helper_param() {
         ParamKind::Optional,
         "a defaulted segment must be callable with no argument: {params:?}"
     );
+    assert_eq!(*params[0].ty, Ty::Str, "the type follows the default, `\"me\"`: {params:?}");
 }
 
 #[test]
@@ -170,4 +171,5 @@ fn a_trailing_defaulted_segment_stays_positional() {
     assert_eq!(params.len(), 1, "{params:?}");
     assert_eq!(params[0].name.as_str(), "user_id");
     assert_eq!(params[0].kind, ParamKind::Optional, "{params:?}");
+    assert_eq!(*params[0].ty, Ty::Str, "{params:?}");
 }

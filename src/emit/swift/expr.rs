@@ -213,7 +213,16 @@ pub(super) fn throws_lookup(type_name: &str, method_camel: &str) -> bool {
 }
 
 fn is_error_class_name(name: &str) -> bool {
-    ERROR_CLASSES.with(|m| m.borrow().contains(name))
+    let mut cur = name.to_string();
+    loop {
+        if ERROR_CLASSES.with(|m| m.borrow().contains(&cur)) {
+            return true;
+        }
+        match CLASS_PARENTS.with(|m| m.borrow().get(&cur).cloned()) {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
 }
 
 /// Ruby's `Module#<` family. `RecordNotFound < StandardError` is a
@@ -1625,7 +1634,11 @@ fn emit_string_interp(parts: &[InterpPart]) -> String {
 
 fn emit_bool_op(op: BoolOpKind, left: &Expr, right: &Expr, e: &Expr) -> String {
     let l = emit_expr(left);
-    let r = group_try_rhs(&emit_expr(right));
+    // Swift does not narrow across `||`: past `x == nil`, the right operand reads `x!`.
+    let r = match (op, nil_checked_local(left)) {
+        (BoolOpKind::Or, Some(n)) if !rebinds(right, &n) => group_try_rhs(&with_narrowed_local(&n, right)),
+        _ => group_try_rhs(&emit_expr(right)),
+    };
     match op {
         // `true && "hot"` is a value, not a Bool: the right operand when
         // the left holds, else the left's `false`.
@@ -2053,6 +2066,36 @@ fn reassigned_nil_guard(stmt: &Expr) -> Option<(String, String)> {
     };
     let line = format!("if {n} == nil{more} {{\n{}\n}}", indent(&emit_expr(then_branch)));
     Some((n, line))
+}
+
+/// Does `e` bind the local `name` again (a block parameter, an assignment)? A read of that one is not the checked local.
+fn rebinds(e: &Expr, name: &str) -> bool {
+    let binds = match &*e.node {
+        ExprNode::Lambda { params, rest_param, .. } => {
+            params.iter().chain(rest_param.iter()).any(|p| camel(p.as_str()) == name)
+        }
+        _ => false,
+    };
+    binds || writes_local(e, name) || children(e).into_iter().any(|c| rebinds(c, name))
+}
+
+/// The optional local `x` of an `x.nil?` check.
+fn nil_checked_local(e: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else {
+        return None;
+    };
+    if method.as_str() != "nil?" || !args.is_empty() {
+        return None;
+    }
+    let ExprNode::Var { name, .. } = &*r.node else {
+        return None;
+    };
+    let optionalish = matches!(
+        r.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+    );
+    optionalish.then(|| camel(name.as_str()))
 }
 
 /// Emit `e` with the local `name` read force-unwrapped.
@@ -3220,5 +3263,75 @@ mod equal_identity_tests {
         let out = emit_expr(&send(recv, "equal?", var("sentinel")));
         assert!(out.contains("equalPred"), "{out}");
         assert!(!out.contains("==="), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod nil_or_narrowing_tests {
+    use super::*;
+    use crate::expr::{BoolOpKind, BoolOpSurface, Expr, ExprNode};
+    use crate::ident::{Symbol, VarId};
+    use crate::span::Span;
+    use crate::ty::Ty;
+
+    fn optional_str(name: &str) -> Expr {
+        let mut e = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
+        e.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
+        e
+    }
+
+    fn call(recv: Expr, method: &str) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args: vec![], block: None, parenthesized: false },
+        )
+    }
+
+    fn or(left: Expr, right: Expr) -> Expr {
+        let mut e = Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp { op: BoolOpKind::Or, surface: BoolOpSurface::Symbol, left, right },
+        );
+        e.ty = Some(Ty::Bool);
+        e
+    }
+
+    #[test]
+    fn the_right_of_a_nil_check_reads_the_local_unwrapped() {
+        let mut stripped = call(optional_str("vary"), "strip");
+        stripped.ty = Some(Ty::Str);
+        let out = emit_expr(&or(call(optional_str("vary"), "nil?"), call(stripped, "empty?")));
+        assert!(out.contains("vary!.trimmingCharacters"), "{out}");
+        assert!(out.starts_with("(vary == nil) ||"), "{out}");
+    }
+
+    #[test]
+    fn a_block_parameter_of_the_same_name_is_not_the_checked_local() {
+        let mut lambda = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda {
+                params: vec![Symbol::from("vary")],
+                rest_param: None,
+                extra_params: vec![],
+                block_param: None,
+                signature: Default::default(),
+                body: call(optional_str("vary"), "empty?"),
+                block_style: Default::default(),
+            },
+        );
+        lambda.ty = Some(Ty::Bool);
+        let mut any = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(optional_str("list")), method: Symbol::from("any?"), args: vec![], block: Some(lambda), parenthesized: false },
+        );
+        any.ty = Some(Ty::Bool);
+        let out = emit_expr(&or(call(optional_str("vary"), "nil?"), any));
+        assert!(!out.contains("vary!"), "{out}");
+    }
+
+    #[test]
+    fn a_left_that_is_not_a_nil_check_leaves_the_right_alone() {
+        let out = emit_expr(&or(call(optional_str("a"), "empty?"), call(optional_str("vary"), "empty?")));
+        assert!(!out.contains("vary!"), "{out}");
     }
 }

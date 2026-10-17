@@ -106,6 +106,8 @@ module ActiveRecord
   end
 
   class Connection
+    self.@shared: Connection?
+    def self.shared: () -> Connection
     def adapter_name: () -> String
     def transaction_open?: () -> bool
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
@@ -123,6 +125,14 @@ module ActiveRecord
     def exec_update: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_delete: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_insert: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Result
+  end
+
+  class EnlistedRecord
+    @record: Base
+    @kind: Integer
+    def record: () -> Base
+    def kind: () -> Integer
+    def initialize: (Base record, Integer kind) -> void
   end
 
   class Base
@@ -223,7 +233,8 @@ module ActiveRecord
     def delete: () -> Base
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Nil and uncastable request keys reject before the scalar adapter.
-    def self.exists?: (?(Integer | Float | String | nil) id) -> bool
+    # Not `?id`: the def takes `*ids`, and spinel types a positional field by the def's own slot.
+    def self.exists?: (*(Integer | Float | String | nil) ids) -> bool
     def self._exists_primary_key_input: (Integer | Float | String | nil id) -> bool
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
     def self.where: (?(Hash[Symbol, untyped] | String | Array[untyped] | nil) conditions, *untyped args) -> Relation
@@ -336,6 +347,17 @@ module ActiveRecord
     def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool
     def save!: (?context: Symbol?) -> Base
+    def destroy: () -> Base
+    def touch: () -> bool
+    def touch_written: () -> bool
+    def _note_touched: () -> nil
+    @__touch_owner: Base?
+    def _adopt_touch_owner: (Base owner) -> nil
+    def _touch_owner: () -> nil
+    def self._commit_enlisted: () -> nil
+    def self._rollback_enlisted: (Integer from) -> nil
+    def _restore_after_rollback: (Integer kind) -> nil
+    def _run_enlisted_commit: (Integer kind) -> nil
     # Ruby-family overrides of base.rb's dirty-tracking stubs.
     def __track_saved_changes: (bool was_new) -> void
     def saved_changes: () -> Hash[String, untyped]

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # The `pagy` gem (43.6.2 -- the version EngineeredAt's Gemfile.lock pins):
 # `Pagy::Method#pagy` and the offset paginator it returns.
 #

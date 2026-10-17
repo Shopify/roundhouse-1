@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # HTTP/1.x request parser. Produces a Tep::Request from the raw
 # byte blob the C helper read off the wire (headers, possibly a
 # prefix of the body).

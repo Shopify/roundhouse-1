@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `response.cache_control` — Rails' mixed-Hash surface
 # (`{public: true, max_age: 31556952}`) over the typed
 # `ActionController::CacheControlStore` in base.rb.

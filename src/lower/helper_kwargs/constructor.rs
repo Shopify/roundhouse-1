@@ -10,6 +10,7 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
 use super::{Slot, slot_of};
+use super::owned::{Defined, OwnerIndex, Side};
 
 pub(super) struct InstanceCallParams {
     pub(super) slots: HashMap<(String, Symbol), Vec<Slot>>,
@@ -30,6 +31,12 @@ pub(super) struct InstanceCallParams {
     /// subclasses: no tree carries those declarations, so a constructor call
     /// on one runs as written only into a class that cannot take it.
     declarations_dropped: HashSet<String>,
+    /// The owner-relative walk's ancestor/module-aware lookup, reused
+    /// here to tell "this union member doesn't define the method at
+    /// all" apart from "defines it, but not with flattened keyword
+    /// slots" when narrowing a nilable receiver's union — `params.slots`
+    /// alone cannot tell those apart (see `resolve_instance_receiver_class`).
+    owner_index: OwnerIndex,
 }
 
 impl InstanceCallParams {
@@ -126,6 +133,7 @@ impl InstanceCallParams {
             model_names: names.model_names.clone(),
             ruby_family_positional_constructor: ruby_family_positional_constructor(app),
             declarations_dropped: declarations_dropped(app),
+            owner_index: OwnerIndex::new(app),
         }
     }
 }
@@ -440,6 +448,155 @@ pub(super) fn rewrite_instance_call_node(
     rewrite_instance_call(expr, params, diagnostics);
 }
 
+/// What `resolve_instance_receiver_class` found for a non-constructor
+/// instance call's receiver type.
+enum ClassResolution {
+    /// No candidate class defines this method with flattened keyword
+    /// slots (including an untyped/non-class remainder after dropping
+    /// `Nil`): nothing for this pass to rewrite.
+    None,
+    /// Exactly one class remains after dropping `Nil`, or several
+    /// remain whose flattened slots for this method are identical —
+    /// either way the keywords land in the same positions whichever
+    /// branch runs at runtime.
+    One(String),
+    /// Several classes remain that disagree about this method: either
+    /// their flattened slots differ, or one of them defines the method
+    /// without a flattened keyword ABI at all (real keywords, `rest`,
+    /// forwarding, or no keywords — already binding correctly as
+    /// written). No one respelling is right for every branch, so the
+    /// call is left exactly as written — the dynamic path, with no
+    /// diagnostic, the same as before this fix existed and the same as
+    /// the general untyped-receiver gap.
+    Mismatch,
+}
+
+/// Resolve the library class a non-constructor instance call's receiver
+/// may be, after dropping `Nil` from a nilable union. `Array#first`,
+/// `find_by`, and an `[]` read all type the receiver
+/// `Ty::Union { [Class, Nil] }` — the analyzer knows the class, the
+/// receiver just isn't pinned to it the way a plain `Ty::Class` is. A
+/// wider union of several classes is handled too, as long as they agree
+/// on this method's slot shape; anything else (an `Untyped`/`Var` arm,
+/// a non-class type) returns `None`, leaving that gap exactly as it was.
+///
+/// A union member with no entry in `params.slots` is NOT assumed to
+/// skip the method: `params.slots` only ever holds flattened keyword
+/// ABIs, so a class that defines the method with real keywords, `rest`,
+/// forwarding, or a plain positional parameter (`def deliver(opts)`,
+/// which already binds the caller's keyword Hash correctly as written)
+/// looks identical to a class that doesn't define the method at all.
+/// Respelling the call for another branch would silently change that
+/// one's binding. `OwnerIndex::defines` — the same ancestor/module-aware
+/// lookup the owner-relative walk uses — tells the two apart: truly
+/// missing is skipped (that branch's dispatch never reaches the method,
+/// so it raises `NoMethodError` regardless of this rewrite), while
+/// "defined but not flattened" is a `Mismatch` — left exactly as
+/// written, the dynamic path, with no diagnostic (see `ClassResolution`).
+fn resolve_instance_receiver_class(
+    ty: &crate::ty::Ty,
+    params: &InstanceCallParams,
+    method: &Symbol,
+) -> ClassResolution {
+    let stripped = ty.clone().strip_nil();
+    match &stripped {
+        // A single class is unambiguous — there is no other branch to
+        // agree or disagree with — so this is exactly the plain typed
+        // receiver case #814 already handled: a miss in `params.slots`
+        // means nothing to rewrite, not a refusal. The ancestor-aware
+        // `Mismatch` check below only makes sense across several
+        // candidates, so it does not apply here (it would otherwise
+        // turn every ordinary, non-keyword method call on a typed
+        // instance — an `attr_reader`, `b.add(...).rows` below — into a
+        // spurious refusal, since `OwnerIndex::defines` resolves nearly
+        // every real method name as "defined, not flattened").
+        crate::ty::Ty::Class { id, .. } => {
+            let class_id = id.0.as_str().to_string();
+            match params.slots.get(&(class_id.clone(), method.clone())) {
+                Some(_) => ClassResolution::One(class_id),
+                None => ClassResolution::None,
+            }
+        }
+        crate::ty::Ty::Union { variants } => {
+            let mut class_ids = Vec::with_capacity(variants.len());
+            for variant in variants.iter() {
+                let crate::ty::Ty::Class { id, .. } = variant else {
+                    return ClassResolution::None;
+                };
+                class_ids.push(id.0.as_str().to_string());
+            }
+            let mut representative: Option<(&str, &Vec<Slot>)> = None;
+            for class_id in &class_ids {
+                let slots = match params.slots.get(&(class_id.clone(), method.clone())) {
+                    Some(slots) => slots,
+                    // `params.slots` only keys each class's OWN direct
+                    // definitions; fall back to the ancestor/module-aware
+                    // lookup for one reached only through inheritance or
+                    // an included module (e.g. a subclass that doesn't
+                    // override the method at all).
+                    None => match params.owner_index.defines(class_id, Side::Instance, method) {
+                        Defined::Missing => {
+                            // This branch of the union doesn't define
+                            // the method at all: calling it raises
+                            // `NoMethodError` regardless of this
+                            // rewrite, so it doesn't constrain the
+                            // respelling.
+                            continue;
+                        }
+                        Defined::Flattened(slots) => slots,
+                        Defined::Unflattened | Defined::Ambiguous => {
+                            // Defined, but without a flattened keyword
+                            // ABI this call site could respell to (real
+                            // keywords, rest, forwarding, no keywords at
+                            // all — already binds correctly as written),
+                            // or the lookup itself is ambiguous.
+                            // Rewriting the call for another branch
+                            // would silently change this one's binding,
+                            // so this is a `Mismatch` — left dynamic,
+                            // not guessed at.
+                            return ClassResolution::Mismatch;
+                        }
+                    },
+                };
+                match representative {
+                    None => representative = Some((class_id.as_str(), slots)),
+                    Some((_, rep_slots)) if !slots_match_shape(rep_slots, slots) => {
+                        // Two members flatten this method differently:
+                        // same reasoning, same `Mismatch`.
+                        return ClassResolution::Mismatch;
+                    }
+                    Some(_) => {}
+                }
+            }
+            match representative {
+                Some((id, _)) => ClassResolution::One(id.to_string()),
+                None => ClassResolution::None,
+            }
+        }
+        _ => ClassResolution::None,
+    }
+}
+
+/// Whether two classes' flattened slots for the same method name agree
+/// on shape: same slot count, same names in the same order, the same
+/// keyword/kwrest origin per slot, and structurally equal defaults
+/// (defaults are spliced into gaps the caller left unnamed, so a
+/// mismatched default would change behavior depending on which branch
+/// actually runs).
+fn slots_match_shape(a: &[Slot], b: &[Slot]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.name == y.name
+                && x.from_keyword == y.from_keyword
+                && x.from_kwrest == y.from_kwrest
+                && match (&x.default, &y.default) {
+                    (None, None) => true,
+                    (Some(dx), Some(dy)) => dx.node == dy.node,
+                    _ => false,
+                }
+        })
+}
+
 fn rewrite_instance_call(
     expr: &mut Expr,
     params: &InstanceCallParams,
@@ -468,29 +625,59 @@ fn rewrite_instance_call(
     else {
         return;
     };
-    let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else {
-        return;
-    };
     let is_constructor = method.as_str() == "new" && matches!(&*recv.node, ExprNode::Const { .. });
-    // Owned: `refuse_constructor` marks `expr` while the name is read.
-    let id_name = id.0.as_str().to_string();
-    let class_id = if is_constructor {
-        params.unqualified_class_ids.get(&id_name).map_or(id_name.as_str(), String::as_str)
-    } else {
-        id_name.as_str()
-    };
-    if is_constructor
-        && let Some(reason) =
+    let owned_class_id: String;
+    let class_id: &str = if is_constructor {
+        let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else {
+            return;
+        };
+        // Owned: `refuse_constructor` marks `expr` while the name is read.
+        let id_name = id.0.as_str().to_string();
+        owned_class_id = params
+            .unqualified_class_ids
+            .get(&id_name)
+            .cloned()
+            .unwrap_or_else(|| id_name.clone());
+        let class_id = owned_class_id.as_str();
+        if let Some(reason) =
             constructor_refusal_reason(params, expr.span, &id_name, class_id, args)
-    {
-        refuse_constructor(expr, params, class_id, reason, diagnostics);
-        return;
-    }
-    if is_constructor {
+        {
+            refuse_constructor(expr, params, class_id, reason, diagnostics);
+            return;
+        }
         if params.custom_new.contains(class_id) {
             return;
         }
-    }
+        class_id
+    } else {
+        // A receiver whose type isn't a single `Ty::Class` is usually
+        // untyped (out of scope here), but `Array#first`, `find_by` and
+        // an `[]` read type it `Ty::Union { [Class, Nil] }`: the
+        // analyzer knows the class(es), the call just isn't pinned to
+        // one. Strip `Nil` and respell against what's left when that's
+        // unambiguous; a call on the dropped `nil` branch would raise
+        // `NoMethodError` either way, so narrowing it away doesn't
+        // change that call's behavior.
+        let Some(ty) = &recv.ty else { return };
+        match resolve_instance_receiver_class(ty, params, method) {
+            ClassResolution::None => return,
+            ClassResolution::One(id) => {
+                owned_class_id = id;
+                owned_class_id.as_str()
+            }
+            // Several classes disagree about this method (different
+            // flattened shapes, or one of them isn't flattened at all):
+            // no one respelling is right for every branch. Per #959's
+            // CodeRabbit review, this keeps the DYNAMIC path — the call
+            // is left exactly as written, with no diagnostic — the same
+            // as the general untyped-receiver gap and as every union
+            // receiver before this fix existed. A hard refusal here
+            // regressed `critic_corrections_preserve_class_objects_
+            // reflection_and_operators`, which passes on main precisely
+            // because its mismatched union fell through silently.
+            ClassResolution::Mismatch => return,
+        }
+    };
     if !is_constructor && super::SEND_METHODS.contains(&method.as_str()) {
         let class_id = class_id.to_string();
         super::owned::refuse_send(

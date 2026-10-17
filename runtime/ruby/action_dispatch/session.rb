@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 module ActionDispatch
   # Per-app session store. Real-blog uses no session keys, so the
   # struct is empty (no typed fields). It still exposes HWIA-shape

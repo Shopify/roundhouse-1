@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # OpenTelemetry — `OpenTelemetry::Trace.current_span` stands behind
 # `deprecate_api`-shaped concern macros (a `before_action` tail that
 # tags the current span as deprecated when one is recording). NOT a

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Ruby-family model surfaces: raw-SQL connections and request-key finders.
 #
 # Rails hands back the adapter itself here; this runtime hands back a
@@ -216,6 +217,20 @@ module ActiveRecord
     end
   end
 
+  # One write an open transaction holds the commit callbacks of: the
+  # record, and what the write was (0 create, 1 update, 2 destroy).
+  # `Base.transaction` runs the held callbacks after its outermost
+  # COMMIT and drops them on a ROLLBACK, restoring the record's
+  # persisted state as Rails' `rolledback!` does.
+  class EnlistedRecord
+    attr_reader :record, :kind
+
+    def initialize(record, kind)
+      @record = record
+      @kind = kind
+    end
+  end
+
   # attribute_registration.rb's `decorate_attributes` block, bound to the
   # attribute it decorates: the `(name, cast_type)` block as the
   # `call(cast_type)` a declared-type decoration answers.
@@ -354,6 +369,10 @@ module ActiveRecord
   end
 
   class Connection
+    def self.shared
+      @shared ||= Connection.new
+    end
+
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
     def adapter_name
@@ -615,10 +634,15 @@ module ActiveRecord
       _adapter_exists_by_id?(key)
     end
 
-    # Stateless facade — every member delegates straight to `Db`, so a
-    # fresh instance per call is cheap and dodges class-ivar state.
+    # Stateless facade — every member delegates straight to `Db`. One
+    # instance per process, as Rails hands every caller (and every
+    # model class) the same connection object: a test that stubs
+    # `ActiveRecord::Base.connection.transaction_open?` must see that
+    # stub through `connection_pool.with_connection`, which a fresh
+    # instance per call would lose. Held on Connection, not on Base, so
+    # `User.connection` and `ActiveRecord::Base.connection` agree.
     def self.connection
-      ActiveRecord::Connection.new
+      ActiveRecord::Connection.shared
     end
 
     # Rails' `Model.sanitize_sql(["insert … values (?, ?)", a, b])` —
@@ -806,6 +830,9 @@ module ActiveRecord
       if depth > 0
         savepoint = requires_new ? "rh_savepoint_#{depth}" : nil
         Db.exec("SAVEPOINT #{savepoint}") unless savepoint.nil?
+        # The writes a ROLLBACK TO this savepoint undoes are the ones
+        # enlisted after this mark.
+        mark = Db._txn_records.length
         Db._txn_depth = depth + 1
         begin
           begin
@@ -824,6 +851,7 @@ module ActiveRecord
                 # SQLite may already have ended the whole transaction; the
                 # Rollback still answers nil, as the outer ROLLBACK's does.
               end
+              ActiveRecord::Base._rollback_enlisted(mark)
             end
             result = nil
           rescue Exception => e
@@ -836,11 +864,24 @@ module ActiveRecord
                 # SQLite may already have ended the whole transaction (see
                 # the outer ROLLBACK below); that must not hide `e`.
               end
+              ActiveRecord::Base._rollback_enlisted(mark)
             end
             raise e
           end
         ensure
           Db._txn_depth = depth
+        end
+      elsif Db.transaction_open?
+        # A transaction opened BELOW ActiveRecord (a raw `BEGIN`, or
+        # `raw_connection.transaction`) owns the connection: a BEGIN of
+        # our own would fail ("cannot start a transaction within a
+        # transaction"), and its COMMIT or ROLLBACK is the caller's. The
+        # block runs inside it, unwrapped, with commit callbacks running
+        # at once as they do outside any transaction this runtime opened.
+        begin
+          yield
+        rescue ActiveRecord::Rollback
+          nil
         end
       else
         Db.exec("BEGIN")
@@ -855,6 +896,7 @@ module ActiveRecord
             rolled_back = true
             Db._txn_depth = 0
             Db.exec("ROLLBACK")
+            ActiveRecord::Base._rollback_enlisted(0)
             ActiveRecord::TransactionHooks.rolled_back
             result = nil
           rescue Exception => e
@@ -868,6 +910,7 @@ module ActiveRecord
               # transaction, not just the statement, does this) — the
               # ROLLBACK's own failure must not hide the real error below.
             end
+            ActiveRecord::Base._rollback_enlisted(0)
             ActiveRecord::TransactionHooks.rolled_back
             raise e
           end
@@ -887,10 +930,12 @@ module ActiveRecord
               rescue StandardError
                 # Already ended; the COMMIT's error is the one to raise.
               end
+              ActiveRecord::Base._rollback_enlisted(0)
               ActiveRecord::TransactionHooks.rolled_back
               raise e
             end
             ActiveRecord::TransactionHooks.committed
+            ActiveRecord::Base._commit_enlisted
           end
         end
       end
@@ -998,6 +1043,11 @@ module ActiveRecord
     # created_at / updated_at the table has and the rows lack are stamped
     # (`record_timestamps:`, default the model's); on a conflict
     # updated_at moves only when a written column changed.
+    #
+    # Timestamps as Rails 8.1's `record_timestamps` stamps them: an
+    # insert fills every created/updated column a row leaves out, and an
+    # update moves `updated_at` only when an assigned column changed; a
+    # raw `on_duplicate:` is left as written.
     #
     # NOT Rails-complete, deliberately: no RETURNING (asking for it
     # raises rather than quietly handing back nothing). Returns the
@@ -1177,9 +1227,9 @@ module ActiveRecord
     end
 
     # `self.record_timestamps=` — Rails class-attribute toggling auto
-    # timestamp stamping around a bulk write. `fill_timestamps` always
-    # stamps (the toggle only matters on write paths); accept and ignore
-    # the assignment so the class-side setter resolves.
+    # timestamp stamping. Kept nowhere: `fill_timestamps` always stamps,
+    # so analysis reports any assignment other than `true`; the per-call
+    # `upsert_all(…, record_timestamps:)` is honored.
     def self.record_timestamps=(value)
       value
     end
@@ -2311,7 +2361,179 @@ module ActiveRecord
     # extracted post-validation half directly.
     def update_attribute(name, value)
       self[name] = value
-      save_after_validation
+      status = false
+      self.class.transaction do
+        status = save_after_validation
+      end
+      status
+    end
+
+    # `destroy` in a transaction too, for the same reason: a dependent
+    # cascade or an `after_destroy` write that raises undoes the delete.
+    # base.rb's body, restated as `save` is.
+    def destroy
+      return self unless persisted?
+      self.class.transaction do
+        _transaction_write_begin
+        before_destroy
+        _adapter_delete
+        @_trigger_destroy_callback = true
+        @persisted = false
+        @destroyed = true
+        after_destroy
+        _transaction_write_end
+      end
+      self
+    end
+
+    # Rails' `touch` runs in a transaction too, and is an update as far
+    # as the commit callbacks are concerned: `after_update_commit` and
+    # `after_commit` fire for it (campfire's `Message::Searchable`
+    # guards its index rewrite because boosts touch the message). The
+    # bodies are base.rb's, restated for the transaction.
+    def touch
+      self.class.transaction do
+        _transaction_write_begin
+        fill_timestamps(false)
+        _adapter_touch
+        _note_touched
+        @_trigger_update_callback = true if self.class.schema_columns.include?(:updated_at)
+        after_touch
+        _transaction_write_end
+      end
+      true
+    end
+
+    def touch_written
+      self.class.transaction do
+        _transaction_write_begin
+        fill_timestamps(false)
+        _adapter_update
+        _note_touched
+        @_trigger_update_callback = true if self.class.schema_columns.include?(:updated_at)
+        after_touch
+        _transaction_write_end
+      end
+      true
+    end
+
+    # The timestamp a touch wrote is saved, not pending: Rails clears
+    # the touched attribute's change, so `changed?` stays false after a
+    # rich text touches its record. Other pending changes stay pending.
+    # Kept beside the snapshot rather than written into it: the snapshot
+    # IS the Hash `attributes` built, and a write into it widens every
+    # model's `attributes` literal to one value type (Spinel then types
+    # `Article#attributes` as a poly hash its String-valued slot refuses).
+    def _note_touched
+      current = attributes
+      @__touched_updated_at = current["updated_at"]
+      nil
+    end
+
+    # The record a `belongs_to …, touch: true` touches when it was handed
+    # over as an object rather than found from the key: Action Text's
+    # `has_rich_text` sets it on the rich text it reads or builds, as
+    # Rails' `inverse_of: :record` does (emit::ruby::library::
+    # apply_rich_text_record_touch). `_touch_owner` runs from the
+    # holder's `after_save` / `after_destroy`.
+    def _adopt_touch_owner(owner)
+      @__touch_owner = owner
+      nil
+    end
+
+    def _touch_owner
+      owner = @__touch_owner
+      owner.touch if !owner.nil? && owner.persisted?
+      nil
+    end
+
+    # The commit callbacks wait for the COMMIT: outside a transaction
+    # they run now (base.rb's `_transaction_committed_now`); inside one
+    # they are enlisted and run after the outermost COMMIT
+    # (`_commit_enlisted`), or are dropped by a ROLLBACK
+    # (`_rollback_enlisted`). Rails defers them the same way, so an
+    # `after_create_commit` that enqueues a job never queues one for a
+    # row a rollback removed.
+    def _transaction_committed
+      if Db._txn_depth == 0
+        _transaction_committed_now
+      else
+        if _trigger_transactional_callbacks?
+          kind = if @_trigger_destroy_callback && destroyed?
+            2
+          elsif @_new_record_before_last_commit
+            0
+          else
+            1
+          end
+          Db._txn_records << ActiveRecord::EnlistedRecord.new(self, kind)
+        end
+        @_trigger_update_callback = false
+        @_trigger_destroy_callback = false
+      end
+      nil
+    end
+
+    # The enlisted write's commit hooks, run with the state of the
+    # write that was enlisted (a create stays a create through later
+    # updates in the transaction).
+    def _run_enlisted_commit(kind)
+      @_new_record_before_last_commit = kind == 0
+      @_trigger_update_callback = kind == 1
+      @_trigger_destroy_callback = kind == 2
+      _transaction_committed_now
+      nil
+    end
+
+    # The outermost COMMIT landed: each enlisted record's callbacks run
+    # once, as Rails' `committed!` runs once for a record the
+    # transaction wrote more than once. A create stays a create through
+    # later updates; a destroyed record reports the destroy.
+    def self._commit_enlisted
+      records = Db._txn_records
+      return nil if records.empty?
+      held = records.dup
+      records.clear
+      seen = []
+      held.each do |entry|
+        record = entry.record
+        next if seen.any? { |other| other.equal?(record) }
+        seen << record
+        kind = entry.kind
+        held.each do |other|
+          next unless other.record.equal?(record)
+          kind = other.kind if other.kind == 2 || (other.kind == 0 && kind == 1)
+        end
+        record._run_enlisted_commit(kind)
+      end
+      nil
+    end
+
+    # A ROLLBACK (to the savepoint whose mark is `from`, or of the
+    # whole transaction for 0) undid the writes enlisted since: their
+    # commit callbacks are dropped, and each record is put back the way
+    # the database now has it -- a create is a new record again, a
+    # destroy persisted again -- as Rails' `rolledback!` restores them.
+    def self._rollback_enlisted(from)
+      records = Db._txn_records
+      return nil if records.length <= from
+      undone = records[from, records.length - from]
+      records.pop while records.length > from
+      undone.each { |entry| entry.record._restore_after_rollback(entry.kind) }
+      nil
+    end
+
+    # The id a rolled-back create was given stays on the record (Rails
+    # puts back the pre-save nil): the unsaved sentinel differs by key
+    # type, and a later save inserts the row afresh either way.
+    def _restore_after_rollback(kind)
+      if kind == 0
+        @persisted = false
+      elsif kind == 2
+        @persisted = true
+        @destroyed = false
+      end
+      nil
     end
 
     # Rails' validation context: `valid?(:publish)` / `save(context:)`
@@ -2393,13 +2615,25 @@ module ActiveRecord
       ActiveRecord::RuntimeValidations.instance_validates_with(self, args, block)
     end
 
+    # `save` joins or opens a transaction as Rails' does
+    # (`with_transaction_returning_status`): the row write, the
+    # callbacks and every write they make (autosaved associations, an
+    # `after_save` that inserts an index row) land together, or an
+    # exception from any of them rolls them all back and propagates. A
+    # `false` from validation rolls back what `before_validation`
+    # wrote. The body is base.rb's `save`, restated here rather than
+    # wrapped because `transaction` is a ruby-family method the strict
+    # targets' base does not have.
     def save(context: nil)
-      before_validation
-      ok = _valid_with_caller_hooks?(context)
-      after_validation
-      return false unless ok
-
-      save_after_validation
+      status = false
+      self.class.transaction do
+        before_validation
+        ok = _valid_with_caller_hooks?(context)
+        after_validation
+        status = ok ? save_after_validation : false
+        raise ActiveRecord::Rollback unless status
+      end
+      status
     end
 
     def save!(context: nil)
@@ -2430,6 +2664,7 @@ module ActiveRecord
       changes["id"] = [nil, id] if was_new && !id.nil?
       _merge_forced_changes(changes, current)
       @__last_saved_attributes = current
+      @__touched_updated_at = nil
       @saved_changes = _indifferent_changes(_typed_store_changes(changes))
       @id_previously_changed = was_new
       @__forced_changes = nil
@@ -2646,6 +2881,7 @@ module ActiveRecord
 
     def _note_hydrated
       @__last_saved_attributes = _attribute_snapshot
+      @__touched_updated_at = nil
       nil
     end
 
@@ -2659,6 +2895,7 @@ module ActiveRecord
     def _note_new_record_baseline(attrs)
       return nil if attrs.equal?(ActiveRecord::Base::HYDRATE_ATTRS)
       @__last_saved_attributes = _attribute_snapshot
+      @__touched_updated_at = nil
       nil
     end
 
@@ -2769,9 +3006,11 @@ module ActiveRecord
     # every non-nil attribute reads as pending.
     def changes_to_save
       previous = @__last_saved_attributes
+      touched = @__touched_updated_at
       changes = {}
       _attribute_snapshot.each do |key, value|
         prev = previous.nil? ? nil : previous[key]
+        prev = touched if key == "updated_at" && !touched.nil?
         changes[key] = [prev, value] if prev != value
       end
       _merge_forced_changes(changes, _attribute_snapshot)

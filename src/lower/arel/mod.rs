@@ -210,6 +210,8 @@ const RELATION_REFINERS: &[&str] = &[
 fn requires_relation_receiver(method: &str) -> bool {
     RELATION_REFINERS.contains(&method)
         || matches!(method, "find_by" | "find_by!" | "exists?" | "sole" | "find_sole_by")
+        // Not a lifted SELECT: Array answers none of the bulk writes, so the hydrated rows would raise NoMethodError.
+        || matches!(method, "delete_all" | "update_all" | "destroy_all" | "touch_all")
         || is_dynamic_finder(method)
 }
 

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Gem façades — typed, loudly-raising stand-ins for native/third-party
 # gems that are REACHABLE in the require graph but never EXECUTED on
 # the read path. Spinel AOT must type-check the whole reachable graph,

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Minitest-shaped, like hash_to_query_test.rb: a CRuby run of the ruby
 # family's `ActiveStorage::Previewer.poster` reopen
 # (runtime/active_storage_previewer.rb over the shared

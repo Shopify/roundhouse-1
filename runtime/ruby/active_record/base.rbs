@@ -87,10 +87,16 @@ module ActiveRecord
     @attribute: String
     @kind: String
     @message: String
+    @full_message: String
+    @symbolic: bool
+    @optionless: bool
     def attribute: () -> String
     def kind: () -> String
     def message: () -> String
-    def initialize: (String attribute, String kind, String message) -> void
+    def full_message: () -> String
+    def symbolic: () -> bool
+    def optionless: () -> bool
+    def initialize: (String attribute, String kind, String message, ?String full_message, ?bool symbolic, ?bool optionless) -> void
   end
 
   class Base
@@ -336,6 +342,7 @@ module ActiveRecord
     def _transaction_write_begin: () -> void
     def _transaction_write_end: () -> void
     def _transaction_committed: () -> void
+    def _transaction_committed_now: () -> void
     def _run_commit_hooks: () -> void
     def _transaction_rolled_back: () -> void
     def _trigger_transactional_callbacks?: () -> bool

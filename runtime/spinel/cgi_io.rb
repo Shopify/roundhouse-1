@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CGI protocol I/O. Reads requests from ENV + stdin; writes responses
 # to stdout. The shape spinel can ingest (no sockets) and the shape
 # any CGI-aware web server (Apache mod_cgi, nginx fcgiwrap, lighttpd)

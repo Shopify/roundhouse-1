@@ -84,6 +84,10 @@ module Rails
   class Application
     def session_cookie_key: () -> String
     def forgery_protection_verification_strategy: () -> String
+    def public_file_server_headers: () -> Hash[String, String]
+    def action_cable_origin_listed?: (String origin) -> bool
+    def action_cable_allow_same_origin_as_host: () -> bool
+    def action_cable_disable_request_forgery_protection: () -> bool
     def token_fields_omitted: () -> bool
     def global_id_app: () -> String
     def secret_key_base: () -> String
@@ -93,6 +97,7 @@ module Rails
     ENV_CONFIG: Hash[String, Symbol?]
     def env_config: () -> Hash[String, Symbol?]
     def config_time_zone: () -> String
+    def config_filter_parameters: () -> Array[String]
     def active_storage_excluded_content_types: () -> Array[String]
     def active_storage_video_preview_arguments: () -> String
     def active_storage_previewers: () -> Array[untyped]

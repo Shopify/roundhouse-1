@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Props are held as JSON text, not as a Hash of values, and a lazy prop
 # is a condition around its expression, not a Proc: a strict target can
 # compile neither a mixed-value Hash nor a Proc.

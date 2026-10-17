@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Module-only Shellwords for Spinel.
 #
 # NOT NAMED `shellwords.rb`. `walk_dir_flat` copies every

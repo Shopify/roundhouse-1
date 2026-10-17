@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # geared_pagination's controller concern — `set_page_and_extract_portion_from`
 # and the `Page` object it parks in `@page`.
 #

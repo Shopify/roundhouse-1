@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionController::ParameterMissing — raised by `Params.require_key`
 # when a required parameter is absent or blank, and RESCUED by app code
 # as a normal path (a controller turns it into a 400 rather than letting
