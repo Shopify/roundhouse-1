@@ -2376,6 +2376,14 @@ module ActiveRecord
       self
     end
 
+    # `in_batches(of: n).each_record { |rec| }` — Rails' BatchEnumerator#each_record
+    # (7.1+) yields every record of every batch. `in_batches` answers this
+    # relation (one batch), so this is `find_each`.
+    def each_record(&block)
+      find_each(&block)
+      self
+    end
+
     # Not split into `of:`-row relations: one batch is the same answer at corpus sizes (as `find_in_batches`), so the block and the enumerator are this relation.
     def in_batches(of: 1000, order: nil)
       yield self if block_given?

@@ -930,4 +930,64 @@ module ActiveRecord
     end
   end
   Base.singleton_class.prepend(IntegerColumnBooleans)
+
+  # A json/jsonb column the compiled model retypes only for a `default:`
+  # (`attribute :signal_value, default: {}`) keeps the column's own type, as
+  # Rails' default-only declaration does: its writer casts, hydration
+  # parses and every bind serializes through Type::Json. Without it the
+  # compiled path passes the Hash through and the insert binds
+  # `Hash#to_s`. Only the names the compiler routed to the dynamic path
+  # (`_retypable_attribute_names`) are touched; any other json column is
+  # still the compiled string.
+  module JsonDefaultAttributeType
+    def _attribute_cast(name, value)
+      type = _json_default_attribute_type(name)
+      return super if type.nil?
+      type.assert_valid_value(value)
+      type.cast(value)
+    end
+
+    def _attribute_deserialize(name, value)
+      type = _json_default_attribute_type(name)
+      type.nil? ? super : type.deserialize(value)
+    end
+
+    def _attribute_serialize(name, value)
+      type = _json_default_attribute_type(name)
+      type.nil? ? super : _bind_type_cast(name, type.serialize(value))
+    end
+
+    def _attribute_for_database(name, value)
+      type = _json_default_attribute_type(name)
+      type.nil? ? super : _bind_type_cast(name, type.serialize(type.cast(value)))
+    end
+
+    def _json_default_attribute_type(name)
+      key = name.to_s
+      return nil unless _retypable_attribute_names.include?(key)
+      return nil if _declared_attribute_types[key]
+      spec = begin
+        schema_column_types[key]
+      rescue NotImplementedError
+        nil
+      end
+      return nil unless spec && (spec[0] == :json || spec[0] == :jsonb)
+      type_for_attribute(key)
+    end
+    private :_json_default_attribute_type
+  end
+  Base.singleton_class.prepend(JsonDefaultAttributeType)
+
+  # insert_all.rb's `on_duplicate: :skip` (Rails 7.2+) is `DO NOTHING`, and
+  # `:update` the default assignment of every column. The shared
+  # `_upsert_rows` takes the SET clause as SQL, so `:skip` is a write that
+  # updates no column (an empty `update_only` leaves nothing to assign).
+  module UpsertOnDuplicateSymbols
+    def _upsert_rows(rows, unique_by, on_duplicate, update_only, returning, record_timestamps = nil)
+      return super(rows, unique_by, nil, [], returning, record_timestamps) if on_duplicate == :skip
+      return super(rows, unique_by, nil, update_only, returning, record_timestamps) if on_duplicate == :update
+      super
+    end
+  end
+  Base.singleton_class.prepend(UpsertOnDuplicateSymbols)
 end
