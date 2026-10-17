@@ -247,6 +247,7 @@ module ActiveRecord
     def merge!: (Relation other) -> Relation
     def where_clauses: () -> Array[String]
     def join_clauses: () -> Array[String]
+    def eager_join?: (String frag) -> bool
     def order_clauses: () -> Array[String]
     def cast_schema_date: (untyped value) -> untyped
     def cast_schema_value: (untyped value, Symbol column) -> untyped
@@ -376,6 +377,7 @@ module ActiveRecord
     def third_to_last!: () -> Base
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
+    def take_n: (Integer | Float | String n) -> Array[Base]
     def count: () ?{ (Base) -> bool } -> Integer
     def sum: (?(String | Symbol | Integer | Float) expr) ?{ (Base) -> untyped } -> Float
     def minimum: (String | Symbol expr) -> untyped
@@ -468,6 +470,8 @@ module ActiveRecord
 def alias_referenced_joins: (Array[String] keys) -> void
 %a{abstract}
 def aliased_join_sql: (untyped owner, untyped reflection, String kind) -> String
+%a{abstract}
+def nested_column_name: (untyped owner, untyped col) -> String
     def sync_eager_joins: () -> void
     def eager_loading?: () -> bool
     def referenced_collection_hop?: (untyped owner, untyped spec) -> bool
@@ -483,6 +487,7 @@ def aliased_join_sql: (untyped owner, untyped reflection, String kind) -> String
     def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
     def nested_hash?: (String | Symbol key, Hash[untyped, untyped] val) -> bool
     def nested_table: (String | Symbol key) -> [String, untyped]
+    def nested_conditions: (String table, untyped owner, Hash[String | Symbol, untyped] conditions, Array[String] parts, Array[untyped] named) -> void
     def associated_model_by_table: (String name) -> untyped
     def tuple_predicate: (Array[untyped] columns, untyped val) -> String
     def hash_conditions: (Hash[String | Symbol, untyped] hash, ?bool note) -> String

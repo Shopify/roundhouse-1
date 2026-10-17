@@ -226,6 +226,17 @@ pub(super) fn included_block_with_defs<'pr>(call: &ruby_prism::CallNode<'pr>) ->
         .then_some(block)
 }
 
+/// The block of an argument-less, receiverless `included do … end`.
+pub(super) fn included_block<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    if call.receiver().is_some()
+        || call.arguments().is_some()
+        || super::util::constant_id_str(&call.name()) != "included"
+    {
+        return None;
+    }
+    call.block()?.as_block_node()
+}
+
 /// `class << self … end` directly in an `included do` block whose body
 /// is only `def`s and visibility markers: the defs, which Ruby makes the
 /// includer's class methods. Any other statement there (an

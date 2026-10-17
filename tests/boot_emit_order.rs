@@ -495,3 +495,38 @@ fn a_module_eval_loop_over_a_literal_hash_of_lists_runs_as_native() {
         "[:post, \"/a\", \"b\", {}, {}]\n[:get, \"/c\", nil, {}, 1]\n-4\n-3\n",
     );
 }
+
+/// carriers_db's `Carrier`: `add_country_index` is a class method of the
+/// class that the body calls right below its def, to register an index in
+/// a class-side registry. The call was dropped as an unmodelled class-body
+/// call, so the registry stayed empty.
+const OWN_CLASS_CALL: &[(&str, &str)] = &[(
+    "indexed.rb",
+    r##"module Indexed
+  class Carrier
+    class << self
+      attr_accessor :index_definitions
+    end
+
+    self.index_definitions = {}.freeze
+
+    def self.add_country_index
+      self.index_definitions = index_definitions.merge("country" => :country).freeze
+    end
+
+    add_country_index
+  end
+end
+"##,
+)];
+
+#[test]
+fn a_bare_call_to_the_classs_own_class_method_runs_after_its_def() {
+    gem_same_as_native(
+        "indexed",
+        OWN_CLASS_CALL,
+        "indexed",
+        "p Indexed::Carrier.index_definitions\n",
+        "{\"country\" => :country}\n",
+    );
+}

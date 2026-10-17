@@ -3195,12 +3195,20 @@ impl<'a> BodyTyper<'a> {
                         "Hash#deep_merge arity",
                         "exactly one Hash argument is supported",
                     )),
+                    // An argument whose type is not known (an untyped parameter,
+                    // a union) is a Hash at run time as often as not: the call
+                    // stays as written and dispatches to the core_ext the
+                    // CRuby overlay reopens Hash with. Only an argument known
+                    // not to be a Hash is refused.
                     "deep_merge" | "deep_merge!"
-                        if !matches!(args.first().and_then(|arg| arg.ty.as_ref()), Some(Ty::Hash { .. })) =>
+                        if matches!(
+                            args.first().and_then(|arg| arg.ty.as_ref()),
+                            Some(Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Nil | Ty::Array { .. })
+                        ) =>
                     {
                         Some((
                             "Hash#deep_merge argument",
-                            "the supported form requires a statically typed Hash argument",
+                            "the argument is statically known not to be a Hash",
                         ))
                     }
                     _ => None,
@@ -5375,7 +5383,7 @@ pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
 ///   Core, Persistence, Callbacks, ConnectionHandling, Transactions'
 ///   `current_transaction`);
 /// - the CRuby overlay's Active Record reopens the PostgreSQL boot loads
-///   (`active_record_bang.rb`, `_serialization`, `_relation_ext`,
+///   (`active_record_bang.rb`, `_serialization`, `_relation_ext`, `_counters`,
 ///   `_postgresql_adapter`, `_statement_errors`; not the SQLite adapter's);
 /// - the ActiveModel ports Base includes there that the bootstrap always
 ///   carries (`active_model_naming.rb`'s Conversion,
@@ -5796,6 +5804,7 @@ mod runtime_base {
         "active_record_store.rb",
         "active_record_serialization.rb",
         "active_record_relation_ext.rb",
+        "active_record_counters.rb",
         "active_record_postgresql_adapter.rb",
         "active_record_statement_errors.rb",
     ];

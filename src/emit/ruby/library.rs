@@ -2700,6 +2700,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let wrapped_inserts = app.library_classes.iter().any(|c| {
         c.origin.is_none() && c.methods.iter().any(|m| matches!(m.name.as_str(), "insert_all" | "insert_all!"))
     });
+    let stubbed_sends = crate::lower::scope_chain::stubbed_class_sends(app);
     let regs = crate::lower::scope_chain::Registries {
         scopes: &scopes,
         models: &models,
@@ -2713,6 +2714,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         wrapped_inserts,
         // The Ruby family's attrs Hash holds a record (see the field).
         owner_objects: true,
+        stubbed_sends: &stubbed_sends,
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
@@ -3664,6 +3666,15 @@ fn is_relation_chain(e: &Expr) -> bool {
         ExprNode::Send { recv: Some(inner), method, .. } if method.as_str() == "new" => {
             matches!(&*inner.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "Relation"))
         }
+        // A scope the model compiled to a class method taking the relation
+        // it narrows (`Credential.not_revoked(ActiveRecord::Relation.new(
+        // Credential).where(…))`, an association's `-> { not_revoked }`).
+        ExprNode::Send { recv: Some(inner), args, .. }
+            if matches!(&*inner.node, ExprNode::Const { .. })
+                && args.first().is_some_and(|base| matches!(&*base.node, ExprNode::Send { .. }) && is_relation_chain(base)) =>
+        {
+            true
+        }
         ExprNode::Const { .. } => true,
         _ => false,
     }
@@ -4241,6 +4252,7 @@ pub(crate) fn apply_association_reflections(lcs: &mut [LibraryClass], app: &App)
             };
             if matches!(assoc, Association::HasMany { extension, .. } if !extension.is_empty())
                 && !unsupported.iter().any(|u| u.contains("block"))
+                && !options.contains("Module.new")
             {
                 unsupported.push("`extend:` (the declaration's block)".to_string());
             }
@@ -4452,6 +4464,13 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 }
             })
     }
+    // An `extend:` naming its modules: a constant, or an array of constants
+    // (`extend: Taggable::TagAssociationExtension`), which names the same
+    // module where the reflection table is built.
+    fn extension_modules(node: &ruby_prism::Node<'_>) -> bool {
+        let constant = |n: &ruby_prism::Node<'_>| n.as_constant_read_node().is_some() || n.as_constant_path_node().is_some();
+        constant(node) || node.as_array_node().is_some_and(|a| a.elements().iter().all(|e| constant(&e)))
+    }
     // An association option value the reflection table can rebuild from its
     // source text: a `proc { |owner, record| ... }` / `lambda` / `->` that
     // reads no local of the class body around it (the callback options,
@@ -4541,6 +4560,24 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
         scan.visit(node);
         scan.free
     }
+    // A block whose statements are all `include`/`extend`/`prepend` of
+    // constants.
+    fn mixin_only_block(block: &ruby_prism::BlockNode<'_>) -> bool {
+        if block.parameters().is_some() {
+            return false;
+        }
+        let Some(body) = block.body() else { return true };
+        let Some(statements) = body.as_statements_node() else { return false };
+        statements.body().iter().all(|statement| {
+            let Some(call) = statement.as_call_node() else { return false };
+            call.receiver().is_none()
+                && call.block().is_none()
+                && matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend")
+                && call.arguments().is_some_and(|a| {
+                    a.arguments().iter().all(|arg| arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some())
+                })
+        })
+    }
     fn call_options(call: &ruby_prism::CallNode<'_>) -> (String, Vec<String>) {
         let mut pairs: Vec<String> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
@@ -4565,7 +4602,7 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 match name {
                     Some(name) if label(&name) => {
                         let value = assoc.value();
-                        if literal(&value) || carried_option_value(&value) {
+                        if literal(&value) || carried_option_value(&value) || (name == "extend" && extension_modules(&value)) {
                             pairs.push(format!("{name}: {}", String::from_utf8_lossy(value.location().as_slice())));
                         } else {
                             unsupported.push(format!("`{name}:` (not a literal)"));
@@ -4575,8 +4612,29 @@ fn declaration_calls(text: &str) -> HashMap<u32, (String, Vec<String>)> {
                 }
             }
         }
-        if call.block().is_some() {
-            unsupported.push("`extend:` (the declaration's block)".to_string());
+        // The declaration's block is an anonymous module Rails adds to
+        // `options[:extend]` (`options[:extend] = [*options[:extend],
+        // extension]`, builder/association.rb; an `extend:` the call names
+        // is not a carried value, so it is already named): rebuilt from the block's source where the table
+        // is built, as the other carried values are, when the block only
+        // mixes in constants (`include Sortable`): a `def` in it is not
+        // read back from the table's source, so a block with methods stays
+        // named.
+        if let Some(block) = call.block() {
+            match block.as_block_node().filter(|b| mixin_only_block(b)) {
+                Some(b) => {
+                    let module = format!("Module.new {}", String::from_utf8_lossy(b.location().as_slice()));
+                    // The call's own `extend:` comes first (`[*options[:extend], extension]`).
+                    match pairs.iter().position(|p| p.starts_with("extend: ")) {
+                        Some(at) => {
+                            let named = pairs[at]["extend: ".len()..].to_string();
+                            pairs[at] = format!("extend: [*{named}, {module}]");
+                        }
+                        None => pairs.push(format!("extend: [{module}]")),
+                    }
+                }
+                None => unsupported.push("`extend:` (the declaration's block)".to_string()),
+            }
         }
         let hash = if pairs.is_empty() { "{}".to_string() } else { format!("{{ {} }}", pairs.join(", ")) };
         (hash, unsupported)
@@ -5774,6 +5832,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             m.body = through_reader_body(
                 name,
                 target,
+                roots_target(&lc.name, target),
                 &join_sql,
                 &where_sql,
                 &edge.owner_bind(),
@@ -5809,6 +5868,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 .map(|s| crate::lower::model_to_library::associations::bind_scope_owner(s, scope_owner.as_ref()));
             let relation = through_relation_chain(
                 target,
+                roots_target(&lc.name, target),
                 &joins.join(" "),
                 &edge.owner_condition(),
                 &edge.owner_bind(),
@@ -5835,6 +5895,14 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             }
         }
     }
+}
+
+/// A top-level target read from a namespaced owner is written rooted:
+/// the target is the resolved class (Rails' `class_name: "::Province"`),
+/// where a bare `Province` in `Delivery::Zone` is the lexical
+/// `Delivery::Province` when the namespace declares one.
+fn roots_target(owner: &ClassId, target: &ClassId) -> bool {
+    owner.0.as_str().contains("::") && !target.0.as_str().contains("::")
 }
 
 /// Where a `through:` chain ties back to its owner.
@@ -5986,11 +6054,23 @@ fn resolve_through_chain(
     })?;
     match src {
         // The source belongs_to on the join model (`Vote.belongs_to
-        // :story`). A polymorphic one needs a type predicate this join
-        // does not write, so it stays on the shared reader.
+        // :story`).
         Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. } => {
             let mut joins = vec![format!(
                 "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
+            )];
+            joins.extend(back_joins);
+            Some((joins, edge))
+        }
+        // A polymorphic source (`has_many :provinces, through: :zone_regions,
+        // source: :region, source_type: "Province"`, `ZoneRegion belongs_to
+        // :region, polymorphic: true`) names the target by `source_type:`,
+        // which the type column pins: `zone_regions.region_type = 'Province'`.
+        Association::BelongsTo { name: src_name, foreign_key: src_fk, polymorphic: true, foreign_type, .. } => {
+            let type_column = foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{src_name}_type")));
+            let type_name = target.0.as_str().replace('\'', "''");
+            let mut joins = vec![format!(
+                "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type} AND {thr_table}.{type_column} = '{type_name}'"
             )];
             joins.extend(back_joins);
             Some((joins, edge))
@@ -6085,6 +6165,7 @@ fn through_owner_type_predicate(table: &str, as_interface: &Option<Symbol>, owne
 fn through_reader_body(
     name: &Symbol,
     target: &ClassId,
+    rooted: bool,
     join_sql: &str,
     where_sql: &str,
     bind: &Symbol,
@@ -6092,7 +6173,7 @@ fn through_reader_body(
     assoc_scope: &Option<Expr>,
 ) -> Expr {
     let span = Span::synthetic;
-    let chain = through_relation_chain(target, join_sql, where_sql, bind, hop_scopes, assoc_scope);
+    let chain = through_relation_chain(target, rooted, join_sql, where_sql, bind, hop_scopes, assoc_scope);
     // Last in the chain, after any scope graft: the scope's conditions
     // belong to the QUERY, and this hands the finished relation the
     // records an eager load already fetched.
@@ -6121,6 +6202,7 @@ fn through_reader_body(
 /// `through_reader_body`).
 fn through_relation_chain(
     target: &ClassId,
+    rooted: bool,
     join_sql: &str,
     where_sql: &str,
     bind: &Symbol,
@@ -6131,7 +6213,11 @@ fn through_relation_chain(
     let target_const = Expr::new(
         span(),
         ExprNode::Const {
-            path: target.0.as_str().split("::").map(Symbol::from).collect(),
+            path: rooted
+                .then(|| Symbol::from(""))
+                .into_iter()
+                .chain(target.0.as_str().split("::").map(Symbol::from))
+                .collect(),
         },
     );
     let seed = Expr::new(
@@ -11455,8 +11541,17 @@ fn emit_library_class_decl_inner(
             }
         }
         for f in declined.into_iter().flatten() {
-            if !copy.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == f.name) {
-                copy.methods.push(f.clone());
+            let taken = copy.methods.iter().position(|m| m.receiver == MethodReceiver::Instance && m.name == f.name);
+            match taken {
+                None => copy.methods.push(f.clone()),
+                // A `delegate` named like a column (`orders.total_received`)
+                // is written in the class, ahead of the generated attribute
+                // methods module: its forwarder replaces the synthesized
+                // accessor.
+                Some(i) if copy.methods[i].name_span.is_synthetic() && !f.name_span.is_synthetic() => {
+                    copy.methods[i] = f.clone();
+                }
+                Some(_) => {}
             }
         }
         // An `alias_method :to, :from` of a forwarder the ingest declined
@@ -13159,6 +13254,51 @@ fn emit_library_class_decl_inner(
             tail_effects.sort_by_key(|e| e.span.start);
         }
     }
+    // A def the source has below a class-body macro that names it
+    // (`money_column(:variant_price)` above `def variant_price`) is the
+    // one that stands: the macro's `define_method` ran first. The macros
+    // are written below the methods, so such a def follows the macro that
+    // names it, instead of being replaced by what the macro defined.
+    let defs_named_below: Vec<(usize, &Expr)> = if railtie {
+        Vec::new()
+    } else {
+        let mut out: Vec<(usize, &Expr)> = Vec::new();
+        for e in late_inits.iter().copied().chain(tail_effects.iter().copied()) {
+            let ExprNode::Send { recv, args, .. } = &*e.node else { continue };
+            if e.span.is_synthetic() || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
+            for arg in args {
+                let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node else { continue };
+                let Some(index) = lc.methods.iter().position(|m| {
+                    m.name == *value
+                        && m.receiver == MethodReceiver::Instance
+                        && !m.name_span.is_synthetic()
+                        && m.name_span.file == e.span.file
+                        && m.name_span.start > e.span.start
+                }) else {
+                    continue;
+                };
+                let m = &lc.methods[index];
+                if !out.iter().any(|(i, _)| *i == index)
+                    && !carried_method(m)
+                    && !written_in_state.contains(&index)
+                    && !hoisted_hooks.contains(&index)
+                    && !lc.conditional_definitions.iter().any(|c| c.contains(m))
+                    && inherited_alias(lc, m).is_none()
+                {
+                    out.push((index, e));
+                }
+            }
+        }
+        out
+    };
+    let write_defs_named_by = |s: &mut String, effect: &Expr| {
+        for &(index, _) in defs_named_below.iter().filter(|(_, e)| std::ptr::eq(*e, effect)) {
+            writeln!(s).unwrap();
+            write_library_method(s, lc, index, &body_pad, &instance_form);
+        }
+    };
     // A carried railtie's body: its locals first (a statement's block
     // closes over a local an earlier statement writes), then each
     // statement under `run_body_statement`, which names one that fails
@@ -13295,6 +13435,8 @@ fn emit_library_class_decl_inner(
         }
 
         match conditional {
+            // After the macro that names it (`defs_named_below`).
+            None if defs_named_below.iter().any(|(i, _)| *i == index) => {}
             // After every def (below).
             None if inherited_alias(lc, m).is_some() => {}
             Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad, &instance_form),
@@ -13346,6 +13488,7 @@ fn emit_library_class_decl_inner(
                 writeln!(s, "{body_pad}{line}").unwrap();
             }
         }
+        write_defs_named_by(&mut s, effect);
     }
 
     // Named visibility for methods without a local definition (inherited,
@@ -13434,6 +13577,7 @@ fn emit_library_class_decl_inner(
         for line in super::emit_expr(&top_level(init)).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
+        write_defs_named_by(&mut s, init);
         for o in overrides_at(at + 1) {
             write_override(&mut s, o);
         }
@@ -14769,6 +14913,18 @@ fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr>
                     if method.as_str() == "singleton_class" && inner.is_empty() && implicit_self(recv))
                     && args.len() == 2
                     && args.iter().all(symbol)
+            }
+            // A bare call to a class-side method this class defines itself
+            // (carriers_db's `add_country_index`, which registers an index
+            // in `index_definitions`): written after the methods
+            // (`OwnClassCalls`), as Ruby ran it after its def.
+            ExprNode::Send { recv, method, block: None, .. }
+                if implicit_self(recv)
+                    && lc.methods.iter().any(|m| {
+                        m.receiver == MethodReceiver::Class && m.name == *method && !m.name_span.is_synthetic()
+                    }) =>
+            {
+                true
             }
             _ => self_write_or_assign(call).is_some_and(|(name, reads)| {
                 let answers = |method: &str| {
@@ -22599,4 +22755,33 @@ fn mixed_in_outside_helpers(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod association_scope_chain_tests {
+    use super::*;
+
+    fn chain(body: &str) -> bool {
+        let src = format!("def probe\n  {body}\nend\n");
+        let method = crate::runtime_src::parse_methods(&src).expect("parses").pop().expect("one method");
+        is_relation_chain(&method.body)
+    }
+
+    // A has_many's `-> { not_revoked }` (Core's payment_credentials) is the
+    // target's compiled scope applied to the key relation; the model must
+    // carry it as `_<name>_association_scope`, or `association(:name).scope`
+    // raises NotImplementedError.
+    #[test]
+    fn a_compiled_scope_applied_to_the_key_relation_is_a_relation() {
+        assert!(chain("::Credential.not_revoked(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id))"));
+        assert!(chain("::Credential.live(::Credential.not_revoked(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id)))"));
+        assert!(chain("::Credential.since(ActiveRecord::Relation.new(::Credential).where(instrument_id: @id), 3)"));
+    }
+
+    #[test]
+    fn a_class_method_on_something_else_is_not() {
+        assert!(!chain("::Credential.find(@id)"));
+        assert!(!chain("::Credential.count_for(@id)"));
+        assert!(!chain("helper.not_revoked(ActiveRecord::Relation.new(::Credential))"));
+    }
 }

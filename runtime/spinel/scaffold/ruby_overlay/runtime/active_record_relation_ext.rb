@@ -483,6 +483,15 @@ module ActiveRecord
 def aliased_join_sql(owner, reflection, kind)
   reflection_join_sql(owner, reflection, kind, join_alias_for(owner, reflection))
 end
+
+    # A nested where hash's column on its owner's table
+    # (`where(condition_responders: {condition_id:})`): the owner's own
+    # `alias_attribute` names the column, as `where(subdomain:)` does on
+    # the model itself. The shared `hash_conditions` calls this so the
+    # owner's untyped reflection stays out of the typed body.
+    def nested_column_name(owner, col)
+      owner.nil? ? col.to_s : owner._attribute_name(col.to_s)
+    end
   end
 end
 
@@ -506,12 +515,36 @@ module ActiveRecord
     def association_key_predicates(reflection, val, note)
       pairs = reflection.respond_to?(:_roundhouse_key_pairs) ? reflection._roundhouse_key_pairs : nil
       return super if pairs.nil?
-      return composite_list_predicates(pairs, val.to_a) if val.is_a?(Array) || val.is_a?(Relation)
+      polymorphic = reflection.polymorphic?
+      if val.is_a?(Array) || val.is_a?(Relation)
+        return polymorphic_composite_list_predicates(reflection, pairs, val.to_a, note) if polymorphic
+        return composite_list_predicates(pairs, val.to_a)
+      end
       raise NotImplementedError, "roundhouse: where(#{reflection.name}: ...) with the composite key " \
         "#{pairs.map { |pair| pair[0] }.inspect} takes a record, a list of records or nil" unless val.nil? || val.is_a?(Base)
-      pairs.map do |pair|
+      out = pairs.map do |pair|
         [pair[0], column_predicate(pair[0], val.nil? ? nil : val.public_send(pair[1]), note)]
       end
+      # A polymorphic key names its type too (`ledger_type = 'Payments::Account'`),
+      # which also seeds the type of a record built through the relation.
+      if polymorphic
+        type = reflection.foreign_type.to_s
+        out.unshift([type, column_predicate(type, val.nil? ? nil : val.class.polymorphic_name, note)])
+      end
+      out
+    end
+
+    # `where(ledger: [records])` over a polymorphic composite key: Rails'
+    # PolymorphicArrayValue groups the records by their class and matches
+    # each group by the type column and the key pairs, the groups ORed.
+    def polymorphic_composite_list_predicates(reflection, pairs, records, note)
+      type = reflection.foreign_type.to_s
+      groups = records.group_by { |record| record.class.polymorphic_name }.map do |name, group|
+        keys = composite_list_predicates(pairs, group)[0][1]
+        "(#{column_predicate(type, name, note)} AND #{keys})"
+      end
+      return [[pairs[0][0], "1=0"]] if groups.empty?
+      [[pairs[0][0], groups.length == 1 ? groups[0] : "(#{groups.join(" OR ")})"]]
     end
 
     # A list of records over a composite key is Rails' tuple match: one
@@ -526,4 +559,105 @@ module ActiveRecord
     end
   end
   Relation.prepend(CompositeAssociationKeyPredicates)
+
+  # `where(variants: { inventory_item_variants: { inventory_item_id: 1 } })`:
+  # a Hash value under a key that is no column of the nested model nests a
+  # further table (Rails' `associated_table` walking the hops), qualified by
+  # its own key and typed by the model of that hop. The dynamic walk lives
+  # here, outside the typed gate; the leaf conditions are the shared body's.
+  module RelationNestedHops
+    private
+
+    def nested_conditions(table, owner, conditions, parts, named)
+      return super unless conditions.any? { |col, v| v.is_a?(Hash) && nested_hop?(owner, col) }
+
+      conditions.each do |col, v|
+        if v.is_a?(Hash) && nested_hop?(owner, col)
+          inner, inner_owner = Relation.new(owner).send(:nested_table, col)
+          nested_conditions(inner, inner_owner, v, parts, named)
+        else
+          super(table, owner, { col => v }, parts, named)
+        end
+      end
+    end
+
+    def nested_hop?(owner, col)
+      owner.respond_to?(:schema_columns) && !owner.schema_columns.include?(owner._attribute_name(col.to_s).to_sym)
+    end
+  end
+  Relation.prepend(RelationNestedHops)
+
+  # Rails' `check_if_method_has_arguments!` drops blank order arguments
+  # (`compact_blank`): `reorder(nil)` clears the order and orders by nothing.
+  module RelationBlankOrder
+    def order!(*parts)
+      super(*parts.reject { |part| part.nil? || part == "" })
+    end
+  end
+  Relation.prepend(RelationBlankOrder)
+
+  # A PostgreSQL row already carries the Time its driver decoded.
+  module RelationDecodedTimes
+    def cast_schema_value(value, column)
+      return value if value.is_a?(Time) && @model.schema_time_columns.include?(column)
+
+      super
+    end
+  end
+  Relation.prepend(RelationDecodedTimes)
+
+  # Rails' InsertAll takes the relation's create attributes
+  # (`attributes.merge!(scope_attributes)`): an association's foreign key
+  # and a default scope's `where(island: n)` go into every row of
+  # `owner.snapshots.insert_all!(rows)`, over the row's own value. The
+  # shared Relation hands the rows to the model as given, which left a
+  # default-scoped table's `island` NULL.
+  module InsertScopeAttributes
+    def insert_all(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    def insert_all!(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    def upsert_all(rows, **options)
+      super(_rows_with_scope_attributes(rows), **options)
+    end
+
+    private
+
+    def _rows_with_scope_attributes(rows)
+      scope = scope_attributes
+      return rows if scope.empty?
+      rows.map do |row|
+        merged = row.dup
+        scope.each do |name, value|
+          merged.delete(name.to_s)
+          merged[name.to_sym] = value
+        end
+        merged
+      end
+    end
+  end
+  Relation.prepend(InsertScopeAttributes)
+end
+
+module ActiveRecord
+  # Rails' `sanitize_forbidden_attributes` on a `where` condition: an
+  # `ActionController::Parameters` (anything answering `permitted?`) is
+  # unwrapped to its Hash when permitted and refused with
+  # `ForbiddenAttributesError` when not, so
+  # `milestones.where(milestone_params.slice(:name, :value))` filters by
+  # column rather than reaching the raw-SQL path as the object's `to_s`.
+  module RelationPermittedParametersCondition
+    def where(condition = nil, *args)
+      if !condition.nil? && condition.respond_to?(:permitted?)
+        raise ActiveModel::ForbiddenAttributesError unless condition.permitted?
+        condition = condition.to_h
+      end
+      super(condition, *args)
+    end
+  end
+  Relation.prepend(RelationPermittedParametersCondition)
 end

@@ -237,6 +237,12 @@ module ActiveRecord
       initialize_internals_callback
     end
 
+    # The instance reader of core.rb's `cattr_accessor :logger`
+    # (ActiveRecord::Base.logger above).
+    def logger
+      ::ActiveRecord::Base.logger
+    end
+
     # Returns +true+ if the record is read only.
     def readonly?
       @readonly == true
@@ -290,6 +296,7 @@ module ActiveRecord
     def initialize_dup(other)
       super
       @persisted = false
+      @new_record = nil
       @destroyed = false
       @readonly = false
       @errors = _fresh_errors
@@ -1001,6 +1008,25 @@ module ActiveRecord
     const_set(:HYDRATE_ATTRS, hydrate_attrs.freeze)
 
     class << self
+      # core.rb's `cattr_accessor :logger, instance_writer: false`: one
+      # logger every model class reads off ActiveRecord::Base, which
+      # railties' "active_record.logger" initializer fills with
+      # `self.logger ||= ::Rails.logger`. The emitted boot runs no railtie
+      # initializers, so the first read stands in for that one, as the
+      # LogSubscriber's does: it takes Rails.logger unless a logger was
+      # assigned (nil included).
+      def logger
+        base = ::ActiveRecord::Base
+        unless base.instance_variable_defined?(:@__roundhouse_logger)
+          base.logger = ::Rails.logger if defined?(::Rails) && ::Rails.respond_to?(:logger)
+        end
+        base.instance_variable_get(:@__roundhouse_logger)
+      end
+
+      def logger=(logger)
+        ::ActiveRecord::Base.instance_variable_set(:@__roundhouse_logger, logger)
+      end
+
       # inheritance.rb's `new`: a record built with the inheritance
       # column's value (`Condition.new(attribute_name: "title")`, which
       # `create!` and an association's `build` reach) is an instance of

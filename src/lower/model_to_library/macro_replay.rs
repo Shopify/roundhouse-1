@@ -866,8 +866,12 @@ impl<'a> ClassSide<'a> {
         // into ActiveRecord::Base (`on_load(:active_record)`), so the call
         // runs there and sets the class's `token_prefix` and `before_create`
         // hook. Dropped, `generate_token_for` reads a nil prefix
-        // (`nil + SecureRandom.hex`).
-        if method.as_str() == "has_token"
+        // (`nil + SecureRandom.hex`). `has_handle(column = :handle, **opts)`
+        // is the same gem's other macro: it sets `handle_column` /
+        // `handle_options` (class attributes the gem's InstanceMethods
+        // declares when included) and the `before_create` hook that fills
+        // the handle. Dropped, `Product.create!` leaves `handle` nil.
+        if matches!(method.as_str(), "has_token" | "has_handle")
             && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
             && self.app.bundler_gems.iter().any(|g| g.name == "identifications")
         {
@@ -1449,8 +1453,12 @@ impl<'s, 'a> Walk<'s, 'a> {
         // boot.rb; runtime/active_support_redefine_method.rb, which the
         // class_attribute port requires), so a class is answered them.
         // Core's `configure_money_bags` reads `try(:money_bag_options) ||
-        // {}` and `money_bags` redefines each reader.
-        if matches!(name, "try" | "try!" | "silence_redefinition_of_method")
+        // {}` and `money_bags` redefines each reader. `Class#class_attribute`
+        // is the same port set (`apply_postgres_bootstrap` always carries it):
+        // Core's `Taggable::ClassMethods#has_tags` declares
+        // `class_attribute :tag_associate_name, :tag_options` on the model,
+        // which `Product.tag_options` and `Taggable#tags` read.
+        if matches!(name, "try" | "try!" | "silence_redefinition_of_method" | "class_attribute")
             && self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
         {
             return Ok(());
@@ -1561,6 +1569,16 @@ impl<'s, 'a> Walk<'s, 'a> {
                     self.self_call(&name)?;
                     if matches!(name.as_str(), "class_eval" | "module_eval" | "instance_eval") {
                         self.eval_strings(args)?;
+                    }
+                    // `class_attribute :a, :b`: the macro's later `self.a = ...`
+                    // and reads reach what the declaration just defined.
+                    if name == "class_attribute" {
+                        for arg in args {
+                            if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
+                                let attr = value.as_str();
+                                self.defined_singletons.extend([attr.to_string(), format!("{attr}="), format!("{attr}?")]);
+                            }
+                        }
                     }
                     if name == "define_singleton_method" {
                         match args.first().map(|a| &*a.node) {

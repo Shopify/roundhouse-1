@@ -824,6 +824,10 @@ class ActionResponse
   # same key normalization every other read goes through.
   attr_reader :status, :body, :location, :flash, :cookies, :content_type
 
+  # Rails' `TestResponse#request`: the request this response answered
+  # (set by the controller-test `process`; nil for a bare response).
+  attr_accessor :request
+
   def initialize(status:, body:, location:, flash:, cookies:, content_type: "text/html; charset=utf-8",
                  cache_control_max_age: 0, cache_control_public: false, cache_control_store: nil, headers: {})
     @status   = status
@@ -1743,32 +1747,43 @@ module RequestDispatch
   # `request_parameters` (body alone) the encoder would; a controller
   # that reads the raw body sees an empty one. campfire's direct-upload
   # tests are the corpus's use.
-  def get(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("GET", path, params, headers.merge(env), as)
+  def get(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("GET", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def post(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("POST", path, params, headers.merge(env), as)
+  def post(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("POST", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def patch(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("PATCH", path, params, headers.merge(env), as)
+  def patch(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("PATCH", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
   # Rails' integration tests define all five verbs plus `head`; the four
   # the blog happened to use were the four that existed. campfire's
   # `put account_user_url(...)` is the first `put` in the corpus, and it
   # failed as a missing METHOD rather than as an unrouted request.
-  def put(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("PUT", path, params, headers.merge(env), as)
+  def put(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("PUT", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def delete(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("DELETE", path, params, headers.merge(env), as)
+  def delete(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("DELETE", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def head(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("HEAD", path, params, headers.merge(env), as)
+  def head(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("HEAD", path, params, xhr_headers(headers.merge(env), xhr), as)
+  end
+
+  # Rails' `xhr: true` on an integration verb (`ActionDispatch::Integration::
+  # Session#process`): the request says it is an XMLHttpRequest and, unless
+  # the test named one, accepts what a browser's XHR does.
+  def xhr_headers(headers, xhr)
+    return headers unless xhr
+    headers.merge(
+      "HTTP_X_REQUESTED_WITH" => "XMLHttpRequest",
+      "HTTP_ACCEPT" => headers["HTTP_ACCEPT"] || "text/javascript, text/html, application/xml, text/xml, */*"
+    )
   end
 
   # Rails' `open_session` — a second browser beside the test's own, with

@@ -197,6 +197,44 @@ module ActiveRecord
       end
     end
 
+    # abstract/schema_definitions.rb's IndexDefinition: a table's index as
+    # `indexes` reads it from the catalog.
+    class IndexDefinition
+      attr_reader :table, :name, :unique, :columns, :lengths, :orders, :opclasses, :where, :type, :using, :include, :nulls_not_distinct, :comment
+
+      def initialize(table, name, unique = false, columns = [], lengths: {}, orders: {}, opclasses: {}, where: nil, type: nil, using: nil, include: nil, nulls_not_distinct: nil, comment: nil, valid: true)
+        @table = table
+        @name = name
+        @unique = unique
+        @columns = columns
+        @lengths = concise_options(lengths)
+        @orders = concise_options(orders)
+        @opclasses = concise_options(opclasses)
+        @where = where
+        @type = type
+        @using = using
+        @include = include
+        @nulls_not_distinct = nulls_not_distinct
+        @comment = comment
+        @valid = valid
+      end
+
+      def valid?
+        @valid
+      end
+
+      private
+
+      # One value shared by every column is that value.
+      def concise_options(options)
+        if columns.size == options.size && options.values.uniq.size == 1
+          options.values.first
+        else
+          options
+        end
+      end
+    end
+
     module PostgreSQL
       # postgresql/type_metadata.rb: the SqlTypeMetadata with the
       # column's type OID and modifier.
@@ -648,6 +686,63 @@ module ActiveRecord
         pk = primary_keys(table_name)
         pk = pk.first unless pk.size > 1
         pk
+      end
+
+      # postgresql/schema_statements.rb's indexes: the table's indexes
+      # (the primary key's excluded) from pg_index, each parsed from its
+      # `pg_get_indexdef` as Rails does, ordered by index name.
+      def indexes(table_name) # :nodoc:
+        schema, table = table_name.to_s.scan(/[^".]+|"[^"]*"/).map { |part| part.delete('"') }
+        if table.nil?
+          table = schema
+          schema = nil
+        end
+        scope = schema ? "n.nspname = #{quote(schema)}" : "n.nspname = ANY (current_schemas(false))"
+        rows = query_rows(<<~SQL, "SCHEMA")
+          SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), t.oid,
+                          pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid
+          FROM pg_class t
+          INNER JOIN pg_index d ON t.oid = d.indrelid
+          INNER JOIN pg_class i ON d.indexrelid = i.oid
+          LEFT JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE i.relkind IN ('i', 'I')
+            AND d.indisprimary = 'f'
+            AND t.relname = #{quote(table)}
+            AND #{scope}
+          ORDER BY i.relname
+        SQL
+        rows.map do |index_name, unique, indkey, inddef, oid, comment, valid|
+          indkey = indkey.split(" ").map(&:to_i)
+          using, expressions, include, nulls_not_distinct, where =
+            inddef.scan(/ USING (\w+?) \((.+?)\)(?: INCLUDE \((.+?)\))?( NULLS NOT DISTINCT)?(?: WHERE (.+))?\z/m).flatten
+          orders = {}
+          opclasses = {}
+          include_columns = include ? include.split(",").map { |c| c.strip.delete('"').split(".").last } : []
+          if indkey.include?(0)
+            columns = expressions
+          else
+            names = query_rows(<<~SQL, "SCHEMA").to_h
+              SELECT a.attnum, a.attname FROM pg_attribute a WHERE a.attrelid = #{oid.to_i} AND a.attnum IN (#{indkey.join(",")})
+            SQL
+            columns = names.values_at(*indkey).compact
+            # Only DESC is spelled out (ASC is the default), as are non-default operator classes.
+            expressions.scan(/(?<column>\w+)"?\s?(?<opclass>\w+_ops(_\w+)?)?\s?(?<desc>DESC)?\s?(?<nulls>NULLS (?:FIRST|LAST))?/).each do |column, opclass, desc, nulls|
+              opclasses[column] = opclass.to_sym if opclass
+              if nulls
+                orders[column] = [desc, nulls].compact.join(" ")
+              elsif desc
+                orders[column] = :desc
+              end
+            end
+          end
+          IndexDefinition.new(
+            table_name.to_s, index_name, unique, columns,
+            orders: orders, opclasses: opclasses, where: where, using: using.to_sym,
+            include: include_columns.empty? ? nil : include_columns,
+            nulls_not_distinct: !nulls_not_distinct.nil? && !nulls_not_distinct.empty?,
+            comment: comment.nil? || comment.empty? ? nil : comment, valid: valid
+          )
+        end
       end
 
       def supports_identity_columns? # :nodoc:

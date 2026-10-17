@@ -26,7 +26,7 @@ use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
     ClassKind, ConcernClassMethodSpans, ConcernEnumDecl, classify_class_file,
-    ingest_concern_class_method_spans, ingest_concern_filters,
+    ingest_concern_class_method_spans, ingest_concern_filters, ingest_concern_rescues,
     ingest_concern_included_redefs, ingest_concern_model_items_with_constants,
     ingest_concern_prepended_items, ingest_helper_method_names, ingest_library_classes,
     ingest_nested_library_classes, ingest_rails_application_singleton_methods,
@@ -883,6 +883,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             unwrap_or_record(ingest_concern_filters(&source, &path_str))?
                         {
                             app.concern_filters.extend(concern_filters);
+                        }
+                        if let Some(concern_rescues) =
+                            unwrap_or_record(ingest_concern_rescues(&source, &path_str))?
+                        {
+                            app.concern_rescues.extend(concern_rescues);
                         }
                         let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
@@ -2322,6 +2327,11 @@ end
                             unwrap_or_record(ingest_concern_filters(&source, &path_str))?
                         {
                             app.concern_filters.extend(concern_filters);
+                        }
+                        if let Some(concern_rescues) =
+                            unwrap_or_record(ingest_concern_rescues(&source, &path_str))?
+                        {
+                            app.concern_rescues.extend(concern_rescues);
                         }
                         let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
@@ -4889,7 +4899,7 @@ fn splice_concerns_into_models_named(
         carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
     let mut dependencies: crate::det::HashMap<ClassId, Vec<ClassId>> = crate::det::HashMap::default();
     for lc in app.library_classes.iter().filter(|lc| lc.is_module && concerns.contains(&lc.name)) {
-        dependencies.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        dependencies.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     // `id` with its dependencies ahead of it, depth first, each concern
     // once per includer (`append_features` returns early for a module the
@@ -5452,7 +5462,7 @@ fn splice_concern_class_methods_into_includers(
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     if class_side.is_empty() {
         return;
@@ -5774,7 +5784,7 @@ fn splice_deferred_mixes_in_extends(app: &mut App, carriers: &[ConcernClassMetho
         carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(unrooted));
     }
     let mut direct: HashMap<ClassId, (Option<ClassId>, Vec<ClassId>)> = HashMap::default();
     for model in &app.models {
@@ -6235,6 +6245,22 @@ fn splice_concerns_into_controllers(app: &mut App) {
                     filter.from_concern = Some(module.clone());
                     filters.push(ControllerBodyItem::Filter {
                         filter,
+                        leading_comments: Vec::new(),
+                        leading_blank_line: false,
+                    });
+                }
+                // The concern's `rescue_from`s, behind its filters: the
+                // `Unknown` item a controller's own is, with the module's
+                // constants (`RESOURCE_NOT_FOUND_ERRORS`) qualified, as
+                // they resolve lexically in the module and not here.
+                for call in app.concern_rescues.get(module).into_iter().flatten() {
+                    let mut call = call.clone();
+                    if let Some(consts) = module_constants.get(module) {
+                        qualify_lexical_consts(&mut call, module, consts);
+                    }
+                    spliced_any = true;
+                    filters.push(ControllerBodyItem::Unknown {
+                        expr: call,
                         leading_comments: Vec::new(),
                         leading_blank_line: false,
                     });
@@ -16210,4 +16236,16 @@ fn constructs_app_instance_answering(
             })
         })
     })
+}
+
+/// An include written `::X` names the top-level `X`. Ingest keeps the
+/// leading `::` when a namespace of the same name lies on the owner's
+/// lexical path (`include ::MutationGuard` inside
+/// `Returns::Internal::MutationGuard`), so the emitted include is not read
+/// as the nested module; a concern table is keyed by the plain name.
+fn unrooted(id: &crate::ident::ClassId) -> crate::ident::ClassId {
+    match id.0.as_str().strip_prefix("::") {
+        Some(top) => crate::ident::ClassId(crate::ident::Symbol::from(top)),
+        None => id.clone(),
+    }
 }

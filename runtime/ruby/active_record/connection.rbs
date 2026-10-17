@@ -169,6 +169,7 @@ module ActiveRecord
     def self.insert!: (Hash[Symbol, untyped] attrs, ?returning: untyped, ?unique_by: (String | Symbol | Array[Symbol])?, ?record_timestamps: bool?) -> ActiveRecord::Result
     def self._insert_rows: (Array[Hash[Symbol, untyped]] rows, bool skip_conflicts, (String | Symbol | Array[Symbol])? unique_by, (Array[String | Symbol] | String | false)? returning, bool? record_timestamps) -> ActiveRecord::Result
     def self._upsert_serialize: (Symbol | String name, Object? value) -> Object?
+    def self._string_keyed_rows: (Array[Hash[Symbol, untyped]] rows) -> Array[Hash[String, untyped]]
     def self._upsert_rows: (Array[Hash[Symbol, untyped]] rows, (String | Symbol | Array[Symbol])? unique_by, String? on_duplicate, (String | Symbol | Array[Symbol | String])? update_only, untyped returning, ?bool? record_timestamps) -> ActiveRecord::Result
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
@@ -277,6 +278,8 @@ module ActiveRecord
     def self.current_scope=: (untyped scope) -> untyped
     def self.global_current_scope: (?bool skip_inherited_scope) -> untyped
     def self.global_current_scope=: (untyped scope) -> untyped
+    def self.scope_attributes: () -> Hash[Symbol, untyped]
+    def self.scope_attributes?: () -> bool
     def self.scope_registry: () -> ::ActiveRecord::Scoping::ScopeRegistry
     # Declared by the emitted model or a class-level macro, not by a `def`
     # here: the contract the bodies in connection.rb are typed against.
@@ -337,6 +340,9 @@ module ActiveRecord
     def attribute_previously_was: (String | Symbol name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?
+    def self.first!: () -> Base
+    def self.last!: () -> Base
+    def self.take!: () -> Base
     def self._hydrate_all: (String sql) -> Array[Base]
     def update_attribute: (Symbol name, untyped value) -> bool
     def valid?: (?Symbol? context) -> bool
@@ -344,6 +350,7 @@ module ActiveRecord
     def _valid_with_caller_hooks?: (?untyped context) -> bool
     def _valid_for_owner?: (?Symbol? context) -> bool
     def _validated_for_owner?: () -> bool
+    def _before_validation_without_saving_targets: () -> void
     def validation_context: () -> Symbol?
     def validates_with: (*untyped args) ?{ (untyped, untyped, untyped) -> untyped } -> nil
     def save: (?context: Symbol?) -> bool

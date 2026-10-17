@@ -317,6 +317,7 @@ mod tests {
             scope_owner: None,
             extension: Vec::new(),
             skip_validation: false,
+            no_autosave: false,
             autosave: false,
             primary_key: None,
             extra_keys: Vec::new(),

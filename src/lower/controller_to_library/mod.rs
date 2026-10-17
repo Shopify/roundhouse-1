@@ -2673,7 +2673,7 @@ fn insert_baseline_controller_methods(info: &mut crate::analyze::ClassInfo) {
 /// one, and bare when it does not — Rails allows both arities and the
 /// method is on this controller, so the arity is known here.
 ///
-/// Anything else — a splat of classes, a String class name, a `with:`
+/// Anything else — a splat of anything but a constant, a String class name, a `with:`
 /// whose value is not a Symbol — is left alone rather than guessed at:
 /// a handler that swallows the wrong exception is worse than one that
 /// never runs.
@@ -2731,7 +2731,13 @@ fn collect_rescue_handlers(
             };
             let class_args = if with.is_some() { &args[..args.len() - 1] } else { &args[..] };
             if class_args.is_empty()
-                || !class_args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+                || !class_args.iter().all(|a| match &*a.node {
+                    ExprNode::Const { .. } => true,
+                    // `rescue_from(*RESOURCE_NOT_FOUND_ERRORS)`: Ruby's
+                    // `rescue` takes the splat of a constant list.
+                    ExprNode::Splat { value } => matches!(&*value.node, ExprNode::Const { .. }),
+                    _ => false,
+                })
             {
                 continue;
             }

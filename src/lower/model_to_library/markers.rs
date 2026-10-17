@@ -670,6 +670,41 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 block_param: None,
             });
         }
+        // `name?` (attribute_methods/query.rb) over a Boolean attribute:
+        // the reader's value. Other types answer a presence test the
+        // lowering does not claim.
+        let predicate = Symbol::from(format!("{}?", name.as_str()));
+        if is_bool && !methods.iter().any(|m| m.name == predicate) {
+            methods.push(MethodDef {
+                visibility: crate::dialect::MethodVisibility::Public,
+                unsupported_formals: None,
+                has_anonymous_block: false,
+                name_span: crate::span::Span::synthetic(),
+                name: predicate,
+                receiver: MethodReceiver::Instance,
+                params: Vec::new(),
+                body: with_ty(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send {
+                            recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                            method: name.clone(),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ),
+                    Ty::Bool,
+                ),
+                signature: Some(super::fn_sig(vec![], Ty::Bool)),
+                effects: EffectSet::default(),
+                enclosing_class: Some(model.name.0.clone()),
+                kind: AccessorKind::Method,
+                is_async: false,
+                mutates_self: false,
+                block_param: None,
+            });
+        }
         if !methods.iter().any(|m| m.name == setter) {
             let value = Symbol::from("value");
             let value_ref = Expr::new(
@@ -888,13 +923,27 @@ pub(super) fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
 /// fold preserves source order; broadcasts_to runs first so its calls
 /// lead any block-form callback bodies that the next pass would add.
 pub(crate) fn fold_into_or_push(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr) {
+    fold_into_or_push_at(methods, model, hook_name, call, false)
+}
+
+/// [`fold_into_or_push`] for a `prepend: true` callback: its statement runs
+/// before the ones already folded into the hook.
+pub(crate) fn fold_into_or_push_front(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr) {
+    fold_into_or_push_at(methods, model, hook_name, call, true)
+}
+
+fn fold_into_or_push_at(methods: &mut Vec<MethodDef>, model: &Model, hook_name: &str, call: Expr, front: bool) {
     let hook = Symbol::from(hook_name);
     if let Some(existing) = methods.iter_mut().find(|m| m.name == hook) {
         let mut stmts = match &*existing.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
             _ => vec![existing.body.clone()],
         };
-        stmts.push(call);
+        if front {
+            stmts.insert(0, call);
+        } else {
+            stmts.push(call);
+        }
         existing.body = seq(stmts);
     } else {
         methods.push(MethodDef {
@@ -1537,8 +1586,24 @@ fn push_symbol_callback(
         )
     };
 
-    let mut body = seq(cb.targets.iter().map(self_call).collect());
-    if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
+    let mut body = match &cb.object {
+        // A callback object (`after_create Methods`) is sent
+        // `<hook>(record)`.
+        Some(object) => Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(object.clone()),
+                method: Symbol::from(hook_name),
+                args: vec![Expr::new(span, ExprNode::SelfRef)],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        None => seq(cb.targets.iter().map(self_call).collect()),
+    };
+    if !cb.on_contexts.is_empty() {
+        body = guard_validation_contexts(body, &cb.on_contexts, span);
+    } else if matches!(cb.hook, Hook::BeforeValidation | Hook::AfterValidation) && cb.on.is_some() {
         // Validations never run on destroy; ingest rejects this.
         let Some(on) = cb.on else { return };
         let Some(guarded) = guard_validation_on(body, on, span) else { return };
@@ -1560,7 +1625,11 @@ fn push_symbol_callback(
             },
         );
     }
-    fold_into_or_push(methods, model, hook_name, body);
+    if cb.prepend {
+        fold_into_or_push_front(methods, model, hook_name, body);
+    } else {
+        fold_into_or_push(methods, model, hook_name, body);
+    }
 }
 
 /// Wrap a validation-hook body in the `new_record?` guard its `on:`
@@ -1609,6 +1678,36 @@ fn guard_validation_on(
     );
     guarded.inherit_span(span);
     Some(guarded)
+}
+
+/// A validation hook's `on: [:create, :fulfillment]` (or custom context):
+/// the body runs when the record's `validation_context` is any of them,
+/// as Rails' `Array(on).intersect?(Array(validation_context))`.
+fn guard_validation_contexts(body: Expr, contexts: &[Symbol], span: Span) -> Expr {
+    let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>, parenthesized: bool| {
+        Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized })
+    };
+    let wanted = Expr::new(
+        span,
+        ExprNode::Array {
+            elements: contexts
+                .iter()
+                .map(|c| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: c.clone() } }))
+                .collect(),
+            style: crate::expr::ArrayStyle::Brackets,
+        },
+    );
+    let current = send(None, "Array", vec![send(None, "validation_context", vec![], false)], true);
+    let mut guarded = Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(wanted), "intersect?", vec![current], true),
+            then_branch: body,
+            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        },
+    );
+    guarded.inherit_span(span);
+    guarded
 }
 
 /// The runtime Base hook method a `CallbackHook` overrides when no

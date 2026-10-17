@@ -593,6 +593,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // A column whose storage ivar the model's own methods also use keeps
     // its compiled uses in a slot of its own (`emit::ruby::column_slot`).
     column_slot::apply(&mut lcs, app);
+    column_slot::bind_attribute_set(&mut lcs, app);
 }
 
 fn emit_model_classes(

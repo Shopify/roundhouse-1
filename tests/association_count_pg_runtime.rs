@@ -30,6 +30,11 @@ use std::process::Command;
 const APPLICATION_RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
 const SHOP: &str = "class Shop < ApplicationRecord\n  has_many :products\nend\n";
 const PRODUCT: &str = "class Product < ApplicationRecord\n  belongs_to :shop\nend\n";
+/// Core's `ApiClientSecret`: a `has_many` with a scope lambda, and a
+/// create validation that counts the siblings through the inverse
+/// (`api_client.secrets.count < LIMIT`) while one is built, not saved.
+const LEDGER: &str = "class Ledger < ApplicationRecord\n  has_many :entries, -> { order(:id) }, inverse_of: :ledger\nend\n";
+const ENTRY: &str = "class Entry < ApplicationRecord\n  belongs_to :ledger, inverse_of: :entries\n  validate :within_limit, on: :create\n\n  private\n\n  def within_limit\n    owner = ledger\n    errors.add(:base, \"too many\") unless owner.entries.count < 2\n  end\nend\n";
 
 /// `tally`, `counts` and `lengths` only READ the association, so
 /// nothing else in their bodies (a scope, a constructor, a `where`)
@@ -57,6 +62,11 @@ const PROBE: &str = r##"class CountProbe
     built = Shop.find(s.id)
     built.products.build(title: "built")
     out << "build: #{built.products.count} #{built.products.size} #{built.products.length}"
+    elsewhere = Shop.find(s.id)
+    add_unsaved(elsewhere)
+    out << "built in another method: #{counts(elsewhere)}"
+    out << "validated build: #{build_limited}"
+    out << "new owner: #{Shop.new(name: "n").products.count}"
     empty = Shop.find(Shop.create!(name: "empty").id)
     out << "empty: #{counts(empty)}"
     out
@@ -64,6 +74,20 @@ const PROBE: &str = r##"class CountProbe
 
   def self.tally(shop)
     "#{counts(shop)} #{shop.products.loaded?}"
+  end
+
+  def self.build_limited
+    limited = Ledger.create!(name: "limited")
+    limited.entries.build(title: "one")
+    limited.entries.build(title: "two")
+    limited.save!
+    "#{limited.entries.count} #{limited.reload.entries.count}"
+  rescue ActiveRecord::RecordInvalid => e
+    e.message
+  end
+
+  def self.add_unsaved(shop)
+    shop.products.build(title: "unsaved")
   end
 
   def self.counts(shop)
@@ -87,6 +111,9 @@ const EXPECTED: &[&str] = &[
     "loaded, outside create: 4 3 false true true 3 [\"a\", \"outside\", \"through\"]",
     "loaded, create through: 5 4 false true true 4 [\"a\", \"outside\", \"through\", \"through 2\"]",
     "build: 5 6 6",
+    "built in another method: 5 6 false true",
+    "validated build: 2 2",
+    "new owner: 0",
     // Not `loaded?` here: Rails' `size` marks an association loaded when
     // its COUNT finds no rows (`count_records`' `loaded! if count == 0`),
     // which the seeded Relation does not tell the owner.
@@ -99,6 +126,13 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define(version: 1) do
   end
   create_table "products", force: :cascade do |t|
     t.integer "shop_id"
+    t.string "title"
+  end
+  create_table "ledgers", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "entries", force: :cascade do |t|
+    t.integer "ledger_id"
     t.string "title"
   end
 end
@@ -115,6 +149,17 @@ CREATE TABLE products (
     title character varying,
     CONSTRAINT products_pkey PRIMARY KEY (id)
 );
+CREATE TABLE ledgers (
+    id bigserial NOT NULL,
+    name character varying,
+    CONSTRAINT ledgers_pkey PRIMARY KEY (id)
+);
+CREATE TABLE entries (
+    id bigserial NOT NULL,
+    ledger_id bigint,
+    title character varying,
+    CONSTRAINT entries_pkey PRIMARY KEY (id)
+);
 "#;
 
 const DATABASE_YML: &str =
@@ -125,6 +170,8 @@ fn models() -> Vec<(&'static str, &'static str)> {
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/shop.rb", SHOP),
         ("app/models/product.rb", PRODUCT),
+        ("app/models/ledger.rb", LEDGER),
+        ("app/models/entry.rb", ENTRY),
         ("app/models/count_probe.rb", PROBE),
     ]
 }
@@ -208,7 +255,14 @@ fn association_counts_like_activerecord_on_postgresql() {
     let real: Vec<_> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
     assert!(real.is_empty(), "{}", errors.join("\n"));
     let loads =
-        ["app/models/application_record", "app/models/shop", "app/models/product", "app/models/count_probe"];
+        [
+        "app/models/application_record",
+        "app/models/shop",
+        "app/models/product",
+        "app/models/ledger",
+        "app/models/entry",
+        "app/models/count_probe",
+    ];
     let (native, emitted) = pg_probe::native_and_emitted(
         "association-count",
         &files,

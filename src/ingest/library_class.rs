@@ -1627,8 +1627,20 @@ pub(super) fn library_class_and_struct_base(
             synthesized.push(props);
         }
         let declares_serialize = methods.iter().any(|m| m.name.as_str() == "serialize" && matches!(m.receiver, MethodReceiver::Instance));
-        if !declares_serialize && let Some(serialize) = synth_struct_serialize(&owner, &members) {
+        if let Some(serialize) = synth_struct_serialize(&owner, &members) {
             synthesized.push(serialize);
+        }
+        // A `serialize` override that calls `super` (Core's
+        // `CustomDiscountSignaturePayloadType`) reaches sorbet's own on
+        // the ancestor; one that does not simply replaces it.
+        route_super_to_synthesized(&mut synthesized, &mut methods).map_err(|name| IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "`super` in `{name}` with keyword, rest or forwarding parameters is not modeled for a T::Struct override"
+            ),
+        })?;
+        if declares_serialize {
+            synthesized.retain(|m| !(m.name.as_str() == "serialize" && matches!(m.receiver, MethodReceiver::Instance)));
         }
         synthesized.append(&mut methods);
         methods = synthesized;
@@ -5112,6 +5124,20 @@ fn walk_decl_body_in<'pr>(
                         // A constant written in the block is the
                         // concern's: the block keeps its lexical scope.
                         out.constants.extend(inner.constants);
+                    } else if let Some(block) = visibility::included_block(&call) {
+                        // No `def` in the block, but a constant written
+                        // directly in it is the concern's all the same
+                        // (`INVALID_PARAMETERS_EXCEPTIONS = [...]` beside
+                        // the `rescue_from(*INVALID_PARAMETERS_EXCEPTIONS)`
+                        // that reads it, spliced into each includer
+                        // qualified by the concern's name).
+                        for write in block.body().map(flatten_statements).unwrap_or_default() {
+                            let Some(cw) = write.as_constant_write_node() else { continue };
+                            if is_sorbet_type_alias(&cw.value()) {
+                                continue;
+                            }
+                            out.constants.push((Symbol::from(constant_id_str(&cw.name())), ingest_expr(&cw.value(), file)?));
+                        }
                     }
                 }
                 // `class_attribute :x, …` (`ingest::class_attribute`): its
@@ -7413,6 +7439,51 @@ pub fn ingest_concern_filters(
     Ok(out)
 }
 
+/// `rescue_from` declarations in a concern's `included do` block, keyed
+/// by the module, in declaration order: each the whole receiverless call,
+/// as a controller's own `rescue_from` is carried (an `Unknown` body
+/// item). `splice_concerns_into_controllers` puts them behind the
+/// `include` that brings them, so `collect_rescue_handlers` wraps the
+/// includer's dispatcher in them. Core's `ApplicationControllerExceptionHandler`
+/// answers `ParameterMissing` with a 400 only this way.
+pub fn ingest_concern_rescues(
+    source: &[u8],
+    file: &str,
+) -> super::IngestResult<Vec<(ClassId, Vec<crate::expr::Expr>)>> {
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let mut out = Vec::new();
+    for (scope, module) in find_all_modules_with_scope(&root) {
+        let Some(name_path) = module_name_path(&module) else { continue };
+        let mut full_path: Vec<String> = scope.clone();
+        full_path.extend(name_path);
+        let id = ClassId(Symbol::from(full_path.join("::")));
+        let Some(body) = module.body() else { continue };
+        let mut rescues = Vec::new();
+        for stmt in flatten_statements(body) {
+            let Some(call) = stmt.as_call_node() else { continue };
+            if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+                continue;
+            }
+            let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+            let Some(block_body) = block.body() else { continue };
+            for inner in flatten_statements(block_body) {
+                let Some(inner_call) = inner.as_call_node() else { continue };
+                if inner_call.receiver().is_some() || constant_id_str(&inner_call.name()) != "rescue_from" {
+                    continue;
+                }
+                if let Ok(expr) = ingest_expr(&inner, file) {
+                    rescues.push(expr);
+                }
+            }
+        }
+        if !rescues.is_empty() {
+            out.push((id, rescues));
+        }
+    }
+    Ok(out)
+}
+
 /// `protect_from_forgery` / `skip_forgery_protection`, receiverless.
 fn forgery_macro_name(stmt: &ruby_prism::Node<'_>) -> Option<&'static str> {
     let call = stmt.as_call_node()?;
@@ -7957,6 +8028,33 @@ pub(in crate::ingest) fn ingest_concern_prepended_items(
     ingest_concern_hook_items(source, file, enum_constants, "prepended").0
 }
 
+/// A callback object (`after_create Methods`) read in `concern`'s `included`
+/// block names its constant where the concern is written, not where the
+/// block is carried (the includer's class body): written in full when a
+/// module this file declares answers the lexical lookup, innermost scope
+/// first.
+fn qualify_callback_object(item: &mut crate::dialect::ModelBodyItem, concern: &ClassId, declared: &HashSet<String>) {
+    let crate::dialect::ModelBodyItem::Callback { callback, .. } = item else { return };
+    let Some(object) = &mut callback.object else { return };
+    let crate::expr::ExprNode::Const { path } = &*object.node else { return };
+    if path.is_empty() {
+        return;
+    }
+    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let mut scope: Vec<&str> = concern.0.as_str().split("::").collect();
+    loop {
+        let candidate = if scope.is_empty() { written.clone() } else { format!("{}::{written}", scope.join("::")) };
+        if declared.contains(&candidate) {
+            let path: Vec<Symbol> = candidate.split("::").map(Symbol::from).collect();
+            *object = crate::expr::Expr::new(object.span, crate::expr::ExprNode::Const { path });
+            return;
+        }
+        if scope.pop().is_none() {
+            return;
+        }
+    }
+}
+
 /// The model DSL of each module's `<hook> do ... end` block.
 fn ingest_concern_hook_items(
     source: &[u8],
@@ -7976,6 +8074,14 @@ fn ingest_concern_hook_items(
     let mut out = Vec::new();
     let mut enums_out = Vec::new();
     let mut guarded_out: ConcernGuardedItems = Vec::new();
+    let declared_modules: HashSet<String> = super::util::find_all_module_declarations_with_scope(&root)
+        .into_iter()
+        .filter_map(|(scope, module)| {
+            let mut path = scope;
+            path.extend(module_name_path(&module)?);
+            Some(path.join("::"))
+        })
+        .collect();
     for (scope, module) in find_all_modules_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
         let mut full_path: Vec<String> = scope.clone();
@@ -8143,7 +8249,10 @@ fn ingest_concern_hook_items(
                                 ModelBodyItem::Association { .. }
                                 | ModelBodyItem::Scope { .. }
                                 | ModelBodyItem::Validation { .. }
-                                | ModelBodyItem::Callback { .. } => items.push(item),
+                                | ModelBodyItem::Callback { .. } => {
+                                    qualify_callback_object(&mut item, &id, &declared_modules);
+                                    items.push(item)
+                                }
                                 ModelBodyItem::Method { .. } | ModelBodyItem::ClassBody { .. }
                                     if class_attribute && is_direct && is_concern =>
                                 {

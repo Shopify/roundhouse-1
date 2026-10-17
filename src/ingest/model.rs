@@ -405,6 +405,20 @@ pub(super) fn ingest_model_class_at(
         format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))
     };
 
+    // A superclass-less class is a tableless ActiveModel includer
+    // (`classify_class_file`): the table its name would infer is not its
+    // own. Core's `Taxes::TaxLine` (`include ActiveModel::Model` and
+    // `attr_accessor`s) shares `tax_lines` with the `TaxLine` record, and
+    // taking that table's columns made it a row-hydrating class whose
+    // writers cast through a `_cast_column` it does not have.
+    let table_name = if table_decl.is_none()
+        && class.superclass().is_none()
+        && schema.tables.contains_key(&Symbol::from(table_name.as_str()))
+    {
+        String::new()
+    } else {
+        table_name
+    };
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {
         row_from_table(table)
     } else {
@@ -2509,7 +2523,11 @@ fn parse_callback(
     };
     let args = call.arguments()?;
     let mut targets: Vec<Symbol> = Vec::new();
+    let mut object: Option<Expr> = None;
+    let mut prepend = false;
     let mut on: Option<CallbackOn> = None;
+    let mut on_contexts: Vec<Symbol> = Vec::new();
+    let validation_hook = matches!(hook, CallbackHook::BeforeValidation | CallbackHook::AfterValidation);
     let mut if_cond: Option<Expr> = None;
     let mut unless_cond: Option<Expr> = None;
     for arg in args.arguments().iter() {
@@ -2521,14 +2539,32 @@ fn parse_callback(
                 let key = symbol_value(&assoc.key())?;
                 match key.as_str() {
                     "on" => {
-                        on = Some(match symbol_value(&assoc.value())?.as_str() {
-                            "create" => CallbackOn::Create,
-                            "update" => CallbackOn::Update,
-                            "destroy" => CallbackOn::Destroy,
-                            // `on: [:create, :update]` array form and
-                            // unknown values: not modeled — reject.
-                            _ => return None,
+                        let value = assoc.value();
+                        let single = symbol_value(&value).and_then(|s| match s.as_str() {
+                            "create" => Some(CallbackOn::Create),
+                            "update" => Some(CallbackOn::Update),
+                            "destroy" => Some(CallbackOn::Destroy),
+                            _ => None,
                         });
+                        if let Some(single) = single {
+                            on = Some(single);
+                        } else if validation_hook {
+                            // `on: [:create, :fulfillment]` or a custom
+                            // context: a validation hook runs when the
+                            // record's validation context is any of them.
+                            let values: Vec<ruby_prism::Node<'_>> = match value.as_array_node() {
+                                Some(array) => array.elements().iter().collect(),
+                                None => vec![value],
+                            };
+                            on_contexts.clear();
+                            for v in values {
+                                on_contexts.push(Symbol::from(symbol_value(&v)?.as_str()));
+                            }
+                        } else {
+                            // Array form and unknown values on a hook
+                            // without validation contexts: not modeled.
+                            return None;
+                        }
                     }
                     // `if:` / `unless:` — a zero-arity lambda/proc body
                     // (Rails `instance_exec`s it with `self` the record)
@@ -2539,11 +2575,28 @@ fn parse_callback(
                     // at all, which is the wrong answer too.
                     "if" => if_cond = Some(callback_condition(&assoc.value(), file)?),
                     "unless" => unless_cond = Some(callback_condition(&assoc.value(), file)?),
-                    // `prepend:` and anything else: not modeled — reject
-                    // rather than run the callback in the wrong place.
+                    // `prepend: true` puts a before callback at the front of
+                    // its chain (an after callback already is: ActiveModel
+                    // sets `prepend` on every after callback it defines).
+                    "prepend" => {
+                        let value = assoc.value();
+                        prepend = if value.as_true_node().is_some() {
+                            true
+                        } else if value.as_false_node().is_some() {
+                            false
+                        } else {
+                            return None;
+                        };
+                    }
+                    // Anything else: not modeled — reject rather than run
+                    // the callback in the wrong place.
                     _ => return None,
                 }
             }
+        } else if (arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some()) && object.is_none() {
+            // A callback OBJECT naming a constant (`after_create Methods`):
+            // Rails sends it `<hook>(record)`.
+            object = Some(ingest_expr(&arg, file).ok()?);
         } else {
             // Lambda / block-pass target (`after_create -> { … }`):
             // stays an Unknown item (block-form bodies are handled by
@@ -2551,8 +2604,11 @@ fn parse_callback(
             return None;
         }
     }
-    if targets.is_empty() {
+    if targets.is_empty() == object.is_none() {
         return None;
+    }
+    if prepend && !matches!(hook, CallbackHook::BeforeValidation | CallbackHook::BeforeSave | CallbackHook::BeforeCreate | CallbackHook::BeforeUpdate | CallbackHook::BeforeDestroy) {
+        prepend = false;
     }
     // `on:` is only expressible where the runtime hook surface can
     // carry it — the validation hooks (new_record? guard). Rails
@@ -2560,7 +2616,7 @@ fn parse_callback(
     // so anything else here is either source that doesn't run in
     // Rails or a shape we can't lower faithfully. (The transaction
     // hooks take theirs in `transaction_callback`.)
-    if on.is_some() && !matches!(hook, CallbackHook::BeforeValidation | CallbackHook::AfterValidation) {
+    if on.is_some() && !validation_hook {
         return None;
     }
 
@@ -2571,7 +2627,7 @@ fn parse_callback(
         (Some(a), Some(b)) => Some(and_condition(a, negate_condition(b))),
     };
 
-    Some(Callback { hook, targets, on, condition, on_any: Vec::new(), object: None, prepend: false })
+    Some(Callback { hook, targets, on, on_contexts, condition, on_any: Vec::new(), object, prepend })
 }
 
 /// The transaction callbacks (activerecord transactions.rb, the Rails
@@ -2694,7 +2750,7 @@ fn transaction_callback(
             on_any = enforced.to_vec();
         }
         let condition = conditions.into_iter().chain(unless_conditions).reduce(and_condition);
-        Some(Callback { hook, targets, on: None, condition, on_any, object, prepend })
+        Some(Callback { hook, targets, on: None, on_contexts: Vec::new(), condition, on_any, object, prepend })
     })();
     Some(parsed)
 }
@@ -3348,6 +3404,7 @@ pub(super) fn parse_association(
             scope_owner,
             skip_validation: validate == Some(false),
             autosave: autosave == Some(true),
+            no_autosave: autosave == Some(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
             extra_keys,
         }),

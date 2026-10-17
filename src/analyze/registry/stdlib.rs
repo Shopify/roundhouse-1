@@ -237,6 +237,25 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActionDispatch::Journey::Router::Utils", &[
         ("escape_path", Ty::Str), ("escape_segment", Ty::Str), ("escape_fragment", Ty::Str),
     ], &[]);
+    // The route-pattern half of Journey (the same file): a pattern parsed
+    // to a node tree, its `Ast`, and the `Format` a `FormatBuilder` makes
+    // of it. The nodes are only walked, so they stay untyped.
+    let journey_format = class("ActionDispatch::Journey::Format");
+    register_stdlib_class(classes, "ActionDispatch::Journey::Parser", &[
+        ("parse", Ty::Untyped), ("new", class("ActionDispatch::Journey::Parser")),
+    ], &[("parse", Ty::Untyped)]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Ast", &[
+        ("new", class("ActionDispatch::Journey::Ast")),
+    ], &[
+        ("root", Ty::Untyped), ("tree", Ty::Untyped),
+        ("path_params", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
+        ("names", str_arr.clone()), ("terminals", Ty::Untyped), ("wildcard_options", Ty::Untyped),
+        ("glob?", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Visitors::FormatBuilder", &[
+        ("new", class("ActionDispatch::Journey::Visitors::FormatBuilder")),
+    ], &[("accept", journey_format)]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Format", &[], &[("evaluate", Ty::Str)]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");
@@ -1382,6 +1401,17 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("allowed_tags", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
         ("allowed_attributes", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![].into() }].into() }),
     ], &[]);
+    // `Rails::HTML::SafeListSanitizer` is the gem's alias of the HTML4 safe-list
+    // sanitizer (`SafeListSanitizer = HTML4::SafeListSanitizer`), and `Rails::Html`
+    // of `Rails::HTML`; a caller instantiates it and sanitizes (`sanitize(html,
+    // scrubber:, tags:, attributes:)` answers the cleaned String, nil for nil).
+    for name in ["Rails::Html::SafeListSanitizer", "Rails::HTML::SafeListSanitizer"] {
+        register_stdlib_class(classes, name, &[
+            ("new", Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() }),
+        ], &[
+            ("sanitize", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
+        ]);
+    }
     // rails-html-sanitizer's vendor-neutral entry point (`Rails::Html` is the
     // gem's alias of `Rails::HTML`): each finder answers the vendor's
     // sanitizer class, which the caller instantiates. The gem loads on the

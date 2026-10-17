@@ -128,6 +128,10 @@ require_relative "runtime/active_record_store"
 require_relative "runtime/active_record_db_config"
 require_relative "runtime/active_record_serialization"
 require_relative "runtime/active_record_relation_ext"
+# `update_counters`, `increment_counter`, `increment!` and kin: SQL counter
+# writes with variable column names (dynamic Ruby, ruby lane only).
+require_relative "runtime/active_record_counters"
+require_relative "runtime/active_record_errors_ext"
 # `Base.connection` as Rails' SQLite3 adapter class (see the file).
 require_relative "runtime/active_record_sqlite3_adapter"
 require_relative "config/schema"
@@ -143,6 +147,10 @@ require_relative "runtime/action_controller_renderers"
 # the hooks the synthesized `process_action` runs them through. Dynamic
 # Ruby (procs, instance_exec), so ruby lane only.
 require_relative "runtime/action_controller_filters"
+# `respond_with` (the responders gem): GET renders the resource, POST
+# renders it with 201 and a location, other verbs answer 204.
+require_relative "runtime/action_controller_respond_with"
+require_relative "runtime/action_controller_params_indifferent"
 # Replace the portable character walk only after loading the shared policy.
 require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.
@@ -233,6 +241,8 @@ require_relative "runtime/action_controller_json_render"
 require_relative "runtime/schematized_json"
 require_relative "runtime/json_column"
 require_relative "runtime/action_mailer"
+# After it: the mailer class takes rescue_from and answers handle_exception.
+require_relative "runtime/action_mailer_rescuable"
 # App-code gem dependencies, guarded so apps that don't use them (the
 # blog) boot without the gems installed. The list itself lives in
 # runtime/gem_facades.rb — on a ruby-family tree that file IS the

@@ -1451,6 +1451,15 @@ module ArTransactionChanges
       _noting_transaction_changes { super }
     end
 
+    # A model's own `@attributes[name]` (Core's Checkout reads
+    # `@attributes["pristine_state"].value`): the compiled model keeps its
+    # columns in slots, so the emit reads the ivar through this, which binds
+    # the record's attribute view first.
+    def _attribute_set
+      _bind_attribute_set
+      @attributes
+    end
+
     private
       def _noting_transaction_changes
         outer = @_transaction_changes_noting

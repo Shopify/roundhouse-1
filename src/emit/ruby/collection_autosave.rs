@@ -140,6 +140,8 @@ struct Collection {
     /// `as:` — the interface whose `<as>_type` names the owner's class.
     as_interface: Option<Symbol>,
     validate: bool,
+    /// `autosave: false`: the owner's save inserts none of the records.
+    no_autosave: bool,
     /// The target's `belongs_to` back to the owner.
     inverse: Option<Symbol>,
 }
@@ -169,20 +171,27 @@ pub(crate) fn apply(
                     as_interface,
                     scope,
                     skip_validation,
+                    no_autosave,
                     inverse_of: written_inverse,
                     ..
                 } = assoc
                 else {
                     return None;
                 };
-                let inverse = if scope.is_some() || as_interface.is_some() {
+                // A written `inverse_of:` holds under a scope lambda too;
+                // only the automatic inverse is off for a scoped association
+                // (reflection.rb `can_find_inverse_of_automatically?`).
+                let inverse = if as_interface.is_some() {
                     None
                 } else {
                     written_inverse_of(app, target, written_inverse.as_ref()).or_else(|| {
-                        (!*foreign_key_explicit).then(|| inverse_of(app, model, target, foreign_key)).flatten()
+                        (scope.is_none() && !*foreign_key_explicit)
+                            .then(|| inverse_of(app, model, target, foreign_key))
+                            .flatten()
                     })
                 };
                 memoizes(lc, name).then(|| Collection {
+                    no_autosave: *no_autosave,
                     span,
                     name: name.clone(),
                     foreign_key: foreign_key.clone(),
@@ -333,7 +342,7 @@ pub(crate) fn apply(
         // by name, in declaration order, ahead of the callbacks the
         // model's body adds after them.
         let mut saved: Vec<(Span, &Symbol)> = collections.iter().map(|c| (c.span, &c.name)).collect();
-        saved.extend(singles.iter().filter(|s| !s.autosave).map(|s| (s.span, &s.name)));
+        saved.extend(singles.iter().map(|s| (s.span, &s.name)));
         let order: Vec<&Symbol> = model
             .spanned_associations()
             .filter_map(|(span, assoc)| saved.iter().find(|(s, n)| *s == span && *n == assoc.name()).map(|(_, n)| *n))
@@ -347,15 +356,29 @@ pub(crate) fn apply(
             }
             *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
         }
-        // An `autosave: true` has_one keeps its save where the lowering
-        // folded it (after_save), entered by Rails' name.
+        // An `autosave: true` has_one saves in the create and update chains
+        // above, as Rails' does, not in `after_save`, where the lowering
+        // folded it: `run_callbacks(:save)` alone, as the agreement
+        // builder's bulk insert does for each new sale tax, would save the
+        // presentment record, and that one its still-new sale tax.
         for s in singles.iter().filter(|s| s.autosave) {
             let lowered = format!("_autosave_{}", s.name.as_str());
-            let entry = entry_point(&s.name);
             for m in lc.methods.iter_mut().filter(|m| {
                 m.name.as_str() == "after_save" && m.receiver == MethodReceiver::Instance && m.params.is_empty()
             }) {
-                rename_bare_calls(&mut m.body, &lowered, &entry);
+                let bare = |e: &Expr| {
+                    matches!(&*e.node, ExprNode::Send { recv, method, args, block: None, .. }
+                        if method.as_str() == lowered
+                            && args.is_empty()
+                            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)))
+                };
+                let mut stmts = statements(&m.body);
+                stmts.retain(|e| !bare(e));
+                m.body = if stmts.is_empty() {
+                    Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil })
+                } else {
+                    Expr::new(m.body.span, ExprNode::Seq { exprs: stmts })
+                };
             }
         }
     }
@@ -547,6 +570,12 @@ fn insert_record_source(collections: &[Collection], owner_type: &str) -> String 
 /// when the association was never loaded.
 fn save_records_source(c: &Collection) -> String {
     let n = c.name.as_str();
+    // `autosave: false` reaches `records.each` and inserts none of them.
+    if c.no_autosave {
+        return format!(
+            "def _autosave_associated_records_for_{n}(was_new)\n  return nil unless @{n}_loaded == true\n  @{n}_cache\nend\n"
+        );
+    }
     let save = if c.validate {
         format!(
             "    unless _insert_record(:{n}, record)\n      errors << {:?}\n      raise ActiveRecord::RecordInvalid.new(self)\n    end\n",
@@ -632,17 +661,6 @@ fn replace_bare_call(expr: &mut Expr, name: &str, with: &mut Option<Expr>) {
         return;
     }
     expr.node.for_each_child_mut(&mut |c| replace_bare_call(c, name, with));
-}
-
-/// Renames each receiverless, argumentless call to `from` in `expr`.
-fn rename_bare_calls(expr: &mut Expr, from: &str, to: &str) {
-    expr.node.for_each_child_mut(&mut |c| rename_bare_calls(c, from, to));
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node
-        && method.as_str() == from
-        && args.is_empty()
-    {
-        *method = Symbol::from(to);
-    }
 }
 
 /// Whether the model defines the no-argument instance method `name`.

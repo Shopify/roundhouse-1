@@ -304,6 +304,106 @@ module ActiveRecord
     end
 
     prepend ArelArguments
+
+    # The models a relation's association joins reach. `joins` records the
+    # SQL of each hop and not the model, while Rails' predicate builder
+    # types a nested table the model's own reflections do not name from the
+    # join dependencies (`where(condition_responders: { responder_id: id })`
+    # after `joins(condition: [:condition_responders])`:
+    # relation/query_methods.rb `lookup_reflection_from_join_dependencies`,
+    # a joined reflection by its name or its table). A `model_uuid_attributes`
+    # column of that model then serializes its integer to a uuid, where an
+    # untyped bind reaches the uuid column as an integer's text.
+    # type_caster/connection.rb: the types of a plain table's columns, from
+    # the database (`where(context_driver_group_responders: { shop_id: 1 })`
+    # over a table only a `through` join reaches). A uuid column serializes
+    # its value as the adapter's uuid type does (Core's
+    # PostgreSQLUuidIntegerCast gives an Integer its uuid); any other column,
+    # and a name that is no table, binds as written.
+    class TableTypeCaster
+      def initialize(model, table_name)
+        @model = model
+        @table_name = table_name
+      end
+
+      def _attribute_force_equality?(_name, _value)
+        false
+      end
+
+      # No model, so no `alias_attribute`: the key is the column.
+      def _attribute_name(name)
+        name
+      end
+
+      def _attribute_for_database(name, value)
+        column = uuid_column(name)
+        column.nil? ? value : column.cast_type.serialize(value)
+      end
+
+      private
+
+      def uuid_column(name)
+        return nil unless @model.respond_to?(:connection)
+
+        cache = @model.connection.schema_cache
+        return nil unless cache.data_source_exists?(@table_name)
+
+        column = cache.columns_hash(@table_name)[name.to_s]
+        column.nil? || column.type != :uuid ? nil : column
+      end
+    end
+
+    module JoinedTables
+      def joins!(spec)
+        result = super
+        note_joined_models(@model, spec)
+        result
+      end
+
+      def left_outer_joins!(spec)
+        result = super
+        note_joined_models(@model, spec)
+        result
+      end
+
+      private
+
+      def nested_table(key)
+        pair = super
+        return pair unless pair[1].nil?
+
+        joined = (@join_models || {})[pair[0]]
+        return [pair[0], joined] unless joined.nil?
+
+        # A table no association of the model or its joins explains is typed
+        # by its columns (type_caster/connection.rb), as a model's own are.
+        [pair[0], TableTypeCaster.new(@model, pair[0])]
+      end
+
+      def note_joined_models(owner, spec)
+        case spec
+        when Symbol
+          reflection = owner.respond_to?(:reflect_on_association) ? owner.reflect_on_association(spec) : nil
+          return nil if reflection.nil? || !reflection.respond_to?(:polymorphic?) || reflection.polymorphic?
+
+          klass = reflection.klass
+          # An earlier join of the name keeps it (Rails takes the first).
+          @join_models = { reflection.name.to_s => klass, klass.table_name.to_s => klass }.merge(@join_models || {})
+          klass
+        when Array
+          spec.each { |part| note_joined_models(owner, part) }
+          nil
+        when Hash
+          spec.each do |name, nested|
+            klass = note_joined_models(owner, name)
+            note_joined_models(klass, nested) unless klass.nil?
+          end
+          nil
+        end
+      end
+    end
+
+    prepend JoinedTables
   end
 end
 

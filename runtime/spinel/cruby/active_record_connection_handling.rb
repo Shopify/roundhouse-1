@@ -425,9 +425,9 @@ module ActiveRecord
     # (the adapter's `columns`, a "SCHEMA" query) per table name: the
     # columns, by name, of each table a model or the app asks about.
     # Loading or dumping a cache file (`_load_from`, `dump_to`,
-    # `init_with` / `encode_with`), the data source list and indexes are
-    # not ported and refuse by name; `data_source_exists?` and
-    # `primary_keys` are asked of the catalog per name.
+    # `init_with` / `encode_with`) and the data source list are not
+    # ported and refuse by name; `data_source_exists?`, `primary_keys`
+    # and `indexes` are asked of the catalog per name.
     class SchemaCache
       def initialize # :nodoc:
         @columns = {}
@@ -497,7 +497,21 @@ module ActiveRecord
         end
       end
 
-      %i[add data_sources indexes version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
+      # schema_cache.rb: a table's indexes, asked of the catalog once per
+      # name (none for a name that is no data source).
+      def indexes(pool, table_name)
+        @indexes.fetch(table_name) do
+          pool.with_connection do |connection|
+            if data_source_exists?(pool, table_name)
+              @indexes[table_name.dup.freeze] = connection.indexes(table_name)
+            else
+              []
+            end
+          end
+        end
+      end
+
+      %i[add data_sources version database_version dump_to init_with encode_with marshal_dump marshal_load].each do |name|
         define_method(name) do |*|
           raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: ActiveRecord::ConnectionAdapters::SchemaCache##{name}: " \
             "this runtime's schema cache holds only the columns it reads from the catalog"

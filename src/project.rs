@@ -4535,7 +4535,7 @@ fn ruby_family_files(
     // header; tests/action_dispatch_http_url_runtime.rs holds it to
     // native actionpack): carried where app code names the module, as
     // Core's WebUrlHelpersFactory does. gem_facades.rb requires it.
-    let carries_http_url = carries_named(&files, &["ActionDispatch::Http::URL"]);
+    let carries_http_url = carries_named(&files, &["ActionDispatch::Http::URL", "ActionDispatch::Journey"]);
     if carries_http_url {
         files.push((
             "runtime/action_dispatch_http_url.rb".to_string(),
@@ -12144,9 +12144,26 @@ const AUTOLOAD_RUNTIME: &str = r##"
     program ? path(program) : file
   end
 
+  # A compiled gem's own autoload of a constant the tree already
+  # autoloads, through a feature the tree answers with its files
+  # (COMPILED_GEM_FEATURES): polaris' `register_component :Badge, "badge"`
+  # autoloads `components/polaris/badge/badge`, which is
+  # models/polaris/badge and models/polaris/badge/badge here. The tree's
+  # autoload names the file that defines the constant; replacing it with
+  # the feature lets that file's own `module Badge` miss the autoload in
+  # progress and require badge/badge first, which raised "uninitialized
+  # constant Polaris::Badge". The tree's autoload is kept.
+  def self.tree_autoload_kept?(mod, name, file)
+    key = file.is_a?(String) && file.delete_suffix(".rb")
+    return false unless key && defined?(COMPILED_GEM_FEATURES) && COMPILED_GEM_FEATURES[key]
+    current = mod.autoload?(name, false)
+    current.is_a?(String) && current.start_with?("#{ROOT}/")
+  end
+
   module AutoloadThroughProgram
     def autoload(name, file)
       return super if RoundhouseAutoload.registering_autoload?
+      return nil if RoundhouseAutoload.tree_autoload_kept?(self, name, file)
       super(name, RoundhouseAutoload.autoload_target(file))
     end
   end
@@ -13228,7 +13245,8 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "SocketError"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Net::HTTPSuccess" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError" | "Zlib::DataError" | "OpenSSL::Random"
-        | "Rails::HTML5::SafeListSanitizer" | "Rails::Html::Sanitizer" | "Rails::HTML::Sanitizer" | "JSON" | "JSON::ParserError"
+        | "Rails::HTML5::SafeListSanitizer" | "Rails::Html::SafeListSanitizer" | "Rails::HTML::SafeListSanitizer"
+        | "Rails::Html::Sanitizer" | "Rails::HTML::Sanitizer" | "JSON" | "JSON::ParserError"
         | "Struct" | "Mutex" | "Fiber" | "Process" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"

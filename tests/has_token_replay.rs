@@ -45,3 +45,35 @@ fn has_token_stays_dropped_without_the_gem() {
     assert!(!card.contains("has_token"), "{card}");
     assert!(errors.iter().any(|e| e.contains("has_token")), "{errors:#?}");
 }
+
+const ITEM: &str = "class Item < ApplicationRecord\n  has_handle :handle, scope: :shop_id, sticky: true,\n    limit_similar_handles: ->(record) { record.handle.blank? },\n    utf8: -> do\n      #: self as Item\n      true\n    end\nend\n";
+
+fn emit_item(gemfile: &str) -> (String, Vec<String>) {
+    let (tree, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "database_adapter: postgresql\n")
+        .write("Gemfile", gemfile)
+        .write("config.ru", "")
+        .write("config/boot.rb", "require \"bundler/setup\"\n")
+        .write("config/application.rb", APPLICATION)
+        .write("config/environments/test.rb", "Rails.application.configure do\n  config.eager_load = false\nend\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_has_token_unused\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"items\" do |t|\n    t.string \"handle\"\n    t.string \"title\"\n    t.integer \"shop_id\"\n  end\nend\n")
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/item.rb", ITEM)
+        .emit(BuildTarget::Ruby);
+    (std::fs::read_to_string(tree.join("app/models/item.rb")).expect("item.rb"), errors)
+}
+
+#[test]
+fn has_handle_is_replayed_when_the_gem_is_required() {
+    let (item, errors) = emit_item("source \"https://rubygems.org\"\ngem \"rails\"\ngem \"identifications\"\n");
+    assert!(item.contains("has_handle"), "{item}");
+    assert!(!errors.iter().any(|e| e.contains("has_handle")), "{errors:#?}");
+}
+
+#[test]
+fn has_handle_stays_dropped_without_the_gem() {
+    let (item, errors) = emit_item("source \"https://rubygems.org\"\ngem \"rails\"\n");
+    assert!(!item.contains("has_handle"), "{item}");
+    assert!(errors.iter().any(|e| e.contains("has_handle")), "{errors:#?}");
+}

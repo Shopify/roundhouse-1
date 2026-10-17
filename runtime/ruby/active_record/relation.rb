@@ -2004,9 +2004,13 @@ module ActiveRecord
       spawn.merge!(other)
     end
 
+    # Rails' Merger carries the other relation's joins with its
+    # conditions (`merge_joins`): its WHEREs name the joined tables. The
+    # eager LEFT OUTER JOINs of its `includes` are its own load plan.
     def merge!(other)
       own_lists
       unload_records
+      other.join_clauses.each { |j| @joins << j unless @joins.include?(j) || other.eager_join?(j) }
       other.where_clauses.each do |w|
         push_where(w)
         @opaque_wheres = true
@@ -2017,6 +2021,10 @@ module ActiveRecord
 
     def where_clauses
       @wheres
+    end
+
+    def eager_join?(frag)
+      @eager_frags.include?(frag)
     end
 
     # `rel.arel` — the relation reified as its SELECT text, for the
@@ -2683,6 +2691,19 @@ module ActiveRecord
       rows = to_a
       @limit = prior
       @orders = [] if keyed
+      unload_records
+      rows
+    end
+
+    # Rails' `take(n)`: up to n rows with no ordering imposed, as `take`
+    # leaves the order to the database. A terminal like `first_n`: the
+    # borrowed `@limit` is restored and the page is not left memoized.
+    def take_n(n)
+      n = sql_limit(n)
+      prior = @limit
+      @limit = n
+      rows = to_a
+      @limit = prior
       unload_records
       rows
     end
@@ -3875,11 +3896,7 @@ module ActiveRecord
           named << [key.map { |k| k.to_s }.join(","), predicate]
         elsif val.is_a?(Hash) && nested_hash?(key, val)
           table, owner = nested_table(key)
-          val.each do |col, v|
-            predicate = column_predicate("#{table}.#{col}", v, false, owner)
-            parts << predicate
-            named << ["#{table}.#{col}", predicate]
-          end
+          nested_conditions(table, owner, val, parts, named)
         else
           # An alias names its column (`where(subdomain:)`).
           column = @model._attribute_name(key.to_s)
@@ -3898,6 +3915,20 @@ module ActiveRecord
       end
       @hash_parts = named
       parts.join(" AND ")
+    end
+
+    # The conditions of one nested table (`where(story: {id: 1})`), each
+    # `table.col`.
+    def nested_conditions(table, owner, conditions, parts, named)
+      conditions.each do |col, v|
+        # The nested table's own alias names its column
+        # (`where(condition_responders: {condition_id:})` over
+        # `alias_attribute :condition_id, :context_driver_group_id`).
+        name = nested_column_name(owner, col)
+        predicate = column_predicate("#{table}.#{name}", v, false, owner)
+        parts << predicate
+        named << ["#{table}.#{name}", predicate]
+      end
     end
 
     # A Hash value (callers check `is_a?(Hash)`) nests a table only when the key is not a column of this
@@ -4089,10 +4120,18 @@ module ActiveRecord
         # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
         # `mark_null!` from `none` / lasting positive `where` only.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
+        # A nil element is `IS NULL` beside the IN list (arel
+        # `ArrayHandler`: `col IN (1, 2) OR col IS NULL`), never a NULL
+        # inside it: `NOT (col IN (NULL, 1))` is NULL for every row, so
+        # `where.not(api_client_id: [nil, 1])` matched nothing.
+        has_nil = ids.any? { |x| x.nil? }
+        ids = ids.reject { |x| x.nil? } if has_nil
         ids = ids.map { |x| typed._attribute_for_database(tcol, x) } unless tcol.nil?
         # An empty list matches nothing: Arel renders `1=0` (`IN ()` is a
         # syntax error), which `where.not` negates to match everything.
+        return "#{qcol} IS NULL" if ids.empty? && has_nil
         return "1=0" if ids.empty?
+        return "(#{qcol} IN (#{escape_list(ids)}) OR #{qcol} IS NULL)" if has_nil
         "#{qcol} IN (#{escape_list(ids)})"
       elsif val.is_a?(Range)
         range_predicate(qcol, val, typed, tcol)

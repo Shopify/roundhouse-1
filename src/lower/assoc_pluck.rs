@@ -233,12 +233,20 @@ pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &crate::det::HashSet<S
             ExprNode::Var { id: crate::ident::VarId(0), name: var.clone() },
         );
         row.ty = row_ty.clone();
+        // A Hash row (`T::Array[{ line_item: LineItem, .. }]`) answers
+        // its column through `[]`, as ActiveSupport's `Enumerable#pluck`
+        // does; a record answers a reader.
+        let hash_row = matches!(&row_ty, Some(crate::ty::Ty::Hash { .. } | crate::ty::Ty::Record { .. }));
         let mut send = Expr::new(
             span,
             ExprNode::Send {
                 recv: Some(row),
-                method: col.clone(),
-                args: vec![],
+                method: if hash_row { Symbol::from("[]") } else { col.clone() },
+                args: if hash_row {
+                    vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: col.clone() } })]
+                } else {
+                    vec![]
+                },
                 block: None,
                 parenthesized: false,
             },

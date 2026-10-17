@@ -174,3 +174,50 @@ fn a_require_hook_prepended_to_kernel_still_reaches_zeitwerks_implicit_namespace
         assert_eq!(out, "\"core macro\"\ntrue\n[:compiled, \"compiled codec\"]\n");
     }
 }
+
+/// A compiled gem whose own body autoloads its components (polaris 25's
+/// `register_component :Badge, "badge"`, an
+/// `autoload(name, "components/polaris/#{path}/#{path}")`) keeps the
+/// tree's autoload of the constant. Replayed, the gem's autoload named a
+/// feature the tree answers with two files, and loading the first (the
+/// `Badge` module) required the second inside its own `module Badge`:
+/// "uninitialized constant Polaris::Badge" for 74 v2-r50 ids.
+#[test]
+fn a_compiled_gems_own_autoload_keeps_the_trees() {
+    let home = gem_home();
+    std::fs::write(
+        home.join("specifications/pollike-25.0.1.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"pollike\"\n  s.version = \"25.0.1\"\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\nend\n",
+    )
+    .unwrap();
+    let lock = LOCK.replace("    paqlike (1.0.2)\n", "    paqlike (1.0.2)\n    pollike (25.0.1)\n").replace("  paqlike\n  sessionish\n", "  paqlike\n  pollike\n  sessionish\n");
+    let (dir, errors) = emit_and_run::empty_app()
+        .write(
+            "roundhouse.yml",
+            &format!(
+                "test_paths:\n  - test\ndatabase_adapter: postgresql\ngem_home: {}\ngem_sources:\n  pollike: vendor/gems/pollike-25.0.1\n",
+                home.display()
+            ),
+        )
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_compiled_gem_own_autoload\n")
+        .write("Gemfile.lock", &lock)
+        .write(
+            "vendor/gems/pollike-25.0.1/lib/pollike.rb",
+            "module Pollike\n  def self.register_component(name, path)\n    autoload(name, \"components/pollike/#{path}/#{path}\")\n  end\n\n  register_component :Badge, \"badge\"\nend\n",
+        )
+        .write(
+            "vendor/gems/pollike-25.0.1/lib/components/pollike/badge/badge.rb",
+            "module Pollike\n  module Badge\n    class Badge\n      def self.label\n        \"badge\"\n      end\n    end\n\n    def ui_badge\n      Badge.label\n    end\n  end\nend\n",
+        )
+        .write("app/helpers/labels_helper.rb", "require \"pollike\"\nrequire \"components/pollike/badge/badge\"\n\nmodule LabelsHelper\n  include Pollike::Badge\nend\n")
+        .write("lib/oracle.rb", "class Oracle\n  def self.label\n    Object.new.extend(LabelsHelper).ui_badge\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    let own: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
+    assert!(own.is_empty(), "{own:?}");
+    let script = format!("{BOOT}require_relative 'app/models'\nrequire 'pollike'\np Pollike::Badge::Badge.label\np Oracle.label\n");
+    let out = emit_and_run::ruby().current_dir(&*dir).env("RH_TEST_GEMS", &home).args(["-e", &script]).output().expect("ruby");
+    let _ = std::fs::remove_dir_all(&home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "\"badge\"\n\"badge\"\n");
+}
