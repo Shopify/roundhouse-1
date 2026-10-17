@@ -84,9 +84,13 @@ fn a_single_class_nilable_receiver_binds_by_name() {
 
     let source =
         std::fs::read_to_string(run.emitted.join("app/models/nilable/courier.rb")).unwrap();
+    // The Ruby-family tree writes a flattened keyword back as a keyword
+    // (the callee keeps `connection:`), where the strict targets move it into
+    // the slot; either way it is bound by name, never a Hash in the slot
+    // (the run above agrees with native).
     assert!(
-        source.contains("deliver(\"REAL\")"),
-        "the keyword should move into the flattened `connection` slot, not stay a Hash:\n{source}"
+        source.contains("deliver(\"REAL\")") || source.contains("deliver(connection: \"REAL\")"),
+        "the keyword should bind the `connection` slot, not stay a Hash:\n{source}"
     );
 }
 
@@ -135,9 +139,10 @@ fn a_two_class_union_with_matching_slot_shapes_binds_by_name() {
 
     let source =
         std::fs::read_to_string(run.emitted.join("app/models/nilable/courier.rb")).unwrap();
+    // As above: the Ruby-family tree keeps the keyword the callees keep.
     assert!(
-        source.contains("deliver(\"REAL\")"),
-        "both branches share a slot shape, so the call should move into it rather than stay a Hash:\n{source}"
+        source.contains("deliver(\"REAL\")") || source.contains("deliver(connection: \"REAL\")"),
+        "both branches share a slot shape, so the call should bind it rather than stay a Hash:\n{source}"
     );
 }
 

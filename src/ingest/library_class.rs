@@ -6764,6 +6764,11 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         if !find_all_modules_with_scope(&root).is_empty() {
             return Some(ClassKind::LibraryClass);
         }
+        // `Breadcrumb = Data.define(:name, :path)`: the file declares a
+        // value class, not a model (see `file_data_class`).
+        if file_data_factory(&root).is_some_and(|(_, call)| data_members(&call).is_some()) {
+            return Some(ClassKind::LibraryClass);
+        }
         // Nor a module: a file of file-level constants (`RemoteDomain =
         // DomainSubscription`, `Pair = Struct.new(:a, :b)`) declares
         // those, which the library ingest carries.
