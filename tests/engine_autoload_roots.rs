@@ -83,9 +83,22 @@ const SECTION_TEMPLATE: &str = r#"class SectionTemplate
 end
 "#;
 
+const VISITOR: &str = r#"module StaticAnalysis
+  module ParseTreeVisitor
+    def self.visit(text)
+      text.size
+    end
+  end
+end
+"#;
+
 const ASSET: &str = r#"class ThemeAsset
   def parsed(text)
     SectionTemplate.parse(text)
+  end
+
+  def analysed(text)
+    StaticAnalysis::ParseTreeVisitor.visit(text)
   end
 end
 "#;
@@ -104,6 +117,7 @@ fn an_engines_lib_named_eager_load_root_autoloads_its_constants() {
         .write("Gemfile.lock", LIQUID_LOCK)
         .write("engines/widgets/lib/widgets/engine.rb", LIB_ENGINE)
         .write("engines/widgets/app/liquid/lib/section_template.rb", SECTION_TEMPLATE)
+        .write("engines/widgets/app/liquid/lib/static_analysis/parse_tree_visitor.rb", VISITOR)
         .write("app/models/theme_asset.rb", ASSET)
         .emit(BuildTarget::Ruby);
     let own: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
@@ -114,5 +128,12 @@ fn an_engines_lib_named_eager_load_root_autoloads_its_constants() {
             || models.contains("[:SectionTemplate, \"models/section_template\", false]"),
         "SectionTemplate is a top-level autoload:\n{}",
         models.lines().filter(|l| l.contains("SectionTemplate") || l.contains("UNREACHED")).collect::<Vec<_>>().join("\n")
+    );
+    // The directory under the root is a top-level namespace too
+    // (`StaticAnalysis::ParseTreeVisitor`, read in a method body).
+    assert!(
+        models.contains("[:StaticAnalysis, "),
+        "StaticAnalysis is a top-level namespace:\n{}",
+        models.lines().filter(|l| l.contains("StaticAnalysis") || l.contains("ParseTreeVisitor")).collect::<Vec<_>>().join("\n")
     );
 }
