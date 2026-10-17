@@ -191,11 +191,11 @@ fn an_unfoldable_translate_stays_the_gems_call() {
     assert!(model.contains("I18n.t(label_key, scope: \"probe.reasons\", default: I18n.t(label_key, scope: \"probe.platforms\"))"), "{model}");
     assert!(model.contains("I18n.t(code, scope: scope)"), "{model}");
     assert!(model.contains("locale: locale"), "{model}");
-    // A run-time key whose reach is small still folds, over the helpers the gem tree carries.
-    assert!(model.contains("shipped #{count} items"), "{model}");
+    // A run-time key whose reach is small still folds, into the app's translation table
+    // (`I18n.translate_site`, the runtime answers it), and so does a literal key.
+    assert!(model.contains("I18n.translate_site(\"t2\""), "{model}");
     assert!(model.contains("I18n.t(\"probe.wide.k#{n}\")"), "{model}");
-    // A literal key still folds at compile time.
-    assert!(model.contains("\"Initial inventory\""), "{model}");
+    assert!(model.contains("I18n.translate_site(\"t3\""), "{model}");
 }
 
 /// The gem tree's runtime/i18n_locale.rb loads the gem, then defines the
@@ -211,13 +211,17 @@ fn the_gem_tree_carries_the_folded_call_helpers() {
     assert!(!anchor.contains("def self.locale"), "{anchor}");
 }
 
-/// Without the i18n gem in the lockfile the call has no run-time
-/// answer, so it stays refused by name.
+/// Without the i18n gem in the lockfile the call is not the gem's: the
+/// runtime answers it from the app's catalog (`I18n.translate_runtime`),
+/// and nothing is refused.
 #[test]
-fn without_the_gem_it_is_still_refused_by_name() {
+fn without_the_gem_the_runtime_answers_it() {
     let app = files().iter().filter(|(p, _)| p != "Gemfile.lock").fold(emit_and_run::empty_app(), |app, (p, t)| app.write(p, t));
-    let (_, errors) = app.emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(errors.iter().any(|e| e.contains("I18n not supported") && e.contains("a key computed at run time")), "{}", errors.join("\n"));
+    let (emitted, errors) = app.emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let model = std::fs::read_to_string(emitted.join("app/models/template.rb")).unwrap();
+    assert!(model.contains("I18n.translate_runtime(label_key"), "{model}");
+    assert!(!model.contains("I18n.t(label_key"), "{model}");
 }
 
 /// The same app natively, on Rails 8.2, and emitted.

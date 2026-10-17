@@ -13,7 +13,7 @@ mod emit_and_run;
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    identity_client (59.3.0)\n\nDEPENDENCIES\n  activesupport\n  identity_client\n";
 
 /// A gem whose load closure reaches Rails (`rails_dependent`).
-const GEMS: &str = "rails_dependent:\n  - {gem: identity_client, why: \"requiring it loads 199 Rails framework files\"}\n";
+const GEMS: &str = "rails_dependent_by_name: true\nrails_dependent:\n  - {gem: identity_client, why: \"requiring it loads 199 Rails framework files\"}\n";
 
 const RBI: &str = "# typed: true\nmodule IdentityClient\n  class << self\n    def cache; end\n    def cache=(value); end\n  end\nend\n";
 

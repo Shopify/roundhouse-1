@@ -582,6 +582,13 @@ thread_local! {
 }
 
 thread_local! {
+    /// The tree loads the real i18n gem (`App::carries_i18n_gem`): an `I18n.t`
+    /// that can only run at run time stays the gem's call, which reads the
+    /// app's loaded locale files, instead of going to `translate_runtime`.
+    static GEM_ANSWERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     /// The calls this lowering left to `I18n.translate_runtime`, and every call that reads the translation table.
     static RUNTIME_SITES: std::cell::RefCell<(Vec<Span>, Vec<Span>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
@@ -592,6 +599,7 @@ thread_local! {
 pub fn apply_i18n_translate_lowering(app: &mut App) {
     TABLE.with(|t| *t.borrow_mut() = Default::default());
     RUNTIME_SITES.with(|r| *r.borrow_mut() = Default::default());
+    GEM_ANSWERS.with(|g| g.set(app.carries_i18n_gem()));
     let catalog = app.i18n.or_rails_default().clone();
     let controllers: crate::det::HashMap<crate::ident::ClassId, String> = app
         .controllers
@@ -718,7 +726,12 @@ fn rewrite_one(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
         return;
     }
     let runtime = |reason: &str, expr: &mut Expr| {
-        let ExprNode::Send { args, block: None, .. } = &*expr.node else { return };
+        let ExprNode::Send { recv, args, block: None, .. } = &*expr.node else { return };
+        let on_i18n = matches!(recv.as_ref().map(|r| &*r.node),
+            Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "I18n");
+        if on_i18n && GEM_ANSWERS.with(|g| g.get()) {
+            return;
+        }
         if runs_at_run_time(reason, args, catalog) {
             *expr = runtime_call(expr.span, args, catalog, site);
         }
