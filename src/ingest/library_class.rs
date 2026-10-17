@@ -7223,6 +7223,51 @@ pub fn ingest_concern_filters(
     Ok(out)
 }
 
+/// `rescue_from` declarations in a concern's `included do` block, keyed
+/// by the module, in declaration order: each the whole receiverless call,
+/// as a controller's own `rescue_from` is carried (an `Unknown` body
+/// item). `splice_concerns_into_controllers` puts them behind the
+/// `include` that brings them, so `collect_rescue_handlers` wraps the
+/// includer's dispatcher in them. Core's `ApplicationControllerExceptionHandler`
+/// answers `ParameterMissing` with a 400 only this way.
+pub fn ingest_concern_rescues(
+    source: &[u8],
+    file: &str,
+) -> super::IngestResult<Vec<(ClassId, Vec<crate::expr::Expr>)>> {
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let mut out = Vec::new();
+    for (scope, module) in find_all_modules_with_scope(&root) {
+        let Some(name_path) = module_name_path(&module) else { continue };
+        let mut full_path: Vec<String> = scope.clone();
+        full_path.extend(name_path);
+        let id = ClassId(Symbol::from(full_path.join("::")));
+        let Some(body) = module.body() else { continue };
+        let mut rescues = Vec::new();
+        for stmt in flatten_statements(body) {
+            let Some(call) = stmt.as_call_node() else { continue };
+            if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+                continue;
+            }
+            let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+            let Some(block_body) = block.body() else { continue };
+            for inner in flatten_statements(block_body) {
+                let Some(inner_call) = inner.as_call_node() else { continue };
+                if inner_call.receiver().is_some() || constant_id_str(&inner_call.name()) != "rescue_from" {
+                    continue;
+                }
+                if let Ok(expr) = ingest_expr(&inner, file) {
+                    rescues.push(expr);
+                }
+            }
+        }
+        if !rescues.is_empty() {
+            out.push((id, rescues));
+        }
+    }
+    Ok(out)
+}
+
 /// `protect_from_forgery` / `skip_forgery_protection`, receiverless.
 fn forgery_macro_name(stmt: &ruby_prism::Node<'_>) -> Option<&'static str> {
     let call = stmt.as_call_node()?;

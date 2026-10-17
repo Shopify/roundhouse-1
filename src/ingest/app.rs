@@ -26,7 +26,7 @@ use super::fixture::ingest_fixture_file;
 use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
     ClassKind, ConcernClassMethodSpans, ConcernEnumDecl, classify_class_file,
-    ingest_concern_class_method_spans, ingest_concern_filters,
+    ingest_concern_class_method_spans, ingest_concern_filters, ingest_concern_rescues,
     ingest_concern_included_redefs, ingest_concern_model_items_with_constants,
     ingest_concern_prepended_items, ingest_helper_method_names, ingest_library_classes,
     ingest_nested_library_classes, ingest_rails_application_singleton_methods,
@@ -881,6 +881,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             unwrap_or_record(ingest_concern_filters(&source, &path_str))?
                         {
                             app.concern_filters.extend(concern_filters);
+                        }
+                        if let Some(concern_rescues) =
+                            unwrap_or_record(ingest_concern_rescues(&source, &path_str))?
+                        {
+                            app.concern_rescues.extend(concern_rescues);
                         }
                         let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
@@ -2230,6 +2235,11 @@ end
                             unwrap_or_record(ingest_concern_filters(&source, &path_str))?
                         {
                             app.concern_filters.extend(concern_filters);
+                        }
+                        if let Some(concern_rescues) =
+                            unwrap_or_record(ingest_concern_rescues(&source, &path_str))?
+                        {
+                            app.concern_rescues.extend(concern_rescues);
                         }
                         let (concern_items, concern_enum_decls, concern_guarded) =
                             ingest_concern_model_items_with_constants(
@@ -6021,6 +6031,22 @@ fn splice_concerns_into_controllers(app: &mut App) {
                     filter.from_concern = Some(module.clone());
                     filters.push(ControllerBodyItem::Filter {
                         filter,
+                        leading_comments: Vec::new(),
+                        leading_blank_line: false,
+                    });
+                }
+                // The concern's `rescue_from`s, behind its filters: the
+                // `Unknown` item a controller's own is, with the module's
+                // constants (`RESOURCE_NOT_FOUND_ERRORS`) qualified, as
+                // they resolve lexically in the module and not here.
+                for call in app.concern_rescues.get(module).into_iter().flatten() {
+                    let mut call = call.clone();
+                    if let Some(consts) = module_constants.get(module) {
+                        qualify_lexical_consts(&mut call, module, consts);
+                    }
+                    spliced_any = true;
+                    filters.push(ControllerBodyItem::Unknown {
+                        expr: call,
                         leading_comments: Vec::new(),
                         leading_blank_line: false,
                     });

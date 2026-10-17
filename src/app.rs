@@ -699,6 +699,12 @@ pub struct App {
     /// the app walk; empty for apps without concerns.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_filters: HashMap<ClassId, Vec<Filter>>,
+    /// `rescue_from` calls inside a concern module's `included do` block,
+    /// keyed by the module, in declaration order. Spliced into each
+    /// including controller behind the `include` as the `Unknown` body
+    /// item a controller's own `rescue_from` is.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_rescues: HashMap<ClassId, Vec<crate::expr::Expr>>,
     /// graphql-ruby object types (`ingest::graphql_ruby`), for the
     /// analyzer only; their synthesized methods leave at lowering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1692,6 +1698,7 @@ impl App {
             rails_application: None,
             application_namespace: None,
             concern_filters: HashMap::default(),
+            concern_rescues: HashMap::default(),
             graphql_types: Vec::new(),
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),

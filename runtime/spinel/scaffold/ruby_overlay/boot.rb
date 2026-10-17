@@ -146,6 +146,10 @@ require_relative "runtime/action_controller_renderers"
 # the hooks the synthesized `process_action` runs them through. Dynamic
 # Ruby (procs, instance_exec), so ruby lane only.
 require_relative "runtime/action_controller_filters"
+# `respond_with` (the responders gem): GET renders the resource, POST
+# renders it with 201 and a location, other verbs answer 204.
+require_relative "runtime/action_controller_respond_with"
+require_relative "runtime/action_controller_params_indifferent"
 # Replace the portable character walk only after loading the shared policy.
 require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.

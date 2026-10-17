@@ -169,7 +169,9 @@ module ActionController
         controller.request_method = http_method
         controller.request_path = path
         controller.query_string = query_string
-        format_name = format.to_s
+        # Rails reads the format from the params too (`get :index, params:
+        # { format: :json }`): the path parameter `format` the router sets.
+        format_name = (format.nil? ? parameters["format"] : format).to_s
         controller.request_format = :json if format_name == "json"
         controller.request_format = :turbo_stream if format_name == "turbo_stream"
         controller.request_format = :rss if format_name == "rss"
@@ -312,6 +314,7 @@ module ActionController
           cache_control_store: controller.cache_control,
           headers: copied_headers
         )
+        @response.request = request
         @__response = @response
         @request = request
         @__request = request
