@@ -47,3 +47,6 @@
 /bench/probes/
 /scratchpad/
 .codegraph
+
+# Rails logs written by test runs in the checkout
+/log/
