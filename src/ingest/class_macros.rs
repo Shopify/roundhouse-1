@@ -129,6 +129,13 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
                     items.extend(run.aliases.into_iter().map(|(new, old, span)| ModelBodyItem::Alias { new, old, leading_comments: Vec::new(), leading_blank_line: false, span }));
                     expansions.insert(index, items);
                 }
+                // A macro that reaches model DSL is refused by name where the model is lowered
+                // (`lower::model_to_library::macro_replay`), which says what it reaches; one report.
+                Err(why)
+                    if why
+                        .strip_prefix("it calls `")
+                        .and_then(|rest| rest.strip_suffix('`'))
+                        .is_some_and(crate::lower::model_to_library::macro_replay::is_model_dsl) => {}
                 Err(why) => {
                     super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                         expr.span,

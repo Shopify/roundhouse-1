@@ -206,7 +206,7 @@ fn runtime_registers_at_class_body(name: &str) -> bool {
 const SCHEMA_CLASS_METHODS: &[&str] = &["table_name", "_table_sql", "primary_key"];
 
 /// `validates_presence_of`, `validates_uniqueness_of`, ...
-fn is_model_dsl(name: &str) -> bool {
+pub(crate) fn is_model_dsl(name: &str) -> bool {
     MODEL_DSL.contains(&name)
         || is_lifecycle_callback(name)
         || (name.starts_with("validates_") && name.ends_with("_of"))
