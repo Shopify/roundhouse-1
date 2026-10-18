@@ -973,8 +973,8 @@ fn hydration_setter(model: &Model, col: &Column) -> Symbol {
         enum_storage_writer(col)
     } else if is_generic_json_col(col, model) {
         json_storage_writer(col)
-    } else if super::model_defines_writer(model, &col.name) && !is_temporal_col(col) {
-        // The model's own `<col>=` is what assignment runs, not what a row loads through.
+    } else if super::model_defines_writer(model, &col.name) && !is_temporal_col(col) && !crate::emit::ruby::native_keywords() {
+        // The model's own `<col>=` is what assignment runs, not what a row loads through (the ruby family's generated module writes it under `_generated_<col>=`).
         Symbol::from(format!("_write_{}_raw", col.name.as_str()))
     } else {
         col_storage_setter(col)

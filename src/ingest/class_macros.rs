@@ -136,6 +136,10 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
                         .strip_prefix("it calls `")
                         .and_then(|rest| rest.strip_suffix('`'))
                         .is_some_and(crate::lower::model_to_library::macro_replay::is_model_dsl) => {}
+                // A macro whose body declares through model DSL (`has_many(name, scope, **options)`) is replayed where the model is lowered, whatever its parameters.
+                Err(_) if reaches_model_dsl(method, &table, 0) => {}
+                // Parameters this expansion does not bind (`*args, **kwargs`): the model lowering's replay takes the call, or refuses it by name.
+                Err(why) if why.ends_with("parameters are not ones it binds") || why == "its parameters include a rest or a block" => {}
                 Err(why) => {
                     super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                         expr.span,
@@ -224,6 +228,24 @@ fn reaches_definition(name: &Symbol, table: &HashMap<Symbol, MethodDef>, depth: 
         {
             found |= matches!(method.as_str(), "define_method" | "define_singleton_method")
                 || (method != name && table.contains_key(method) && reaches_definition(method, table, depth + 1));
+        }
+    });
+    found
+}
+
+/// Whether the macro, or a class method it calls, calls model DSL.
+fn reaches_model_dsl(name: &Symbol, table: &HashMap<Symbol, MethodDef>, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(def) = table.get(name) else { return false };
+    let mut found = false;
+    visit(&def.body, &mut |e| {
+        if let ExprNode::Send { recv, method, .. } = &*e.node
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        {
+            found |= crate::lower::model_to_library::macro_replay::is_model_dsl(method.as_str())
+                || (method != name && table.contains_key(method) && reaches_model_dsl(method, table, depth + 1));
         }
     });
     found

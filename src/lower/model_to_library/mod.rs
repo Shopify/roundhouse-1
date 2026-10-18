@@ -2463,7 +2463,7 @@ fn push_user_methods(
             let existing_is_column = existing.signature.is_some()
                 && matches!(existing.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
                 && columns.contains(&crate::ident::Symbol::from(existing.name.as_str().trim_end_matches('=')));
-            if incoming_is_real && existing_is_column && !method.name_span.is_synthetic() {
+            if incoming_is_real && existing_is_column && !method.name_span.is_synthetic() && !generated_attribute_overrides.contains(&method.name) {
                 // The synthesized accessor stays, under the name the override's `super` (`ingest::column_accessors`) and hydration (`schema::hydration_setter`) reach it by.
                 let raw = {
                     let mut raw = existing.clone();
@@ -2494,8 +2494,13 @@ fn push_user_methods(
                 && generated_attribute_overrides.contains(&method.name)
             {
                 // Ruby family only: the synthesized accessor moves to
-                // GeneratedAttributeMethods and this def overrides it.
-                methods.push(method.clone());
+                // GeneratedAttributeMethods and this def overrides it, its
+                // `super` the module's accessor as in Rails (not the
+                // `_<read|write>_<col>_raw` name `ingest::column_accessors`
+                // gave it for the targets that keep the accessor apart).
+                let mut own = method.clone();
+                raw_accessor_calls_to_super(&mut own.body);
+                methods.push(own);
             }
             continue;
         }
@@ -2504,6 +2509,23 @@ fn push_user_methods(
         methods.push(source);
         selected_source_methods.insert(method.name_span);
     }
+}
+
+/// `_write_<col>_raw(v)` / `_read_<col>_raw` in an override's body back to
+/// the `super` `ingest::column_accessors` replaced.
+fn raw_accessor_calls_to_super(e: &mut Expr) {
+    e.node.for_each_child_mut(&mut |c| raw_accessor_calls_to_super(c));
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node else { return };
+    let name = method.as_str();
+    let is_raw = |prefix: &str| name.strip_prefix(prefix).is_some_and(|rest| rest.ends_with("_raw") && rest.len() > 4);
+    let args = if is_raw("_write_") && args.len() == 1 {
+        Some(args.clone())
+    } else if is_raw("_read_") && args.is_empty() {
+        None
+    } else {
+        return;
+    };
+    *e = Expr::new(e.span, ExprNode::Super { args, block: None });
 }
 
 /// A model subclass's view model's synthesized methods

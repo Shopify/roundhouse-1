@@ -1251,6 +1251,11 @@ module RoundhouseTestRunner
     return trace if shared.zero?
     inner = trace[0, trace.length - shared]
     inner = inner[0...-1] if inner.last.to_s.include?("capture'")
+    # The fixture transaction around a test's call (`in_fixture_transaction`)
+    # is the runner's, as the frames between the call and it are.
+    wrapper = inner.index { |frame| frame.include?("in_fixture_transaction'") }
+    call = wrapper && inner[0, wrapper].rindex { |frame| frame.include?("Kernel#public_send") }
+    inner = inner[0..call] + inner[(wrapper + 1)..] if call
     inner
   end
 
@@ -1283,15 +1288,23 @@ module RoundhouseTestRunner
   # (`use_transactional_tests`, default true), so a nested `save` or
   # `destroy` is a SAVEPOINT and commit callbacks run when it releases.
   # A tree with ActiveRecord::TestFixtures opens that transaction in its
-  # own setup_fixtures; the in-memory tree wraps the example here. A class
-  # that sets the flag false sees a real COMMIT.
+  # own setup_fixtures; the in-memory tree wraps the example here, when
+  # the app has models (the suites with a fixture reset). A class that
+  # sets the flag false sees a real COMMIT.
   def self.in_fixture_transaction(test, &block)
     klass = test.class
     wrap = !defined?(ActiveRecord::TestFixtures) &&
       klass.respond_to?(:use_transactional_tests) && klass.use_transactional_tests &&
-      defined?(ActiveRecord::Base) && ActiveRecord::Base.respond_to?(:transaction)
+      defined?(ActiveRecord::Base) && ActiveRecord::Base.respond_to?(:transaction) &&
+      model_defined?(ActiveRecord::Base)
     return block.call unless wrap
     ActiveRecord::Base.transaction(joinable: false, &block)
+  end
+
+  # Whether a class below `base` carries a table (a lowered model's
+  # per-table truncate).
+  def self.model_defined?(base)
+    base.subclasses.any? { |k| k.respond_to?(:_adapter_truncate) || model_defined?(k) }
   end
 
   def self.run_one(klass, name)

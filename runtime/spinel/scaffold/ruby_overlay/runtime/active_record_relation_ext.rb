@@ -590,8 +590,8 @@ module ActiveRecord
   # Rails' `check_if_method_has_arguments!` drops blank order arguments
   # (`compact_blank`): `reorder(nil)` clears the order and orders by nothing.
   module RelationBlankOrder
-    def order!(*parts)
-      super(*parts.reject { |part| part.nil? || part == "" })
+    def order_parts!(parts)
+      super(parts.reject { |part| part.nil? || part == "" })
     end
   end
   Relation.prepend(RelationBlankOrder)

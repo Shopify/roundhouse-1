@@ -152,20 +152,20 @@ module ActiveRecord
         super(arel_text(condition), *args)
       end
 
-      # The in-place body: `order` spawns and calls it, `reorder!` clears
-      # the orders and calls it, and default-scope lowering calls it.
+      # The in-place body: `order` and `order!` spawn / call it, `reorder!`
+      # clears the orders and calls it, and default-scope lowering calls it.
       #
       # Rails flattens its arguments (`order([a.asc, b.desc])`, `order(*list)`
       # alike), so an Array of nodes is read term by term.
-      def order!(*parts)
+      def order_parts!(parts)
         parts = parts.flatten
-        return super(*parts) unless parts.any? { |part| arel_tree?(part) }
+        return super(parts) unless parts.any? { |part| arel_tree?(part) }
 
         parts.each do |part|
           if arel_tree?(part)
             order_sql!(arel_text(part))
           else
-            super(part)
+            super([part])
           end
         end
         self
