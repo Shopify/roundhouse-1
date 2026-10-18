@@ -768,7 +768,17 @@ fn source_mutations(app: &App, resolver: &ConstResolver) -> Mutations {
                 },
                 &path,
             ) {
-                return vec![id.0.as_str().to_owned()];
+                let mut targets = vec![id.0.as_str().to_owned()];
+                // A name written for something other than the class it
+                // resolves to is an alias the source rebinds (`Core =
+                // String; Core = Class`): the resolver answers one of its
+                // bindings, and the written name keeps the others reachable
+                // through the alias map.
+                let written = text.trim_start_matches("::");
+                if written != id.0.as_str() {
+                    targets.push(written.to_owned());
+                }
+                return targets;
             }
             // A literal unmodeled receiver may denote the written parent or a
             // lexically nested one. Keep those plausible targets, not a veto.

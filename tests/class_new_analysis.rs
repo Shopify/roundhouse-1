@@ -9,6 +9,27 @@ use roundhouse::ty::Ty;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+// Where these tests differ from upstream on this tree, and why:
+//
+// * `Class.new(P) { .. }` WITH a block is gradual here: its value is
+//   `Untyped` (`anonymous_module_ty`), so a constant assigned it registers
+//   and its readers resolve, and the CRuby tree runs the call as written.
+//   Upstream refuses the read in main ("constant not supported"). A test
+//   that asserted that refusal asserts here that nothing is claimed instead:
+//   the class registry carries no identity for the factory, and main and
+//   source analysis agree.
+// * A nameless `*` in a `def` of the constructor preludes
+//   (`def self.new(*) = 7`, a refinement's `def new(*)`) is a named
+//   refusal here (`UnsupportedFormal::AnonymousRest`); the preludes name
+//   the rest (`*args`), which redefines the same constructor.
+// * `*Rest, Parent = [nil, 7]` (a post-rest multi-write with a constant
+//   target) is a file-level statement ingest names and refuses
+//   (`FileStatementUnsupported`); `superclass_limits_remain_at_ordinary_class_parity`
+//   pins that refusal and runs the other shapes.
+// * `NAME = Class.new` with no argument is `class NAME; end` at ingest
+//   (`library_class::class_new_declaration`), as the one-argument form is, so
+//   it is in main's registry; the refusal shapes use the block form.
+
 fn ingest(source: &str, action: &str, extra: Option<&str>) -> roundhouse::App {
     let mut tree: HashMap<PathBuf, Vec<u8>> = [
         (PathBuf::from("app/services/owner.rb"), source.as_bytes().to_vec()),
@@ -64,15 +85,15 @@ fn retained_factories_have_exact_identity_parent_and_constructor() {
     );
     let (main, main_analyzer) = analyzed(app.clone(), false);
     let (source, analyzer) = analyzed(app, true);
-    // A blockless one-argument factory is a real class at ingest. No-arg
-    // and empty-block factories stay check-only.
+    // A blockless factory (one argument, or none: `class Plain; end`) is a
+    // real class at ingest. Empty-block factories stay check-only.
     assert!(
         main_analyzer
             .class_registry()
             .contains_key(&ClassId(Symbol::from("Owner::Failure")))
     );
     assert!(
-        !main_analyzer
+        main_analyzer
             .class_registry()
             .contains_key(&ClassId(Symbol::from("Owner::Plain")))
     );
@@ -84,14 +105,15 @@ fn retained_factories_have_exact_identity_parent_and_constructor() {
     assert!(errors(&main).is_empty(), "{:?}", errors(&main));
     assert!(errors(&source).is_empty(), "{:?}", errors(&source));
     for (name, parent) in [
-        ("Plain", "Object"),
-        ("Failure", "StandardError"),
-        ("Empty", "Object"),
+        // Declared as `class Plain; end`: no written parent.
+        ("Plain", None),
+        ("Failure", Some("StandardError")),
+        ("Empty", Some("Object")),
     ] {
         let id = ClassId(Symbol::from(format!("Owner::{name}")));
         assert_eq!(
             analyzer.class_registry()[&id].parent,
-            Some(ClassId(Symbol::from(parent)))
+            parent.map(|parent| ClassId(Symbol::from(parent)))
         );
     }
     let action = source.controllers[0].actions().next().unwrap();
@@ -112,8 +134,10 @@ fn known_parent_methods_are_inherited_without_lifting_declarations() {
         "Owner::Child.new.code",
         None,
     );
-    let (main, _) = analyzed(raw.clone(), false);
-    assert!(!errors(&main).is_empty());
+    let (main, main_analyzer) = analyzed(raw.clone(), false);
+    // Gradual in main: the block factory claims no class, and no error.
+    assert!(errors(&main).is_empty(), "{:?}", errors(&main));
+    assert!(!main_analyzer.class_registry().contains_key(&ClassId(Symbol::from("Owner::Child"))));
     let (source, analyzer) = analyzed(raw, true);
     assert!(errors(&source).is_empty(), "{:?}", errors(&source));
     let child = &analyzer.class_registry()[&ClassId(Symbol::from("Owner::Child"))];
@@ -274,11 +298,9 @@ fn newly_exposed_errors_are_kept_without_rolling_back_other_facts() {
     );
     let (main, _) = analyzed(raw.clone(), false);
     let (source, analyzer) = analyzed(raw, true);
-    assert!(
-        errors(&main)
-            .iter()
-            .any(|error| error.code() == "unsupported")
-    );
+    // Main reads the block factories gradually (`Untyped + 1` is no error);
+    // source analysis knows them as classes and exposes the binop.
+    assert!(errors(&main).is_empty(), "{:?}", errors(&main));
     assert!(
         errors(&source)
             .iter()
@@ -468,7 +490,6 @@ fn inherited_hooks_exclude_factories_through_the_entire_ancestry() {
         let (main, _) = analyzed(raw.clone(), false);
         let (source, analyzer) = analyzed(raw, true);
         assert_eq!(source, main, "{declarations}");
-        assert!(!errors(&source).is_empty(), "{declarations}");
         assert!(
             !analyzer
                 .class_registry()
@@ -556,7 +577,6 @@ fn ruby_inherited_hooks_observe_anonymous_factories_and_named_headers() {
         let ordinary =
             format!("{declarations}\nclass Owner; class Child < Parent; end; end\n{action}");
         let (source, analyzer) = analyzed(ingest(&factory, action, None), true);
-        assert!(!errors(&source).is_empty());
         assert!(
             !analyzer
                 .class_registry()
@@ -607,7 +627,7 @@ const CORE_CONSTRUCTOR_LIMITS: &[&str] = &[
     "Class.method(:define_singleton_method).to_proc.call(:new) { 7 }",
     "Class.method(:define_singleton_method).curry.call(:new) { 7 }",
     "Module.instance_method(:define_method).bind_call(Class.singleton_class, :new) { 7 }",
-    "module Replacement; refine Class do; def new(*) = 7; end; end; using Replacement",
+    "module Replacement; refine Class do; def new(*args) = 7; end; end; using Replacement",
     r#"class Module; class << self; undef :"n#{"ew"}"; end; end"#,
 ];
 
@@ -617,7 +637,6 @@ fn core_constructor_redefinitions_remain_known_limits() {
         let factory = format!("{mutation}\nclass Owner; Child = Class.new(Object) {{}}; end");
         let raw = ingest(&factory, "Owner::Child.new", None);
         let (main, _) = analyzed(raw.clone(), false);
-        assert!(!errors(&main).is_empty(), "{mutation}");
         let (source, analyzer) = analyzed(raw, true);
         assert!(
             errors(&source).is_empty(),
@@ -668,13 +687,8 @@ fn lexical_const_set_of_class_shadows_only_later_factories() {
         "self.const_set(:Class, Object)",
         "send(:const_set, :Class, Object)",
     ] {
-        let refused = format!("class Owner\n  {shadow}\n  Failure = Class.new\nend");
-        let (source, analyzer) = analyzed(ingest(&refused, "Owner::Failure.new", None), true);
-        assert!(
-            !errors(&source).is_empty(),
-            "{shadow}: {:?}",
-            errors(&source)
-        );
+        let refused = format!("class Owner\n  {shadow}\n  Failure = Class.new {{}}\nend");
+        let (_, analyzer) = analyzed(ingest(&refused, "Owner::Failure.new", None), true);
         assert!(
             !analyzer
                 .class_registry()
@@ -692,9 +706,8 @@ fn lexical_const_set_of_class_shadows_only_later_factories() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let reopened = "class Owner; end\nOwner.const_set(:Class, Object)\nclass Owner\n  Failure = Class.new\nend";
-    let (source, analyzer) = analyzed(ingest(reopened, "Owner::Failure.new", None), true);
-    assert!(!errors(&source).is_empty(), "{:?}", errors(&source));
+    let reopened = "class Owner; end\nOwner.const_set(:Class, Object)\nclass Owner\n  Failure = Class.new {}\nend";
+    let (_, analyzer) = analyzed(ingest(reopened, "Owner::Failure.new", None), true);
     assert!(
         !analyzer
             .class_registry()
@@ -702,7 +715,7 @@ fn lexical_const_set_of_class_shadows_only_later_factories() {
     );
 
     // A shadow after the call does not rewrite the class already created.
-    let kept = "class Owner\n  Failure = Class.new\nend\nOwner.const_set(:Class, Object)";
+    let kept = "class Owner\n  Failure = Class.new {}\nend\nOwner.const_set(:Class, Object)";
     let (source, analyzer) = analyzed(ingest(kept, "Owner::Failure.new", None), true);
     assert!(errors(&source).is_empty(), "{:?}", errors(&source));
     assert!(
@@ -719,13 +732,8 @@ fn lexical_const_set_of_class_shadows_only_later_factories() {
         ("Alias ||= Owner", "Alias.const_set(:Class, Object)"),
     ] {
         let refused =
-            format!("class Owner; end\n{alias}\n{shadow}\nclass Owner\n  Failure = Class.new\nend");
-        let (source, analyzer) = analyzed(ingest(&refused, "Owner::Failure.new", None), true);
-        assert!(
-            !errors(&source).is_empty(),
-            "{alias}: {:?}",
-            errors(&source)
-        );
+            format!("class Owner; end\n{alias}\n{shadow}\nclass Owner\n  Failure = Class.new {{}}\nend");
+        let (_, analyzer) = analyzed(ingest(&refused, "Owner::Failure.new", None), true);
         assert!(
             !analyzer
                 .class_registry()
@@ -748,7 +756,7 @@ fn lexical_const_set_of_class_shadows_only_later_factories() {
 #[test]
 fn analysis_facts_never_enter_the_emission_pipeline() {
     let raw = ingest(
-        "class Owner\n  Plain = Class.new\nend",
+        "class Owner\n  Plain = Class.new(Object) {}\nend",
         "Owner::Plain.new",
         None,
     );
@@ -759,11 +767,8 @@ fn analysis_facts_never_enter_the_emission_pipeline() {
             .class_registry()
             .contains_key(&ClassId(Symbol::from("Owner::Plain")))
     );
-    assert!(
-        errors(&emitted)
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "unsupported")
-    );
+    // Emission reads the block factory gradually; it holds no class for it.
+    assert!(errors(&emitted).is_empty(), "{:?}", errors(&emitted));
     let (source, analyzer) = analyzed(raw, true);
     assert!(errors(&source).is_empty());
     assert!(
@@ -1005,13 +1010,12 @@ fn constructor_lookup_mutations_refuse_factories() {
         "Alias = Module.singleton_class\nAlias.send(:send, :alias_method, :new, :name)",
     ] {
         let raw = ingest(
-            "class Owner\n Child = Class.new\nend",
+            "class Owner\n Child = Class.new {}\nend",
             "Owner::Child.new",
             Some(mutation),
         );
         let (main, _) = analyzed(raw.clone(), false);
         let (source, analyzer) = analyzed(raw, true);
-        assert!(!errors(&source).is_empty(), "{mutation}");
         assert_eq!(source, main, "{mutation}");
         assert!(
             !analyzer
@@ -1025,12 +1029,12 @@ fn constructor_lookup_mutations_refuse_factories() {
 #[test]
 fn qualified_constructor_body_owners_use_resolved_identity() {
     for mutation in [
-        "class Object::Module; def self.new(*) = 7; end",
-        "class ::Object::Module; def self.new(*) = 7; end",
-        "module Space; class Object::Module; def self.new(*) = 7; end; end",
-        "Core = Object; class Core::Module; def self.new(*) = 7; end",
-        "Core = Object; module Space; class Core::Module; def self.new(*) = 7; end; end",
-        "Core = Module; class Core; def self.new(*) = 7; end",
+        "class Object::Module; def self.new(*args) = 7; end",
+        "class ::Object::Module; def self.new(*args) = 7; end",
+        "module Space; class Object::Module; def self.new(*args) = 7; end; end",
+        "Core = Object; class Core::Module; def self.new(*args) = 7; end",
+        "Core = Object; module Space; class Core::Module; def self.new(*args) = 7; end; end",
+        "Core = Module; class Core; def self.new(*args) = 7; end",
         "class Object::Module; class << self; undef new; end; end",
         "class Object::Module; class << self; attr_reader :new; end; end",
     ] {
@@ -1052,7 +1056,6 @@ fn assert_refused_factory(declarations: &str, parent: &str) {
     );
     let (main, _) = analyzed(raw.clone(), false);
     let (source, analyzer) = analyzed(raw, true);
-    assert!(!errors(&main).is_empty(), "{declarations}");
     assert_eq!(source, main, "{declarations}");
     assert!(
         !analyzer
@@ -1142,8 +1145,8 @@ fn ruby_rejects_review_counterexamples_while_ordinary_headers_survive_constructo
         "class Module; class << self; undef new; end; end",
         "Class.private_class_method(:new)",
         "Class.method(:define_singleton_method).call(:new) { 7 }",
-        "class Object::Module; def self.new(*) = 7; end",
-        "class ::Object::Module; def self.new(*) = 7; end",
+        "class Object::Module; def self.new(*args) = 7; end",
+        "class ::Object::Module; def self.new(*args) = 7; end",
         "module Space; class Object::Module; def self.new(*) = 7; end; end",
         "Core = Object; class Core::Module; def self.new(*) = 7; end",
         "Core = Module; class Core; def self.new(*) = 7; end",
@@ -1328,7 +1331,6 @@ fn superclass_limits_remain_at_ordinary_class_parity() {
             "class Parent; end; (Parent, Other), Tail = [7, nil], nil",
             "Parent",
         ),
-        ("class Parent; end; *Rest, Parent = [nil, 7]", "Parent"),
     ] {
         let ordinary = format!("{declarations}\nclass Owner; class Child < {parent}; end; end");
         let (main, _) = analyzed(ingest(&ordinary, "Owner::Child.new", None), false);
@@ -1351,4 +1353,19 @@ fn superclass_limits_remain_at_ordinary_class_parity() {
             "{declarations}, {parent}"
         );
     }
+}
+
+#[test]
+fn a_post_rest_constant_write_is_a_named_refusal() {
+    // The shape upstream carries as an ordinary file statement; here ingest
+    // refuses it by name, before any `Class.new` is involved.
+    let (main, _) = analyzed(
+        ingest("class Parent; end; *Rest, Parent = [nil, 7]\nclass Owner; class Child < Parent; end; end", "Owner::Child.new", None),
+        false,
+    );
+    assert!(
+        errors(&main).iter().any(|error| error.message.contains("*Rest,")),
+        "{:?}",
+        errors(&main)
+    );
 }
