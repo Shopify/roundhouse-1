@@ -782,6 +782,8 @@ module Db
   # own handle `release_abandoned_write` rolled that transaction back
   # (`cannot commit - no transaction is active`).
   def self.reserve_txn_connection
+    # Memory mode has no pool: each thread already owns its handle.
+    return memory_dbh if @memory
     conn = nil
     adopt_after_fork
     @mutex.synchronize do
