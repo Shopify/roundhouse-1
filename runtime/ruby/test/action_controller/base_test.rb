@@ -65,15 +65,16 @@ class ActionControllerBaseTest < Minitest::Test
   end
 
   def test_response_redirect_predicate_matches_redirect_statuses
-    [301, 302, 303, 307, 308].each do |status|
+    # `head` names the status: `instance_variable_set` has no strict-target counterpart.
+    %i[moved_permanently found see_other temporary_redirect permanent_redirect].each do |status|
       controller = TestController.new
-      controller.instance_variable_set(:@status, status)
+      controller.head(status)
       assert controller.response.redirect?, "status #{status}"
     end
 
-    [200, 204, 299, 300, 304, 305, 306, 309, 399, 400, 500].each do |status|
+    %i[ok no_content im_used multiple_choices not_modified use_proxy bad_request internal_server_error].each do |status|
       controller = TestController.new
-      controller.instance_variable_set(:@status, status)
+      controller.head(status)
       refute controller.response.redirect?, "status #{status}"
     end
   end

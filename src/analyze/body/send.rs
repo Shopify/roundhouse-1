@@ -1328,7 +1328,13 @@ impl<'a> BodyTyper<'a> {
         // `call` (a callable app class).
         if matches!(method.as_str(), "call" | "yield" | "[]" | "===") {
             match recv_ty {
-                Some(Ty::Fn { ret, .. }) => return (**ret).clone(),
+                // Not left a type variable: `call` is known, and what the body answers is the body's own sends' to report.
+                Some(Ty::Fn { ret, .. }) => {
+                    return match &**ret {
+                        Ty::Var { .. } => Ty::Untyped,
+                        ret => ret.clone(),
+                    };
+                }
                 Some(Ty::Class { id, .. }) if id.0.as_str() == "Proc" => return Ty::Untyped,
                 _ => {}
             }
@@ -3655,9 +3661,14 @@ pub(crate) fn string_answers(method: &Symbol) -> bool {
 }
 
 pub(super) fn str_method(method: &Symbol) -> Ty {
+    // The mirrored kernel lives in `catalog::string_kernel`. This
+    // ladder keeps every other String method.
+    if let Some(ty) = crate::catalog::string_kernel::return_ty(method.as_str()) {
+        return ty;
+    }
     match method.as_str() {
-        "length" | "size" | "bytesize" => Ty::Int,
-        "upcase" | "downcase" | "strip" | "chomp" | "chop" | "reverse" | "to_s"
+        "bytesize" => Ty::Int,
+        "chomp" | "chop" | "reverse" | "to_s"
         | "capitalize" | "swapcase" | "squeeze" | "dup" | "clone"
         | "tr" | "tr_s" | "delete" | "gsub" | "sub" | "lstrip" | "rstrip"
         | "delete_prefix" | "delete_suffix"
@@ -3675,7 +3686,6 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // on a String is a shape the transpiled targets do not all
         // lower). Both answer a String whatever the width.
         | "rjust" | "ljust" | "center" => Ty::Str,
-        "to_i" => Ty::Int,
         "to_f" => Ty::Float,
         "to_sym" | "intern" => Ty::Sym,
         // Case-insensitive comparison: `casecmp` returns -1/0/1 (Int),
@@ -3718,8 +3728,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // template names; `unpack1` its first element.
         "unpack" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
         "unpack1" => Ty::Untyped,
-        "empty?" | "blank?" | "present?" | "include?" | "start_with?"
-        | "end_with?" | "match?" => Ty::Bool,
+        "blank?" | "present?" | "match?" => Ty::Bool,
         // ActiveSupport `Object#presence_in(collection)` — the receiver
         // when the collection includes it, else nil. campfire's
         // `params.require(:user)[:role].presence_in(%w[ member

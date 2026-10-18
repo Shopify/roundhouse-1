@@ -8,6 +8,7 @@ require_relative "action_dispatch/exceptions"
 # X-Request-Id and X-Runtime (ActionDispatch::RequestId, Rack::Runtime),
 # stamped by both ruby-family dispatchers around every app response.
 require_relative "action_dispatch/request_id"
+require_relative "action_dispatch/content_security_policy"
 
 # actionpack lib/action_dispatch/routing/route_set.rb:849, from
 # Shopify/rails 5813559f4aed (8.2.0.alpha; docs/RAILS_VERSION.md): the

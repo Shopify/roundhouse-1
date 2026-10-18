@@ -187,17 +187,40 @@ module I18n
   def self.translate_tree(full, options)
     loc = options.key?(:locale) ? locale_name(options[:locale]) : locale.to_s
     leaves = runtime_leaves
+    empties = runtime_empties
     runtime_chain(loc).each do |l|
       next unless runtime_nodes.key?(l + "." + full)
       prefix = l + "." + full + "."
       tree = {}
-      leaves.each do |k, v|
+      runtime_order.each do |k|
         next unless k.start_with?(prefix)
-        insert_tree(tree, k[prefix.length, k.length - prefix.length].to_s.split("."), v)
+        path = k[prefix.length, k.length - prefix.length].to_s.split(".")
+        if empties.key?(k)
+          insert_empty(tree, path)
+        else
+          insert_tree(tree, path, leaves[k].to_s)
+        end
       end
       return tree
     end
     {}
+  end
+
+  # An empty mapping in the files (`feed: {}`), which I18n answers as `{}`.
+  def self.insert_empty(tree, path)
+    node = tree
+    i = 0
+    while i < path.length
+      key = path[i].to_s.to_sym
+      child = node[key]
+      unless child.is_a?(Hash)
+        child = {}
+        node[key] = child
+      end
+      node = child
+      i += 1
+    end
+    nil
   end
 
   def self.insert_tree(tree, path, value)
@@ -459,6 +482,16 @@ module I18n
     @runtime_nodes || {}
   end
 
+  def self.runtime_order
+    load_translation_table if @runtime_order.nil?
+    @runtime_order || []
+  end
+
+  def self.runtime_empties
+    load_translation_table if @runtime_empties.nil?
+    @runtime_empties || {}
+  end
+
   def self.runtime_chains
     load_translation_table if @runtime_chains.nil?
     @runtime_chains || {}
@@ -488,6 +521,8 @@ module I18n
     keys = {}
     leaves = {}
     nodes = {}
+    order = []
+    empties = {}
     chains = {}
     sep = "\u001C"
     File.read(File.join(Rails.root.to_s, "config", "i18n_translations")).split("\u001E").each do |line|
@@ -497,8 +532,14 @@ module I18n
         entries << fields[1, fields.length - 2]
       elsif kind == "K"
         keys[fields[1]] = fields[2, fields.length - 3]
-      elsif kind == "L"
-        leaves[fields[1]] = fields[2].to_s
+      elsif kind == "L" || kind == "M"
+        if kind == "L"
+          leaves[fields[1]] = fields[2].to_s
+        else
+          empties[fields[1]] = true
+          nodes[fields[1]] = true
+        end
+        order << fields[1].to_s
         parts = fields[1].split(".")
         j = parts.length - 1
         while j > 1
@@ -524,6 +565,8 @@ module I18n
     end
     @runtime_leaves = leaves
     @runtime_nodes = nodes
+    @runtime_order = order
+    @runtime_empties = empties
     @runtime_chains = chains
     @runtime_rules = rules
     @runtime_opaque = opaque

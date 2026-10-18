@@ -71,7 +71,6 @@ module ActiveRecord
       # Rails' `set_inverse_instance` sets it, where the owner model
       # names one (`emit::ruby::collection_autosave`).
       def self.created(owner, name, record)
-        owner._await_preload if owner.respond_to?(:_await_preload)
         owner._set_inverse_instance(name, record) if owner.respond_to?(:_set_inverse_instance)
         if owner.instance_variable_get(:"@#{name}_loaded") != true && record.new_record?
           owner.public_send(name)
@@ -108,7 +107,6 @@ module ActiveRecord
       # onto what it answers, as before.
       def self.concat(owner, name, *records)
         records = records.flatten
-        owner._await_preload if owner.respond_to?(:_await_preload)
         target = owner.public_send(name)
         unless owner.instance_variable_get(:"@#{name}_loaded") == true && owner.respond_to?(:_insert_record)
           records.each { |record| push_target(target, record) }
@@ -384,12 +382,10 @@ module ActiveRecord
       end
 
       def target
-        await_preload
         @owner.instance_variable_get(@cache_ivar)
       end
 
       def reset
-        await_preload
         @owner.instance_variable_set(@loaded_ivar, false)
         nil
       end
@@ -401,18 +397,15 @@ module ActiveRecord
       end
 
       def loaded?
-        await_preload
         @owner.instance_variable_get(@loaded_ivar) == true
       end
 
       def loaded!
-        await_preload
         @owner.instance_variable_set(@loaded_ivar, true)
         nil
       end
 
       def target=(target)
-        await_preload
         @owner.instance_variable_set(@cache_ivar, target)
         loaded!
       end
@@ -424,13 +417,6 @@ module ActiveRecord
       end
 
       private
-        # A Relation's `includes` runs when a record first reads an
-        # association (`lower::deferred_preload`); Rails has run it by
-        # the time the records exist, so every member runs it first.
-        def await_preload
-          @owner._await_preload if @owner.respond_to?(:_await_preload)
-        end
-
         # The model's own reader, with the loaded guard down: the query
         # Rails' `find_target` runs.
         def find_target
@@ -642,7 +628,6 @@ module ActiveRecord
         end
 
         def super_loaded?
-          await_preload
           @owner.instance_variable_get(@loaded_ivar) == true
         end
 

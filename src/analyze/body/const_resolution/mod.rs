@@ -62,6 +62,9 @@ struct FileAnswers {
     /// For each reference Rubydex leaves unresolved, the full names of
     /// the namespaces it is lexically written in, innermost first.
     unresolved_nesting: HashMap<u32, Vec<Box<str>>>,
+    class_references: HashSet<u32>,
+    /// Canonical class/module body owners, keyed by the end of their header name.
+    namespace_bodies: HashMap<u32, ClassId>,
     /// Each constant definition as (offset where its name ends, name,
     /// declaration), sorted by offset.
     constants: Vec<(u32, Box<str>, DeclarationId)>,
@@ -82,6 +85,10 @@ struct FileAnswers {
     /// encloses it, as in `X = Struct.new do class << self … end end`
     /// at file level). No written constant inside has an answer.
     unindexed_singletons: Vec<(u32, u32)>,
+    /// Source-only factory admission facts; they do not alter name resolution.
+    sole_namespaces: HashSet<Box<str>>,
+    singleton_methods: HashMap<Box<str>, HashSet<Box<str>>>,
+    singleton_owners: HashSet<Box<str>>,
 }
 
 pub(crate) struct ConstResolver {
@@ -113,6 +120,8 @@ pub(crate) struct ConstResolver {
     /// Whether the PostgreSQL runtime's test-tree ports were indexed
     /// (`App::carries_postgresql_runtime`).
     postgresql_runtime: bool,
+    /// Complete, canonical ancestry from the same graph, for source admission.
+    class_ancestry: HashMap<ClassId, Vec<ClassId>>,
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
@@ -502,6 +511,23 @@ impl ConstResolver {
         // Rubydex resolves all source references after every file enters
         // its graph, including declarations in later files.
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
+        // Match ingest and reference answers even for singleton-class nesting.
+        let class_ancestry = graph.declarations().values().filter_map(|declaration| {
+            let namespace = declaration.as_namespace()?;
+            if namespace.kind() != "Class" { return None; }
+            let mut ancestors = vec![ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))];
+            for ancestor in namespace.ancestors() {
+                // Mutation reachability needs the known edges even when a
+                // gem superclass leaves the rest of the ancestry incomplete.
+                let Ancestor::Complete(id) = ancestor else { continue };
+                let Some(ancestor) = graph.declarations().get(id) else { continue };
+                if matches!(ancestor.kind(), "Class" | "Module") {
+                    let id = ClassId(Symbol::from(hoisted_name(ancestor.name()).as_ref()));
+                    if !ancestors.contains(&id) { ancestors.push(id); }
+                }
+            }
+            Some((ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref())), ancestors))
+        }).collect();
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         let stdlib_namespaces = stdlib_namespaces(&graph);
         drop(graph);
@@ -566,6 +592,7 @@ impl ConstResolver {
             namespace_aliases,
             source_fingerprint: source_fingerprint(sources),
             postgresql_runtime,
+            class_ancestry,
         }
     }
 
@@ -655,6 +682,12 @@ impl ConstResolver {
             ResolvedConstant::Namespace { class, .. } => Some(class),
             ResolvedConstant::Value { .. } => None,
         }
+    }
+
+    /// A declaration header is not a constant reference. Its body still runs
+    /// on the resolved namespace, including qualified reopenings and aliases.
+    pub(in crate::analyze) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
+        self.file(span.file)?.namespace_bodies.get(&span.end)
     }
 
     /// The declaration that a constant assignment defines. The IR keeps
@@ -771,6 +804,31 @@ impl ConstResolver {
         matches!(self.reference(span, path),
             Some(Some(ResolvedConstant::Namespace { class, runtime: true, .. }))
                 if class.0.as_str() == name)
+    }
+
+    pub(in crate::analyze) fn sole_namespace(&self, file: FileId, name: &str) -> bool {
+        self.file(file).is_some_and(|file| file.sole_namespaces.contains(name))
+    }
+
+    pub(in crate::analyze) fn is_class_namespace(&self, span: Span, path: &[Symbol]) -> bool {
+        path.last().and_then(|name| span.end.checked_sub(name.as_str().len() as u32))
+            .is_some_and(|start| self.file(span.file).is_some_and(|file| file.class_references.contains(&start)))
+    }
+
+    pub(in crate::analyze) fn has_source_singleton_body(&self, owner: &str) -> bool {
+        self.files.iter().flatten().any(|file| {
+            file.singleton_owners.contains(owner) || file.singleton_methods.contains_key(owner)
+        })
+    }
+
+    pub(in crate::analyze) fn source_singleton_method(&self, owner: &str, method: &str) -> bool {
+        self.files.iter().flatten().any(|file| {
+            file.singleton_methods.get(owner).is_some_and(|methods| methods.contains(method))
+        })
+    }
+
+    pub(in crate::analyze) fn class_ancestry(&self, name: &ClassId) -> Option<&[ClassId]> {
+        self.class_ancestry.get(name).map(Vec::as_slice)
     }
 }
 
@@ -1171,7 +1229,7 @@ fn answer_file(
             && let Some(target) = resolved_namespace(graph, *reference.name_id())
                 .filter(|target| is_runtime_declaration(graph, target))
         {
-            answers.namespace_definitions.insert(target.name().into());
+            answers.namespace_definitions.insert(hoisted_name(target.name()).into());
         }
         let target = graph
             .name_id_to_declaration_id(*reference.name_id())
@@ -1191,6 +1249,13 @@ fn answer_file(
                 answers.unresolved_nesting.insert(start, nesting);
             }
         }
+        if graph
+            .name_id_to_declaration_id(*reference.name_id())
+            .and_then(|id| graph.declarations().get(id))
+            .is_some_and(|declaration| declaration.kind() == "Class")
+        {
+            answers.class_references.insert(offset.start());
+        }
         match answers.references.entry(start) {
             Entry::Vacant(slot) => {
                 slot.insert(target);
@@ -1204,6 +1269,16 @@ fn answer_file(
     }
     for definition_id in document.definitions() {
         let definition = graph.definitions().get(definition_id);
+        if let Some(definition @ (Definition::Class(_) | Definition::Module(_))) = definition
+            && let Some(offset) = definition.name_offset()
+            && let Some(id) = graph.definition_to_declaration_id(definition)
+            && let Some(declaration) = graph.declarations().get(&graph.resolve_alias(id).unwrap_or(*id))
+        {
+            answers.namespace_bodies.insert(
+                offset.end(),
+                ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref())),
+            );
+        }
         if let Some(name) = definition
             .filter(|definition| matches!(definition,
                 Definition::Class(_) | Definition::Module(_) | Definition::Constant(_) | Definition::ConstantAlias(_)))
@@ -1237,28 +1312,52 @@ fn answer_file(
                     if let Some(target) = resolved_namespace(graph, *alias.target_name_id())
                         .filter(|target| is_runtime_declaration(graph, target))
                     {
-                        answers.runtime_namespace_aliases.insert(full.clone().into(), target.name().into());
+                        answers.runtime_namespace_aliases.insert(full.clone().into(), hoisted_name(target.name()).into());
                     }
                 }
                 answers.namespace_definitions.insert(full.into());
+            }
+            if let Some(declaration) = definition
+                .and_then(|definition| graph.definition_to_declaration_id(definition))
+                .and_then(|id| graph.declarations().get(id))
+                && declaration.definitions().len() == 1
+                && declaration.kind() == "Class"
+                && !is_runtime_declaration(graph, declaration)
+            {
+                answers.sole_namespaces.insert(hoisted_name(declaration.name()).into());
             }
         }
         if let Some(Definition::SingletonClass(singleton)) = definition
             && let Some(ParentScope::Attached(receiver)) = graph.names().get(singleton.name_id())
                 .map(|name| name.parent_scope())
             && let Some(target) = resolved_namespace(graph, *receiver)
-                .filter(|target| is_runtime_declaration(graph, target))
         {
-            answers.namespace_definitions.insert(target.name().into());
+            answers.singleton_owners.insert(hoisted_name(target.name()).into());
+            if is_runtime_declaration(graph, target) {
+                answers.namespace_definitions.insert(hoisted_name(target.name()).into());
+            }
         }
         if let Some(Definition::Method(method)) = definition {
+            let owner = match method.receiver() {
+                Some(Receiver::ConstantReceiver(receiver)) => resolved_namespace(graph, *receiver),
+                Some(Receiver::SelfReceiver(receiver)) => graph.definitions().get(receiver)
+                    .and_then(|definition| graph.definition_to_declaration_id(definition))
+                    .and_then(|id| graph.declarations().get(id)),
+                None => None,
+            };
+            if let Some(owner) = owner
+                && let Some(name) = graph.strings().get(method.str_id())
+            {
+                answers.singleton_methods.entry(hoisted_name(owner.name()).into()).or_default()
+                    .insert(name.as_str().trim_end_matches("()").into());
+            }
             if let Some(Receiver::ConstantReceiver(receiver)) = method.receiver()
                 && graph.strings().get(method.str_id()).is_some_and(|name| name.as_str() == "define()")
                 && let Some(target) = resolved_namespace(graph, *receiver)
                     .filter(|target| is_runtime_declaration(graph, target))
             {
                 // A named singleton definition can override a core factory without a class reopen.
-                answers.namespace_definitions.insert(target.name().into());
+                answers.namespace_definitions.insert(hoisted_name(target.name()).into());
             }
         }
         let (name_id, offset) = match definition {
@@ -1760,6 +1859,45 @@ mod tests {
                 .replace("prepend Mixins", "prepen_ Mixins")
         );
         assert!(dynamic_mixin_projection("class A\n  include B\n  extend C::D\n  extend self\nend\n").is_none());
+    }
+
+    #[test]
+    fn singleton_namespace_answers_use_hoisted_names() {
+        let sources = vec![SourceFile {
+            path: "app/services/outer.rb".into(),
+            text: "\
+class Outer
+  class << self
+    class << self
+      module M; end
+      class Base; end
+      class Parent < Base
+        include M
+        def self.inherited(child); end
+      end
+      class BodyOwner; end
+      class << BodyOwner; end
+      Factory = Class.new
+      Parent
+    end
+  end
+end
+".into(),
+        }];
+        let resolver = ConstResolver::from_app_sources(&sources);
+        assert_eq!(resolved_name(&resolver, &sources, 0, "Parent"), "Outer::Parent");
+        let ancestry = resolver.class_ancestry(&ClassId(Symbol::from("Outer::Parent"))).unwrap();
+        for name in ["Outer::Parent", "Outer::Base", "Outer::M"] {
+            assert!(ancestry.contains(&ClassId(Symbol::from(name))), "{name}: {ancestry:?}");
+        }
+        for (header, owner) in [("class Parent", "Outer::Parent"), ("module M", "Outer::M")] {
+            let end = (sources[0].text.find(header).unwrap() + header.len()) as u32;
+            assert_eq!(resolver.namespace_body(Span { file: FileId(1), start: 0, end }),
+                Some(&ClassId(Symbol::from(owner))));
+        }
+        assert!(resolver.sole_namespace(FileId(1), "Outer::Factory"));
+        assert!(resolver.has_source_singleton_body("Outer::BodyOwner"));
+        assert!(resolver.source_singleton_method("Outer::Parent", "inherited"));
     }
 
     #[test]

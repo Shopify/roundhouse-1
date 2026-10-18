@@ -236,6 +236,8 @@ end
 # Nokogiri; the shared harness's `Dom` is a scanner that matches a
 # selector's LAST compound and keeps no per-element attributes, so a
 # descendant selector read from it would answer for the whole page.
+# A spinel tree that carries spinel-nokogiri gets the same helper
+# (`project::SPINEL_CSS_SELECT`).
 require "nokogiri"
 
 # rails-dom-testing parses with HTML5 where Nokogiri has the parser and
@@ -261,8 +263,9 @@ module ActionCable
         else
           Broadcasts.log.select { |entry| entry[:stream] == stream }
         end
-      # The CRuby tree logs the Hash it publishes, the spinel tree the
-      # JSON text; both compare after the same round trip.
+      # The CRuby tree logs the Hash it publishes; the shared harness's
+      # version, which this replaces, reads the spinel tree's JSON text.
+      # Both compare after the same round trip.
       wire = ->(value) { ::JSON.parse(value.is_a?(String) ? value : ::JSON.generate(value)) }
       want = wire.(data)
       payloads = entries.map { |entry| entry[:payload] }.compact

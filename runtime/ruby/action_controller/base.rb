@@ -1080,6 +1080,13 @@ module ActionController
       @headers
     end
 
+    # `importmap.to_json(resolver: helpers)`. The map's paths are
+    # already resolved at ingest, so the resolver is accepted and
+    # unused. `self` is enough for the call to evaluate.
+    def helpers
+      self
+    end
+
     # `send_data data, type:, disposition:` — a binary response body
     # (lobsters streams avatar PNGs). Same buffering contract as
     # render. `disposition` is retained as a Content-Disposition

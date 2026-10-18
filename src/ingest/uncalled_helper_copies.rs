@@ -9,33 +9,47 @@
 //! controllers include it for `allowed_registration?`, none calls the
 //! label, and its `_html` translations were refused as controller code.
 //!
-//! Not dropped: the copy is where the helper's body is checked at all
-//! (the module's own body is not reported).
+//! Not dropped: the copy is the helper's body as controller code, which
+//! is what a controller that does call it runs.
 //!
-//! A copy counts as called when any controller body names it: a call, or
-//! a String / Symbol literal (`before_action :x`, `helper_method :x`,
+//! A copy counts as called when a controller of its family (the
+//! includer, its ancestors, which run with a subclass as `self`, and
+//! its descendants, which inherit the copy) names it: a call, or a
+//! String / Symbol literal (`before_action :x`, `helper_method :x`,
 //! `send(:x)`), or a route's action.
 
-use crate::det::HashSet;
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::ControllerBodyItem;
 use crate::expr::{Expr, ExprNode, Literal};
-use crate::ident::Symbol;
+use crate::ident::{ClassId, Symbol};
 
 pub(super) fn mark(app: &mut App) {
     let helpers: HashSet<_> = app.helper_method_index.values().cloned().collect();
+    // After the splice, so the controllers' copies keep their own reading.
+    let modules: HashSet<_> = helpers.iter().chain(app.helper_modules.iter()).cloned().collect();
+    for lc in app.library_classes.iter_mut().filter(|lc| modules.contains(&lc.name)) {
+        for m in &mut lc.methods {
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                mark_with(default, crate::expr::HELPER_BODY_TRANSLATE);
+            }
+            mark_with(&mut m.body, crate::expr::HELPER_BODY_TRANSLATE);
+        }
+    }
     if helpers.is_empty() || app.concern_spliced_actions.is_empty() {
         return;
     }
-    let routed: HashSet<String> =
-        crate::lower::routes::flatten_routes_for_helpers(app).into_iter().map(|r| r.action.as_str().to_string()).collect();
-    let named = names_in_controllers(app);
+    let mut named = names_in_controllers(app);
+    for r in crate::lower::routes::flatten_routes_for_helpers(app) {
+        named.entry(r.controller.clone()).or_default().insert(r.action.as_str().to_string());
+    }
     let mut uncalled: Vec<(crate::ident::ClassId, Symbol)> = Vec::new();
     for (controller, spliced) in &app.concern_spliced_actions {
+        let family = family(app, controller);
         for (method, module) in spliced {
             let name = method.as_str();
-            if helpers.contains(module) && !named.contains(name) && !routed.contains(name) {
+            if helpers.contains(module) && !family.iter().any(|c| named.get(c).is_some_and(|n| n.contains(name))) {
                 uncalled.push((controller.clone(), method.clone()));
             }
         }
@@ -53,18 +67,51 @@ pub(super) fn mark(app: &mut App) {
 }
 
 fn mark_translate(e: &mut Expr) {
-    e.node.for_each_child_mut(&mut |c| mark_translate(c));
+    mark_with(e, crate::expr::HELPER_COPY_TRANSLATE);
+}
+
+fn mark_with(e: &mut Expr, bit: u64) {
+    e.node.for_each_child_mut(&mut |c| mark_with(c, bit));
     if let ExprNode::Send { recv: None, method, .. } = &*e.node
         && matches!(method.as_str(), "t" | "translate")
     {
-        e.decisions |= crate::expr::HELPER_COPY_TRANSLATE;
+        e.decisions |= bit;
     }
 }
 
-/// Every method name a controller body calls or spells as a literal.
-fn names_in_controllers(app: &App) -> HashSet<String> {
-    let mut out = HashSet::default();
+/// The controller, its ancestors and its descendants among the app's controllers.
+fn family(app: &App, controller: &ClassId) -> Vec<ClassId> {
+    let parent_of = |c: &ClassId| app.controllers.iter().find(|x| x.name == *c).and_then(|x| x.parent.clone());
+    let mut out = vec![controller.clone()];
+    let mut cur = parent_of(controller);
+    while let Some(p) = cur {
+        if out.contains(&p) {
+            break;
+        }
+        cur = parent_of(&p);
+        out.push(p);
+    }
     for c in &app.controllers {
+        let mut cur = c.parent.clone();
+        for _ in 0..32 {
+            let Some(p) = cur else { break };
+            if p == *controller {
+                if !out.contains(&c.name) {
+                    out.push(c.name.clone());
+                }
+                break;
+            }
+            cur = parent_of(&p);
+        }
+    }
+    out
+}
+
+/// Every method name each controller body calls or spells as a literal.
+fn names_in_controllers(app: &App) -> HashMap<ClassId, HashSet<String>> {
+    let mut by_controller = HashMap::default();
+    for c in &app.controllers {
+        let out: &mut HashSet<String> = by_controller.entry(c.name.clone()).or_default();
         for item in &c.body {
             let exprs: Vec<&Expr> = match item {
                 ControllerBodyItem::Action { action, .. } => {
@@ -83,11 +130,11 @@ fn names_in_controllers(app: &App) -> HashSet<String> {
                 _ => Vec::new(),
             };
             for e in exprs {
-                collect(e, &mut out);
+                collect(e, out);
             }
         }
     }
-    out
+    by_controller
 }
 
 fn collect(e: &Expr, out: &mut HashSet<String>) {

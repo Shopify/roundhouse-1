@@ -48,6 +48,10 @@ mod class_configuration;
 mod dry_initializer;
 #[path = "support/data_factory.rs"]
 mod data_factory;
+#[path = "support/relation_fork.rs"]
+mod relation_fork_contract;
+#[path = "spinel_toolchain/relation_fork.rs"]
+mod relation_fork;
 #[path = "support/dry_struct.rs"]
 mod dry_struct;
 #[path = "support/dry_validation.rs"]
@@ -118,6 +122,10 @@ mod json_params;
 mod io_process_constants_contract;
 #[path = "spinel_toolchain/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "support/backticks.rs"]
+mod backticks_contract;
+#[path = "spinel_toolchain/backticks.rs"]
+mod backticks;
 #[path = "support/class_side_default.rs"]
 mod class_side_default_contract;
 #[path = "spinel_toolchain/class_side_default.rs"]

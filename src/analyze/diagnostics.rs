@@ -213,6 +213,8 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     }
     out.extend(IncludeRefusalRow::collapse(include_rows));
     out.extend(attribute_macro_refusals(app));
+    out.extend(overridden_synthesized_accessors(app));
+    out.extend(runtime_defined_surfaces(app));
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
@@ -246,6 +248,10 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     for view in &app.views {
         diagnose_expr(&view.body, &mut out);
     }
+    match &app.helper_diagnostics {
+        Some(taken) => out.extend(taken.iter().cloned()),
+        None => out.extend(diagnose_helper_modules(app)),
+    }
     for class in &app.library_classes {
         for initializer in &class.class_ivar_initializers {
             diagnose_expr(initializer, &mut out);
@@ -255,6 +261,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
         diagnose_expr(seeds, &mut out);
     }
     out.extend(super::forwarding::diagnose(app));
+    out.extend(super::private_calls::diagnose(app));
     out.extend(super::filter_targets::diagnose(app));
 
     // Static N+1 pass (#64): missing-preload warnings over the typed
@@ -373,6 +380,113 @@ fn explains_send(stamped: Option<&DiagnosticKind>) -> bool {
                 | DiagnosticKind::SendDispatchFailed { .. }
         )
     )
+}
+
+/// One warning per class that defines methods under computed names: the
+/// sends the registry does not know there answer untyped
+/// (`analyze::open_classes`), so what they return is not checked.
+fn runtime_defined_surfaces(app: &App) -> Vec<Diagnostic> {
+    let open = super::open_classes::OpenClasses::of(app);
+    let mut out: Vec<Diagnostic> = open
+        .classes()
+        .map(|(class, class_side, span)| {
+            let kind = DiagnosticKind::GradualUntyped { expr_kind: Symbol::new("runtime-defined method") };
+            Diagnostic {
+                span: *span,
+                severity: crate::diagnostic::Severity::Warning,
+                kind,
+                message: format!(
+                    "`{}` defines {} methods under names computed when it runs, so a call to one the source does not declare answers untyped",
+                    class.0.as_str(),
+                    if class_side { "class" } else { "instance" }
+                ),
+            }
+        })
+        .collect();
+    out.sort_by_key(|d| (d.span.file.0, d.span.start, d.message.clone()));
+    out
+}
+
+/// A model's own `def author` / `def author=` over an association's
+/// accessor: Rails calls the model's, the model lowering keeps the
+/// synthesized one (`push_user_methods`; a column's yields), so the
+/// definition is reported rather than dropped without a word.
+fn overridden_synthesized_accessors(app: &App) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for model in &app.models {
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Association { assoc, .. } = item {
+                taken.insert(assoc.name().as_str().to_string());
+                taken.insert(format!("{}=", assoc.name().as_str()));
+            }
+        }
+        for m in model.methods().filter(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Instance
+                && matches!(m.kind, crate::dialect::AccessorKind::Method)
+                && !m.name_span.is_synthetic()
+        }) {
+            if !taken.contains(m.name.as_str()) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                m.name_span,
+                None,
+                "accessor override",
+                format!(
+                    "`{}#{}` overrides the accessor its association defines, and the emitted model keeps that accessor, so this definition does not run",
+                    model.name.0.as_str(),
+                    m.name.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// An `app/helpers` module runs in the view, so it is checked as one,
+/// not under the library policy.
+pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
+    let helper_modules: std::collections::HashSet<&crate::ident::ClassId> = app.helper_method_index.values().chain(app.helper_modules.iter()).collect();
+    let mut helper_out = Vec::new();
+    for class in app.library_classes.iter().filter(|c| helper_modules.contains(&c.name)) {
+        for method in &class.methods {
+            for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
+                diagnose_expr(default, &mut helper_out);
+            }
+            diagnose_expr(&method.body, &mut helper_out);
+        }
+    }
+    // Not errors: the ivar is the rendering view's, which the emitted helper reads as Rails does (only its type is unseeded);
+    // and nullable primitive arithmetic raises where Rails raises, as the library policy already holds.
+    // Only where the value, once not nil, takes the operation: `String? + Integer` fails whatever it holds.
+    fn nil_is_the_only_miss(op: &str, lhs: &Ty, rhs: &Ty) -> bool {
+        let Ty::Union { variants } = lhs else { return false };
+        let numeric = |t: &Ty| matches!(t, Ty::Int | Ty::Float);
+        let present: Vec<&Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect();
+        variants.iter().any(|v| matches!(v, Ty::Nil))
+            && !present.is_empty()
+            && present.iter().all(|v| match v {
+                Ty::Int | Ty::Float => numeric(rhs) && matches!(op, "+" | "-" | "*" | "/" | "%" | "**" | "<" | ">" | "<=" | ">="),
+                Ty::Str => match op {
+                    "+" | "<" | ">" | "<=" | ">=" => matches!(rhs, Ty::Str),
+                    "*" => matches!(rhs, Ty::Int),
+                    _ => false,
+                },
+                _ => false,
+            })
+    }
+    for d in &mut helper_out {
+        let soft = match &d.kind {
+            DiagnosticKind::IvarUnresolved { .. } => true,
+            DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty } => nil_is_the_only_miss(op.as_str(), lhs_ty, rhs_ty),
+            _ => false,
+        };
+        if soft {
+            d.severity = crate::diagnostic::Severity::Warning;
+        }
+    }
+    helper_out
 }
 
 /// A type is "unknown" if it's `None` or `Ty::Var(n)` (a placeholder the

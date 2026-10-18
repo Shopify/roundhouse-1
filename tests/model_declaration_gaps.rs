@@ -199,7 +199,7 @@ end
 #[test]
 fn declaration_reporting_preserves_original_ingest_failures() {
     let files = tree(
-        "class Article < ApplicationRecord\n  aasm do\n    `unsupported_command`\n  end\nend\n",
+        "class Article < ApplicationRecord\n  aasm do\n    defined?(helper(1))\n  end\nend\n",
         "module Workflow\nend\n",
     );
     // Strict ingest refuses the failing body statement at its own site

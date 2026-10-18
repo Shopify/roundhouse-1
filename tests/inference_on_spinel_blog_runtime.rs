@@ -492,10 +492,10 @@ fn untyped_subexpressions_baseline() {
     // all read the enlisted list through `Db._txn_records` (or the
     // owner slot) — unmodeled `Db` here, as the depth counter's reads
     // above are; the RBS-paired gate types them all.
-    // Merge of origin/main 298fd9a1c into r13-merge: upstream measured 757 for its
-    // side alone; ours (811) already includes the same connection.rb port. PROVISIONAL:
-    // re-measure with the probe after the merged tree builds and lower it.
-    const CEILING: usize = 811;
+    // Merge of origin/main 558f86ba3 (2026-10-18): upstream added 37 sites since
+    // 298fd9a1c (757 -> 794: non-joinable fixture savepoints, raw `transaction`
+    // savepoints), so 811 + 37. PROVISIONAL: re-measure with the probe and lower it.
+    const CEILING: usize = 848;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

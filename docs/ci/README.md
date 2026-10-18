@@ -26,6 +26,7 @@ advisory jobs and the scheduled Full cycle for the multi-target ledger.
 | **Draft or ready** + focus label(s) | Ruby floor plus **only** the selected focus lanes (required) |
 | **Draft or ready** + `ci:full` | Full validation (all targets, WASM, Spinel); extras stay advisory |
 | **Push to canonical `main`** | Ruby floor plus the full Spinel suite (advisory except `campfire-archive-build`) and `campfire-latest` (advisory); extra-language SDKs wait for the schedule |
+| **Push to `main`** with a `[ci full]` line in a pushed commit's message | Full validation, as `ci:full` would plan it; extras stay advisory |
 | **Scheduled / manual Full validation** | Full validation (the extra-language ledger and publication cycle) |
 
 PRs without a special label run a Ruby floor: fixture preparation, unit
@@ -117,14 +118,16 @@ so fix rounds only queue the lanes under repair — and those lanes are
 | Label | Selects (required while focused) |
 |---|---|
 | `ci:crystal` … `ci:python` | That language's `compare-extra` **and** `smoke-extra` (+ `build-site` / archives / `archive-results`) |
+| `ci:rust` / `ci:typescript` | That language's `compare` and floor `smoke` (+ `build-site` / archives). Each label is its own leg |
 | `ci:extras` | All seven of the above |
 | `ci:jruby` | `compare-jruby` + floor `smoke` jruby (+ site/archives) |
 | `ci:spinel` | CORE Spinel (`spinel-build`, `spinel-toolchain`, `spinel-compare`) + `spinel-framework` (+ site/archives). Not the heavy Campfire Spinel suite (`campfire-spinel-*`); not folded into `ci:extras`. |
 
 **Narrow semantics:** with any focus label set and `ci:full` **not** set, the
 plan is the Ruby floor (`BASE`) plus only the selected focus lanes. Path
-ownership does not expand the plan. Unrelated extras / WASM / rust·ts
-`compare` / full Spinel11 stay off. `ci:full` still wins as the
+ownership does not expand the plan. Unrelated extras / WASM / full
+Spinel11 stay off, and rust·ts `compare` stays off unless `ci:rust` or
+`ci:typescript` is set. `ci:full` still wins as the
 full ledger (extras remain advisory there).
 
 **Rust vs TypeScript:** selecting one no longer forces both `compare` matrix
@@ -187,6 +190,13 @@ path, and floating-pin catch-up.
 - **A newer head:** needs a new run. Reruns retain the original SHA and
   coverage; rerunning an old compact run neither tests the new head nor
   expands its matrix.
+- **Full validation of a push to `main`:** put `[ci full]` on a line of its
+  own in a pushed commit's message, outside the subject. Committers land on
+  `main` without a PR, so there is no label to set. The run plans like
+  `ci:full` and names the commit in the plan's reasons. Only a whole line
+  counts, so prose that names the marker does not trigger it. Pull requests
+  ignore the marker and keep the maintainer-applied label. A later push
+  still cancels the run, and plans from its own commits only.
 - **Manual full validation:** Actions → **Full validation** → **Run workflow**.
   Leave `publish` unchecked. This executes freshly on the chosen ref; a
   branch-head dispatch is not a substitute for a PR merge-tree check.

@@ -1,15 +1,4 @@
 module ActiveRecord
-  # Same model handle and include list types as Relation (the Spinel
-  # tree widens `Base` here as it does there).
-  class PendingPreload
-    @model: Base
-    @records: Array[Base]
-    @specs: Array[Symbol | Hash[Symbol, Symbol]]
-    @done: bool
-    def initialize: (Base model, Array[Base] records, Array[Symbol | Hash[Symbol, Symbol]] specs) -> void
-    def run: () -> nil
-  end
-
   class EagerNode
     @reflection: untyped
     @parent: EagerNode?
@@ -72,6 +61,7 @@ module ActiveRecord
     # Rails' Relation#spawn — copy query state onto a fresh Relation so
     # a scope fork cannot mutate its caller's accumulators.
     def spawn: () -> Relation
+    def unloaded_spawn: () -> Relation
     def own_lists: () -> Relation
     def take_query_lists: (
         Array[String] wheres,
@@ -90,6 +80,9 @@ module ActiveRecord
     def copy_scope_attributes: (Hash[Symbol, untyped] attrs) -> Hash[Symbol, untyped]
 
     def where: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
+    # In-place steps behind the chain methods (each chain method is
+    # `spawn` plus one of these); rest args arrive as one list.
+    def where_args!: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args) -> Relation
 
     # Query ivars the body reads after builders write them. Declared so
     # probes / RBS-seeded typing do not freeze on `initialize`'s `nil`
@@ -160,6 +153,8 @@ module ActiveRecord
     def push_where: (String sql, ?bool null_clause) -> Relation
     def pop_where: () -> String?
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def order_parts!: (Array[String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]] parts) -> Relation
+    def reorder_parts!: (Array[String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]] parts) -> Relation
     def order_sql: (String fragment) -> Relation
     def order_sql!: (String fragment) -> Relation
     def reorder_sql: (String fragment) -> Relation

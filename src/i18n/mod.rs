@@ -634,27 +634,28 @@ impl Catalog {
         self.order.contains_key(key) || self.entries.range(below.clone()..).next().is_some_and(|(k, _)| k.starts_with(&below))
     }
 
-    /// Whether `key` is a subtree holding only Strings, which a Hash of
-    /// them answers whole. Not one with an empty node: the runtime's
-    /// table carries leaves only, so it could not answer that `{}`.
+    /// Whether `key` is a subtree holding only Strings (and empty
+    /// mappings), which a Hash of them answers whole.
     pub fn plain_subtree(&self, key: &str) -> bool {
         let below = format!("{key}.");
-        self.is_subtree(key)
-            && !self.opaque.iter().any(|k| k.starts_with(&below))
-            && !self.order.iter().any(|(k, children)| children.is_empty() && (k == key || k.starts_with(&below)))
+        self.is_subtree(key) && !self.opaque.iter().any(|k| k.starts_with(&below))
     }
 
-    /// Every String leaf in the order the files give them, as a Ruby Hash
-    /// built from them iterates.
-    pub fn ordered_entries(&self) -> Vec<(&String, &String)> {
-        let mut out = Vec::with_capacity(self.entries.len());
+    /// Every String leaf and every empty mapping (`None`), in the order
+    /// the files give them, as a Ruby Hash built from them iterates.
+    pub fn ordered_nodes(&self) -> Vec<(String, Option<&String>)> {
+        let mut out = Vec::new();
         let mut seen = crate::det::HashSet::default();
-        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(&'a String, &'a String)>, seen: &mut crate::det::HashSet<&'a String>) {
+        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a String>)>, seen: &mut crate::det::HashSet<String>) {
             for child in c.order.get(node).into_iter().flatten() {
                 let path = if node.is_empty() { child.clone() } else { format!("{node}.{child}") };
-                if let Some((k, v)) = c.entries.get_key_value(&path) {
-                    if seen.insert(k) {
-                        out.push((k, v));
+                if let Some(v) = c.entries.get(&path) {
+                    if seen.insert(path.clone()) {
+                        out.push((path, Some(v)));
+                    }
+                } else if c.order.get(&path).is_some_and(|children| children.is_empty()) {
+                    if seen.insert(path.clone()) {
+                        out.push((path, None));
                     }
                 } else {
                     walk(c, &path, out, seen);
@@ -663,8 +664,8 @@ impl Catalog {
         }
         walk(self, "", &mut out, &mut seen);
         for (k, v) in &self.entries {
-            if seen.insert(k) {
-                out.push((k, v));
+            if seen.insert(k.clone()) {
+                out.push((k.clone(), Some(v)));
             }
         }
         out
@@ -1205,13 +1206,14 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_mapping_is_a_node_but_not_a_plain_subtree() {
-        let c = catalog(&[("config/locales/en.yml", "en:\n  feed: {}\n  menu:\n    home: \"Home\"\n    more: {}\n  nav:\n    home: \"Home\"\n")]);
+    fn an_empty_mapping_is_a_node_in_the_files_order() {
+        let c = catalog(&[("config/locales/en.yml", "en:\n  feed: {}\n  menu:\n    more: {}\n    home: \"Home\"\n")]);
         assert!(c.is_subtree("feed"));
-        assert!(!c.plain_subtree("feed"));
-        assert!(!c.plain_subtree("menu"));
-        assert!(c.plain_subtree("nav"));
-        assert!(c.resolve(&Translate { key: "feed".into(), ..Default::default() }).is_err());
+        assert!(c.plain_subtree("feed"));
+        assert!(c.plain_subtree("menu"));
+        let home = "Home".to_string();
+        let ours: Vec<_> = c.ordered_nodes().into_iter().filter(|(k, _)| k == "feed" || k.starts_with("menu.")).collect();
+        assert_eq!(ours, vec![("feed".to_string(), None), ("menu.more".to_string(), None), ("menu.home".to_string(), Some(&home))]);
     }
 
     #[test]

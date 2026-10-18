@@ -72,7 +72,7 @@ It preserves the test name in both layouts.
 [`tests/test_subprocess.rs`](../../tests/test_subprocess.rs) checks that the
 child executes its test body, not just that the child exits successfully.
 
-`--all` cannot be combined with `--test`, `--toolchain`, or `--ignored`.
+`--all` cannot be combined with `--test`, `--toolchain`, `--ignored`, `--lib`, or `--contract`.
 `NEXTEST_TEST_THREADS` controls test processes; `--jobs` controls Cargo workers.
 Full verification defaults incremental compilation on and preserves an explicit
 `CARGO_INCREMENTAL` value. `--all --plan` remains read-only.
@@ -98,29 +98,44 @@ paths to fail.
 
 ## Focused verification
 
-Without `--all`, `bin/rh verify` runs library tests, then only the integration
-suites you select, sequentially and fail-fast. Neither mode is a hosted CI
-emulator or merge approval.
+Without `--all`, `bin/rh verify` runs the integration suites you select,
+sequentially and fail-fast. The library suite runs only with `--lib`, after
+those suites. `--contract` runs `ingests_without_errors` and
+`type_analysis_coverage` in `tests/real_blog.rs`, then
+`every_runtime_method_body_is_fully_typed` in
+`tests/runtime_src_integration.rs`, and does not build the other integration
+binaries. A `--contract` `--exact` filter that matches no test fails that check. Neither mode is a hosted CI emulator or merge approval. A green
+focused run does not replace the commit bar below.
 
 ```sh
 bin/rh verify --plan --base main --test ingest
 bin/rh verify --test ingest --test real_blog
+bin/rh verify --contract
+bin/rh verify --lib --test ingest
 bin/rh verify --test framework_tests_ruby --ignored
 bin/rh verify --toolchain ruby --json > /tmp/verification.json
 ```
 
 - Repeat `--test` or `--toolchain` to select more suites. Default `--test`
   excludes ignored tests; an ignored-only suite otherwise executes nothing.
-  `--ignored` runs only ignored tests in selected integration suites, not library
-  tests. `--toolchain` already selects ignored tests in `<target>_toolchain`.
+  `--ignored` runs only ignored tests in selected `--test` suites, not the
+  library suite or the contract filters. `--toolchain` already selects
+  ignored tests in `<target>_toolchain`.
 - `--plan` is read-only: no Cargo, installs, tests, or verification lock.
+  With no `--test`, `--toolchain`, `--contract`, or `--lib`, it is only a
+  hosted-coverage preview and reports no local checks. A run without
+  `--plan`, `--all`, or one of those selectors exits with an error.
 - `--base REF` compares the current working tree with that exact commit
   (default `HEAD`), including non-ignored untracked files. It neither fetches
   nor finds a merge base. The hosted selection preview is informational,
   not GitHub's actual PR merge-tree/draft/label context.
-- Execution uses locked Cargo commands and one test thread; Cargo workers
-  default to at most four unless configured. `--jobs` overrides workers.
-  Explicit Cargo environment settings are preserved; incremental defaults off.
+- Execution uses locked Cargo commands. Every suite this loop launches keeps
+  `--test-threads=1`, because suites share SQLite or the process-global
+  `ingest::survey`. Cargo workers default to `CARGO_BUILD_JOBS` or the
+  machine's processor count. `--jobs` overrides workers. Explicit Cargo
+  environment settings are preserved. Verify does not set `CARGO_INCREMENTAL`;
+  Cargo's own dev/test default applies, and a caller-supplied value is passed
+  through. Hosted unit shards do not use this script.
 - The worktree lock coordinates verifier callers only. Do not run unrelated
   Cargo builds/tests concurrently in that checkout.
 - `--json` separates executed, failed, and not-run checks; child output goes to

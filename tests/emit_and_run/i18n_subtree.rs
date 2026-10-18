@@ -3,7 +3,8 @@
 //! chain that has the node (forem hands one to its front end). A value
 //! that is not a String (an Array here) stays an error: the catalog
 //! holds Strings only; a nil value is a missing one, as I18n finds
-//! nothing there. Expected values are i18n 1.15.2's for the same
+//! nothing there; an empty mapping is `{}`, even where a fallback
+//! locale has the node. Expected values are i18n 1.15.2's for the same
 //! files on CRuby 3.4.
 
 use super::emit_and_run;
@@ -18,12 +19,16 @@ const EN_YML: &str = "en:
         title: \"A title\"
     greet: \"Hello\"
     nothing:
+    menu:
+      more: {}
+      home: \"Home\"
+    links: {}
 ";
 
 fn subtree_app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .write("config/locales/en.yml", EN_YML)
-        .write("config/locales/pl.yml", "pl:\n  probe:\n    greet: \"Cześć\"\n")
+        .write("config/locales/pl.yml", "pl:\n  probe:\n    greet: \"Cześć\"\n    menu: {}\n")
         .edit(
             "config/application.rb",
             "    # config.time_zone",
@@ -32,7 +37,7 @@ fn subtree_app() -> emit_and_run::Overlay {
         .edit(
             "app/models/article.rb",
             "  validates :title, presence: true\n",
-            "  validates :title, presence: true\n\n  def self.feed\n    I18n.t(\"probe.feed\")\n  end\n\n  def self.scoped_feed\n    I18n.t(\"feed\", scope: \"probe\")\n  end\n\n  def self.polish_feed\n    I18n.with_locale(:pl) { I18n.t(\"probe.feed\") }\n  end\n\n  def self.first_entry\n    feed.to_a.first.inspect\n  end\n\n  def self.nothing\n    I18n.t(\"probe.nothing\")\n  end\n",
+            "  validates :title, presence: true\n\n  def self.feed\n    I18n.t(\"probe.feed\")\n  end\n\n  def self.scoped_feed\n    I18n.t(\"feed\", scope: \"probe\")\n  end\n\n  def self.polish_feed\n    I18n.with_locale(:pl) { I18n.t(\"probe.feed\") }\n  end\n\n  def self.first_entry\n    feed.to_a.first.inspect\n  end\n\n  def self.nothing\n    I18n.t(\"probe.nothing\")\n  end\n\n  def self.menus\n    [I18n.t(\"probe.menu\"), I18n.t(\"probe.links\"), I18n.with_locale(:pl) { I18n.t(\"probe.menu\") }, I18n.t(\"probe.menu\").to_a.first.inspect]\n  end\n",
         )
 }
 
@@ -41,6 +46,8 @@ got = [Article.feed, Article.scoped_feed, Article.polish_feed]
 raise got.inspect unless got == [want, want, want]
 raise Article.first_entry unless Article.first_entry == [:zeta, { title: "Z title", action: "Go" }].inspect
 raise Article.nothing unless Article.nothing == "Translation missing: en.probe.nothing"
+menus = Article.menus
+raise menus.inspect unless menus == [{ more: {}, home: "Home" }, {}, {}, [:more, {}].inspect]
 puts "subtree passed"
 "##;
 

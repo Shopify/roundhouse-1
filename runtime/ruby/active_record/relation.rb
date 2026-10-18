@@ -13,34 +13,6 @@ module ActiveRecord
     class WhereChain; end
   end
 
-  # A Relation's `includes`/`preload`, deferred until a record asks.
-  #
-  # `load_records` used to batch-load every included association the
-  # moment the rows arrived. On a page whose records only feed a cached
-  # collection (campfire's room page: 40 messages, their rich text,
-  # creators, boosts and attachments), the cache key needs each record's
-  # id and updated_at, and on a hit nothing reads an association at all:
-  # the batch loads were most of the page's database time. Now each record
-  # carries this object, and the first association read on any of them
-  # (an emitted reader calls `_await_preload`) runs the same batched
-  # preload for the whole group, once. A miss issues the same queries as
-  # before, later; a hit issues none of them.
-  class PendingPreload
-    def initialize(model, records, specs)
-      @model = model
-      @records = records
-      @specs = specs
-      @done = false
-    end
-
-    def run
-      return nil if @done
-      @done = true
-      @model.preload_associations(@records, @specs)
-      nil
-    end
-  end
-
   # One association hop of an eager load, Rails' JoinDependency::
   # JoinAssociation: the reflection, the node it hangs off (nil for the
   # base model), the table reference its JOIN names (the table, or the
@@ -85,7 +57,6 @@ module ActiveRecord
       @leftover = nil
     end
   end
-
   # A lazy, chainable query builder — the metaprogramming-free analog of
   # ActiveRecord::Relation. Lowered model code drives it: `scope`s become
   # class methods that take/return a Relation, associations return one,
@@ -101,18 +72,18 @@ module ActiveRecord
   # Database access and value escaping go through `ActiveRecord.adapter`
   # (the `AdapterInterface`) rather than the raw `Db` primitive, so the
   # whole class types against the same adapter contract `Base` uses — no
-  # target-specific surface leaks in here. Chain methods mutate and return
-  # `self`; lowered chains are linear (build then terminate), so a fresh
-  # Relation per chain start is enough isolation.
+  # target-specific surface leaks in here. Chain methods answer a new
+  # relation (`spawn` plus an in-place `*!` step) and leave the receiver
+  # as it was, as in Rails, so two relations derived from one base never
+  # see each other's clauses.
   #
   # Terminals memoize: the first `to_a` loads and caches the records
   # (Rails' loaded-relation contract), so `map` + `each` + `empty?` on
   # the same relation hit the database once, not once per call — and
   # record mutations made between terminals (lobsters' current_vote
-  # stamping) survive to the render. Every chain method drops the cache:
-  # app code does re-chain after a terminal (`rel = rel.where(...)`
-  # returns this same object, mutated), and a stale cache there would
-  # serve the pre-refinement rows.
+  # stamping) survive to the render. A chain method answers a relation
+  # without the receiver's cache (or, for `order`, a sorted copy of it),
+  # and the receiver keeps its own.
   class Relation
     # Rails' Relation includes Enumerable and iterates its loaded records
     # (`each` below), so every Enumerable method it does not name itself
@@ -391,6 +362,16 @@ module ActiveRecord
       clone
     end
 
+    # A fork that queries again, as every Rails query method's is
+    # (`initialize_copy` resets the loaded rows): for a chain method
+    # that changes no query state, so a reload of the receiver is not
+    # answered from rows the fork kept.
+    def unloaded_spawn
+      fork = spawn
+      fork.unload_records
+      fork
+    end
+
     def own_lists
       if @shared_lists
         @shared_lists = false
@@ -446,7 +427,7 @@ module ActiveRecord
       attrs
     end
 
-    # ---- chain methods (return self) --------------------------------
+    # ---- chain methods (return a new relation) ----------------------
 
     # `with_recursive(parents: [base, step])` — a recursive common table
     # expression, each named part the UNION ALL of its relations (Rails
@@ -605,8 +586,8 @@ module ActiveRecord
     # branch, and wrapped in an array it would reach the IN-list branch
     # and escape a Relation object into the SQL text.
     def excluding(*records)
-      return self if records.length == 1 && records[0].is_a?(Array) && records[0].empty?
-      return self if records.empty?
+      return unloaded_spawn if records.length == 1 && records[0].is_a?(Array) && records[0].empty?
+      return unloaded_spawn if records.empty?
       spawn.excluding!(*records)
     end
 
@@ -639,7 +620,7 @@ module ActiveRecord
       # Rails NullRelation#or: left-null yields the other side; right-null
       # (including both-null) leaves the receiver.
       return other.spawn if @null && !other.null_relation?
-      return self if other.null_relation?
+      return unloaded_spawn if other.null_relation?
       spawn.or!(other)
     end
 
@@ -1175,7 +1156,7 @@ module ActiveRecord
     # `per(0)` is `limit(0)`.
     def per(num)
       text = num.to_s
-      return self unless text.match?(/\A\d/)
+      return unloaded_spawn unless text.match?(/\A\d/)
       n = text.to_i
       return limit(0) if n == 0
       page_now = current_page
@@ -1730,8 +1711,7 @@ module ActiveRecord
         n.klass.preload_associations(loaded, n.leftover) if loaded.length > 0
       end
       if !plan.leftover.nil? && !@skip_preloading && records.length > 0
-        pending = ActiveRecord::PendingPreload.new(@model, records, plan.leftover)
-        records.each { |record| record._pend_preload(pending) }
+        @model.preload_associations(records, plan.leftover)
       end
       records
     end
@@ -1995,7 +1975,7 @@ module ActiveRecord
     # stay chainable (lobsters' filters page).
     def references(*names)
       names
-      self
+      unloaded_spawn
     end
 
     # `merge(other)` — fold another relation's WHEREs in. v1 handles the
@@ -2143,6 +2123,7 @@ module ActiveRecord
     # straight from the statement (`_hydrate_all`) — the positions are
     # fixed at compile time, so no String-keyed Hash per row. An
     # explicit `select` can project anything, and keeps the Hash path.
+    # Recorded `includes` run here unless `skip_preloading!` is set.
     def load_records
       return [] if @null
       if @select_sql.nil? && @from.nil? && eager_loading?
@@ -2163,8 +2144,7 @@ module ActiveRecord
       end
       records.each { |record| record.readonly! } if @readonly
       if @includes.length > 0 && !@skip_preloading && records.length > 0
-        pending = ActiveRecord::PendingPreload.new(@model, records, @includes.dup)
-        records.each { |record| record._pend_preload(pending) }
+        @model.preload_associations(records, @includes.dup)
       end
       records
     end
@@ -2846,9 +2826,9 @@ module ActiveRecord
       column = expr.to_s.to_sym
       raise ArgumentError, "unknown aggregate column: #{expr}" unless @model.schema_columns.include?(column)
       return grouped_extreme(column.to_s, function) if @groups.length > 0
-      scoped = spawn
       projection = "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
       projection = "#{@select_sql}, #{projection}" if @havings.length > 0 && !@select_sql.nil?
+      scoped = spawn
       scoped.select!(projection)
       scoped.clear_ordering
       rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)
@@ -2870,8 +2850,8 @@ module ActiveRecord
         selects << "#{group} AS #{name}"
       end
       selects << "#{function}(#{@table}.#{ActiveRecord.adapter.quote_column_name(column)}) AS value"
-      scoped = spawn
       selects.unshift(@select_sql) if @havings.length > 0 && !@select_sql.nil?
+      scoped = spawn
       scoped.select!(selects.join(", "))
       scoped.clear_ordering
       rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)

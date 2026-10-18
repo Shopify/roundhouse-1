@@ -204,7 +204,7 @@ fn nested_library_failures_are_refused_at_their_site() {
   module Associations
     extend ActiveSupport::Concern
     included { has_many :memberships }
-    def broken; `unsupported_command`; end
+    def broken; defined?(helper(1)); end
   end
 end
 "#,

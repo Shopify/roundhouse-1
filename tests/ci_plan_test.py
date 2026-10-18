@@ -376,6 +376,60 @@ class Routing(unittest.TestCase):
             self.assertIn("compare-extra", plan["jobs"])
             self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
 
+    def test_a_ci_full_marker_line_on_a_main_push_plans_full(self):
+        main = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}
+        changed = {"return_value": (["src/emit/go.rs"], None)}
+        # The marker on an earlier commit of a multi-commit push counts.
+        event = {
+            "before": "0" * 40,
+            "commits": [
+                {"id": "a" * 40, "message": "Fix a lowering\n\n[ci full]\n\nCo-Authored-By: x"},
+                {"id": "b" * 40, "message": "Follow-up"},
+            ],
+        }
+        plan = self.run_planner(event, main, changed)["plan"]
+        self.assertIn("compare-extra", plan["jobs"])
+        self.assertEqual(plan["smoke_extra"], list(ci.EXTRA_COMPARE_TARGETS))
+        self.assertTrue(plan["extras_advisory"])
+        self.assertTrue(set(ci.SPINEL11).issubset(plan["jobs"]))
+        self.assertIn(f"[ci full] in commit {'a' * 12}", plan["reasons"])
+
+    def test_a_ci_full_marker_must_be_a_line_of_its_own(self):
+        main = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}
+        changed = {"return_value": (["src/emit/go.rs"], None)}
+        for message in (
+            "Add the [ci full] marker",
+            "Document it\n\nA line reading `[ci full]` asks for full validation.",
+            "[ci full] in the subject",
+        ):
+            event = {"before": "0" * 40, "head_commit": {"id": "c" * 40, "message": message}}
+            plan = self.run_planner(event, main, changed)["plan"]
+            self.assertEqual(plan["jobs"], ci.SPINEL_LANE, message)
+            self.assertNotIn("compare-extra", plan["jobs"], message)
+
+    def test_a_ci_full_marker_is_ignored_off_a_main_push(self):
+        message = {"id": "d" * 40, "message": "Fix\n\n[ci full]\n"}
+        pr = {
+            "pull_request": {"number": 1, "labels": [], "draft": False},
+            "commits": [message],
+            "head_commit": message,
+        }
+        outputs = self.run_planner(
+            pr,
+            {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/1/merge"},
+            {"return_value": (["src/emit/go.rs"], None)},
+        )
+        self.assertNotIn("campfire-latest", outputs["plan"]["jobs"])
+        self.assertFalse(outputs["plan"]["wasm"])
+        self.assertEqual(outputs["plan"]["smoke_extra"], ["go"])
+        branch = self.run_planner(
+            {"before": "0" * 40, "commits": [message]},
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/topic"},
+            {"return_value": (["src/emit/go.rs"], None)},
+        )
+        self.assertFalse(branch["plan"]["wasm"])
+        self.assertEqual(branch["plan"]["smoke_extra"], ["go"])
+
     def test_unknown_changed_inputs_keep_ruby_and_spinel(self):
         with tempfile.TemporaryDirectory() as directory:
             event = Path(directory) / "event.json"

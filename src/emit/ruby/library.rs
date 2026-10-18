@@ -272,8 +272,6 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     crate::timings::lap("emit library: boolean");
     apply_hydration_nil_lowering(&mut lcs, app);
     crate::timings::lap("emit library: hydration_nil");
-    apply_nilsafe_empty_lowering(&mut lcs);
-    crate::timings::lap("emit library: nilsafe_empty");
     apply_time_format_lowering(&mut lcs, app);
     crate::timings::lap("emit library: time_format");
     // Same rooting the view pipeline applies, for the same reason one
@@ -6354,7 +6352,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // whether some unrelated file existed.
     let helper_modules: BTreeSet<ClassId> =
         app.helper_method_index.values().cloned().collect();
-    PLAIN_HELPERS.with(|p| *p.borrow_mut() = plain_text_helpers(&app.library_classes, &helper_modules, &app.html_safe_methods));
+    PLAIN_HELPERS.with(|p| *p.borrow_mut() = plain_text_helpers(&app.library_classes, &helper_modules, &app.html_safe_method_owners));
     // Generated route-helper names (`active_path`, `story_path`, …) —
     // bare calls to these in layout/helper bodies resolve to the
     // generated `RouteHelpers` module. (The view walker rewrites route
@@ -7378,21 +7376,34 @@ fn strip_to_s(e: &Expr) -> &Expr {
 }
 
 thread_local! {
-    /// `(module, method)` of the app helpers whose every return is plain
-    /// text (`plain_text_helpers`), set per `apply_helper_lowering` run.
-    static PLAIN_HELPERS: std::cell::RefCell<crate::det::HashSet<(String, String)>> = Default::default();
+    /// What each app helper `(module, method)` returns, when the walk can
+    /// read it (`plain_text_helpers`), set per `apply_helper_lowering` run.
+    static PLAIN_HELPERS: std::cell::RefCell<crate::det::HashMap<(String, String), HelperReturn>> = Default::default();
+}
+
+/// A helper's return as a template sees it.
+#[derive(Clone, Debug, PartialEq)]
+enum HelperReturn {
+    /// Plain text on every path: Rails escapes it.
+    Plain,
+    /// Plain text or one of these positional arguments as given: safe
+    /// exactly when each such argument is.
+    Args(Vec<usize>),
 }
 
 /// The app helper methods whose every return is plain text — a String
 /// literal, an interpolation, a number, or another such helper's
-/// result — which Rails escapes in a template like any String. Anything
-/// the walk cannot read stays out, keeping the safe default below, and so
-/// does a method whose `.html_safe` was erased (`App::html_safe_methods`).
+/// result — which Rails escapes in a template like any String, and those
+/// that may instead hand back a required positional argument
+/// (`def label(v) = v || "—"`), which Rails escapes unless the argument
+/// was safe. Anything the walk cannot read stays out, keeping the safe
+/// default below, and so does a method whose `.html_safe` was erased
+/// (`App::html_safe_methods`).
 fn plain_text_helpers(
     lcs: &[LibraryClass],
     helper_modules: &BTreeSet<ClassId>,
-    html_safe: &BTreeSet<Symbol>,
-) -> crate::det::HashSet<(String, String)> {
+    html_safe: &BTreeSet<(String, String)>,
+) -> crate::det::HashMap<(String, String), HelperReturn> {
     fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match &*e.node {
             ExprNode::Seq { exprs } => match exprs.last() {
@@ -7424,13 +7435,13 @@ fn plain_text_helpers(
         .filter(|lc| helper_modules.contains(&lc.name))
         .flat_map(|lc| lc.methods.iter().map(move |m| (lc.name.0.as_str().to_string(), m)))
         .collect();
-    let mut plain: crate::det::HashSet<(String, String)> = crate::det::HashSet::default();
+    let mut read: crate::det::HashMap<(String, String), HelperReturn> = Default::default();
     loop {
-        let before = plain.len();
+        let before = read.len();
         for (module, m) in &methods {
             let key = (module.clone(), m.name.as_str().to_string());
             // Not one `lower::html_safe` or the tag builder recorded: its `.html_safe` mark was erased, not absent.
-            if plain.contains(&key) || html_safe.contains(&m.name) {
+            if read.contains_key(&key) || html_safe.contains(&key) {
                 continue;
             }
             let mut out = Vec::new();
@@ -7440,15 +7451,47 @@ fn plain_text_helpers(
                 ExprNode::Lit { value: Literal::Str { .. } | Literal::Int { .. } | Literal::Float { .. } } => true,
                 ExprNode::StringInterp { .. } => true,
                 ExprNode::Send { recv: None, method, .. } => methods.iter().any(|(md, other)| md == module && other.name == *method)
-                    && plain.contains(&(module.clone(), method.as_str().to_string())),
+                    && read.get(&(module.clone(), method.as_str().to_string())) == Some(&HelperReturn::Plain),
                 _ => false,
             };
-            if !out.is_empty() && out.iter().all(|e| is_plain(e)) {
-                plain.insert(key);
+            // An optional or rest positional shifts which argument binds which parameter by the call's arity.
+            let fixed_arity = m.params.iter().all(|p| p.keyword || (p.default.is_none() && !p.rest && !p.forwarding));
+            let positional = |e: &Expr| match &*e.node {
+                ExprNode::Var { name, .. } if fixed_arity => {
+                    m.params.iter().position(|p| p.name == *name && !p.keyword)
+                }
+                _ => None,
+            };
+            let arg_or_plain = |e: &Expr| -> Option<Option<usize>> {
+                if is_plain(e) {
+                    return Some(None);
+                }
+                if let Some(i) = positional(e) {
+                    return Some(Some(i));
+                }
+                match &*e.node {
+                    ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => {
+                        match (positional(left), is_plain(right)) {
+                            (Some(i), true) => Some(Some(i)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if out.is_empty() {
+                continue;
             }
+            let Some(each) = out.iter().map(|e| arg_or_plain(e)).collect::<Option<Vec<_>>>() else {
+                continue;
+            };
+            let mut args: Vec<usize> = each.into_iter().flatten().collect();
+            args.sort_unstable();
+            args.dedup();
+            read.insert(key, if args.is_empty() { HelperReturn::Plain } else { HelperReturn::Args(args) });
         }
-        if plain.len() == before {
-            return plain;
+        if read.len() == before {
+            return read;
         }
     }
 }
@@ -7464,7 +7507,7 @@ fn plain_text_helpers(
 /// return tag-helper compositions, and per-method safety inference can
 /// refine this when a counterexample shows up.
 fn is_html_safe_call(e: &Expr, index: &HashMap<Symbol, ClassId>) -> bool {
-    let ExprNode::Send { recv: Some(r), method, .. } = &*e.node else {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else {
         return false;
     };
     let ExprNode::Const { path } = &*r.node else {
@@ -7516,8 +7559,20 @@ fn is_html_safe_call(e: &Expr, index: &HashMap<Symbol, ClassId>) -> bool {
         );
     }
     // Not every app helper: one whose every return is plain text is a String Rails escapes.
-    index.values().any(|cid| cid.0.as_str() == joined)
-        && !PLAIN_HELPERS.with(|p| p.borrow().contains(&(joined.clone(), method.as_str().to_string())))
+    if !index.values().any(|cid| cid.0.as_str() == joined) {
+        return false;
+    }
+    match PLAIN_HELPERS.with(|p| p.borrow().get(&(joined.clone(), method.as_str().to_string())).cloned()) {
+        None => true,
+        Some(HelperReturn::Plain) => false,
+        Some(HelperReturn::Args(idxs)) => idxs.iter().all(|&i| {
+            args.get(i).is_some_and(|a| {
+                let a = strip_to_s(a);
+                // An interpolation may be a tag helper the walker inlined (`link_to` → `"<a href=…>"`).
+                matches!(&*a.node, ExprNode::StringInterp { .. }) || is_html_safe_call(a, index)
+            })
+        }),
+    }
 }
 
 /// `<Const ending in Base>.helpers` — the Rails idiom
@@ -10423,14 +10478,6 @@ fn widen_fk_zero_guards(expr: &mut Expr, fks: &BTreeSet<Symbol>) {
     );
 }
 
-/// Ruby-family pre-emit pass, companion to
-/// `apply_hydration_nil_lowering`: once nullable columns hydrate to
-/// real nil, the `.empty?` forms the predicate lowering synthesized
-/// from `present?`/`blank?` (which assumed never-nil reads) crash.
-/// Rewrite `<recv>.empty?` → `(<recv> || "").empty?` — single
-/// evaluation, transparent for arrays/strings that are never nil, and
-/// nil reads get Rails' blank-when-nil semantics. Only the
-/// zero-arg `empty?` shape is touched.
 /// `<time>.rfc2822` → `ActiveSupport.rfc2822(<time>)`.
 ///
 /// `Time#rfc2822` is stdlib `time`, not core Ruby — `require "time"`
@@ -10606,14 +10653,6 @@ fn rewrite_rfc2822(expr: &mut Expr) {
         block: None,
         parenthesized: true,
     };
-}
-
-pub(crate) fn apply_nilsafe_empty_lowering(lcs: &mut [LibraryClass]) {
-    for lc in lcs.iter_mut() {
-        for m in &mut lc.methods {
-            rewrite_empty_nilsafe(&mut m.body);
-        }
-    }
 }
 
 /// `::`-root a view body's constant references when the view's own
@@ -10994,51 +11033,6 @@ fn rewrite_render_options_assign(expr: &mut Expr) {
         let span = value.span;
         *value = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: name } });
     }
-}
-
-fn rewrite_empty_nilsafe(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_empty_nilsafe(c));
-    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *expr.node else {
-        return;
-    };
-    if method.as_str() != "empty?" || !args.is_empty() {
-        return;
-    }
-    // THE GUARD GOES ON THE VALUE, NOT ON THE STRIP. `lower::blank`
-    // grounds a String `blank?` as `r.strip.empty?` (ActiveSupport's
-    // is a whitespace match, not `empty?`), so the receiver of
-    // `empty?` is now `r.strip` at half the sites — and `nil.strip`
-    // raises before any guard wrapped around it could answer. Descend
-    // one link so a nullable column still reads `(r || "").strip.empty?`.
-    // This is the interaction the whitespace form used to be deferred
-    // behind; four lines is the whole of it.
-    let target: &mut Expr = match &mut *r.node {
-        ExprNode::Send { recv: Some(inner), method, args, .. }
-            if method.as_str() == "strip" && args.is_empty() =>
-        {
-            inner
-        }
-        _ => r,
-    };
-    // Idempotence: an already-guarded `(x || "").empty?` keeps its shape.
-    if matches!(&*target.node, ExprNode::BoolOp { right, .. }
-        if matches!(&*right.node, ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()))
-    {
-        return;
-    }
-    let guarded = Expr::new(
-        target.span,
-        ExprNode::BoolOp {
-            op: crate::expr::BoolOpKind::Or,
-            surface: crate::expr::BoolOpSurface::Symbol,
-            left: target.clone(),
-            right: Expr::new(
-                target.span,
-                ExprNode::Lit { value: Literal::Str { value: String::new() } },
-            ),
-        },
-    );
-    *target = guarded;
 }
 
 /// True when a reader body is exactly `@<name>` — the untouched

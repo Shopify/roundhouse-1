@@ -41,9 +41,12 @@ module ActionMailer
 
   class Base
     self.@deliveries: Array[Message]
+    @params: Hash[Symbol, untyped]?
 
     def self.default: (?Hash[Symbol, untyped]? opts) -> nil
     def self.deliveries: () -> Array[Message]
     def mail: (Hash[Symbol, untyped] opts, ?String? text_body, ?String? html_body) -> Message
+    def params: () -> Hash[Symbol, untyped]?
+    def _with_params: (Hash[Symbol, untyped] params) -> self
   end
 end

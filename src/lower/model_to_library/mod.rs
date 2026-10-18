@@ -632,7 +632,12 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
             crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
         })
-        .filter(|expr| is_constant_prepend(expr) || callbacks.iter().any(|c| std::ptr::eq(*c, *expr)))
+        .filter(|expr| {
+            is_constant_prepend(expr)
+                || callbacks.iter().any(|c| std::ptr::eq(*c, *expr))
+                // Replayed where the source has it (`ingest::app_extension_calls`).
+                || expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+        })
         .cloned()
         .collect();
     LibraryClass {
@@ -717,7 +722,9 @@ fn collect_class_attr_initializers(model: &Model, port_macros: &[&Expr]) -> Vec<
         })
         .chain(model.body.iter().filter_map(|item| match item {
             crate::dialect::ModelBodyItem::ClassBody { expr, .. } => Some(class_side_write_as_call(expr)),
-            crate::dialect::ModelBodyItem::Unknown { expr, .. } if port_macros.iter().any(|c| std::ptr::eq(*c, expr)) => {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                if port_macros.iter().any(|c| std::ptr::eq(*c, expr)) || writes_class_ivar(expr) =>
+            {
                 Some(expr.clone())
             }
             _ => None,
@@ -744,6 +751,16 @@ pub(crate) fn class_side_write_as_call(expr: &Expr) -> Expr {
     let operator = op.as_ruby().trim_end_matches('=');
     let combined = send(Some(read), Symbol::from(operator), vec![value.clone()]);
     send(Some(recv.clone()), Symbol::from(format!("{}=", name.as_str())), vec![combined])
+}
+
+/// A class-body write to a class instance variable (`@registry ||= []`, `@registry << ...`).
+pub(crate) fn writes_class_ivar(expr: &Expr) -> bool {
+    match &*expr.node {
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { .. }, .. }
+        | ExprNode::OpAssign { target: crate::expr::LValue::Ivar { .. }, .. } => true,
+        ExprNode::Send { recv: Some(r), block: None, .. } => matches!(&*r.node, ExprNode::Ivar { .. }),
+        _ => false,
+    }
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -998,6 +1015,10 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // arguments: the Ruby emit writes its `(...)` forwarders
         // (`ingest::delegate`, `App::ruby_declined_delegate_forwarders`).
         if declined_delegate_forwarded(model, expr, app) {
+            continue;
+        }
+        // Replayed where the source has it (`ingest::app_extension_calls`).
+        if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
             continue;
         }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
@@ -2279,7 +2300,12 @@ fn build_methods_for_dialect(
     // one of these (last-def-wins) — exactly the collapse snapshot
     // semantics needs to see THROUGH, not after.
     let pre_user_methods = methods.clone();
-    push_user_methods(&mut methods, model, &generated_attribute_overrides);
+    let columns: HashSet<crate::ident::Symbol> = schema
+        .tables
+        .get(&model.table.0)
+        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    push_user_methods(&mut methods, model, &generated_attribute_overrides, &columns);
     // friendly_id — `friendly`, its configuration and the slug
     // `to_param`. After the user methods (their own wins), before the
     // `to_param` default below.
@@ -2362,7 +2388,10 @@ fn build_methods_for_dialect(
 ///     duplicate body name (the corpus does not redefine those). The
 ///     replace predicate matches unsigned bare-ivar attr_* halves only
 ///     (`signature: None`); schema column readers stamp a signature and
-///     are never replaced. The ruby family keeps both for a generated
+///     are never replaced, except by the model's own definition of a
+///     column accessor, which Rails' generated attribute methods yield
+///     to as well (the synthesized one stays as `_read_<col>_raw` /
+///     `_write_<col>_raw`). The ruby family keeps both for a generated
 ///     attribute method (`generated_attribute_overrides`): the
 ///     synthesized one is written into GeneratedAttributeMethods.
 ///     A later source-level `delegate` may replace an earlier real
@@ -2373,6 +2402,7 @@ fn push_user_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
     generated_attribute_overrides: &crate::det::HashSet<Symbol>,
+    columns: &HashSet<crate::ident::Symbol>,
 ) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
@@ -2423,6 +2453,31 @@ fn push_user_methods(
                     && selected_source_methods.contains(&existing.name_span)
                     && existing.name_span.file == method.name_span.file
                     && method.name_span.start > existing.name_span.start;
+            // A table column's accessor yields to the model's own, as Rails' generated attribute methods do; not a signed virtual one (`has_secure_password`'s `confirmation=`).
+            let existing_is_column = existing.signature.is_some()
+                && matches!(existing.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
+                && columns.contains(&crate::ident::Symbol::from(existing.name.as_str().trim_end_matches('=')));
+            if incoming_is_real && existing_is_column && !method.name_span.is_synthetic() {
+                // The synthesized accessor stays, under the name the override's `super` (`ingest::column_accessors`) and hydration (`schema::hydration_setter`) reach it by.
+                let raw = {
+                    let mut raw = existing.clone();
+                    let column = existing.name.as_str().trim_end_matches('=');
+                    raw.name = crate::ident::Symbol::from(match existing.kind {
+                        AccessorKind::AttributeWriter => format!("_write_{column}_raw"),
+                        _ => format!("_read_{column}_raw"),
+                    });
+                    Some(raw)
+                };
+                selected_source_methods.remove(&existing.name_span);
+                if let Some(raw) = raw
+                    && !methods.iter().any(|m| m.name == raw.name && m.receiver == raw.receiver)
+                {
+                    methods.push(raw);
+                }
+                methods[idx] = method.clone();
+                selected_source_methods.insert(method.name_span);
+                continue;
+            }
             if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
@@ -2873,21 +2928,21 @@ pub(crate) fn push_scope_methods(
 
         // Rails relations are immutable, so every implicit-self root in
         // a scope body starts from the scope as it was on entry:
-        // `where(a).or(where(b))` is `a OR b`. Ours mutate in place, and
-        // the rewrite roots each of those on the one threaded `__rel`,
-        // so the receiver's `where(a)` landed on the argument too and
-        // the query became `(a AND b) OR (a AND b)`. When the body reads
-        // the relation more than once, each read takes its own copy.
-        // (A single read keeps the bare `__rel`; the entry spawn below
-        // already protects the caller's relation.)
+        // `where(a).or(where(b))` is `a OR b`. The rewrite roots each of
+        // those on the one threaded `__rel`. Chain methods now answer a
+        // new relation (#1041), so these copies no longer change the
+        // query; they cost one clone per extra read and can go once
+        // nothing reaches a scope body through a bang method.
+        // (A single read keeps the bare `__rel`.)
         if count_var_reads(&mut body, &rel_param) > 1 {
             spawn_each_var_read(&mut body, &rel_param, &model.name);
         }
 
         // Rails scopes spawn on entry: `rel.visible.with_direct_rooms`
         // must not leave joins/orders on `rel.visible` for a sibling
-        // `rel.visible.with_ordered_room`. Our chain methods mutate in
-        // place, so the scope method itself takes a copy first.
+        // `rel.visible.with_ordered_room`. Chain methods fork on their
+        // own since #1041; the entry copy is kept for the bang methods
+        // (`where!`, `order!`), which still write in place.
         let span = body.span;
         let rel_ty = Ty::Relation {
             of: model.name.clone(),
@@ -3905,7 +3960,8 @@ fn backfill_scalar_signature(method: &mut MethodDef, body_ty: Ty) {
     });
 }
 
-fn contains_return(e: &Expr) -> bool {
+/// Does `e` contain a `return` anywhere, nested blocks included?
+pub(crate) fn contains_return(e: &Expr) -> bool {
     if matches!(&*e.node, ExprNode::Return { .. }) {
         return true;
     }

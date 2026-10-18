@@ -1049,6 +1049,50 @@ fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
     }
 }
 
+/// Every Ruby exception class is JavaScript's `Error` on the TypeScript
+/// targets, so an app class named `Error` emits `class Error extends
+/// Error`, which reads the class it is declaring.
+fn report_typescript_error_class(app: &App, target: BuildTarget) {
+    if !matches!(target, BuildTarget::Typescript | BuildTarget::TypescriptWorker) {
+        return;
+    }
+    for lc in app.library_classes.iter().filter(|lc| lc.origin.is_none() && !lc.is_module && lc.name.0.as_str() == "Error") {
+        emit::diagnostics::report_unsupported(
+            lc.parent_span,
+            target.as_str(),
+            "class named Error",
+            format!("an app class named `Error` shadows the `Error` the {} emit maps every Ruby exception to", target.as_str()),
+        );
+    }
+}
+
+/// A model's class-body `extend AppModule` and the calls after it to the
+/// module's methods (`ingest::app_extension_calls`) are replayed by the
+/// Ruby family's emit; no other target carries a class body's own code.
+fn report_replayed_class_bodies(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda | BuildTarget::Futamura) {
+        return;
+    }
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
+                && expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+            {
+                let name = match &*expr.node {
+                    crate::expr::ExprNode::Send { method, .. } => method.as_str().to_string(),
+                    _ => "call".to_string(),
+                };
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target.as_str(),
+                    "class body",
+                    format!("`{name}` in the body of `{}` runs the app's own module code as the class loads, which the {} emit does not carry", model.name.0.as_str(), target.as_str()),
+                );
+            }
+        }
+    }
+}
+
 /// A mailer and the `ActionMailer` runtime it delivers through ship on
 /// the Ruby family only; elsewhere `Mailer.action(…)` reached nothing,
 /// or a view of the same name.
@@ -2061,6 +2105,104 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target, &kernel));
 }
 
+/// A send on a typed Array or number receiver that the TypeScript emit has
+/// no translation for: it writes the Ruby name on the JS value
+/// (`xs.zip(ys)`, `n.digits` as a property read), which throws or reads
+/// `undefined`. `emit::typescript::array_method_handled` and
+/// `numeric_method_handled` name what it does translate.
+fn report_typescript_array_sends(app: &App, target: BuildTarget) {
+    if !matches!(target, BuildTarget::Typescript | BuildTarget::TypescriptWorker) {
+        return;
+    }
+    // (model, reader) of each collection association: its reader answers a CollectionProxy.
+    let proxies: std::collections::HashSet<(&str, &str)> = app
+        .models
+        .iter()
+        .flat_map(|m| {
+            m.associations().filter_map(move |a| match a {
+                crate::dialect::Association::HasMany { name, .. }
+                | crate::dialect::Association::HasAndBelongsToMany { name, .. } => {
+                    Some((m.name.0.as_str(), name.as_str()))
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    let models: std::collections::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
+    struct Records<'a> {
+        proxies: std::collections::HashSet<(&'a str, &'a str)>,
+        models: std::collections::HashSet<&'a str>,
+    }
+    /// A query chain off a model class or a collection reader (`Post.where(…)`,
+    /// `product.subscribers.where(…)`): a Relation or CollectionProxy that types as
+    /// an Array of the model. `to_a` and `records` end it in a real Array.
+    fn is_query(e: &crate::expr::Expr, records: &Records) -> bool {
+        use crate::expr::ExprNode;
+        use crate::ty::Ty;
+        match &*e.node {
+            ExprNode::Const { path } => records.models.contains(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").as_str()),
+            ExprNode::Send { recv: Some(owner), method, .. } => {
+                if matches!(method.as_str(), "to_a" | "records" | "load" | "entries") {
+                    return false;
+                }
+                let reader = matches!(owner.ty.as_ref(), Some(Ty::Class { id, .. })
+                    if records.proxies.contains(&(id.0.as_str(), method.as_str())));
+                reader || is_query(owner, records)
+            }
+            _ => false,
+        }
+    }
+    let records = Records { proxies, models };
+    fn visit(expr: &crate::expr::Expr, target: BuildTarget, records: &Records) {
+        use crate::expr::ExprNode;
+        use crate::ty::Ty;
+        if let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*expr.node {
+            let elem = match r.ty.as_ref() {
+                Some(Ty::Array { elem }) => Some(elem),
+                Some(Ty::Union { variants }) if variants.len() == 2 && variants.iter().any(|v| matches!(v, Ty::Nil)) => {
+                    variants.iter().find_map(|v| match v {
+                        Ty::Array { elem } => Some(elem),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            // Already refused by name in `report_ruby_only_sends`.
+            let ruby_only = matches!(method.as_str(), "fetch" | "each_slice" | "each_cons" | "lazy" | "with_object");
+            // A has_many reader types as an Array of its model, but answers a CollectionProxy (`build`, `create!`).
+            if let Some(elem) = elem.filter(|_| !is_query(r, records)) {
+                let argc = args.len() + usize::from(block.is_some());
+                if !ruby_only && !crate::emit::typescript::array_method_handled(method.as_str(), argc, block.as_ref(), elem) {
+                    crate::emit::diagnostics::report_unsupported(
+                        expr.span,
+                        target.as_str(),
+                        format!("Array#{}", method.as_str()).as_str(),
+                        "the TypeScript emit has no translation for it and would call the Ruby name on a JS Array",
+                    );
+                }
+            }
+            let number = match r.ty.as_ref() {
+                Some(Ty::Int) => Some("Integer"),
+                Some(Ty::Float) => Some("Float"),
+                _ => None,
+            };
+            if let Some(class) = number {
+                let argc = args.len() + usize::from(block.is_some());
+                if !crate::emit::typescript::numeric_method_handled(method.as_str(), argc, block.as_ref()) {
+                    crate::emit::diagnostics::report_unsupported(
+                        expr.span,
+                        target.as_str(),
+                        format!("{class}#{}", method.as_str()).as_str(),
+                        "the TypeScript emit has no translation for it and would call the Ruby name on a JS number",
+                    );
+                }
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, target, records));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target, &records));
+}
+
 /// `case/in` is not equivalent to the targets' existing `case/when`
 /// renderers, even for nil or a plain binding. Refuse before file emission
 /// rather than lose bindings, skip evaluation, or turn a test into a wildcard.
@@ -2365,6 +2507,8 @@ fn target_files_inner(
     report_inherited_visibility_overrides(app, target);
     report_test_helper_connection(app, target);
     report_unemitted_library_classes(app, target);
+    report_typescript_error_class(app, target);
+    report_replayed_class_bodies(app, target);
     report_controller_sibling_classes(app, target);
     report_mailers(app, target);
     report_sqlite_index_predicates(app, target);
@@ -2372,6 +2516,7 @@ fn target_files_inner(
     report_self_bindings(app, target);
     report_alias_super_copies(app, target);
     report_ruby_only_sends(app, target);
+    report_typescript_array_sends(app, target);
     report_dry_struct_stdlib(app, target);
     // Full forwarding currently has a native Ruby contract only. A
     // declaration must be gated even when its body never forwards.
@@ -2481,7 +2626,10 @@ fn target_files_inner(
                 return Err(format!("finite class-side configuration is not supported ({})", target.as_str()));
             }
         }
-        if app.library_classes.iter().any(|lc| !lc.class_ivar_initializers.is_empty()) {
+        let model_class_ivars = app.models.iter().any(|m| {
+            m.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if crate::lower::model_to_library::writes_class_ivar(expr)))
+        });
+        if model_class_ivars || app.library_classes.iter().any(|lc| !lc.class_ivar_initializers.is_empty()) {
             return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));
         }
     }
@@ -7859,8 +8007,11 @@ fn i18n_table_text(app: &App) -> String {
         for locale in &locales {
             let Some(c) = catalog.catalog_for(locale) else { continue };
             // In the files' order, not the catalog's sorted one: `translate_tree` builds its Hash from them as they come.
-            for (key, text) in c.ordered_entries() {
-                out.push_str(&format!("L\u{1f}{locale}.{key}\u{1f}{text}\u{1f}.\u{1e}"));
+            for (key, text) in c.ordered_nodes() {
+                match text {
+                    Some(text) => out.push_str(&format!("L\u{1f}{locale}.{key}\u{1f}{text}\u{1f}.\u{1e}")),
+                    None => out.push_str(&format!("M\u{1f}{locale}.{key}\u{1f}.\u{1e}")),
+                }
             }
             for key in &c.opaque {
                 out.push_str(&format!("O\u{1f}{locale}.{key}\u{1f}.\u{1e}"));
@@ -12398,6 +12549,47 @@ fn apply_cruby_test_support(files: &mut [(String, String)]) {
     }
 }
 
+/// Rails-dom-testing's `css_select` for a spinel tree that carries the
+/// real Nokogiri (spinel-nokogiri): the elements of the last response
+/// matching `selector`, as Nokogiri nodes, parsed the way the CRuby
+/// overlay parses them (`test_support_cruby.rb`). Only when a test calls
+/// it — a tree without the package has nothing to answer it with, and
+/// there the call stays the compile error it is.
+/// The helper itself. A string here rather than a file under
+/// `runtime/spinel/test/`: every file there ships into the emitted
+/// `test/`, where `spin test` builds it as a program of its own.
+const SPINEL_CSS_SELECT: &str = r#"
+# Rails-dom-testing's `css_select`: the elements of the last response
+# matching `selector`, as Nokogiri nodes (`node["id"]`). Appended to a
+# spinel tree's harness only when it carries spinel-nokogiri and a test
+# calls it (`project::apply_spinel_css_select`); the CRuby tree has its
+# own in test_support_cruby.rb. rails-dom-testing parses with HTML5.
+require "nokogiri"
+
+class TestBase
+  def css_select(selector)
+    Nokogiri::HTML5.fragment(@__response.body.to_s).css(selector).to_a
+  end
+end
+"#;
+
+fn apply_spinel_css_select(files: &mut [(String, String)]) {
+    let called = files
+        .iter()
+        .any(|(p, c)| p.starts_with("test/") && p.ends_with(".rb") && c.contains("css_select("));
+    if !called {
+        return;
+    }
+    if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
+        if !helper.contains("def css_select(") {
+            if !helper.ends_with('\n') {
+                helper.push('\n');
+            }
+            helper.push_str(SPINEL_CSS_SELECT);
+        }
+    }
+}
+
 fn patch_harness_dispatch(content: &mut String, generated: &str) {
     const HEAD: &str = "    controller = case matched.controller\n";
     const TAIL: &str = "                 end";
@@ -13817,6 +14009,20 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 format!("`{name}` is Ruby's process stream, which the {target} emit does not map"),
             );
         }
+        // A name computed when it runs: the Ruby family defines it then, which no compiled target can.
+        if !matches!(target, "jruby")
+            && let crate::expr::ExprNode::Send { recv, method, args, .. } = &*expr.node
+            && matches!(method.as_str(), "define_method" | "define_singleton_method")
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef))
+            && !args.first().is_some_and(|a| matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { .. } | crate::expr::Literal::Str { .. } }))
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "runtime-defined method",
+                format!("`{}` with a name computed when it runs, which the {target} emit cannot define ahead of time", method.as_str()),
+            );
+        }
         // `runtime/ruby/active_record/connection.rb` carries `upsert_all`; no strict runtime transpiles it.
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Send { recv: Some(_), method, .. } = &*expr.node
@@ -13920,6 +14126,22 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 target,
                 "pagy",
                 "the pagy gem's `pagy` is only available on the ruby family and spinel".to_string(),
+            );
+        }
+        // Kernel#` is the backtick / `%x` shell-out. The ruby family and
+        // spinel emit it as a literal and run it; every other target would
+        // spell a method named "`" and fail to compile. One gate, not a
+        // per-emitter shell.
+        if let crate::expr::ExprNode::Send { method, .. } = &*expr.node
+            && method.as_str() == "`"
+            && !matches!(target, "spinel" | "jruby" | "futamura")
+            && !expr.span.is_synthetic()
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "shell_command",
+                format!("Kernel#` (a backtick / %x shell-out) is only available on the ruby family and spinel"),
             );
         }
         // A mapped JSON call does not emit a Ruby module object. Skip
@@ -14062,18 +14284,29 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             }
         }
     }
-    // The immutable app-body survey also excludes association extensions.
+    // The immutable app-body survey also excludes association extensions,
+    // scope lambdas, and belongs_to defaults. Those expressions are
+    // copied into synthesized methods only while emitting, after this gate.
     for model in &app.models {
         for item in &model.body {
-            if let crate::dialect::ModelBodyItem::Association {
-                assoc: crate::dialect::Association::HasMany { extension, .. }, ..
-            } = item {
-                for method in extension {
-                    visit(&method.body);
-                    for param in &method.params {
-                        if let Some(default) = &param.default {
-                            visit(default);
-                        }
+            let crate::dialect::ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (scope, default, extension) = match assoc {
+                crate::dialect::Association::BelongsTo { default, .. } => (None, default.as_ref(), &[][..]),
+                crate::dialect::Association::HasMany { scope, extension, .. } => (scope.as_ref(), None, extension.as_slice()),
+                crate::dialect::Association::HasOne { scope, .. } => (scope.as_ref(), None, &[][..]),
+                crate::dialect::Association::HasAndBelongsToMany { .. } => (None, None, &[][..]),
+            };
+            if let Some(scope) = scope {
+                visit(scope);
+            }
+            if let Some(default) = default {
+                visit(default);
+            }
+            for method in extension {
+                visit(&method.body);
+                for param in &method.params {
+                    if let Some(default) = &param.default {
+                        visit(default);
                     }
                 }
             }
@@ -15339,8 +15572,15 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>, minitest: bool) {
             // otherwise inherit WebMock's, and once a test disables
             // WebMock to reach a real server its `start` breaks.
             const BOOT: &str = "require_relative \"../boot\"\n";
+            // ruby-vips loads the system libxml. Nokogiri's packaged
+            // libxml (the one with the wildcard-namespace patch that
+            // `*:a` and `css-class()` need) is loaded when boot
+            // requires nokogiri. A `require "vips"` above that line
+            // binds the process to libxml 2.9 and every HTML5 CSS
+            // wildcard raises `Invalid expression`.
+            let after_boot = *gem == "webmock" || *gem == "ruby-vips";
             match helper.find(BOOT) {
-                Some(at) if *gem == "webmock" => helper.insert_str(at + BOOT.len(), &format!("{line}\n")),
+                Some(at) if after_boot => helper.insert_str(at + BOOT.len(), &format!("{line}\n")),
                 _ => insert_require_line(helper, &line),
             }
         }
@@ -17653,7 +17893,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)], stdlib: &[(&str, &st
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 26] = [
+const BUNDLED: [(&str, &str); 27] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -17726,6 +17966,11 @@ const BUNDLED: [(&str, &str); 26] = [
     // makes its lock directory. A default gem on CRuby/JRuby (Rails has
     // loaded it); spinel takes `packages/fileutils`.
     ("FileUtils", "fileutils"),
+    // `Dir.mktmpdir` — campfire's WAL checkpointer test makes its lock
+    // directory under one. Not a constant (Dir is core), so the row names
+    // the call: `Dir` has `mktmpdir` only after `require "tmpdir"`, which
+    // a booted Rails app has done and spinel's `packages/tmpdir` answers.
+    ("Dir.mktmpdir", "tmpdir"),
     // `OpenSSL::HMAC.digest` - a default gem on CRuby/JRuby, spinel's
     // `packages/openssl`; an app that signs a payload without HTTP never
     // loads it through net/http.
@@ -18246,6 +18491,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
                 .to_string();
         }
         files.retain(|(p, _)| p != "runtime/nokogiri_facade.rbs" && p != "runtime/nokogiri_spinel.rbs");
+        apply_spinel_css_select(&mut files);
     }
 
     // commonmarker: no façade to swap (Markdowner's own façade stands aside
@@ -18322,9 +18568,9 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              #\n\
              # `ref` is a clone `--branch`, so it takes a branch or tag,\n\
              # never a commit SHA (`git clone --branch <sha>` fails with\n\
-             # `Remote branch ... not found`). spinel-bcrypt publishes no\n\
-             # tags today, so this tracks `main`.\n\
-             bcrypt = { git = \"https://github.com/rubys/spinel-bcrypt\", ref = \"main\" }\n",
+             # `Remote branch ... not found`). It names the release tag, so\n\
+             # a build doesn't pick up whatever lands on `main` next.\n\
+             bcrypt = { git = \"https://github.com/rubys/spinel-bcrypt\", ref = \"v0.1.1\" }\n",
         );
     }
     if needs_vips {
@@ -18338,7 +18584,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # on Debian/Ubuntu, `brew install vips` on macOS) and loadable\n\
              # at run time (`libvips42`). Git form for the reason bcrypt\n\
              # gives above: matz/spin-index#7 is the registration.\n\
-             ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\", ref = \"main\" }\n",
+             ruby-vips = { git = \"https://github.com/rubys/spinel-ruby-vips\", ref = \"v0.2.0\" }\n",
         );
     }
     if needs_rqrcode {
@@ -18350,7 +18596,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              # matrix and exporter over Nayuki's qrcodegen, carried in the\n\
              # package — no system library. Git form for the reason bcrypt\n\
              # gives above: matz/spin-index#8 is the registration.\n\
-             rqrcode = { git = \"https://github.com/rubys/spinel-rqrcode\", ref = \"main\" }\n",
+             rqrcode = { git = \"https://github.com/rubys/spinel-rqrcode\", ref = \"v0.1.0\" }\n",
         );
     }
     if needs_nokogiri {
@@ -18360,8 +18606,8 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         manifest.push_str(
             "# HTML parsing, CSS/XPath and serialization: the nokogiri gem's\n\
              # surface over libxml2 2.13.9 with Nokogiri's patches, carried in\n\
-             # the package. Git form until matz/spin-index#10/#11 land.\n\
-             nokogiri = { git = \"https://github.com/rubys/spinel-nokogiri\", ref = \"main\" }\n",
+             # the package. Git form until matz/spin-index#14 lands.\n\
+             nokogiri = { git = \"https://github.com/rubys/spinel-nokogiri\", ref = \"v0.3.1\" }\n",
         );
     }
     if needs_commonmarker {
@@ -18372,7 +18618,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             "# Markdown: the commonmarker gem's surface over cmark-gfm\n\
              # 0.29.0.gfm.13, carried in the package. Git form until\n\
              # matz/spin-index#9 lands.\n\
-             commonmarker = { git = \"https://github.com/rubys/spinel-commonmarker\", ref = \"main\" }\n",
+             commonmarker = { git = \"https://github.com/rubys/spinel-commonmarker\", ref = \"v0.1.0\" }\n",
         );
     }
     files.push(("spin.toml".to_string(), manifest));
@@ -19903,6 +20149,35 @@ mod tests {
         apply_test_gem_wiring(&mut files, false);
         let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
         assert!(gemfile.contains("webmock"), "a test body's demand stands:\n{gemfile}");
+    }
+
+    /// `require "vips"` after boot. ruby-vips pulls in the system
+    /// libxml; Nokogiri has to load its packaged one first or `*:a`
+    /// and `css-class()` raise `Invalid expression`.
+    #[test]
+    fn vips_require_follows_boot() {
+        let mut files = vec![
+            (
+                "test/test_helper.rb".to_string(),
+                "require_relative \"../boot\"\n".to_string(),
+            ),
+            (
+                "test/models/avatar_test.rb".to_string(),
+                "class AvatarTest < TestBase\n  def test_pixels\n    Vips::Image.new_from_buffer(body, \"\")\n  end\nend\n"
+                    .to_string(),
+            ),
+            ("Gemfile".to_string(), "source \"https://rubygems.org\"\n".to_string()),
+        ];
+        apply_test_gem_wiring(&mut files, false);
+        let helper = &files.iter().find(|(p, _)| p == "test/test_helper.rb").unwrap().1;
+        let boot = helper.find("require_relative \"../boot\"\n").expect("boot");
+        let vips = helper.find("require \"vips\"\n").expect("vips require");
+        assert!(
+            boot < vips,
+            "vips must load after boot so Nokogiri's libxml wins:\n{helper}"
+        );
+        let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
+        assert!(gemfile.contains("ruby-vips"), "{gemfile}");
     }
 
     #[test]

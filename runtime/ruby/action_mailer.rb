@@ -151,5 +151,14 @@ module ActionMailer
     def mail(opts, text_body = nil, html_body = nil)
       Message.new(opts, text_body, html_body)
     end
+
+    def params
+      @params
+    end
+
+    def _with_params(params)
+      @params = params
+      self
+    end
   end
 end

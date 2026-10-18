@@ -279,6 +279,11 @@ pub(in crate::analyze) fn register(
                     .entry(method.name.clone())
                     .or_insert_with(|| delivery_ty.clone());
             }
+            if !lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "with") {
+                cls.class_methods
+                    .entry(Symbol::from("with"))
+                    .or_insert_with(|| Ty::Class { id: lc.name.clone(), args: vec![].into() });
+            }
         }
 
         // The deliverable returned by a mailer action. `deliver_now`

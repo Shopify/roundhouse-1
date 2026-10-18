@@ -50,6 +50,7 @@ mod fixture_entries;
 mod body;
 mod class_configuration;
 mod data;
+mod class_new;
 pub(crate) use body::{indexed_pluck, lexical_class, string_answers};
 pub(crate) use body::ConstResolverTask;
 pub use body::PreparedConstResolver;
@@ -65,7 +66,9 @@ mod ivar_set;
 pub(crate) use ivar_set::controller_name_of;
 mod effects;
 mod diagnostics;
+pub mod open_classes;
 pub(crate) mod forwarding;
+mod private_calls;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
@@ -82,7 +85,7 @@ pub mod indifferent;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
 pub use forwarding::nameless_rest_refusals_off_ruby;
-pub use diagnostics::{diagnose, diagnose_with_coverage, unknown_receiver_sends, UnknownReceiverSend};
+pub use diagnostics::{diagnose, diagnose_helper_modules, diagnose_with_coverage, unknown_receiver_sends, UnknownReceiverSend};
 
 pub use body::{BodyTyper, ClassInfo, ConstScope, Ctx};
 pub(crate) use body::PARAM_VALUE;
@@ -167,6 +170,7 @@ pub struct Analyzer {
     /// `app/helpers` modules, whose bodies run in a view and take
     /// ActionView's `t`.
     helper_modules: crate::det::HashSet<ClassId>,
+    open_classes: open_classes::OpenClasses,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
     ///
@@ -224,6 +228,8 @@ pub struct Analyzer {
     setup_scan: setup_scan::SetupScan,
     /// Library-class constant initializer typings across passes.
     init_memo: Vec<(ClassId, Vec<Option<InitTyping>>)>,
+    /// Opt-in source analysis; the emit pipeline never registers these facts.
+    class_factories: HashMap<crate::span::Span, Ty>,
     /// Registered Data factories that use the generated initializer, so
     /// `.new` call-site types do not manufacture a source `initialize`.
     data_factories_without_custom_initialize: HashSet<ClassId>,
@@ -453,6 +459,14 @@ impl Analyzer {
     /// the default preserves the status quo.
     pub fn new(app: &App) -> Self {
         Self::with_adapter(app, Box::new(SqliteAdapter))
+    }
+
+    /// Source consumers may recover retained Class.new identities. Emission
+    /// keeps using `new`, preserving its typed IR, refusal stubs and signatures.
+    pub fn for_source(app: &App) -> Self {
+        let mut analyzer = Self::new(app);
+        analyzer.class_factories = class_new::register(app, &analyzer.const_resolver, &mut analyzer.classes);
+        analyzer
     }
 
     /// Build an analyzer with a specific database adapter. Use this
@@ -1288,6 +1302,9 @@ impl Analyzer {
         }
         registry::ar::register_action_text(&mut classes);
         registry::ar::register_action_cable(&mut classes);
+        if app.gem_lock.as_ref().is_some_and(|lock| lock.has("sentry-ruby")) {
+            registry::ar::register_sentry(&mut classes);
+        }
 
         // ActiveModel::Validations / Model modules + the ActiveModel::Errors
         // collection and individual ActiveModel::Error classes — see
@@ -1610,6 +1627,7 @@ impl Analyzer {
             i18n: app.i18n.clone(),
             i18n_gem: app.carries_i18n_gem(),
             helper_modules: app.helper_method_index.values().cloned().collect(),
+            open_classes: open_classes::OpenClasses::of(app),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
             gem_sources: std::sync::Arc::new(app.gem_boundary.source_constants.clone()),
@@ -1617,6 +1635,7 @@ impl Analyzer {
             typed_constants: IdentityHashMap::default(),
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
+            class_factories: HashMap::default(),
             data_factories_without_custom_initialize,
             fixpoint_rounds: FixpointRounds::default(),
             constant_rounds: 0,
@@ -1642,8 +1661,10 @@ impl Analyzer {
             .with_load_hook_bases(&self.load_hook_bases)
             .with_i18n(&self.i18n, &self.helper_modules)
             .with_i18n_gem(self.i18n_gem)
+            .with_open_classes(&self.open_classes)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories)
+            .with_class_factories(&self.class_factories)
             .with_gem_sources(self.gem_sources.clone())
             .with_extensions(self.extensions.clone());
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
@@ -2875,6 +2896,7 @@ impl Analyzer {
             .with_load_hook_bases(&self.load_hook_bases)
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories)
+                .with_class_factories(&self.class_factories)
                 .with_gem_sources(self.gem_sources.clone())
                 .with_extensions(self.extensions.clone());
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
@@ -4929,7 +4951,7 @@ impl Analyzer {
                 }
             }
             for (_, value) in &mut lc.constants {
-                if self.data_factories.contains_key(&value.span) {
+                if self.data_factories.contains_key(&value.span) || self.class_factories.contains_key(&value.span) {
                     self.body_typer().with_deps(&deps).analyze_expr(value, &class_ctx);
                 }
             }
@@ -10583,6 +10605,8 @@ fn register_has_rich_text(model: &crate::dialect::Model, methods: &mut HashMap<S
         let content = Ty::Class { id: rich_text::content_class(), args: vec![].into() };
         methods.insert(Symbol::from("body"), content);
         methods.entry(Symbol::from("body=")).or_insert(Ty::Str);
+        // `push_record_methods` defines it: the column as stored.
+        methods.entry(Symbol::from("body_before_type_cast")).or_insert(Ty::Str);
         for (name, ret) in [
             ("to_s", Ty::Str),
             ("to_plain_text", Ty::Str),

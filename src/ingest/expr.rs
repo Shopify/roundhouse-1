@@ -2936,15 +2936,35 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // which the Ruby family writes verbatim and every other target
         // refuses by name.
         n if n.as_def_node().is_some() => method_def_expr(&n.as_def_node().unwrap(), file)?,
-        // Backticks / `%x{…}` — a shell-out (`Kernel#\``). Not a
-        // construct any target can run, and not worth pretending to
-        // model; ledgered by name so it stops reading as the generic
-        // "unsupported expression node" catch-all.
+        // Backticks / `%x{…}` - a shell-out. Ruby evaluates the literal
+        // as a call of `Kernel#\`` with the (interpolated) command
+        // string, so that is the IR: a receiverless Send named "`". The
+        // ruby family writes it back as the literal (spinel compiles
+        // backticks; it has no `Kernel.\`` method). A strict target
+        // ledgers the call (`shell_command` in
+        // `project::report_unsupported_bundled_constants`) instead of
+        // emitting a method named "`". It used to be a survey gap, and
+        // `--allow-unsupported`
+        // emitted `nil` in its place: a tmux session list read
+        // `nil.split("\n")`.
         n if n.as_x_string_node().is_some() || n.as_interpolated_x_string_node().is_some() => {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "shell command (backticks) is not modeled".into(),
-            });
+            let command = if let Some(xs) = n.as_x_string_node() {
+                ExprNode::Lit {
+                    value: Literal::Str { value: String::from_utf8_lossy(xs.unescaped()).into_owned() },
+                }
+            } else {
+                let ix = n.as_interpolated_x_string_node().unwrap();
+                let mut parts: Vec<InterpPart> = Vec::new();
+                collect_interp_parts(ix.parts(), &mut parts, file)?;
+                ExprNode::StringInterp { parts }
+            };
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("`"),
+                args: vec![Expr::new(span, command)],
+                block: None,
+                parenthesized: true,
+            }
         }
         // Prism's error-recovery node: the parser hit something it
         // couldn't make sense of and inserted a placeholder to keep

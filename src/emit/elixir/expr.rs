@@ -789,7 +789,9 @@ pub(super) fn emit_expr(e: &Expr) -> String {
                 BoolOpKind::Or => "||",
                 BoolOpKind::And => "&&",
             };
-            format!("{} {op_s} {}", emit_expr(left), emit_expr(right))
+            // Parenthesized: `||`/`&&` bind looser than `==` and `|>`, so a
+            // bare `x || "" == ""` would compare `""` instead of the result.
+            format!("({} {op_s} {})", emit_expr(left), emit_expr(right))
         }
         ExprNode::Array { elements, .. } => {
             let parts: Vec<String> = elements.iter().map(emit_expr).collect();

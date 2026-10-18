@@ -136,10 +136,7 @@ module ActiveRecord
   end
 
   class Base
-    @__pending_preload: PendingPreload?
     self.@__declared_attribute_types: Hash[String, [Symbol | ActiveModel::Type::Value, Hash[Symbol, untyped]]]?
-    def _pend_preload: (PendingPreload pending) -> nil
-    def _await_preload: () -> nil
     # Request values stay intact until the schema-selected scalar adapter.
     def self.find: (Integer | Float | String | nil id) -> Base
     def self.find_by!: (Hash[String | Symbol, untyped] conditions) -> Base
@@ -363,7 +360,10 @@ module ActiveRecord
     def _adopt_touch_owner: (Base owner) -> nil
     def _touch_owner: () -> nil
     def _transaction_committed: () -> nil
+    def self._txn_parent_joinable?: (Integer depth) -> bool
+    def self._txn_note_joinable: (Integer depth, bool joinable) -> nil
     def self._commit_enlisted: () -> nil
+    def self._commit_enlisted_from: (Integer from) -> nil
     def self._rollback_enlisted: (Integer from) -> nil
     def _restore_after_rollback: (Integer kind) -> nil
     def _run_enlisted_commit: (Integer kind) -> nil

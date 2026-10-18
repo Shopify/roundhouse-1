@@ -1169,8 +1169,8 @@ fn bind_all_options(call: &mut Call, span: Span) -> Vec<Expr> {
 /// an `around_action` writes it, spelled out as the gem runs it:
 ///
 /// ```ruby
-/// __i18n_locale_prev = I18n.enter_locale(l)
 /// begin
+///   __i18n_locale_prev = I18n.enter_locale(l)
 ///   body              # or action.call
 /// ensure
 ///   I18n.leave_locale(__i18n_locale_prev)
@@ -1214,11 +1214,12 @@ fn with_locale(e: &Expr) -> Option<Expr> {
     let leave = Expr { ty: Some(Ty::Nil), ..const_send(span, "I18n", "leave_locale", vec![read_prev]) };
     let save = Expr { ty: Some(prev_ty), ..Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: prev }, value: enter }) };
     let body_ty = body.ty.clone();
-    let run = Expr {
-        ty: body_ty.clone(),
+    // The save inside the `begin`, not a statement before it: a value-position Seq is hoisted ahead of the whole statement (`[t(…), with_locale(…) { … }]`), which ran its siblings in the new locale.
+    let body = Expr { ty: body_ty.clone(), ..Expr::new(span, ExprNode::Seq { exprs: vec![save, body] }) };
+    Some(Expr {
+        ty: body_ty,
         ..Expr::new(span, ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: Some(leave), implicit: false })
-    };
-    Some(Expr { ty: body_ty, ..Expr::new(span, ExprNode::Seq { exprs: vec![save, run] }) })
+    })
 }
 
 /// `branches` (each with the environments it runs in, `None` for every

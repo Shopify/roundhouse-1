@@ -1578,6 +1578,45 @@ fn emit_bool_op_operand(
     s
 }
 
+/// A command as a backtick literal. It takes a double-quoted String's
+/// escapes, so the command's text is escaped as one, with a backtick in
+/// the text escaped as well; an interpolated expression is emitted as
+/// code, untouched (`%x{echo #{`printf hi`}}` keeps its inner literal).
+fn emit_backtick_literal(arg: &Expr) -> Option<String> {
+    match &*arg.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            let quoted = ruby_str_literal(value);
+            let inner = quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"'))?;
+            Some(format!("`{}`", inner.replace('`', "\\`")))
+        }
+        ExprNode::StringInterp { parts } => Some(crate::emit::shared::interp::render(
+            parts,
+            &crate::emit::shared::interp::InterpDelims { open_quote: "`", close_quote: "`", expr_open: "#{", expr_close: "}" },
+            emit_expr,
+            |value| interp_text(value).replace('`', "\\`"),
+        )),
+        _ => None,
+    }
+}
+
+/// A double-quoted String's text between interpolations, escaped.
+fn interp_text(value: &str) -> String {
+    let mut out = String::new();
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '#' => out.push_str("\\#"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn emit_string_interp(parts: &[crate::expr::InterpPart]) -> String {
     crate::emit::shared::interp::render(
         parts,
@@ -1588,22 +1627,7 @@ fn emit_string_interp(parts: &[crate::expr::InterpPart]) -> String {
             expr_close: "}",
         },
         emit_expr,
-        |value| {
-            let mut out = String::new();
-            for c in value.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    '#' => out.push_str("\\#"),
-                    c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
-                    other => out.push(other),
-                }
-            }
-            out
-        },
+        interp_text,
     )
 }
 
@@ -2015,6 +2039,14 @@ pub(super) fn emit_send_base(
     let args = &*without_keyword_fills(args);
     let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
     let m = method.as_str();
+    // A receiverless call, or one the typer folded onto `self`, is the
+    // backtick literal. An override of `` ` `` still runs through that
+    // syntax. An explicit other receiver stays a normal send.
+    if m == "`" && args.len() == 1 && recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+        if let Some(literal) = emit_backtick_literal(&args[0]) {
+            return literal;
+        }
+    }
     // `...` is a send argument packet, never an index or infix operand.
     // Preserve explicit call syntax even for operator/setter method names
     // and `self`, before any surface-syntax prettification below.

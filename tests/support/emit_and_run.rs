@@ -266,6 +266,24 @@ impl Overlay {
         (scratch, source)
     }
 
+    /// The errors `roundhouse check` reports for the overlaid app: analysis
+    /// alone, with no lowering, so a call the lowering would answer still
+    /// reads as written.
+    pub fn check_errors(self) -> Vec<String> {
+        let (scratch, source) = self.materialize();
+        let (app, ingest_diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+        let errors = ingest_diags
+            .into_iter()
+            .chain(diagnose(&app))
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| format!("{:?}: {}", d.span, d.message))
+            .collect();
+        let _ = std::fs::remove_dir_all(&scratch);
+        errors
+    }
+
     /// The warnings ingesting the overlaid app reports.
     pub fn ingest_warnings(self) -> Vec<String> {
         let (scratch, source) = self.materialize();
@@ -276,13 +294,16 @@ impl Overlay {
 
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         let (scratch, source) = self.materialize();
-        let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
+        // As the CLI does: an error ingest reports gates the emit too.
+        let (app, ingest_diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
         let mut lower_diags = roundhouse::session::analyze_and_lower(&mut app);
         if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
             roundhouse::lower::helper_kwargs::demote_constructor_keywords_run_as_written(&mut lower_diags);
         }
-        let mut errors: Vec<_> = diagnose(&app)
+        let mut errors: Vec<_> = ingest_diags
             .into_iter()
+            .chain(diagnose(&app))
             .chain(lower_diags)
             .filter(|d| d.severity == Severity::Error)
             .collect();

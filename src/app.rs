@@ -436,6 +436,11 @@ pub struct App {
     /// `&lt;span&gt;` markup to the page.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub html_safe_methods: BTreeSet<Symbol>,
+    /// The same marks with the class that defines each (`(class,
+    /// method)`), for a reader that knows the owner: two helper modules
+    /// can define one name, and only one of them mark it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub html_safe_method_owners: BTreeSet<(String, String)>,
     /// App-registered `to_fs` formats from `config/initializers/`, in
     /// both spellings Rails accepts: the current
     /// `ActiveSupport::TimeFormats.register(:name, fmt)` and the
@@ -782,6 +787,17 @@ pub struct App {
     /// are reported as warnings, since Rails never runs them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unreachable_views: BTreeSet<Symbol>,
+    /// The `app/helpers` modules' diagnostics, taken before the
+    /// post-analyze lowerings rewrite their bodies; `None` until then,
+    /// and on a path that never lowers (`check`), where they are
+    /// computed from the bodies as they stand.
+    #[serde(skip)]
+    pub helper_diagnostics: Option<Vec<crate::diagnostic::Diagnostic>>,
+    /// Every `app/helpers/**/*_helper.rb` module, including one whose
+    /// method names a later helper all redefines (and so owns in
+    /// `helper_method_index`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub helper_modules: BTreeSet<ClassId>,
     /// The class-side twin of `concern_spliced_actions`: concern methods
     /// `splice_concern_class_methods_into_includers` copied onto a model
     /// or library class, keyed includer → method → the source module.
@@ -1722,6 +1738,7 @@ impl App {
             partial_local_types: HashMap::default(),
             view_ivar_types: HashMap::default(),
             html_safe_methods: BTreeSet::new(),
+            html_safe_method_owners: BTreeSet::new(),
             time_formats: BTreeMap::new(),
             module_mixins: Vec::new(),
             initializer_filters: Vec::new(),
@@ -1766,6 +1783,8 @@ impl App {
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
+            helper_diagnostics: None,
+            helper_modules: BTreeSet::new(),
             concern_spliced_class_methods: HashMap::default(),
             class_methods_carrier_splices: HashMap::default(),
             class_methods_blocks: HashMap::default(),

@@ -3621,7 +3621,7 @@ table it prints, and the gaps in it:
 | global_ids, sgids.generate | 4/4, 5/5 | |
 | sgids.verify | 19/24 | |
 | app_verifiers.blob_id / envelope / data | 8/8, 3/3, 7/7 | fixed with this entry: the blob verifier signed with signed-id's envelope |
-| encrypted_cookies | 0/28 | not implemented |
+| encrypted_cookies.verify / generate | 20/20, 8/8 | `cookies.encrypted`; see "`cookies.encrypted` is Rails' encrypted cookie jar" below |
 | csrf | 0/208 | not implemented |
 | passwords | 0/45 | not held |
 
@@ -4065,6 +4065,49 @@ comparison, so there is one script.
    the first and split between them in the second — RSS alone would
    invent a penalty the clustered lane does not pay, PSS alone would
    break comparison with the single-process rows already measured.
+
+### `cookies.encrypted` is Rails' encrypted cookie jar - CLOSED (ours, 2026-10-15)
+
+**Was:** `ActionController::CookieJar` had `signed` and `permanent`
+views and no `encrypted`, so `cookies.encrypted[...]` was a
+NoMethodError, and the runtime had no AES-GCM.
+
+**Now (measured against Rails 8.1.4, `load_defaults 8.1`):**
+`cookies.encrypted` writes and reads
+`b64(ciphertext)--b64(iv)--b64(tag)`, AES-256-GCM with a 12-byte IV and
+no associated data, the key PBKDF2-HMAC-SHA256(secret_key_base,
+"authenticated encrypted cookie", 1000, 32), the plaintext the `_rails`
+envelope (purpose `cookie.<name>`) around the value as JSON, so a
+read answers the value with its type (a Hash with String keys, an
+Integer). `ActionController::MessageEncryptor` holds the format, over
+`MessageDigest.aes_256_gcm_encrypt` / `aes_256_gcm_decrypt` (OpenSSL on
+CRuby, spinel's `packages/openssl` on spinel).
+`tests/rails_compat_vectors.rb` holds the jar to campfire's 28 vectors
+(tampered parts, wrong name, rotated secret, Marshal value, the
+pre-5.2 cookie without metadata), CRuby and the spinel binary alike.
+
+**Left as they are, each stated where it lives:**
+
+- **Not read:** key rotation (`config.action_dispatch.cookies_rotations`),
+  the AES-256-CBC jar (`use_authenticated_cookie_encryption = false`),
+  overridden `authenticated_encrypted_cookie_salt` / `encrypted_cookie_cipher`
+  / `cookies_serializer` (`:marshal`, `:hybrid`), and the
+  `{"_rails":{"data":…}}` envelope no cookie jar writes. An app that
+  sets them gets the defaults here.
+- **`expires:` on a write is dropped:** `cookies.encrypted[:t] = {
+  value: x, expires: 1.hour }` sends no `Expires` and puts no `exp` in
+  the envelope, so the cookie reads for as long as the browser keeps
+  it. Rails records the expiry inside the encrypted envelope, so a
+  copied short-lived cookie stops reading server-side. Only
+  `.permanent` sets one. The signed jar has the same gap.
+- **The session cookie** is still the signed one (see "Not
+  implemented" in the vectors entry above): `cookies.encrypted[<session
+  key>]` reads nil in an emitted app until the session store writes
+  through this jar.
+- **Link cost (spinel):** AES-GCM comes from spinel's `packages/openssl`,
+  which `runtime/spinel/message_digest.rb` requires, so every spinel web
+  app now links libssl/libcrypto and a build host needs the OpenSSL
+  headers.
 
 ### Signed cookies interoperate with Rails — CLOSED (ours)
 

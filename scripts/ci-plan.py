@@ -91,6 +91,7 @@ SPINEL_TESTS = [
     "routes_segment_pattern_spinel",
     "open_telemetry_stub_spinel",
     "around_block_filter_spinel",
+    "before_action_return_spinel",
     "plain_class_optional_keywords_spinel",
     "jbuilder_array_value_spinel",
     "active_job_payload",
@@ -258,17 +259,39 @@ PROJECT_BUILDERS = {
 }
 
 # Coverage labels. Precedence: ci:full (or CI_FULL) > any focus labels
-# (ci:<lang> / ci:extras / ci:jruby / ci:spinel) > path ownership.
+# (ci:<lang> / ci:extras / ci:jruby / ci:spinel / ci:rust /
+# ci:typescript) > path ownership.
 # Focus mode is NARROW: BASE + selected focus lanes only.
 CI_FULL = "ci:full"
 CI_SPINEL = "ci:spinel"
 CI_JRUBY = "ci:jruby"
 CI_EXTRAS = "ci:extras"
 CI_FOCUS_BY_LABEL = {f"ci:{t}": t for t in EXTRA_COMPARE_TARGETS}
+CI_COMPARE_BY_LABEL = {f"ci:{t}": t for t in COMPARE_TARGETS}
 
 CoverageLabels = namedtuple(
-    "CoverageLabels", "full focus_spinel focus_jruby focus_extras"
+    "CoverageLabels", "full focus_spinel focus_jruby focus_extras focus_compare"
 )
+
+
+# A committer pushing to main has no PR to label. A line reading exactly
+# `[ci full]` in a pushed commit's message plans like `ci:full`. Only a
+# whole line counts, so prose that names the marker does not trigger it,
+# and only a push to main honors it: a PR author controls their messages,
+# and `ci:full` there stays a maintainer's label.
+CI_FULL_MARKER = "[ci full]"
+
+
+def full_marker_commit(event, event_name, ref):
+    """The first pushed commit whose message requests full validation."""
+    if event_name != "push" or ref != "refs/heads/main":
+        return None
+    commits = event.get("commits") or [event.get("head_commit") or {}]
+    for commit in commits:
+        lines = (commit.get("message") or "").splitlines()
+        if any(line.strip() == CI_FULL_MARKER for line in lines):
+            return commit.get("id") or ""
+    return None
 
 
 def parse_coverage_labels(names, *, env_full=False):
@@ -282,22 +305,28 @@ def parse_coverage_labels(names, *, env_full=False):
         if label in labels:
             focus.add(target)
     focus_extras = tuple(t for t in EXTRA_COMPARE_TARGETS if t in focus)
+    focus_compare = tuple(
+        target for label, target in CI_COMPARE_BY_LABEL.items() if label in labels
+    )
     return CoverageLabels(
         full=full,
         focus_spinel=CI_SPINEL in labels,
         focus_jruby=CI_JRUBY in labels,
         focus_extras=focus_extras,
+        focus_compare=focus_compare,
     )
 
 
-def focus_plan(extras=(), jruby=False, spinel=False):
+def focus_plan(extras=(), jruby=False, spinel=False, compare_targets=()):
     """BASE plus selected focus lanes; path ownership suppressed.
 
-    Focused extras / jruby / CORE Spinel are merge-gate required for the
-    fix round. Unrelated extras, WASM, rust/ts compare, and the heavy
-    Spinel11 Campfire suite stay off.
+    Focused extras / jruby / rust / typescript / CORE Spinel are
+    merge-gate required for the fix round. Unrelated extras, WASM, and
+    the heavy Spinel11 Campfire suite stay off. `ci:rust` and
+    `ci:typescript` add only that language's `compare` and floor `smoke`.
     """
     extra = [t for t in EXTRA_COMPARE_TARGETS if t in extras]
+    compare = [t for t in COMPARE_TARGETS if t in compare_targets]
     jobs = list(BASE)
     smoke_floor = []
     reasons = []
@@ -307,6 +336,18 @@ def focus_plan(extras=(), jruby=False, spinel=False):
             "ci focus: BASE + "
             + ", ".join(extra)
             + " (compare-extra and smoke-extra; required)"
+        )
+    if compare:
+        jobs.append("compare")
+        if "build-site" not in jobs:
+            jobs.extend(["build-site", "archive-results"])
+        if "smoke" not in jobs:
+            jobs.append("smoke")
+        smoke_floor.extend(compare)
+        reasons.append(
+            "ci focus: "
+            + ", ".join(compare)
+            + " (compare and floor smoke; required)"
         )
     if jruby:
         if "build-site" not in jobs:
@@ -332,7 +373,7 @@ def focus_plan(extras=(), jruby=False, spinel=False):
         bool(spinel),
         reasons,
         smoke_extra=extra,
-        compare=[],
+        compare=compare,
         focus_required=bool(extra) or jruby,
         hard_spinel=bool(spinel),
         spinel_tests=list(SPINEL_TESTS) if spinel else None,
@@ -526,19 +567,21 @@ def select(
     focus_extras=(),
     focus_jruby=False,
     focus_spinel=False,
+    focus_compare=(),
     publish=False,
     project_scope=None,
     campfire_latest=True,
 ):
     focus_extras = tuple(focus_extras or ())
+    focus_compare = tuple(focus_compare or ())
     # Publication always requires full mode — reject before any narrow lane
     # (focus / main Spinel) can silently drop publish=True.
     if publish and not full:
         raise ValueError("publication requires full validation mode")
     # Focus labels narrow the plan before path ownership or main-push Spinel.
     # ci:full still falls through to the full ledger below.
-    if not full and (focus_extras or focus_jruby or focus_spinel):
-        return focus_plan(focus_extras, focus_jruby, focus_spinel)
+    if not full and (focus_extras or focus_jruby or focus_spinel or focus_compare):
+        return focus_plan(focus_extras, focus_jruby, focus_spinel, focus_compare)
     if spinel_lane and not full:
         return finish(
             [j for j in SPINEL_LANE if campfire_latest or j != "campfire-latest"],
@@ -1136,11 +1179,13 @@ def main():
         {label["name"] for label in pr.get("labels", [])},
         env_full=os.environ.get("CI_FULL") == "true",
     )
-    full = coverage.full
+    marker = full_marker_commit(event, event_name, os.environ.get("GITHUB_REF"))
+    full = coverage.full or marker is not None
     focus_extras = coverage.focus_extras
     focus_jruby = coverage.focus_jruby
     focus_spinel = coverage.focus_spinel
-    any_focus = bool(focus_extras or focus_jruby or focus_spinel)
+    focus_compare = coverage.focus_compare
+    any_focus = bool(focus_extras or focus_jruby or focus_spinel or focus_compare)
     # Main-push / unknown-input advisory Spinel suite (not the PR focus lane).
     spinel_lane = False
     if (
@@ -1191,12 +1236,15 @@ def main():
         focus_extras=focus_extras,
         focus_jruby=focus_jruby,
         focus_spinel=focus_spinel,
+        focus_compare=focus_compare,
         publish=publish,
         project_scope=project_scope,
         campfire_latest=not pr,
     )
     if reason:
         plan["reasons"].append(reason)
+    if marker is not None and not coverage.full:
+        plan["reasons"].append(f"{CI_FULL_MARKER} in commit {marker[:12]}".rstrip())
     timings = spinel_timings_from_env()
     plan["spinel_framework_shards"] = spinel_framework_shards(plan["spinel_tests"] or [], timings=timings)
     if not any(timings.values()):

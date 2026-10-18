@@ -43,6 +43,24 @@ fn a_controller_s_called_copy_keeps_the_controller_s_t() {
 }
 
 #[test]
+fn an_uncalled_copy_s_parameter_defaults_take_the_view_s_t() {
+    let (_emitted, errors) = included(helper_app())
+        .edit("app/helpers/agreement_helper.rb", "  def greeting_label\n", "  def framed(label = t('probe.agree_html', path: '/t', name: 'n'), title: t('probe.agree_html', path: '/k', name: 'k'))\n    [label, title]\n  end\n\n  def greeting_label\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("an `_html` key in a controller")), "{errors:#?}");
+}
+
+/// A name in a controller outside the copy's family does not call it.
+#[test]
+fn only_the_copy_s_own_family_calls_it() {
+    let (_emitted, errors) = helper_app()
+        .edit("app/controllers/comments_controller.rb", "class CommentsController < ApplicationController\n", "class CommentsController < ApplicationController\n  include AgreementHelper\n")
+        .edit("app/controllers/articles_controller.rb", "  def index\n", "  def index\n    @probe = respond_to?(:agreement_label)\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("an `_html` key in a controller")), "{errors:#?}");
+}
+
+#[test]
 fn a_keyword_default_counts_as_a_call() {
     let (_emitted, errors) = included(helper_app())
         .edit("app/controllers/articles_controller.rb", "  def index

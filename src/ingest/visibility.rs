@@ -883,6 +883,9 @@ impl Visibility {
     }
 
     fn reject_dynamic_declarations(node: &Node<'_>, file: &str) -> IngestResult<()> {
+        if console_only(node) {
+            return Ok(());
+        }
         struct Declarations {
             invalid: bool,
             reject_defs: bool,
@@ -1574,4 +1577,21 @@ fn reads_self(node: &Node<'_>) -> bool {
     let mut reads = Reads(false);
     ruby_prism::Visit::visit(&mut reads, node);
     reads.0
+}
+
+/// `if defined?(Rails::Console) … end` with no `else`: what it declares
+/// exists only under `rails console`, never in the app a target emits
+/// (a server or its tests), so the branch declares nothing there.
+pub(super) fn console_only(node: &Node<'_>) -> bool {
+    let Some(branch) = node.as_if_node() else { return false };
+    if branch.subsequent().is_some() {
+        return false;
+    }
+    let Some(defined) = branch.predicate().as_defined_node() else { return false };
+    let Some(path) = defined.value().as_constant_path_node() else { return false };
+    let parent_is_rails = path.parent().is_some_and(|p| {
+        p.as_constant_read_node().is_some_and(|c| c.name().as_slice() == b"Rails")
+            || p.as_constant_path_node().is_some_and(|cp| cp.parent().is_none() && cp.name().is_some_and(|n| n.as_slice() == b"Rails"))
+    });
+    parent_is_rails && path.name().is_some_and(|n| n.as_slice() == b"Console")
 }

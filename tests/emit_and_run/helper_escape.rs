@@ -21,3 +21,20 @@ fn app() -> emit_and_run::Overlay {
 fn a_helper_s_plain_string_is_escaped_and_its_markup_is_not() {
     app().run_test("test/controllers/badge_controller_test.rb").assert_passes();
 }
+
+/// Two helper modules define `badge`; Rails includes them in name order,
+/// so the later one answers. A mark on the other module's `badge` does
+/// not reach it: here the answering one is plain and is escaped.
+#[test]
+fn a_mark_on_another_module_s_helper_of_the_same_name_does_not_reach_it() {
+    emit_and_run::real_blog()
+        .write("app/helpers/a_badge_helper.rb", "module ABadgeHelper\n  def badge\n    \"<i>a</i>\".html_safe\n  end\nend\n")
+        .write("app/helpers/b_badge_helper.rb", "module BBadgeHelper\n  def badge\n    \"<i>b</i>\"\n  end\nend\n")
+        .edit("app/views/articles/index.html.erb", "<h1", "<p id=\"badge\"><%= badge %></p>\n<h1")
+        .write(
+            "test/controllers/badge_controller_test.rb",
+            "require \"test_helper\"\n\nclass BadgeControllerTest < ActionDispatch::IntegrationTest\n  test \"the later module answers\" do\n    get articles_url\n    assert_includes response.body, \"<p id=\\\"badge\\\">&lt;i&gt;b&lt;/i&gt;</p>\"\n  end\nend\n",
+        )
+        .run_test("test/controllers/badge_controller_test.rb")
+        .assert_passes();
+}

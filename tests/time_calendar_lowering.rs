@@ -59,6 +59,15 @@ fn a_nullable_reader_grounds_too() {
 }
 
 #[test]
+fn time_to_date_uses_the_receivers_civil_day() {
+    assert_eq!(emit("starts_at.to_date"), "ActiveSupport.date_current(self.starts_at)");
+    assert_eq!(
+        emit("starts_at.in_time_zone(\"Tokyo\").to_date"),
+        "ActiveSupport.date_current(ActiveSupport.in_time_zone(self.starts_at, \"Tokyo\"))"
+    );
+}
+
+#[test]
 fn time_zone_readers_ground_and_chain() {
     assert_eq!(emit("Time.zone.now"), "ActiveSupport.now");
     assert_eq!(emit("Time.zone.yesterday"), "ActiveSupport.yesterday(ActiveSupport.beginning_of_day(ActiveSupport.now))");

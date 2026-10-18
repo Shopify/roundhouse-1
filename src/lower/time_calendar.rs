@@ -124,6 +124,12 @@ pub(crate) fn rewrite_node(expr: &mut Expr, zone_port: bool) {
     if !is_time_value(r) {
         return;
     }
+    // The PostgreSQL CRuby tree runs Rails' own `to_date` on its zone port.
+    if method.as_str() == "to_date" && args.is_empty() && !zone_port {
+        *expr.node = active_support_call("date_current", vec![r.clone()]);
+        expr.ty = Some(Ty::Date);
+        return;
+    }
     if method.as_str() == "in_time_zone" && args.len() <= 1 && !zone_port {
         let grounded = match args.first() {
             Some(zone) => active_support_call("in_time_zone", vec![r.clone(), zone_name_arg(zone)]),

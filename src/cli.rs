@@ -269,7 +269,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     if let Some(ledger) = initializer_ledger {
         return write_initializer_ledger(&app, &ledger);
     }
-    let mut analyzer = Analyzer::new(&app);
+    let mut analyzer = Analyzer::for_source(&app);
     crate::timings::phase("analyze", || analyzer.analyze(&mut app));
     let mut diags = crate::timings::phase("diagnose", || diagnose(&app));
     // Survey mode: diagnostics that trace back to a recorded ingest gap

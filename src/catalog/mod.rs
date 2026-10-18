@@ -44,6 +44,7 @@
 use std::collections::BTreeSet;
 
 pub mod gems;
+pub mod string_kernel;
 pub use gems::{GemClass, GemTy, GEM_CATALOG};
 
 /// One cataloged method. Static-lifetime strings keep entries

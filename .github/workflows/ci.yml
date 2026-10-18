@@ -54,7 +54,7 @@ env:
   # Mastodon (AGPL) is the scale case.
   MASTODON_SHA: 163f96cee4dea23365bff9b433871e68d20d9ee7
   RUBY_BENCH_SHA: d771f81f1ce9db51376e03ca7b8e6a83160556d4
-  CAMPFIRE_SHA: edbc779f4dfc9b26c36310881711ddc976a9dfc8
+  CAMPFIRE_SHA: 11d3fb9ce01faad3384807563053ba86126f747e
   # rubys/spinel-pg, the PostgreSQL driver the Spinel Db shim
   # (runtime/spinel/db_pg.rb) is tested against in spinel-framework.
   # Pinned like the apps above; bump deliberately.
@@ -1963,12 +1963,41 @@ jobs:
       # and will keep that file red for as long as a compiled target
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
+      #
+      # 555/74 -> 568/77 on the CAMPFIRE_SHA bump to `11d3fb9c`
+      # (2026-10-16: enforcing script CSP). 16 commits past `edbc779f`.
+      # Measured on the ruby lane against that tree: 568 of 584 tests,
+      # 77 of 86 files. Message creation is already green on this
+      # compiler (`d5bbeaaaa`; `message-creation-tx` is `at_zero`).
+      # The blocking job keeps the constant. It does not follow
+      # Campfire main.
+      #
+      # 568/77 -> 576/81. Cached pages write the narrowed script
+      # Content-Security-Policy (cached_responses 13/13). ruby-vips
+      # loads after boot, so Nokogiri keeps the libxml that accepts
+      # `*:` and css-class() (messages_helper 17/17, boosts 5/5,
+      # rooms_refreshes 1/1).
+      #
+      # 576/81 -> 577/82. `ActionView::Base#form_with` runs when a
+      # template form site runs (fragment_rendering 9/9). A
+      # non-joinable fixture transaction makes each destroy its own
+      # savepoint (room_test 11/11); the CRuby pool pins that
+      # connection so the request sees the uncommitted rows.
+      # messages_caching went 4/4 -> 3/4 on that measurement: the
+      # fixture BEGIN made `FragmentCache.transaction_open?` true.
+      #
+      # 577/82 -> 578/83. That frame is hidden from
+      # `transaction_open?`, and an uncommitted write moves the
+      # observer's data_version, so messages_caching is 4/4 again.
+      # room_test stays 11/11; `use_transactional_tests = false` still
+      # COMMITs. Still red, and outside this floor: ActiveRecord::Tasks
+      # 0/4, deferred preload 9/10, Object#extend 13/14. A parallel
+      # run can lose a channel file to Errno::EEXIST on `tmp/test`;
+      # those files are green serially and are counted here.
         env:
-          # Tip Campfire suite floor — 555/74 via hygiene + conditional GET
-          # (strict suite emit, ActiveStorage.paths + timed poster,
-          # NullRelation, fresh_when ETag → 304).
-          FLOOR_TESTS: 555
-          FLOOR_FILES: 74
+          # Tip Campfire suite floor — 578/83 at CAMPFIRE_SHA 11d3fb9c.
+          FLOOR_TESTS: 578
+          FLOOR_FILES: 83
         run: |
           set -euo pipefail
           tests=$(awk -F'|' '{p += $3} END {print p+0}' /tmp/campfire-tally.txt)
