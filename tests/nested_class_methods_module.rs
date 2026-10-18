@@ -204,7 +204,12 @@ fn spinel_keeps_the_class_side_copies_and_drops_the_bridge() {
         app = app.write(&format!("app/lib/{name}.rb"), text);
     }
     let (emitted, errors) = app.emit(BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    // `flag_alias` names its method when it runs, which no compiled target can define ahead of time: the one refusal, named.
+    assert!(
+        errors.len() == 1 && errors[0].contains("`define_method` with a name computed when it runs"),
+        "{}",
+        errors.join("\n")
+    );
     let read = |path: &str| std::fs::read_to_string(emitted.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
     let flaggy = read("app/models/flaggy.rb");
     assert!(!flaggy.contains("def self.included") && !flaggy.contains("raise"), "{flaggy}");
