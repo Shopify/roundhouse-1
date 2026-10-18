@@ -244,8 +244,12 @@ fn reaches_model_dsl(name: &Symbol, table: &HashMap<Symbol, MethodDef>, depth: u
         if let ExprNode::Send { recv, method, .. } = &*e.node
             && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
         {
-            found |= crate::lower::model_to_library::macro_replay::is_model_dsl(method.as_str())
-                || (method != name && table.contains_key(method) && reaches_model_dsl(method, table, depth + 1));
+            // A class method of the same name (`store`) is the class's own, not the DSL.
+            found |= if table.contains_key(method) {
+                method != name && reaches_model_dsl(method, table, depth + 1)
+            } else {
+                crate::lower::model_to_library::macro_replay::is_model_dsl(method.as_str())
+            };
         }
     });
     found
