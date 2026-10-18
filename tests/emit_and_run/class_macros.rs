@@ -113,7 +113,12 @@ fn a_macro_it_cannot_run_is_reported() {
 /// calling class's body, which no strict target carries.
 #[test]
 fn a_class_body_state_write_is_unsupported_on_strict_targets() {
-    let refused = std::panic::catch_unwind(|| { app().emit(roundhouse::project::BuildTarget::Rust); }).expect_err("the Rust emit refuses");
+    // Without the keyword block parameter the defined readers take, which a
+    // strict target refuses first, by its own message (`block_signature`).
+    let refused = std::panic::catch_unwind(|| {
+        app().edit("app/models/settings_base.rb", "do |scope: nil|", "do").emit(roundhouse::project::BuildTarget::Rust);
+    })
+    .expect_err("the Rust emit refuses");
     let message = refused.downcast_ref::<String>().cloned().unwrap_or_default();
     assert!(message.contains("class-instance-variable initialization is not supported"), "{message}");
 }

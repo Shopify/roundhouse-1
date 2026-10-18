@@ -317,8 +317,12 @@ impl Overlay {
             Ok(files) => files,
             // A refusal at target level (`gems::extension_gem_refusals`) is
             // also an error diagnostic; no tree is written, and the
-            // caller's assertions read `errors`.
-            Err(_) if !errors.is_empty() => return (emitted, app, errors),
+            // caller's assertions read `errors`. Any other refusal (a
+            // message no diagnostic carries) panics, whatever else the
+            // analysis reported.
+            Err(message) if !errors.is_empty() && message.lines().all(|line| errors.iter().any(|d| d.message == line)) => {
+                return (emitted, app, errors);
+            }
             Err(message) => panic!("target files: {message:?}"),
         };
         roundhouse::project::write_to_dir(&files, &emitted).expect("write ruby target tree");
