@@ -44,7 +44,10 @@ fn emitted_config() -> String {
 fn a_reader_the_model_writes_answers_the_validation() {
     let config = emitted_config();
     let validate = validate_of(&config);
-    assert!(validate.contains("[:on, :off].include?(self.status)"), "{validate}");
+    // The reader is called, never the slot. The model's own `status` has no
+    // declared signature, so the call stays receiverless (it is not
+    // annotated onto `self` as a typed column reader is).
+    assert!(validate.contains("[:on, :off].include?(status)"), "{validate}");
     assert!(!validate.contains("include?(@status)"), "{validate}");
     // A column the model leaves alone keeps its slot read, and numericality
     // reads the value before type cast whatever the reader answers.

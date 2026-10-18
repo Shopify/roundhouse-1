@@ -58,10 +58,13 @@ fn a_call_the_replay_cannot_carry_keeps_the_class_closed() {
 }
 
 /// The Ruby emit keeps one opening of a module, so a macro a reopening
-/// supplies is not replayed: it stays reported, not a load-time raise.
-#[test]
-fn a_reopened_module_s_macro_stays_reported() {
-    let errors = emit_and_run::real_blog()
+/// supplies is not replayed through it: a replayed call would raise at
+/// load. Ingest expands the call from the module's methods across both
+/// openings (`ingest::define_method_loops`) into the methods it defines,
+/// which is what Ruby's own run of it leaves; nothing is dropped, so
+/// nothing is left to report.
+fn reopened() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
         .write("lib/settings_extension.rb", "module SettingsExtension\n  def settings_loaded?\n    true\n  end\nend\n")
         .write("lib/settings_extension/setting.rb", "module SettingsExtension\n  def setting(name, default)\n    define_singleton_method(name) { default }\n  end\nend\n")
         .edit(
@@ -69,6 +72,13 @@ fn a_reopened_module_s_macro_stays_reported() {
             "  validates :title, presence: true\n",
             "  validates :title, presence: true\n  extend SettingsExtension\n  setting :title_limit, 40\n\n  def self.limit\n    Article.title_limit\n  end\n",
         )
-        .check_errors();
-    assert!(errors.iter().any(|e| e.contains("title_limit")), "{errors:#?}");
+}
+
+#[test]
+fn a_reopened_module_s_macro_is_expanded_not_replayed() {
+    let errors = reopened().check_errors();
+    assert!(errors.is_empty(), "the expansion leaves nothing missing: {errors:#?}");
+    reopened()
+        .run_ruby("raise Article.limit.inspect unless Article.limit == 40\nputs \"reopened passed\"\n")
+        .assert_passes();
 }

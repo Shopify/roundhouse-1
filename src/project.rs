@@ -2627,7 +2627,7 @@ fn target_files_inner(
             }
         }
         let model_class_ivars = app.models.iter().any(|m| {
-            m.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } if crate::lower::model_to_library::writes_class_ivar(expr)))
+            m.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } if crate::lower::model_to_library::writes_class_ivar(expr)))
         });
         if model_class_ivars || app.library_classes.iter().any(|lc| !lc.class_ivar_initializers.is_empty()) {
             return Err(format!("class-instance-variable initialization is not supported ({})", target.as_str()));

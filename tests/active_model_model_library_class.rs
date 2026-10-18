@@ -99,7 +99,7 @@ end
     // runs the same unconditional validations.
     assert!(
         src.contains(
-            "if @href.nil? || @href.is_a?(String) && (@href || \"\").empty? || @href.is_a?(Array) && (@href || \"\").empty?"
+            "if @href.nil? || @href.is_a?(String) && @href.empty? || @href.is_a?(Array) && @href.empty?"
         ),
         "{src}"
     );

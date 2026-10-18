@@ -23,6 +23,6 @@ fn a_retypable_column_presence_check_does_not_assume_a_string() {
         )
         .emit(BuildTarget::Ruby);
     let model = std::fs::read_to_string(emitted.join("app/models/operation.rb")).expect("operation.rb");
-    assert!(model.contains("@batch_id.nil? || @batch_id.is_a?(String) && (@batch_id || \"\").empty?"), "{model}");
-    assert!(model.contains("@label.nil? || (@label || \"\").empty?"), "{model}");
+    assert!(model.contains("@batch_id.nil? || @batch_id.is_a?(String) && @batch_id.empty?"), "{model}");
+    assert!(model.contains("@label.nil? || @label.empty?"), "{model}");
 }

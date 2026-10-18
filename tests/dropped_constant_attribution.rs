@@ -133,7 +133,7 @@ fn a_gap_that_kept_the_class_is_not_named() {
     let diags = check(&[
         (
             "app/lib/settings.rb",
-            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def host\n    `hostname`\n  end\nend\n",
+            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def host\n    defined?(Settings.zork(1))\n  end\nend\n",
         ),
         ("app/lib/user.rb", "class User\n  def go\n    [Settings::A, Settings::B]\n  end\nend\n"),
     ]);
@@ -146,8 +146,7 @@ fn a_gap_that_kept_the_class_is_not_named() {
 }
 
 /// A gap in a constant's own value: ingest kept the module but held the
-/// constant as its `nil` placeholder (here a shell command, which no
-/// target runs; Core's wider-than-64-bit `SIGN_BIT` was one before
+/// constant as its `nil` placeholder (here a `defined?` over a call with arguments, which the ingest does not model; Core's wider-than-64-bit `SIGN_BIT` was one before
 /// tests/wide_integer_literals.rs). Its references are the gap's
 /// shadow; a sibling constant ingest compiled is not named.
 #[test]
@@ -155,13 +154,13 @@ fn a_constant_whose_value_was_the_gap_names_it() {
     let diags = check(&[
         (
             "app/lib/codec.rb",
-            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    HOST = `hostname`\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        HOST.empty? ? TAG : bits\n      end\n    end\n  end\nend\n",
+            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    HOST = defined?(Codec.zork(1))\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        HOST ? TAG : bits\n      end\n    end\n  end\nend\n",
         ),
         ("app/lib/user.rb", "class User\n  def go\n    [Codec::DoubleLayout::HOST, Codec::DoubleLayout::TAG, Codec::Missing]\n  end\nend\n"),
     ]);
     let d = constant_refusal(&diags, "Codec::DoubleLayout::HOST", Severity::Info);
     assert!(
-        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::HOST was not compiled: shell command"),
+        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::HOST was not compiled: defined? calls with arguments"),
         "{}",
         d.message
     );
