@@ -73,10 +73,10 @@ module ActionController
 
     def initialize: (ActionController::CookieJar jar, ?bool permanent) -> void
     def []: (String | Symbol key) -> untyped
-    def []=: (String | Symbol key, untyped value) -> untyped
+    def []=: (String | Symbol key, Hash[Symbol, untyped] | Array[untyped] | String | Integer | Float | Symbol | bool | nil value) -> untyped
     def permanent: () -> ActionController::EncryptedCookieJar
     def delete: (String | Symbol key) -> String
-    def self.value_of: (untyped value) -> untyped
+    def self.value_of: (Hash[Symbol, untyped] | Array[untyped] | String | Integer | Float | Symbol | bool | nil value) -> untyped
     def self.parse: (String json) -> untyped
     def self.permanent_time: () -> ::Time
   end

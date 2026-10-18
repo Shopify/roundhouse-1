@@ -360,37 +360,35 @@ module ActiveRecord
     # inside a fixture example, because that frame is hidden from
     # `transaction_open?` (see active_record_db_config.rb).
     def transaction(mode = :deferred)
-      if Db.transaction_open?
+      nested = Db.transaction_open?
+      name = ""
+      if nested
         name = "rh_raw_#{Db._txn_depth}"
         Db.exec("SAVEPOINT #{name}")
-        begin
-          result = yield
-        rescue Exception => e
-          begin
-            Db.exec("ROLLBACK TO SAVEPOINT #{name}")
-            Db.exec("RELEASE SAVEPOINT #{name}")
-          rescue StandardError
-            # SQLite may have ended the transaction itself already.
-          end
-          raise e
-        end
-        Db.exec("RELEASE SAVEPOINT #{name}")
-        result
       else
         Db.exec("BEGIN #{mode.to_s.upcase} TRANSACTION")
-        begin
-          result = yield
-        rescue Exception => e
-          begin
-            Db.exec("ROLLBACK")
-          rescue StandardError
-            # SQLite may have ended the transaction itself already.
-          end
-          raise e
-        end
-        Db.exec("COMMIT")
-        result
       end
+      begin
+        result = yield
+      rescue Exception => e
+        begin
+          if nested
+            Db.exec("ROLLBACK TO SAVEPOINT #{name}")
+            Db.exec("RELEASE SAVEPOINT #{name}")
+          else
+            Db.exec("ROLLBACK")
+          end
+        rescue StandardError
+          # SQLite may have ended the transaction itself already.
+        end
+        raise e
+      end
+      if nested
+        Db.exec("RELEASE SAVEPOINT #{name}")
+      else
+        Db.exec("COMMIT")
+      end
+      result
     end
   end
 

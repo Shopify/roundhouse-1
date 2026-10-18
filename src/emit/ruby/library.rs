@@ -21492,6 +21492,9 @@ fn walk_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>, mut stored: Option<&mut
             }
         }
         ExprNode::Assign { value, .. } => walk!(value),
+        // `@map ||= Concurrent::Map.new`: a memoized value reads its
+        // runtime constant as the statement runs.
+        ExprNode::OpAssign { value, .. } => walk!(value),
         ExprNode::Yield { args } => {
             for a in args {
                 walk!(a);

@@ -495,6 +495,15 @@ fn untyped_subexpressions_baseline() {
     // Merge of origin/main 558f86ba3 (2026-10-18): upstream added 37 sites since
     // 298fd9a1c (757 -> 794: non-joinable fixture savepoints, raw `transaction`
     // savepoints), so 811 + 37. PROVISIONAL: re-measure with the probe and lower it.
+    // MEASURED on this merge (om18c): 1286 on the merged runtime, against 1242 on r13-merge's
+    // runtime read by the same binary, so this probe already exceeded 811 before the merge
+    // (it is in failed-ours.txt) and is not a merge regression. The +44 over r13-merge is all
+    // upstream's new runtime code: `_commit_enlisted_from` +7, `_txn_note_joinable` +11,
+    // `_txn_parent_joinable?` +2, `Base.transaction` +6, `Connection#transaction_open?` +4,
+    // `RawConnection#transaction` +7 (savepoint branch), and `Relation#where_args!` /
+    // `order_parts!` / `reorder_parts!` +8 (upstream's in-place steps behind the chain
+    // methods, parameters read here without their RBS). The 848 ceiling is left as the
+    // upstream-derived figure; lowering this tree to it is its own piece of work.
     const CEILING: usize = 848;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,

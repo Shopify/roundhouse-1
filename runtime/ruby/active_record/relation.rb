@@ -493,12 +493,17 @@ module ActiveRecord
       # `where` with no condition is Rails' WhereChain (`where.not(…)`,
       # `where.missing(…)`): the hop after it spawns.
       return self if condition.nil? && args.empty?
-      spawn.where!(condition, *args)
+      spawn.where_args!(condition, args)
+    end
+
+    # The in-place step of `where` / `where!`, the binds as one list.
+    def where_args!(condition, args)
+      add_condition(condition, args, false, true)
+      self
     end
 
     def where!(condition = nil, *args)
-      add_condition(condition, args, false, true)
-      self
+      where_args!(condition, args)
     end
 
     # An association's scope: `where(fk => owner.id)` that ALSO presets
@@ -719,10 +724,16 @@ module ActiveRecord
     # order, the same order SQLite hands back for tied keys -- and a
     # page sorted here matches one sorted by the database byte for byte.
     def order(*parts)
-      spawn.order!(*parts)
+      spawn.order_parts!(parts)
     end
 
     def order!(*parts)
+      order_parts!(parts)
+    end
+
+    # The in-place step of `order` / `order!` / `reorder`, the terms as
+    # one list.
+    def order_parts!(parts)
       own_lists
       terms = parts.map { |p| order_term(p) }
       terms.each { |t| @orders << t }
@@ -794,13 +805,17 @@ module ActiveRecord
     # `order` when the records are already loaded.
     def reorder(*parts)
       raise ArgumentError, "The method .reorder() must contain arguments." if parts.empty?
-      spawn.reorder!(*parts)
+      spawn.reorder_parts!(parts)
     end
 
     def reorder!(*parts)
       raise ArgumentError, "The method .reorder() must contain arguments." if parts.empty?
+      reorder_parts!(parts)
+    end
+
+    def reorder_parts!(parts)
       @orders = []
-      order!(*parts)
+      order_parts!(parts)
     end
 
     # `lock` / `lock(false)` / `lock("FOR SHARE")` — the row-locking
