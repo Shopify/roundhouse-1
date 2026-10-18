@@ -15412,12 +15412,15 @@ fn same_named_classes_in_two_test_support_classes_stay_apart() {
     assert!(errors.is_empty(), "{errors:?}");
     app().run_test("test/models/mock_bucket_test.rb").assert_passes();
     // The support files are library files: TypeScript writes each
-    // `Bucket` as a class of its own; Crystal, which carries no plain
-    // Ruby class, refuses each by its qualified name. What either refuses
-    // beyond that is `kind(*)`'s nameless rest.
+    // `Bucket` as a class of its own, in a namespace merged into its
+    // owner's file (`export namespace MockAlpha { export class Bucket`),
+    // so the two stay apart; Crystal, which carries no plain Ruby class,
+    // refuses each by its qualified name. What either refuses beyond that
+    // is `kind(*)`'s nameless rest.
     let (tree, errors) = app().emit(BuildTarget::Typescript);
-    for file in ["app/models/mock_alpha::bucket.ts", "app/models/mock_beta::bucket.ts"] {
+    for (file, owner) in [("app/models/mock_alpha.ts", "MockAlpha"), ("app/models/mock_beta.ts", "MockBeta")] {
         let ts = std::fs::read_to_string(tree.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(ts.contains(&format!("export namespace {owner} {{")), "{file}: {ts}");
         assert!(ts.contains("export class Bucket"), "{file}: {ts}");
     }
     assert!(errors.iter().all(|e| e.contains("`*` on `kind`") || e.contains("nameless rest")), "{errors:?}");

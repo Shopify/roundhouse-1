@@ -45,6 +45,10 @@ module ActiveSupport
 end
 
 class TestBase
+  # The shared harness defines a refusing `stub_const` on TestBase itself
+  # (for the sites a compiled tree cannot stub); a class's own method
+  # outranks an included module's, so drop it for the real one.
+  remove_method :stub_const if instance_methods(false).include?(:stub_const)
   include ActiveSupport::Testing::ConstantStubbing
 
   # Minitest::Runnable.methods_matching (minitest/lib/minitest.rb):

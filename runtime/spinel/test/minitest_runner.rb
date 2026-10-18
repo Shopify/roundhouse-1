@@ -1279,6 +1279,21 @@ module RoundhouseTestRunner
     full.start_with?(TREE + "/") ? full.delete_prefix(TREE + "/") : nil
   end
 
+  # Rails runs each example inside a non-joinable transaction
+  # (`use_transactional_tests`, default true), so a nested `save` or
+  # `destroy` is a SAVEPOINT and commit callbacks run when it releases.
+  # A tree with ActiveRecord::TestFixtures opens that transaction in its
+  # own setup_fixtures; the in-memory tree wraps the example here. A class
+  # that sets the flag false sees a real COMMIT.
+  def self.in_fixture_transaction(test, &block)
+    klass = test.class
+    wrap = !defined?(ActiveRecord::TestFixtures) &&
+      klass.respond_to?(:use_transactional_tests) && klass.use_transactional_tests &&
+      defined?(ActiveRecord::Base) && ActiveRecord::Base.respond_to?(:transaction)
+    return block.call unless wrap
+    ActiveRecord::Base.transaction(joinable: false, &block)
+  end
+
   def self.run_one(klass, name)
     errors = []
     test = nil
@@ -1310,7 +1325,7 @@ module RoundhouseTestRunner
         test.setup
         test.after_setup if test.respond_to?(:after_setup)
       end
-      capture(errors, "test") { test.public_send(name) } if errors.empty?
+      capture(errors, "test") { in_fixture_transaction(test) { test.public_send(name) } } if errors.empty?
       capture(errors, "teardown") { test.before_teardown } if test.respond_to?(:before_teardown)
       # Minitest's before_teardown, where mocha/minitest verifies, and
       # only a test that passed (`return unless passed?`): the stub slots'

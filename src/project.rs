@@ -6609,9 +6609,12 @@ fn boot_loaded_core_extensions(files: &[(String, String)]) -> Vec<&'static BootC
             before_ok && after_ok && !text[line_start..at].trim_start().starts_with('#')
         })
     };
+    // The harness files the scaffold ships into test/ are the runtime's, not app code: their own `Time#year` calls no core extension.
+    let mut shipped: Vec<(String, String)> = Vec::new();
+    let _ = crate::runtime_files::walk_partitioned("runtime/spinel/test", "test/", "sig/test/", &mut shipped);
     let app_code: Vec<&str> = files
         .iter()
-        .filter(|(path, _)| path.ends_with(".rb") && !path.starts_with("runtime/"))
+        .filter(|(path, text)| path.ends_with(".rb") && !path.starts_with("runtime/") && !shipped.iter().any(|(p, t)| p == path && t == text))
         .map(|(_, text)| text.as_str())
         .collect();
     BOOT_LOADED_CORE_EXTENSIONS
