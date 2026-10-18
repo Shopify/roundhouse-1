@@ -1021,6 +1021,12 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
             continue;
         }
+        // A write to the class's own instance variables (`@defined_settings << ...`,
+        // a class macro's expansion) is a class-ivar initializer
+        // (`collect_class_attr_initializers`), written in the body.
+        if writes_class_ivar(expr) {
+            continue;
+        }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;

@@ -89,6 +89,10 @@ pub(super) struct ConditionalDefinition<'pr> {
 /// whose branches holds a `def` directly. `None` for any other node,
 /// including a conditional with no `def` in its branches.
 pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<ConditionalDefinition<'pr>> {
+    // Declares nothing in the emitted app: not a conditional definition to carry.
+    if console_only(node) {
+        return None;
+    }
     let body = |statements: Option<ruby_prism::StatementsNode<'pr>>| -> Vec<Node<'pr>> {
         statements.map(|s| flatten_statements(s.as_node())).unwrap_or_default()
     };

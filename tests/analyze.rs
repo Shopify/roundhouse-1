@@ -5818,8 +5818,26 @@ fn record_identifier_explicit_receiver_dom_id_stays_unresolved() {
     assert_ne!(bad.body.ty, Some(Ty::Str), "explicit-receiver dom_id must not type as String");
 }
 
+/// A name the macro computes when it runs (here from the clock) is not in
+/// the source, so a reference to it answers untyped.
 #[test]
 fn a_method_reference_to_a_computed_name_reads_untyped() {
+    let app = app_from_files(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("lib/settings_extension.rb", "module SettingsExtension\n  def setting(name, default)\n    define_singleton_method(\"#{name}_#{Time.now.year}\") { default }\n  end\nend\n"),
+        ("app/models/article.rb", "class Article < ApplicationRecord\n  extend SettingsExtension\n  setting :title_limit, 40\n\n  def self.limit_ref\n    method(:title_limit)\n  end\n\n  def self.limits\n    [1].map(&method(:title_limit))\n  end\nend\n"),
+    ]);
+    let article = app.models.iter().find(|m| m.name.0.as_str() == "Article").expect("Article");
+    let limits = article.methods().find(|m| m.name.as_str() == "limits").expect("limits");
+    assert_eq!(limits.body.ty, Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }), "{:?}", limits.body.ty);
+}
+
+/// A macro whose name is bound from the call (`setting :title_limit` into
+/// `define_singleton_method(name)`) is expanded into the def it defines, so
+/// the reference to it reads that def's type.
+#[test]
+fn a_method_reference_to_an_expanded_macro_name_reads_its_type() {
     let app = app_from_files(&[
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
@@ -5828,5 +5846,5 @@ fn a_method_reference_to_a_computed_name_reads_untyped() {
     ]);
     let article = app.models.iter().find(|m| m.name.0.as_str() == "Article").expect("Article");
     let limits = article.methods().find(|m| m.name.as_str() == "limits").expect("limits");
-    assert_eq!(limits.body.ty, Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }), "{:?}", limits.body.ty);
+    assert_eq!(limits.body.ty, Some(Ty::Array { elem: std::sync::Arc::new(Ty::Int) }), "{:?}", limits.body.ty);
 }

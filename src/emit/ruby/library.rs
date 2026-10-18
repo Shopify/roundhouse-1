@@ -1284,10 +1284,143 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass, app: &App) -> Opti
     }
     let first = declared_at(kid, app)?;
     let above = |span: &crate::span::Span| span.file == first.file && *span != crate::span::Span::synthetic() && span.start < first.start;
+    // A statement the source wrote above the kid that reads it as it
+    // loads (a constant's value, a class-body call, a class-level
+    // initializer; through a method it calls, a parameter default, an
+    // immediately invoked closure) puts the kid right before it, as
+    // far as Ruby's own order would allow it to run: the kid's body
+    // reads only what is written above that statement.
+    let reader = parent
+        .constants
+        .iter()
+        .map(|(_, value)| value)
+        .chain(&parent.unknown_calls)
+        .chain(&parent.class_ivar_initializers)
+        .filter(|e| above(&e.span))
+        .filter(|e| {
+            let mut paths = BTreeSet::new();
+            placement_load_paths(e, parent, &mut BTreeSet::new(), &mut paths);
+            reads_nested(parent, &kid.name, &paths)
+        })
+        .map(|e| e.span)
+        .min_by_key(|span| span.start);
+    if let Some(reader) = reader {
+        return Some(crate::span::Span { start: reader.start.saturating_sub(1), ..reader });
+    }
     (parent.constants.iter().any(|(_, value)| above(&value.span))
         || parent.unknown_calls.iter().any(|call| above(&call.span))
         || includes_hooking_subclass_above(parent, kid, first, app))
     .then_some(first)
+}
+
+/// Whether one of `paths` (the constants some code reads as it loads)
+/// names `kid`, or something nested in it, as `owner`'s body would
+/// resolve it: lexically from the owner outwards, then from the root.
+fn reads_nested(owner: &LibraryClass, kid: &ClassId, paths: &BTreeSet<Vec<String>>) -> bool {
+    let kid = kid.0.as_str().trim_start_matches("::");
+    let local: BTreeSet<&str> = owner.constants.iter().map(|(name, _)| name.as_str()).collect();
+    paths.iter().any(|path| {
+        if path.len() == 1 && local.contains(path[0].as_str()) {
+            return false;
+        }
+        let rooted = path.first().is_some_and(String::is_empty);
+        let path = path.iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<_>>().join("::");
+        let mut candidates = Vec::new();
+        if !rooted {
+            let mut scope = Some(owner.name.0.as_str().trim_start_matches("::"));
+            while let Some(prefix) = scope {
+                candidates.push(format!("{prefix}::{path}"));
+                scope = prefix.rsplit_once("::").map(|(outer, _)| outer);
+            }
+        }
+        candidates.push(path);
+        candidates.iter().any(|c| c == kid || c.starts_with(&format!("{kid}::")))
+    })
+}
+
+/// The constants the code `expr` of `owner` reads as it loads: what it
+/// names, plus what the class methods it calls (and `initialize`, for
+/// `new`) read in their parameter defaults and bodies, and an
+/// immediately invoked lambda or proc (`-> { X }.call`, `proc { X }[]`)
+/// with its own parameter defaults. A closure only stored runs later
+/// and adds nothing.
+fn placement_load_paths(expr: &Expr, owner: &LibraryClass, visited: &mut BTreeSet<String>, paths: &mut BTreeSet<Vec<String>>) {
+    fn defaults(params: &[crate::dialect::Param], owner: &LibraryClass, visited: &mut BTreeSet<String>, paths: &mut BTreeSet<Vec<String>>) {
+        for default in params.iter().filter_map(|p| p.default.as_ref()) {
+            placement_load_paths(default, owner, visited, paths);
+        }
+    }
+    if let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node {
+        if matches!(method.as_str(), "call" | "[]" | "()" | "yield" | "===") {
+            let closure = match &*recv.node {
+                ExprNode::Lambda { .. } => Some(recv),
+                ExprNode::Send { recv: r, method: m, args, block: Some(block), .. }
+                    if args.is_empty() && matches!(m.as_str(), "lambda" | "proc") && stores_block(r, m.as_str()) =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            };
+            if let Some(closure) = closure {
+                if let ExprNode::Lambda { extra_params, body, signature, .. } = &*closure.node {
+                    defaults(extra_params, owner, visited, paths);
+                    for d in signature.defaults() {
+                        placement_load_paths(d, owner, visited, paths);
+                    }
+                    placement_load_paths(body, owner, visited, paths);
+                } else {
+                    placement_load_paths(closure, owner, visited, paths);
+                }
+            }
+        }
+    }
+    if let ExprNode::Apply { fun, .. } = &*expr.node {
+        if let ExprNode::Lambda { extra_params, body, signature, .. } = &*fun.node {
+            defaults(extra_params, owner, visited, paths);
+            for d in signature.defaults() {
+                placement_load_paths(d, owner, visited, paths);
+            }
+            placement_load_paths(body, owner, visited, paths);
+        }
+    }
+    if let ExprNode::Lambda { .. } = &*expr.node {
+        return;
+    }
+    if let ExprNode::Const { path } = &*expr.node {
+        paths.insert(path.iter().map(|part| part.as_str().to_string()).collect());
+    }
+    if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
+        let own = recv.as_ref().map_or(true, |recv| match &*recv.node {
+            ExprNode::SelfRef => true,
+            ExprNode::Const { path } => {
+                path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join("::")
+                    == owner.name.0.as_str().trim_start_matches("::")
+            }
+            _ => false,
+        });
+        let called = if method.as_str() == "new" { "initialize" } else { method.as_str() };
+        if own && visited.insert(called.to_string()) {
+            for def in owner.methods.iter().filter(|m| m.name.as_str() == called) {
+                defaults(&def.params, owner, visited, paths);
+                if let Some(block) = &def.block_param {
+                    defaults(std::slice::from_ref(block), owner, visited, paths);
+                }
+                placement_load_paths(&def.body, owner, visited, paths);
+            }
+        }
+        for value in recv.iter().chain(args) {
+            placement_load_paths(value, owner, visited, paths);
+        }
+        if let Some(block) = block.as_ref().filter(|_| !stores_block(recv, method.as_str())) {
+            let body = match &*block.node {
+                ExprNode::Lambda { body, .. } => body,
+                _ => block,
+            };
+            placement_load_paths(body, owner, visited, paths);
+        }
+        return;
+    }
+    expr.node.for_each_child(&mut |child| placement_load_paths(child, owner, visited, paths));
 }
 
 /// Whether `parent` includes, above `kid`'s declaration, a module whose
@@ -13252,7 +13385,8 @@ fn emit_library_class_decl_inner(
     // (`money_column(:variant_price)` above `def variant_price`) is the
     // one that stands: the macro's `define_method` ran first. The macros
     // are written below the methods, so such a def follows the macro that
-    // names it, instead of being replaced by what the macro defined.
+    // names it, instead of being replaced by what the macro defined. A
+    // class-side def counts too (`setting :limit` above `def self.limit`).
     let defs_named_below: Vec<(usize, &Expr)> = if railtie {
         Vec::new()
     } else {
@@ -13266,7 +13400,6 @@ fn emit_library_class_decl_inner(
                 let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node else { continue };
                 let Some(index) = lc.methods.iter().position(|m| {
                     m.name == *value
-                        && m.receiver == MethodReceiver::Instance
                         && !m.name_span.is_synthetic()
                         && m.name_span.file == e.span.file
                         && m.name_span.start > e.span.start

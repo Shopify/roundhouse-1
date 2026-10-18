@@ -50,12 +50,42 @@ fn assert_runs(files: &[(&str, &str)], stem: &str, script: &str) {
     assert!(output.status.success(), "{}\n{source}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// Emitted files that stay apart (a class nested in its own file, the
+/// way Rails autoload finds it) are run as files: written out as
+/// emitted, with `entry` — the file autoload loads first for the
+/// constant — required, and `script` run after. The file requires its
+/// enclosing class's, so the body reads what that file assigned.
+fn assert_runs_required(files: &[(&str, &str)], entry: &str, script: &str) {
+    let files = emitted(files);
+    let dir = std::env::temp_dir().join(format!("nested_in_parent_{}_{}", std::process::id(), entry.replace('/', "_")));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, content) in files.iter().filter(|(p, _)| p.ends_with(".rb")) {
+        let at = dir.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, content).unwrap();
+    }
+    let entry_path = files
+        .iter()
+        .map(|(p, _)| p)
+        .find(|p| p.ends_with(entry))
+        .unwrap_or_else(|| panic!("no {entry} in {:?}", files.iter().map(|(p, _)| p).collect::<Vec<_>>()));
+    let output = std::process::Command::new("ruby")
+        .args(["--enable-frozen-string-literal", "-e", &format!("require {:?}\n{script}", dir.join(entry_path))])
+        .output()
+        .expect("run emitted Ruby");
+    let ok = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let tree: Vec<String> = files.iter().map(|(p, c)| format!("# {p}\n{c}")).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "{stderr}\n{}", tree.join("\n"));
+}
+
 #[test]
 fn a_nested_file_reads_parent_constants_after_their_assignment() {
-    assert_runs(&[
+    assert_runs_required(&[
         ("app/services/gauge.rb", "class Gauge\n  PREFIX = \"start\"\n  SUFFIX = \"end\"\nend\n"),
         ("app/services/gauge/reading.rb", "class Gauge::Reading\n  TEXT = Gauge::PREFIX + Gauge::SUFFIX\nend\n"),
-    ], "gauge.rb", "raise unless Gauge::Reading::TEXT == \"startend\"");
+    ], "gauge/reading.rb", "raise unless Gauge::Reading::TEXT == \"startend\"");
 }
 
 #[test]
@@ -188,7 +218,7 @@ end
 
 #[test]
 fn a_namespaced_child_initializes_class_state_from_a_parent_constant() {
-    assert_runs(&[
+    assert_runs_required(&[
         ("app/services/tools/gauge.rb", "module Tools\n  class Gauge\n    PREFIX = \"start\"\n  end\nend\n"),
         ("app/services/tools/gauge/reading.rb", r#"class Tools::Gauge::Reading
   @prefix = Tools::Gauge::PREFIX
@@ -197,7 +227,7 @@ fn a_namespaced_child_initializes_class_state_from_a_parent_constant() {
   end
 end
 "#),
-    ], "tools/gauge.rb", "raise unless Tools::Gauge::Reading.prefix == \"start\"");
+    ], "tools/gauge/reading.rb", "raise unless Tools::Gauge::Reading.prefix == \"start\"");
 }
 
 #[test]

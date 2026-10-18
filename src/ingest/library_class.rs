@@ -4502,6 +4502,11 @@ fn walk_decl_body_in<'pr>(
         // branch has neither a `def` nor a marker, so reject it here:
         // skipping it would drop `attr_reader :token` with no error.
         if statement.as_if_node().is_some() || statement.as_unless_node().is_some() {
+            // `if defined?(Rails::Console) … end` declares nothing in the
+            // emitted app: not carried, and not a gap either.
+            if visibility::console_only(&statement) {
+                continue;
+            }
             // `if Rails.env.test?; def x = false; else; def x = …; end`:
             // every branch's methods, and which branch defines each. The
             // visibility pass admitted only branches of `def`s.
