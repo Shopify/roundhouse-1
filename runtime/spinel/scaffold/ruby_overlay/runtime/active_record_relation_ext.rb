@@ -661,3 +661,383 @@ module ActiveRecord
   end
   Relation.prepend(RelationPermittedParametersCondition)
 end
+
+module ActiveRecord
+  # Rails 8.2 `ActiveRecord::Batches` (relation/batches.rb): the batch
+  # iterators page by the cursor columns (the primary key by default), in
+  # `of:` rows per query, each page found after the last row of the one
+  # before. CRuby-only: the options are keywords the shared relation's
+  # monomorphic `find_each` / `in_batches` do not take, and the shared
+  # bodies stay for the strict targets.
+  module Batches
+    # `in_batches` without a block (Rails' BatchEnumerator): the batches as
+    # an Enumerable of relations, with the bulk writes run batch by batch.
+    class BatchEnumerator
+      include Enumerable
+
+      attr_reader :relation, :of, :start, :finish
+
+      def initialize(of:, start:, finish:, relation:, cursor:, order:, use_ranges:)
+        @of = of
+        @relation = relation
+        @start = start
+        @finish = finish
+        @cursor = cursor
+        @order = order
+        @use_ranges = use_ranges
+      end
+
+      def each(&block)
+        return to_enum(:each) unless block
+        @relation.in_batches(of: @of, start: @start, finish: @finish, load: false, cursor: @cursor, order: @order,
+                             use_ranges: @use_ranges, &block)
+      end
+
+      def each_record
+        return to_enum(:each_record) unless block_given?
+        @relation.in_batches(of: @of, start: @start, finish: @finish, load: true, cursor: @cursor, order: @order,
+                             use_ranges: @use_ranges) do |batch|
+          batch.to_a.each { |record| yield record }
+        end
+      end
+
+      def delete_all
+        total = 0
+        each { |batch| total += batch.delete_all }
+        total
+      end
+
+      def update_all(updates)
+        total = 0
+        each { |batch| total += batch.update_all(updates) }
+        total
+      end
+
+      def touch_all(*args, **kwargs)
+        total = 0
+        each { |batch| total += batch.touch_all(*args, **kwargs) }
+        total
+      end
+
+      def destroy_all
+        each(&:destroy_all)
+        nil
+      end
+
+      def inspect
+        "#<#{self.class} #{@relation.inspect} of=#{@of} start=#{@start.inspect} finish=#{@finish.inspect}>"
+      end
+    end
+  end
+
+  module RelationBatches
+    DEFAULT_ORDER = :asc
+
+    # `find_each` yields each record, a page at a time. Without a block it
+    # is an Enumerator whose size is the rows the bounds leave.
+    def find_each(start: nil, finish: nil, batch_size: 1000, error_on_ignore: nil, order: DEFAULT_ORDER, cursor: nil, &block)
+      unless block
+        return to_enum(:find_each, start: start, finish: finish, batch_size: batch_size, error_on_ignore: error_on_ignore,
+                                   order: order, cursor: cursor) do
+          batch_bounded(start, finish, order, cursor).size
+        end
+      end
+      find_in_batches(start: start, finish: finish, batch_size: batch_size, error_on_ignore: error_on_ignore, order: order,
+                      cursor: cursor) do |records|
+        records.each(&block)
+      end
+      self
+    end
+
+    # `find_in_batches` yields each page as an Array of records.
+    def find_in_batches(start: nil, finish: nil, batch_size: 1000, error_on_ignore: nil, order: DEFAULT_ORDER, cursor: nil, &block)
+      unless block
+        return to_enum(:find_in_batches, start: start, finish: finish, batch_size: batch_size,
+                                         error_on_ignore: error_on_ignore, order: order, cursor: cursor) do
+          total = batch_bounded(start, finish, order, cursor).size
+          (total - 1).div(batch_size) + 1
+        end
+      end
+      in_batches(of: batch_size, start: start, finish: finish, load: true, error_on_ignore: error_on_ignore, order: order,
+                 cursor: cursor) do |batch|
+        yield batch.to_a
+      end
+      self
+    end
+
+    # `in_batches` yields each page as a relation (`load: true` keeps the
+    # rows it already read), or answers a BatchEnumerator without a block.
+    # `use_ranges: true` yields the page as the id range it spans in place
+    # of an IN list of its ids.
+    def in_batches(of: 1000, start: nil, finish: nil, load: false, error_on_ignore: nil, order: DEFAULT_ORDER,
+                   use_ranges: nil, cursor: nil, &block)
+      cursor = batch_cursor(cursor)
+      dirs = batch_directions(order, cursor)
+      unless block
+        return Batches::BatchEnumerator.new(of: of, start: start, finish: finish, relation: self, cursor: cursor,
+                                            order: order, use_ranges: use_ranges)
+      end
+      if !@orders.empty? && error_on_ignore
+        raise ArgumentError, "Scoped order is ignored, it's forced to be batch order."
+      end
+      return batch_loaded_relation(of, start, finish, cursor, dirs, &block) unless @records.nil?
+      batch_unloaded_relation(of, start, finish, load, use_ranges, cursor, dirs, &block)
+      nil
+    end
+
+    protected
+
+    def batch_cursor(cursor)
+      cursor = @model.primary_key if cursor.nil?
+      names = Array(cursor).map(&:to_s)
+      raise ArgumentError, "Primary key not included in the custom select clause" if names.empty?
+      names
+    end
+
+    def batch_directions(order, cursor)
+      dirs = Array(order).map { |one| one.to_s.downcase.to_sym }
+      dirs.each do |dir|
+        raise ArgumentError, ":order must be :asc or :desc or an array consisting of :asc or :desc, got #{order.inspect}" unless dir == :asc || dir == :desc
+      end
+      dirs = Array.new(cursor.length, dirs[0]) if dirs.length == 1
+      raise ArgumentError, "Cursor and order must have the same length" unless dirs.length == cursor.length
+      dirs
+    end
+
+    def batch_column(name)
+      "#{@table}.#{@model._attribute_name(name)}"
+    end
+
+    # The rows from `values` on in the batch order (`side` :after) or up to
+    # them (:before), the cursor read lexicographically: each column
+    # beyond the equal ones before it, the last one inclusive when asked.
+    def batch_condition(cursor, dirs, values, side, inclusive)
+      values = [values] unless values.is_a?(Array) && cursor.length > 1
+      raise ArgumentError, "Cursor and bound must have the same length" unless values.length == cursor.length
+      clauses = []
+      cursor.each_index do |i|
+        parts = []
+        i.times { |j| parts << "#{batch_column(cursor[j])} = #{ActiveRecord.adapter.escape_value(values[j])}" }
+        greater = (side == :after) == (dirs[i] == :asc)
+        op = greater ? ">" : "<"
+        op = "#{op}=" if inclusive && i == cursor.length - 1
+        parts << "#{batch_column(cursor[i])} #{op} #{ActiveRecord.adapter.escape_value(values[i])}"
+        clauses << "(#{parts.join(" AND ")})"
+      end
+      clauses.join(" OR ")
+    end
+
+    def batch_bounded(start, finish, order, cursor)
+      cursor = batch_cursor(cursor)
+      dirs = batch_directions(order, cursor)
+      relation = spawn
+      relation = relation.batch_bound(batch_condition(cursor, dirs, start, :after, true)) unless start.nil?
+      relation = relation.batch_bound(batch_condition(cursor, dirs, finish, :before, true)) unless finish.nil?
+      relation
+    end
+
+    public
+
+    # One more condition on a copy, as SQL written over the cursor columns.
+    def batch_bound(sql)
+      copy = spawn
+      copy.batch_bound!(sql)
+    end
+
+    def batch_bound!(sql)
+      own_lists
+      unload_records
+      push_where("(#{sql})")
+      self
+    end
+
+    # Rows already read for the batch it stands for, as `load: true`
+    # hands them on.
+    def batch_loaded!(records)
+      @records = records
+      self
+    end
+
+    private
+
+    def batch_unloaded_relation(of, start, finish, load, use_ranges, cursor, dirs)
+      batch_limit = of
+      remaining = @limit
+      batch_limit = remaining if !remaining.nil? && remaining < batch_limit
+      # `order` takes bare identifiers, so the table is named unquoted.
+      table = @model.table_name.to_s
+      qualifier = table.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/) ? "#{table}." : ""
+      order_terms = cursor.each_index.map { |i| "#{qualifier}#{@model._attribute_name(cursor[i])} #{dirs[i] == :asc ? "ASC" : "DESC"}" }
+      relation = reorder(*order_terms).limit(batch_limit)
+      relation = relation.batch_bound(batch_condition(cursor, dirs, start, :after, true)) unless start.nil?
+      relation = relation.batch_bound(batch_condition(cursor, dirs, finish, :before, true)) unless finish.nil?
+      by_key = cursor.length == 1 && cursor[0] == Array(@model.primary_key).map(&:to_s).first && !use_ranges
+      lower = start.nil? ? nil : batch_condition(cursor, dirs, start, :after, true)
+      batch_relation = relation
+      loop do
+        if load
+          records = batch_relation.to_a
+          break if records.empty?
+          rows = records
+          last = cursor.map { |name| records.last[name] }
+          last = last[0] if cursor.length == 1
+        else
+          rows = batch_relation.pluck(*cursor)
+          break if rows.empty?
+          last = rows.last
+        end
+        yielded = if by_key
+          keys = load ? records.map { |record| record[cursor[0]] } : rows
+          spawn.where(@model.primary_key => keys)
+        else
+          bounded = spawn
+          bounded = bounded.batch_bound(lower) unless lower.nil?
+          bounded.batch_bound(batch_condition(cursor, dirs, last, :before, true))
+        end
+        yielded.batch_loaded!(records) if load
+        yield yielded
+        break if rows.length < batch_limit
+        unless @limit.nil?
+          remaining -= rows.length
+          break if remaining <= 0
+          relation = relation.limit(remaining) if remaining < batch_limit
+        end
+        lower = batch_condition(cursor, dirs, last, :after, false)
+        batch_relation = relation.batch_bound(lower)
+      end
+    end
+
+    # A relation that has its rows already pages over them in memory
+    # (Rails' batch_on_loaded_relation).
+    def batch_loaded_relation(of, start, finish, cursor, dirs)
+      raise NotImplementedError, "roundhouse: in_batches over a loaded relation with mixed :asc and :desc cursor order" unless dirs.uniq.length <= 1
+      key = ->(record) { cursor.map { |name| record[name] } }
+      records = @records.sort_by(&key)
+      records = records.reverse if dirs[0] == :desc
+      records = records.select { |record| (key.call(record) <=> Array(start)) != (dirs[0] == :asc ? -1 : 1) } unless start.nil?
+      records = records.select { |record| (key.call(record) <=> Array(finish)) != (dirs[0] == :asc ? 1 : -1) } unless finish.nil?
+      records = records.first(@limit) unless @limit.nil?
+      records.each_slice(of) do |slice|
+        keys = slice.map { |record| record[cursor[0]] }
+        yield spawn.where(@model.primary_key => keys).batch_loaded!(slice)
+      end
+      nil
+    end
+  end
+  Relation.prepend(RelationBatches)
+
+  # `Model.find_each` / `find_in_batches` / `in_batches`: the same on the
+  # model's relation (Rails delegates them through `all`).
+  module BaseBatches
+    def find_each(**options, &block)
+      all.find_each(**options, &block)
+    end
+
+    def find_in_batches(**options, &block)
+      all.find_in_batches(**options, &block)
+    end
+
+    def in_batches(**options, &block)
+      all.in_batches(**options, &block)
+    end
+  end
+  Base.singleton_class.prepend(BaseBatches)
+
+  # Rails 8.2 Relation surface the shared relation leaves out.
+  module RelationRailsSurface
+    # `count(column)` counts the rows where the column is not NULL
+    # (`COUNT(col)`, `COUNT(DISTINCT col)` on a distinct relation); `count`
+    # alone and the block form keep the shared relation's answers.
+    def count(column_name = nil, &block)
+      if block
+        raise ArgumentError, "Column name argument is not supported when a block is passed." unless column_name.nil?
+        return super(&block)
+      end
+      return super() if column_name.nil? || column_name.to_s == "all" || column_name.to_s == "*"
+      return 0 if @null
+      raise NotImplementedError, "roundhouse: #{@model}.group(…).count(#{column_name.inspect}) is not ported" unless @groups.empty?
+      expression = count_column_expression(column_name)
+      expression = "DISTINCT #{expression}" if @distinct && !expression.match?(/\ADISTINCT\s/i)
+      rows = ActiveRecord.adapter.select_rows(append_join_where("#{cte_prefix}SELECT COUNT(#{expression}) AS n FROM #{from_source}"))
+      rows.length == 0 ? 0 : rows[0]["n"].to_i
+    end
+
+    # Rails' `invert_where` (`where_clause.invert`): the relation's
+    # conditions negated as one. With no condition Rails writes `NOT ()`,
+    # which PostgreSQL refuses; here it stays no condition. A relation
+    # emptied by `where(id: [])` (always false) turns always true.
+    def invert_where
+      spawn.invert_where!
+    end
+
+    def invert_where!
+      own_lists
+      @null = false
+      unload_records
+      return self if @wheres.empty?
+      clause = "NOT (#{@wheres.join(" AND ")})"
+      @wheres = []
+      @where_null = []
+      @where_parts = {}
+      @scope_attributes = {}
+      @opaque_wheres = true
+      push_where(clause)
+      self
+    end
+
+    # Rails' `except(*skips)`: the relation without those clauses.
+    def except(*skips)
+      spawn.except!(*skips)
+    end
+
+    def except!(*skips)
+      own_lists
+      unload_records
+      skips.flatten.each { |skip| unscope_clause(skip.to_sym) }
+      clear_null_unless_forced
+      self
+    end
+
+    # Rails' `Relation#reset`: forget the loaded rows.
+    def reset
+      unload_records
+      self
+    end
+
+    # `update!(id = :all, attributes)`: `update` with the bang's raises.
+    def update!(id = :all, attributes)
+      return each { |record| record.update!(attributes) } if id == :all
+      scoping do
+        if id.is_a?(Array)
+          id.map { |one| update!(one, attributes) }
+        else
+          record = find(id)
+          record.update!(attributes)
+          record
+        end
+      end
+    end
+
+    def first_or_create(attributes = nil, &block)
+      first || create(attributes || {}, &block)
+    end
+
+    def first_or_create!(attributes = nil, &block)
+      first || create!(attributes || {}, &block)
+    end
+
+    private
+
+    # Rails' `aggregate_column`: a column of the model is the table's, a
+    # `table.column` or any other text is SQL as written.
+    def count_column_expression(column_name)
+      text = column_name.to_s
+      if text.match?(/\A\w+\z/)
+        name = @model._attribute_name(text)
+        return "#{@table}.#{name}" if @model.schema_columns.include?(name.to_sym)
+      end
+      text
+    end
+  end
+  Relation.prepend(RelationRailsSurface)
+end
