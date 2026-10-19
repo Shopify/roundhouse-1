@@ -178,7 +178,7 @@ puts "ALL OK"
 const PORT_WITH_OVERLAY: &str = r##"
 require_relative "runtime/spinel/active_support_cache"
 overlay = File.read("runtime/spinel/scaffold/ruby_overlay/test/test_support_cruby.rb")
-from = overlay.index("module ActiveSupport\n  module Cache\n    class MemoryStore\n      module Instrumented") or raise "overlay moved"
+from = overlay.index("module ActiveSupport\n  module Cache\n    class MemoryStore\n      unless private_method_defined?(:instrument)") or raise "overlay moved"
 upto = overlay.index("# Rails' collection renderer") or raise "overlay moved"
 eval(overlay[from...upto], TOPLEVEL_BINDING)
 "##;
@@ -189,7 +189,7 @@ fn overlay_fetch_forwards_options_and_the_block_to_the_store() {
         "{PORT_WITH_OVERLAY}{}",
         r##"
 store = ActiveSupport::Cache::MemoryStore.new
-raise "overlay not prepended" unless store.singleton_class.ancestors.include?(ActiveSupport::Cache::MemoryStore::Instrumented)
+raise "overlay stacked on the port" if ActiveSupport::Cache::MemoryStore.const_defined?(:Instrumented, false)
 events = []
 ActiveSupport::Notifications.subscribe("cache_read.active_support") { |*args| events << args.last }
 
@@ -253,12 +253,11 @@ raise "write expires_in" unless store.read("e").nil?
 store.write_multi({ "x" => 1, "y" => 2 }, expires_in: 60, namespace: "m")
 events.clear
 raise "read_multi" unless store.read_multi("x", "y", "z", namespace: "m") == { "x" => 1, "y" => 2 }
-# Two events: the store's own (namespaced keys) and the overlay's (the
-# names as asked) — neither may list the options Hash as a key.
-raise "read_multi events #{events.inspect}" unless events.length == 2
+# One event, the store's own (namespaced keys), not listing the options
+# Hash as a key.
+raise "read_multi events #{events.inspect}" unless events.length == 1
 raise "options listed as a key #{events.inspect}" unless events.all? { |e| e[:key].length == 3 && e[:key].none? { |k| k.include?("namespace") } }
 raise "store event" unless events.any? { |e| e[:key] == %w[m:x m:y m:z] && e[:hits] == %w[m:x m:y] }
-raise "overlay event" unless events.any? { |e| e[:key] == %w[x y z] && e[:hits] == %w[x y] }
 events.clear
 store.read_multi("x", "y")
 raise "bare names" unless events.all? { |e| e[:key].length == 2 }
@@ -271,6 +270,137 @@ raise "delete ns" unless store.delete("a", namespace: "n") && store.read("a", na
 raise "incr" unless store.increment("cnt", 2, expires_in: 60) == 2
 raise "incr again" unless store.increment("cnt") == 3
 raise "decr" unless store.decrement("cnt", 1) == 2
+puts "ALL OK"
+"##
+    ));
+}
+
+/// The bounded store with the same overlay: the overlay instruments it
+/// (it does not instrument itself), and each operation reports once.
+const BOUNDED_WITH_OVERLAY: &str = r##"
+require_relative "runtime/ruby/rails"
+require_relative "runtime/spinel/active_support_cache_memory"
+require_relative "runtime/spinel/active_support_notifications"
+overlay = File.read("runtime/spinel/scaffold/ruby_overlay/test/test_support_cruby.rb")
+from = overlay.index("module ActiveSupport\n  module Cache\n    class MemoryStore\n      unless private_method_defined?(:instrument)") or raise "overlay moved"
+upto = overlay.index("# Rails' collection renderer") or raise "overlay moved"
+eval(overlay[from...upto], TOPLEVEL_BINDING)
+EVENTS = []
+%w[read write read_multi write_multi exist? delete].each do |op|
+  ActiveSupport::Notifications.subscribe("cache_#{op}.active_support") { |name, *rest| EVENTS << [name.sub(".active_support", ""), rest.last] }
+end
+def seen
+  EVENTS.clear
+  yield
+  EVENTS.map(&:first)
+end
+"##;
+
+#[test]
+fn overlay_reports_each_event_once_on_the_bounded_store() {
+    run_ruby(&format!(
+        "{BOUNDED_WITH_OVERLAY}{}",
+        r##"
+store = ActiveSupport::Cache::MemoryStore.new
+raise "overlay not prepended" unless ActiveSupport::Cache::MemoryStore::Instrumented.instance_method(:read)
+raise "overlay not prepended" unless store.singleton_class.ancestors.include?(ActiveSupport::Cache::MemoryStore::Instrumented)
+
+# write: one cache_write, with the key.
+raise "write #{seen { store.write("a", 1) }}" unless seen { store.write("a", 1) } == ["cache_write"]
+store.write("a", 1)
+raise "write payload #{EVENTS.last.inspect}" unless EVENTS.last[1][:key] == "a" && EVENTS.last[1][:store] == "ActiveSupport::Cache::MemoryStore"
+
+# read: one cache_read with hit, hit or miss; the hit probe is no event.
+raise "read hit #{seen { store.read("a") }}" unless seen { store.read("a") } == ["cache_read"]
+store.read("a")
+raise "payload #{EVENTS.last[1].inspect}" unless EVENTS.last[1][:key] == "a" && EVENTS.last[1][:hit] == true
+raise "read miss" unless seen { store.read("zz") } == ["cache_read"] && EVENTS.last[1][:hit] == false
+raise "no super_operation on read" if EVENTS.last[1].key?(:super_operation)
+
+# exist?: one cache_exist?, nothing more.
+raise "exist? #{seen { store.exist?("a") }}" unless seen { store.exist?("a") } == ["cache_exist?"]
+
+# fetch miss: the read (super_operation: :fetch, hit: false), then the write.
+names = seen { store.fetch("f", expires_in: 60) { "v" } }
+raise "fetch miss #{names}" unless names == ["cache_read", "cache_write"]
+raise "fetch miss payload #{EVENTS.inspect}" unless EVENTS[0][1][:super_operation] == :fetch && EVENTS[0][1][:hit] == false && EVENTS[0][1][:key] == "f" && EVENTS[0][1][:expires_in] == 60
+# fetch hit: the read alone.
+names = seen { store.fetch("f", expires_in: 60) { "other" } }
+raise "fetch hit #{names}" unless names == ["cache_read"]
+raise "fetch hit payload #{EVENTS.inspect}" unless EVENTS[0][1][:super_operation] == :fetch && EVENTS[0][1][:hit] == true
+# blockless fetch is a plain read, once.
+raise "blockless fetch #{seen { store.fetch("f") }}" unless seen { store.fetch("f") } == ["cache_read"]
+store.fetch("f")
+raise "blockless payload" if EVENTS.last[1].key?(:super_operation)
+# force: no read, one write. skip_nil with nil: a read, no write.
+raise "force #{seen { store.fetch("f", force: true) { "n" } }}" unless seen { store.fetch("f", force: true) { "n" } } == ["cache_write"]
+raise "skip_nil #{seen { store.fetch("sn", skip_nil: true) { nil } }}" unless seen { store.fetch("sn", skip_nil: true) { nil } } == ["cache_read"]
+# a namespaced entry is a hit under its namespace, keyed with it.
+store.write("ns", 1, namespace: "one")
+seen { store.fetch("ns", namespace: "one") { 2 } }
+raise "ns #{EVENTS.inspect}" unless EVENTS.length == 1 && EVENTS[0][1][:hit] == true && EVENTS[0][1][:key] == "one:ns"
+
+# read_multi: one event, the names (options Hash not among them) and hits.
+raise "read_multi #{seen { store.read_multi("a", "f", "zz") }}" unless seen { store.read_multi("a", "f", "zz") } == ["cache_read_multi"]
+store.read_multi("a", "f", "zz")
+raise "read_multi payload #{EVENTS.last[1].inspect}" unless EVENTS.last[1][:key] == %w[a f zz] && EVENTS.last[1][:hits] == %w[a f]
+store.read_multi("a", "zz", expires_in: 60)
+raise "options as key #{EVENTS.last[1].inspect}" unless EVENTS.last[1][:key] == %w[a zz]
+
+# write_multi: one cache_write_multi, not one write per name.
+raise "write_multi #{seen { store.write_multi({ "m" => 1, "n" => 2 }) }}" unless seen { store.write_multi({ "m" => 1, "n" => 2 }) } == ["cache_write_multi"]
+store.write_multi({ "m" => 1, "n" => 2 })
+raise "write_multi key #{EVENTS.last[1].inspect}" unless EVENTS.last[1][:key] == %w[m n]
+raise "write after write_multi" unless seen { store.write("w", 1) } == ["cache_write"]
+
+# fetch_multi: one read_multi (super_operation: :fetch_multi), one write_multi for the misses.
+names = seen { store.fetch_multi("m", "x", "y") { |n| n * 2 } }
+raise "fetch_multi #{names}" unless names == ["cache_read_multi", "cache_write_multi"]
+raise "fetch_multi payload #{EVENTS.inspect}" unless EVENTS[0][1][:super_operation] == :fetch_multi && EVENTS[0][1][:hits] == %w[m] && EVENTS[1][1][:key] == %w[x y]
+raise "fetch_multi all hits #{seen { store.fetch_multi("m", "x") { |n| n } }}" unless seen { store.fetch_multi("m", "x") { |n| n } } == ["cache_read_multi"]
+
+# a failing subscriber surfaces from the write, once.
+raised = 0
+sub = ActiveSupport::Notifications.subscribe("cache_write.active_support") { raised += 1; raise IOError, "Cache write failed" }
+begin
+  store.write("boom", 1)
+  raise "write did not raise"
+rescue IOError
+end
+ActiveSupport::Notifications.unsubscribe(sub)
+raise "raised #{raised}" unless raised == 1
+puts "ALL OK"
+"##
+    ));
+}
+
+#[test]
+fn overlay_reports_each_event_once_on_the_ported_store() {
+    run_ruby(&format!(
+        "{PORT_WITH_OVERLAY}{}",
+        r##"
+store = ActiveSupport::Cache::MemoryStore.new
+events = []
+%w[read write read_multi write_multi exist? delete].each do |op|
+  ActiveSupport::Notifications.subscribe("cache_#{op}.active_support") { |name, *rest| events << [name.sub(".active_support", ""), rest.last] }
+end
+seen = ->(&blk) { events.clear; blk.call; events.map(&:first) }
+raise "overlay stacked on the port" if ActiveSupport::Cache::MemoryStore.const_defined?(:Instrumented, false)
+raise "stacked" if store.singleton_class.ancestors.any? { |a| a.name.to_s.end_with?("Instrumented") }
+
+raise "write #{events.inspect}" unless seen.call { store.write("a", 1) } == ["cache_write"]
+raise "write key" unless events[0][1][:key] == "a" && events[0][1][:store] == "ActiveSupport::Cache::MemoryStore"
+raise "read" unless seen.call { store.read("a") } == ["cache_read"]
+raise "read payload #{events.inspect}" unless events[0][1][:key] == "a" && events[0][1][:hit] == true
+raise "read miss" unless seen.call { store.read("zz") } == ["cache_read"] && events[0][1][:hit] == false
+raise "exist? #{events.inspect}" unless seen.call { store.exist?("a") } == ["cache_exist?"]
+names = seen.call { store.fetch("f", expires_in: 60) { "v" } }
+raise "fetch miss #{names}" unless names == ["cache_read", "cache_write"]
+raise "fetch payload #{events.inspect}" unless events[0][1][:super_operation] == :fetch && events[0][1][:hit] == false
+names = seen.call { store.fetch("f", expires_in: 60) { "other" } }
+raise "fetch hit #{names}" unless names == ["cache_read"] && events[0][1][:super_operation] == :fetch && events[0][1][:hit] == true
+raise "read_multi" unless seen.call { store.read_multi("a", "f", "zz") } == ["cache_read_multi"]
+raise "read_multi payload #{events.inspect}" unless events[0][1][:key] == %w[a f zz] && events[0][1][:hits] == %w[a f]
 puts "ALL OK"
 "##
     ));

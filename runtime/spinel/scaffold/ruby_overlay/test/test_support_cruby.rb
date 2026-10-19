@@ -368,47 +368,132 @@ end
 # with the keys asked for and the ones found (`hits`) — the events
 # campfire's fragment tests subscribe to. A fetch is a read, then on a
 # miss a write, as Rails instruments it.
+#
+# Only a store that does not report them itself is instrumented here.
+# The ported Rails store (runtime/spinel/active_support_cache.rb)
+# publishes every `cache_<operation>.active_support` through its own
+# private `Store#instrument`, so a second report from this file would
+# fire each event twice; the bounded store
+# (runtime/spinel/active_support_cache_memory.rb) has none. The probe
+# for a hit reads the store without reporting, so it is no event of its
+# own.
 module ActiveSupport
   module Cache
     class MemoryStore
-      module Instrumented
-        def read(name, options = nil)
-          key = ActiveSupport::Cache.expanded_key(name)
-          hit = options.nil? ? exist?(name) : exist?(name, options)
-          value = super
-          ActiveSupport::Notifications.instrument("cache_read.active_support", { key: key, hit: hit })
-          value
-        end
+      unless private_method_defined?(:instrument)
+        module Instrumented
+          def read(name, options = nil)
+            payload = __rh_payload(name, options)
+            payload[:hit] = __rh_hit?(name, options)
+            value = super
+            ActiveSupport::Notifications.instrument("cache_read.active_support", payload)
+            value
+          end
 
-        def write(name, value, options = nil)
-          stored = super
-          ActiveSupport::Notifications.instrument("cache_write.active_support", { key: ActiveSupport::Cache.expanded_key(name) })
-          stored
-        end
+          def exist?(name, options = nil)
+            found = super
+            ActiveSupport::Notifications.instrument("cache_exist?.active_support", __rh_payload(name, options))
+            found
+          end
 
-        # Rails' `fetch(name, options = nil, &block)`: the options a
-        # caller writes as keywords arrive as the one Hash, and go on to
-        # the store (and to `exist?`, so a `namespace:` finds its entry).
-        def fetch(name, options = nil, &block)
-          key = ActiveSupport::Cache.expanded_key(name)
-          hit = options.nil? ? exist?(name) : exist?(name, options)
-          ActiveSupport::Notifications.instrument("cache_read.active_support", { key: key, hit: hit, super_operation: :fetch })
-          super
-        end
+          def write(name, value, options = nil)
+            stored = super
+            unless @__rh_in_write_multi
+              ActiveSupport::Notifications.instrument("cache_write.active_support", __rh_payload(name, options))
+            end
+            stored
+          end
 
-        # `read_multi(*names, **options)`: a trailing Hash is the options,
-        # not a name.
-        def read_multi(*names)
-          found = super
-          keys = names.last.instance_of?(Hash) ? names[0...-1] : names
-          ActiveSupport::Notifications.instrument("cache_read_multi.active_support", {
-            key: keys.map { |name| ActiveSupport::Cache.expanded_key(name) },
-            hits: found.keys.map { |name| ActiveSupport::Cache.expanded_key(name) }
-          })
-          found
+          # The bounded `write_multi` writes through `write`; Rails reports
+          # one `cache_write_multi` for the batch, keyed by the names.
+          def write_multi(hash, options = nil)
+            @__rh_in_write_multi = true
+            stored = super
+            @__rh_in_write_multi = false
+            payload = { store: self.class.name, key: hash.keys.map { |name| __rh_key(name, options) } }
+            payload.merge!(options) if options
+            ActiveSupport::Notifications.instrument("cache_write_multi.active_support", payload) unless hash.empty?
+            stored
+          ensure
+            @__rh_in_write_multi = false
+          end
+
+          # `fetch_multi(*names, **options) { |name| … }` reads the names
+          # first — one `cache_read_multi` marked `super_operation:
+          # :fetch_multi` — then writes the computed ones (`write_multi`).
+          def fetch_multi(*names, &block)
+            return super unless block
+            options = names.last.instance_of?(Hash) ? names.last : nil
+            keys = options ? names[0...-1] : names
+            unless options && options[:force]
+              payload = { store: self.class.name, key: keys.map { |name| __rh_key(name, options) } }
+              payload.merge!(options) if options
+              payload[:super_operation] = :fetch_multi
+              payload[:hits] = keys.select { |name| __rh_hit?(name, options) }.map { |name| __rh_key(name, options) }
+              ActiveSupport::Notifications.instrument("cache_read_multi.active_support", payload)
+            end
+            super
+          end
+
+          # Rails' `fetch(name, options = nil, &block)`: the options a
+          # caller writes as keywords arrive as the one Hash, and go on to
+          # the store (and to the hit probe, so a `namespace:` finds its
+          # entry). A blockless fetch is a plain `read`, which reports
+          # itself; `force: true` skips the read, as Rails does. The
+          # bounded store writes a computed value without going through
+          # `write`, so the write is reported here.
+          def fetch(name, options = nil, &block)
+            return super unless block
+            unless options && options[:force]
+              payload = __rh_payload(name, options)
+              payload[:super_operation] = :fetch
+              payload[:hit] = __rh_hit?(name, options)
+              ActiveSupport::Notifications.instrument("cache_read.active_support", payload)
+            end
+            computed = false
+            result = super(name, options) { |computed_name| computed = true; block.call(computed_name) }
+            unless !computed || (result.nil? && options && options[:skip_nil])
+              ActiveSupport::Notifications.instrument("cache_write.active_support", __rh_payload(name, options))
+            end
+            result
+          end
+
+          # `read_multi(*names, **options)`: a trailing Hash is the options,
+          # not a name.
+          def read_multi(*names)
+            found = super
+            options = names.last.instance_of?(Hash) ? names.last : nil
+            keys = options ? names[0...-1] : names
+            payload = { store: self.class.name, key: keys.map { |name| __rh_key(name, options) } }
+            payload.merge!(options) if options
+            payload[:hits] = found.keys.map { |name| __rh_key(name, options) }
+            ActiveSupport::Notifications.instrument("cache_read_multi.active_support", payload)
+            found
+          end
+
+          private
+
+          # `Store#instrument`'s payload: the store, the normalized key
+          # (namespace included) and the call's options.
+          def __rh_payload(name, options)
+            payload = { store: self.class.name, key: __rh_key(name, options) }
+            payload.merge!(options) if options
+            payload
+          end
+
+          def __rh_key(name, options)
+            storage_key(name, ActiveSupport::Cache::MemoryStore.options(options))
+          end
+
+          # Whether a live entry is filed under `name`, asked of the store
+          # without the report `exist?` makes.
+          def __rh_hit?(name, options)
+            key = __rh_key(name, options)
+            @lock.synchronize { live_locked(key)[0] }
+          end
         end
+        prepend Instrumented
       end
-      prepend Instrumented
     end
   end
 end
