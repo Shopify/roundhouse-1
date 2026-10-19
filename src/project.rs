@@ -6478,6 +6478,12 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
+    // memory_mapped_store's ActiveSupport::Cache::MemoryMappedStore is a
+    // `Store` and requires this before reopening `ActiveSupport::Cache`;
+    // Rails has loaded it natively (ActiveSupport::Cache is autoloaded and
+    // `config.cache_store` resolves it at boot). Carried with the tree's
+    // ActiveSupport::Cache port or not at all.
+    ("active_support/cache", &["active_support_cache"]),
     ("active_support/logger", &["active_support_logger"]),
     ("active_support/tagged_logging", &["active_support_logger"]),
     ("active_support/broadcast_logger", &["active_support_logger"]),
@@ -19697,6 +19703,22 @@ mod tests {
     }
 
     use super::*;
+
+    /// memory_mapped_store requires "active_support/cache" as it loads; a
+    /// tree that carries the ActiveSupport::Cache port answers it with that
+    /// port, and one that does not gets no file (the require then refuses
+    /// by name rather than loading a gem home's Rails).
+    #[test]
+    fn require_active_support_cache_is_answered_by_the_cache_port() {
+        let mut carried = vec![("runtime/active_support_cache.rb".to_string(), String::new())];
+        framework_feature_files(&mut carried);
+        let feature = carried.iter().find(|(p, _)| p == "runtime/features/active_support/cache.rb").expect("feature file");
+        assert!(feature.1.contains("require_relative \"../../active_support_cache\"\n"), "{}", feature.1);
+
+        let mut bare: Vec<(String, String)> = Vec::new();
+        framework_feature_files(&mut bare);
+        assert!(!bare.iter().any(|(p, _)| p == "runtime/features/active_support/cache.rb"));
+    }
 
     /// A class body the emitter split around a cycle (close, require,
     /// reopen) still names one constant, so it autoloads rather than

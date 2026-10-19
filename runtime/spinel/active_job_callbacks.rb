@@ -676,9 +676,75 @@ module ActiveJob
     end
   end
 
+  # ActiveJob::QueueAdapter's class-level adapter and the test helper's
+  # `TestQueueAdapter#disable_test_adapter` (active_job/test_helper.rb).
+  #
+  # The suite's `:test` adapter is the shared runtime's enqueue-only mode
+  # (active_job.rb), which holds a job's work and never reaches an
+  # adapter. A class that `disable_test_adapter`s (Core's
+  # `WithProductionJobQueue`, to exercise the Hedwig queue) is taken out
+  # of it, as Rails does through `TestQueueAdapter.exclude`: its jobs go
+  # to the adapter the class was given (`self.queue_adapter = X`), the
+  # way a production enqueue does. The exclusion lasts until the test's
+  # teardown (`ActiveJob::TestHelper#after_teardown`).
+  module QueueAdapter
+    @excluded_jobs = []
+    singleton_class.attr_reader :excluded_jobs # :nodoc:
+
+    def self.reset # :nodoc:
+      @excluded_jobs.clear
+    end
+
+    module ClassMethods
+      def queue_adapter=(adapter)
+        @_queue_adapter = adapter
+      end
+
+      # The adapter the nearest class that assigned one holds; nil where
+      # none did (the shared runtime's in-process adapter takes the job).
+      def queue_adapter
+        owner = self
+        until owner.nil?
+          return owner.instance_variable_get(:@_queue_adapter) if owner.instance_variable_defined?(:@_queue_adapter)
+          owner = owner.superclass
+          owner = nil unless owner.respond_to?(:queue_adapter)
+        end
+        nil
+      end
+
+      def disable_test_adapter
+        QueueAdapter.excluded_jobs << self unless QueueAdapter.excluded_jobs.include?(self)
+        nil
+      end
+
+      # Whether this class or an ancestor was taken out of the `:test`
+      # adapter (`TestQueueAdapter.compute_excluded`).
+      def test_adapter_disabled?
+        QueueAdapter.excluded_jobs.any? { |job| self <= job }
+      end
+
+      # The adapter a job of this class enqueues through, when the `:test`
+      # adapter does not take it: one an adapter object answers
+      # `enqueue`/`enqueue_at` for (`:inline` and the like are names).
+      def production_queue_adapter # :nodoc:
+        return nil unless test_adapter_disabled?
+        adapter = queue_adapter
+        adapter.respond_to?(:enqueue) && adapter.respond_to?(:enqueue_at) ? adapter : nil
+      end
+    end
+
+    def queue_adapter
+      self.class.queue_adapter
+    end
+  end
+
   # ActiveJob::Enqueuing.
   module Enqueuing
+    include QueueAdapter
+
     module ClassMethods
+      include QueueAdapter::ClassMethods
+
       # Push a job onto the queue. By default the arguments must be either
       # String, Integer, Float, NilClass, TrueClass, FalseClass, BigDecimal,
       # Symbol, Date, Time, DateTime, ActiveSupport::TimeWithZone,
@@ -734,6 +800,8 @@ module ActiveJob
       def _raw_enqueue
         job_class = self.class
         name = job_class.name
+        adapter = job_class.production_queue_adapter
+        return enqueue_through(adapter) unless adapter.nil?
         enqueued = [arguments, job_id, executions, queue_name, @priority]
         work = -> do
           arguments, job_id, executions, queue_name, priority = enqueued
@@ -756,6 +824,23 @@ module ActiveJob
           ActiveJob.hold(name, work)
         end
         self.successfully_enqueued = true
+      end
+
+      # ActiveJob::Enqueuing#enqueue's adapter call, for a class the
+      # `:test` adapter does not take (`disable_test_adapter`): the job
+      # goes to the adapter the class was given, scheduled or not, and an
+      # EnqueueError it raises is the job's `enqueue_error`.
+      def enqueue_through(adapter)
+        begin
+          if scheduled_at
+            adapter.enqueue_at(self, scheduled_at.to_f)
+          else
+            adapter.enqueue(self)
+          end
+          self.successfully_enqueued = true
+        rescue EnqueueError => e
+          self.enqueue_error = e
+        end
       end
 
       # The payload the generated `JobRegistry` writes for this job
