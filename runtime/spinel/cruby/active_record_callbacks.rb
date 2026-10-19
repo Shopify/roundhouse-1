@@ -593,8 +593,9 @@ module ActiveRecord
 
     # Rails' `create!` saves with `save!` (`object.save!`), so a halted
     # save raises RecordNotSaved.
-    def self.create!(attrs = {})
+    def self.create!(attrs = {}, &block)
       instance = new(attrs)
+      block.call(instance) if block
       instance.save!
       instance
     end
@@ -907,8 +908,9 @@ module ActiveRecord
     remove_method(:create!) if method_defined?(:create!, false)
 
     # Relation#create!: `save!`, as Base.create! above.
-    def create!(attrs = {})
+    def create!(attrs = {}, &block)
       record = build(attrs)
+      block.call(record) if block
       record.save!
       record
     end
