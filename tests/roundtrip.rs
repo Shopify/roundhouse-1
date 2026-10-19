@@ -276,6 +276,7 @@ fn tiny_blog_round_trips() {
         bundler_gems: Vec::new(),
         ruby_delegate_forwarders: Default::default(),
         ruby_declined_delegate_forwarders: Default::default(),
+        ruby_abstract_stubs: Default::default(),
         class_eval_macro_expansions: Default::default(),
         concern_prepended_items: Default::default(),
         library_class_files: Vec::new(),

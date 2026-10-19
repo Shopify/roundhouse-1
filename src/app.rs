@@ -852,6 +852,15 @@ pub struct App {
     /// placed at the call.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ruby_declined_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
+    /// The empty `def`s under a `sig { abstract… }` that `ingest::app`
+    /// drops from a module's methods (so no includer gets a `nil`
+    /// answering stub ahead of its own implementation). The module still
+    /// DECLARES them in Ruby: `instance_methods(false)` lists them, which
+    /// Core's `AccessPolicyHelper#validate_actions!` reads off an
+    /// abstract policy module. The Ruby emit writes each back as a stub
+    /// that defers to an implementation further up the ancestor chain.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ruby_abstract_stubs: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
     /// Where each instance forwarder `ingest::delegate` expanded sits
     /// (its name and the declaration's span), by class: the Ruby emit
     /// writes one where `Module#delegate` would have defined it, ahead of
@@ -1790,6 +1799,7 @@ impl App {
             class_methods_blocks: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
             ruby_declined_delegate_forwarders: HashMap::default(),
+            ruby_abstract_stubs: HashMap::default(),
             delegate_forwarder_sites: HashMap::default(),
             class_eval_macro_expansions: HashMap::default(),
             concern_model_items: HashMap::default(),

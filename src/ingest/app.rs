@@ -6120,14 +6120,20 @@ fn drop_abstract_stubs(
     app: &mut App,
     abstracts: &HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>>,
 ) {
+    let mut stubs: HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>> = HashMap::default();
     for lc in &mut app.library_classes {
         let Some(names) = abstracts.get(&lc.name) else { continue };
-        lc.methods.retain(|m| {
-            !(matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
+        let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut lc.methods).into_iter().partition(|m| {
+            matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
                 && names.contains(&m.name)
-                && is_empty_body(&m.body))
+                && is_empty_body(&m.body)
         });
+        lc.methods = kept;
+        if !dropped.is_empty() {
+            stubs.entry(lc.name.clone()).or_default().extend(dropped);
+        }
     }
+    app.ruby_abstract_stubs.extend(stubs);
 }
 
 fn is_empty_body(body: &crate::expr::Expr) -> bool {

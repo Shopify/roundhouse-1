@@ -970,7 +970,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::Bool),
     },
     // ---- Instance-method accessors (state / metadata) ----
-    // `#attributes` returns Hash<Sym, Str>; `#errors` returns the
+    // `#attributes` returns Hash<Str, untyped> (Rails keys it by column name String); `#errors` returns the
     // per-instance ActiveModel::Errors collection. Both pure
     // (no DB hit); both structural rather than expression-
     // dispatchable.
@@ -979,7 +979,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::HashSymStr),
+        return_kind: Some(ReturnKind::HashStrUntyped),
     },
     CatalogedMethod {
         name: "attributes_before_type_cast",

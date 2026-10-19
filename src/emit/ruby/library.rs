@@ -11625,6 +11625,34 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // The empty `def` under a `sig { abstract… }` is a declaration the
+    // module still makes in Ruby: `instance_methods(false)` lists it
+    // (`AccessPolicyHelper#validate_actions!` reads the abstract policy's
+    // actions that way). It defers to an implementation further up the
+    // ancestor chain, as the includer's inherited `params` must not be
+    // shadowed by an empty answer, and raises when there is none.
+    let with_abstract_stubs;
+    let lc = match app.ruby_abstract_stubs.get(&lc.name) {
+        Some(stubs) => {
+            let mut copy = lc.clone();
+            for stub in stubs {
+                if copy.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == stub.name) {
+                    continue;
+                }
+                let message = format!("{}#{} is abstract", lc.name.0, stub.name);
+                let source = format!(
+                    "def __abstract_stub\n  defined?(super) ? super : raise(NotImplementedError, {message:?})\nend\n"
+                );
+                let Ok(mut parsed) = crate::runtime_src::parse_methods(&source) else { continue };
+                let mut stub = stub.clone();
+                stub.body = parsed.remove(0).body;
+                copy.methods.push(stub);
+            }
+            with_abstract_stubs = copy;
+            &with_abstract_stubs
+        }
+        None => lc,
+    };
     // `delegate :m, to: :t` forwards `(...)` in Ruby; the IR's forwarder
     // is the zero-arg one the strict targets get (`App::ruby_delegate_forwarders`).
     // A declaration ingest declined for the strict targets (it needs
