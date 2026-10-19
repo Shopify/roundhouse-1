@@ -401,6 +401,19 @@ module ActiveModel
       end
     end
 
+    # Not Rails'. What the lowered `error.type` read asks of an error
+    # (`lower::errors_index`): it cannot tell Rails' own Error, which
+    # `ErrorAttributes.objects` answers over a record whose `errors` is
+    # this port's Errors, from the Array accumulator's, so both answer
+    # whether the type is a Symbol and the type as a String.
+    def symbolic
+      type.is_a?(Symbol)
+    end
+
+    def kind
+      type.is_a?(Symbol) ? type.to_s : type
+    end
+
     # Returns the error details.
     def details
       { error: raw_type }.merge(options.except(*CALLBACKS_OPTIONS + MESSAGE_OPTIONS))

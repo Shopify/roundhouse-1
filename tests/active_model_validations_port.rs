@@ -50,6 +50,32 @@ fn validations_port_answers_like_activemodel() {
     assert!(stdout.lines().count() > 45, "too few observations:\n{stdout}");
 }
 
+// `ErrorAttributes.objects` answers a record over the port with Rails' own
+// Errors, whose `type` the lowering reads as `symbolic` / `kind`
+// (component/schema.rb's validator, sweep-1 family 737ec4d1).
+#[test]
+fn port_errors_answer_the_lowered_type_read() {
+    let home = core_gem_home();
+    let out = Command::new("ruby")
+        .arg(root().join("tests/active_model_error_lowering_reads.rb"))
+        .env("GEM_HOME", &home)
+        .env("GEM_PATH", &home)
+        .env(
+            "LD_PRELOAD",
+            std::env::var("RH_JEMALLOC")
+                .unwrap_or_else(|_| "/nix/store/c04j2i0fkin1bw5fab35gx896558knsd-jemalloc-5.3.0-unstable-2025-09-12/lib/libjemalloc.so.2".into()),
+        )
+        .current_dir(root())
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("ok [[:name, :blank], [:code, \"is weird\"]]"),
+        "the port's ActiveModel::Error does not answer the lowered type read\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
