@@ -252,6 +252,12 @@ pub(crate) struct AppDefinitions {
     /// Full names of the classes the app defines, with whether each
     /// defines its own blank-predicate / `empty?`.
     defined: crate::det::HashMap<String, (bool, bool)>,
+    /// `(class last segment, method)` of every zero-arg reader whose body is
+    /// a bare ivar read (`attr_reader` / `attr_accessor`). The ivar's stamp
+    /// comes from the assignments the analyzer saw in the owner's methods
+    /// (`@languages = []` in `initialize`); the writer, or a caller outside
+    /// the class, can leave nil there, so the stamp is not a proof.
+    ivar_readers: HashSet<(String, String)>,
 }
 
 impl AppDefinitions {
@@ -287,6 +293,10 @@ impl AppDefinitions {
             defs.defined.entry(lc.name.0.as_str().to_string()).or_default();
             for method in &lc.methods {
                 defs.note(lc.name.0.as_str(), method.name.as_str());
+                if method.params.is_empty() && matches!(&*method.body.node, ExprNode::Ivar { name } if name.as_str() == method.name.as_str()) {
+                    let last = lc.name.0.as_str().rsplit("::").next().unwrap_or(lc.name.0.as_str());
+                    defs.ivar_readers.insert((last.to_string(), method.name.as_str().to_string()));
+                }
             }
         }
         defs
@@ -705,11 +715,17 @@ fn try_rewrite(
         // `@response_cache_version.present?`, which a detached
         // `ApplicationController.new` never assigned, and grounding it
         // as `!@response_cache_version.empty?` raised on nil.
-        let grounding = match (grounding, &*r.node) {
-            (Grounding::Container { nilable: false, whitespace }, ExprNode::Ivar { .. }) => {
+        // An attr reader that returns the ivar is the same read one call
+        // removed: Worldwide's `Region#languages` is stamped `Array` from
+        // `@languages = []`, and its loader writes `spec["languages"]`
+        // (nil for BV, HM, AN, IO) through the writer, so CountryDb's
+        // `region.languages.presence` grounded as `.empty?` on nil.
+        let ivar_read = matches!(&*r.node, ExprNode::Ivar { .. }) || is_ivar_reader_call(r, defs);
+        let grounding = match (grounding, ivar_read) {
+            (Grounding::Container { nilable: false, whitespace }, true) => {
                 Grounding::Container { nilable: true, whitespace }
             }
-            (Grounding::NeverBlank { nilable: false }, ExprNode::Ivar { .. }) => {
+            (Grounding::NeverBlank { nilable: false }, true) => {
                 Grounding::NeverBlank { nilable: true }
             }
             (g, _) => g,
@@ -1335,4 +1351,21 @@ fn unlowered(expr: &Expr, recv_ty: Option<&Ty>, method: &str, reason: &str) -> D
              the CRuby overlay serves it at runtime; AOT/strict targets cannot compile it"
         ),
     }
+}
+
+/// `recv.name` where `name` is an app class's ivar-returning reader
+/// (see `AppDefinitions::ivar_readers`), judged by the receiver's class.
+fn is_ivar_reader_call(r: &Expr, defs: &AppDefinitions) -> bool {
+    let ExprNode::Send { recv: Some(inner), method, args, block: None, .. } = &*r.node else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+    let Some(Ty::Class { id, .. }) = inner.ty.as_ref().map(non_nil_of) else {
+        return false;
+    };
+    let raw = id.0.as_str();
+    let last = raw.rsplit("::").next().unwrap_or(raw);
+    defs.ivar_readers.contains(&(last.to_string(), method.as_str().to_string()))
 }

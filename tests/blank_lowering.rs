@@ -815,3 +815,67 @@ fn view_blank_and_present_guard_nil_without_strip() {
         "any? stays a collection empty? with no nil-guard wrap:\n{printed}"
     );
 }
+
+#[test]
+fn attr_accessor_assigned_nil_elsewhere_keeps_the_nil_guard_on_presence() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+class Region
+  attr_accessor :languages
+
+  def initialize
+    @languages = []
+  end
+end
+
+class Loader
+  def apply(region, spec)
+    region.languages = spec["languages"]
+  end
+end
+
+class Country
+  def initialize
+    @region = Region.new
+  end
+
+  def languages
+    @region.languages.presence || ["en"]
+  end
+end
+"#,
+    );
+    assert!(
+        out.contains("@region.languages.nil?"),
+        "an attr reader of an ivar the writer can set to nil needs the nil guard:\n{out}"
+    );
+}
+
+/// The guard is about the reader, not every zero-arg call: a method that
+/// computes its answer keeps the plain `empty?` grounding.
+#[test]
+fn computed_reader_keeps_the_plain_empty_grounding() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+class Region
+  def languages
+    ["en", "fr"]
+  end
+end
+
+class Country
+  def initialize
+    @region = Region.new
+  end
+
+  def languages
+    @region.languages.presence || ["xx"]
+  end
+end
+"#,
+    );
+    assert!(
+        !out.contains("@region.languages.nil?"),
+        "a computed Array reader is proven non-nil:\n{out}"
+    );
+}
