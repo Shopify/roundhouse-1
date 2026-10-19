@@ -1264,7 +1264,7 @@ fn push_value_segment(
             }
             binds.push(Bind { expr: expr.clone(), ty: *ty, nullable_column: None, parameterized: true });
         }
-        Value::Runtime { .. } => segments.push(escape_value(&db, val, dialect)),
+        Value::Runtime { .. } | Value::RuntimeOrDefault { .. } => segments.push(escape_value(&db, val, dialect)),
     }
 }
 
@@ -1290,6 +1290,15 @@ fn escape_value(db: &ClassId, val: &Value, dialect: SqlDialect) -> Expr {
                 ValueType::Temporal => "escape_temporal",
             };
             db_call(db, method, vec![expr.clone()])
+        }
+        Value::RuntimeOrDefault { expr, ty } => {
+            let mut unassigned = send_to(expr.clone(), "nil?", vec![], true);
+            unassigned.ty = Some(Ty::Bool);
+            let assigned = escape_value(db, &Value::Runtime { expr: expr.clone(), ty: *ty }, dialect);
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If { cond: unassigned, then_branch: lit_str("DEFAULT".into()), else_branch: assigned },
+            )
         }
         Value::LiteralInt(n) => lit_str(n.to_string()),
         Value::LiteralStr(s) => lit_str(format!("'{}'", s.replace('\'', "''"))),
@@ -1514,6 +1523,7 @@ mod tests {
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
+                        default_function: false,
                     },
                     Column {
                         name: Symbol::from("title"),
@@ -1524,6 +1534,7 @@ mod tests {
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
+                        default_function: false,
                     },
                 ],
                 indexes: vec![],
