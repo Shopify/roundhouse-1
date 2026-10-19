@@ -5932,6 +5932,8 @@ fn fold_before_validation(
 pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
 
+    let sti = crate::lower::sti_scope::sti_bases(app);
+
     for lc in lcs.iter_mut() {
         let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
         for assoc in model.associations() {
@@ -5943,7 +5945,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             };
             let mut hop_scopes = Vec::new();
             let Some((joins, edge)) =
-                resolve_through_chain(&app.models, model, assoc, 0, &mut hop_scopes)
+                resolve_through_chain(&app.models, &sti, model, assoc, 0, &mut hop_scopes)
             else {
                 continue;
             };
@@ -5983,7 +5985,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
             };
             let mut hop_scopes = Vec::new();
             let Some((joins, edge)) =
-                resolve_through_chain(&app.models, model, assoc, 0, &mut hop_scopes)
+                resolve_through_chain(&app.models, &sti, model, assoc, 0, &mut hop_scopes)
             else {
                 continue;
             };
@@ -6089,6 +6091,7 @@ impl ThroughEdge {
 /// and for pathological depth (cyclic `through:` declarations).
 fn resolve_through_chain(
     models: &[crate::dialect::Model],
+    sti: &HashMap<ClassId, ClassId>,
     model: &crate::dialect::Model,
     assoc: &crate::dialect::Association,
     depth: usize,
@@ -6145,17 +6148,17 @@ fn resolve_through_chain(
     // sibling's fk, or through the sibling's own chain.
     let (back_joins, edge) = match thr_through {
         None if belongs_to => {
-            (Vec::new(), ThroughEdge::Parent { table: model_table_name(models, thr_target), owner_fk: thr_fk.clone() })
+            (Vec::new(), ThroughEdge::Parent { table: model_table_name(models, sti, thr_target), owner_fk: thr_fk.clone() })
         }
         None => (
             Vec::new(),
-            ThroughEdge::Child { table: model_table_name(models, thr_target), fk: thr_fk.clone() },
+            ThroughEdge::Child { table: model_table_name(models, sti, thr_target), fk: thr_fk.clone() },
         ),
-        Some(_) => resolve_through_chain(models, model, thr, depth + 1, hop_scopes)?,
+        Some(_) => resolve_through_chain(models, sti, model, thr, depth + 1, hop_scopes)?,
     };
     let thr_model = models.iter().find(|m| &m.name == thr_target)?;
-    let thr_table = model_table_name(models, thr_target);
-    let target_table = model_table_name(models, target);
+    let thr_table = model_table_name(models, sti, thr_target);
+    let target_table = model_table_name(models, sti, target);
     let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
     // The source association on the join model: named by `source:` /
     // the singular name (`Model::through_source`), else the one whose
@@ -6234,7 +6237,7 @@ fn resolve_through_chain(
         // that chain (phrased from the same target table), then graft
         // the join model onto its owner edge.
         Association::HasMany { through: Some(_), .. } | Association::HasOne { through: Some(_), .. } => {
-            let (src_joins, src_edge) = resolve_through_chain(models, thr_model, src, depth + 1, hop_scopes)?;
+            let (src_joins, src_edge) = resolve_through_chain(models, sti, thr_model, src, depth + 1, hop_scopes)?;
             let mut joins = src_joins;
             joins.push(format!("INNER JOIN {thr_table} ON {}{owner_type}", src_edge.join_condition(&thr_table)));
             joins.extend(back_joins);
@@ -6247,7 +6250,10 @@ fn resolve_through_chain(
 /// The table a model reads: its own (`self.table_name`, a namespace's
 /// `table_name_prefix`), else Rails' default from the demodulized class
 /// name (`compute_table_name`).
-fn model_table_name(models: &[crate::dialect::Model], class: &ClassId) -> String {
+fn model_table_name(models: &[crate::dialect::Model], sti: &HashMap<ClassId, ClassId>, class: &ClassId) -> String {
+    // An STI subclass is a library class, not a model, and reads its base's
+    // table (`ExpressGateway` rows live in `payment_gateways`).
+    let class = sti.get(class).unwrap_or(class);
     match models.iter().find(|m| &m.name == class) {
         Some(m) => m.table.0.as_str().to_string(),
         None => crate::naming::rails_table_name(class.0.as_str()),
@@ -21989,6 +21995,7 @@ fn composite_belongs_to(model: &crate::dialect::Model, app: &App) -> Vec<(String
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
     use crate::dialect::Association;
+    let mut sti_cache: Option<HashMap<ClassId, ClassId>> = None;
 
     let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
     // The owner's own key is a uuid / string: the batches keyed by it
@@ -22126,8 +22133,9 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 else {
                     continue;
                 };
-                let thr_table = model_table_name(&app.models, thr_target);
-                let target_table = model_table_name(&app.models, target);
+                let sti = sti_cache.get_or_insert_with(|| crate::lower::sti_scope::sti_bases(app));
+                let thr_table = model_table_name(&app.models, sti, thr_target);
+                let target_table = model_table_name(&app.models, sti, target);
                 let owner_type = through_owner_type_predicate(&thr_table, as_interface, &model.name);
                 out.push((
                     name.as_str().to_string(),
