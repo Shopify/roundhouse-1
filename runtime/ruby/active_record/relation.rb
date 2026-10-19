@@ -1426,8 +1426,15 @@ module ActiveRecord
     def reference_tables(hash)
       added = []
       hash.each do |key, val|
-        next unless val.is_a?(Hash) && nested_hash?(key, val)
-        added << key.to_s unless @referenced.include?(key.to_s)
+        if val.is_a?(Hash) && nested_hash?(key, val)
+          name = key.to_s
+        else
+          # A dotted key (`where("definition.namespace": x)`) references
+          # the table before the dot (predicate_builder `references`).
+          name = dotted_reference(key)
+          next if name.nil?
+        end
+        added << name unless @referenced.include?(name) || added.include?(name)
       end
       return if added.empty?
       @referenced = @referenced + added
@@ -3932,6 +3939,17 @@ module ActiveRecord
         parts << predicate
         named << ["#{table}.#{name}", predicate]
       end
+    end
+
+    # The table a `"table.column"` where key names, other than this
+    # relation's own; nil for any other key.
+    def dotted_reference(key)
+      return nil if key.is_a?(Array)
+      text = key.to_s
+      return nil unless text.include?(".")
+      qualifier = text.split(".").first.to_s.delete('"')
+      return nil if qualifier.empty? || qualifier == @table || qualifier == @model.table_name.to_s
+      qualifier
     end
 
     # A Hash value (callers check `is_a?(Hash)`) nests a table only when the key is not a column of this

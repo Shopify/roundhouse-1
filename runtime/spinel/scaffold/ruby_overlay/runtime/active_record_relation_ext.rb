@@ -371,6 +371,11 @@ module ActiveRecord
     # aliased, in place.
     def alias_referenced_joins(keys)
       return if @joins.empty? || !@model.respond_to?(:reflect_on_association)
+      # Hops below the first first: aliasing a hop renames its table in the
+      # hops after it, which are matched under the names they were rendered
+      # with.
+      keys = keys.reject { |k| !@model.reflect_on_association(k.to_sym).nil? } +
+             keys.select { |k| !@model.reflect_on_association(k.to_sym).nil? }
       keys.each do |key|
         reflection = @model.reflect_on_association(key.to_sym)
         # A key that is no association of this model may name a hop below
@@ -379,13 +384,17 @@ module ActiveRecord
         # in its join dependencies.
         alias_nested_join_hop(key.to_sym) if reflection.nil?
         next unless alias_join_reflection?(@model, reflection)
+        found = false
         ["INNER JOIN", "LEFT OUTER JOIN"].each do |kind|
           plain = reflection_join_sql(@model, reflection, kind)
           index = @joins.index(plain)
           next if index.nil?
+          found = true
           own_lists
           @joins[index] = reflection_join_sql(@model, reflection, kind, key.to_s)
         end
+        # The first hop of a `joins(a: :b)` the compiler rendered whole.
+        alias_join_hop(@model, reflection, key.to_s) unless found
       end
     end
 
@@ -455,7 +464,12 @@ module ActiveRecord
         next if index.nil?
         aliased = reflection_join_sql(owner, reflection, kind, key)
         own_lists
-        @joins[index] = @joins[index].sub(pattern) { aliased }
+        frag = @joins[index]
+        match = frag.match(pattern)
+        # The hops after it join off its table: they name the alias.
+        table = reflection.klass.table_name.to_s
+        tail = match.post_match.gsub(Regexp.new("(?<![\w\"])\"?#{Regexp.escape(table)}\"?\."), "\"#{key}\".")
+        @joins[index] = match.pre_match + aliased + tail
       end
     end
 

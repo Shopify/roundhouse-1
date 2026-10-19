@@ -482,6 +482,7 @@ def nested_column_name: (untyped owner, untyped col) -> String
     def order_sql_terms: () -> Array[String]
     def eager_records_by_key: (untyped klass, Array[untyped] ids) -> Hash[String, Base]
     def nested_hash?: (String | Symbol key, Hash[untyped, untyped] val) -> bool
+    def dotted_reference: (untyped key) -> String?
     def nested_table: (String | Symbol key) -> [String, untyped]
     def nested_conditions: (String table, untyped owner, Hash[String | Symbol, untyped] conditions, Array[String] parts, Array[untyped] named) -> void
     def associated_model_by_table: (String name) -> untyped
