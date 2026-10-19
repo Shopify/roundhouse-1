@@ -239,8 +239,8 @@ module ActiveJob
   # (`disable_test_adapter`; runtime/active_job_callbacks.rb).
   module TestHelper
     def after_teardown
-      super
-      ActiveJob::QueueAdapter.reset
+      super if defined?(super)
+      ActiveJob::QueueAdapter.reset if defined?(ActiveJob::QueueAdapter)
     end
   end
 end
