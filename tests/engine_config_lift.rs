@@ -102,6 +102,12 @@ const REPORT_LIB: &str = r#"module WidgetReport
   def self.line
     Rails.configuration.widgets.greeting
   end
+
+  # Core reads a component's config through its engine class:
+  # `CustomersComponent::Engine.config.customers.data_platform_host`.
+  def self.engine_line
+    Widgets::Engine.config.widgets.greeting
+  end
 end
 "#;
 
@@ -191,6 +197,40 @@ fn emitted_ruby_reads_the_engine_config_through_rails_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
+}
+
+/// The same config read through the engine class. The lifted reader lives on
+/// `Rails::Application`, so the read must anchor there: anchored on the
+/// engine it was `Widgets::Engine.widgets`, a NoMethodError out of
+/// `Railtie.method_missing` (the sweep-1 `undefined method 'customers' for
+/// class CustomersComponent::Engine`).
+#[test]
+fn emitted_ruby_reads_the_engine_config_through_the_engine_class() {
+    let mut fixture = bundled_blog();
+    for (path, text) in FILES {
+        fixture = fixture.write(path, text);
+    }
+    let (emitted, errors) = fixture.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let report = std::fs::read_to_string(emitted.join("app/models/widget_report.rb")).unwrap();
+    assert!(!report.contains("Engine.widgets"), "the engine class has no `widgets` reader:\n{report}");
+    let main = emitted.join("main").display().to_string();
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("require {main:?}\nMain.configure_default_adapter!\nputs WidgetReport.engine_line\n"))
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .env("RAILS_ENV", "test")
+        .env("WIDGET_NAME", "gadget")
+        .output()
+        .expect("spawn ruby");
+    assert!(
+        output.status.success(),
+        "emitted program failed in {}:\n{}",
+        emitted.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "test greeting for gadget\n");
 }
 
 /// Core's per-environment configs are empty: `config/test.rb` is

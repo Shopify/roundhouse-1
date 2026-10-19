@@ -60,6 +60,25 @@ use crate::expr::{Expr, ExprNode, Literal};
 /// Where every lane serves the Action Cable WebSocket.
 const CABLE_MOUNT_PATH: &str = "/cable";
 
+/// What the rewrite needs to know about the app: the readers ingest lifted onto
+/// `Rails::Application` (name, type of the value it answers), and the carried
+/// engines and railties whose `config` shares that key namespace.
+#[derive(Default)]
+struct Lifted {
+    readers: Vec<(crate::ident::Symbol, Option<crate::ty::Ty>)>,
+    engines: Vec<String>,
+}
+
+impl Lifted {
+    /// `Widgets::Engine` (or `Engine` written inside `Widgets`): a carried
+    /// engine or railtie, spelled as a constant.
+    fn is_engine_const(&self, expr: &Expr) -> bool {
+        let ExprNode::Const { path } = &*expr.node else { return false };
+        let spelled = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        self.engines.iter().any(|e| e == &spelled || e.ends_with(&format!("::{spelled}")))
+    }
+}
+
 pub fn apply_config_reader_lowering(app: &mut App) {
     // Reader name -> the type of the value it answers, from the lifted
     // method's own body. Stamped onto each rewritten read for the same
@@ -74,7 +93,7 @@ pub fn apply_config_reader_lowering(app: &mut App) {
     // analyzer cannot type; the expression it memoizes lives in the
     // `<key>__build` sibling ingest lifted beside it, so that is where
     // the leaf's type is read from.
-    let lifted: Vec<(crate::ident::Symbol, Option<crate::ty::Ty>)> = match &app.rails_application {
+    let readers: Vec<(crate::ident::Symbol, Option<crate::ty::Ty>)> = match &app.rails_application {
         Some(lc) => lc
             .methods
             .iter()
@@ -91,6 +110,7 @@ pub fn apply_config_reader_lowering(app: &mut App) {
             .collect(),
         None => Vec::new(),
     };
+    let lifted = Lifted { readers, engines: app.railties.iter().map(|r| r.name.0.as_str().to_string()).collect() };
     // Cable, credentials, and lifted config reads used to be three
     // hook+view walks. They match disjoint chains, so one walk is
     // equivalent: config peels outermost-first (longest chain wins),
@@ -108,7 +128,7 @@ pub fn apply_config_reader_lowering(app: &mut App) {
 /// list still rewrites framework defaults that are known without app readers.
 fn rewrite_fused(
     expr: &mut Expr,
-    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+    lifted: &Lifted,
     cable_and_credentials: bool,
 ) {
     unwrap_config_tap(expr);
@@ -258,7 +278,7 @@ fn is_cable_mount_path(expr: &Expr) -> bool {
 /// A node that does not peel still recurses, so a chain nested inside
 /// an argument or a block is reached exactly as before; a node that
 /// DOES peel has nothing left to walk but its `Rails` anchor.
-fn rewrite(expr: &mut Expr, lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)]) {
+fn rewrite(expr: &mut Expr, lifted: &Lifted) {
     unwrap_config_tap(expr);
     if rewrite_write_here(expr, lifted) {
         return;
@@ -347,7 +367,7 @@ fn substitute_var(expr: &mut Expr, name: &crate::ident::Symbol, with: &Expr) {
 /// .web_push_pool.invalid_subscription_handler)`).
 fn rewrite_write_here(
     expr: &mut Expr,
-    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+    lifted: &Lifted,
 ) -> bool {
     // Ingest spells `a.b = v` as a Send of `b=`; the `Attr` LValue is
     // the op-assign forms' spelling. Both are the same write.
@@ -362,12 +382,12 @@ fn rewrite_write_here(
         }
         _ => return false,
     };
-    let Some((application, mut segments)) = peel_config_chain(recv) else {
+    let Some((application, mut segments)) = peel_config_chain(recv, lifted) else {
         return false;
     };
     segments.push(name);
     let key = crate::ident::Symbol::from(segments.join("_"));
-    if !lifted.iter().any(|(n, _)| n == &key) {
+    if !lifted.readers.iter().any(|(n, _)| n == &key) {
         return false;
     }
     let mut value = value.clone();
@@ -400,13 +420,13 @@ const UNASSIGNED_FRAMEWORK_DEFAULTS: &[(&str, fn() -> Literal)] = &[
 
 fn rewrite_here(
     expr: &mut Expr,
-    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+    lifted: &Lifted,
 ) -> bool {
-    let Some((application, segments)) = peel_config_chain(expr) else {
+    let Some((application, segments)) = peel_config_chain(expr, lifted) else {
         return false;
     };
     let key = crate::ident::Symbol::from(segments.join("_"));
-    let Some((_, reader_ty)) = lifted.iter().find(|(name, _)| name == &key) else {
+    let Some((_, reader_ty)) = lifted.readers.iter().find(|(name, _)| name == &key) else {
         // A framework key the app never assigns reads Rails' own default,
         // when that default is a constant (`UNASSIGNED_FRAMEWORK_DEFAULTS`).
         // Anything else stays the unmodelled chain it was.
@@ -453,7 +473,7 @@ fn rewrite_here(
 /// `Rails.configuration` is Rails' own alias for
 /// `Rails.application.config`, so it anchors the same chain and the
 /// `application` hop is synthesized to match.
-fn peel_config_chain(expr: &Expr) -> Option<(Expr, Vec<String>)> {
+fn peel_config_chain(expr: &Expr, lifted: &Lifted) -> Option<(Expr, Vec<String>)> {
     let mut segments: Vec<String> = Vec::new();
     let mut cur = expr;
     // Bounded so a pathological chain cannot spin; Rails' `x` namespace
@@ -468,29 +488,27 @@ fn peel_config_chain(expr: &Expr) -> Option<(Expr, Vec<String>)> {
         match method.as_str() {
             "config" => {
                 segments.reverse();
+                // An engine's `config` reads the key namespace the
+                // application's does (`Railtie::Configuration` falls
+                // through to the shared `@@options`), and ingest lifted
+                // the engine's `config.<key> = …` onto `Rails::Application`.
+                // `Widgets::Engine.config.widgets` therefore anchors on
+                // `Rails.application`, not on the engine class, which has
+                // no `widgets` reader (the class answers it only through
+                // `Railtie.method_missing`, and only for its instance's
+                // own methods). Keys no reader was lifted for never get
+                // this far in `rewrite_here`, so the engine keeps its own.
+                if lifted.is_engine_const(r) {
+                    let key = segments.join("_");
+                    if lifted.readers.iter().any(|(n, _)| n.as_str() == key) {
+                        return Some((synthesized_application(r.span, rails_const(r.span)), segments));
+                    }
+                }
                 return Some((r.clone(), segments));
             }
             "configuration" => {
                 segments.reverse();
-                let mut app = Expr::new(
-                    r.span,
-                    ExprNode::Send {
-                        recv: Some(r.clone()),
-                        method: crate::ident::Symbol::from("application"),
-                        args: vec![],
-                        block: None,
-                        parenthesized: false,
-                    },
-                );
-                // The hop is synthesized after the analyzer has run, so
-                // nothing else will ever type it. `Rails.application` is
-                // `Untyped` in the stdlib registry — the answer the
-                // analyzer would have given had the source written the
-                // hop out — and an unstamped node here reads on the
-                // ledger as `no known method application on Class(Rails)`
-                // against a class that plainly has one.
-                app.ty = Some(crate::ty::Ty::Untyped);
-                return Some((app, segments));
+                return Some((synthesized_application(r.span, r.clone()), segments));
             }
             _ => {
                 segments.push(method.as_str().to_string());
@@ -499,6 +517,33 @@ fn peel_config_chain(expr: &Expr) -> Option<(Expr, Vec<String>)> {
         }
     }
     None
+}
+
+fn rails_const(span: crate::span::Span) -> Expr {
+    Expr::new(span, ExprNode::Const { path: vec![crate::ident::Symbol::from("Rails")] })
+}
+
+/// `<rails>.application`, the hop a config chain hangs off.
+fn synthesized_application(span: crate::span::Span, rails: Expr) -> Expr {
+    let mut app = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(rails),
+            method: crate::ident::Symbol::from("application"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+                // The hop is synthesized after the analyzer has run, so
+                // nothing else will ever type it. `Rails.application` is
+                // `Untyped` in the stdlib registry — the answer the
+                // analyzer would have given had the source written the
+                // hop out — and an unstamped node here reads on the
+                // ledger as `no known method application on Class(Rails)`
+                // against a class that plainly has one.
+    app.ty = Some(crate::ty::Ty::Untyped);
+    app
 }
 
 #[cfg(test)]
@@ -527,7 +572,7 @@ mod framework_default_tests {
         let config = send(send(rails, "application"), "config");
         let mut read = send(config, "content_security_policy_nonce_generator");
 
-        rewrite_fused(&mut read, &[], false);
+        rewrite_fused(&mut read, &Lifted::default(), false);
 
         assert!(matches!(&*read.node, ExprNode::Lit { value: Literal::Nil }));
     }
