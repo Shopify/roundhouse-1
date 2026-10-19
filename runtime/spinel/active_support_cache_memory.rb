@@ -20,10 +20,15 @@
 # normalized as `Store#expanded_key` does: a record by its `cache_key`, an
 # Array by its elements joined with "/", a Hash as sorted `k=v` pairs.
 #
-# NOT HERE: entry options (`expires_in:`, `version:`, `race_condition_ttl:`,
-# `namespace:`) — a call passing one raises ArgumentError rather than
-# being cached with the option ignored; `increment`/`decrement`;
-# instrumentation (`cache_read.active_support`). Non-String values are
+# ENTRY OPTIONS: every call takes Rails' `options` (a trailing Hash or
+# keywords): `expires_in:`/`expires_at:` (an entry past its time is a
+# miss), `force:`, `skip_nil:`, `race_condition_ttl:` (an expired entry
+# stays readable that long while `fetch` recomputes it), `namespace:`
+# and, for writes, `unless_exist:`. `increment`/`decrement` and
+# `fetch_multi` are here. NOT HERE: `version:`, `compress:`, `raw:`,
+# coders — a call passing one raises ArgumentError rather than being
+# cached with the option ignored; instrumentation
+# (`cache_read.active_support`).  Non-String values are
 # limited to recursively copied Arrays/Hashes and immutable scalars; other
 # object types fail closed rather than being retained by reference. Rails
 # counts a Marshal dump for non-Strings; this port counts the copied value's
@@ -75,84 +80,137 @@ module ActiveSupport
       def initialize(size: 32 * 1024 * 1024)
         super()
         @data = {}
+        @expires = {}
         @max_size = size
         @cache_size = 0
         @lock = Mutex.new
       end
 
-      def read(name)
-        key = ActiveSupport::Cache.expanded_key(name)
-        _, value = @lock.synchronize { read_locked(key) }
+      def read(name, options = nil)
+        opts = MemoryStore.options(options)
+        key = storage_key(name, opts)
+        _, value = @lock.synchronize { live_locked(key) }
         MemoryStore.copy(value)
       end
 
-      def exist?(name)
-        key = ActiveSupport::Cache.expanded_key(name)
-        @lock.synchronize { @data.key?(key) }
+      def exist?(name, options = nil)
+        opts = MemoryStore.options(options)
+        key = storage_key(name, opts)
+        @lock.synchronize { live_locked(key)[0] }
       end
 
-      def write(name, value)
-        key = ActiveSupport::Cache.expanded_key(name)
-        payload = MemoryStore.copy(value)
-        @lock.synchronize do
-          if @data.key?(key)
-            @cache_size -= MemoryStore.bytes(@data[key]) - MemoryStore.bytes(payload)
-            @data.delete(key)
-          else
-            @cache_size += key.bytesize + MemoryStore.bytes(payload) + PER_ENTRY_OVERHEAD
-          end
-          @data[key] = payload
-          prune_locked(@max_size * 3 / 4) if @cache_size > @max_size
-        end
-        true
+      # `unless_exist: true` keeps a live entry and answers false.
+      def write(name, value, options = nil)
+        opts = MemoryStore.options(options)
+        write_value(storage_key(name, opts), value, opts)
       end
 
-      # The cached value, or the block's — which is then written.
-      def fetch(name)
-        key = ActiveSupport::Cache.expanded_key(name)
-        found, cached = @lock.synchronize { read_locked(key) }
+      # The cached value, or the block's — which is then written. As
+      # Rails' `Store#fetch`: `force: true` recomputes; `skip_nil: true`
+      # does not cache a nil result; `race_condition_ttl:` keeps an
+      # expired entry readable for that long while one caller recomputes
+      # it; without a block it is `read` (and `force: true` is an error).
+      def fetch(name, options = nil)
+        opts = MemoryStore.options(options)
         # Keep one result path: Spinel inlines yield-bearing methods at
         # call sites, where an early return is mis-typed as the caller's.
-        value = if found
-          MemoryStore.copy(cached)
+        value = if block_given?
+          key = storage_key(name, opts)
+          found = false
+          cached = nil
+          unless opts[:force]
+            found, cached = @lock.synchronize { fetchable_locked(key, opts[:race_condition_ttl].to_i) }
+          end
+          if found
+            MemoryStore.copy(cached)
+          else
+            computed = yield(name)
+            write_value(key, computed, opts) unless computed.nil? && opts[:skip_nil]
+            computed
+          end
         else
-          computed = yield
-          write(key, computed)
-          computed
+          raise ArgumentError, "Missing block: Calling `Cache#fetch` with `force: true` requires a block." if opts[:force]
+          read(name, options)
         end
         value
       end
 
-      def delete(name)
-        key = ActiveSupport::Cache.expanded_key(name)
+      def delete(name, options = nil)
+        opts = MemoryStore.options(options)
+        key = storage_key(name, opts)
         @lock.synchronize { delete_locked(key) }
       end
 
+      # `read_multi(*names, **options)`: a trailing Hash is the options.
       def read_multi(*names)
+        options = names.last.instance_of?(Hash) ? names.pop : nil
+        opts = MemoryStore.options(options)
         out = {}
         names.each do |name|
-          key = ActiveSupport::Cache.expanded_key(name)
-          found, value = @lock.synchronize { read_locked(key) }
+          key = storage_key(name, opts)
+          found, value = @lock.synchronize { live_locked(key) }
           out[name] = MemoryStore.copy(value) if found
         end
         out
       end
 
-      def write_multi(hash)
-        hash.each { |name, value| write(name, value) }
+      def write_multi(hash, options = nil)
+        hash.each { |name, value| write(name, value, options) }
         true
+      end
+
+      # `fetch_multi(*names, **options) { |name| … }`: the cached values by
+      # name, the block's for the names missing (written, unless `skip_nil`
+      # drops a nil). `force: true` recomputes every name.
+      def fetch_multi(*names)
+        raise ArgumentError, "Missing block: `Cache#fetch_multi` requires a block." unless block_given?
+        options = names.last.instance_of?(Hash) ? names.pop : nil
+        opts = MemoryStore.options(options)
+        ordered = {}
+        writes = {}
+        names.each do |name|
+          key = storage_key(name, opts)
+          found = false
+          cached = nil
+          unless opts[:force]
+            found, cached = @lock.synchronize { live_locked(key) }
+          end
+          if found
+            ordered[name] = MemoryStore.copy(cached)
+          else
+            computed = yield(name)
+            ordered[name] = computed
+            writes[name] = computed unless computed.nil? && opts[:skip_nil]
+          end
+        end
+        write_multi(writes, options)
+        ordered
+      end
+
+      # Rails' `MemoryStore#increment`: an absent or expired counter is
+      # created at `amount`; a live one is advanced and keeps its expiry.
+      def increment(name, amount = 1, options = nil)
+        modify_value(name, amount, options)
+      end
+
+      def decrement(name, amount = 1, options = nil)
+        modify_value(name, -amount, options)
       end
 
       def clear
         @lock.synchronize do
           @data.clear
+          @expires.clear
           @cache_size = 0
         end
         super
       end
 
-      # Entries expire only by option, and options are not carried here.
+      # Drop every expired entry.
       def cleanup
+        @lock.synchronize do
+          @data.keys.each { |key| delete_locked(key) if expired_locked?(key) }
+        end
         nil
       end
 
@@ -163,6 +221,29 @@ module ActiveSupport
 
       def inspect
         "#<ActiveSupport::Cache::MemoryStore entries=#{@data.size}, size=#{@cache_size}>"
+      end
+
+      OPTIONS = [:expires_in, :expires_at, :force, :skip_nil, :race_condition_ttl, :namespace, :unless_exist]
+
+      # The call's options, checked: `expires_in`/`expires_at` (not both,
+      # not negative), `force`, `skip_nil`, `race_condition_ttl`,
+      # `namespace` and (writes) `unless_exist`. Anything else — `version`,
+      # `compress`, `raw`, a coder — is an option this store does not
+      # carry, and raises rather than being dropped.
+      def self.options(options)
+        opts = options.nil? ? {} : options.dup
+        raise ArgumentError, "cache options must be a Hash, got #{options.class}" unless opts.is_a?(Hash)
+        opts.each_key do |name|
+          raise ArgumentError, "ActiveSupport::Cache::MemoryStore does not support the #{name.inspect} option" unless OPTIONS.include?(name)
+        end
+        if opts.key?(:expires_in) && opts.key?(:expires_at)
+          raise ArgumentError, "Either :expires_in or :expires_at can be supplied, but not both"
+        end
+        raise ArgumentError, "expires_in parameter should not be a Time. Did you mean to use expires_at? Got: #{opts[:expires_in]}" if opts[:expires_in].is_a?(Time)
+        if !opts[:expires_in].nil? && opts[:expires_in].to_f < 0
+          raise ArgumentError, "Cache expiration time is invalid, cannot be negative: #{opts[:expires_in]}"
+        end
+        opts
       end
 
       def self.copy(value, ancestors = [])
@@ -202,6 +283,99 @@ module ActiveSupport
 
       private
 
+      # The key an entry is filed under: the normalized key, behind the
+      # call's `namespace:` as `Store#namespace_key` puts it.
+      def storage_key(name, opts)
+        key = ActiveSupport::Cache.expanded_key(name)
+        namespace = opts[:namespace]
+        namespace = namespace.call if namespace.respond_to?(:call)
+        namespace.nil? ? key : "#{namespace}:#{key}"
+      end
+
+      # When the entry written under these options lapses (nil: never).
+      def expiry_for(opts)
+        if opts[:expires_at]
+          opts[:expires_at].to_f
+        elsif opts[:expires_in]
+          Time.now.to_f + opts[:expires_in].to_f
+        end
+      end
+
+      def expired_locked?(key)
+        at = @expires[key]
+        !at.nil? && at <= Time.now.to_f
+      end
+
+      # `read_locked`, but an entry past its expiry is dropped and missed.
+      def live_locked(key)
+        if expired_locked?(key)
+          delete_locked(key)
+          return [false, nil]
+        end
+        read_locked(key)
+      end
+
+      # `fetch`'s read: as `live_locked`, but an expired entry within its
+      # `race_condition_ttl` is kept, lent that long to the callers still
+      # reading it while this one recomputes (Rails `handle_expired_entry`).
+      def fetchable_locked(key, race_ttl)
+        if @data.key?(key) && expired_locked?(key)
+          now = Time.now.to_f
+          if race_ttl > 0 && now - @expires[key] <= race_ttl
+            @expires[key] = now + race_ttl
+          else
+            delete_locked(key)
+          end
+          return [false, nil]
+        end
+        read_locked(key)
+      end
+
+      def write_value(key, value, opts)
+        payload = MemoryStore.copy(value)
+        @lock.synchronize { write_locked(key, payload, opts) }
+      end
+
+      # Call only while holding @lock; `payload` is already a copy.
+      def write_locked(key, payload, opts)
+        return false if opts[:unless_exist] && live_locked(key)[0]
+        expires_at = expiry_for(opts)
+        if @data.key?(key)
+          @cache_size -= MemoryStore.bytes(@data[key]) - MemoryStore.bytes(payload)
+          @data.delete(key)
+        else
+          @cache_size += key.bytesize + MemoryStore.bytes(payload) + PER_ENTRY_OVERHEAD
+        end
+        @data[key] = payload
+        if expires_at.nil?
+          @expires.delete(key)
+        else
+          @expires[key] = expires_at
+        end
+        prune_locked(@max_size * 3 / 4) if @cache_size > @max_size
+        true
+      end
+
+      # An absent or expired counter is created at `amount` (with the
+      # call's expiry); a live one is advanced and keeps its own.
+      def modify_value(name, amount, options)
+        opts = MemoryStore.options(options)
+        key = storage_key(name, opts)
+        @lock.synchronize do
+          found, value = live_locked(key)
+          if found
+            kept = @expires[key]
+            result = value.to_i + amount
+            write_locked(key, result, {})
+            @expires[key] = kept unless kept.nil?
+            result
+          else
+            write_locked(key, Integer(amount), opts)
+            amount
+          end
+        end
+      end
+
       # Return presence separately because a cached nil is still a hit.
       # Call only while holding @lock.
       def read_locked(key)
@@ -214,6 +388,7 @@ module ActiveSupport
       def delete_locked(key)
         return false unless @data.key?(key)
         payload = @data.delete(key)
+        @expires.delete(key)
         @cache_size -= key.bytesize + MemoryStore.bytes(payload) + PER_ENTRY_OVERHEAD
         true
       end

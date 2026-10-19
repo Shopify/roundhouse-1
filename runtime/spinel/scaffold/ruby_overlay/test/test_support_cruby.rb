@@ -374,7 +374,7 @@ module ActiveSupport
       module Instrumented
         def read(name, options = nil)
           key = ActiveSupport::Cache.expanded_key(name)
-          hit = exist?(name)
+          hit = options.nil? ? exist?(name) : exist?(name, options)
           value = super
           ActiveSupport::Notifications.instrument("cache_read.active_support", { key: key, hit: hit })
           value
@@ -386,17 +386,23 @@ module ActiveSupport
           stored
         end
 
-        def fetch(name)
+        # Rails' `fetch(name, options = nil, &block)`: the options a
+        # caller writes as keywords arrive as the one Hash, and go on to
+        # the store (and to `exist?`, so a `namespace:` finds its entry).
+        def fetch(name, options = nil, &block)
           key = ActiveSupport::Cache.expanded_key(name)
-          hit = exist?(name)
+          hit = options.nil? ? exist?(name) : exist?(name, options)
           ActiveSupport::Notifications.instrument("cache_read.active_support", { key: key, hit: hit, super_operation: :fetch })
           super
         end
 
+        # `read_multi(*names, **options)`: a trailing Hash is the options,
+        # not a name.
         def read_multi(*names)
           found = super
+          keys = names.last.instance_of?(Hash) ? names[0...-1] : names
           ActiveSupport::Notifications.instrument("cache_read_multi.active_support", {
-            key: names.map { |name| ActiveSupport::Cache.expanded_key(name) },
+            key: keys.map { |name| ActiveSupport::Cache.expanded_key(name) },
             hits: found.keys.map { |name| ActiveSupport::Cache.expanded_key(name) }
           })
           found
