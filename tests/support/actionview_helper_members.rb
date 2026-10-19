@@ -1,6 +1,6 @@
 # Prints src/view_helpers/actionview_members.txt from the pinned Rails
 # (tests/support/rails_oracle.rb): for each `ActionView::Helpers` module
-# (and `ActiveSupport::NumberHelper`), every method an includer can call
+# (plus `ActionView::Context`, and `ActiveSupport::NumberHelper`), every method an includer can call
 # on implicit self — public and private, from the module and from all
 # the modules including it brings along. Measured by including it into
 # a fresh class, so ActiveSupport::Concern dependencies (`ActionView::
@@ -14,7 +14,7 @@ RailsOracle.activate("activesupport", "actionview", "actionpack", "activemodel")
 require "action_view"
 require "active_support/number_helper"
 
-modules = [ActionView::Helpers, ActiveSupport::NumberHelper]
+modules = [ActionView::Helpers, ActionView::Context, ActiveSupport::NumberHelper]
 ActionView::Helpers.constants(false).sort.each do |name|
   value = ActionView::Helpers.const_get(name)
   modules << value if value.instance_of?(Module)
