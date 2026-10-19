@@ -17674,10 +17674,12 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
         .chain(ancestors.iter().copied())
         .flat_map(|c| extended_app_modules(c, app))
         .collect();
+    let tableless = tableless_model_ancestor(&ancestors, app);
     let inherited = |name: &str| {
         ancestors.iter().any(|a| {
             a.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
-        }) || extended.iter().any(|m| module_defines(m, name, app, &mut Vec::new()))
+        }) || tableless.is_some_and(|m| m.methods().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == name))
+            || extended.iter().any(|m| module_defines(m, name, app, &mut Vec::new()))
     };
     // A `with_options(optional: true) do attribute(:x, :string) end`
     // whose block (no parameter: its calls reach the OptionMerger, which
@@ -17714,6 +17716,33 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
             on_self && (inherited(method.as_str()) || app_module_extend(lc, call, app).is_some())
         })
         .collect()
+}
+
+/// The tableless ActiveModel model (a superclass-less includer of
+/// `ActiveModel::Validations`, which ingest lowers as a model) that
+/// ends `ancestors`' chain: the class macros it defines on its singleton
+/// are inherited by the library classes below it. Core's
+/// `Home::Traits::Matcher` defines `describe` and `argument`, and
+/// `Matchers::MilestoneCompleteBeforeDate < Trait < Matcher` calls both.
+/// An ActiveRecord model ends the chain as before (an STI subclass's
+/// calls are `sti_macro_calls`).
+fn tableless_model_ancestor<'a>(ancestors: &[&LibraryClass], app: &'a App) -> Option<&'a crate::dialect::Model> {
+    let last = *ancestors.last()?;
+    let parent = last.parent.as_ref()?;
+    let written = written_parent(last, parent, app);
+    let rooted = written.starts_with("::");
+    let written = written.trim_start_matches("::");
+    let mut scope: Vec<&str> = if rooted { Vec::new() } else { last.name.0.as_str().split("::").collect() };
+    scope.pop();
+    loop {
+        let candidate = if scope.is_empty() { written.to_string() } else { format!("{}::{written}", scope.join("::")) };
+        if let Some(model) = app.models.iter().find(|m| m.name.0.as_str() == candidate) {
+            return model.parent.is_none().then_some(model);
+        }
+        if scope.pop().is_none() {
+            return None;
+        }
+    }
 }
 
 /// `M` for a bare `extend M` naming the app's own module, as Ruby
