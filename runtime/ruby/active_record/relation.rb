@@ -4254,8 +4254,10 @@ module ActiveRecord
     end
 
     # One `?` bind's SQL: Rails quotes an Array (an `IN (?)` list) as its
-    # escaped elements joined by commas, and an empty one as NULL.
+    # escaped elements joined by commas, and an empty one as NULL. A
+    # Relation is its own SQL (`replace_bind_variable`), a subquery.
     def bind_value_sql(value)
+      return value.to_sql if value.is_a?(Relation)
       return ActiveRecord.adapter.escape_value(value) unless value.is_a?(Array)
       return "NULL" if value.empty?
       escape_list(value)
@@ -4284,7 +4286,7 @@ module ActiveRecord
           key = name.to_sym
           if binds.key?(key)
             value = binds[key]
-            out = out + (value.is_a?(Array) ? bind_value_sql(value) : ActiveRecord.adapter.escape_value(value))
+            out = out + bind_value_sql(value)
             i = j
             next
           end
