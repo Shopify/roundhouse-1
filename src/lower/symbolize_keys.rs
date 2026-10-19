@@ -317,7 +317,12 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         }
         _ => None,
     };
-    if let Some(r) = replacement {
+    // The rebuilt value fills the same argument slot: a `**h.symbolize_keys`
+    // the keyword lowering erased keeps its splat mark, or the Ruby family
+    // passes the Hash positionally (Core's `@factory.node(type,
+    // **declaration.except("field").symbolize_keys)` raised ArgumentError).
+    if let Some(mut r) = replacement {
+        crate::lower::keyword_marks::SlotMarks::of(expr).restore(&mut r);
         *expr = r;
     }
 }
