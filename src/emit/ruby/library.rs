@@ -11793,6 +11793,11 @@ fn emit_library_class_decl_inner(
     // the IR's class-side copies on the Concern are that module here.
     let block_spans = app.class_methods_blocks.get(&lc.name).filter(|_| lc.is_module && lc.top_level_constants.is_empty());
     let (class_methods_block, without_block_methods);
+    // The `include`s the block writes (`class_methods do include M … end`):
+    // ingest reads one as `extend M` on the singleton (`SINGLETON_BODY`),
+    // but the block is `module_eval`ed on `ClassMethods`, so they are that
+    // module's own includes, written inside it.
+    let mut block_includes: Vec<Vec<String>> = Vec::new();
     let lc = match block_spans {
         Some(spans) if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && spans.contains(&m.name_span)) => {
             let in_block = |m: &MethodDef| m.receiver == MethodReceiver::Class && spans.contains(&m.name_span);
@@ -11804,6 +11809,12 @@ fn emit_library_class_decl_inner(
             }
             let mut rest = lc.clone();
             rest.methods.retain(|m| !in_block(m));
+            for call in lc.unknown_calls.iter().filter(|c| is_class_methods_block_include(c)) {
+                if let ExprNode::Send { args, .. } = &*call.node {
+                    block_includes.push(args.iter().map(super::emit_expr).collect());
+                }
+            }
+            rest.unknown_calls.retain(|c| !is_class_methods_block_include(c));
             (class_methods_block, without_block_methods) = (Some(module), rest);
             &without_block_methods
         }
@@ -12557,6 +12568,12 @@ fn emit_library_class_decl_inner(
     if let Some(module) = &class_methods_block {
         let inner_pad = format!("{body_pad}  ");
         writeln!(s, "{body_pad}module ClassMethods").unwrap();
+        for modules in &block_includes {
+            writeln!(s, "{inner_pad}include {}", modules.join(", ")).unwrap();
+        }
+        if !block_includes.is_empty() {
+            writeln!(s).unwrap();
+        }
         for index in 0..module.methods.len() {
             if index > 0 {
                 writeln!(s).unwrap();
@@ -16863,6 +16880,17 @@ fn carrier_included_modules<'a>(
         }
     }
     out
+}
+
+/// Whether `call` is an `include M` written directly in a Concern's
+/// `class_methods do … end` block: ingested as `extend M` on the
+/// singleton (`SINGLETON_BODY`) and tagged as the block's statement
+/// (`CLASS_METHODS_BLOCK_STATEMENT`).
+fn is_class_methods_block_include(call: &Expr) -> bool {
+    call.decisions & crate::expr::CLASS_METHODS_BLOCK_STATEMENT != 0
+        && call.decisions & crate::expr::SINGLETON_BODY != 0
+        && matches!(&*call.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str() == "extend" && !args.is_empty())
 }
 
 /// Whether a module body uses ActiveSupport::Concern's hooks, which

@@ -98,6 +98,7 @@ Rails.secret_key_base = LocalSecret.resolve(ENV["SECRET_KEY_BASE"])
 # runtime's Cache is a recompute-every-fetch no-op).
 require_relative "runtime/rails_cache"
 require_relative "runtime/rails_application_routes"
+require_relative "runtime/rails_application_tasks"
 require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_time_parsing"
 require_relative "runtime/active_support_core_ext"
