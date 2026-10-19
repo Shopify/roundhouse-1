@@ -9,11 +9,13 @@
 //! passed the Hash positionally, and `node(type, nullable: false,
 //! **options)` raised ArgumentError (given 2, expected 1) while the
 //! module body ran: every sweep-1 test failed at boot.
+//!
+//! Native Ruby is the oracle.
 
-use roundhouse::det::HashMap;
-use std::path::PathBuf;
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
 
-use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::project::BuildTarget;
 
 const FACTORY: &str = r#"class SchemaFactory
   #: (String type, ?nullable: bool, **untyped) -> Hash[String, untyped]
@@ -28,31 +30,48 @@ const FACTORY: &str = r#"class SchemaFactory
 end
 "#;
 
-fn emitted() -> String {
-    let files: Vec<(&str, String)> = vec![("app/models/schema_factory.rb", FACTORY.into())];
-    let tree: HashMap<PathBuf, Vec<u8>> =
-        files.into_iter().map(|(p, c)| (PathBuf::from(p), c.into_bytes())).collect();
-    let mut app = ingest_app_from_tree(tree).expect("ingest");
-    let _ = roundhouse::session::analyze_and_lower(&mut app);
-    let class = app
-        .library_classes
-        .iter()
-        .find(|c| c.name.0.as_str() == "SchemaFactory")
-        .expect("SchemaFactory class");
-    format!(
-        "class SchemaFactory\n{}end\n",
-        class.methods.iter().map(roundhouse::emit::ruby::emit_method).collect::<String>()
-    )
+const REPORT: &str = r#"p SchemaFactory.new.lower("string", { "field" => "title", "max_length" => 3, "nullable" => true })
+"#;
+
+const EXPECTED: &str = "{\"type\" => \"string\", \"nullable\" => true, \"max_length\" => 3}\n";
+
+#[test]
+fn native_ruby_passes_the_converted_hash_as_keywords() {
+    let dir = std::env::temp_dir().join(format!("roundhouse-kwsplat-rebuilt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("schema_factory.rb");
+    std::fs::write(&file, FACTORY).unwrap();
+    // `symbolize_keys` is ActiveSupport's; the control defines the same conversion.
+    let prelude = "class Hash; def symbolize_keys = transform_keys(&:to_sym); end\n";
+    let output = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(format!("{prelude}require {:?}\n{REPORT}", file.display().to_string()))
+        .output()
+        .expect("native Ruby control");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
 #[test]
-fn a_rebuilt_symbolize_keys_argument_is_still_a_keyword_splat() {
-    let out = emitted();
-    let lower = out
-        .lines()
-        .skip_while(|l| !l.contains("def lower"))
-        .nth(1)
-        .unwrap_or_else(|| panic!("no lower body in:\n{out}"));
-    assert!(lower.contains("symbolize_keys"), "the call is still converted:\n{out}");
-    assert!(lower.contains("node(type, **"), "the converted Hash is passed as keywords:\n{out}");
+fn emitted_ruby_passes_the_converted_hash_as_keywords() {
+    let fixture = emit_and_run::real_blog().write("app/lib/schema_factory.rb", FACTORY);
+    let (emitted, errors) = fixture.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let main = emitted.join("main").display().to_string();
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("require {main:?}\nMain.configure_default_adapter!\n{REPORT}"))
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("spawn ruby");
+    assert!(
+        output.status.success(),
+        "emitted program failed in {}:\n{}",
+        emitted.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
