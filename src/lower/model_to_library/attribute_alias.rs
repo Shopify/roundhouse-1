@@ -76,6 +76,11 @@ pub(super) fn demanded_as_alias(
 /// :id` on every model with an `id` column and no `id_value` one; that
 /// alias gets its twins here too. A composite key's `id_value` is the
 /// renamed column reader (`composite_key::rekey`), so it is skipped.
+///
+/// The `id_value` alias names the `id` column. When the model's key is
+/// another column (`domains` has an `id` column beside `PRIMARY KEY (host)`),
+/// `id` answers that key, so the twins copy the column's accessors instead
+/// of delegating to `id`: Core's `generate_oid` asks `id_value`, not the key.
 pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
     let has_column = |name: &str| table.columns.iter().any(|c| c.name.as_str() == name);
     let implicit_id_value = has_column("id")
@@ -90,6 +95,7 @@ pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, ta
         aliases.push((Symbol::from("id_value"), Symbol::from("id")));
     }
     let owner = &model.name;
+    let key_shadows_id = super::schema::key_alias_column(model, table).is_some();
     let column_spellings: Vec<Symbol> = table
         .columns
         .iter()
@@ -114,7 +120,11 @@ pub(super) fn push_alias_methods(methods: &mut Vec<MethodDef>, model: &Model, ta
             let Some(target) = methods.iter().find(|m| m.receiver == MethodReceiver::Instance && m.name == orig) else {
                 continue;
             };
-            twins.push(delegate(target, twin));
+            twins.push(if key_shadows_id && old.as_str() == "id" {
+                MethodDef { name: twin, ..target.clone() }
+            } else {
+                delegate(target, twin)
+            });
         }
     }
     methods.extend(twins);

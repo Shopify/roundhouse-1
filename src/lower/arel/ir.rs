@@ -245,6 +245,11 @@ pub enum Value {
     /// program — typically `id` (Var ref to a method param) or
     /// `instance.<col>` (instance-field accessor) or `@id` (Ivar).
     Runtime { expr: Expr, ty: ValueType },
+    /// A column with a database-side function default, written by an
+    /// INSERT (PostgreSQL only): a slot nothing assigned (nil) is the
+    /// `DEFAULT` keyword, as Rails leaves such an attribute out of the
+    /// INSERT; an assigned slot is escaped like `Runtime`.
+    RuntimeOrDefault { expr: Expr, ty: ValueType },
 }
 
 /// Discriminator for which `Db.escape_*` primitive the visitor calls.

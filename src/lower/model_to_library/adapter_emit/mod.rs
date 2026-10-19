@@ -343,19 +343,26 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
         !matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt) || (unflagged && c.default.is_none())
     });
 
+    // A column the database defaults with a function (PostgreSQL), which
+    // the record left nil: Rails leaves it out of the INSERT and reads the
+    // value the database chose back (`auto_populated?`). Here the slot is
+    // the `DEFAULT` keyword, and the value is read back through the
+    // generated columns' `RETURNING` when the table has a key to return.
+    let defaulted = |c: &crate::schema::Column| {
+        dialect == SqlDialect::Postgres && c.default_function && !c.primary_key && c.generated.is_none()
+    };
+    let insert_value = |c: &crate::schema::Column| {
+        let (expr, ty) = (column_bind_expr(model, c), insert_bind_type(model, c));
+        if defaulted(c) { Value::RuntimeOrDefault { expr, ty } } else { Value::Runtime { expr, ty } }
+    };
+
     // SQL column names are the PUBLIC names; the value reads the STORAGE
     // ivar (`@col_raw` for temporal — stored ISO-8601 text goes to disk).
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
         .filter(|c| c.generated.is_none() && (!c.primary_key || supplied_key.is_some()))
-        .map(|c| Assignment {
-            column: c.name.clone(),
-            value: Value::Runtime {
-                expr: column_bind_expr(model, c),
-                ty: insert_bind_type(model, c),
-            },
-        })
+        .map(|c| Assignment { column: c.name.clone(), value: insert_value(c) })
         .collect();
 
     let insert = Insert {
@@ -372,15 +379,17 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
             .columns
             .iter()
             .filter(|c| c.generated.is_none())
-            .map(|c| Assignment {
-                column: c.name.clone(),
-                value: Value::Runtime { expr: column_bind_expr(model, c), ty: insert_bind_type(model, c) },
-            })
+            .map(|c| Assignment { column: c.name.clone(), value: insert_value(c) })
             .collect();
         (k, Insert { table: TableRef(table.name.clone()), assignments, returns_rowid: true })
     });
-    let generated: Vec<&crate::schema::Column> =
-        table.columns.iter().filter(|c| c.generated.is_some()).collect();
+    // Database-owned values read back from the INSERT: generated columns,
+    // then the function-defaulted ones when the table has a key to return.
+    let generated: Vec<&crate::schema::Column> = table
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_some() || (key.is_some() && defaulted(c)))
+        .collect();
     let ret_ty = if supplied_key.is_some() { key_ty(model, table) } else { Ty::Int };
     // A uuid key left blank is minted here, as the `gen_random_uuid()`
     // default the Postgres schema declares would have on insert — SQLite
@@ -669,13 +678,28 @@ fn hydrate_generated_after_insert(
             },
         );
         is_nil.ty = Some(Ty::Bool);
-        let assign = Expr::new(
-            Span::synthetic(),
-            ExprNode::Assign {
-                target: crate::expr::LValue::Ivar { name: storage },
-                value: var_ref(staged),
-            },
-        );
+        // A retypable column's slot holds the declared type's value, so the
+        // database's text goes through its deserializing writer.
+        let assign = if super::schema::is_retypable(model, col) {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                    method: super::schema::retypable_storage_writer(col),
+                    args: vec![var_ref(staged)],
+                    block: None,
+                    parenthesized: true,
+                },
+            )
+        } else {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: storage },
+                    value: var_ref(staged),
+                },
+            )
+        };
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::If {

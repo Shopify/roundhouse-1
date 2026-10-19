@@ -544,7 +544,7 @@ fn parse_column_def(
         file: file.into(),
         message: format!("generated column dropped: {table}.{col_name}: {message}"),
     })?;
-    let (nullable, default) = parse_modifiers(modifiers);
+    let (nullable, default, default_function) = parse_modifiers(modifiers);
     if generated.is_some() && default.is_some() {
         return Err(unsupported_col(file, table, &col_name, "generated column also has DEFAULT"));
     }
@@ -554,6 +554,7 @@ fn parse_column_def(
         .then_some(false);
     let generated_int4_compatible =
         has_nonportable_int4_source_type(type_phrase).then_some(false);
+    let default_function = default_function && generated.is_none();
 
     Ok(Some(Column {
         name: Symbol::from(col_name),
@@ -564,6 +565,7 @@ fn parse_column_def(
         generated,
         generated_text_compatible,
         generated_int4_compatible,
+        default_function,
     }))
 }
 
@@ -1730,10 +1732,11 @@ fn only_optional_nullability(s: &str) -> bool {
 /// `nextval(…)` or `now()`. A nullable column keeps its default as the
 /// value a new record has: `products.gift_card boolean DEFAULT false`
 /// reads `false`, not nil, on `Product.new`.
-fn parse_modifiers(modifiers: &str) -> (bool, Option<String>) {
+fn parse_modifiers(modifiers: &str) -> (bool, Option<String>, bool) {
     let words = top_level_words(modifiers);
     let mut nullable = true;
     let mut default = None;
+    let mut default_function = false;
     for idx in 0..words.len() {
         let (pos, word) = &words[idx];
         if word == "NOT" && words.get(idx + 1).map(|(_, w)| w.as_str()) == Some("NULL") {
@@ -1745,10 +1748,14 @@ fn parse_modifiers(modifiers: &str) -> (bool, Option<String>) {
                 default = Some(v);
             } else if let Some(v) = words.get(idx + 1).and_then(|(_, w)| bare_literal_default(w)) {
                 default = Some(v);
+            } else {
+                // A function call or any other expression: the database
+                // evaluates it, so it is no value a record can hold.
+                default_function = true;
             }
         }
     }
-    (nullable, default)
+    (nullable, default, default_function)
 }
 
 /// A bare `DEFAULT` token the column type reads as a value: `true` / `false`
@@ -1961,5 +1968,22 @@ CREATE INDEX widgets_payload_idx ON widgets USING public.gin (payload);"#;
             resolve_column_type("public.widget_status", &enums),
             Some(ColumnType::String { limit: None })
         ));
+    }
+
+    #[test]
+    fn a_function_default_is_flagged_and_a_literal_default_is_kept() {
+        let sql = b"CREATE TABLE core.medias (\n    id uuid NOT NULL,\n    directory_id uuid DEFAULT lpad(to_hex(0::bigint), 32, '0')::uuid NOT NULL,\n    kind integer DEFAULT length('abcd'::text) NOT NULL,\n    note character varying(255) DEFAULT 'plain'::character varying NOT NULL,\n    live boolean DEFAULT false,\n    weight numeric(21,3) DEFAULT 0.0,\n    blank character varying(255),\n    CONSTRAINT medias_pkey PRIMARY KEY (id)\n);\n";
+        let schema = ingest_structure_sql(sql, "db/structure.sql").expect("ingests");
+        let table = schema.tables.get(&Symbol::from("medias")).expect("medias");
+        let column = |name: &str| table.columns.iter().find(|c| c.name.as_str() == name).expect(name);
+        for name in ["directory_id", "kind"] {
+            assert!(column(name).default_function, "{name} is a function default");
+            assert_eq!(column(name).default, None, "{name} holds no value");
+        }
+        for name in ["id", "note", "live", "weight", "blank"] {
+            assert!(!column(name).default_function, "{name} is no function default");
+        }
+        assert_eq!(column("note").default.as_deref(), Some("plain"));
+        assert_eq!(column("live").default.as_deref(), Some("false"));
     }
 }

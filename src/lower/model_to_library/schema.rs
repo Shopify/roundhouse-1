@@ -537,23 +537,7 @@ pub(super) fn push_schema_methods(
     // where it names a column and the table has no `id` (Core's
     // ThemeTemplateBody declares "cityhash" over a composite
     // `(cityhash, island)` table key), else the schema's.
-    let has_id_column = table.columns.iter().any(|c| c.name.as_str() == "id");
-    let declared_key = model
-        .primary_key
-        .as_ref()
-        .filter(|_| model.composite_primary_key.is_empty() && !has_id_column)
-        .and_then(|pk| table.columns.iter().find(|c| c.name == *pk));
-    // A model that declares `self.primary_key = :id` over a table that has
-    // an `id` column keys on it, whatever the table's PRIMARY KEY
-    // constraint names (Core's MerchantSubscriptions::CoreGeneral2::Price
-    // keeps a uuid-as-integer `id` beside a `PRIMARY KEY (uuid)`): `id`
-    // is the column's own accessor, not an alias of the constraint's key.
-    let declares_id_key = has_id_column
-        && model.composite_primary_key.is_empty()
-        && model.primary_key.as_ref().is_some_and(|pk| pk.as_str() == "id");
-    let key = declared_key
-        .or_else(|| table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id"))
-        .filter(|_| !declares_id_key);
+    let key = key_alias_column(model, table);
     if let Some(key) = key {
         methods.push(synth_key_alias_reader(owner, key));
         methods.push(synth_key_alias_writer(owner, key));
@@ -1499,6 +1483,32 @@ fn synth_temporal_writer(owner: &ClassId, col: &Column) -> MethodDef {
         mutates_self: true,
         block_param: None,
     }
+}
+
+/// The key column whose value `id` answers when it is not the `id` column:
+/// the model's `self.primary_key =` where it names a column and the table
+/// has no `id` (Core's ThemeTemplateBody declares "cityhash" over a
+/// composite `(cityhash, island)` table key), else the schema's key column
+/// that is not `id`.
+///
+/// A model that declares `self.primary_key = :id` over a table that has
+/// an `id` column keys on it, whatever the table's PRIMARY KEY
+/// constraint names (Core's MerchantSubscriptions::CoreGeneral2::Price
+/// keeps a uuid-as-integer `id` beside a `PRIMARY KEY (uuid)`): `id`
+/// is the column's own accessor, not an alias of the constraint's key.
+pub(super) fn key_alias_column<'a>(model: &Model, table: &'a Table) -> Option<&'a Column> {
+    let has_id_column = table.columns.iter().any(|c| c.name.as_str() == "id");
+    let declared_key = model
+        .primary_key
+        .as_ref()
+        .filter(|_| model.composite_primary_key.is_empty() && !has_id_column)
+        .and_then(|pk| table.columns.iter().find(|c| c.name == *pk));
+    let declares_id_key = has_id_column
+        && model.composite_primary_key.is_empty()
+        && model.primary_key.as_ref().is_some_and(|pk| pk.as_str() == "id");
+    declared_key
+        .or_else(|| table.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id"))
+        .filter(|_| !declares_id_key)
 }
 
 /// `def id; @<key>; end` for a model whose key column is not `id`.

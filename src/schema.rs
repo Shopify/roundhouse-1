@@ -86,6 +86,13 @@ pub struct Column {
     /// form and application typing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_int4_compatible: Option<bool>,
+    /// The column carries a database-side DEFAULT that is not a literal
+    /// value: a function or expression (`now()`, `lpad(to_hex(0::bigint), 32,
+    /// '0')::uuid`). Rails reads such a column's default as nil, leaves it
+    /// out of an INSERT nothing assigned, and reads the database's value
+    /// back (`auto_populated?`). A literal default is in `default`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_function: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -12535,17 +12535,19 @@ fn emit_library_class_decl_inner(
     if let Some((module, retargeted)) = &generated_attributes {
         let inner_pad = format!("{body_pad}  ");
         writeln!(s, "{body_pad}module GeneratedAttributeMethods").unwrap();
+        // Each alias follows its writer's first definition: a model whose key
+        // is not its `id` column defines `id=` twice (the column's, then the
+        // key's), and `_generated_id=` is the column's.
+        let mut aliased: crate::det::HashSet<&Symbol> = crate::det::HashSet::default();
         for index in 0..module.methods.len() {
             if index > 0 {
                 writeln!(s).unwrap();
             }
             write_library_method(&mut s, module, index, &inner_pad, &[]);
-        }
-        if !retargeted.is_empty() {
-            writeln!(s).unwrap();
-        }
-        for writer in retargeted {
-            writeln!(s, "{inner_pad}alias_method :{}, :{}", generated_writer_alias(writer).as_str(), writer.as_str()).unwrap();
+            let name = &module.methods[index].name;
+            if let Some(writer) = retargeted.iter().find(|w| *w == name).filter(|w| aliased.insert(*w)) {
+                writeln!(s, "{inner_pad}alias_method :{}, :{}", generated_writer_alias(writer).as_str(), writer.as_str()).unwrap();
+            }
         }
         writeln!(s, "{body_pad}end").unwrap();
         writeln!(s, "{body_pad}private_constant :GeneratedAttributeMethods").unwrap();
