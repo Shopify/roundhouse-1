@@ -3593,7 +3593,14 @@ end
         app.models.iter().map(|m| crate::analyze::retypable_attributes::defaulted_attributes(m, &app)).collect();
     let aliases: Vec<Vec<(crate::ident::Symbol, crate::ident::Symbol)>> =
         app.models.iter().map(|m| crate::analyze::retypable_attributes::attribute_aliases(m, &app)).collect();
-    for (((model, cols), defaulted), aliases) in app.models.iter_mut().zip(retypable).zip(defaulted).zip(aliases) {
+    let macro_defaulted: Vec<Vec<crate::span::Span>> = app
+        .models
+        .iter()
+        .map(|m| crate::analyze::retypable_attributes::macro_defaulted_spans(m, &app))
+        .collect();
+    for ((((model, cols), defaulted), aliases), macro_defaulted) in
+        app.models.iter_mut().zip(retypable).zip(defaulted).zip(aliases).zip(macro_defaulted)
+    {
         for col in &cols {
             if let Some(ty) = model.attributes.fields.get_mut(col) {
                 *ty = crate::ty::Ty::Untyped;
@@ -3616,6 +3623,7 @@ end
                     || crate::analyze::retypable_attributes::decorated_columns(expr, table).is_some()
                     || crate::analyze::retypable_attributes::defaulted_attribute(expr, table).is_some()
                     || crate::analyze::retypable_attributes::alias_attribute_decl(expr, table).is_some()
+                    || macro_defaulted.contains(&expr.span)
                     || crate::analyze::retypable_attributes::store_accessor_decl(expr, table)
                         .is_some_and(|(column, _)| model.retypable_attributes.contains(&column))
                 {

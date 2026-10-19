@@ -125,6 +125,8 @@ pub(crate) fn defaulted_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         }
         visited.push(m.name.0.as_str());
         names.extend(body_statements(m).filter_map(|e| defaulted_attribute(e, table)));
+        let side = ClassSide::of(m, app);
+        names.extend(body_statements(m).filter_map(|e| macro_defaulted_attribute(&side, e, table)));
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
     for lc in sti_descendants(model, app) {
@@ -164,6 +166,69 @@ pub(crate) fn defaulted_attribute(expr: &Expr, table: &crate::schema::Table) -> 
         return None;
     }
     table.columns.iter().find(|c| c.name.as_str() == name).map(|c| c.name.clone())
+}
+
+/// A body call of an app class macro (Core's `suid_column :id`) whose own
+/// body is one top-level `attribute <param>[, :type], default: value` over
+/// the macro's positional parameter, the call's argument a literal naming
+/// a column of `table`: the column [`defaulted_attribute`] would name had
+/// the call been written out. The call runs at class load as written, so
+/// the runtime's `attribute` records the default the compiled `initialize`
+/// starts a new record from. None for a macro that declares anything else
+/// (a nested branch, another macro, a computed name, further options).
+pub(crate) fn macro_defaulted_attribute(side: &ClassSide<'_>, call: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
+    let ExprNode::Send { recv, method, args, .. } = &*call.node else { return None };
+    if !on_self(recv) || method.as_str() == "attribute" {
+        return None;
+    }
+    let def = side.class_method(method.as_str())?;
+    if def.params.len() != args.len() || def.params.iter().any(|p| p.keyword || p.rest || p.forwarding || p.name.as_str().is_empty()) {
+        return None;
+    }
+    let literal = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let bound: Vec<(&Symbol, String)> =
+        def.params.iter().zip(args).map(|(p, a)| literal(a).map(|v| (&p.name, v))).collect::<Option<_>>()?;
+    let aliases = self_aliases(&def.body);
+    let statements: Vec<&Expr> = match &*def.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&def.body],
+    };
+    let mut found: Option<String> = None;
+    for statement in statements {
+        if let ExprNode::Send { recv, method, args, block: None, .. } = &*statement.node
+            && method.as_str() == "attribute"
+            && on_class(recv, &aliases)
+        {
+            let (name, options) = match args.as_slice() {
+                [name, options] => (name, options),
+                [name, ty, options] if matches!(&*ty.node, ExprNode::Lit { value: Literal::Sym { .. } }) => (name, options),
+                _ => return None,
+            };
+            let name = match &*name.node {
+                ExprNode::Var { name, .. } => bound.iter().find(|(p, _)| *p == name).map(|(_, v)| v.clone())?,
+                _ => literal(name)?,
+            };
+            let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+            let [(key, _)] = entries.as_slice() else { return None };
+            if !matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "default") {
+                return None;
+            }
+            if found.replace(name).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let mut seen = vec![def.name.as_str().to_string()];
+        if side.reaches(statement, "attribute", &aliases, &mut seen) {
+            return None;
+        }
+    }
+    let found = found?;
+    table.columns.iter().find(|c| c.name.as_str() == found).map(|c| c.name.clone())
 }
 
 /// The `alias_attribute` calls (`alias_attribute_decl`) of the model and
@@ -620,6 +685,8 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| decorated_columns(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
+        let defaulting = ClassSide::of(model, app);
+        out.extend(body_statements(model).filter(|e| macro_defaulted_attribute(&defaulting, e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| alias_attribute_decl(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| claimed_store_accessor(model, e, table)).map(|e| e.span));
         let side = ClassSide::of(model, app);
@@ -1120,4 +1187,12 @@ fn sti_descendants<'a>(model: &'a Model, app: &'a App) -> impl Iterator<Item = &
         names.extend(out[before..].iter().map(|lc| &lc.name));
     }
     out.into_iter()
+}
+
+/// The spans of the model's body calls [`macro_defaulted_attribute`]
+/// names a column for: they run at class load as written.
+pub(crate) fn macro_defaulted_spans(model: &Model, app: &App) -> Vec<crate::span::Span> {
+    let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
+    let side = ClassSide::of(model, app);
+    body_statements(model).filter(|e| macro_defaulted_attribute(&side, e, table).is_some()).map(|e| e.span).collect()
 }
