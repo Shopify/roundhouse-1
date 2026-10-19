@@ -5678,8 +5678,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     framework_feature_files(files);
     files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
-    // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
-    for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
+    // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha), and
+    // activerecord-session_store's ActiveRecordStore (autoloads
+    // ActiveRecord::SessionStore::Session from its own port).
+    for port in ["action_dispatch_session_store", "active_record_session_store", "action_dispatch_show_exceptions"] {
         let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
             .map_err(|e| format!("read {port} runtime: {e}"))?;
         files.push((format!("runtime/{port}.rb"), text));
@@ -14787,6 +14789,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_i18n_railtie.rb"
         && p != "runtime/rails_framework_locales.rb"
         && p != "runtime/action_dispatch_session_store.rb"
+        && p != "runtime/active_record_session_store.rb"
         && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb"
         && p != "runtime/active_record_query_logs.rb");

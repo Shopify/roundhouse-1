@@ -95,3 +95,73 @@ puts "ALL OK"
         )
         .assert_passes();
 }
+
+/// `rescue_from(*ERRORS, ...)` (Core's ApplicationController names its
+/// handled errors as a splatted constant) lowered the cause walk to
+/// `__rescued.is_a?(*ERRORS)`, which raised ArgumentError (given N,
+/// expected 1) from inside the handler for every unhandled error.
+#[test]
+fn rescue_from_a_splatted_class_list_walks_the_cause() {
+    emit_and_run::empty_app()
+        .write(
+            "app/controllers/application_controller.rb",
+            r##"class ApplicationController < ActionController::API
+  HANDLED = [KeyError, IndexError].freeze
+  rescue_from(*HANDLED, with: :listed)
+
+  private
+
+  def listed(e)
+    render json: { listed: e.class.name }, status: :gone
+  end
+end
+"##,
+        )
+        .write(
+            "app/controllers/widgets_controller.rb",
+            r##"class WidgetsController < ApplicationController
+  def direct
+    raise KeyError, "direct"
+  end
+
+  def wrap
+    raise IndexError, "inner"
+  rescue StandardError => e
+    raise ArgumentError, "while handling: #{e.message}"
+  end
+
+  def unhandled
+    raise ArgumentError, "no handler"
+  end
+end
+"##,
+        )
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  post \"widgets/direct\", to: \"widgets#direct\"\n  post \"widgets/wrap\", to: \"widgets#wrap\"\n  post \"widgets/unhandled\", to: \"widgets#unhandled\"\nend\n",
+        )
+        .run_ruby(
+            r##"
+def probe(path)
+  status, _headers, body = Main.run_rack("REQUEST_METHOD" => "POST", "PATH_INFO" => path, "QUERY_STRING" => "",
+                                         "CONTENT_TYPE" => "application/json", "rack.input" => StringIO.new("{}"))
+  text = +""
+  body.each { |part| text << part }
+  [status, text]
+end
+got = probe("/widgets/direct")
+raise "direct #{got.inspect}" unless got == [410, %({"listed":"KeyError"})]
+got = probe("/widgets/wrap")
+raise "wrap #{got.inspect}" unless got == [410, %({"listed":"IndexError"})]
+escaped = begin
+  probe("/widgets/unhandled")
+  nil
+rescue ArgumentError => e
+  e.message
+end
+raise "unhandled #{escaped.inspect}" unless escaped == "no handler"
+puts "ALL OK"
+"##,
+        )
+        .assert_passes();
+}

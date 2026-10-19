@@ -64,6 +64,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     // The PostgreSQL CRuby tree with i18n in its lockfile.
     ("runtime/spinel/active_support_i18n_railtie.rb", "runtime/active_support_i18n_railtie.rb"),
     ("runtime/spinel/action_dispatch_session_store.rb", "runtime/action_dispatch_session_store.rb"),
+    ("runtime/spinel/active_record_session_store.rb", "runtime/active_record_session_store.rb"),
     ("runtime/spinel/action_dispatch_show_exceptions.rb", "runtime/action_dispatch_show_exceptions.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_query_logs.rb", "runtime/active_record_query_logs.rb"),
@@ -1019,6 +1020,9 @@ mod tests {
             ("ActionDispatch::Session::AbstractSecureStore", "runtime/action_dispatch_session_store.rb"),
             ("ActionDispatch::Session::Compatibility", "runtime/action_dispatch_session_store.rb"),
             ("ActionDispatch::Session::SessionRestoreError", "runtime/action_dispatch_session_store.rb"),
+            ("ActionDispatch::Session::ActiveRecordStore", "runtime/action_dispatch_session_store.rb"),
+            ("ActiveRecord::SessionStore", "runtime/active_record_session_store.rb"),
+            ("ActiveRecord::SessionStore::Session", "runtime/active_record_session_store.rb"),
             ("ActionDispatch::Constants", "runtime/action_dispatch_show_exceptions.rb"),
             ("ActionDispatch::ShowExceptions", "runtime/action_dispatch_show_exceptions.rb"),
             ("ActionDispatch::Http::URL", "runtime/action_dispatch_http_url.rb"),
