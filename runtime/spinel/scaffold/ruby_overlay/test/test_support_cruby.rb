@@ -233,6 +233,16 @@ module ActiveJob
         end
     end
   end
+
+  # Rails' `TestHelper#after_teardown` resets the test adapter, which
+  # forgets the job classes a test took out of it
+  # (`disable_test_adapter`; runtime/active_job_callbacks.rb).
+  module TestHelper
+    def after_teardown
+      super if defined?(super)
+      ActiveJob::QueueAdapter.reset if defined?(ActiveJob::QueueAdapter)
+    end
+  end
 end
 
 # Rails-dom-testing's `css_select`: the elements of the last response

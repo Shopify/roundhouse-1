@@ -17038,6 +17038,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || claimed(c)
                 || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
                 || ruby2_keywords_call(lc, c)
+                || job_queue_adapter_assignment(lc, c, app)
                 || splatted_delegate_call(c)
                 || podded_client_binding_call(c)
         })
@@ -17162,6 +17163,25 @@ fn splatted_delegate_call(call: &Expr) -> bool {
         }
     }
     (splatted || private) && target
+}
+
+/// `self.queue_adapter = HedwigAdapter` in the body of a job class
+/// (`ActiveJob::QueueAdapter`'s class-level writer): the adapter the
+/// class enqueues through when the `:test` adapter does not take its
+/// jobs (`disable_test_adapter`, runtime/spinel/active_job_callbacks.rb).
+/// Replayed as written, where the receiver is the runtime's own job base
+/// and the value is a constant or a symbol; dropped, Core's
+/// `BackgroundQueue::Job` had no adapter, so `WithProductionJobQueue`'s
+/// production queue path had nothing to enqueue through.
+fn job_queue_adapter_assignment(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*call.node else { return false };
+    if method.as_str() != "queue_adapter=" || !matches!(&*recv.node, ExprNode::SelfRef) {
+        return false;
+    }
+    let [value] = args.as_slice() else { return false };
+    matches!(&*value.node, ExprNode::Const { .. } | ExprNode::Lit { value: Literal::Sym { .. } })
+        && !lc.is_module
+        && crate::lower::job_class_side::job_class_names(&app.library_classes).contains(lc.name.0.as_str())
 }
 
 /// `ruby2_keywords :a, :b` naming instance methods the class defines
