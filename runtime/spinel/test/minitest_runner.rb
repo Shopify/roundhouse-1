@@ -21,6 +21,8 @@ module RoundhouseMinitestAssertions
   # here, before any setup callback or authored setup reads a record.
   def __roundhouse_setup_fixtures
     TestBase.instance_method(:setup).super_method.bind_call(self)
+    # Where TestBase#setup restarts the performed log (`@__jobs_from`).
+    RoundhouseEnqueuedArguments.log.clear
   end
 
   # Where an authored `super` from setup lands: Minitest::Test#setup is
@@ -364,6 +366,44 @@ module ActiveSupport
   end
 end
 
+# The arguments of every job enqueued on this thread since the test's
+# setup, serialized at enqueue as Rails' `:test` adapter holds them:
+# `[job class name, ActiveJob::Arguments.serialize(arguments)]`, in
+# enqueue order. The shared performed log keeps names only, and a callable
+# `args:` of `assert_enqueued_with` is called with the job's arguments.
+module RoundhouseEnqueuedArguments
+  def self.log
+    Thread.current[:roundhouse_enqueued_arguments] ||= []
+  end
+
+  # Rails deserializes what it serialized, so a symbol-keyed hash comes
+  # back symbol-keyed and a record comes back through its GlobalID. An
+  # argument the serializer refuses is kept as it was enqueued.
+  def self.deserialize(serialized)
+    return serialized unless serialized.is_a?(Array) && defined?(ActiveJob::Arguments)
+    ActiveJob::Arguments.deserialize(serialized)
+  end
+
+  def self.serialize(arguments)
+    ActiveJob::Arguments.serialize(arguments)
+  rescue StandardError
+    arguments
+  end
+
+  module Recorder
+    private
+
+    def _raw_enqueue
+      RoundhouseEnqueuedArguments.log << [self.class.name, RoundhouseEnqueuedArguments.serialize(arguments)]
+      super
+    end
+  end
+end
+# On the module that defines `_raw_enqueue`, not on Base: an app's job
+# base (Core's BackgroundQueue::Job) has the module ahead of Base in its
+# ancestors, and a prepend on Base would never be reached from there.
+ActiveJob::Enqueuing.prepend(RoundhouseEnqueuedArguments::Recorder) if defined?(ActiveJob::Enqueuing)
+
 # ---- The Rails test helpers this tree models ------------------------
 #
 # TestBase's job, query, event and error helpers compute their answer
@@ -388,10 +428,16 @@ module RoundhouseRailsTestHelpers
     assert_enqueued_jobs 0, only: only, &block
   end
 
-  # TestBase's narrowing stands (only the job class is matched, see its
-  # note); the assertion and its message are Rails'.
+  # TestBase's narrowing stands for plain `args:` (only the job class is
+  # matched, see its note); the assertion and its message are Rails'.
+  # A callable `args:` is Rails' `value.call(deserialized_job[:args])`
+  # over each enqueued job of the class (the lambda asserts inside it, and
+  # those assertions count on the test): it is called with the arguments
+  # the job was serialized with, from RoundhouseEnqueuedArguments' log.
   def assert_enqueued_with(job: "", args: nil, &block)
     name = job.to_s
+    log = RoundhouseEnqueuedArguments.log
+    from = block ? log.length : 0
     jobs =
       if block
         capture_enqueued_jobs([]) { _assert_nothing_raised_or_warn("assert_enqueued_with", &block) }
@@ -399,6 +445,13 @@ module RoundhouseRailsTestHelpers
         capture_enqueued_jobs([])
       end
     matching = name.empty? ? jobs : jobs.select { |enqueued| enqueued.to_s == name }
+    if args.respond_to?(:call) && !matching.empty?
+      entries = log[from..].select { |entry| name.empty? || entry[0] == name }
+      unless entries.empty?
+        found = entries.find { |entry| args.call(RoundhouseEnqueuedArguments.deserialize(entry[1])) }
+        matching = found ? [found] : []
+      end
+    end
     shown = job.is_a?(String) && !name.empty? && Object.const_defined?(name) ? Object.const_get(name) : job
     shown = nil if name.empty?
     expected = { job: shown, args: args }.compact
@@ -411,6 +464,20 @@ module RoundhouseRailsTestHelpers
     end
     assert !matching.empty?, message
     nil
+  end
+
+  # webmock/minitest counts these two as an assertion each, by wrapping
+  # them on `Minitest::Test`; TestBase is not one (it includes
+  # WebMock::API by hand), so the count is ours. `assert_requested` and
+  # `assert_not_requested` reach them through the API.
+  def assert_request_requested(*args, &block)
+    self.assertions += 1
+    super
+  end
+
+  def assert_request_not_requested(*args, &block)
+    self.assertions += 1
+    super
   end
 
   def perform_enqueued_jobs(only: [], &block)

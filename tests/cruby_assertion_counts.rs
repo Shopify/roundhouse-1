@@ -40,6 +40,7 @@ fn app(source: &str) -> emit_and_run::Overlay {
         .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n")
         .write("app/models/probe.rb", PROBE_MODEL)
         .write("app/jobs/probe_job.rb", PROBE_JOB)
+        .write("app/jobs/args_job.rb", ARGS_JOB)
         .write("test/models/assertion_count_test.rb", source)
 }
 
@@ -57,9 +58,21 @@ fn minitest_version() -> String {
 /// where the default gem path may resolve mocha 3. Pure Ruby, so a load
 /// path is enough; unset, both runs take whatever `require` resolves.
 fn shared_includes() -> Vec<String> {
-    std::env::var("ROUNDHOUSE_ASSERTION_ORACLE_MOCHA_LIB")
+    let mocha = std::env::var("ROUNDHOUSE_ASSERTION_ORACLE_MOCHA_LIB")
         .ok().filter(|lib| !lib.is_empty())
-        .map(|lib| vec![format!("-I{lib}")]).unwrap_or_default()
+        .map(|lib| vec![format!("-I{lib}")]).unwrap_or_default();
+    mocha.into_iter().chain(webmock_includes()).collect()
+}
+
+/// The webmock gem's lib directories, colon separated, with those of its
+/// dependencies (`ROUNDHOUSE_ASSERTION_ORACLE_WEBMOCK_LIBS`: webmock,
+/// addressable, public_suffix, crack, hashdiff, bigdecimal, rexml). The
+/// default gem path carries none of them; unset, the webmock case is
+/// skipped by name.
+fn webmock_includes() -> Vec<String> {
+    std::env::var("ROUNDHOUSE_ASSERTION_ORACLE_WEBMOCK_LIBS").ok()
+        .map(|libs| libs.split(':').filter(|lib| !lib.is_empty()).map(|lib| format!("-I{lib}")).collect())
+        .unwrap_or_default()
 }
 
 /// Native-only `-I` directories: a Rails checkout's component libs
@@ -75,6 +88,12 @@ fn native_includes() -> Vec<String> {
 }
 
 const PROBE_JOB: &str = "class ProbeJob < ActiveJob::Base\n  def perform(*args)\n  end\nend\n";
+
+/// A job under an app-defined base, as Core's are (`BackgroundQueue::Job`):
+/// it registers a callback, so it enqueues through the shared runtime's `ActiveJob::Enqueuing`, where
+/// `ProbeJob`'s `perform_later` is the lowered class-side entry that logs
+/// the job's name alone.
+const ARGS_JOB: &str = "class ArgsBaseJob < ActiveJob::Base\n  after_perform { }\nend\n\nclass ArgsJob < ArgsBaseJob\n  def perform(*args)\n  end\nend\n";
 
 static ORACLE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -113,6 +132,7 @@ class ApplicationRecord < ActiveRecord::Base
 end
 {PROBE_MODEL}
 {PROBE_JOB}
+{ARGS_JOB}
 "#)
 }
 
@@ -719,8 +739,79 @@ class AssertionCountTest < ActiveSupport::TestCase
       ProbeJob.perform_later(4)
     end
   end
+
+  # A callable `args:` is called with the enqueued job's arguments, and
+  # what it asserts counts on the test.
+  def test_enqueued_with_callable_args
+    expected = ->(args) do
+      assert_equal(1, args.first)
+      assert_equal({ name: "a" }, args.last)
+    end
+    assert_enqueued_with(job: ArgsJob, args: expected) { ArgsJob.perform_later(1, { name: "a" }) }
+  end
+
+  def test_enqueued_with_callable_args_plain
+    ArgsJob.perform_later(5)
+    assert_enqueued_with(job: ArgsJob, args: ->(args) { assert_equal([5], args) })
+  end
+
+  def test_enqueued_with_callable_args_fails
+    assert_enqueued_with(job: ArgsJob, args: ->(args) { assert_equal(9, args.first) }) { ArgsJob.perform_later(6) }
+  end
 end
-"#, &["test_enqueued_jobs_fails", "test_no_enqueued_jobs_fails", "test_enqueued_with_fails"]);
+"#, &["test_enqueued_jobs_fails", "test_no_enqueued_jobs_fails", "test_enqueued_with_fails", "test_enqueued_with_callable_args_fails"]);
+}
+
+/// webmock/minitest wraps `assert_request_requested` and
+/// `assert_request_not_requested` (behind `assert_requested` and
+/// `assert_not_requested`) to count one assertion each on
+/// `Minitest::Test`; the emitted TestBase is not one and counts them
+/// itself.
+#[test]
+fn webmock_request_assertions_count_like_webmock() {
+    if webmock_includes().is_empty() {
+        eprintln!("skipped: ROUNDHOUSE_ASSERTION_ORACLE_WEBMOCK_LIBS names no webmock gem");
+        return;
+    }
+    let source = r#"
+class AssertionCountTest < ActiveSupport::TestCase
+  # Names WebMock, which is what wires the gem into the emitted tree.
+  include WebMock::API
+
+  def test_requested
+    stub = stub_request(:get, "http://probe.test/a").to_return(body: "ok")
+    Net::HTTP.get(URI("http://probe.test/a"))
+    assert_requested(stub)
+  end
+
+  def test_requested_times
+    stub = stub_request(:get, "http://probe.test/b").to_return(body: "ok")
+    2.times { Net::HTTP.get(URI("http://probe.test/b")) }
+    assert_requested(stub, times: 2)
+    assert_equal(1, 1)
+  end
+
+  def test_not_requested
+    stub_request(:get, "http://probe.test/c").to_return(body: "ok")
+    assert_not_requested(:get, "http://probe.test/c")
+  end
+
+  def test_requested_fails
+    stub = stub_request(:get, "http://probe.test/d").to_return(body: "ok")
+    assert_requested(stub)
+  end
+
+  def test_not_requested_fails
+    stub_request(:get, "http://probe.test/e").to_return(body: "ok")
+    Net::HTTP.get(URI("http://probe.test/e"))
+    assert_not_requested(:get, "http://probe.test/e")
+  end
+end
+"#;
+    let prelude = format!("{}\nrequire \"net/http\"\nrequire \"webmock/minitest\"\n", model_prelude());
+    let native = native_rows(&prelude, source);
+    let (rows, log) = emitted_rows(app(source), "test/models/assertion_count_test.rb");
+    check(native, rows, log, &[]);
 }
 
 #[test]
