@@ -2974,6 +2974,13 @@ pub struct TestModule {
     /// before setup; the inline test backends prepend both to each test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<Expr>,
+    /// A `setup do … end` block reads or writes a local of the class body
+    /// (`default_filter = Filter.parameter_filter` above it). The blocks
+    /// compile into one method, which loses that scope, so the Ruby emit
+    /// defines it as a block (`define_method`) after the class body's
+    /// statements, as Ruby's closure sees the local.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub setup_closes_over_class_locals: bool,
     /// Classes declared inside the test class body — e.g. the
     /// framework-test pattern of `class Validatable; include
     /// ActiveRecord::Validations; end` inside `class ValidationsTest

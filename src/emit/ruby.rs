@@ -1656,6 +1656,9 @@ pub fn emit_with_assertions(
                     }
                 }
             }
+            if minitest && module.setup_closes_over_class_locals {
+                emitted.content = setup_method_as_block(&emitted.content, class_name);
+            }
             // Class-body constant assignments (`TABLE = [...]`) go back
             // INSIDE the class, at the top of its body — the source's
             // own scope. They used to hoist to file scope so bare-name
@@ -2462,6 +2465,49 @@ fn splice_test_body_statements(content: &str, class_name: &str, statements: &[cr
     out
 }
 
+/// Move `def __roundhouse_before_setup` (the class's `setup do` blocks,
+/// compiled into one method) to the end of the class as
+/// `define_method(:__roundhouse_before_setup) do`, after the class-body
+/// statements. A block sees the class body's locals that were assigned
+/// above it (`default_filter = Filter.parameter_filter` and a `setup do`
+/// reading it); a `def` does not, and the compiled method sits among the
+/// definitions, above the statements that follow a test.
+fn setup_method_as_block(content: &str, class_name: &str) -> String {
+    const NAME: &str = "__roundhouse_before_setup";
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let Some(header) = test_class_header(&lines, class_name) else { return content.to_string() };
+    let class_indent = &lines[header][..lines[header].len() - lines[header].trim_start().len()];
+    let class_end = lines[header + 1..]
+        .iter()
+        .position(|l| l.trim_end_matches(['\n', '\r']) == format!("{class_indent}end"))
+        .map(|at| header + 1 + at);
+    let def_line = format!("{class_indent}  def {NAME}");
+    let start = lines.iter().position(|l| l.trim_end_matches(['\n', '\r']) == def_line);
+    let (Some(start), Some(class_end)) = (start, class_end) else { return content.to_string() };
+    let end_line = format!("{class_indent}  end");
+    let Some(finish) = lines[start + 1..].iter().position(|l| l.trim_end_matches(['\n', '\r']) == end_line).map(|at| start + 1 + at) else {
+        return content.to_string();
+    };
+    if finish >= class_end {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len() + 32);
+    for (at, line) in lines.iter().enumerate() {
+        if at == class_end {
+            out.push('\n');
+            writeln!(out, "{class_indent}  define_method(:{NAME}) do").unwrap();
+            for body in &lines[start + 1..=finish] {
+                out.push_str(body);
+            }
+        }
+        if (start..=finish).contains(&at) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 fn splice_after_class_header(content: &str, class_name: &str, block: &str) -> String {
     let mut out = String::with_capacity(content.len() + block.len());
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
@@ -3123,7 +3169,7 @@ mod declaration_program_header_tests {
 
 #[cfg(test)]
 mod nested_test_class_splice_tests {
-    use super::{splice_after_class_header, splice_test_body_statements};
+    use super::{setup_method_as_block, splice_after_class_header, splice_test_body_statements};
     use crate::dialect::TestBodyStatement;
     use crate::expr::{Expr, ExprNode, Literal};
     use crate::ident::Symbol;
@@ -3136,6 +3182,22 @@ mod nested_test_class_splice_tests {
     // reopen, so two loaded split files reassigned
     // `PlaybookActionTest::TACTIC_INSTANCE_ID` ("already initialized
     // constant"). It belongs in the nested class, as in the source.
+    // A `setup do` reading a class-body local compiles to a `def`, which
+    // does not see the local; the block form, after the class body's
+    // statements, does.
+    #[test]
+    fn setup_reading_a_class_local_is_defined_as_a_block_at_the_end() {
+        let content = "class FilterTest < TestBase\n  default_filter = 1\n  def __roundhouse_before_setup\n    super()\n    @x = default_filter\n  end\n\n  def helper\n  end\n  later = 2\nend\n";
+        let out = setup_method_as_block(content, "FilterTest");
+        assert_eq!(
+            out,
+            "class FilterTest < TestBase\n  default_filter = 1\n\n  def helper\n  end\n  later = 2\n\n  define_method(:__roundhouse_before_setup) do\n    super()\n    @x = default_filter\n  end\nend\n"
+        );
+        // A class without the method is left as it is.
+        let plain = "class FilterTest < TestBase\nend\n";
+        assert_eq!(setup_method_as_block(plain, "FilterTest"), plain);
+    }
+
     #[test]
     fn nested_test_class_constants_go_in_the_nested_class() {
         let out = splice_after_class_header(NESTED, "PlaybookActionTest::ApprovedTest", "  TACTIC_INSTANCE_ID = \"x\"\n\n");
