@@ -1023,6 +1023,9 @@ fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
     let table = lookup_table(schema, &upd.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
 
+    if let Some(columns) = &upd.only {
+        return visit_update_only(upd, columns, table, dialect);
+    }
     let mut segments: Vec<Expr> = vec![lit_str(format!("UPDATE {} SET ", dialect.ident(upd.table.0.as_str())))];
     for (idx, a) in upd.assignments.iter().enumerate() {
         let prefix = if idx == 0 {
@@ -1038,6 +1041,41 @@ fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
     // regardless of the placeholder-bind gate.
     push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
     db_call(&db, "exec", vec![concat_chain(segments)])
+}
+
+/// An UPDATE that sets only the assignments whose column the `columns`
+/// parameter lists (`Update::only`):
+///
+///   sets = []
+///   sets.push("\"title\" = " + <value>) if columns.include?("title")
+///   Db.exec("UPDATE \"articles\" SET " + sets.join(", ") + " WHERE …") unless sets.empty?
+fn visit_update_only(upd: &Update, columns: &Symbol, table: &Table, dialect: SqlDialect) -> Expr {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let sets = Symbol::from("sets");
+    let mut stmts: Vec<Expr> = Vec::new();
+    let mut empty = Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets });
+    empty.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    stmts.push(assign_var(&sets, empty));
+    for a in &upd.assignments {
+        let fragment = concat_chain(vec![
+            lit_str(format!("{} = ", dialect.ident(a.column.as_str()))),
+            escape_value(&db, &a.value, dialect),
+        ]);
+        let push = send_to(var_ref(&sets), "push", vec![fragment], true);
+        let listed = send_to(var_ref(columns), "include?", vec![lit_str(a.column.as_str().to_string())], true);
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If { cond: listed, then_branch: push, else_branch: nil_lit() },
+        ));
+    }
+    let mut segments: Vec<Expr> = vec![lit_str(format!("UPDATE {} SET ", dialect.ident(upd.table.0.as_str())))];
+    segments.push(send_to(var_ref(&sets), "join", vec![lit_str(", ".to_string())], true));
+    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
+    // A listed column that is not writable (generated) leaves nothing to set.
+    let nothing = send_to(var_ref(&sets), "empty?", vec![], false);
+    let exec = db_call(&db, "exec", vec![concat_chain(segments)]);
+    stmts.push(Expr::new(Span::synthetic(), ExprNode::If { cond: nothing, then_branch: nil_lit(), else_branch: exec }));
+    seq(stmts)
 }
 
 fn visit_delete(del: &Delete, schema: &Schema, dialect: SqlDialect) -> Expr {
@@ -1783,6 +1821,7 @@ mod tests {
                 id_col(),
                 Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
             )),
+            only: None,
         });
         let body = SqliteVisitor.visit(&op, &schema, &ClassId(Symbol::from("Article")));
         // single Db.exec(...) Send

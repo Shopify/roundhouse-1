@@ -110,7 +110,7 @@ fn shared_lowering_executes_postgresql_sql_in_emitted_ruby() {
     let update = ArelOp::Update(Update {
         table: table.clone(), assignments: vec![Assignment {
             column: Symbol::from("enabled"), value: Value::LiteralBool(false),
-        }], conditions: Some(Predicate::Eq(col, Value::LiteralStr("l'été \\ hi".into()))),
+        }], conditions: Some(Predicate::Eq(col, Value::LiteralStr("l'été \\ hi".into()))), only: None,
     });
     let truncate = ArelOp::Delete(Delete { table, conditions: None });
     let methods = [("pg_insert(title)", insert), ("pg_count(title)", count),

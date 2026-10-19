@@ -126,6 +126,11 @@ pub struct Update {
     pub table: TableRef,
     pub assignments: Vec<Assignment>,
     pub conditions: Option<Predicate>,
+    /// Names a method parameter holding the column names (Strings) to
+    /// write: the statement then sets only the assignments whose column
+    /// the parameter lists, as Rails' partial updates write only the
+    /// changed attributes. `None` writes every assignment.
+    pub only: Option<Symbol>,
 }
 
 /// `DELETE FROM <table> [WHERE <conditions>]`.
