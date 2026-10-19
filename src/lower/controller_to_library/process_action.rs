@@ -528,14 +528,37 @@ fn cause_fallback_clause(rescues: &[RescueHandler], exc: &Symbol) -> Option<Resc
             value,
         })
     };
-    let is_a = |class: &Expr| {
+    let is_a_one = |class: Expr| {
         syn(ExprNode::Send {
             recv: Some(rescued()),
             method: Symbol::from("is_a?"),
-            args: vec![class.clone()],
+            args: vec![class],
             block: None,
             parenthesized: true,
         })
+    };
+    // `rescue_from(*ERRORS, ...)` names a list: `is_a?` takes one class, so
+    // test the list's members (`[*ERRORS].any? { |__class| ... }`).
+    let is_a = |class: &Expr| match &*class.node {
+        ExprNode::Splat { .. } => {
+            let member = "__class";
+            syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::Array { elements: vec![class.clone()], style: Default::default() })),
+                method: Symbol::from("any?"),
+                args: vec![],
+                block: Some(syn(ExprNode::Lambda {
+                    signature: Default::default(),
+                    extra_params: Vec::new(),
+                    params: vec![Symbol::from(member)],
+                    rest_param: None,
+                    block_param: None,
+                    body: is_a_one(var_ref(member)),
+                    block_style: crate::expr::BlockStyle::Brace,
+                })),
+                parenthesized: false,
+            })
+        }
+        _ => is_a_one(class.clone()),
     };
     let or = |left: Expr, right: Expr| {
         syn(ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, surface: Default::default(), left, right })

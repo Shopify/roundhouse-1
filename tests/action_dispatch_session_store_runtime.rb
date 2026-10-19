@@ -15,7 +15,9 @@
 # prints one line per observation over Core's uses (MultiSessionStore's
 # and ShopifyRedisSessionStore's subclassing and store options,
 # SessionUnavailableMiddleware's `super(app, exceptions_app)` and
-# `render_exception(request, error)`); `compare` requires them equal.
+# `render_exception(request, error)`) and ShopifyMysqlSessionStore's
+# ActiveRecordStore superclass (activerecord-session_store); `compare`
+# requires them equal.
 require_relative "support/rails_oracle"
 
 if ARGV.first == "compare"
@@ -50,6 +52,9 @@ if MODE == "native"
   require "action_dispatch"
   require "action_dispatch/middleware/session/abstract_store"
   require "action_dispatch/middleware/show_exceptions"
+  # activerecord-session_store (Core's gem home, the version Core locks):
+  # its store file alone, as the gem's session_store.rb loads it.
+  require Dir[File.join(RailsOracle::CORE_GEM_HOME, "bundler/gems/activerecord-session_store-*/lib/action_dispatch/session/active_record_store.rb")].min
 else
   require_relative "../runtime/ruby/action_dispatch/session"
   require_relative "../runtime/spinel/action_dispatch_session_store"
@@ -222,3 +227,78 @@ failing = ProbeMiddleware.new(->(env) { raise SessionUnavailable, "redis down" }
 # Core passes the exception where Rails' render_exception takes an
 # ExceptionWrapper: the failsafe answers.
 show("render_exception with the exception", stderr_first_line { failing.call({}) })
+
+# activerecord-session_store's ActionDispatch::Session::ActiveRecordStore:
+# Core's ShopifyMysqlSessionStore subclasses it and registers
+# `MultiSessionStore.stores[:services_internal]`. `logger.silence` reads
+# `ActiveRecord::Base.logger`, so the probe gives Base a nil logger (the
+# store falls back to its NilLogger); the session class is a plain
+# duck-typed class of the gem's documented contract (find_by_session_id,
+# new(session_id:, data:), data, save, destroy).
+module ActiveRecord
+  class Base
+    def self.logger; nil; end
+  end
+end
+
+class DuckSession
+  ROWS = {}
+  attr_accessor :session_id, :data
+  def self.find_by_session_id(id); ROWS[id]; end
+  def initialize(attrs, options = {}); @session_id = attrs[:session_id]; @data = attrs[:data]; end
+  def save; ROWS[session_id] = self; true; end
+  def destroy; ROWS.delete(session_id); end
+end
+
+ars = ActionDispatch::Session::ActiveRecordStore
+show("ActiveRecordStore ancestors", ars.ancestors.take_while { |a| a != Object }.map(&:name))
+show("ActiveRecordStore public", ars.public_instance_methods(false).sort)
+show("ActiveRecordStore private", ars.private_instance_methods(false).sort)
+show("ActiveRecordStore constants", ars.constants(false).sort)
+show("ActiveRecordStore SESSION_RECORD_KEY", ars::SESSION_RECORD_KEY)
+show("ActiveRecordStore ENV_SESSION_OPTIONS_KEY", ars::ENV_SESSION_OPTIONS_KEY)
+show("ActiveRecordStore private_session_id?", [ars.private_session_id?("12::abc"), ars.private_session_id?("abc")])
+ars.session_class = DuckSession
+
+class ProbeDbStore < ars
+  attr_reader :options
+
+  def initialize(app = nil, options = {})
+    @options = options
+    @fallback = options[:fallback_to_readslave]
+    super
+  end
+end
+
+store_options = { key_prefix: "core:", key: "_secure_internal_session_id", secure: true, fallback_to_readslave: true }
+db = ProbeDbStore.new(nil, store_options)
+show("db key", db.key)
+show("db default_options", db.default_options)
+show("db secure_session_only", db.instance_variable_get(:@secure_session_only))
+show("db options after new", db.options)
+show("db session_class", [db.session_class, ProbeDbStore.session_class, ars.session_class])
+show("db secure_session_only: true", ProbeDbStore.new(nil, secure_session_only: true).instance_variable_get(:@secure_session_only))
+
+env = Rack::MockRequest.env_for("/services/internal")
+request = Rack::Request.new(env)
+env[Rack::RACK_SESSION_OPTIONS] = {}
+sid, data = db.send(:get_session, request, nil)
+show("get_session new", [sid.class.name, sid.private_id.length, data, env[ars::SESSION_RECORD_KEY].class.name, DuckSession::ROWS.size])
+db.send(:write_session, request, sid, { "a" => 1 }, {})
+show("write_session stored", DuckSession::ROWS[sid.private_id]&.data)
+sid2, data2 = db.send(:get_session, Rack::Request.new(Rack::MockRequest.env_for("/")), sid)
+show("get_session existing", [sid2 == sid, data2])
+show("get_session unknown sid", db.send(:get_session, Rack::Request.new(Rack::MockRequest.env_for("/")), Rack::Session::SessionId.new("0" * 32)).last)
+show("find_session", db.send(:find_session, Rack::Request.new(Rack::MockRequest.env_for("/").merge(Rack::RACK_SESSION_OPTIONS => {})), sid).last)
+legacy = Rack::Session::SessionId.new("f" * 32)
+DuckSession::ROWS[legacy.public_id] = DuckSession.new({ session_id: legacy.public_id, data: { "legacy" => true } })
+show("fallback to the public id", db.send(:get_session_with_fallback, legacy).data)
+show("secure_session_only skips it", ProbeDbStore.new(nil, secure_session_only: true).send(:get_session_with_fallback, legacy))
+show("a private id is not looked up publicly", db.send(:get_session_with_fallback, Rack::Session::SessionId.new("1::abc")))
+del_env = Rack::MockRequest.env_for("/")
+del_env[Rack::RACK_SESSION] = Struct.new(:id).new(sid)
+del_request = Rack::Request.new(del_env)
+new_sid = db.send(:delete_session, del_request, sid, { renew: true })
+show("delete_session renew", [new_sid == sid, DuckSession::ROWS.key?(sid.private_id), DuckSession::ROWS.key?(new_sid.private_id), DuckSession::ROWS[new_sid.private_id]&.data])
+show("delete_session drop", db.send(:delete_session, del_request, sid, { drop: true }))
+show("logger", db.send(:logger).respond_to?(:silence))

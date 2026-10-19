@@ -60,6 +60,17 @@ const MODEL: &str = r##"class ProbeSessionStore < ActionDispatch::Session::Abstr
   end
 end
 
+# Core's ShopifyMysqlSessionStore: a subclass of activerecord-session_store's
+# ActiveRecordStore, which MultiSessionStore.stores[:services_internal] holds.
+class ProbeDatabaseSessionStore < ActionDispatch::Session::ActiveRecordStore
+  attr_reader :options
+
+  def initialize(app = nil, options = {})
+    @options = options
+    super
+  end
+end
+
 class ProbeSessionMiddleware < ActionDispatch::ShowExceptions
   def initialize(app)
     super(app, Rails.application.config.exceptions_app)
@@ -160,6 +171,25 @@ fn the_postgresql_ruby_tree_carries_the_session_stores() {
     if let Some(shared) = shared {
         assert!(shared < boot.find("require_relative \"runtime/action_dispatch_session_store\"").unwrap(), "{boot}");
     }
+    // activerecord-session_store's ActiveRecordStore rides in the same port;
+    // its default session class, ActiveRecord::SessionStore::Session, is
+    // autoloaded from its own file (not required at boot).
+    let session_port = source("runtime/action_dispatch_session_store.rb");
+    assert!(session_port.contains("class ActiveRecordStore < ActionDispatch::Session::AbstractSecureStore"), "ActiveRecordStore not carried");
+    assert!(
+        session_port.contains("autoload :Session, File.expand_path(\"active_record_session_store\", __dir__)"),
+        "ActiveRecord::SessionStore::Session not autoloaded"
+    );
+    assert_eq!(
+        source("runtime/active_record_session_store.rb"),
+        std::fs::read_to_string(root().join("runtime/spinel/active_record_session_store.rb")).unwrap()
+    );
+    assert!(source("runtime/active_record_session_store.rb").contains("class Session < ActiveRecord::Base"));
+    let database_store = source("app/models/probe_database_session_store.rb");
+    assert!(
+        database_store.contains("ProbeDatabaseSessionStore < ActionDispatch::Session::ActiveRecordStore") && !database_store.contains("not supported"),
+        "{database_store}"
+    );
     let store = source("app/models/probe_session_store.rb");
     assert!(store.contains("ProbeSessionStore < ActionDispatch::Session::AbstractStore") && !store.contains("not supported"), "{store}");
     assert!(store.contains("ActionDispatch::Session::AbstractStore::DEFAULT_OPTIONS.merge"), "{store}");

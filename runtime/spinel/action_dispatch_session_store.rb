@@ -22,6 +22,15 @@ require "rack/request"
 require "rack/session/abstract/id"
 require_relative "active_support_hash_keys"
 
+# `ActiveRecord::SessionStore::Session` (the ActiveRecordStore default
+# session class) loads from runtime/active_record_session_store.rb on its
+# first reference.
+module ActiveRecord
+  module SessionStore
+    autoload :Session, File.expand_path("active_record_session_store", __dir__)
+  end
+end
+
 module ActionDispatch
   # runtime/ruby/action_dispatch/session.rb, which every target shares,
   # declares `ActionDispatch::Session` as the session object (Rails'
@@ -145,6 +154,171 @@ module ActionDispatch
         def set_cookie(request, response, cookie)
           request.cookie_jar[key] = cookie
         end
+    end
+
+    # activerecord-session_store 2.2.0 (rails/activerecord-session_store,
+    # branch hm-xlyxlmxnwnrtyypm, Core's Gemfile.lock),
+    # lib/action_dispatch/session/active_record_store.rb, verbatim: the
+    # database-backed store Core's ShopifyMysqlSessionStore subclasses at
+    # load and registers as `MultiSessionStore.stores[:services_internal]`.
+    # Requiring the gem loads 198 Rails framework files (extensions/core/
+    # gems.yml), so the store is ported here; its default session class,
+    # `ActiveRecord::SessionStore::Session`, is the lazily loaded
+    # runtime/active_record_session_store.rb.
+    #
+    # One departure: the gem assigns `session_class` when Session loads
+    # (`ActiveSupport.on_load(:active_record)`), so the class attribute is
+    # always set once Active Record is up. Here Session loads on first use,
+    # so `session_class` is a hand-written inheritable reader that falls
+    # back to that constant (class_attribute's per-subclass override,
+    # without its dependency on the descendants tracker).
+    class ActiveRecordStore < ActionDispatch::Session::AbstractSecureStore
+      # The class used for session storage. Defaults to
+      # ActiveRecord::SessionStore::Session; a subclass inherits and may
+      # override it (`class_attribute :session_class`).
+      class << self
+        def session_class
+          if instance_variable_defined?(:@session_class)
+            @session_class
+          elsif superclass.respond_to?(:session_class)
+            superclass.session_class
+          else
+            ActiveRecord::SessionStore::Session
+          end
+        end
+
+        def session_class=(value)
+          @session_class = value
+        end
+
+        def session_class?
+          !!session_class
+        end
+      end
+
+      def session_class
+        instance_variable_defined?(:@session_class) ? @session_class : self.class.session_class
+      end
+
+      def session_class=(value)
+        @session_class = value
+      end
+
+      def session_class?
+        !!session_class
+      end
+
+      SESSION_RECORD_KEY = 'rack.session.record'
+      ENV_SESSION_OPTIONS_KEY = Rack::RACK_SESSION_OPTIONS
+
+      def initialize(app, options = {})
+        @secure_session_only = options.delete(:secure_session_only) { false }
+        super(app, options)
+      end
+
+    private
+      def get_session(request, sid)
+        logger.silence do
+          unless sid and session = get_session_with_fallback(sid)
+            # If the sid was nil or if there is no pre-existing session under the sid,
+            # force the generation of a new sid and associate a new session associated with the new sid
+            sid = generate_sid
+            session = session_class.new(:session_id => sid.private_id, :data => {})
+          end
+          request.env[SESSION_RECORD_KEY] = session
+          [sid, session.data]
+        end
+      end
+
+      def write_session(request, sid, session_data, options)
+        logger.silence do
+          record, sid = get_session_model(request, sid)
+          record.data = session_data
+          return false unless record.save
+
+          session_data = record.data
+          if session_data && session_data.respond_to?(:each_value)
+            session_data.each_value do |obj|
+              obj.clear_association_cache if obj.respond_to?(:clear_association_cache)
+            end
+          end
+
+          sid
+        end
+      end
+
+      def delete_session(request, session_id, options)
+        logger.silence do
+          if sid = current_session_id(request)
+            if model = get_session_with_fallback(sid)
+              data = model.data
+              model.destroy
+            end
+          end
+
+          request.env[SESSION_RECORD_KEY] = nil
+
+          unless options[:drop]
+            new_sid = generate_sid
+
+            if options[:renew]
+              new_model = session_class.new(:session_id => new_sid.private_id, :data => data)
+              new_model.save
+              request.env[SESSION_RECORD_KEY] = new_model
+            end
+            new_sid
+          end
+        end
+      end
+
+      def get_session_model(request, id)
+        logger.silence do
+          model = get_session_with_fallback(id)
+          unless model
+            id = generate_sid
+            model = session_class.new(:session_id => id.private_id, :data => {})
+            model.save
+          end
+          if request.env[ENV_SESSION_OPTIONS_KEY][:id].nil?
+            request.env[SESSION_RECORD_KEY] = model
+          else
+            request.env[SESSION_RECORD_KEY] ||= model
+          end
+          [model, id]
+        end
+      end
+
+      def get_session_with_fallback(sid)
+        if sid && !self.class.private_session_id?(sid.public_id)
+          if (secure_session = session_class.find_by_session_id(sid.private_id))
+            secure_session
+          elsif !@secure_session_only && (insecure_session = session_class.find_by_session_id(sid.public_id))
+            insecure_session.session_id = sid.private_id # this causes the session to be secured
+            insecure_session
+          end
+        end
+      end
+
+      def find_session(request, id)
+        model, id = get_session_model(request, id)
+        [id, model.data]
+      end
+
+      module NilLogger
+        def self.silence
+          yield
+        end
+      end
+
+      def logger
+        ActiveRecord::Base.logger || NilLogger
+      end
+
+      def self.private_session_id?(session_id)
+        # user tried to retrieve a session by a private key?
+        session_id =~ /\A\d+::/
+      end
+
     end
   end
 
