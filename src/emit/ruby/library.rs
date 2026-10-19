@@ -20006,6 +20006,20 @@ fn app_constant_paths(app: &App) -> std::rc::Rc<crate::det::HashSet<String>> {
             }
             out.insert(name.to_string());
         }
+        // A value constant a class body declares (a `T::Enum` value
+        // `Home = new(..)`) binds its name lexically just as a nested
+        // class does: inside `Home::Onboarding::GuideSurface`, a written
+        // `Home::Onboarding::GuideSurface::ShopifyEmail` reads the enum
+        // value `Home` first. A constant written in the owner's
+        // `class << self` lives on the singleton class, out of that scope.
+        for class in &app.library_classes {
+            let owner = class.name.0.as_str().trim_start_matches("::");
+            for (constant, value) in &class.constants {
+                if value.decisions & crate::expr::SINGLETON_CONSTANT_WRITE == 0 {
+                    out.insert(format!("{owner}::{constant}"));
+                }
+            }
+        }
         std::rc::Rc::new(out)
     };
     match NameIndex::current(app) {
