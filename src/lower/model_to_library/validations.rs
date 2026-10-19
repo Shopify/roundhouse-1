@@ -857,6 +857,20 @@ pub(super) fn push_active_model_constructor(methods: &mut Vec<MethodDef>, model:
     if defines_initialize {
         return;
     }
+    // `include ActiveModel::Attributes` beside the Model include: the
+    // runtime's `Attributes#initialize(*)` seeds the typed attribute set
+    // and forwards its arguments to the next `initialize`, which in Rails
+    // is `ActiveModel::API#initialize(attributes = {})`. The Model include
+    // is dropped here, so without this constructor `super` reached
+    // Object#initialize with the hash ("wrong number of arguments (given
+    // 1, expected 0)": Core's `SmartGrid::Tile::TileModel`, built by
+    // `type.new(**attributes)`). The writers are the attribute set's, not
+    // `attr_*` ivars, so assign through `assign_attributes` after `super`
+    // has seeded `@attributes` (Rails' order too: Attributes first).
+    if includes_active_model(model, &["Attributes"]) {
+        methods.push(crate::lower::active_model_model::attribute_set_initialize(&model.name, model.span));
+        return;
+    }
     let names = super::markers::declared_attr_names(model);
     if names.is_empty() {
         return;

@@ -593,9 +593,24 @@ module ActiveRecord
 
     # Rails' `create!` saves with `save!` (`object.save!`), so a halted
     # save raises RecordNotSaved.
+    #
+    # persistence.rb: an Array of attribute hashes creates one record
+    # each (`create!([{ ... }, { ... }])`) and answers the records.
     def self.create!(attrs = {})
+      return attrs.map { |each_attrs| create!(each_attrs) } if attrs.is_a?(Array)
       instance = new(attrs)
       instance.save!
+      instance
+    end
+
+    # persistence.rb's `create`, with the same Array form as `create!`
+    # above; the class-side `create` of base.rb takes one Hash.
+    singleton_class.send(:remove_method, :create) if singleton_class.method_defined?(:create, false)
+
+    def self.create(attrs = {})
+      return attrs.map { |each_attrs| create(each_attrs) } if attrs.is_a?(Array)
+      instance = new(attrs)
+      instance.save
       instance
     end
 

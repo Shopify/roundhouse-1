@@ -1555,7 +1555,7 @@ pub(super) fn library_class_and_struct_base(
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
-        constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
+        super::util::superclass_path_of(&n, scope).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
     // A superclass EXPRESSION — `class Image < Struct.new(:asset_path,
     // :width, :height)`. `constant_path_of` has no answer for a call

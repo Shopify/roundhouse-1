@@ -221,6 +221,58 @@ pub(crate) fn attributes_initialize(
     }
 }
 
+/// `def initialize(attributes = {}); super(); assign_attributes(attributes) if attributes; end`
+/// — `ActiveModel::API#initialize` for a class that also includes
+/// `ActiveModel::Attributes`, whose `initialize` seeds the attribute set
+/// the writers `assign_attributes` calls live on. `super()` first, since
+/// Attributes comes before Model in Rails' ancestors; the call carries no
+/// arguments, as API's own `super()` does.
+pub(crate) fn attribute_set_initialize(owner: &ClassId, span: Span) -> MethodDef {
+    let attributes = Symbol::from("attributes");
+    let read = || {
+        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: attributes.clone() })
+    };
+    let assign = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("assign_attributes"),
+            args: vec![read()],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let guarded = Expr::new(
+        span,
+        ExprNode::If {
+            cond: read(),
+            then_branch: assign,
+            else_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+        },
+    );
+    let call_super = Expr::new(span, ExprNode::Super { args: Some(Vec::new()), block: None });
+    let mut param = Param::positional(attributes.clone());
+    param.default =
+        Some(Expr::new(span, ExprNode::Hash { entries: Vec::new(), kwargs: false }));
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Private,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from("initialize"),
+        receiver: MethodReceiver::Instance,
+        params: vec![param],
+        body: Expr::new(span, ExprNode::Seq { exprs: vec![call_super, guarded] }),
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
+        block_param: None,
+    }
+}
+
 fn constant_predicate(owner: &ClassId, name: &str, value: bool) -> MethodDef {
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
