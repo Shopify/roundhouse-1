@@ -1006,6 +1006,53 @@ end
 }
 
 #[test]
+fn date_column_rules_read_the_stored_text_or_the_reader_never_the_bare_ivar() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "charges", force: :cascade do |t|
+    t.date "cycle_ends_at"
+    t.date "valid_from"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        br#"
+class Charge < ApplicationRecord
+  validates :cycle_ends_at, presence: true
+  validates :valid_from, inclusion: { in: [Date.new(2020, 1, 1)] }
+end
+"#,
+        "app/models/charge.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let validate = lc.methods.iter().find(|m| m.name.as_str() == "validate").expect("validate");
+    let body_dbg = format!("{:?}", validate.body);
+    // `date_column :cycle_ends_at` writes `@cycle_ends_at_raw`;
+    // `@cycle_ends_at` is never assigned, so reading it made every
+    // record fail `Cycle ends at can't be blank`.
+    assert!(body_dbg.contains("Symbol(\"cycle_ends_at_raw\")"), "presence must read the raw slot");
+    assert!(
+        !body_dbg.contains("Ivar { name: Symbol(\"cycle_ends_at\") }"),
+        "presence must not read the bare date ivar"
+    );
+    // Every other rule reads `send(attr)`, as ActiveModel does.
+    assert!(
+        !body_dbg.contains("Ivar { name: Symbol(\"valid_from\") }"),
+        "inclusion must read the reader, not the bare date ivar"
+    );
+}
+
+#[test]
 fn has_many_through_collection_writer_and_save_sync() {
     use roundhouse::ingest::{ingest_model, ingest_schema};
 
