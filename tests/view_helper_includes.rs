@@ -215,3 +215,51 @@ fn an_unported_helper_call_refuses_the_include() {
     }
     assert_eq!(errors.len(), 5, "one refusal per include, nothing else:\n{}", errors.join("\n"));
 }
+
+const CONTEXT_MANAGER: &str = r##"module Cs
+  class Manager
+    include ActionView::Helpers::TagHelper
+    include ActionView::Context
+
+    #: -> String
+    def label = "manager"
+  end
+end
+"##;
+
+/// `include ActionView::Context` beside `TagHelper` (Core's AppManager)
+/// is a marker, not an `uninitialized constant ActionView::Context` at
+/// class-definition time that takes the whole boot with it.
+#[test]
+fn action_view_context_include_is_dropped_when_no_member_is_called() {
+    let expected = native(
+        "context",
+        &format!(
+            "RailsOracle.activate(\"activesupport\", \"actionview\", \"actionpack\", \"activemodel\")\n\
+             require \"action_view\"\n{CONTEXT_MANAGER}p Cs::Manager.new.label\np Cs::Manager.include?(ActionView::Context)\n"
+        ),
+    );
+    assert_eq!(expected.lines().collect::<Vec<_>>(), [r#""manager""#, "true"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/cs/manager.rb", CONTEXT_MANAGER)
+        .run_ruby("p Cs::Manager.new.label\n");
+    run.assert_passes();
+    assert_eq!(run.stdout.lines().collect::<Vec<_>>(), [r#""manager""#]);
+}
+
+/// A member of `ActionView::Context` the runtime does not answer
+/// (`output_buffer`) is refused by name rather than emitted bare.
+#[test]
+fn an_unanswered_action_view_context_member_refuses_the_include() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .write(
+            "app/lib/cs/manager.rb",
+            &CONTEXT_MANAGER.replace("def label = \"manager\"", "def label = output_buffer.to_s"),
+        )
+        .emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Cs::Manager includes ActionView::Context and calls `output_buffer` through it") && e.contains("does not port")),
+        "no refusal in\n{}",
+        errors.join("\n")
+    );
+}

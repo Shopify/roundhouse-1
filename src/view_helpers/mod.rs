@@ -30,13 +30,15 @@ use std::sync::OnceLock;
 pub(crate) const REFUSAL_CONSTRUCT: &str = "view_helper_include";
 
 /// The framework include markers: `ActionView::Helpers` and every
-/// module under it, and `ActiveSupport::NumberHelper` (the same number
-/// helpers). Called from both homes that build an include list —
+/// module under it, `ActionView::Context` (the `output_buffer` /
+/// `view_flow` accessors Rails' own helper modules rely on; an app
+/// class that includes it beside `TagHelper` uses neither), and
+/// `ActiveSupport::NumberHelper` (the same number helpers). Called from both homes that build an include list —
 /// `analyze::model_includes` for models, `ingest::library_class`'s decl
 /// walk for everything else — because the same source line means the
 /// same thing in either.
 pub(crate) fn is_marker_include(path: &[&str]) -> bool {
-    matches!(path, ["ActionView", "Helpers", ..] | ["ActiveSupport", "NumberHelper"])
+    matches!(path, ["ActionView", "Helpers", ..] | ["ActionView", "Context"] | ["ActiveSupport", "NumberHelper"])
 }
 
 /// Whether the runtime defines `module` (`ActionView::Helpers::...`) as a
@@ -249,6 +251,19 @@ mod tests {
             })
             .collect();
         assert!(missing.is_empty(), "qualified to ActionView::ViewHelpers but never defined there: {missing:?}");
+    }
+
+    /// `include ActionView::Context` is a marker like the helpers: its
+    /// members (`output_buffer`, `view_flow`, ...) are measured, none of
+    /// them answered, so a class that never calls one drops the include
+    /// and a class that does is refused.
+    #[test]
+    fn action_view_context_is_a_marker_whose_members_are_unanswered() {
+        assert!(is_marker_include(&["ActionView", "Context"]));
+        assert!(!is_marker_include(&["ActionView", "ContextualThing"]));
+        assert!(members("ActionView::Context").is_some_and(|m| m.contains(&"output_buffer") && m.contains(&"view_flow")));
+        assert_eq!(unanswered_members("ActionView::Context", [("puts", false)]), Ok(vec![]));
+        assert_eq!(unanswered_members("ActionView::Context", [("output_buffer", false)]), Ok(vec!["output_buffer"]));
     }
 
     #[test]
