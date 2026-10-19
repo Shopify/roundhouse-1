@@ -258,6 +258,10 @@ pub(crate) struct AppDefinitions {
     /// (`@languages = []` in `initialize`); the writer, or a caller outside
     /// the class, can leave nil there, so the stamp is not a proof.
     ivar_readers: HashSet<(String, String)>,
+    /// Every model column's name. A record's column reader answers nil
+    /// until the column is assigned, NOT NULL or not, so a reader call by
+    /// one of these names is not proof of a value even when typed `Time`.
+    column_readers: HashSet<String>,
 }
 
 impl AppDefinitions {
@@ -288,6 +292,7 @@ impl AppDefinitions {
             for method in model.methods() {
                 defs.note(model.name.0.as_str(), method.name.as_str());
             }
+            defs.column_readers.extend(model.attributes.fields.keys().map(|c| c.as_str().to_string()));
         }
         for lc in &app.library_classes {
             defs.defined.entry(lc.name.0.as_str().to_string()).or_default();
@@ -720,7 +725,9 @@ fn try_rewrite(
         // `@languages = []`, and its loader writes `spec["languages"]`
         // (nil for BV, HM, AN, IO) through the writer, so CountryDb's
         // `region.languages.presence` grounded as `.empty?` on nil.
-        let ivar_read = matches!(&*r.node, ExprNode::Ivar { .. }) || is_ivar_reader_call(r, defs);
+        let ivar_read = matches!(&*r.node, ExprNode::Ivar { .. })
+            || is_ivar_reader_call(r, defs)
+            || is_column_reader_call(r, defs);
         let grounding = match (grounding, ivar_read) {
             (Grounding::Container { nilable: false, whitespace }, true) => {
                 Grounding::Container { nilable: true, whitespace }
@@ -1351,6 +1358,20 @@ fn unlowered(expr: &Expr, recv_ty: Option<&Ty>, method: &str, reason: &str) -> D
              the CRuby overlay serves it at runtime; AOT/strict targets cannot compile it"
         ),
     }
+}
+
+/// `name` / `self.name` where `name` is a model column: the reader of the
+/// record being built or validated. Refresh tokens' `after_initialize`
+/// reads `expires_at.blank?` on a new record, where the NOT NULL column
+/// (typed `Time`) is still nil and folding the predicate to `false` skipped
+/// the default the callback exists to set.
+fn is_column_reader_call(r: &Expr, defs: &AppDefinitions) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*r.node else {
+        return false;
+    };
+    args.is_empty()
+        && recv.as_ref().map_or(true, |inner| matches!(&*inner.node, ExprNode::SelfRef))
+        && defs.column_readers.contains(method.as_str())
 }
 
 /// `recv.name` where `name` is an app class's ivar-returning reader
