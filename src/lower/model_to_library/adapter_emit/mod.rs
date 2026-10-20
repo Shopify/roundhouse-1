@@ -65,6 +65,9 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_adapter_last(model, table, schema, dialect));
     methods.push(synth_adapter_insert(model, table, schema, dialect));
     methods.push(synth_adapter_update(model, table, schema, dialect));
+    if dialect == SqlDialect::Postgres {
+        methods.push(synth_adapter_update_columns(model, table, schema, dialect));
+    }
     methods.push(synth_adapter_touch(model, table, schema, dialect));
     methods.push(synth_adapter_delete(model, table, schema, dialect));
     methods.push(synth_adapter_count(owner, table, schema, dialect));
@@ -733,7 +736,7 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
     let has_assignments = !assignments.is_empty();
 
     let update = |conditions: Predicate| {
-        ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions) })
+        ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions), only: None })
     };
     let mut body = dialect.visit(&update(eq_id_ivar(model, table)), schema, owner);
     if let Some(cols) = query_constraint_columns(model, table) {
@@ -763,6 +766,61 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
     }
 }
 
+/// `def _adapter_update_columns(columns)` — `_adapter_update` writing
+/// only the named columns (Strings), as Rails' partial updates write
+/// only the changed attributes: a column the database maintains behind
+/// the record, or another writer changed since the record loaded, is not
+/// overwritten with the stale in-memory value. The CRuby save path calls
+/// it with the pending changes' names. `columns` must name at least one
+/// column.
+fn synth_adapter_update_columns(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
+    let columns = Symbol::from("columns");
+    let assignments: Vec<Assignment> = table
+        .columns
+        .iter()
+        .filter(|c| !c.primary_key && c.generated.is_none())
+        .map(|c| Assignment {
+            column: c.name.clone(),
+            value: Value::Runtime { expr: column_bind_expr(model, c), ty: bind_type(model, c) },
+        })
+        .collect();
+    let has_assignments = !assignments.is_empty();
+    let update = |conditions: Predicate| {
+        ArelOp::Update(Update {
+            table: TableRef(table.name.clone()),
+            assignments: assignments.clone(),
+            conditions: Some(conditions),
+            only: Some(columns.clone()),
+        })
+    };
+    let mut body = dialect.visit(&update(eq_id_ivar(model, table)), schema, owner);
+    if let Some(cols) = query_constraint_columns(model, table) {
+        let composite = dialect.visit(&update(eq_query_constraints(model, table, &cols)), schema, owner);
+        body = when_query_constraints(composite, body);
+    }
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from("_adapter_update_columns"),
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(columns.clone())],
+        body: if has_assignments { body } else { super::nil_lit() },
+        signature: Some(fn_sig(
+            vec![(columns, Ty::Array { elem: std::sync::Arc::new(Ty::Str) })],
+            Ty::Nil,
+        )),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
 /// `def _adapter_touch` — `touch`'s write: `updated_at` alone, as
 /// Rails' `touch` issues it. A full-row `_adapter_update` writes back
 /// every column the record loaded, so a column the database maintains
@@ -786,7 +844,7 @@ fn synth_adapter_touch(model: &Model, table: &Table, schema: &Schema, dialect: S
         .collect();
     let has_assignments = !assignments.is_empty();
     let update = |conditions: Predicate| {
-        ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions) })
+        ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions), only: None })
     };
     let mut body = dialect.visit(&update(eq_id_ivar(model, table)), schema, owner);
     if let Some(cols) = query_constraint_columns(model, table) {

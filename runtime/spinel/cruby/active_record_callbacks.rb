@@ -704,6 +704,18 @@ module ActiveRecord
       env.value
     end
 
+    # Persistence#_update_record's `attributes_for_update`: the UPDATE
+    # sets the changed columns alone, through the model's emitted
+    # `_adapter_update_columns`; a column nobody changed keeps whatever
+    # the row holds now. A model without that method (a hand-written
+    # one over the adapter shim) writes the whole row.
+    def _runtime_update_changed
+      return _adapter_update unless respond_to?(:_adapter_update_columns)
+      columns = self.class.schema_columns.map(&:to_s)
+      names = changed_attribute_names_to_save.map(&:to_s).select { |name| columns.include?(name) }
+      _adapter_update_columns(names) unless names.empty?
+    end
+
     private
       # A copy of runtime/active_record/base.rb's `save_after_validation`
       # (change both), with the save chain around the create or update
@@ -726,9 +738,15 @@ module ActiveRecord
               _callback_chain_run(:update) do
                 # Timestamp#should_record_timestamps?: with partial updates
                 # (the default) a save with nothing pending stamps nothing,
-                # so `saved_changes?` stays false for it.
-                fill_timestamps(false) if has_changes_to_save?
-                _adapter_update
+                # so `saved_changes?` stays false for it. Persistence#_update_record
+                # then issues no UPDATE either (`attributes_for_update` is
+                # empty), though the update callbacks ran and the save still
+                # counts as triggering them; Core's NoSetupMutations fails a
+                # test whose setup saves an unchanged record.
+                if has_changes_to_save?
+                  fill_timestamps(false)
+                  _runtime_update_changed
+                end
                 @_trigger_update_callback = true
                 __track_saved_changes(was_new)
                 true
