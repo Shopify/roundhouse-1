@@ -7722,6 +7722,11 @@ fn apply_class_load_hooks(files: &mut [(String, String)], app: &App) {
         })
         .collect();
     for hook in &app.class_load_hooks {
+        // A body that replays its calls verbatim already fires it, where
+        // the source does; a second firing runs every hook twice.
+        if emit::ruby::writes_class_body_call(app, hook.span) {
+            continue;
+        }
         let stem = crate::naming::underscore(&hook.class);
         let source = hook.site.rsplit_once(':').map_or(hook.site.as_str(), |(file, _)| file);
         if let Some((_, program)) = programs.get(source).and_then(|path| files.iter_mut().find(|(p, _)| p == path)) {

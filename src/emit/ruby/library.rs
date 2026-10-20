@@ -15934,6 +15934,23 @@ pub(crate) fn replays_class_body(lc: &LibraryClass, app: &App) -> bool {
     carried_railtie(lc, app) || replays_foreign_class_body(lc, app)
 }
 
+/// Whether the emitted body of a library class writes the class-body
+/// call at `span` itself: the ingest kept it in `unknown_calls` and the
+/// body does not drop it (`dropped_class_body_calls`), as a body that
+/// replays its calls verbatim does. `project::apply_class_load_hooks`
+/// asks before it ends the class file with a `run_load_hooks` call:
+/// writing it again fired the hook twice, and each of Core's
+/// `on_load(:filter_view_models_connection_registry)` initializers
+/// registered its filters twice (`DuplicateRegistrationError`).
+pub(crate) fn writes_class_body_call(app: &App, span: Span) -> bool {
+    !span.is_synthetic()
+        && body_statement_classes(app).into_iter().any(|lc| {
+            !name_is_class_eval_body(lc)
+                && lc.unknown_calls.iter().any(|call| call.span == span)
+                && !dropped_class_body_calls(lc, app).iter().any(|dropped| dropped.span == span)
+        })
+}
+
 /// Whether this class's captured `unknown_calls` should be replayed
 /// into the emitted class body.
 ///
@@ -17034,7 +17051,8 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
         plain_extension_calls(lc, app)
     };
     let gem = gem_mixin_macro_calls(lc, app);
-    let carried = carried_class_macro_calls(lc, app);
+    let mut carried = carried_class_macro_calls(lc, app);
+    carried.extend(mixes_in_class_macro_calls(lc, app));
     let mut runtime = runtime_mixin_macro_calls(lc, app);
     runtime.extend(model_callback_calls(lc, app));
     runtime.extend(sti_macro_calls(lc, app));
@@ -17044,6 +17062,60 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     lc.unknown_calls
         .iter()
         .filter(|call| own.iter().chain(gem.iter()).chain(carried.iter()).chain(runtime.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .collect()
+}
+
+/// The body calls that name a class macro an app module the class
+/// includes gives it through sorbet's `mixes_in_class_methods(M)`: each
+/// include of the module extends the includer with `M`
+/// (`SorbetRuntimeCheck.mixes_in_class_methods`, which every emitted
+/// body runs), so `M`'s instance methods are the includer's class
+/// methods. Core's `PrivacyTooling::DataSubjectRequests::CustomerProcessor`
+/// mixes in `DatasetConfiguration`, and each processor's body calls
+/// `public_facing_dataset_name "third_party_apps"`; dropped, the registry
+/// refused the processor ("Processor must define a dataset name"). The
+/// modules are the includes of the class and of its app ancestors,
+/// through the app modules they include in turn. Bare and `self.` calls
+/// only.
+fn mixes_in_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    if lc.unknown_calls.is_empty() {
+        return Vec::new();
+    }
+    let mut queue: Vec<String> = std::iter::once(lc)
+        .chain(app_library_ancestors(lc, app))
+        .flat_map(|c| c.includes.iter().map(|i| i.0.as_str().trim_start_matches("::").to_string()))
+        .collect();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut mixed: Vec<&LibraryClass> = Vec::new();
+    while let Some(name) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for module in library_classes_named(&name, app).into_iter().filter(|c| c.is_module && c.origin.is_none()) {
+            queue.extend(module.includes.iter().map(|i| i.0.as_str().trim_start_matches("::").to_string()));
+            for call in module.unknown_calls.iter().filter(|c| crate::ingest::sorbet_check::is_mixes_in(c)) {
+                let ExprNode::Send { args, .. } = &*call.node else { continue };
+                for arg in args.iter().skip(1) {
+                    if let ExprNode::Const { path } = &*arg.node
+                        && let Some(class_methods) = resolve_app_module(module, path, app)
+                    {
+                        mixed.push(class_methods);
+                    }
+                }
+            }
+        }
+    }
+    if mixed.is_empty() {
+        return Vec::new();
+    }
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && !ANY_CLASS_SELF_CALLS.contains(&method.as_str())
+                && mixed.iter().any(|m| module_defines(m, method.as_str(), app, &mut Vec::new()))
+        })
         .collect()
 }
 

@@ -468,6 +468,18 @@ module Rails
       false
     end
 
+    # `config.cache_classes`, the reader Shopify's Rails keeps beside
+    # `enable_reloading` (`!enable_reloading`). Core's Lifecycle.register
+    # reads it to decide whether to replace a reloaded class's entry, and
+    # the lifecycle.rb initializers call register: without the reader each
+    # `on_load(:lifecycle)` hook raised NoMethodError and registered nothing.
+    # This tree never reloads, so it is true.
+    def cache_classes
+      return method_missing(:cache_classes) unless defined?(::Rails::Railtie::Configuration)
+
+      !reloading_enabled?
+    end
+
     # `config.eager_load`, Application::Configuration's `attr_accessor
     # :eager_load` (railties 8.2.0.alpha application/configuration.rb),
     # which bootstrap.rb's `set_eager_load` initializer fills in with
@@ -566,7 +578,35 @@ module Rails
     end
 
     def framework_namespace(name)
-      Custom.nested[name.to_s] ||= Custom.new(@application, name.to_s, reads_nil: true)
+      Custom.nested[name.to_s] ||= Custom.new(@application, name.to_s, reads_nil: true).tap do
+        seed_framework_namespace(name.to_s)
+      end
+    end
+
+    # What a framework's railtie body sets in its namespace before any
+    # app code reads it. ActiveJob::Railtie (activejob 8.2.0.alpha
+    # active_job/railtie.rb) writes `config.active_job.custom_serializers
+    # = []` and, in `config.after_initialize`, hands the list its app
+    # initializers appended to (`Rails.application.config.to_prepare do
+    # config.active_job.custom_serializers << MySerializer end`, Core's
+    # custom_serializers.rb) to ActiveJob::Serializers.add_serializers.
+    # Without the seed that namespace read nil and the `<<` raised.
+    def seed_framework_namespace(name)
+      return unless name == "active_job"
+
+      Custom.store["active_job_custom_serializers"] ||= []
+      return if Configuration.settings[:active_job_serializers_hooked]
+
+      Configuration.settings[:active_job_serializers_hooked] = true
+      ::Rails::Railtie::Configuration.new.after_initialize do
+        serializers = Custom.store.delete("active_job_custom_serializers")
+        next if serializers.nil? || serializers.empty?
+
+        unless defined?(::ActiveJob::Serializers)
+          raise NameError, "config.active_job.custom_serializers names #{serializers.size} serializer(s) but this tree carries no ActiveJob::Serializers"
+        end
+        ::ActiveJob::Serializers.add_serializers(serializers)
+      end
     end
 
     # ActionDispatch::Session.resolve_store (actionpack 8.2.0.alpha

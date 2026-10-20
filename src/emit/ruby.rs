@@ -27,7 +27,7 @@ mod collection_autosave;
 mod column_slot;
 pub(crate) mod expr;
 mod library;
-pub(crate) use library::{through_source_scope_applies, body_statement_classes, carried_body_statement_spans, carries_body_statement, dropped_class_body_calls, includes_active_model_validations, install_lookup_indexes, modelled_class_body_calls, replays_class_body, singleton_scoped};
+pub(crate) use library::{through_source_scope_applies, body_statement_classes, carried_body_statement_spans, carries_body_statement, dropped_class_body_calls, writes_class_body_call, includes_active_model_validations, install_lookup_indexes, modelled_class_body_calls, replays_class_body, singleton_scoped};
 mod rbs;
 pub mod shake;
 mod shared;
