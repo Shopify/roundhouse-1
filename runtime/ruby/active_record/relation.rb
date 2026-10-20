@@ -1662,7 +1662,7 @@ module ActiveRecord
         @limit = written_limit
         @offset = written_offset
       end
-      rows = ActiveRecord.adapter.select_rows(sql)
+      rows = ActiveRecord.adapter.select_rows(sql, query_event_name("Load"))
       base_keys = [] #: Array[String]
       base_ids = {} #: Hash[String, untyped]
       links = {} #: Hash[Integer, Hash[String, Array[String]]]
@@ -2157,7 +2157,7 @@ module ActiveRecord
       else
         # A partial projection: the columns it left out answer
         # `has_attribute?` false (`Base#_note_unloaded`).
-        rows = ActiveRecord.adapter.select_rows(bound_sql)
+        rows = ActiveRecord.adapter.select_rows(bound_sql, query_event_name("Load"))
         rows.map do |row|
           record = @model.instantiate(row)
           record._note_unloaded(row)
@@ -2808,7 +2808,7 @@ module ActiveRecord
     def count(&block)
       return loaded_records.count(&block) if block
       return 0 if @null
-      rows = ActiveRecord.adapter.select_rows(bound_count_sql)
+      rows = ActiveRecord.adapter.select_rows(bound_count_sql, query_event_name("Count"))
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
 
@@ -2826,7 +2826,7 @@ module ActiveRecord
       sql = "SELECT COALESCE(SUM(#{term}), 0) AS n FROM #{@table}"
       sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
-      rows = ActiveRecord.adapter.select_rows(sql)
+      rows = ActiveRecord.adapter.select_rows(sql, query_event_name("Sum"))
       rows.length == 0 ? 0.0 : rows[0]["n"].to_f
     end
 
@@ -2853,7 +2853,7 @@ module ActiveRecord
       scoped = spawn
       scoped.select!(projection)
       scoped.clear_ordering
-      rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)
+      rows = ActiveRecord.adapter.select_rows(scoped.bound_sql, query_event_name(function == "MIN" ? "Minimum" : "Maximum"))
       return nil if rows.length == 0
       value = rows[0]["value"]
       cast_schema_value(value, column)
@@ -2876,7 +2876,7 @@ module ActiveRecord
       scoped = spawn
       scoped.select!(selects.join(", "))
       scoped.clear_ordering
-      rows = ActiveRecord.adapter.select_rows(scoped.bound_sql)
+      rows = ActiveRecord.adapter.select_rows(scoped.bound_sql, query_event_name(function == "MIN" ? "Minimum" : "Maximum"))
       grouped = {}
       rows.each do |row|
         key_values = []
@@ -2980,7 +2980,7 @@ module ActiveRecord
         )
       end
       h = {}
-      rows = ActiveRecord.adapter.select_rows(sql)
+      rows = ActiveRecord.adapter.select_rows(sql, query_event_name("Count"))
       # One own column groups by values read through its declared type.
       own = @groups.length == 1 && key.start_with?("#{@table}.") ? key.delete_prefix("#{@table}.") : nil
       rows.each do |row|
@@ -3029,7 +3029,7 @@ module ActiveRecord
       return loaded_records.one?(*pattern, &block) if block || !pattern.empty?
       r = @records
       return r.length == 1 unless r.nil?
-      probe_existence(2) == 1
+      probe_existence(2, "Count") == 1
     end
 
     # More than one row. Unloaded: SELECT 1 LIMIT 2.
@@ -3037,7 +3037,7 @@ module ActiveRecord
       return loaded_records.count(&block) > 1 if block
       r = @records
       return r.length > 1 unless r.nil?
-      probe_existence(2) > 1
+      probe_existence(2, "Count") > 1
     end
 
     # Block form of Enumerable#all? over the materialized rows (the
@@ -3083,12 +3083,19 @@ module ActiveRecord
       end
     end
 
+    # The `sql.active_record` event name Rails gives this relation's
+    # statement: "<Model> <kind>" (Load, Count, Sum, Pluck, Exists? ...).
+    def query_event_name(kind)
+      "#{@model.name} #{kind}"
+    end
+    private :query_event_name
+
     # How many probe rows `exists_sql(n)` returns. Shared by `exists?`,
     # `one?`, and `many?` so cardinality questions never hydrate.
-    def probe_existence(n)
+    def probe_existence(n, kind = "Exists?")
       return 0 if @null
       return 0 if @limit == 0
-      ActiveRecord.adapter.select_rows(bound_exists_sql(n)).length
+      ActiveRecord.adapter.select_rows(bound_exists_sql(n), query_event_name(kind)).length
     end
 
     # `count > n` without a COUNT(*): same FROM/JOIN/WHERE as
@@ -3102,7 +3109,7 @@ module ActiveRecord
       sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} LIMIT 1 OFFSET #{n}"
-      ActiveRecord.adapter.select_rows(sql).length > 0
+      ActiveRecord.adapter.select_rows(sql, query_event_name("Exists?")).length > 0
     end
 
     def length
@@ -3128,7 +3135,7 @@ module ActiveRecord
       inner = select_sql_with(cols)
       @orders = prior_orders
       sql = "SELECT COUNT(*) AS n FROM (#{inner}) AS __rh_size"
-      rows = ActiveRecord.adapter.select_rows(sql)
+      rows = ActiveRecord.adapter.select_rows(sql, query_event_name("Count"))
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
 
@@ -3318,7 +3325,7 @@ module ActiveRecord
         end
       end
       @select_sql = projections.join(", ")
-      rows = ActiveRecord.adapter.select_rows(bound_sql)
+      rows = ActiveRecord.adapter.select_rows(bound_sql, query_event_name("Pluck"))
       @select_sql = prior
       if names.length == 1
         name = names[0]
@@ -3358,7 +3365,7 @@ module ActiveRecord
       prior = @select_sql
       key = @model.primary_key
       @select_sql = "#{@table}.#{key} AS v"
-      rows = ActiveRecord.adapter.select_rows(bound_sql)
+      rows = ActiveRecord.adapter.select_rows(bound_sql, query_event_name("Pluck"))
       @select_sql = prior
       rows.map { |row| @model._primary_key_from_database(row["v"]) }
     end

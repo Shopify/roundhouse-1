@@ -719,7 +719,7 @@ module Db
     raise error if error
   end
 
-  def self.exec(sql)
+  def self.exec(sql, _query_name = "SQL")
     record_query(sql)
     write(sql) { |conn, s| run_exec(conn, s) }
   end
@@ -729,7 +729,7 @@ module Db
   # write permit), reads every row before the permit goes back, and
   # answers a replay handle over them: step/column_*/finalize as for a
   # read. `changes` is the write's row count.
-  def self.exec_returning(sql)
+  def self.exec_returning(sql, _query_name = "SQL")
     v = loaded_sqlite_version
     if !returning_supported?(v)
       raise "Db.exec_returning: RETURNING needs SQLite 3.35 or newer; this process loads " + v.to_s
@@ -1328,7 +1328,7 @@ module Db
     raise error if error
   end
 
-  def self.prepare(sql)
+  def self.prepare(sql, _query_name = "SQL")
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
   rescue SQLite3::Exception => e
@@ -1450,7 +1450,7 @@ module Db
   # Explicit uncached reads skip statement reuse, but the separate
   # request result cache still applies. Partial replays already promote
   # to a transient statement, which finalize closes.
-  def self.prepare_uncached(sql)
+  def self.prepare_uncached(sql, _query_name = "SQL")
     qcache = Fiber[:rh_qcache]
     parameterized = sql.include?("?")
     if !qcache.nil? && !parameterized && (hit = qcache[sql])

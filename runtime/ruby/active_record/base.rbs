@@ -33,7 +33,7 @@ module ActiveRecord
     # SELECT and return its rows; escape a value for inline SQL. The
     # SqliteAdapter (CRuby/spinel) already implements both.
     %a{abstract}
-    def select_rows: (String sql) -> Array[Hash[String, untyped]]
+    def select_rows: (String sql, ?String name) -> Array[Hash[String, untyped]]
     %a{abstract}
     def execute_ddl: (String sql) -> void
     %a{abstract}
