@@ -93,6 +93,24 @@ struct Bind {
     parameterized: bool,
 }
 
+/// The `sql.active_record` name Rails gives a model's statement
+/// ("Order Load", "Order Exists?", "Order Create"). Only the PostgreSQL
+/// runtime instruments statements, so only its `Db` calls take the name.
+fn event_name(dialect: SqlDialect, owner: &ClassId, kind: &str) -> Option<String> {
+    (dialect == SqlDialect::Postgres).then(|| format!("{} {}", owner.0, kind))
+}
+
+/// The same name for a statement an instance method writes: Rails names
+/// it for the record's own class (`self.class`), so an STI subclass's
+/// save is "Sprocket Update" even though its base class owns the method.
+fn instance_event_name(dialect: SqlDialect, kind: &str) -> Option<Expr> {
+    (dialect == SqlDialect::Postgres).then(|| {
+        let class = send_to(Expr::new(Span::synthetic(), ExprNode::SelfRef), "class", vec![], false);
+        let name = send_to(class, "name", vec![], false);
+        send_to(name, "+", vec![lit_str(format!(" {kind}"))], false)
+    })
+}
+
 /// One shaped-read site gets one id so `__rh_value_0` from two reads in
 /// the same method cannot collide under Spinel's pinned local types.
 fn next_read_id() -> usize {
@@ -117,7 +135,7 @@ fn has_shaped_predicates(binds: &[Bind]) -> bool {
 /// the cache, including Spinel's cache which only trims at lease boundaries.
 const MAX_CACHED_NULLABLE_PREDICATES: usize = 7;
 
-fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize, dialect: SqlDialect) -> Vec<Expr> {
+fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize, dialect: SqlDialect, event: Option<String>) -> Vec<Expr> {
     let db = ClassId(Symbol::from(DB_MOD));
     let mut out = Vec::new();
     let shaped = has_shaped_predicates(binds);
@@ -172,7 +190,9 @@ fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize, dialec
     } else {
         "prepare"
     };
-    out.push(assign_var(stmt, db_call(&db, prepare, vec![sql])));
+    let mut prepare_args = vec![sql];
+    prepare_args.extend(event.map(lit_str));
+    out.push(assign_var(stmt, db_call(&db, prepare, prepare_args)));
     out
 }
 
@@ -257,7 +277,9 @@ impl SqlDialect {
         let projection = projection.join(", ");
         let mut segments = insert_segments(ins, schema, self);
         segments.push(lit_str(format!(" RETURNING {projection}")));
-        db_call(&ClassId(Symbol::from(DB_MOD)), "exec_returning", vec![concat_chain(segments)])
+        let mut args = vec![concat_chain(segments)];
+        args.extend(instance_event_name(self, "Create"));
+        db_call(&ClassId(Symbol::from(DB_MOD)), "exec_returning", args)
     }
 }
 
@@ -295,8 +317,8 @@ fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId, dialect: SqlDial
     // byte-for-byte.
     let param = dialect == SqlDialect::Postgres || param_binds_enabled();
     match &sel.columns {
-        ColumnSpec::Count => emit_count(sel, table, param, dialect),
-        ColumnSpec::Exists => emit_exists(sel, table, param, dialect),
+        ColumnSpec::Count => emit_count(sel, table, owner, param, dialect),
+        ColumnSpec::Exists => emit_exists(sel, table, owner, param, dialect),
         // Cardinality comes from the BUILDER (`single_record`), never
         // from `LIMIT 1` — `find_by(x)` and `.limit(1)` render the same
         // SQL and mean different things. See `Select::single_record`.
@@ -304,8 +326,8 @@ fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId, dialect: SqlDial
             emit_single_hydrate(sel, table, owner, param, dialect)
         }
         ColumnSpec::All => emit_multi_hydrate(sel, table, owner, schema, param, dialect),
-        ColumnSpec::Pluck(col) => emit_pluck(sel, table, col, param, dialect),
-        ColumnSpec::GroupCount(col) => emit_group_count(sel, table, col, param, dialect),
+        ColumnSpec::Pluck(col) => emit_pluck(sel, table, owner, col, param, dialect),
+        ColumnSpec::GroupCount(col) => emit_group_count(sel, table, owner, col, param, dialect),
         ColumnSpec::Named(_) => {
             // Reserved — no Phase 1 builder produces Named yet (it's for
             // find_by(<col>)). Degrade instead of crashing: report the
@@ -342,7 +364,7 @@ fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool
 
     let mut binds = Vec::new();
     let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
-    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect, event_name(dialect, owner, "Load"));
     let result_init = assign_var(&result, nil_lit());
 
     // if Db.step?(stmt) ; result = <Owner>.from_stmt(stmt) ; end
@@ -386,7 +408,7 @@ fn emit_multi_hydrate(
 
     let mut binds = Vec::new();
     let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
-    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect, event_name(dialect, owner, "Load"));
     // Empty Array literal carries an explicit `Array<Owner>` type
     // annotation so strict-target emit (Crystal `[] of Owner`)
     // matches the subsequent `results << instance` push semantics.
@@ -509,7 +531,9 @@ fn push_preload_stmts(
         db_call(&db, "escape_int_list", vec![var_ref(&ids)]),
         lit_str(close),
     ]);
-    out.push(assign_var(&pstmt, db_call(&db, "prepare", vec![sql])));
+    let mut prepare_args = vec![sql];
+    prepare_args.extend(event_name(dialect, &directive.target_class, "Load").map(lit_str));
+    out.push(assign_var(&pstmt, db_call(&db, "prepare", prepare_args)));
 
     // loaded = [] (typed Array<Target> so the `<<` push types cleanly)
     let elem_ty = Ty::Class { id: directive.target_class.clone(), args: vec![].into() };
@@ -725,7 +749,7 @@ fn push_planned_distribute(
 /// which is where the nullable `_opt` rule lives. Reusing it is the
 /// point: a second copy of that rule would be a second description of
 /// the same column.
-fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool, dialect: SqlDialect) -> Expr {
+fn emit_pluck(sel: &Select, table: &Table, owner: &ClassId, col: &super::ir::ColRef, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from(DB_MOD));
@@ -749,7 +773,7 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool,
 
     let mut binds = Vec::new();
     let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
-    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect, event_name(dialect, owner, "Pluck"));
 
     // The element type is carried explicitly for the same reason the
     // hydrate loop carries `Array<Owner>`: an untyped `[]` types as
@@ -818,6 +842,7 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool,
 fn emit_group_count(
     sel: &Select,
     table: &Table,
+    owner: &ClassId,
     col: &super::ir::ColRef,
     param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
@@ -847,7 +872,7 @@ fn emit_group_count(
 
     let mut binds = Vec::new();
     let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
-    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect, event_name(dialect, owner, "Count"));
 
     let results_init = assign_var(
         &results,
@@ -895,7 +920,7 @@ fn emit_group_count(
 }
 
 /// `SELECT COUNT(*) FROM <table> [WHERE …]` → integer scalar.
-fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> Expr {
+fn emit_count(sel: &Select, table: &Table, owner: &ClassId, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
@@ -908,7 +933,7 @@ fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> 
     let mut binds = Vec::new();
     push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect, read_id);
 
-    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect, event_name(dialect, owner, "Count"));
     let step = db_call(&db, "step?", vec![var_ref(&stmt)]);
     let read = db_call(&db, "column_int", vec![var_ref(&stmt), lit_int(0)]);
     let result_assign = assign_var(&result, read);
@@ -925,7 +950,7 @@ fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> 
 }
 
 /// `SELECT 1 FROM <table> WHERE … LIMIT 1` → bool from `step?`.
-fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> Expr {
+fn emit_exists(sel: &Select, table: &Table, owner: &ClassId, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
@@ -939,7 +964,7 @@ fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) ->
         segments.push(lit_str(format!(" LIMIT {}", n)));
     }
 
-    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect);
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect, event_name(dialect, owner, "Exists?"));
     let result_assign = assign_var(&result, db_call(&db, "step?", vec![var_ref(&stmt)]));
     let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
 
@@ -975,10 +1000,14 @@ fn visit_insert(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Expr {
             return stub;
         }
         segments.push(lit_str(format!(" RETURNING {}", dialect.ident(keys[0].name.as_str()))));
-        return db_call(&db, "insert_returning_int", vec![concat_chain(segments)]);
+        let mut args = vec![concat_chain(segments)];
+        args.extend(instance_event_name(dialect, "Create"));
+        return db_call(&db, "insert_returning_int", args);
     }
 
-    let exec_call = db_call(&db, "exec", vec![concat_chain(segments)]);
+    let mut exec_args = vec![concat_chain(segments)];
+    exec_args.extend(instance_event_name(dialect, "Create"));
+    let exec_call = db_call(&db, "exec", exec_args);
     if !ins.returns_rowid {
         return exec_call;
     }
@@ -1040,7 +1069,9 @@ fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
     // the prepared-statement cache — so the WHERE stays inline-escaped
     // regardless of the placeholder-bind gate.
     push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
-    db_call(&db, "exec", vec![concat_chain(segments)])
+    let mut args = vec![concat_chain(segments)];
+    args.extend(instance_event_name(dialect, "Update"));
+    db_call(&db, "exec", args)
 }
 
 /// An UPDATE that sets only the assignments whose column the `columns`
@@ -1073,7 +1104,9 @@ fn visit_update_only(upd: &Update, columns: &Symbol, table: &Table, dialect: Sql
     push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
     // A listed column that is not writable (generated) leaves nothing to set.
     let nothing = send_to(var_ref(&sets), "empty?", vec![], false);
-    let exec = db_call(&db, "exec", vec![concat_chain(segments)]);
+    let mut exec_args = vec![concat_chain(segments)];
+    exec_args.extend(instance_event_name(dialect, "Update"));
+    let exec = db_call(&db, "exec", exec_args);
     stmts.push(Expr::new(Span::synthetic(), ExprNode::If { cond: nothing, then_branch: nil_lit(), else_branch: exec }));
     seq(stmts)
 }
@@ -1091,7 +1124,9 @@ fn visit_delete(del: &Delete, schema: &Schema, dialect: SqlDialect) -> Expr {
     let mut segments: Vec<Expr> = vec![lit_str(format!("DELETE FROM {}", dialect.ident(del.table.0.as_str())))];
     // Exec path — inline WHERE (see visit_update note); not cached.
     push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
-    let delete_call = db_call(&db, "exec", vec![concat_chain(segments)]);
+    let mut delete_args = vec![concat_chain(segments)];
+    delete_args.extend(instance_event_name(dialect, "Destroy"));
+    let delete_call = db_call(&db, "exec", delete_args);
 
     // Truncate (Delete with no WHERE) — also reset the
     // sqlite_sequence row for this table so the next INSERT picks up
@@ -2125,7 +2160,7 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_count(&sel, table, true, SqlDialect::Sqlite);
+        let body = emit_count(&sel, table, &ClassId(Symbol::from("Article")), true, SqlDialect::Sqlite);
         let sql = prepare_sql(&body);
         assert!(sql.contains("COUNT(*)") && sql.contains("WHERE id = ?"), "got:\n{sql}");
         assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_int"), "expected bind_int");
@@ -2150,8 +2185,102 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_exists(&sel, table, true, SqlDialect::Sqlite);
+        let body = emit_exists(&sel, table, &ClassId(Symbol::from("Article")), true, SqlDialect::Sqlite);
         assert!(prepare_sql(&body).contains("WHERE title = ?"));
         assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_text"), "expected bind_text");
+    }
+
+    /// The literal String passed as a `Db` call's second argument.
+    fn event_arg(e: &Expr) -> Option<String> {
+        let ExprNode::Send { args, .. } = e.node.as_ref() else { return None };
+        match args.get(1)?.node.as_ref() {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+            // `self.class.name + " Create"`: the record's own class.
+            ExprNode::Send { recv: Some(name), method, args, .. } if method.as_str() == "+" => {
+                let ExprNode::Send { recv: Some(class), method: name_method, .. } = name.node.as_ref() else { return None };
+                let ExprNode::Send { recv: Some(me), method: class_method, .. } = class.node.as_ref() else { return None };
+                if !matches!(me.node.as_ref(), ExprNode::SelfRef) || name_method.as_str() != "name" || class_method.as_str() != "class" {
+                    return None;
+                }
+                let ExprNode::Lit { value: Literal::Str { value } } = args[0].node.as_ref() else { return None };
+                Some(format!("self.class.name{value}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `Db.prepare` call a read body assigns to `stmt` (exprs[0]).
+    fn prepare_call(body: &Expr) -> &Expr {
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { panic!("expected Seq") };
+        let ExprNode::Assign { value, .. } = exprs[0].node.as_ref() else { panic!("expected stmt =") };
+        value
+    }
+
+    fn by_title_select(columns: ColumnSpec, single_record: bool) -> Select {
+        Select {
+            single_record,
+            table: TableRef(Symbol::from("articles")),
+            columns,
+            conditions: Some(Predicate::Eq(
+                ColRef { table: TableRef(Symbol::from("articles")), column: Symbol::from("title") },
+                Value::Runtime { expr: var_ref(&Symbol::from("title")), ty: ValueType::Str },
+            )),
+            orders: vec![],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        }
+    }
+
+    /// Rails names every statement it instruments ("Article Load",
+    /// "Article Exists?", "Article Count"); the PostgreSQL runtime puts
+    /// that name on `sql.active_record`, so its `Db.prepare` carries it.
+    #[test]
+    fn postgres_reads_carry_rails_query_names() {
+        let (schema, owner) = fixture_schema();
+        let table = &schema.tables[&Symbol::from("articles")];
+        for (select, kind) in [
+            (by_title_select(ColumnSpec::Count, false), "Count"),
+            (by_title_select(ColumnSpec::Exists, false), "Exists?"),
+            (by_title_select(ColumnSpec::All, true), "Load"),
+            (by_title_select(ColumnSpec::All, false), "Load"),
+        ] {
+            let body = SqlDialect::Postgres.visit(&ArelOp::Select(select), &schema, &owner);
+            assert_eq!(event_arg(prepare_call(&body)), Some(format!("Article {kind}")), "{kind}");
+        }
+    }
+
+    #[test]
+    fn sqlite_reads_keep_the_one_argument_prepare() {
+        let (schema, owner) = fixture_schema();
+        let body = SqlDialect::Sqlite.visit(&ArelOp::Select(by_title_select(ColumnSpec::Count, false)), &schema, &owner);
+        let ExprNode::Send { args, .. } = prepare_call(&body).node.as_ref() else { panic!("expected Db.prepare") };
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn postgres_writes_carry_rails_query_names() {
+        let (schema, owner) = fixture_schema();
+        let title = || Assignment {
+            column: Symbol::from("title"),
+            value: Value::Runtime { expr: var_ref(&Symbol::from("title")), ty: ValueType::Str },
+        };
+        let by_id = Some(Predicate::Eq(id_col(), Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int }));
+        let insert = ArelOp::Insert(Insert {
+            table: TableRef(Symbol::from("articles")), assignments: vec![title()], returns_rowid: false,
+        });
+        assert_eq!(event_arg(&SqlDialect::Postgres.visit(&insert, &schema, &owner)), Some("self.class.name Create".into()));
+        let keyed = ArelOp::Insert(Insert {
+            table: TableRef(Symbol::from("articles")), assignments: vec![title()], returns_rowid: true,
+        });
+        assert_eq!(event_arg(&SqlDialect::Postgres.visit(&keyed, &schema, &owner)), Some("self.class.name Create".into()));
+        let update = ArelOp::Update(Update {
+            table: TableRef(Symbol::from("articles")), assignments: vec![title()], conditions: by_id.clone(), only: None,
+        });
+        assert_eq!(event_arg(&SqlDialect::Postgres.visit(&update, &schema, &owner)), Some("self.class.name Update".into()));
+        let delete = ArelOp::Delete(Delete { table: TableRef(Symbol::from("articles")), conditions: by_id });
+        assert_eq!(event_arg(&SqlDialect::Postgres.visit(&delete, &schema, &owner)), Some("self.class.name Destroy".into()));
+        // The SQLite lane's `Db.exec` takes the statement alone.
+        assert_eq!(event_arg(&SqlDialect::Sqlite.visit(&insert, &schema, &owner)), None);
     }
 }

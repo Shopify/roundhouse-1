@@ -252,9 +252,16 @@ module Db
     # Lowest-level statement execution: one `sql.active_record` event
     # around a verified session, yielding the PG::Connection. Driver errors
     # leave as their Active Record translation.
+    # The event's `row_count` is the result's row count and `affected_rows`
+    # its command tag count (Rails' PostgreSQL perform_query).
     def raw_execute(sql, name = "SQL", binds = [], materialize_transactions: true)
-      Db.instrument_sql(sql, binds, name: name, connection: self) do
-        with_raw_connection(sql, binds, materialize_transactions: materialize_transactions) { |conn| yield conn }
+      Db.instrument_sql(sql, binds, name: name, connection: self) do |payload|
+        result = with_raw_connection(sql, binds, materialize_transactions: materialize_transactions) { |conn| yield conn }
+        if payload.is_a?(Hash) && result.respond_to?(:ntuples)
+          payload[:row_count] = result.ntuples
+          payload[:affected_rows] = result.cmd_tuples
+        end
+        result
       end
     end
 
@@ -943,7 +950,7 @@ module Db
     context[:cache]&.clear
     adapter = current_adapter
     sql = transform_query(sql, adapter)
-    result = adapter.raw_execute(sql, name) { |conn| adapter.perform_query(conn, sql) }
+    result = adapter.raw_execute(sql, event_name(sql, name)) { |conn| adapter.perform_query(conn, sql) }
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     nil
   ensure
@@ -952,13 +959,13 @@ module Db
 
   # The lowerer appends a typed RETURNING key, so trigger side effects or
   # unrelated sequences cannot affect the returned insert identity.
-  def self.insert_returning_int(sql)
+  def self.insert_returning_int(sql, name = "SQL")
     sql = unmark(sql)
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
     sql = transform_query(sql, adapter)
-    result = adapter.raw_execute(sql) { |conn| adapter.perform_query(conn, sql) }
+    result = adapter.raw_execute(sql, event_name(sql, name)) { |conn| adapter.perform_query(conn, sql) }
     raise "INSERT RETURNING must produce one key" unless result.ntuples == 1 && result.nfields == 1
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     Integer(result.getvalue(0, 0))
@@ -970,8 +977,8 @@ module Db
   # columns): runs once, now, as `exec` does, and answers a handle over
   # the returned rows (step?/column_*/finalize, as for a read). Executing
   # clears the query cache and sets `changes`, by the command tag.
-  def self.exec_returning(sql)
-    handle = prepare_uncached(sql)
+  def self.exec_returning(sql, name = "SQL")
+    handle = prepare_uncached(sql, name)
     execute_handle(handle)
     handle
   end
@@ -1064,10 +1071,23 @@ module Db
   # raised by with_raw_connection's own recovery reaches the caller as is.
   def self.instrument_sql(sql, binds = [], name: "SQL", connection: nil, &operation)
     if defined?(ActiveSupport::Notifications::Event)
-      active_record_instrumenter.instrument("sql.active_record", sql: sql, name: name, binds: binds.dup, connection: connection, &operation)
+      active_record_instrumenter.instrument("sql.active_record", sql: sql, name: name, binds: binds.dup,
+        async: false, connection: connection, affected_rows: 0, row_count: 0, &operation)
     else
       operation.call
     end
+  end
+
+  # The `sql.active_record` event name of a statement. Compiler-emitted
+  # call sites and relation reads pass Rails' query name ("Order Load",
+  # "Order Exists?", "Order Create" ...); a statement that arrives
+  # unnamed is named by what it is: the transaction-control statements
+  # Rails issues as "TRANSACTION", anything else its default "SQL".
+  TRANSACTION_STATEMENT = /\A\s*(BEGIN|COMMIT|ROLLBACK|END|SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT|START TRANSACTION)\b/i
+
+  def self.event_name(sql, name)
+    return name unless name.nil? || name == "SQL"
+    TRANSACTION_STATEMENT.match?(sql) ? "TRANSACTION" : "SQL"
   end
 
   # Active Record's AbstractAdapter#instrumenter: cached per thread at the
@@ -1091,10 +1111,10 @@ module Db
   # (`Relation#bind_literal`); `lift_marked` answers the shape with `$n`
   # placeholders and the values as binds, as Rails binds them, so the
   # statement cache shares the shape and the query log shows `$1`.
-  def self.prepare(sql, cacheable: false)
+  def self.prepare(sql, name = "SQL", cacheable: false)
     adapter = current_adapter
     sql, binds = lift_marked(sql)
-    { adapter: adapter, sql: sql, binds: binds, result: nil, row: nil, pos: 0, closed: false,
+    { adapter: adapter, sql: sql, binds: binds, name: name, result: nil, row: nil, pos: 0, closed: false,
       owner: [Thread.current, Fiber.current], database: context[:name],
       lease: adapter.instance_variable_get(:@rh_pg_lease), cacheable: cacheable }
   end
@@ -1127,8 +1147,8 @@ module Db
   # nil (more of them than the shape cache keeps): executed with its binds
   # but never prepared server-side, so its shapes cannot churn the
   # connection's bounded statement cache.
-  def self.prepare_uncached(sql)
-    handle = prepare(sql)
+  def self.prepare_uncached(sql, name = "SQL")
+    handle = prepare(sql, name)
     handle[:uncached] = true
     handle
   end
@@ -1161,7 +1181,7 @@ module Db
     sent = transform_query(sql, adapter)
     transformed = !sent.equal?(sql) && sent != sql
     sql = sent
-    result = adapter.raw_execute(sql, "SQL", binds) do |conn|
+    result = adapter.raw_execute(sql, event_name(sql, handle[:name]), binds) do |conn|
       if binds.empty?
         adapter.perform_query(conn, sql)
       elsif handle[:uncached] || transformed

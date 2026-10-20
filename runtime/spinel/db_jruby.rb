@@ -429,7 +429,7 @@ module Db
     nil
   end
 
-  def self.exec(sql)
+  def self.exec(sql, _query_name = "SQL")
     record_query(sql)
     # Any exec is (per the Db contract) DDL or a write — Rails
     # invalidates the whole query cache on write; so do we.
@@ -457,7 +457,7 @@ module Db
   # as in db_cruby.rb: the query cache is cleared, every row is read
   # before the statement closes, and the handle replays them (step,
   # column_*, finalize as for a read). `changes` is the write's row count.
-  def self.exec_returning(sql)
+  def self.exec_returning(sql, _query_name = "SQL")
     v = loaded_sqlite_version
     if !returning_supported?(v)
       raise "Db.exec_returning: RETURNING needs SQLite 3.35 or newer; this driver bundles " + v.to_s
@@ -560,7 +560,7 @@ module Db
   # hits and over-cap statements are transient, closed on finalize.
   # Placeholder queries reuse one cached statement across bound values;
   # STMT_CACHE_CAP bounds growth for other SQL shapes.
-  def self.prepare(sql)
+  def self.prepare(sql, _query_name = "SQL")
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
   rescue Java::JavaSql::SQLException => e
@@ -643,7 +643,7 @@ module Db
 
   # Explicit uncached reads skip statement reuse, retaining result replay.
   # finalize closes real transient statements, including replay promotion.
-  def self.prepare_uncached(sql)
+  def self.prepare_uncached(sql, _query_name = "SQL")
     qcache = Fiber[:rh_qcache]
     parameterized = sql.include?("?")
     if !qcache.nil? && !parameterized && (hit = qcache[sql])

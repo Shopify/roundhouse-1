@@ -19,10 +19,10 @@ module Db
   def self.adapter_name: () -> String
   def self.transaction_open?: () -> bool
   def self.close: () -> void
-  def self.exec: (String) -> void
-  def self.prepare: (String) -> Integer
+  def self.exec: (String, ?String) -> void
+  def self.prepare: (String, ?String) -> Integer
   # Reads with too many SQL shapes bypass the cache; finalize releases them.
-  def self.prepare_uncached: (String) -> Integer
+  def self.prepare_uncached: (String, ?String) -> Integer
   # `prepare` for SQL carrying `Relation#bind_literal` marks: lifts them
   # to placeholders and binds the values.
   def self.prepare_marked: (String) -> Integer
@@ -65,7 +65,7 @@ module Db
   # (and clears the query cache like it), then answers a handle over the
   # returned rows: step?/column_*/finalize as for a read. `changes` is
   # the write's affected-row count.
-  def self.exec_returning: (String) -> Integer
+  def self.exec_returning: (String, ?String) -> Integer
   def self.last_insert_rowid: () -> Integer
   def self.changes: () -> Integer
   # Query-log capture (issue #27) — records the SQL each prepare/exec

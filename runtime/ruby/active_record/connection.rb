@@ -741,7 +741,7 @@ module ActiveRecord
     def self.find_by_sql(sql, binds = [], preparable: nil, allow_retry: false, &block)
       statement = sql.is_a?(Array) ? sanitize_sql(sql) : sql
       statement = connection._with_binds(statement, binds)
-      records = ActiveRecord.adapter.select_rows(statement).map do |row|
+      records = ActiveRecord.adapter.select_rows(statement, "#{name} Load").map do |row|
         record = instantiate(row)
         record._note_unloaded(row)
         record
@@ -2464,7 +2464,7 @@ module ActiveRecord
     # targets' adapter contract stops at `all`/`find`/`count`, and
     # their models always carry the emitted override.
     def self._hydrate_all(sql)
-      ActiveRecord.adapter.select_rows(sql).map { |row| instantiate(row) }
+      ActiveRecord.adapter.select_rows(sql, "#{name} Load").map { |row| instantiate(row) }
     end
 
     # Rails' `update_attribute`: one writer, then save WITHOUT

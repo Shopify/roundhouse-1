@@ -90,8 +90,8 @@ module SqlAdapterQueries
   # shims answer this now, the FFI one by storage-class dispatch. Each
   # row is its own Hash so the caller gets a stable copy after
   # `finalize`.
-  def select_rows(sql)
-    stmt = Db.prepare(sql)
+  def select_rows(sql, name = "SQL")
+    stmt = Db.prepare(sql, name)
     rows = []
     ncols = Db.column_count(stmt)
     # Column names can't change between rows — resolve them once, not

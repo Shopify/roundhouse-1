@@ -968,7 +968,7 @@ module Db
 
   # ── Statements ──
 
-  def self.exec(sql)
+  def self.exec(sql, _query_name = "SQL")
     record_query(sql)
     conn = current_conn
     # A COMMIT or ROLLBACK that itself raises — the backend's session
@@ -1033,7 +1033,7 @@ module Db
   # like `exec`, and answers a handle over the returned rows
   # (step?/column_*/finalize, as for a read). `changes` is its row count.
   # There is no query cache to invalidate yet.
-  def self.exec_returning(sql)
+  def self.exec_returning(sql, _query_name = "SQL")
     record_query(sql)
     conn = current_conn
     h = conn.returning(sql)
@@ -1042,7 +1042,7 @@ module Db
   end
 
   # A read through the connection's cached named statement for `sql`.
-  def self.prepare(sql)
+  def self.prepare(sql, _query_name = "SQL")
     sql = sql.to_s
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
@@ -1065,7 +1065,7 @@ module Db
   end
 
   # Reads with too many SQL shapes to cache run as the unnamed statement.
-  def self.prepare_uncached(sql)
+  def self.prepare_uncached(sql, _query_name = "SQL")
     sql = sql.to_s
     record_query(sql)
     h = current_conn.open_stmt(sql, false)

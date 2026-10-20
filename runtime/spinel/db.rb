@@ -1678,7 +1678,7 @@ module Db
     0
   end
 
-  def self.exec(sql)
+  def self.exec(sql, _query_name = "SQL")
     record_query(sql)
     conn = current_conn
     # A bare BEGIN reserves (and binds) the connection BEFORE it runs,
@@ -1769,7 +1769,7 @@ module Db
   # write permit), every row is read before the permit goes back, and
   # the handle replays them like a query-cache hit. `changes` is the
   # write's row count. Finalize the handle as for a read.
-  def self.exec_returning(sql)
+  def self.exec_returning(sql, _query_name = "SQL")
     v = SQL.sqlite3_libversion_number
     if !returning_supported?(v)
       raise "Db.exec_returning: RETURNING needs SQLite 3.35 or newer; this process links " + v.to_s
@@ -1905,7 +1905,7 @@ module Db
   # columns with `column_int` / `column_text`, releases with
   # `finalize`. The -1 length argument lets sqlite measure the SQL
   # itself (NUL-terminated).
-  def self.prepare(sql)
+  def self.prepare(sql, _query_name = "SQL")
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
   end
@@ -1969,7 +1969,7 @@ module Db
   # Finalize releases the transient immediately; abandoned handles close
   # at lease release. Outside with_connection they remain owned until
   # Db.close, so scripts must finalize explicitly after use.
-  def self.prepare_uncached(sql)
+  def self.prepare_uncached(sql, _query_name = "SQL")
     # Keep shared cache keys string-typed even when the compiled program
     # has no transient call site from which Spinel can infer this argument.
     sql = sql.to_s

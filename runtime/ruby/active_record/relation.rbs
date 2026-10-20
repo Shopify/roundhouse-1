@@ -394,7 +394,8 @@ module ActiveRecord
     def all?: () { (Base) -> bool } -> bool
     # Not `?condition`: the def takes `*conditions`, and spinel types a positional field by the def's own slot.
     def exists?: (*(Integer | String | Hash[String | Symbol, untyped] | nil | false) conditions) -> bool
-    def probe_existence: (Integer n) -> Integer
+    def probe_existence: (Integer n, ?String kind) -> Integer
+    def query_event_name: (String kind) -> String
     def more_than?: (Integer n) -> bool
     def length: () -> Integer
     def size: () -> Integer

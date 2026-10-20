@@ -77,7 +77,7 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_delete_all(owner, table, dialect));
     methods.push(synth_adapter_reload(model, table, dialect));
     methods.push(synth_columns_sql(owner, table, dialect));
-    methods.push(synth_hydrate_all(owner));
+    methods.push(synth_hydrate_all(owner, dialect));
     if !model.query_constraints.is_empty() {
         methods.push(synth_compiled_query_constraints(model));
     }
@@ -950,14 +950,20 @@ fn synth_delete_all(owner: &ClassId, table: &Table, dialect: SqlDialect) -> Meth
                 ExprNode::Const { path: vec![Symbol::from("Db")] },
             )),
             method: Symbol::from("exec"),
-            args: vec![Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit {
-                    value: Literal::Str {
-                        value: format!("DELETE FROM {}", dialect.ident(table.name.as_str())),
+            args: {
+                let mut args = vec![Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit {
+                        value: Literal::Str {
+                            value: format!("DELETE FROM {}", dialect.ident(table.name.as_str())),
+                        },
                     },
-                },
-            )],
+                )];
+                if dialect == SqlDialect::Postgres {
+                    args.push(arel_lit_str(format!("{} Delete All", owner.0)));
+                }
+                args
+            },
             block: None,
             parenthesized: true,
         },
@@ -1147,7 +1153,22 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
     // clear assoc loaded ; stmt = prepare ; [bind_int(stmt, 1, @id)] ; if step? {…} ; finalize ; self
     let assemble = |sql: Expr, binds: Vec<Expr>| {
         let mut body_exprs = clear_assoc.clone();
-        body_exprs.push(arel_assign(&stmt, arel_db_call(&db, "prepare", vec![sql])));
+        let mut prepare_args = vec![sql];
+        if dialect == SqlDialect::Postgres {
+            // The record's own class, as `_hydrate_all` names it.
+            let class = Expr::new(Span::synthetic(), ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                method: Symbol::from("class"), args: vec![], block: None, parenthesized: false,
+            });
+            let name = Expr::new(Span::synthetic(), ExprNode::Send {
+                recv: Some(class), method: Symbol::from("name"), args: vec![], block: None, parenthesized: false,
+            });
+            prepare_args.push(Expr::new(Span::synthetic(), ExprNode::Send {
+                recv: Some(name), method: Symbol::from("+"), args: vec![arel_lit_str(" Load".to_string())],
+                block: None, parenthesized: false,
+            }));
+        }
+        body_exprs.push(arel_assign(&stmt, arel_db_call(&db, "prepare", prepare_args)));
         body_exprs.extend(binds);
         body_exprs.push(if_expr.clone());
         body_exprs.push(arel_db_call(&db, "finalize", vec![var_ref(&stmt)]));
@@ -1408,7 +1429,7 @@ fn synth_columns_sql(owner: &ClassId, table: &Table, dialect: SqlDialect) -> Met
 /// `select(...)`. One typed record per row and no Hash in between:
 /// no per-cell key hashing on the write or the read, no boxing, and
 /// nothing for the collector to finalise but the record itself.
-fn synth_hydrate_all(owner: &ClassId) -> MethodDef {
+fn synth_hydrate_all(owner: &ClassId, dialect: SqlDialect) -> MethodDef {
     let sql = Symbol::from("sql");
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
@@ -1416,7 +1437,32 @@ fn synth_hydrate_all(owner: &ClassId) -> MethodDef {
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
     let owner_array_ty = Ty::Array { elem: std::sync::Arc::new(owner_ty) };
 
-    let stmt_assign = arel_assign(&stmt, arel_db_call(&db, "prepare", vec![var_ref(&sql)]));
+    // Rails names the read for the relation's own model, a subclass for an
+    // STI query: the receiver's `name`, not the class that defined this.
+    let mut prepare_args = vec![var_ref(&sql)];
+    if dialect == SqlDialect::Postgres {
+        let class_name = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                method: Symbol::from("name"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        prepare_args.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(class_name),
+                method: Symbol::from("+"),
+                args: vec![arel_lit_str(" Load".to_string())],
+                block: None,
+                parenthesized: false,
+            },
+        ));
+    }
+    let stmt_assign = arel_assign(&stmt, arel_db_call(&db, "prepare", prepare_args));
     // Typed empty literal — same reason as the visitor's multi hydrate
     // (Crystal's `[] of Owner`).
     let results_init = arel_assign(

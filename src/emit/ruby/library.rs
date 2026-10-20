@@ -22411,7 +22411,7 @@ def self._preload_batch_{name}(records)
   grouped = {{}}
   loaded = []
   if ids.length > 0
-    rows = ActiveRecord.adapter.select_rows("SELECT {table}.*, {group_col} AS __src FROM {table} {join} WHERE {group_col} IN (" + Db.{key_list}(ids) + "){order_sql}")
+    rows = ActiveRecord.adapter.select_rows("SELECT {table}.*, {group_col} AS __src FROM {table} {join} WHERE {group_col} IN (" + Db.{key_list}(ids) + "){order_sql}", "{target} Load")
     rows.each do |row|
       rec = {target}.instantiate(row)
       loaded << rec
@@ -22448,7 +22448,7 @@ def self._preload_batch_{name}(records)
   att_ids = {{}}
   blobs = {{}}
   if ids.length > 0
-    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ")").each do |row|
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ")", "ActiveStorage::Attachment Load").each do |row|
       rid = row["record_id"].{to_key}
       att_ids[rid] = row["attachment_id"].to_i
       blobs[rid] = ActiveStorage::Blob.from_row(row)
@@ -22481,7 +22481,7 @@ def self._preload_batch_{name}(records)
   end
   rows_by = {{}}
   if ids.length > 0
-    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ") ORDER BY a.id").each do |row|
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ") ORDER BY a.id", "ActiveStorage::Attachment Load").each do |row|
       rid = row["record_id"].{to_key}
       list = rows_by[rid]
       if list.nil?
