@@ -664,6 +664,18 @@ fn program_items(
                 (Some(write), None) if super::initializer_constants::is_class_new_declaration(&write.value()) => {
                     Some(constant_id_str(&write.name()).to_string())
                 }
+                // Any other constant the file's own classes include by
+                // name: the holder of a file of constants alone
+                // (`file_constants_holder`, named for the first), or a
+                // factory class (`Pair = Struct.new(:a)`). Core's
+                // test/support/helpers/fixture_timing_reporter.rb is
+                // `FixtureTimingReporter = MethodTimingRecorder.new(...)
+                // do … end` and nothing else: its program loaded nothing,
+                // so requiring it left the constant undefined (NameError
+                // in `use_active_record_fixtures`). A constant that rides
+                // on the file's first class is no class name, and stays
+                // with that class's file.
+                (Some(write), None) => Some(constant_id_str(&write.name()).to_string()),
                 _ => None,
             };
             if let Some(name) = class_new.filter(|name| carried.contains(name.as_str())) {
