@@ -5101,8 +5101,11 @@ fn apply_source_path_directories(files: &mut Vec<(String, String)>) {
                     part => resolved.push(part),
                 }
             }
-            // The directory of the file the literal names.
-            resolved.pop();
+            // `__FILE__` names a file, whose directory is wanted; `__dir__`
+            // names the directory itself.
+            if rest[..end].ends_with(".rb") {
+                resolved.pop();
+            }
             if !resolved.is_empty() {
                 wanted.insert(resolved.join("/"));
             }
