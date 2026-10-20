@@ -938,11 +938,38 @@ module ActiveRecord
           if relation.is_a?(ActiveRecord::Relation) && @proxy_owner.respond_to?(:association)
             relation.instance_variable_set(:@association, proxy_association)
           end
-          relation
+          _extended(relation)
         elsif @proxy_owner.respond_to?(:association)
-          proxy_association.scope
+          _extended(proxy_association.scope)
         else
           raise NotImplementedError, "roundhouse: #{@proxy_owner.class.name}##{@proxy_name}: the association's scope is not emitted"
+        end
+      end
+
+      # The scope with the modules of the declaration's `extend:` mixed in
+      # (Rails' CollectionProxy extends itself with them; the relation is
+      # the proxy's scope here, so their methods live on it).
+      def _extended(relation)
+        return relation unless relation.is_a?(ActiveRecord::Relation)
+        owner_class = @proxy_owner.class
+        reflection = owner_class.respond_to?(:reflect_on_association) ? owner_class.reflect_on_association(@proxy_name) : nil
+        return relation if reflection.nil?
+        modules = begin
+          reflection.options[:extend]
+        rescue NotImplementedError
+          nil
+        end
+        modules = Array(modules)
+        return relation if modules.empty?
+        relation.extending(*modules, ExtensionScope)
+      end
+
+      # Rails' extension modules reach the association through
+      # `proxy_association` (Core's `NotificationTemplateRelation` reads
+      # `proxy_association.owner`); the relation they extend holds it.
+      module ExtensionScope
+        def proxy_association
+          @association
         end
       end
 
@@ -991,11 +1018,12 @@ module ActiveRecord
       # `proxy.count` is a COUNT query, not the length of the records
       # held: a record built on the association and not yet saved
       # (`api_client.secrets.build`) is not in the count, and a new owner
-      # has none. The block form counts the records (`Enumerable#count`).
+      # has none. The block form counts the records (`Enumerable#count`);
+      # a column (`count(:id)`) is the scope's `COUNT(column)`.
       def count(*args, &block)
-        return super(*args, &block) if block || !args.empty?
+        return super(*args, &block) if block
         return 0 if @proxy_owner.respond_to?(:new_record?) && @proxy_owner.new_record?
-        scope.count
+        scope.count(*args)
       end
 
       # `select(:id, :delta)` is the scope's column projection (Rails'
