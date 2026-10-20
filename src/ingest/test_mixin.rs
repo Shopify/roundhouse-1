@@ -235,6 +235,11 @@ struct Mixin {
     /// includer those), and each includer includes it, so
     /// `Class.include?(Module)` answers as natively.
     marker: bool,
+    /// A library module's `private_constant`s: Ruby refuses to read one by
+    /// a scoped path (`::Mod::Name`), so a spliced body keeps it a bare name
+    /// (as the module's own methods read it), which the includer's ancestry,
+    /// the module included, resolves (`Mixin::own_copied`).
+    private_constants: Vec<Symbol>,
 }
 
 impl Mixin {
@@ -243,7 +248,7 @@ impl Mixin {
     /// constants, which the includer gets (`ClassWalk::finish`).
     fn own_copied(&self) -> Vec<Symbol> {
         if self.real {
-            Vec::new()
+            self.private_constants.clone()
         } else {
             self.constants.iter().map(|(n, _)| n.clone()).collect()
         }
@@ -3727,6 +3732,7 @@ fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
         library_concern: false,
         ancestry: Vec::new(),
         marker: false,
+        private_constants: Vec::new(),
     };
     let result = super::prism::parse_silent(source);
     let root = result.node();
@@ -3789,10 +3795,20 @@ fn walk_mixin(mixin: &mut Mixin, stmts: Vec<Node<'_>>) -> IngestResult<()> {
             if module_member(&stmt) || stmt.as_constant_write_node().is_some() || stmt.as_module_node().is_some() || stmt.as_class_node().is_some() {
                 continue;
             }
-            if stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "private_constant") {
-                return Err(unsupported(format!(
-                    "`private_constant` {site} hides a constant the spliced bodies read by its full name, which is not modeled"
-                )));
+            if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "private_constant") {
+                // Every name is read bare from a spliced body, so a symbol or
+                // string literal is all it needs; a computed one cannot be told.
+                for arg in call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+                    let name = arg
+                        .as_symbol_node()
+                        .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                        .or_else(|| arg.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()));
+                    let Some(name) = name else {
+                        return Err(unsupported(format!("`private_constant` {site} with a computed name is not modeled")));
+                    };
+                    mixin.private_constants.push(Symbol::from(name.as_str()));
+                }
+                continue;
             }
         }
         if stmt.as_module_node().is_some() || stmt.as_class_node().is_some() {
@@ -4709,13 +4725,30 @@ end
             ("def self.included(base)\n    super\n  end", "it defines `self.included`"),
             ("class << self\n    def extended(base)\n    end\n  end", "it defines `extended (in `class << self`)`"),
             ("module ClassMethods\n    def shout\n    end\n  end", "its `ClassMethods`"),
-            ("private_constant :Inner", "`private_constant`"),
+            ("private_constant Inner.name", "`private_constant` "),
         ] {
             let module = format!("module Hooked\n  extend ActiveSupport::Concern\n  class Inner\n  end\n  {stmt}\n  included do\n    setup do\n      @a = 1\n    end\n  end\nend\n");
             let class = "class HookedTest < ActiveSupport::TestCase\n  include Hooked\n  test \"x\" do\n    assert true\n  end\nend\n";
             let err = run_with(&[("hooked.rb", module.as_str()), ("hooked_test.rb", class)], &["hooked.rb"], "hooked_test.rb").unwrap_err();
             assert!(err.contains("test class `HookedTest` refused") && err.contains(why), "{stmt}: {err}");
         }
+    }
+
+    // `private_constant` makes Ruby refuse the scoped read `::Shop::Runner::Stub`
+    // a spliced body would get, so the private constant stays a bare name, which
+    // the includer's ancestry (the module included) resolves, as the module's
+    // own methods read it. The public one is still rooted.
+    #[test]
+    fn a_library_modules_private_constants_stay_bare_in_spliced_bodies() {
+        let module = "module Shop\n  module Runner\n    extend ActiveSupport::Concern\n\n    Stub = Struct.new(:result)\n    Public = Struct.new(:value)\n    private_constant(:Stub)\n\n    def stubbed\n      [Stub.new(1), Public.new(2)]\n    end\n\n    class Builder\n    end\n\n    included do\n      setup do\n        @stub = Stub.new(3)\n      end\n    end\n  end\nend\n";
+        let class = "class RunnerTest < ActiveSupport::TestCase\n  include Shop::Runner\n  test \"x\" do\n    assert stubbed\n  end\nend\n";
+        let tms = run_with(&[("runner.rb", module), ("runner_test.rb", class)], &["runner.rb"], "runner_test.rb").unwrap();
+        let helper = format!("{:?}", tms[0].helpers.iter().find(|h| h.name.as_str() == "stubbed").expect("the helper").body);
+        let bare = |s: &str, name: &str| s.contains(&format!("Symbol(\"{name}\")")) && !s.contains(&format!("Symbol(\"Runner\"), Symbol(\"{name}\")"));
+        assert!(bare(&helper, "Stub"), "{helper}");
+        assert!(helper.contains("Symbol(\"Runner\"), Symbol(\"Public\")"), "{helper}");
+        let setup = format!("{:?}", tms[0].setup);
+        assert!(bare(&setup, "Stub"), "{setup}");
     }
 
     #[test]
