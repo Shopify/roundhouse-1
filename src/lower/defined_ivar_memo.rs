@@ -61,52 +61,74 @@ pub fn apply_defined_ivar_memo_lowering(app: &mut App) {
     // writer of the name sets the flag (a flag on an unrelated class is
     // an inert extra ivar) and any one writer the flag cannot follow
     // keeps every guard of that name a real `defined?`.
-    let mut bodies: Vec<&mut Expr> = Vec::new();
-    for model in &mut app.models {
-        for item in &mut model.body {
-            match item {
-                ModelBodyItem::Method { method, .. } => bodies.push(&mut method.body),
-                ModelBodyItem::Scope { scope, .. } => bodies.push(&mut scope.body),
-                _ => {}
-            }
-        }
-    }
-    for lc in &mut app.library_classes {
-        bodies.extend(lc.methods.iter_mut().map(|m| &mut m.body));
-    }
-    if let Some(lc) = &mut app.rails_application {
-        bodies.extend(lc.methods.iter_mut().map(|m| &mut m.body));
-    }
-    for controller in &mut app.controllers {
-        for item in &mut controller.body {
-            if let ControllerBodyItem::Action { action, .. } = item {
-                bodies.push(&mut action.body);
-            }
-        }
-    }
-    rewrite_class(bodies);
-}
-
-fn rewrite_class(mut bodies: Vec<&mut Expr>) {
+    //
+    // The pool includes the test classes: a helper module's
+    // `defined?(@args)` guard (Core's `Customers::GraphApiTestHelper`)
+    // reads what the including test's own bodies assigned, and a flag
+    // those writers never set answers "not defined" for ever.
     let mut guarded: BTreeSet<Symbol> = BTreeSet::new();
-    for body in bodies.iter() {
-        collect_guarded(body, &mut guarded);
-    }
+    for_each_root(app, &mut |body, _| collect_guarded(body, &mut guarded));
     if guarded.is_empty() {
         return;
     }
-    // An ivar whose every assignment can take the flag.
+    // An ivar whose every assignment can take the flag. A writer in a
+    // root the rewrite does not expand (a class body, a constant's
+    // value, a default) is not in statement position there.
     let mut blocked: BTreeSet<Symbol> = BTreeSet::new();
-    for body in bodies.iter() {
-        collect_blocked(body, true, &mut blocked);
-    }
+    for_each_root(app, &mut |body, expandable| collect_blocked(body, expandable, &mut blocked));
     let rewritable: BTreeSet<Symbol> = guarded.difference(&blocked).cloned().collect();
     if rewritable.is_empty() {
         return;
     }
-    for body in bodies.iter_mut() {
+    for_each_root(app, &mut |body, expandable| {
         rewrite_guards(body, &rewritable);
-        rewrite_assignments(body, &rewritable, true, true);
+        if expandable {
+            rewrite_assignments(body, &rewritable, true, true);
+        }
+    });
+}
+
+/// Every expression root a guard or a writer of an ivar can sit in,
+/// with whether a statement there can be expanded in place: method,
+/// scope and action bodies, and the test classes' tests, `setup`,
+/// helper and inner-class methods, are; the rest of the hook bodies
+/// (class bodies, constants, defaults, conditions) are visited but not.
+/// Views stay out: their ivars are the controller's copied in, not
+/// assigned in place.
+fn for_each_root(app: &mut App, f: &mut impl FnMut(&mut Expr, bool)) {
+    let mut bodies: BTreeSet<*const Expr> = BTreeSet::new();
+    for model in &app.models {
+        for item in &model.body {
+            match item {
+                ModelBodyItem::Method { method, .. } => bodies.insert(&method.body),
+                ModelBodyItem::Scope { scope, .. } => bodies.insert(&scope.body),
+                _ => false,
+            };
+        }
+    }
+    for lc in app.library_classes.iter().chain(app.rails_application.iter()) {
+        bodies.extend(lc.methods.iter().map(|m| &m.body as *const Expr));
+    }
+    for controller in &app.controllers {
+        for item in &controller.body {
+            match item {
+                ControllerBodyItem::Action { action, .. } => bodies.insert(&action.body),
+                ControllerBodyItem::ClassMethod { method, .. } => bodies.insert(&method.body),
+                _ => false,
+            };
+        }
+    }
+    super::for_each_hook_body(app, &mut |body| {
+        let expandable = bodies.contains(&(body as *const Expr));
+        f(body, expandable)
+    });
+    super::for_each_test_body(app, &mut |body| f(body, true));
+    for tm in &mut app.test_modules {
+        for class in &mut tm.inner_classes {
+            for method in &mut class.methods {
+                f(&mut method.body, true);
+            }
+        }
     }
 }
 
