@@ -1514,6 +1514,12 @@ fn outer_local(block: &ruby_prism::BlockNode<'_>, bound: &[(String, Elem)]) -> O
     scan.found
 }
 
+/// Whether `block` reads or writes a local that lives outside it (a
+/// class-body local): a block lowered into a `def` would lose the scope.
+pub(super) fn block_uses_outer_local(block: &ruby_prism::BlockNode<'_>) -> bool {
+    outer_local(block, &[]).is_some()
+}
+
 /// A test that changes a shared object in place (`k << x`): the copies
 /// each test binds are the one object only when each reads it again from
 /// where the loop got it, or it is an immediate. Checked at each test (or

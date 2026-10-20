@@ -5734,6 +5734,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let request_encoder = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/action_dispatch_request_encoder.rb")
         .map_err(|e| format!("read request encoder runtime: {e}"))?;
     files.push(("runtime/action_dispatch_request_encoder.rb".into(), request_encoder));
+    let integration_runner = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/action_dispatch_integration_runner.rb")
+        .map_err(|e| format!("read integration runner runtime: {e}"))?;
+    files.push(("runtime/action_dispatch_integration_runner.rb".into(), integration_runner));
     files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
@@ -7351,6 +7354,7 @@ fn test_case_load_hooks_block() -> String {
          # ActiveSupport::TestCase is TestBase.\n\
          require_relative \"../runtime/active_record_test_fixtures\"\n\
          require_relative \"../runtime/action_dispatch_request_encoder\"\n\
+         require_relative \"../runtime/action_dispatch_integration_runner\"\n\
          if defined?(ActiveSupport::LazyLoadHooks)\n  \
          ActiveSupport::LazyLoadHooks.naming_failures({site:?}) {{ ActiveSupport.run_load_hooks(:{hook}, TestBase) }}\n\
          end\n\

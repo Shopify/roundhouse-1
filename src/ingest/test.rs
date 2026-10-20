@@ -618,6 +618,7 @@ pub(super) fn ingest_test_class(
     let mut after_definitions = false;
     let mut after_setup_blocks = false;
     let mut after_teardown_blocks = false;
+    let mut setup_closes_over_class_locals = false;
     // A statement declares tests ingest cannot list: they are the loaded
     // class's (`TestModule::tests_at_load`).
     let mut tests_at_load = false;
@@ -674,6 +675,9 @@ pub(super) fn ingest_test_class(
                     continue;
                 }
                 after_setup_blocks = true;
+                if let Some(block) = stmt.as_call_node().and_then(|c| c.block()).and_then(|b| b.as_block_node()) {
+                    setup_closes_over_class_locals |= test_unroll::block_uses_outer_local(&block);
+                }
                 // Multiple setup hooks compose in source order — append
                 // by wrapping in a Seq. Rare in practice; first wins
                 // when stored as Option, so accumulate.
@@ -1092,6 +1096,7 @@ pub(super) fn ingest_test_class(
         target,
         tests,
         setup,
+        setup_closes_over_class_locals,
         inner_classes,
         helpers,
         teardown_blocks,
@@ -2543,6 +2548,19 @@ end
         let plain = "class ThingsControllerTest < ActionController::TestCase\n  test \"a\" do\n    assert true\n  end\nend\n";
         let tm = ingest_test_file(plain.as_bytes(), "things_test.rb").expect("ingest").expect("test class");
         assert!(tm.tests_macro.is_none());
+    }
+
+    /// A `setup do` that reads a class-body local is marked: the compiled
+    /// method would lose the scope the block closes over.
+    #[test]
+    fn setup_block_reading_a_class_body_local_is_marked() {
+        let reads = "class FilterTest < ActiveSupport::TestCase\n  default_filter = Filter.parameter_filter\n  setup do\n    Filter.parameter_filter = default_filter\n  end\n  test \"a\" do\n    assert true\n  end\nend\n";
+        let tm = ingest_test_file(reads.as_bytes(), "filter_test.rb").expect("ingest").expect("test class");
+        assert!(tm.setup_closes_over_class_locals);
+
+        let own = "class FilterTest < ActiveSupport::TestCase\n  setup do\n    filter = Filter.parameter_filter\n    Filter.parameter_filter = filter\n    [1].each { |n| filter = n }\n  end\n  test \"a\" do\n    assert true\n  end\nend\n";
+        let tm = ingest_test_file(own.as_bytes(), "filter_test.rb").expect("ingest").expect("test class");
+        assert!(!tm.setup_closes_over_class_locals);
     }
 
     #[test]
