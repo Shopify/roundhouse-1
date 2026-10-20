@@ -16693,6 +16693,51 @@ const ANY_CLASS_SELF_CALLS: &[&str] = &[
     "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex", "caller", "caller_locations", "freeze", "method",
 ];
 
+/// The reader and writer names (`unscoped_shop`, `unscoped_shop=`) that a
+/// `Const.class_attribute(:name, …)` (or `cattr_*`/`mattr_*`) call run
+/// outside the class's own body defines on `lc` or an app ancestor: Core's
+/// `config/initializers/maintenance_tasks.rb` does
+/// `MaintenanceTasks::Task.class_attribute(:unscoped_shop, default: false)`
+/// in a load hook, and each task's body then writes `self.unscoped_shop =
+/// true`. The call is in a boot initializer's holder or in another class's
+/// body (`unknown_calls`), and runs as the class loads, before the
+/// subclasses that call the writer.
+fn declared_class_attribute_writers(lc: &LibraryClass, app: &App) -> Vec<Symbol> {
+    const DECLARERS: &[&str] = &["class_attribute", "cattr_accessor", "cattr_writer", "mattr_accessor", "mattr_writer"];
+    fn walk(e: &Expr, targets: &[&str], out: &mut Vec<Symbol>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && DECLARERS.contains(&method.as_str())
+            && let ExprNode::Const { path } = &*r.node
+        {
+            let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            let written = written.trim_start_matches("::");
+            if targets.iter().any(|n| *n == written || n.ends_with(&format!("::{written}"))) {
+                for arg in args {
+                    if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
+                        out.push(Symbol::from(format!("{value}=").as_str()));
+                        out.push(Symbol::from(value.as_str()));
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |child| walk(child, targets, out));
+    }
+    let mut targets: Vec<&str> = vec![lc.name.0.as_str().trim_start_matches("::")];
+    targets.extend(app_library_ancestors(lc, app).into_iter().map(|a| a.name.0.as_str().trim_start_matches("::")));
+    let mut out: Vec<Symbol> = Vec::new();
+    for program in &app.initializer_programs {
+        for holder in library_classes_named(program.holder.0.as_str(), app) {
+            for m in &holder.methods {
+                walk(&m.body, &targets, &mut out);
+            }
+        }
+    }
+    for other in app.library_classes.iter().filter(|other| !std::ptr::eq(*other, lc)) {
+        other.unknown_calls.iter().for_each(|c| walk(c, &targets, &mut out));
+    }
+    out
+}
+
 /// Whether every call `call` makes on the class itself (no receiver, or
 /// `self`) is one any class answers ([`ANY_CLASS_SELF_CALLS`]) or a
 /// class method `lc` defines. A `define_method` block is a method body,
@@ -16703,11 +16748,15 @@ fn self_calls_answered(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
     // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
     // singleton class, which the class's own class methods do not answer.
     let singleton = call.decisions & crate::expr::SINGLETON_BODY != 0;
+    // The writers a class attribute declared from outside the body
+    // gives the class (`declared_class_attribute_writers`).
+    let declared: Vec<Symbol> = if singleton { Vec::new() } else { declared_class_attribute_writers(lc, app) };
     let mut own: Vec<&Symbol> = lc
         .methods
         .iter()
         .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
         .map(|m| &m.name)
+        .chain(declared.iter())
         .collect();
     // The class methods of the app's own superclasses are inherited
     // (`AssetCloud::ZippedThemeFiles`' body calls `bucket` and
