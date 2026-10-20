@@ -51,7 +51,7 @@ module ActiveRecord
   end
 
   class RecordNotSaved < ActiveRecordError
-    def record: () -> Base?
+    def record: () -> Base
     def initialize: (?String message, ?Base? record) -> void
   end
 
@@ -63,6 +63,6 @@ module ActiveRecord
   # invalid model; `attr_reader :record` lowers to a getter at ingest.
   class RecordInvalid < ActiveRecordError
     def record: () -> Base
-    def initialize: (Base record) -> void
+    def initialize: (?Base? record) -> void
   end
 end

@@ -141,9 +141,16 @@ module ActiveRecord
   class RecordInvalid < ActiveRecordError
     attr_reader :record
 
-    def initialize(record)
+    # Rails' `initialize(record = nil)`: a bare `RecordInvalid.new`
+    # (`raise ActiveRecord::RecordInvalid`) carries no record and the
+    # generic message.
+    def initialize(record = nil)
       @record = record
-      super("Validation failed: #{record.errors.join(', ')}")
+      if record.nil?
+        super("Record invalid")
+      else
+        super("Validation failed: #{record.errors.join(', ')}")
+      end
     end
   end
 end

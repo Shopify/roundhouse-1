@@ -2969,7 +2969,11 @@ pub(super) fn library_class_from_module_node_with_scope(
         constants,
         unknown_calls,
         class_ivar_initializers: class_initializers,
-        visibility_overrides: Vec::new(),
+        // A module has no ancestor to take a method from, so the only
+        // named changes left over are `private_class_method :m` on the
+        // singleton's view of an `extend self` module's own instance
+        // method, which Ruby's own method table carries.
+        visibility_overrides: visibility.overrides(),
     })
 }
 
