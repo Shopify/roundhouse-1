@@ -240,6 +240,10 @@ struct Mixin {
     /// (as the module's own methods read it), which the includer's ancestry,
     /// the module included, resolves (`Mixin::own_copied`).
     private_constants: Vec<Symbol>,
+    /// The modules its `ClassMethods` includes (`ingest_class_methods`): each
+    /// extends the includer, as ActiveSupport extends it with `ClassMethods`
+    /// and so with what that includes.
+    class_extends: Vec<IncludeRef>,
 }
 
 impl Mixin {
@@ -2346,6 +2350,40 @@ impl ClassWalk<'_> {
             }
         }
 
+        // What a concern's `ClassMethods` gives the class (`ingest_class_methods`):
+        // the modules it includes extend the class, farthest first, before the
+        // statements that call its methods. Those methods are defined with the
+        // class's, so the statements the blocks run wait for them.
+        let mut extends: Vec<crate::dialect::TestBodyStatement> = Vec::new();
+        for &m in t.mro.iter().rev() {
+            for r in reg.mixins[m].class_extends.iter().rev() {
+                let mut path: Vec<Symbol> = if r.rooted { vec![Symbol::from("")] } else { Vec::new() };
+                path.extend(r.path.iter().map(|p| Symbol::from(p.as_str())));
+                let mut module = Expr::new(Span::synthetic(), ExprNode::Const { path });
+                q(m, &mut module);
+                extends.push(crate::dialect::TestBodyStatement {
+                    expr: Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![module], block: None, parenthesized: false },
+                    ),
+                    line: 0,
+                    after_definitions: false,
+                    after_setup_blocks: false,
+                    after_teardown_blocks: false,
+                    source: None,
+                });
+            }
+        }
+        let class_methods_given = t.mro.iter().any(|&m| {
+            let mixin = &reg.mixins[m];
+            !mixin.class_extends.is_empty() || mixin.helpers.iter().any(|h| h.receiver == MethodReceiver::Class)
+        });
+        extends.append(&mut block_statements);
+        let mut block_statements = extends;
+        for statement in &mut block_statements {
+            statement.after_definitions |= class_methods_given;
+        }
+
         let mut out = tm.clone();
         // What the class has defined when a subclass's body loads (before
         // the persistent rename): a concern block's `test`s, declared by
@@ -3906,16 +3944,39 @@ fn message(err: IngestError) -> String {
 /// ActiveSupport extends each includer with them, so each is a class method
 /// the includer's tests and `included do` block find (`MethodReceiver::Class`
 /// helpers, as the module's `def self.` ones would be in an `included do`
-/// block). Anything else in it is refused by name.
+/// block); a module it includes extends the includer. Anything else in it
+/// is refused by name.
 fn ingest_class_methods(mixin: &mut Mixin, body: &[Node<'_>], owner: &ClassId, file: &str, site: &str) -> IngestResult<()> {
+    let refuse = |stmt: &Node<'_>| {
+        let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
+        let shown: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
+        IngestError::Unsupported {
+            file: file.into(),
+            message: format!("its `ClassMethods` {site} has `{shown}`, which would extend each includer and the shared-test splice does not model"),
+        }
+    };
     for stmt in body {
-        let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) else {
-            let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
-            let shown: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
-            return Err(IngestError::Unsupported { file: file.into(), message: format!(
-                "its `ClassMethods` {site} has `{shown}`, which would extend each includer and the shared-test splice does not model"
-            ) });
-        };
+        if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none()) {
+            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            match constant_id_str(&call.name()) {
+                // Sorbet only: no effect on what runs.
+                "requires_ancestor" | "abstract!" | "interface!" | "sig" => continue,
+                "extend" if args.iter().all(|a| matches!(constant_path_of(a).map(|p| p.join("::")).as_deref(), Some("T::Helpers" | "T::Sig" | "T::Generic"))) => {
+                    continue
+                }
+                "include" => {
+                    let refs: Vec<IncludeRef> = args.iter().filter_map(IncludeRef::of).collect();
+                    if refs.is_empty() || refs.len() != args.len() {
+                        return Err(refuse(stmt));
+                    }
+                    // `include A, B` puts A first in the lookup.
+                    mixin.class_extends.extend(refs.into_iter().rev());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) else { return Err(refuse(stmt)) };
         let mut method = ingest_library_method(&def, owner, file)?;
         method.receiver = MethodReceiver::Class;
         mixin.helpers.retain(|h| !(h.name == method.name && h.receiver == MethodReceiver::Class));
@@ -3945,6 +4006,7 @@ fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
         ancestry: Vec::new(),
         marker: false,
         private_constants: Vec::new(),
+        class_extends: Vec::new(),
     };
     let result = super::prism::parse_silent(source);
     let root = result.node();
@@ -3999,10 +4061,13 @@ fn walk_mixin(mixin: &mut Mixin, stmts: Vec<Node<'_>>) -> IngestResult<()> {
                     "it defines `{hook}` {site}, a hook Ruby runs on each includer, which the shared-test splice does not model"
                 )));
             }
-            if class_methods && !mixin.provider {
-                return Err(unsupported(format!(
-                    "its `ClassMethods` {site} would extend each includer (ActiveSupport::Concern), which the shared-test splice does not model"
-                )));
+            // The library file keeps the module without its Concern, so
+            // nothing there extends an includer with `ClassMethods`: its
+            // defs are the includer's class helpers, as in a spliced module.
+            if let Some(module) = stmt.as_module_node().filter(|_| class_methods && !mixin.provider) {
+                let body = module.body().map(flatten_statements).unwrap_or_default();
+                ingest_class_methods(mixin, &body, &owner, file, &site)?;
+                continue;
             }
             if module_member(&stmt) || stmt.as_constant_write_node().is_some() || stmt.as_module_node().is_some() || stmt.as_class_node().is_some() {
                 continue;
@@ -4926,12 +4991,30 @@ end
         assert!(tms[0].helpers.iter().any(|h| h.name.as_str() == "allowlist" && h.receiver == MethodReceiver::Class));
     }
 
+    // A library module (its nested class keeps it in its file) is carried
+    // without its Concern, so its `ClassMethods` is the includer's too: the
+    // defs are class helpers and what it includes extends the class.
+    #[test]
+    fn a_library_modules_class_methods_are_class_helpers_of_each_includer() {
+        let module = "module Shop\n  module Remote\n    extend ActiveSupport::Concern\n\n    class Matcher\n    end\n\n    included do\n      setup do\n        @a = 1\n      end\n    end\n\n    # @requires_ancestor: Kernel\n    module ClassMethods\n      include Minitest::Assertions\n\n      def remote_test(name)\n        name\n      end\n    end\n  end\nend\n";
+        let class = "class RemoteTest < ActiveSupport::TestCase\n  include Shop::Remote\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let files = [("support/remote.rb", module), ("remote_test.rb", class)];
+        let tms = run_with(&files, &["support/remote.rb"], "remote_test.rb").unwrap();
+        let tm = &tms[0];
+        assert!(tm.helpers.iter().any(|h| h.name.as_str() == "remote_test" && h.receiver == MethodReceiver::Class), "{:?}", tm.helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>());
+        assert!(
+            tm.body_statements.iter().any(|s| matches!(&*s.expr.node, ExprNode::Send { method, args, .. } if method.as_str() == "extend" && consts(&args[0]).iter().any(|c| c.contains("Minitest::Assertions")))),
+            "{:?}",
+            tm.body_statements
+        );
+    }
+
     #[test]
     fn something_other_than_a_def_in_class_methods_is_refused_by_name() {
-        let module = VERIFIED.replace("      def allowlist(&block)", "      include Helper\n\n      def allowlist(&block)");
+        let module = VERIFIED.replace("      def allowlist(&block)", "      attr_reader :helper\n\n      def allowlist(&block)");
         let class = "class VerifiedTest < ActiveSupport::TestCase\n  include Shop::Verified\n  test \"x\" do\n    assert true\n  end\nend\n";
         let err = run_with(&[("support/verified.rb", module.as_str()), ("verified_test.rb", class)], &["support/verified.rb"], "verified_test.rb").unwrap_err();
-        assert!(err.contains("its `ClassMethods`") && err.contains("include Helper"), "{err}");
+        assert!(err.contains("its `ClassMethods`") && err.contains("attr_reader :helper"), "{err}");
     }
 
     #[test]
@@ -5024,7 +5107,6 @@ end
         for (stmt, why) in [
             ("def self.included(base)\n    super\n  end", "it defines `self.included`"),
             ("class << self\n    def extended(base)\n    end\n  end", "it defines `extended (in `class << self`)`"),
-            ("module ClassMethods\n    def shout\n    end\n  end", "its `ClassMethods`"),
             ("private_constant Inner.name", "`private_constant` "),
         ] {
             let module = format!("module Hooked\n  extend ActiveSupport::Concern\n  class Inner\n  end\n  {stmt}\n  included do\n    setup do\n      @a = 1\n    end\n  end\nend\n");
