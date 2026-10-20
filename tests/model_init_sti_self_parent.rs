@@ -127,7 +127,7 @@ fn class_create_with_an_array_creates_one_record_each() {
     )
     .unwrap();
     for method in ["create!", "create"] {
-        let def = format!("def self.{method}(attrs = {{}})\n      return attrs.map {{ |each_attrs| {method}(each_attrs) }} if attrs.is_a?(Array)");
+        let def = format!("def self.{method}(attrs = {{}}, &block)\n      return attrs.map {{ |each_attrs| {method}(each_attrs, &block) }} if attrs.is_a?(Array)");
         assert!(src.contains(&def), "{method} lacks the Array form");
     }
 }
