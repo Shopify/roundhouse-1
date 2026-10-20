@@ -281,9 +281,12 @@ module ActiveJob
     end
 
     # `self.enqueue_after_transaction_commit = true` — inline jobs run
-    # at the call site; transaction-commit deferral is a queue concern.
+    # at the call site. The setting is kept for the Callbacks port
+    # (runtime/spinel/active_job_callbacks.rb), which defers the enqueue
+    # past the outermost commit and reads this ivar; it may load after
+    # boot assigns the app's config.
     def self.enqueue_after_transaction_commit=(value)
-      nil
+      @enqueue_after_transaction_commit = value
     end
 
     # `retry_on` / `discard_on` — error-handling policy for queued
