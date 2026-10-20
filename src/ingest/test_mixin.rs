@@ -235,6 +235,15 @@ struct Mixin {
     /// includer those), and each includer includes it, so
     /// `Class.include?(Module)` answers as natively.
     marker: bool,
+    /// A library module's `private_constant`s: Ruby refuses to read one by
+    /// a scoped path (`::Mod::Name`), so a spliced body keeps it a bare name
+    /// (as the module's own methods read it), which the includer's ancestry,
+    /// the module included, resolves (`Mixin::own_copied`).
+    private_constants: Vec<Symbol>,
+    /// The modules its `ClassMethods` includes (`ingest_class_methods`): each
+    /// extends the includer, as ActiveSupport extends it with `ClassMethods`
+    /// and so with what that includes.
+    class_extends: Vec<IncludeRef>,
 }
 
 impl Mixin {
@@ -243,7 +252,7 @@ impl Mixin {
     /// constants, which the includer gets (`ClassWalk::finish`).
     fn own_copied(&self) -> Vec<Symbol> {
         if self.real {
-            Vec::new()
+            self.private_constants.clone()
         } else {
             self.constants.iter().map(|(n, _)| n.clone()).collect()
         }
@@ -1454,6 +1463,8 @@ impl TestMixins {
             block_setup: false,
             teardowns: Vec::new(),
             block_teardown: false,
+            closure_setups: Vec::new(),
+            closure_teardowns: Vec::new(),
             block_helpers: Vec::new(),
             block_statements: Vec::new(),
             class_defs: Vec::new(),
@@ -1461,6 +1472,7 @@ impl TestMixins {
             includes_out: Vec::new(),
             used: Vec::new(),
             block_owner: None,
+            block_param: None,
         };
         walk.walk(stmts, file, false, Some(&class)).map_err(refuse)?;
         let own = walk.def_teardown(tm).map(|b| ends_in_super(&b));
@@ -1524,6 +1536,11 @@ struct ClassWalk<'a> {
     teardowns: Vec<Expr>,
     /// One of `teardowns` comes from an `included do` block.
     block_teardown: bool,
+    /// The `setups` / `teardowns` (by index) of an `included do` block that
+    /// read one of the block's locals: each is a closure natively, so it is
+    /// defined where the locals are (`closure_callback`).
+    closure_setups: Vec<usize>,
+    closure_teardowns: Vec<usize>,
     /// The methods `included do` blocks define on the class, each the
     /// last of its name, and only while no later class-body `def`
     /// replaced it.
@@ -1547,6 +1564,9 @@ struct ClassWalk<'a> {
     /// The module whose `included do` block is running: its statements
     /// read constants in that module's lexical scope.
     block_owner: Option<usize>,
+    /// The name the running `included do |base|` block gives the class, and
+    /// whether a carried statement already bound it (`base = self`).
+    block_param: Option<(String, bool)>,
 }
 
 impl ClassWalk<'_> {
@@ -1698,6 +1718,10 @@ impl ClassWalk<'_> {
                             }
                             if let Some(mut body) = ingest_setup_declaration(&stmt, file).map_err(message)? {
                                 self.qualify_block(&mut body);
+                                if in_block && reads_block_local(&body) {
+                                    self.closure_setups.push(self.setups.len());
+                                    self.bind_block_param(&body, file, 0);
+                                }
                                 self.setups.push(body);
                                 self.block_setup |= in_block;
                             }
@@ -1732,6 +1756,10 @@ impl ClassWalk<'_> {
                         "teardown" => {
                             if let Some(mut body) = ingest_teardown_block(&stmt, file).map_err(message)? {
                                 self.qualify_block(&mut body);
+                                if in_block && reads_block_local(&body) {
+                                    self.closure_teardowns.push(self.teardowns.len());
+                                    self.bind_block_param(&body, file, 0);
+                                }
                                 self.teardowns.push(body);
                                 self.block_teardown |= in_block;
                             }
@@ -1823,6 +1851,29 @@ impl ClassWalk<'_> {
                         continue;
                     }
                 }
+                // Any other class macro (`use_active_record_fixtures`,
+                // `let(:x) do … end`, `documentation(…) do … end`) or a local
+                // the macros after it read: `class_eval` runs it on the class
+                // where the include stands, and the emitted class runs the
+                // same statement as it loads. A constant or a nested class
+                // or module would be defined in the module's lexical scope
+                // (the block's), not the class's, so those stay refused.
+                if carries_in_included_block(&stmt) {
+                    if let Some(mut expr) = super::test::carried_body_statement(&stmt, &self.class, file).map_err(message)? {
+                        self.qualify_block(&mut expr);
+                        let line = super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0);
+                        self.bind_block_param(&expr, file, line);
+                        self.block_statements.push(crate::dialect::TestBodyStatement {
+                            expr,
+                            line,
+                            after_definitions: false,
+                            after_setup_blocks: false,
+                            after_teardown_blocks: false,
+                            source: Some(file.to_string()),
+                        });
+                    }
+                    continue;
+                }
                 let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
                 let first = text.lines().next().unwrap_or_default();
                 let shown: String = first.chars().take(60).collect();
@@ -1834,6 +1885,30 @@ impl ClassWalk<'_> {
             }
         }
         Ok(())
+    }
+
+    /// A statement of `included do |base| … end` that reads `base` (the
+    /// class) is carried with a local `base = self` before it, in the class
+    /// body's scope as the block's own is: the first such statement of
+    /// the block binds it, and the statements after it (and the blocks
+    /// they pass) read it.
+    fn bind_block_param(&mut self, expr: &Expr, file: &str, line: u32) {
+        let Some((name, bound)) = self.block_param.as_mut() else { return };
+        if *bound || !reads_var(expr, name) {
+            return;
+        }
+        *bound = true;
+        let span = expr.span;
+        let target = crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name.as_str()) };
+        let value = Expr::new(span, ExprNode::SelfRef);
+        self.block_statements.push(crate::dialect::TestBodyStatement {
+            expr: Expr::new(span, ExprNode::Assign { target, value }),
+            line,
+            after_definitions: false,
+            after_setup_blocks: false,
+            after_teardown_blocks: false,
+            source: Some(file.to_string()),
+        });
     }
 
     /// The body of the `def teardown` the class itself ends up with: an
@@ -1949,9 +2024,20 @@ impl ClassWalk<'_> {
             .map(flatten_statements)
             .unwrap_or_default();
         let file = m.file.clone();
+        let param = call
+            .block()
+            .and_then(|b| b.as_block_node())
+            .and_then(|b| b.parameters())
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| p.requireds().iter().next())
+            .and_then(|p| p.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()))
+            .map(|name| (name, false));
         let outer = self.block_owner.replace(k);
+        let outer_param = std::mem::replace(&mut self.block_param, param);
         let walked = self.walk(stmts, &file, true, None);
         self.block_owner = outer;
+        self.block_param = outer_param;
         walked
     }
 
@@ -1969,6 +2055,8 @@ impl ClassWalk<'_> {
             block_setup,
             teardowns,
             block_teardown,
+            closure_setups,
+            closure_teardowns,
             mut block_helpers,
             mut block_statements,
             block_wins,
@@ -1993,8 +2081,9 @@ impl ClassWalk<'_> {
                 ));
             }
         }
-        let (mut class_helpers, teardown_def) = merge_teardowns(tm, teardowns, &mut block_helpers, &block_wins, &class)?;
-        let (setup, setup_frames) = frame_setups(setups, block_setup, &class)?;
+        let (mut class_helpers, teardown_def) =
+            merge_teardowns(tm, teardowns, &closure_teardowns, &mut block_helpers, &block_wins, &class, &mut block_statements)?;
+        let (setup, setup_frames) = frame_setups(setups, block_setup, &closure_setups, &class, &mut block_statements)?;
         class_helpers.extend(setup_frames);
         // TestTags' persistent hook renames what the class itself defines,
         // and undefines the old names, so an ancestor's are hidden too.
@@ -2261,6 +2350,40 @@ impl ClassWalk<'_> {
             }
         }
 
+        // What a concern's `ClassMethods` gives the class (`ingest_class_methods`):
+        // the modules it includes extend the class, farthest first, before the
+        // statements that call its methods. Those methods are defined with the
+        // class's, so the statements the blocks run wait for them.
+        let mut extends: Vec<crate::dialect::TestBodyStatement> = Vec::new();
+        for &m in t.mro.iter().rev() {
+            for r in reg.mixins[m].class_extends.iter().rev() {
+                let mut path: Vec<Symbol> = if r.rooted { vec![Symbol::from("")] } else { Vec::new() };
+                path.extend(r.path.iter().map(|p| Symbol::from(p.as_str())));
+                let mut module = Expr::new(Span::synthetic(), ExprNode::Const { path });
+                q(m, &mut module);
+                extends.push(crate::dialect::TestBodyStatement {
+                    expr: Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![module], block: None, parenthesized: false },
+                    ),
+                    line: 0,
+                    after_definitions: false,
+                    after_setup_blocks: false,
+                    after_teardown_blocks: false,
+                    source: None,
+                });
+            }
+        }
+        let class_methods_given = t.mro.iter().any(|&m| {
+            let mixin = &reg.mixins[m];
+            !mixin.class_extends.is_empty() || mixin.helpers.iter().any(|h| h.receiver == MethodReceiver::Class)
+        });
+        extends.append(&mut block_statements);
+        let mut block_statements = extends;
+        for statement in &mut block_statements {
+            statement.after_definitions |= class_methods_given;
+        }
+
         let mut out = tm.clone();
         // What the class has defined when a subclass's body loads (before
         // the persistent rename): a concern block's `test`s, declared by
@@ -2369,9 +2492,11 @@ impl ClassWalk<'_> {
 fn merge_teardowns(
     tm: &TestModule,
     teardowns: Vec<Expr>,
+    closures: &[usize],
     block_helpers: &mut Vec<MethodDef>,
     block_wins: &[(String, MethodReceiver)],
     class: &ClassId,
+    carried: &mut Vec<crate::dialect::TestBodyStatement>,
 ) -> Result<(Vec<MethodDef>, bool), String> {
     let mut helpers = tm.helpers.clone();
     helpers.retain(|h| !block_wins.iter().any(|(n, r)| n == h.name.as_str() && *r == h.receiver));
@@ -2405,11 +2530,19 @@ fn merge_teardowns(
     let def_part = def_part.unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Super { args: None, block: None }));
     let prefix = frame_prefix("teardown", class);
     let mut frames: Vec<MethodDef> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for (i, body) in teardowns.into_iter().enumerate() {
         let (body, _) = callback_frame(body, "teardown")?;
         frames.push(synth_method(&format!("{prefix}{}", i + 1), body, class));
+        if closures.contains(&i) {
+            let frame = frames.pop().expect("the frame just pushed");
+            carried.push(closure_callback(&frame));
+            names.push(frame.name.to_string());
+        } else {
+            names.push(frames.last().expect("the frame just pushed").name.to_string());
+        }
     }
-    let calls: Vec<Expr> = frames.iter().rev().map(|f| call(f.name.as_str())).collect();
+    let calls: Vec<Expr> = names.iter().rev().map(|n| call(n)).collect();
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::BeginRescue {
@@ -2434,13 +2567,23 @@ fn merge_teardowns(
 /// merged body's locals, which natively are each block's own. `None`
 /// when the class's `setup` (`ingest_test_class`'s) can stay: no
 /// `included do` block registered one and none needs a method.
-fn frame_setups(setups: Vec<Expr>, block_setup: bool, class: &ClassId) -> Result<(Option<Expr>, Vec<MethodDef>), String> {
+fn frame_setups(
+    setups: Vec<Expr>,
+    block_setup: bool,
+    closures: &[usize],
+    class: &ClassId,
+    carried: &mut Vec<crate::dialect::TestBodyStatement>,
+) -> Result<(Option<Expr>, Vec<MethodDef>), String> {
     let prefix = frame_prefix("setup", class);
     let mut exprs: Vec<Expr> = Vec::new();
     let mut frames: Vec<MethodDef> = Vec::new();
     for (i, body) in setups.into_iter().enumerate() {
         let (framed, own_next) = callback_frame(body.clone(), "setup")?;
-        if own_next {
+        if closures.contains(&i) {
+            let frame = synth_method(&format!("{prefix}{}", i + 1), framed, class);
+            exprs.push(call(frame.name.as_str()));
+            carried.push(closure_callback(&frame));
+        } else if own_next {
             let name = format!("{prefix}{}", i + 1);
             frames.push(synth_method(&name, framed, class));
             exprs.push(call(&name));
@@ -3077,6 +3220,96 @@ fn module_member(stmt: &Node<'_>) -> bool {
         || stmt.as_instance_variable_operator_write_node().is_some()
 }
 
+/// Whether `e` reads a local variable nothing in it binds: one of the
+/// `included do` block it was written in (a callback body is a closure
+/// there), or the block's `base`.
+fn reads_block_local(e: &Expr) -> bool {
+    fn walk(e: &Expr, reads: &mut Vec<String>, binds: &mut Set<String>) {
+        match &*e.node {
+            ExprNode::Var { name, .. } => reads.push(name.to_string()),
+            ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. }
+            | ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } => {
+                binds.insert(name.to_string());
+            }
+            ExprNode::MultiAssign { targets, .. } => {
+                for t in targets {
+                    if let crate::expr::LValue::Var { name, .. } = t {
+                        binds.insert(name.to_string());
+                    }
+                }
+            }
+            ExprNode::Let { name, .. } => {
+                binds.insert(name.to_string());
+            }
+            ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+                binds.extend(params.iter().map(|p| p.to_string()));
+                binds.extend(rest_param.iter().chain(block_param.iter()).map(|p| p.to_string()));
+                binds.extend(extra_params.iter().map(|p| p.name.to_string()));
+            }
+            ExprNode::BeginRescue { rescues, .. } => {
+                binds.extend(rescues.iter().filter_map(|r| r.binding.as_ref()).map(|b| b.to_string()));
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, reads, binds));
+    }
+    let (mut reads, mut binds) = (Vec::new(), Set::default());
+    walk(e, &mut reads, &mut binds);
+    reads.iter().any(|r| !binds.contains(r))
+}
+
+/// A callback method as a statement of the class body that defines it with
+/// `define_method`, so its body is a closure over the class body's locals
+/// (the `included do` block's), as the `setup do … end` block is natively.
+fn closure_callback(frame: &MethodDef) -> crate::dialect::TestBodyStatement {
+    let span = Span::synthetic();
+    let block = Expr::new(
+        span,
+        ExprNode::Lambda {
+            params: Vec::new(),
+            rest_param: None,
+            extra_params: Vec::new(),
+            block_param: None,
+            body: frame.body.clone(),
+            block_style: crate::expr::BlockStyle::Do,
+            signature: crate::expr::BlockSignature::default(),
+        },
+    );
+    let name = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Sym { value: frame.name.clone() } });
+    crate::dialect::TestBodyStatement {
+        expr: Expr::new(
+            span,
+            ExprNode::Send { recv: None, method: Symbol::from("define_method"), args: vec![name], block: Some(block), parenthesized: true },
+        ),
+        line: 0,
+        after_definitions: false,
+        after_setup_blocks: false,
+        after_teardown_blocks: false,
+        source: None,
+    }
+}
+
+/// A statement of an `included do` block the splice carries as written
+/// (`ClassWalk::walk`): a call, a local variable write, or a conditional
+/// around either.
+fn carries_in_included_block(stmt: &Node<'_>) -> bool {
+    stmt.as_call_node().is_some()
+        || stmt.as_local_variable_write_node().is_some()
+        || stmt.as_local_variable_or_write_node().is_some()
+        || stmt.as_if_node().is_some()
+        || stmt.as_unless_node().is_some()
+}
+
+/// Whether `e` reads the local variable `name`.
+fn reads_var(e: &Expr, name: &str) -> bool {
+    if matches!(&*e.node, ExprNode::Var { name: n, .. } if n.as_str() == name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= reads_var(c, name));
+    found
+}
+
 /// Whether `call`'s only argument is the keyword `prepend: true|false`
 /// (`setup(prepend: true) do … end`).
 fn is_prepend_option(call: &ruby_prism::CallNode<'_>) -> bool {
@@ -3707,6 +3940,51 @@ fn message(err: IngestError) -> String {
     }
 }
 
+/// The `def`s of a concern's `module ClassMethods` (or `class_methods do`):
+/// ActiveSupport extends each includer with them, so each is a class method
+/// the includer's tests and `included do` block find (`MethodReceiver::Class`
+/// helpers, as the module's `def self.` ones would be in an `included do`
+/// block); a module it includes extends the includer. Anything else in it
+/// is refused by name.
+fn ingest_class_methods(mixin: &mut Mixin, body: &[Node<'_>], owner: &ClassId, file: &str, site: &str) -> IngestResult<()> {
+    let refuse = |stmt: &Node<'_>| {
+        let text = String::from_utf8_lossy(stmt.location().as_slice()).into_owned();
+        let shown: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
+        IngestError::Unsupported {
+            file: file.into(),
+            message: format!("its `ClassMethods` {site} has `{shown}`, which would extend each includer and the shared-test splice does not model"),
+        }
+    };
+    for stmt in body {
+        if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none()) {
+            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            match constant_id_str(&call.name()) {
+                // Sorbet only: no effect on what runs.
+                "requires_ancestor" | "abstract!" | "interface!" | "sig" => continue,
+                "extend" if args.iter().all(|a| matches!(constant_path_of(a).map(|p| p.join("::")).as_deref(), Some("T::Helpers" | "T::Sig" | "T::Generic"))) => {
+                    continue
+                }
+                "include" => {
+                    let refs: Vec<IncludeRef> = args.iter().filter_map(IncludeRef::of).collect();
+                    if refs.is_empty() || refs.len() != args.len() {
+                        return Err(refuse(stmt));
+                    }
+                    // `include A, B` puts A first in the lookup.
+                    mixin.class_extends.extend(refs.into_iter().rev());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) else { return Err(refuse(stmt)) };
+        let mut method = ingest_library_method(&def, owner, file)?;
+        method.receiver = MethodReceiver::Class;
+        mixin.helpers.retain(|h| !(h.name == method.name && h.receiver == MethodReceiver::Class));
+        mixin.helpers.push(method);
+    }
+    Ok(())
+}
+
 /// Ingest one shared test module's body.
 fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
     let mut mixin = Mixin {
@@ -3727,6 +4005,8 @@ fn ingest_mixin(decl: &Decl, source: &[u8], real: bool) -> Mixin {
         library_concern: false,
         ancestry: Vec::new(),
         marker: false,
+        private_constants: Vec::new(),
+        class_extends: Vec::new(),
     };
     let result = super::prism::parse_silent(source);
     let root = result.node();
@@ -3781,22 +4061,40 @@ fn walk_mixin(mixin: &mut Mixin, stmts: Vec<Node<'_>>) -> IngestResult<()> {
                     "it defines `{hook}` {site}, a hook Ruby runs on each includer, which the shared-test splice does not model"
                 )));
             }
-            if class_methods && !mixin.provider {
-                return Err(unsupported(format!(
-                    "its `ClassMethods` {site} would extend each includer (ActiveSupport::Concern), which the shared-test splice does not model"
-                )));
+            // The library file keeps the module without its Concern, so
+            // nothing there extends an includer with `ClassMethods`: its
+            // defs are the includer's class helpers, as in a spliced module.
+            if let Some(module) = stmt.as_module_node().filter(|_| class_methods && !mixin.provider) {
+                let body = module.body().map(flatten_statements).unwrap_or_default();
+                ingest_class_methods(mixin, &body, &owner, file, &site)?;
+                continue;
             }
             if module_member(&stmt) || stmt.as_constant_write_node().is_some() || stmt.as_module_node().is_some() || stmt.as_class_node().is_some() {
                 continue;
             }
-            if stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "private_constant") {
-                return Err(unsupported(format!(
-                    "`private_constant` {site} hides a constant the spliced bodies read by its full name, which is not modeled"
-                )));
+            if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "private_constant") {
+                // Every name is read bare from a spliced body, so a symbol or
+                // string literal is all it needs; a computed one cannot be told.
+                for arg in call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+                    let name = arg
+                        .as_symbol_node()
+                        .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                        .or_else(|| arg.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()));
+                    let Some(name) = name else {
+                        return Err(unsupported(format!("`private_constant` {site} with a computed name is not modeled")));
+                    };
+                    mixin.private_constants.push(Symbol::from(name.as_str()));
+                }
+                continue;
             }
         }
         if stmt.as_module_node().is_some() || stmt.as_class_node().is_some() {
             if mixin.provider && class_methods {
+                continue;
+            }
+            if let Some(module) = stmt.as_module_node().filter(|_| class_methods) {
+                let body = module.body().map(flatten_statements).unwrap_or_default();
+                ingest_class_methods(mixin, &body, &owner, file, &site)?;
                 continue;
             }
             let name = stmt
@@ -3905,6 +4203,14 @@ fn walk_mixin(mixin: &mut Mixin, stmts: Vec<Node<'_>>) -> IngestResult<()> {
                             mixin.gaps.push(format!(
                                 "the tests `generate_tests` {site} declares are not modeled (SharedTests includes them through an anonymous module); they would not run"
                             ));
+                            continue;
+                        }
+                        // `class_methods do … end` (ActiveSupport::Concern) is
+                        // `module ClassMethods`, written inline.
+                        "class_methods" if call.block().and_then(|b| b.as_block_node()).is_some() && args.is_empty() => {
+                            let body = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body());
+                            let body = body.map(flatten_statements).unwrap_or_default();
+                            ingest_class_methods(mixin, &body, &owner, file, &site)?;
                             continue;
                         }
                         "included" if call.block().is_some() => {
@@ -4610,7 +4916,8 @@ end
     #[test]
     fn unmodeled_included_block_statements_are_refused_by_name() {
         for (stmt, why) in [
-            ("cattr_accessor :flavor", "runs `cattr_accessor :flavor` on the class"),
+            ("FLAVOR = 1", "runs `FLAVOR = 1` on the class"),
+            ("class Inner\n    end", "runs `class Inner…` on the class"),
             ("setup(prepend: flag) do\n      @x = 1\n    end", "passes arguments or a block argument"),
             ("include helpers_module", "includes a module that is not a constant"),
             ("setup \"named\"", "is not `setup do … end` or `setup :name, …`"),
@@ -4621,6 +4928,95 @@ end
             assert!(err.contains("test class `OddTest` refused") && err.contains(why), "{stmt}: {err}");
         }
     }
+    // `class_eval` runs each statement of an `included do |base|` block on the
+    // class where the include stands: a class macro, with or without a block,
+    // and the locals after it, are carried as the class body's own, `base` the
+    // class itself.
+    #[test]
+    fn an_included_blocks_class_macros_run_as_the_class_body_loads() {
+        let module = "module Shop\n  module ApiHelper\n    extend ActiveSupport::Concern\n\n    included do |base|\n      setup do\n        @a = 1\n      end\n      use_active_record_fixtures\n      let(:thing) do\n        make_thing\n      end\n      documentation(\"Thing\", gid: \"x\") do |controller|\n        controller.ownership(team: \"t\")\n      end\n      klass = base #: as Class[top]\n      Detector.triggered!(klass, :fixtures)\n    end\n  end\n\n  module Detector\n  end\nend\n";
+        let class = "class ApiTest < ActiveSupport::TestCase\n  include Shop::ApiHelper\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let files = [("support/api_helper.rb", module), ("api_test.rb", class)];
+        let tms = run_with(&files, &["support/api_helper.rb"], "api_test.rb").unwrap();
+        let shown: Vec<String> = tms[0].body_statements.iter().map(|s| format!("{:?}", s.expr.node)).collect();
+        let methods: Vec<Option<&str>> = tms[0]
+            .body_statements
+            .iter()
+            .map(|s| match &*s.expr.node {
+                ExprNode::Send { method, .. } => Some(method.as_str()),
+                _ => None,
+            })
+            .collect();
+        // `base = self` first (the statement after it reads it), then the macros in order.
+        assert!(matches!(&*tms[0].body_statements[0].expr.node, ExprNode::Assign { value, .. } if matches!(&*value.node, ExprNode::SelfRef)) || methods[0] == Some("use_active_record_fixtures"), "{shown:?}");
+        let order: Vec<&str> = methods.iter().flatten().copied().collect();
+        assert_eq!(order, ["use_active_record_fixtures", "let", "documentation", "triggered!"], "{shown:?}");
+        assert!(tms[0].body_statements.iter().any(|s| matches!(&*s.expr.node, ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value }
+            if name.as_str() == "klass" && matches!(&*value.node, ExprNode::Var { name, .. } if name.as_str() == "base"))), "{shown:?}");
+        assert!(tms[0].body_statements.iter().any(|s| matches!(&*s.expr.node, ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value }
+            if name.as_str() == "base" && matches!(&*value.node, ExprNode::SelfRef))), "{shown:?}");
+        // The constant the macro reads is the module's lexical one.
+        assert!(tms[0].body_statements.iter().any(|s| consts(&s.expr).iter().any(|c| c == "::Shop::Detector")), "{shown:?}");
+        assert!(tms[0].tests_at_load);
+    }
+
+    // A concern's `ClassMethods` extends each includer: its defs are class
+    // methods of the class the tests are spliced into, and the `included do`
+    // block (which runs on the class) calls them.
+    const VERIFIED: &str = "module Shop\n  module Verified\n    extend ActiveSupport::Concern\n\n    included do\n      cattr_accessor :entries\n\n      if self < ActiveJob::TestCase\n        self #: as ClassMethods\n          .allowlist do\n            :jobs\n          end\n      end\n\n      old_enabled = Verifier.enabled\n\n      setup do\n        Verifier.enabled = true\n      end\n\n      teardown do\n        Verifier.enabled = old_enabled\n      end\n    end\n\n    # @requires_ancestor: singleton(Object)\n    module ClassMethods\n      def allowlist(&block)\n        class_eval do\n          self.entries ||= []\n          self.entries << block\n        end\n      end\n    end\n  end\n\n  module Verifier\n  end\nend\n";
+
+    #[test]
+    fn a_concerns_class_methods_are_class_helpers_of_each_includer() {
+        let class = "class VerifiedTest < ActiveSupport::TestCase\n  include Shop::Verified\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let files = [("support/verified.rb", VERIFIED), ("verified_test.rb", class)];
+        let tms = run_with(&files, &["support/verified.rb"], "verified_test.rb").unwrap();
+        let tm = &tms[0];
+        let allowlist = tm.helpers.iter().find(|h| h.name.as_str() == "allowlist").expect("the class helper");
+        assert_eq!(allowlist.receiver, MethodReceiver::Class);
+        // The block's `self.allowlist { … }` guard runs as the class loads.
+        let shown: Vec<String> = tm.body_statements.iter().map(|s| format!("{:?}", s.expr.node)).collect();
+        assert!(tm.body_statements.iter().any(|s| matches!(&*s.expr.node, ExprNode::If { .. })), "{shown:?}");
+        // The teardown reads the block's local `old_enabled`: a closure, so it is
+        // defined with `define_method` after the local's write, not a method.
+        let write = tm.body_statements.iter().position(|s| matches!(&*s.expr.node, ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, .. } if name.as_str() == "old_enabled"));
+        let define = tm.body_statements.iter().position(|s| matches!(&*s.expr.node, ExprNode::Send { method, .. } if method.as_str() == "define_method"));
+        assert!(write.is_some() && define.is_some() && write < define, "{shown:?}");
+        assert!(!tm.helpers.iter().any(|h| h.name.as_str().starts_with("__roundhouse_teardown_")), "{:?}", tm.helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>());
+        let teardown = tm.helpers.iter().find(|h| h.name.as_str() == "teardown").expect("the merged teardown");
+        assert!(format!("{:?}", teardown.body).contains("__roundhouse_teardown_VerifiedTest_1"), "{:?}", teardown.body);
+        // `class_methods do … end` is the same module, written inline.
+        let inline = VERIFIED.replace("module ClassMethods", "class_methods do");
+        let files = [("support/verified.rb", inline.as_str()), ("verified_test.rb", class)];
+        let tms = run_with(&files, &["support/verified.rb"], "verified_test.rb").unwrap();
+        assert!(tms[0].helpers.iter().any(|h| h.name.as_str() == "allowlist" && h.receiver == MethodReceiver::Class));
+    }
+
+    // A library module (its nested class keeps it in its file) is carried
+    // without its Concern, so its `ClassMethods` is the includer's too: the
+    // defs are class helpers and what it includes extends the class.
+    #[test]
+    fn a_library_modules_class_methods_are_class_helpers_of_each_includer() {
+        let module = "module Shop\n  module Remote\n    extend ActiveSupport::Concern\n\n    class Matcher\n    end\n\n    included do\n      setup do\n        @a = 1\n      end\n    end\n\n    # @requires_ancestor: Kernel\n    module ClassMethods\n      include Minitest::Assertions\n\n      def remote_test(name)\n        name\n      end\n    end\n  end\nend\n";
+        let class = "class RemoteTest < ActiveSupport::TestCase\n  include Shop::Remote\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let files = [("support/remote.rb", module), ("remote_test.rb", class)];
+        let tms = run_with(&files, &["support/remote.rb"], "remote_test.rb").unwrap();
+        let tm = &tms[0];
+        assert!(tm.helpers.iter().any(|h| h.name.as_str() == "remote_test" && h.receiver == MethodReceiver::Class), "{:?}", tm.helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>());
+        assert!(
+            tm.body_statements.iter().any(|s| matches!(&*s.expr.node, ExprNode::Send { method, args, .. } if method.as_str() == "extend" && consts(&args[0]).iter().any(|c| c.contains("Minitest::Assertions")))),
+            "{:?}",
+            tm.body_statements
+        );
+    }
+
+    #[test]
+    fn something_other_than_a_def_in_class_methods_is_refused_by_name() {
+        let module = VERIFIED.replace("      def allowlist(&block)", "      attr_reader :helper\n\n      def allowlist(&block)");
+        let class = "class VerifiedTest < ActiveSupport::TestCase\n  include Shop::Verified\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let err = run_with(&[("support/verified.rb", module.as_str()), ("verified_test.rb", class)], &["support/verified.rb"], "verified_test.rb").unwrap_err();
+        assert!(err.contains("its `ClassMethods`") && err.contains("attr_reader :helper"), "{err}");
+    }
+
     #[test]
     fn an_included_blocks_factory_registration_runs_as_the_class_body_loads() {
         let module = "module Shop\n  module FactoryHelper\n    extend ActiveSupport::Concern\n\n    module Factories\n      class << self\n        def define(klass)\n          klass.factory(:shop, class_name: \"Shop\")\n        end\n      end\n    end\n\n    included do\n      setup do\n        @a = 1\n      end\n      if fixture_factory_definitions.empty?\n        define_factories { Factories.define(self) }\n      else\n        Factories.define(self)\n      end\n    end\n  end\nend\n";
@@ -4633,12 +5029,15 @@ end
         assert!(consts(&statement.expr).iter().all(|c| c == "::Shop::FactoryHelper::Factories"), "{:?}", consts(&statement.expr));
     }
 
+    // A guard of any other kind is the same statement the class would run
+    // itself, carried as written.
     #[test]
-    fn a_factory_guard_that_reads_anything_else_is_still_refused_by_name() {
+    fn a_factory_guard_that_reads_anything_else_is_carried_as_written() {
         let module = "module Odd\n  extend ActiveSupport::Concern\n  included do\n    setup do\n      @a = 1\n    end\n    if ENV[\"X\"]\n      define_factories { }\n    end\n  end\nend\n";
         let class = "class OddTest < ActiveSupport::TestCase\n  include Odd\n  test \"x\" do\n    assert true\n  end\nend\n";
-        let err = run(&[("odd.rb", module), ("odd_test.rb", class)], "odd_test.rb").unwrap_err();
-        assert!(err.contains("test class `OddTest` refused") && err.contains("which the shared-test splice does not model"), "{err}");
+        let tms = run(&[("odd.rb", module), ("odd_test.rb", class)], "odd_test.rb").unwrap();
+        let [statement] = tms[0].body_statements.as_slice() else { panic!("{:#?}", tms[0].body_statements) };
+        assert!(matches!(&*statement.expr.node, ExprNode::If { .. }), "{:?}", statement.expr);
     }
 
     /// `Merchandising::CatalogTestHelper`'s shape, in a support file.
@@ -4708,14 +5107,30 @@ end
         for (stmt, why) in [
             ("def self.included(base)\n    super\n  end", "it defines `self.included`"),
             ("class << self\n    def extended(base)\n    end\n  end", "it defines `extended (in `class << self`)`"),
-            ("module ClassMethods\n    def shout\n    end\n  end", "its `ClassMethods`"),
-            ("private_constant :Inner", "`private_constant`"),
+            ("private_constant Inner.name", "`private_constant` "),
         ] {
             let module = format!("module Hooked\n  extend ActiveSupport::Concern\n  class Inner\n  end\n  {stmt}\n  included do\n    setup do\n      @a = 1\n    end\n  end\nend\n");
             let class = "class HookedTest < ActiveSupport::TestCase\n  include Hooked\n  test \"x\" do\n    assert true\n  end\nend\n";
             let err = run_with(&[("hooked.rb", module.as_str()), ("hooked_test.rb", class)], &["hooked.rb"], "hooked_test.rb").unwrap_err();
             assert!(err.contains("test class `HookedTest` refused") && err.contains(why), "{stmt}: {err}");
         }
+    }
+
+    // `private_constant` makes Ruby refuse the scoped read `::Shop::Runner::Stub`
+    // a spliced body would get, so the private constant stays a bare name, which
+    // the includer's ancestry (the module included) resolves, as the module's
+    // own methods read it. The public one is still rooted.
+    #[test]
+    fn a_library_modules_private_constants_stay_bare_in_spliced_bodies() {
+        let module = "module Shop\n  module Runner\n    extend ActiveSupport::Concern\n\n    Stub = Struct.new(:result)\n    Public = Struct.new(:value)\n    private_constant(:Stub)\n\n    def stubbed\n      [Stub.new(1), Public.new(2)]\n    end\n\n    class Builder\n    end\n\n    included do\n      setup do\n        @stub = Stub.new(3)\n      end\n    end\n  end\nend\n";
+        let class = "class RunnerTest < ActiveSupport::TestCase\n  include Shop::Runner\n  test \"x\" do\n    assert stubbed\n  end\nend\n";
+        let tms = run_with(&[("runner.rb", module), ("runner_test.rb", class)], &["runner.rb"], "runner_test.rb").unwrap();
+        let helper = format!("{:?}", tms[0].helpers.iter().find(|h| h.name.as_str() == "stubbed").expect("the helper").body);
+        let bare = |s: &str, name: &str| s.contains(&format!("Symbol(\"{name}\")")) && !s.contains(&format!("Symbol(\"Runner\"), Symbol(\"{name}\")"));
+        assert!(bare(&helper, "Stub"), "{helper}");
+        assert!(helper.contains("Symbol(\"Runner\"), Symbol(\"Public\")"), "{helper}");
+        let setup = format!("{:?}", tms[0].setup);
+        assert!(bare(&setup, "Stub"), "{setup}");
     }
 
     #[test]
