@@ -12891,14 +12891,21 @@ fn emit_library_class_decl_inner(
         })
         .collect();
     let instance_form = extend_self_instance_defs(lc, app, &replayed);
-    // The constants are all written before the replayed statements, so an
-    // include the source has below one of those statements is not due at
-    // a constant: it follows the statement (`flush_late` at the effect).
-    let first_effect: Option<Span> = hoistable
-        .iter()
-        .map(|e| e.span)
-        .filter(|sp| !sp.is_synthetic())
-        .min_by_key(|sp| (sp.file.0, sp.start));
+    // The constants are written before the replayed statements that
+    // remain, so an include the source has below one of those statements
+    // is not due at a constant: it follows the statement (`flush_late` at
+    // the effect). A statement already written above the constant
+    // (`calls_before`) is no such floor: the include below it and above
+    // the constant is due there, ahead of the constant, as in the source.
+    let written_calls: std::cell::RefCell<Vec<Span>> = std::cell::RefCell::new(Vec::new());
+    let first_effect = || -> Option<Span> {
+        let written = written_calls.borrow();
+        hoistable
+            .iter()
+            .map(|e| e.span)
+            .filter(|sp| !sp.is_synthetic() && !written.contains(sp))
+            .min_by_key(|sp| (sp.file.0, sp.start))
+    };
     let flush_late_until = |s: &mut String, upto: Option<Span>, ceiling: Option<Span>| {
         let mut late = late.borrow_mut();
         let due = late
@@ -13160,8 +13167,9 @@ fn emit_library_class_decl_inner(
                         writeln!(s, "{body_pad}{line}").unwrap();
                     }
                 }
+                written_calls.borrow_mut().push(call.span);
             }
-            flush_late_until(s, Some(lc.constants[i].1.span), first_effect);
+            flush_late_until(s, Some(lc.constants[i].1.span), first_effect());
             place_above(s, lc.constants[i].1.span);
             written.borrow_mut().insert(i);
             let (cname, value) = &lc.constants[i];
