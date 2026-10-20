@@ -1002,6 +1002,16 @@ pub(super) fn constant_path_of(node: &Node<'_>) -> Option<Vec<String>> {
     constant_path_segments_strs(node)
 }
 
+/// The path a `class X < <superclass>` header names, where `self` is the
+/// enclosing class: Core's `class PaymentDetails < ShopRecord; class Card
+/// < self`, an STI subclass written beside its base. `constant_path_of`
+/// alone has no answer for a `self` node, so the parent used to come back
+/// None and the class emitted bare (`class Card`), an Object subclass that
+/// `find_sti_class` refused as "not a subclass of PaymentDetails".
+pub(super) fn superclass_path_of(node: &Node<'_>, scope: &[String]) -> Option<Vec<String>> {
+    constant_path_of(node).or_else(|| (node.as_self_node().is_some() && !scope.is_empty()).then(|| scope.to_vec()))
+}
+
 pub(super) fn constant_path_segments_strs(node: &Node<'_>) -> Option<Vec<String>> {
     if let Some(c) = node.as_constant_read_node() {
         return Some(vec![constant_id_str(&c.name()).to_string()]);
