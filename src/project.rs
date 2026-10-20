@@ -7164,7 +7164,13 @@ fn gem_source_dependency_block(app: &App) -> String {
                 .any(|stem| feature == *stem || feature.strip_prefix(stem).is_some_and(|rest| rest.starts_with('/')))
         })
     };
-    let (uncarried, native): (Vec<String>, Vec<String>) = all_native.into_iter().partition(|f| owned_by_path_gem(f));
+    // An extension gem's own native file (monorepo_slices' glob_matcher,
+    // memory_mapped_store's .so) is no compiled file of the app's: it loads
+    // from the gem home, where `runtime/extension_gems.rb` put it on the
+    // load path, whatever Rails the gem's Ruby needs.
+    let extension_gems = declared_extension_gems(app);
+    let (uncarried, native): (Vec<String>, Vec<String>) =
+        all_native.into_iter().partition(|f| owned_by_path_gem(f) && !extension_gem_feature(&extension_gems, f));
     if native.is_empty() && framework.is_empty() {
         return String::new();
     }
@@ -7197,6 +7203,8 @@ fn gem_source_dependency_block(app: &App) -> String {
     };
     let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
     out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
+    let extension: Vec<String> = native.iter().filter(|f| extension_gem_feature(&extension_gems, f)).map(|f| format!("{f:?}")).collect();
+    out.push_str(&format!("__rh_extension_features = [{}].freeze\n", extension.join(", ")));
     out.push_str(
         "__rh_rails_gems = %w[activesupport activerecord activemodel actionpack actionview activejob railties].freeze\n\
          __rh_rails_dependency = lambda do |spec, seen|\n  \
@@ -7215,7 +7223,11 @@ fn gem_source_dependency_block(app: &App) -> String {
     let params = if optional.is_empty() { "feature" } else { "feature, optional" };
     out.push_str(&format!("[{}].each do |{params}|\n", names.join(", ")));
     out.push_str(
-        "  spec = Gem::Specification.find_by_path(feature)\n  \
+        "  if __rh_extension_features.include?(feature)\n    \
+         require feature\n    \
+         next\n  \
+         end\n  \
+         spec = Gem::Specification.find_by_path(feature)\n  \
          if spec && __rh_compiled_gems.include?(spec.name)\n    \
          $stderr.puts \"roundhouse: warning[gem_source_file_not_compiled]: #{feature.inspect}, which a gem source requires, is a file of the #{spec.name} gem this tree carries as source, and this tree does not carry it compiled; it is not loaded\"\n    \
          next\n  \
@@ -7787,7 +7799,7 @@ fn load_hook_registrations(app: &App) -> String {
 /// constants and hook the native Active Record adapter through `on_load`.
 /// So the Gemfile line is `require: false`, written only when the app's
 /// own Gemfile declares the gem.
-const CRUBY_EXTENSION_GEMS: [(&str, &str); 2] = [
+const CRUBY_EXTENSION_GEMS: [(&str, &str); 3] = [
     // runtime/spinel/semian*.rb ports semian's circuit breaker, bulkhead,
     // registry, errors and Active Record PostgreSQL adapter. The bulkhead
     // requires "semian/semian", the gem's SysV semaphore extension.
@@ -7799,18 +7811,45 @@ const CRUBY_EXTENSION_GEMS: [(&str, &str); 2] = [
     // extension defines `MonorepoSlices.match_paths_parallel` and names no
     // Rails constant (`nm -D`: no rb_const_get or rb_path2class).
     ("monorepo_slices", "1.17.0"),
+    // Shopify Core's `ActiveSupport::Cache::MemoryMappedStore` (Podding's
+    // background-queue local cache, the checkout queue cache). The gem's
+    // `DB` is Ruby around an LMDB C extension (`memory_mapped_store/
+    // memory_mapped_store.so`: the `Error` classes and the `_put` / `_get` /
+    // ... primitives), and `lib/memory_mapped_store.rb` keeps a load-time
+    // conditional the ingest does not model. So the tree carries that
+    // file's Ruby as a runtime port (`EXTENSION_GEM_PORTS`) over the gem's
+    // own extension, whose LMDB is the store: no reimplementation.
+    ("memory_mapped_store", "0.4.4"),
 ];
 
+/// The Ruby a [`CRUBY_EXTENSION_GEMS`] gem's entry file would have run,
+/// as a runtime port: the source file and the path it takes in the
+/// finished tree. The tree requires the port from
+/// runtime/extension_gems.rb, right after the gem's built extension
+/// directory is on `$LOAD_PATH`, and carries it only when the app declares
+/// the gem. It also answers the gem's constants (`gem_port_file`), so a
+/// name the gem's own Ruby declares is not refused as `gem_requires_rails`.
+const EXTENSION_GEM_PORTS: &[(&str, &[(&str, &str)])] =
+    &[("memory_mapped_store", &[("runtime/spinel/memory_mapped_store.rb", "runtime/memory_mapped_store.rb")])];
+
+/// The [`CRUBY_EXTENSION_GEMS`] rows the app's lockfile declares.
+fn declared_extension_gems(app: &App) -> Vec<&'static (&'static str, &'static str)> {
+    let Some(lock) = &app.gem_lock else { return Vec::new() };
+    CRUBY_EXTENSION_GEMS.iter().filter(|(gem, _)| lock.dependencies.iter().any(|dep| dep == gem)).collect()
+}
+
+/// Whether `feature` is one of a declared extension gem's own files
+/// (`memory_mapped_store/memory_mapped_store`, `monorepo_slices/glob_matcher`).
+fn extension_gem_feature(declared: &[&(&str, &str)], feature: &str) -> bool {
+    declared.iter().any(|(gem, _)| feature.strip_prefix(gem).is_some_and(|rest| rest.starts_with('/')))
+}
+
 fn apply_extension_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
-    let Some(lock) = &app.gem_lock else { return Ok(()) };
-    let declared: Vec<_> = CRUBY_EXTENSION_GEMS
-        .iter()
-        .filter(|(gem, _)| lock.dependencies.iter().any(|dep| dep == gem))
-        .collect();
+    let declared = declared_extension_gems(app);
     if declared.is_empty() {
         return Ok(());
     }
-    apply_extension_gem_load_paths(files, &declared);
+    apply_extension_gem_load_paths(files, &declared)?;
     let gemfile = files
         .iter_mut()
         .find(|(path, _)| path == "Gemfile")
@@ -7843,8 +7882,8 @@ fn apply_extension_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> R
 /// first. Appended, so the tree's own files and every activated gem
 /// still resolve first. A gem missing from the gem home is a warning
 /// naming it, not a quiet LoadError later.
-fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &[&(&str, &str)]) {
-    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &[&(&str, &str)]) -> Result<(), String> {
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return Ok(()) };
     let entries: String = declared
         .iter()
         .map(|(gem, version)| format!("  [{gem:?}, {version:?}],\n"))
@@ -7865,11 +7904,26 @@ fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &
            spec.full_require_paths.each {{ |path| $LOAD_PATH << path unless $LOAD_PATH.include?(path) }}\n\
          end\n"
     );
+    let mut body = body;
+    // The port of a gem's entry-file Ruby, over the extension just put on
+    // the load path.
+    for (gem, ports) in EXTENSION_GEM_PORTS.iter().filter(|(gem, _)| declared.iter().any(|(g, _)| g == gem)) {
+        for (source, emitted) in *ports {
+            let text = crate::runtime_files::read_to_string(source).map_err(|e| format!("read {source} runtime: {e}"))?;
+            files.push((emitted.to_string(), text));
+            body.push_str(&format!(
+                "\n# {gem}'s entry-file Ruby, a runtime port over the extension above\n\
+                 # (project.rs::EXTENSION_GEM_PORTS).\nrequire_relative {:?}\n",
+                emitted.trim_start_matches("runtime/").trim_end_matches(".rb")
+            ));
+        }
+    }
     files.push(("runtime/extension_gems.rb".to_string(), body));
     let facades = &mut files[idx].1;
     if !facades.contains("require_relative \"extension_gems\"") {
         facades.insert_str(0, "require_relative \"extension_gems\"\n");
     }
+    Ok(())
 }
 
 /// The JRuby tree's Gemfile: the committed scaffold Gemfile is MRI-only
@@ -16416,7 +16470,7 @@ const OVERLAY_GEM_PORTS: &[(&str, &[(&str, &str)])] =
     &[("globalid", &[("runtime/spinel/scaffold/ruby_overlay/runtime/global_id.rb", "runtime/global_id.rb")])];
 
 fn gem_ports() -> impl Iterator<Item = &'static (&'static str, &'static [(&'static str, &'static str)])> {
-    GEM_RUNTIME_PORTS.iter().chain(OVERLAY_GEM_PORTS)
+    GEM_RUNTIME_PORTS.iter().chain(OVERLAY_GEM_PORTS).chain(EXTENSION_GEM_PORTS)
 }
 
 /// Every gem runtime port file, by source path (`runtime/spinel/...`).
