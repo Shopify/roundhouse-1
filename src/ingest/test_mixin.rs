@@ -385,6 +385,10 @@ enum Dsl {
 pub(super) struct TestMixins {
     decls: Vec<Decl>,
     classes: Vec<ClassRef>,
+    /// The reopened base class of the test classes, `class ActiveSupport::TestCase`
+    /// with no superclass (Core's test-support initializer): what its body
+    /// includes is in every test class's ancestry (`TestMixins::ancestry`).
+    bases: Vec<ClassRef>,
     sources: Map<String, Vec<u8>>,
     /// Every module a test file declares.
     known: Set<String>,
@@ -492,6 +496,21 @@ struct ModuleTeardown {
     def: Option<bool>,
 }
 
+/// The Rails test classes that descend from `ActiveSupport::TestCase`: a test
+/// class whose superclass chain ends at one has the modules Core's test-support
+/// initializer includes into `ActiveSupport::TestCase` in its ancestry.
+const TEST_CASE_ROOTS: &[&str] = &[
+    "ActiveSupport::TestCase",
+    "ActiveJob::TestCase",
+    "ActionView::TestCase",
+    "ActionController::TestCase",
+    "ActionMailer::TestCase",
+    "ActionMailbox::TestCase",
+    "ActionCable::TestCase",
+    "ActionDispatch::IntegrationTest",
+    "ActionDispatch::SystemTestCase",
+];
+
 /// Modules of Ruby and of the testing gems Core uses (minitest 5.27,
 /// ActiveSupport, mocha) that a test class includes and that define no
 /// `teardown` (checked against those gems): what they bring cannot change
@@ -583,7 +602,7 @@ impl TestMixins {
         referenced_constants(&root, &mut self.referenced);
         let declared = self.declared.entry(file.to_string()).or_default();
         for stmt in stmts {
-            scan_node(&stmt, &[], file, &mut self.decls, &mut self.classes, &mut self.known, declared);
+            scan_node(&stmt, &[], file, &mut self.decls, &mut self.classes, &mut self.bases, &mut self.known, declared);
         }
         for name in declared.iter().cloned().collect::<Vec<_>>() {
             add_with_namespaces(declared, &name);
@@ -1084,6 +1103,19 @@ impl TestMixins {
         }
         let mut table = Table::default();
         let mut classes: Vec<AncestorTeardown> = Vec::new();
+        // A test class descends from `ActiveSupport::TestCase`, which Core's
+        // test-support initializer reopens to include helpers: `include` of one
+        // of them again is a no-op (`Concern#append_features` returns early when
+        // `base < self`), so its `included do` block does not run a second time.
+        // Only the table learns of them: the base's callbacks are not a class of
+        // the chain.
+        let root = chain.last().map_or(superclass, |c| c.superclass.as_ref());
+        if root.is_some_and(|r| TEST_CASE_ROOTS.contains(&r.written().trim_start_matches("::"))) {
+            for base in &self.bases {
+                let mut scratch = AncestorTeardown { name: base.name.clone(), callbacks: false, spliced: false, def: None, modules: Vec::new() };
+                self.simulate_includes(&mut table, &base.includes, &base.nesting, &mut scratch, 0);
+            }
+        }
         for c in chain.iter().rev() {
             let mut a = AncestorTeardown {
                 name: c.name.clone(),
@@ -2856,6 +2888,7 @@ fn scan_node(
     file: &str,
     out: &mut Vec<Decl>,
     classes: &mut Vec<ClassRef>,
+    bases: &mut Vec<ClassRef>,
     known: &mut Set<String>,
     declared: &mut Set<String>,
 ) {
@@ -2874,7 +2907,7 @@ fn scan_node(
         let mut teardown = BodyTeardown::default();
         for stmt in &stmts {
             if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
-                scan_node(stmt, &nesting, file, out, classes, known, declared);
+                scan_node(stmt, &nesting, file, out, classes, bases, known, declared);
                 continue;
             }
             if let Some(cw) = stmt.as_constant_write_node() {
@@ -2913,6 +2946,8 @@ fn scan_node(
                 superclass: IncludeRef::of(&superclass),
                 teardown,
             });
+        } else if name == "ActiveSupport::TestCase" {
+            bases.push(ClassRef { name, nesting, includes, extends, file: file.to_string(), superclass: None, teardown });
         }
         return;
     }
@@ -2955,12 +2990,12 @@ fn scan_node(
             } else {
                 decl.members = true;
             }
-            scan_node(stmt, &nesting, file, out, classes, known, declared);
+            scan_node(stmt, &nesting, file, out, classes, bases, known, declared);
             continue;
         }
         if stmt.as_class_node().is_some() {
             decl.members = true;
-            scan_node(stmt, &nesting, file, out, classes, known, declared);
+            scan_node(stmt, &nesting, file, out, classes, bases, known, declared);
             continue;
         }
         decl.content = true;
@@ -4644,6 +4679,28 @@ end
         let files = [("support/catalog_helper.rb", CATALOG), ("catalog_test.rb", class)];
         let err = run(&files, "catalog_test.rb").unwrap_err();
         assert!(err.contains("it declares `Factories`") && err.contains("a nested class or module"), "{err}");
+    }
+
+    // Core's test-support initializer reopens `ActiveSupport::TestCase` to include
+    // `ActiveRecordTestHelper`, whose `included do` block registers `teardown(:sym)`.
+    // A test class that includes it again includes nothing (`Concern#append_features`
+    // returns early when `base < self`), so that block never runs on it and the
+    // class is not refused for a teardown form the splice does not model.
+    #[test]
+    fn including_a_helper_the_base_test_case_already_includes_is_a_no_op() {
+        let helper = "module PodHelper\n  extend ActiveSupport::Concern\n  included do\n    setup(:default_pod)\n    teardown(:reset_pod)\n  end\n\n  def reset_pod; end\nend\n";
+        let base = "module ActiveSupport\n  class TestCase\n    include PodHelper\n  end\nend\n";
+        let class = "class PodTest < ActiveSupport::TestCase\n  include PodHelper\n\n  test \"x\" do\n    assert true\n  end\nend\n";
+        let tms = run(&[("pod_helper.rb", helper), ("base.rb", base), ("pod_test.rb", class)], "pod_test.rb").unwrap();
+        assert_eq!(names(&tms[0]), ["test_x"]);
+        // Without the base including it, the block runs on the class and `teardown :sym`
+        // is refused by name.
+        let err = run(&[("pod_helper.rb", helper), ("pod_test.rb", class)], "pod_test.rb").unwrap_err();
+        assert!(err.contains("test class `PodTest` refused") && err.contains("teardown"), "{err}");
+        // Nor does a class outside the Rails test cases inherit the base's includes.
+        let plain = class.replace("ActiveSupport::TestCase", "Minitest::Test");
+        let err = run(&[("pod_helper.rb", helper), ("base.rb", base), ("pod_test.rb", plain.as_str())], "pod_test.rb").unwrap_err();
+        assert!(err.contains("teardown"), "{err}");
     }
 
     #[test]
