@@ -274,6 +274,14 @@ pub(crate) fn unbind_subclassed_model_new(lcs: &mut [crate::dialect::LibraryClas
     let models: crate::det::HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str()).collect();
     let private = private_constructors(app);
     let mut subclassed = subclassed_names(app);
+    // A class a TEST declares a subclass of (`class TestAlert < Base`
+    // inside the test class) is a subclass the tree's monomorphization
+    // never copies into, and the test is the one that stubs it
+    // (`TestAlert.any_instance.expects(:notify)`): `Base.notify` bound
+    // to its owner builds a `Base`, never the `TestAlert` it was reached
+    // through. Its class-side methods are unbound like a model's.
+    let test_subclassed = test_subclassed_names(app);
+    subclassed.extend(test_subclassed.iter().cloned());
     subclassed.retain(|name| !private.contains(name));
     // A library class's class-side method keeps its owner binding unless a
     // class overrides the name and calls `super`: that `super` runs the
@@ -319,7 +327,7 @@ pub(crate) fn unbind_subclassed_model_new(lcs: &mut [crate::dialect::LibraryClas
             continue;
         }
         let owner: Vec<Symbol> = lc.name.0.as_str().split("::").map(Symbol::from).collect();
-        let is_model = models.contains(lc.name.0.as_str());
+        let is_model = models.contains(lc.name.0.as_str()) || test_subclassed.contains(lc.name.0.as_str());
         for m in &mut lc.methods {
             if m.receiver == MethodReceiver::Class
                 && !m.name_span.is_synthetic()
@@ -564,6 +572,38 @@ fn subclassed_names(app: &App) -> crate::det::HashSet<String> {
     for c in &app.controllers {
         if let Some(p) = &c.parent {
             out.insert(p.0.as_str().to_string());
+        }
+    }
+    out
+}
+
+/// The app classes that classes declared inside a test class body
+/// subclass. The parent is spelled as the test wrote it, so it resolves
+/// from the test class's namespace outward, the way Ruby looks it up.
+fn test_subclassed_names(app: &App) -> crate::det::HashSet<String> {
+    let known: crate::det::HashSet<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .chain(app.library_classes.iter().map(|lc| lc.name.0.as_str()))
+        .collect();
+    let mut out = crate::det::HashSet::default();
+    for tm in &app.test_modules {
+        let scope: Vec<&str> = tm.name.0.as_str().split("::").collect();
+        for inner in &tm.inner_classes {
+            let Some(parent) = &inner.parent else { continue };
+            let parent = parent.0.as_str().trim_start_matches("::");
+            let mut ns = scope.clone();
+            loop {
+                let candidate = if ns.is_empty() { parent.to_string() } else { format!("{}::{parent}", ns.join("::")) };
+                if known.contains(candidate.as_str()) {
+                    out.insert(candidate);
+                    break;
+                }
+                if ns.pop().is_none() {
+                    break;
+                }
+            }
         }
     }
     out

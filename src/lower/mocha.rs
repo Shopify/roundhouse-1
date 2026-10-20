@@ -508,6 +508,7 @@ pub fn apply_mocha_lowering(app: &mut App) {
     let mut ctx = AppMethods::index(app);
     for tm in &mut app.test_modules {
         ctx.setup = tm.setup.clone();
+        ctx.scope = Some((tm.name.0.as_str().to_string(), tm.constants.iter().map(|(n, _)| n.as_str().to_string()).collect()));
         if let Some(setup) = &mut tm.setup {
             lower_mock_graphs(setup, &ctx);
             rewrite(setup, &mut ctx);
@@ -537,6 +538,10 @@ struct AppMethods {
     singular_assocs: BTreeMap<(String, String), String>,
     /// The enclosing test module's `setup` body, for an ivar's origin.
     setup: Option<Expr>,
+    /// The enclosing test module's name and the constants its class body
+    /// declares (`CODEC = Foo::Codec`). The bridge resolves a head or an
+    /// argument by NAME from `Object`, where that lexical lookup is lost.
+    scope: Option<(String, BTreeSet<String>)>,
 }
 
 impl AppMethods {
@@ -566,7 +571,7 @@ impl AppMethods {
             .iter()
             .map(|f| (f.name.as_str().to_string(), crate::naming::classify_path(f.path.as_str())))
             .collect();
-        AppMethods { methods, stubbed: BTreeMap::new(), fixtures, singular_assocs, setup: None }
+        AppMethods { methods, stubbed: BTreeMap::new(), fixtures, singular_assocs, setup: None, scope: None }
     }
 
     #[cfg(test)]
@@ -577,6 +582,19 @@ impl AppMethods {
             fixtures: BTreeMap::new(),
             singular_assocs: BTreeMap::new(),
             setup: None,
+            scope: None,
+        }
+    }
+
+    /// A constant name the bridge will resolve from `Object`, spelled so
+    /// that it still means what the test body's lexical lookup meant: one
+    /// whose first segment is a constant the test class declares is
+    /// reached through that class.
+    fn qualify(&self, name: &str) -> String {
+        let first = name.split("::").next().unwrap_or(name);
+        match &self.scope {
+            Some((owner, consts)) if consts.contains(first) => format!("{owner}::{name}"),
+            _ => name.to_string(),
         }
     }
 
@@ -1094,7 +1112,7 @@ fn lower_chain(span: crate::span::Span, chain: Chain, ctx: &mut AppMethods) -> O
     if chain.instance.is_some() {
         return None;
     }
-    Some(bridge_chain(span, chain))
+    Some(bridge_chain(span, chain, ctx))
 }
 
 /// The class a receiver's static type names, its nil arm stripped.
@@ -1476,18 +1494,18 @@ fn bridge() -> Expr {
 /// constant name stays a String. A bare matcher call becomes
 /// `MochaBridge.matcher(:name, *args)`, whatever its arity (`has_entry(:k, v)`,
 /// `all_of(a, b)`), its arguments marked the same way.
-fn bridge_arg(arg: Expr) -> Expr {
+fn bridge_arg(arg: Expr, ctx: &AppMethods) -> Expr {
     let span = arg.span;
     match &*arg.node {
         ExprNode::Const { path } => {
             let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-            call(span, bridge(), "konst", vec![str_lit(span, &name)])
+            call(span, bridge(), "konst", vec![str_lit(span, &ctx.qualify(&name))])
         }
         ExprNode::Send { recv: None, method, args, block: None, .. }
             if MATCHERS.contains(&method.as_str()) =>
         {
             let mut margs = vec![sym_lit(span, method.as_str())];
-            margs.extend(args.iter().cloned().map(bridge_arg));
+            margs.extend(args.iter().cloned().map(|a| bridge_arg(a, ctx)));
             call(span, bridge(), "matcher", margs)
         }
         _ => arg,
@@ -1495,11 +1513,11 @@ fn bridge_arg(arg: Expr) -> Expr {
 }
 
 /// `MochaBridge.chain("<Const>", :<kind>, :<method>, [[:op, [args…]], …]) { with-block }`.
-fn bridge_chain(span: crate::span::Span, chain: Chain) -> Expr {
+fn bridge_chain(span: crate::span::Span, chain: Chain, ctx: &AppMethods) -> Expr {
     let mut block: Option<Expr> = None;
     let mut links: Vec<Expr> = Vec::new();
     for op in chain.ops {
-        let mut args: Vec<Expr> = op.args.into_iter().map(bridge_arg).collect();
+        let mut args: Vec<Expr> = op.args.into_iter().map(|a| bridge_arg(a, ctx)).collect();
         // `with(a: 1)` is keywords, `with({a: 1})` a positional Hash, and a
         // strict-keyword mocha (`Mocha.configure { strict_keyword_argument_matching }`)
         // tells them apart; an array of args loses the difference, so the
@@ -1525,7 +1543,7 @@ fn bridge_chain(span: crate::span::Span, chain: Chain) -> Expr {
             recv: Some(bridge()),
             method: Symbol::from("chain"),
             args: vec![
-                str_lit(span, &chain.path),
+                str_lit(span, &ctx.qualify(&chain.path)),
                 sym_lit(span, &kind),
                 sym_lit(span, chain.method.as_str()),
                 array_lit(span, links),
@@ -1603,6 +1621,35 @@ fn a_keyword_only_block_still_gets_the_host_placeholder() {
     fn int_of(e: &Expr) -> i64 {
         let ExprNode::Lit { value: Literal::Int { value } } = &*e.node else { panic!("{:?}", e.node) };
         *value
+    }
+
+    #[test]
+    fn a_bridged_head_and_argument_naming_a_test_class_constant_are_qualified() {
+        // `CODEC = Foo::Codec` in the test class body; the bridge resolves
+        // names from `Object`, so `CODEC.stubs(:encode).raises(Err)` must
+        // travel as `Suite::CODEC`. A name the class does not declare is
+        // left as written.
+        let mut ctx = AppMethods::empty();
+        ctx.scope = Some(("Merch::Products::SuiteTest".into(), ["CODEC".to_string()].into_iter().collect()));
+        let mut e = send(
+            Some(send(Some(konst(&["CODEC"])), "stubs", vec![sym("encode")])),
+            "raises",
+            vec![konst(&["ArgumentError"]), konst(&["CODEC", "Entry"])],
+        );
+        rewrite(&mut e, &mut ctx);
+        let (recv, m, args, _) = as_send(&e);
+        assert_eq!((const_path(recv).as_str(), m), ("MochaBridge", "chain"));
+        assert!(matches!(&*args[0].node, ExprNode::Lit { value: Literal::Str { value } } if value == "Merch::Products::SuiteTest::CODEC"));
+        let ExprNode::Array { elements, .. } = &*args[3].node else { panic!("{:?}", args[3].node) };
+        let ExprNode::Array { elements: link, .. } = &*elements[0].node else { panic!() };
+        let ExprNode::Array { elements: raised, .. } = &*link[1].node else { panic!() };
+        let named = |x: &Expr| {
+            let (_, _, a, _) = as_send(x);
+            let ExprNode::Lit { value: Literal::Str { value } } = &*a[0].node else { panic!() };
+            value.clone()
+        };
+        assert_eq!(named(&raised[0]), "ArgumentError");
+        assert_eq!(named(&raised[1]), "Merch::Products::SuiteTest::CODEC::Entry");
     }
 
     #[test]

@@ -344,3 +344,25 @@ fn a_class_side_method_a_subclass_reaches_through_super_keeps_its_bare_new() {
     // A name no subclass overrides through `super` keeps its owner.
     assert!(base.contains("Bag.new\n"), "{base}");
 }
+
+/// A class a test declares inside its own body (`class TestAlert < Alert`)
+/// is a subclass the tree's copies never reach, and the test stubs it
+/// (`TestAlert.any_instance.expects(:notify)`). Bound to its owner,
+/// `Alert.notify` built an `Alert`, so the expectation was never met:
+/// Core's `ShopifyPayments::Notifications::TriggerAlertJobTest`.
+#[test]
+fn a_class_side_method_of_a_class_a_test_subclasses_keeps_its_bare_new() {
+    let files = emitted_files(&[
+        (
+            "app/models/shop_alerts/alert.rb",
+            "module ShopAlerts\n  class Alert\n    def initialize(account)\n      @account = account\n    end\n\n    def self.notify(account)\n      new(account).notify\n    end\n\n    def notify\n      :sent\n    end\n  end\nend\n",
+        ),
+        (
+            "test/models/shop_alerts/alert_job_test.rb",
+            "require \"test_helper\"\n\nmodule ShopAlerts\n  class AlertJobTest < ActiveSupport::TestCase\n    class TestAlert < Alert\n    end\n\n    test \"notifies\" do\n      assert_equal :sent, TestAlert.notify(1)\n    end\n  end\nend\n",
+        ),
+    ]);
+    let base = file_named(&files, "shop_alerts/alert.rb");
+    assert!(!base.contains("Alert.new(account)"), "bound to its owner, `TestAlert.notify` builds an Alert:\n{base}");
+    assert!(base.contains("new(account).notify"), "{base}");
+}
