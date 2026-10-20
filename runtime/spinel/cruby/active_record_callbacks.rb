@@ -591,14 +591,30 @@ module ActiveRecord
     end
     singleton_class.send(:remove_method, :create!) if singleton_class.method_defined?(:create!, false)
 
+    # Rails' `attr_readonly :a, :b`: the names `readonly_attributes`
+    # answers, a subclass's added to its superclass's. Recorded only: an
+    # UPDATE still writes them and assigning one to a persisted record does
+    # not raise, which Rails does.
+    def self.attr_readonly(*names)
+      @_readonly_attributes = readonly_attributes | names.map { |name| name.to_s }
+      nil
+    end
+
+    def self.readonly_attributes
+      own = @_readonly_attributes
+      return own unless own.nil?
+      superclass.respond_to?(:readonly_attributes) ? superclass.readonly_attributes : []
+    end
+
     # Rails' `create!` saves with `save!` (`object.save!`), so a halted
     # save raises RecordNotSaved.
     #
     # persistence.rb: an Array of attribute hashes creates one record
     # each (`create!([{ ... }, { ... }])`) and answers the records.
-    def self.create!(attrs = {})
-      return attrs.map { |each_attrs| create!(each_attrs) } if attrs.is_a?(Array)
+    def self.create!(attrs = {}, &block)
+      return attrs.map { |each_attrs| create!(each_attrs, &block) } if attrs.is_a?(Array)
       instance = new(attrs)
+      block.call(instance) if block
       instance.save!
       instance
     end
@@ -607,9 +623,10 @@ module ActiveRecord
     # above; the class-side `create` of base.rb takes one Hash.
     singleton_class.send(:remove_method, :create) if singleton_class.method_defined?(:create, false)
 
-    def self.create(attrs = {})
-      return attrs.map { |each_attrs| create(each_attrs) } if attrs.is_a?(Array)
+    def self.create(attrs = {}, &block)
+      return attrs.map { |each_attrs| create(each_attrs, &block) } if attrs.is_a?(Array)
       instance = new(attrs)
+      block.call(instance) if block
       instance.save
       instance
     end
@@ -940,8 +957,9 @@ module ActiveRecord
     remove_method(:create!) if method_defined?(:create!, false)
 
     # Relation#create!: `save!`, as Base.create! above.
-    def create!(attrs = {})
+    def create!(attrs = {}, &block)
       record = build(attrs)
+      block.call(record) if block
       record.save!
       record
     end

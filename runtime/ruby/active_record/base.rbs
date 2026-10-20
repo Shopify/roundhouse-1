@@ -287,8 +287,8 @@ module ActiveRecord
     def self.any?: () -> bool
     def self.delete_all: () -> Integer
     def self.destroy_all: () -> Array[Base]
-    def self.create: (Hash[Symbol, untyped] attrs) -> Base
-    def self.create!: (Hash[Symbol, untyped] attrs) -> Base
+    def self.create: (Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
+    def self.create!: (Hash[Symbol, untyped] attrs) ?{ (Base) -> void } -> Base
     def self.last: () -> Base?
 
     # Instance lifecycle. `save` returns true/false based on

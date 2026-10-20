@@ -21,7 +21,14 @@ CREATE TABLE customer_email_addresses (
     customer_id bigint NOT NULL,
     shop_id bigint NOT NULL,
     email_address_normalized character varying,
+    kind_id bigint,
     CONSTRAINT customer_email_addresses_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE address_kinds (
+    id bigserial NOT NULL,
+    name character varying,
+    CONSTRAINT address_kinds_pkey PRIMARY KEY (id)
 );
 "#;
 
@@ -40,7 +47,8 @@ end
 "#;
 
 const CUSTOMER: &str = "class Customer < ApplicationRecord\n  has_many :email_addresses, class_name: \"CustomerEmailAddress\"\nend\n";
-const EMAIL: &str = "class CustomerEmailAddress < ApplicationRecord\n  belongs_to :customer\nend\n";
+const EMAIL: &str = "class CustomerEmailAddress < ApplicationRecord\n  belongs_to :customer\n  belongs_to :kind, class_name: \"AddressKind\", optional: true\nend\n";
+const KIND: &str = "class AddressKind < ApplicationRecord\nend\n";
 
 const FINDER: &str = r#"class CustomerFinder
   def self.base(klass)
@@ -70,6 +78,16 @@ const FINDER: &str = r#"class CustomerFinder
       .to_a
   end
 
+  # A dotted key whose qualifier is the association name (not the table's)
+  # aliases the join of a hop below the first, as Rails does.
+  def self.of_kind(shop_id, names)
+    Customer
+      .joins(email_addresses: [:kind])
+      .where("email_addresses.shop_id": shop_id, "kind.name": names)
+      .order(:id)
+      .to_a
+  end
+
   def self.find_many(shop_id, emails)
     base(Customer)
       .joins(:email_addresses)
@@ -92,23 +110,30 @@ const PROBE: &str = r##"class JoinsAliasWhereProbe
     out << "where first: #{CustomerFinder.where_first(1, "bob@x").map(&:name).join(",")}"
     nameless = Customer.create!(shop_id: 1, name: nil)
     CustomerEmailAddress.create!(customer_id: nameless.id, shop_id: 1, email_address_normalized: "none@x")
+    work = AddressKind.create!(name: "work")
+    home = AddressKind.create!(name: "home")
+    CustomerEmailAddress.where(email_address_normalized: "ann@x").update_all(kind_id: work.id)
+    CustomerEmailAddress.where(email_address_normalized: "bob@x").update_all(kind_id: home.id)
+    out << "dotted alias: #{CustomerFinder.of_kind(1, ["work"]).map(&:name).join(",")} #{CustomerFinder.of_kind(1, ["work", "home"]).map(&:name).join(",")}"
     out << "belongs_to where.not: #{CustomerFinder.named_owner(1).map(&:email_address_normalized).join(",")}"
     out
   end
 end
 "##;
 
-const EXPECTED: [&str; 4] = [
+const EXPECTED: [&str; 5] = [
     "find_by: \"ann\" nil nil",
     "where: ann,bob",
     "where first: bob",
+    "dotted alias: ann ann,bob",
     "belongs_to where.not: ann@x,bob@x",
 ];
 
-const LOADS: [&str; 5] = [
+const LOADS: [&str; 6] = [
     "app/models/application_record",
     "app/models/customer",
     "app/models/customer_email_address",
+    "app/models/address_kind",
     "app/models/customer_finder",
     "app/models/joins_alias_where_probe",
 ];
@@ -122,6 +147,7 @@ fn files() -> Vec<(&'static str, &'static str)> {
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/customer.rb", CUSTOMER),
         ("app/models/customer_email_address.rb", EMAIL),
+        ("app/models/address_kind.rb", KIND),
         ("app/models/customer_finder.rb", FINDER),
         ("app/models/joins_alias_where_probe.rb", PROBE),
     ]

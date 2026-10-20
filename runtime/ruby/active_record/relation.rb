@@ -1426,8 +1426,15 @@ module ActiveRecord
     def reference_tables(hash)
       added = []
       hash.each do |key, val|
-        next unless val.is_a?(Hash) && nested_hash?(key, val)
-        added << key.to_s unless @referenced.include?(key.to_s)
+        name = key.to_s
+        unless val.is_a?(Hash) && nested_hash?(key, val)
+          # A dotted key (`where("definition.namespace": x)`) references
+          # the table before the dot (predicate_builder `references`).
+          dotted = dotted_reference(key)
+          next if dotted.nil?
+          name = dotted
+        end
+        added << name unless @referenced.include?(name) || added.include?(name)
       end
       return if added.empty?
       @referenced = @referenced + added
@@ -4123,6 +4130,12 @@ module ActiveRecord
         # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
         # `mark_null!` from `none` / lasting positive `where` only.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
+        # A Range element is its own bound predicate ORed beside the list
+        # (arel `ArrayHandler`: `where(ended_at: [Time.now.., nil])` →
+        # `ended_at >= t OR ended_at IS NULL`), never a quoted string
+        # inside the IN list.
+        ranges = ids.select { |x| x.is_a?(Range) }
+        ids = ids.reject { |x| x.is_a?(Range) } unless ranges.empty?
         # A nil element is `IS NULL` beside the IN list (arel
         # `ArrayHandler`: `col IN (1, 2) OR col IS NULL`), never a NULL
         # inside it: `NOT (col IN (NULL, 1))` is NULL for every row, so
@@ -4132,10 +4145,17 @@ module ActiveRecord
         ids = ids.map { |x| typed._attribute_for_database(tcol, x) } unless tcol.nil?
         # An empty list matches nothing: Arel renders `1=0` (`IN ()` is a
         # syntax error), which `where.not` negates to match everything.
-        return "#{qcol} IS NULL" if ids.empty? && has_nil
-        return "1=0" if ids.empty?
-        return "(#{qcol} IN (#{escape_list(ids)}) OR #{qcol} IS NULL)" if has_nil
-        "#{qcol} IN (#{escape_list(ids)})"
+        parts = []
+        if ids.empty?
+          parts << (has_nil ? "#{qcol} IS NULL" : "1=0") if has_nil || ranges.empty?
+        elsif has_nil
+          parts << "(#{qcol} IN (#{escape_list(ids)}) OR #{qcol} IS NULL)"
+        else
+          parts << "#{qcol} IN (#{escape_list(ids)})"
+        end
+        ranges.each { |r| parts << range_predicate(qcol, r, typed, tcol) }
+        return parts[0].to_s if parts.length == 1
+        "(#{parts.join(" OR ")})"
       elsif val.is_a?(Range)
         range_predicate(qcol, val, typed, tcol)
       elsif val.nil?
@@ -4223,9 +4243,10 @@ module ActiveRecord
     end
 
     # One `?` bind's SQL: Rails quotes an Array (an `IN (?)` list) as its
-    # escaped elements joined by commas, and an empty one as NULL.
+    # escaped elements joined by commas, and an empty one as NULL. A
+    # Relation is its own SQL (`replace_bind_variable`), a subquery.
     def bind_value_sql(value)
-      return ActiveRecord.adapter.escape_value(value) unless value.is_a?(Array)
+      return bind_scalar_sql(value) unless value.is_a?(Array)
       return "NULL" if value.empty?
       escape_list(value)
     end
@@ -4253,7 +4274,7 @@ module ActiveRecord
           key = name.to_sym
           if binds.key?(key)
             value = binds[key]
-            out = out + (value.is_a?(Array) ? bind_value_sql(value) : ActiveRecord.adapter.escape_value(value))
+            out = out + bind_value_sql(value)
             i = j
             next
           end

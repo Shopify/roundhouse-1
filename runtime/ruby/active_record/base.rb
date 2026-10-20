@@ -916,8 +916,9 @@ module ActiveRecord
     # constructs and saves in one call. Mirrors Rails' `create`. The
     # Hash-shaped constructor signature accepts the kwargs-as-hash
     # the seed scripts use (`Article.create(title: ..., body: ...)`).
-    def self.create(attrs = {})
+    def self.create(attrs = {}, &block)
       instance = new(attrs)
+      block.call(instance) if block
       instance.save
       instance
     end
@@ -932,8 +933,9 @@ module ActiveRecord
     # new/block-body/save — so the runtime signature stays blockless on
     # every target (a `yield` here forced a block param onto all twelve
     # transpiled runtimes and broke their 1-arg callers).
-    def self.create!(attrs = {})
+    def self.create!(attrs = {}, &block)
       instance = new(attrs)
+      block.call(instance) if block
       raise RecordInvalid, instance unless instance.save
       instance
     end
