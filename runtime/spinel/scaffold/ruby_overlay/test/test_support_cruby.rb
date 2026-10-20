@@ -58,6 +58,17 @@ class TestBase
   def self.methods_matching(re)
     public_instance_methods(true).grep(re).map(&:to_s)
   end
+
+  # Minitest::Runnable's class-side listing, which a hook prepended on
+  # the singleton (Core's ToggleFlagsHelper defines its `_FLAGS:` variants
+  # there) reaches by `super`. Not shuffled: the runner keeps its own order.
+  def self.runnable_methods
+    methods_matching(/^test_/)
+  end
+
+  def self.unordered_runnable_methods
+    methods_matching(/^test_/)
+  end
 end
 
 # Rails' `ActionMailer::TestHelper` (actionmailer/lib/action_mailer/
