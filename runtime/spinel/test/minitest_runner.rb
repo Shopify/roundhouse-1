@@ -1452,8 +1452,12 @@ module RoundhouseTestRunner
   # class) and those its body declared as it loaded (a loop over a computed
   # collection, a call of a class method that declares tests): the
   # `test_` methods the loaded class has, as Minitest lists them
-  # (`methods_matching(/^test_/)`), after the listed ones.
+  # (`methods_matching(/^test_/)`), after the listed ones. Minitest asks
+  # `runnable_methods` first, and a hook there defines methods as it is
+  # asked (ToggleFlagsHelper's `_FLAGS:` variants of the tests the body
+  # registered), so it is asked here too.
   def self.loaded_tests(klass, listed)
+    klass.runnable_methods if klass.respond_to?(:runnable_methods)
     listed + (klass.public_instance_methods(true).map(&:to_s).grep(/\Atest_/).sort - listed)
   end
 

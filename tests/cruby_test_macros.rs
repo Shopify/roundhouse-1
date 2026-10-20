@@ -3113,3 +3113,325 @@ fn a_conditional_test_is_declared_when_its_condition_holds_at_load() {
     assert_eq!(native.keys().map(String::as_str).collect::<Vec<_>>(), ["GuardTest#test_always", "GuardTest#test_modifier", "GuardTest#test_present"]);
     assert_eq!(emit_and_run_classes(&files, &["GuardTest"]), native);
 }
+
+/// Core's `FlagsTestHelper` reduced to what `ToggleFlagsHelper` calls:
+/// each flag write is recorded by subject type, so a test can assert the
+/// configuration its variant ran under.
+const FLAGS_TEST_HELPER: &str = r##"module FlagsTestHelper
+  def flag_log
+    @flag_log ||= []
+  end
+
+  def flag_state
+    @flag_state ||= {}
+  end
+
+  def enable_shop_flag(name)
+    flag_log << "enable shop #{name}"
+    flag_state[name] = true
+  end
+
+  def disable_shop_flag(name)
+    flag_log << "disable shop #{name}"
+    flag_state[name] = false
+  end
+
+  def enable_api_client_flag(name)
+    flag_log << "enable api_client #{name}"
+    flag_state[name] = true
+  end
+
+  def disable_api_client_flag(name)
+    flag_log << "disable api_client #{name}"
+    flag_state[name] = false
+  end
+
+  def enable_flag(name, subject_type:)
+    flag_log << "enable #{subject_type} #{name}"
+    flag_state[name] = true
+  end
+
+  def disable_flag(name, subject_type:)
+    flag_log << "disable #{subject_type} #{name}"
+    flag_state[name] = false
+  end
+
+  def reset_flag_cache
+    flag_log << "reset"
+  end
+
+  def warm_flag_cache
+    flag_log << "warm"
+  end
+end
+"##;
+
+/// Core's `platform/essentials/testing/toggle_flags_helper.rb` as it is
+/// written (`test(name, flags:)` registering `_FLAGS:` variants, defined
+/// by `process` as Minitest lists the class), without the BinaryStore
+/// opt-in and the Sorbet annotations, and with `send(:define_method)` for its
+/// `class_eval` string (the emitted program compiles this file, and
+/// `class_eval` on an untyped receiver is refused at compile time).
+const TOGGLE_FLAGS_HELPER: &str = r##"module ToggleFlagsHelper
+  extend ActiveSupport::Concern
+
+  include FlagsTestHelper
+
+  DEFAULT_SUBJECT_TYPE = "shop"
+  DEFAULT_FLAG_STATE = :both
+
+  class << self
+    def included(base)
+      base.extend(ClassMethods)
+
+      base.singleton_class.prepend(Module.new do
+        def runnable_methods
+          ToggleFlagsHelper.process(self)
+          super
+        end
+
+        def unordered_runnable_methods
+          ToggleFlagsHelper.process(self)
+          super
+        end
+      end)
+    end
+
+    def process(klass)
+      return if klass.instance_variable_defined?(:@toggle_helper_processed)
+
+      parent = klass.superclass
+      process(parent) if parent&.respond_to?(:flags_to_test)
+
+      klass.instance_variable_set(:@toggle_helper_processed, true)
+      process_flag_toggled_tests(klass, klass.flag_toggled_tests) if klass.flag_toggled_tests.any?
+    end
+
+    def process_flag_toggled_tests(klass, toggled_tests)
+      toggled_tests.each do |method_name, combo, block, name|
+        if block.is_a?(Proc)
+          klass.send(:define_method, method_name) do
+            self.apply_flag_configuration(combo)
+            instance_exec(&block)
+          end
+        else
+          klass.send(:define_method, method_name) do
+            self.apply_flag_configuration(combo)
+            send(name)
+          end
+        end
+      end
+    end
+
+    def build_test_method_name(name, combo, tags = nil)
+      base_name = name.sub(/^test_/, '')
+      base_name = base_name.gsub(/[\s]/, '_')
+      base_name = base_name.gsub(/[^a-zA-Z0-9_:]/, '')
+      flag_suffix = build_flag_suffix(combo)
+      filtered_tags = tags&.reject { |k, _| k == :flags }
+      tagged_name = "test_#{base_name}_FLAGS:#{flag_suffix}"
+      tagged_name = "#{tagged_name}_#{filtered_tags.map { |*pair| pair.join(":").prepend("tag:") }.join("_")}" unless filtered_tags.nil? || filtered_tags.empty?
+      tagged_name.gsub(/[\s]/, '_')
+    end
+
+    def build_flag_suffix(combo)
+      combo.map do |flag_name, config|
+        "#{flag_name}:#{config[:enabled] ? "ON" : "OFF"}"
+      end.join(":")
+    end
+  end
+
+  module ClassMethods
+    def test(name, tags = nil, &block)
+      return super unless tags&.include?(:flags)
+      flag_names = tags[:flags]
+
+      default_subject_type = DEFAULT_SUBJECT_TYPE
+      local_flags_to_test = normalize_flag_specs(flag_names, default_subject_type)
+
+      combos = generate_flag_combinations(local_flags_to_test)
+      combos.each do |combo|
+        method_name = ToggleFlagsHelper.build_test_method_name(name, combo, tags)
+        flag_toggled_tests << [method_name, combo, block, name]
+      end
+
+      :flags
+    end
+
+    def flags_to_test
+      @flags_to_test ||= []
+    end
+
+    def flag_toggled_tests
+      @flag_toggled_tests ||= []
+    end
+
+    def create_flag_config(flag_name, subject_type, state = DEFAULT_FLAG_STATE)
+      { name: flag_name, state: state, subject_type: subject_type }
+    end
+
+    def normalize_flag_specs(flag_spec, default_subject_type)
+      case flag_spec
+      when String, Symbol
+        [create_flag_config(flag_spec.to_s, default_subject_type)]
+      when Array
+        flag_spec.map do |spec|
+          process_flag_spec_item(spec, default_subject_type)
+        end
+      when Hash
+        name = flag_spec[:name] || flag_spec["name"]
+        subject_type = flag_spec[:subject_type] || flag_spec["subject_type"] || default_subject_type
+        state = flag_spec[:state] || flag_spec["state"] || DEFAULT_FLAG_STATE
+        [create_flag_config(name.to_s, subject_type.to_s, state.to_sym)]
+      else
+        Kernel.raise ArgumentError, "Invalid flags tag format: #{flag_spec.inspect}"
+      end
+    end
+
+    def process_flag_spec_item(spec, default_subject_type)
+      case spec
+      when String, Symbol
+        create_flag_config(spec.to_s, default_subject_type)
+      when Hash
+        name = spec[:name] || spec["name"]
+        subject_type = spec[:subject_type] || spec["subject_type"] || default_subject_type
+        state = spec[:state] || spec["state"] || DEFAULT_FLAG_STATE
+        create_flag_config(name.to_s, subject_type.to_s, state.to_sym)
+      else
+        Kernel.raise ArgumentError, "Invalid flag specification format in array: #{spec.inspect}"
+      end
+    end
+
+    def generate_flag_combinations(flags = [])
+      both_flags = flags.select { |f| f[:state] == :both }
+      static_flags = flags.reject { |f| f[:state] == :both }
+
+      base_state = static_flags.each_with_object({}) do |flag, states|
+        states[flag[:name]] = { enabled: flag[:state] == :on, subject_type: flag[:subject_type] }
+      end
+
+      result = both_flags.reduce([{}]) do |acc, flag|
+        acc.flat_map do |combo|
+          [
+            combo.merge(flag[:name] => { enabled: true, subject_type: flag[:subject_type] }),
+            combo.merge(flag[:name] => { enabled: false, subject_type: flag[:subject_type] })
+          ]
+        end
+      end
+
+      result.map { |combo| base_state.merge(combo) }
+    end
+  end
+
+  def apply_flag_configuration(combo)
+    @flag_states = combo
+    combo.each do |flag_name, config|
+      if config[:enabled]
+        self.enable_flag_for_subject_type(flag_name, config[:subject_type])
+      else
+        self.disable_flag_for_subject_type(flag_name, config[:subject_type])
+      end
+    end
+    reset_flag_cache
+    warm_flag_cache
+  end
+
+  def flag_enabled?(flag_name = nil)
+    return false unless @flag_states
+    if flag_name.nil?
+      @flag_states.all? { |_, config| config[:enabled] }
+    else
+      @flag_states.dig(flag_name, :enabled) || false
+    end
+  end
+
+  protected
+
+  def enable_flag_for_subject_type(flag_name, subject_type)
+    case subject_type
+    when "shop"
+      enable_shop_flag(flag_name)
+    when "api_client"
+      enable_api_client_flag(flag_name)
+    else
+      enable_flag(flag_name, subject_type: subject_type)
+    end
+  end
+
+  def disable_flag_for_subject_type(flag_name, subject_type)
+    case subject_type
+    when "shop"
+      disable_shop_flag(flag_name)
+    when "api_client"
+      disable_api_client_flag(flag_name)
+    else
+      disable_flag(flag_name, subject_type: subject_type)
+    end
+  end
+end
+"##;
+
+/// A `test "…", flags:` runs natively as `_FLAGS:<flag>:ON/OFF` variants
+/// the helper defines, each under the configuration its name says, and
+/// defines no test of its own name. The emitted class carries the
+/// statement, so the helper (emitted from the same source) names and
+/// configures the variants.
+#[test]
+fn a_flags_test_runs_as_the_helpers_flag_variants() {
+    let test = r##"class FlagsVariantTest < ActiveSupport::TestCase
+  SCOPED = "f_scoped"
+
+  extend ToggleFlagsHelper::ClassMethods
+  include ToggleFlagsHelper
+
+  setup do
+    @marker = :set
+  end
+
+  test "plain sibling" do
+    assert_equal :set, @marker
+    assert_nil @flag_states
+  end
+
+  test "reads one flag", flags: SCOPED do
+    assert_equal :set, @marker
+    assert_equal [flag_enabled?(SCOPED) ? "enable shop f_scoped" : "disable shop f_scoped", "reset", "warm"], flag_log
+    assert_equal flag_enabled?, flag_state.fetch(SCOPED)
+    first, second = flag_log.first(2)
+    assert_equal [first, second], flag_log.take(2)
+  end
+
+  test "reads two flags", flags: ["f_one", { name: "f_two", subject_type: "api_client" }] do
+    assert_equal 4, flag_log.size
+    assert_includes flag_log, (flag_enabled?("f_two") ? "enable api_client f_two" : "disable api_client f_two")
+  end
+
+  test "pinned on, other subject: with punctuation!", flags: { name: "f_pinned", state: :on, subject_type: "generic" } do
+    assert flag_enabled?("f_pinned")
+    assert_equal ["enable generic f_pinned", "reset", "warm"], flag_log
+  end
+
+  def test_after_the_flags_tests
+    assert_nil @flag_states
+  end
+end
+"##;
+    let files = [
+        ("app/models/flags_test_helper.rb", FLAGS_TEST_HELPER),
+        ("app/models/toggle_flags_helper.rb", TOGGLE_FLAGS_HELPER),
+        ("test/models/flags_variant_test.rb", test),
+    ];
+    let native = native_of(&files, &["FlagsVariantTest"]);
+    let names: Vec<&str> = native.keys().map(String::as_str).collect();
+    assert_eq!(names.len(), 9, "{names:#?}");
+    for name in [
+        "FlagsVariantTest#test_reads_one_flag_FLAGS:f_scoped:ON",
+        "FlagsVariantTest#test_reads_one_flag_FLAGS:f_scoped:OFF",
+        "FlagsVariantTest#test_reads_two_flags_FLAGS:f_one:OFF:f_two:ON",
+    ] {
+        assert!(names.contains(&name), "{name} in {names:#?}");
+    }
+    assert!(!names.iter().any(|n| n.ends_with("#test_reads_one_flag")), "{names:#?}");
+    assert!(native.values().all(|(status, assertions)| status == "pass" && *assertions > 0), "{native:#?}");
+    assert_eq!(emit_and_run_classes(&files, &["FlagsVariantTest"]), native);
+}

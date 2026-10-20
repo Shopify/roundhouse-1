@@ -650,6 +650,18 @@ pub(super) fn ingest_test_class(
                 continue;
             }
             if let Some(test) = ingest_test_declaration(&stmt, file, &test_tags, &consts)? {
+                // A ToggleFlagsHelper `flags:` test defines no method of its
+                // own name: the helper's own `test` registers `_FLAGS:` variants
+                // as the body runs, and defines them as Minitest lists the class.
+                // The statement is carried as written, so the helper (emitted
+                // from Core) names and configures each variant.
+                if test.toggle_flags {
+                    let gap = toggle_flags_gap(&test, &name, file, &stmt.location());
+                    let at = BodyAt { after_definitions, after_setup_blocks, after_teardown_blocks };
+                    carry_at_load(&stmt, gap, &name, file, &test_tags, at, &mut body_statements, &mut tests_at_load)?;
+                    after_definitions = true;
+                    continue;
+                }
                 let is_def = stmt.as_def_node().is_some();
                 declare_test(&mut tests, &mut defined_tests, test, is_def, &name, file, &stmt.location())?;
                 after_definitions = true;
@@ -1822,6 +1834,22 @@ pub(super) fn statement_tests<'pr>(
     }
 }
 
+/// The gap for a ToggleFlagsHelper `flags:` test ingest cannot carry as
+/// the class loads: natively it defines no method of its name, only
+/// `_FLAGS:<flag>:ON/OFF` variants run under flag configurations.
+fn toggle_flags_gap(test: &Test, class: &ClassId, file: &str, at: &ruby_prism::Location<'_>) -> IngestError {
+    let line = line_suffix(file, at);
+    IngestError::Unsupported {
+        file: file.into(),
+        message: format!(
+            "a ToggleFlagsHelper `flags:` test is not modeled here: natively it defines no test of its \
+             own name, only `_FLAGS:<flag>:ON/OFF` variants, each run under its flag configuration; \
+             none is emitted (`{}`, test {:?}, not `{}`{line})",
+            class.0, test.name, test.method_name
+        ),
+    }
+}
+
 /// Add a test the class body declares as it loads, by a `def`
 /// (`is_def`) or by ActiveSupport's `test` (a literal statement, or one
 /// iteration of an unrolled loop), at `at`. A later `def` replaces an
@@ -1830,9 +1858,11 @@ pub(super) fn statement_tests<'pr>(
 /// for `refuse_inherited_test_redefinitions`.
 ///
 /// A ToggleFlagsHelper `flags:` test defines no method of its name
-/// natively, only `_FLAGS:` variants run under flag configurations,
-/// which are not modeled: it is left out, by name, rather than emitted
-/// under a name native never defines (where it could shadow a sibling).
+/// natively, only `_FLAGS:` variants run under flag configurations. A
+/// direct statement of the class body is carried to run as it loads (the
+/// caller); one declared another way (a loop, a macro) is left out, by
+/// name, rather than emitted under a name native never defines (where it
+/// could shadow a sibling).
 fn declare_test(
     tests: &mut Vec<Test>,
     defined_tests: &mut Vec<(String, bool)>,
@@ -1843,16 +1873,7 @@ fn declare_test(
     at: &ruby_prism::Location<'_>,
 ) -> IngestResult<()> {
     if test.toggle_flags {
-        let line = line_suffix(file, at);
-        return super::survey::continue_or_fail(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "a ToggleFlagsHelper `flags:` test is not modeled: natively it defines no test of its \
-                 own name, only `_FLAGS:<flag>:ON/OFF` variants, each run under its flag configuration; \
-                 none is emitted (`{}`, test {:?}, not `{}`{line})",
-                class.0, test.name, test.method_name
-            ),
-        });
+        return super::survey::continue_or_fail(toggle_flags_gap(&test, class, file, at));
     }
     defined_tests.push((test.method_name.clone(), !is_def));
     match tests.iter().position(|t| t.method_name == test.method_name) {
@@ -2762,21 +2783,38 @@ end
     }
 
     // A ToggleFlagsHelper `flags:` test defines no `test_x` natively,
-    // only `_FLAGS:` variants run under flag configurations: it is left
-    // out by name (a survey gap), not emitted as a `test_x` that would
-    // stand in for, or collide with, the class's own `test "x"`.
+    // only `_FLAGS:` variants run under flag configurations, which the
+    // helper's own `test` registers as the class body runs: the statement
+    // is carried as written (the class declares tests as it loads), not
+    // emitted as a `test_x` that would stand in for, or collide with, the
+    // class's own `test "x"`.
     #[test]
-    fn a_flags_test_is_left_out_by_name() {
+    fn a_flags_test_is_carried_to_run_as_the_class_loads() {
         let src = "class NamesTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\n  test \"x\", flags: { name: \"f\" } do\n  end\n  test \"y\", flags: { name: \"f\" }, slow: true do\n  end\nend\n";
         crate::ingest::survey::activate();
         let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
         let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
         let names: Vec<&str> = tms[0].tests.iter().map(|t| t.method_name.as_str()).collect();
         assert_eq!(names, ["test_x"]);
-        assert_eq!(gaps.len(), 2, "{gaps:#?}");
+        assert!(gaps.is_empty(), "{gaps:#?}");
+        assert!(tms[0].tests_at_load);
+        assert_eq!(tms[0].body_statements.len(), 2, "{:#?}", tms[0].body_statements);
+    }
+
+    // Under TestTags' class-level `tag` ingest names the tests itself, so a
+    // carried statement would declare the variants untagged: left out, by
+    // name (a survey gap).
+    #[test]
+    fn a_flags_test_under_a_class_tag_is_left_out_by_name() {
+        let src = "class NamesTest < ActiveSupport::TestCase\n  tag(slow: true)\n  test \"x\" do\n    assert true\n  end\n  test \"x flagged\", flags: { name: \"f\" } do\n  end\nend\n";
+        crate::ingest::survey::activate();
+        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
+        let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+        let names: Vec<&str> = tms[0].tests.iter().map(|t| t.method_name.as_str()).collect();
+        assert_eq!(names, ["test_x_tag:slow:true"]);
+        assert_eq!(gaps.len(), 1, "{gaps:#?}");
         assert!(gaps[0].contains("a ToggleFlagsHelper `flags:` test is not modeled"), "{}", gaps[0]);
-        assert!(gaps[0].contains("(`NamesTest`, test \"x\", not `test_x`, line 5)"), "{}", gaps[0]);
-        assert!(gaps[1].contains("not `test_y_tag:slow:true`, line 7)"), "{}", gaps[1]);
+        assert!(gaps[0].contains("test \"x flagged\""), "{}", gaps[0]);
         // Outside the survey the class is refused.
         let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
         assert!(err.contains("test class `NamesTest` refused: a ToggleFlagsHelper `flags:` test"), "{err}");
