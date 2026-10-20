@@ -5060,7 +5060,73 @@ fn ruby_family_files(
     // content replaces the spinel-tree file that `apply_pay_demand`
     // already annotated in `spinel_files`.
     apply_pay_demand(&mut files, app)?;
+    apply_source_path_directories(&mut files);
     Ok(files)
+}
+
+/// The directory of every source path a file's `__FILE__`/`__dir__`
+/// rewrite names (`emit::ruby::expr::source_file_path`), as a directory
+/// of the tree. Ruby code that locates data from its own file reads
+/// `File.join(File.dirname(__FILE__), "..", "javascript", "loader.js")`
+/// (web_pixels_manager 0.52.0), and the emitted
+/// `::File.expand_path("../../vendor/gems/<gem>/lib/<gem>/javascript.rb",
+/// __dir__)` keeps that path's directory in the string: the kernel
+/// resolves `..` through each directory on the way, so one the tree lacks
+/// (the gem's `.rb` files are relocated, leaving `lib/<gem>/` empty of
+/// files, so nothing created it) raises Errno::ENOENT where Ruby on the
+/// source finds the sibling. Only the directories a rewritten path names
+/// are made, each with a `.keep` where no file holds it open already.
+fn apply_source_path_directories(files: &mut Vec<(String, String)>) {
+    const ANCHOR: &str = "::File.expand_path(\"";
+    const TAIL: &str = "\", __dir__)";
+    let mut wanted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (path, content) in files.iter() {
+        if !path.ends_with(".rb") || !content.contains(ANCHOR) {
+            continue;
+        }
+        let here: Vec<&str> = path.rsplit_once('/').map_or(Vec::new(), |(dir, _)| dir.split('/').collect());
+        for (at, _) in content.match_indices(ANCHOR) {
+            let rest = &content[at + ANCHOR.len()..];
+            let Some(end) = rest.find('"') else { continue };
+            if !rest[end..].starts_with(TAIL) || rest[..end].contains('\\') {
+                continue;
+            }
+            let mut resolved = here.clone();
+            for part in rest[..end].split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        resolved.pop();
+                    }
+                    part => resolved.push(part),
+                }
+            }
+            // The directory of the file the literal names.
+            resolved.pop();
+            if !resolved.is_empty() {
+                wanted.insert(resolved.join("/"));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    let mut present: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (path, _) in files.iter() {
+        let mut dir = path.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            if !present.insert(parent) {
+                break;
+            }
+            dir = parent;
+        }
+    }
+    let made: Vec<(String, String)> = wanted
+        .into_iter()
+        .filter(|dir| !present.contains(dir.as_str()))
+        .map(|dir| (format!("{dir}/.keep"), String::new()))
+        .collect();
+    files.extend(made);
 }
 
 /// The app's applied `inflect.*` declarations as the Ruby Rails runs,
