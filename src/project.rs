@@ -6080,7 +6080,9 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// `framework` holds the Rails features among them (`rails`,
 /// `active_support/...`, ...): this tree's runtime ports answer those, and
 /// requiring the real ones would load Rails over the ports. A semian
-/// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
+/// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's, and so
+/// is a feature of a gem every CRuby tree carries a port of
+/// (`OVERLAY_PORT_FEATURE_ROOTS`: globalid's `require "global_id"`).
 ///
 /// The third list names the native features every require of which sits
 /// in a `begin` that rescues LoadError (graphql-shopify 0.20.3's
@@ -6179,7 +6181,10 @@ pub(crate) fn gem_source_dependencies_with(app: &App, conditional: bool) -> (Vec
             stack.extend(nested.into_iter().rev());
             for feature in order.drain(..) {
                 let list = if framework_feature(&feature) { &mut framework } else { &mut native };
-                if !list.contains(&feature) && !SEMIAN_PORT_FEATURES.iter().any(|(f, _)| *f == feature) {
+                if !list.contains(&feature)
+                    && !SEMIAN_PORT_FEATURES.iter().any(|(f, _)| *f == feature)
+                    && !is_overlay_port_feature(&feature)
+                {
                     list.push(feature);
                 }
             }
@@ -16505,6 +16510,20 @@ fn gem_compiled_from_source(app: &App, gem: &str) -> bool {
 /// is not ported, so it is refused as a port gap.
 const OVERLAY_GEM_PORTS: &[(&str, &[(&str, &str)])] =
     &[("globalid", &[("runtime/spinel/scaffold/ruby_overlay/runtime/global_id.rb", "runtime/global_id.rb")])];
+
+/// The features `require` answers from an [`OVERLAY_GEM_PORTS`] port:
+/// globalid 1.4.0's `lib/globalid.rb` and `lib/global_id.rb`, and the
+/// files under `global_id/` and `globalid/`. The overlay boot already
+/// requires the port, and the gem's own files must never load (the gem
+/// requires activesupport), so a gem source's `require "global_id"` has
+/// nothing to load and is no `error[gem_requires_rails]` at boot.
+const OVERLAY_PORT_FEATURE_ROOTS: &[&str] = &["globalid", "global_id"];
+
+fn is_overlay_port_feature(feature: &str) -> bool {
+    OVERLAY_PORT_FEATURE_ROOTS
+        .iter()
+        .any(|root| feature.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+}
 
 fn gem_ports() -> impl Iterator<Item = &'static (&'static str, &'static [(&'static str, &'static str)])> {
     GEM_RUNTIME_PORTS.iter().chain(OVERLAY_GEM_PORTS).chain(EXTENSION_GEM_PORTS)
