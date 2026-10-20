@@ -46,6 +46,12 @@ class RecordInvalidTest < Minitest::Test
     assert_equal "Validation failed: ", err.message
   end
 
+  def test_bare_construction_has_no_record_and_the_generic_message
+    err = ActiveRecord::RecordInvalid.new
+    assert_nil err.record
+    assert_equal "Record invalid", err.message
+  end
+
   def test_record_attr_exposes_the_offending_record
     record = Recordlike.new(["x"])
     err = ActiveRecord::RecordInvalid.new(record)

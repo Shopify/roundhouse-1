@@ -157,6 +157,26 @@ class ActionResponse
     ?headers: Hash[String, String]
   ) -> void
 
+  STATUS_MESSAGES: Hash[Integer, String]
+  def code: () -> String
+  def response_code: () -> Integer
+  def message: () -> String
+  def status_message: () -> String
+  def successful?: () -> bool
+  def informational?: () -> bool
+  def redirection?: () -> bool
+  def client_error?: () -> bool
+  def server_error?: () -> bool
+  def error?: () -> bool
+  def ok?: () -> bool
+  def created?: () -> bool
+  def accepted?: () -> bool
+  def no_content?: () -> bool
+  def bad_request?: () -> bool
+  def unauthorized?: () -> bool
+  def forbidden?: () -> bool
+  def not_found?: () -> bool
+  def missing?: () -> bool
   def redirect?: () -> bool
   def success?: () -> bool
   def unprocessable?: () -> bool

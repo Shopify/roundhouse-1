@@ -202,3 +202,60 @@ puts answer { Guard.private_instance_methods(false).sort }
     assert!(native.contains("\"versions.yml\""), "{native}");
     assert_eq!(native, run(&src), "emitted:\n{src}");
 }
+
+/// `private_class_method :m` after `extend self` names the singleton's
+/// view of the module's own instance method, which Ruby accepts. It was
+/// refused ("a visibility change in a module requires a method the
+/// module defines") because only a class-side `def self.m` counted, so
+/// Core's `PreviewStores::StorefrontPreviewLink` never loaded.
+#[test]
+fn private_class_method_after_extend_self_names_the_instance_method() {
+    let source = r##"module Guard
+  extend self
+
+  def open(host)
+    [normalize(host), validate!(host)]
+  end
+
+  def normalize(host)
+    host.downcase
+  end
+
+  def validate!(host)
+    host
+  end
+
+  private_class_method :normalize,
+    :validate!
+end
+"##;
+    let src = emitted(source);
+    assert!(src.contains("def normalize(host)") && !src.contains("def self.normalize"), "{src}");
+    assert!(src.contains("private_class_method :normalize") && src.contains("private_class_method :validate!"), "{src}");
+    let probe = r##"
+def answer
+  yield.inspect
+rescue NoMethodError => e
+  e.class.name
+end
+
+puts answer { Guard.open("A.B") }
+puts answer { Guard.normalize("A") }
+puts answer { Guard.validate!("A") }
+puts answer { Guard.instance_method(:normalize).owner }
+puts answer { Guard.public_instance_methods(false).sort }
+"##;
+    let run = |module: &str, tag: &str| {
+        let dir = std::env::temp_dir().join(format!("rh_extend_self_pcm_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.rb");
+        std::fs::write(&file, format!("{module}\n{probe}")).unwrap();
+        let out = std::process::Command::new("ruby").arg(&file).output().expect("ruby");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let native = run(source, "native");
+    assert!(native.contains("NoMethodError"), "{native}");
+    assert_eq!(native, run(&src, "emitted"), "emitted:\n{src}");
+}

@@ -445,8 +445,8 @@ pub(super) fn ingest_model_class_at(
         // Constants the class body assigns, for `enum :x, CONST` and for
         // labels spelled with a constant (`NAME => NAME`).
         let stmts = flatten_statements(class_body);
-        let class_consts = ClassConsts::collect(&stmts, file);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
+        let class_consts = ClassConsts::collect_with(&stmts, file, &resolve_constant);
         for statement in stmts {
             // `private attr_reader :x` declares like `attr_reader :x`; the
             // visibility pass already gave the generated methods the marker's.
@@ -1584,6 +1584,8 @@ pub(super) fn expand_enum_decl(
     // body assigned above (`STATUSES = %i[…].freeze`).
     let labels = if let Some(receiver) = serialized_enum_receiver(&mapping_node) {
         resolve_constant(&receiver).map(|mapping| mapping.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect())
+    } else if let Some(local) = mapping_node.as_local_variable_read_node() {
+        class_consts.mappings.get(constant_id_str(&local.name())).cloned()
     } else { match mapping_node.as_constant_read_node() {
         Some(cr) => class_consts.mappings.get(constant_id_str(&cr.name())).cloned(),
         None => enum_label_values(&mapping_node, file, class_consts, resolve_constant)?,
@@ -1849,8 +1851,32 @@ pub(super) struct ClassConsts {
 
 impl ClassConsts {
     pub(super) fn collect(stmts: &[Node<'_>], file: &str) -> Self {
+        Self::collect_with(stmts, file, &|_| None)
+    }
+
+    /// As [`Self::collect`], folding a mapping that reads another
+    /// source's enum through `resolve_constant` as well.
+    pub(super) fn collect_with(
+        stmts: &[Node<'_>],
+        file: &str,
+        resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
+    ) -> Self {
         let mut out = ClassConsts::default();
+        // A local assigned once in the class body and read by name in an
+        // `enum` call (`category_enum = …; enum :category, category_enum`).
+        // Local and constant names never collide (lowercase vs uppercase),
+        // so a local's mapping lives in `mappings` under its own name.
+        // One written twice is not the value an enum below it read.
+        let mut local_writes: crate::det::HashMap<String, usize> = crate::det::HashMap::default();
         for stmt in stmts {
+            if let Some(lw) = stmt.as_local_variable_write_node() {
+                let name = constant_id_str(&lw.name()).to_string();
+                *local_writes.entry(name.clone()).or_default() += 1;
+                if let Ok(Some(mapping)) = enum_label_values(&lw.value(), file, &out, resolve_constant) {
+                    out.mappings.insert(name, mapping);
+                }
+                continue;
+            }
             let Some(cw) = stmt.as_constant_write_node() else { continue };
             let name = constant_id_str(&cw.name()).to_string();
             let value = cw.value();
@@ -1866,6 +1892,11 @@ impl ClassConsts {
             // enum that names it says so.
             if let Ok(Some(mapping)) = enum_label_values(&value, file, &out, &|_| None) {
                 out.mappings.insert(name, mapping);
+            }
+        }
+        for (name, writes) in local_writes {
+            if writes > 1 {
+                out.mappings.remove(&name);
             }
         }
         out
@@ -2028,6 +2059,9 @@ fn enum_label_values(
         // The same mapping written as `STATUSES.map { |s| [s, s.to_s] }.to_h`.
         "to_h" if call.arguments().is_none() && call.block().is_none() => {
             let Some(map) = recv.as_call_node() else { return Ok(None) };
+            if let Some(mapping) = indexed_mapping(&map, consts) {
+                return Ok(Some(mapping));
+            }
             if constant_id_str(&map.name()) != "map" || !is_identity_pair_block(&map) {
                 return Ok(None);
             }
@@ -2040,6 +2074,62 @@ fn enum_label_values(
         }
         _ => Ok(None),
     }
+}
+
+/// `LABELS.each_with_index.map { |m, i| [m.to_sym, i] }` (the `.to_h` is
+/// the caller's): each label stored as its position, which is what an array
+/// mapping stores. The labels come from a literal array or a class-body
+/// constant naming one; the block key is the label itself (`m`, `m.to_sym`
+/// or `m.to_s`) and the value its index. Another source's enum
+/// (`Status.values`) is not folded: its members' keys are their own methods.
+fn indexed_mapping(map: &ruby_prism::CallNode<'_>, consts: &ClassConsts) -> Option<Vec<(String, EnumStored)>> {
+    if constant_id_str(&map.name()) != "map" || map.arguments().is_some() {
+        return None;
+    }
+    let indexed = map.receiver()?.as_call_node()?;
+    if constant_id_str(&indexed.name()) != "each_with_index" || indexed.arguments().is_some() || indexed.block().is_some() {
+        return None;
+    }
+    let source = indexed.receiver()?;
+    let labels = match source.as_constant_read_node() {
+        Some(cr) => consts.labels.get(constant_id_str(&cr.name())).cloned(),
+        None => label_list(&source),
+    }?;
+    let block = map.block()?.as_block_node()?;
+    let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+    let requireds: Vec<_> = params.requireds().iter().collect();
+    let [member, index] = requireds.as_slice() else { return None };
+    if params.optionals().iter().next().is_some() || params.rest().is_some() || params.posts().iter().next().is_some()
+        || params.keywords().iter().next().is_some() || params.keyword_rest().is_some() || params.block().is_some()
+    {
+        return None;
+    }
+    let member = constant_id_str(&member.as_required_parameter_node()?.name()).to_string();
+    let index = constant_id_str(&index.as_required_parameter_node()?.name()).to_string();
+    let statements = flatten_statements(block.body()?);
+    let [statement] = statements.as_slice() else { return None };
+    let elements: Vec<Node<'_>> = statement.as_array_node()?.elements().iter().collect();
+    let [key, value] = elements.as_slice() else { return None };
+    let reads = |node: &Node<'_>, name: &str| {
+        node.as_local_variable_read_node().is_some_and(|l| constant_id_str(&l.name()) == name)
+    };
+    let key_is_label = reads(key, &member)
+        || key.as_call_node().is_some_and(|c| {
+            matches!(constant_id_str(&c.name()), "to_sym" | "to_s")
+                && c.arguments().is_none()
+                && c.block().is_none()
+                && c.receiver().is_some_and(|r| reads(&r, &member))
+        });
+    if !key_is_label || !reads(value, &index) {
+        return None;
+    }
+    Some(
+        labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| (label, EnumStored::Lit(Literal::Int { value: i as i64 })))
+            .collect(),
+    )
 }
 
 /// `&:itself` / `&:to_s` / `&:to_sym` as the only argument: the block maps
