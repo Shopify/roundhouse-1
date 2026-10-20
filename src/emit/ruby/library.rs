@@ -22037,11 +22037,14 @@ enum PreloadKind {
     /// `pk` is the target column the foreign key matches (`primary_key:`
     /// or `id`).
     BelongsTo { fk: String, pk: String, target: String, table: String, key_list: &'static str },
-    /// (fk column on the target, target class)
-    HasMany { fk: String, owner_key: String, target: String },
+    /// (fk column on the target, target class). `extra` is a composite
+    /// key's other `(target column, owner reader)` pairs
+    /// (`query_constraints`): the batch matches every pair, as the
+    /// reader's `where` does.
+    HasMany { fk: String, owner_key: String, target: String, extra: Vec<(String, String)> },
     /// `has_one` — same FK-on-target batch as has_many, installing one
     /// record (or nil) per owner through the single-record preload setter.
-    HasOne { fk: String, owner_key: String, target: String },
+    HasOne { fk: String, owner_key: String, target: String, extra: Vec<(String, String)> },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -22089,6 +22092,95 @@ fn composite_belongs_to(model: &crate::dialect::Model, app: &App) -> Vec<(String
         .collect()
 }
 
+/// The owner column a composite-key has_many / has_one batch reads for
+/// the association's primary key: a composite-primary-key owner's `id` is
+/// its `id_value` column. A single-column key keeps the declared name.
+fn owner_key_reader(model: &crate::dialect::Model, assoc: &crate::dialect::Association) -> String {
+    let key = assoc.owner_key();
+    if !assoc.extra_keys().is_empty() && key.as_str() == "id" && !model.composite_primary_key.is_empty() {
+        "id_value".to_string()
+    } else {
+        key.as_str().to_string()
+    }
+}
+
+/// A composite key's other `(target column, owner reader)` pairs.
+fn extra_key_pairs(model: &crate::dialect::Model, assoc: &crate::dialect::Association) -> Vec<(String, String)> {
+    assoc
+        .extra_keys()
+        .iter()
+        .map(|(target_col, owner_col)| {
+            let owner = if owner_col.as_str() == "id" && !model.composite_primary_key.is_empty() {
+                "id_value".to_string()
+            } else {
+                owner_col.as_str().to_string()
+            };
+            (target_col.as_str().to_string(), owner)
+        })
+        .collect()
+}
+
+/// The batch loader of a composite-key has_many / has_one. One query
+/// matches the owners' key columns column by column (a superset of the
+/// owners' key tuples when owners differ in more than one column); each
+/// row is then seated under the owners whose whole tuple it matches, and
+/// only those rows are answered, so the nested preload sees the rows the
+/// owners hold.
+fn composite_preload_batch(name: &str, fk: &str, owner_key: &str, target: &str, extra: &[(String, String)], many: bool) -> String {
+    let mut collect = String::new();
+    let mut wheres = format!("{fk}: ids.uniq");
+    let mut row_key = format!("rec.{fk}");
+    let mut owner_tuple = format!("r.{owner_key}");
+    for (i, (target_col, owner)) in extra.iter().enumerate() {
+        let _ = writeln!(collect, "      e{i} << r.{owner}");
+        let _ = write!(wheres, ", {target_col}: e{i}.uniq");
+        let _ = write!(row_key, ", rec.{target_col}");
+        let _ = write!(owner_tuple, ", r.{owner}");
+    }
+    let mut decl = String::from("  ids = []\n");
+    for i in 0..extra.len() {
+        let _ = writeln!(decl, "  e{i} = []");
+    }
+    let seat = if many {
+        "      grouped[k] = [] if grouped[k].nil?\n      grouped[k] << rec\n      matched << rec\n"
+    } else {
+        "      if grouped[k].nil?\n        grouped[k] = rec\n        matched << rec\n      end\n"
+    };
+    let install = if many { "grouped[k] || []" } else { "grouped[k]" };
+    format!(
+        r#"
+def self._preload_batch_{name}(records)
+{decl}  records.each do |r|
+    v = r.{owner_key}
+    unless v.nil?
+      ids << v
+{collect}    end
+  end
+  loaded = []
+  if ids.length > 0
+    loaded = ActiveRecord::Relation.new({target}).where({wheres}).to_a
+  end
+  wanted = {{}}
+  records.each do |r|
+    wanted[[{owner_tuple}]] = true
+  end
+  grouped = {{}}
+  matched = []
+  loaded.each do |rec|
+    k = [{row_key}]
+    if wanted[k]
+{seat}    end
+  end
+  records.each do |r|
+    k = [{owner_tuple}]
+    r._preload_{name}({install})
+  end
+  matched
+end
+"#
+    )
+}
+
 /// Select association shapes whose batch queries preserve the reader's filters,
 /// resolving each against the app model registry and its table metadata.
 fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, PreloadKind)> {
@@ -22108,8 +22200,16 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
             continue;
         }
         // The batch loaders match on one key column; a composite key's
-        // other columns stay on the lazy reader, which applies them.
-        if !assoc.extra_keys().is_empty() {
+        // other columns stay on the lazy reader, which applies them,
+        // except a plain has_many / has_one, whose batch matches every
+        // pair.
+        if !assoc.extra_keys().is_empty()
+            && !matches!(
+                assoc,
+                Association::HasMany { through: None, scope: None, as_interface: None, .. }
+                    | Association::HasOne { through: None, scope: None, as_interface: None, .. }
+            )
+        {
             continue;
         }
         match assoc {
@@ -22167,8 +22267,9 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     name.as_str().to_string(),
                     PreloadKind::HasMany {
                         fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
+                        owner_key: owner_key_reader(model, assoc),
                         target: target.0.as_str().to_string(),
+                        extra: extra_key_pairs(model, assoc),
                     },
                 ));
             }
@@ -22186,8 +22287,9 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     name.as_str().to_string(),
                     PreloadKind::HasOne {
                         fk: foreign_key.as_str().to_string(),
-                        owner_key: assoc.owner_key().as_str().to_string(),
+                        owner_key: owner_key_reader(model, assoc),
                         target: target.0.as_str().to_string(),
+                        extra: extra_key_pairs(model, assoc),
                     },
                 ));
             }
@@ -22381,7 +22483,13 @@ end
 "#
                 );
             }
-            PreloadKind::HasMany { fk, owner_key, target } => {
+            PreloadKind::HasMany { fk, owner_key, target, extra } if !extra.is_empty() => {
+                src.push_str(&composite_preload_batch(name, fk, owner_key, target, extra, true));
+            }
+            PreloadKind::HasOne { fk, owner_key, target, extra } if !extra.is_empty() => {
+                src.push_str(&composite_preload_batch(name, fk, owner_key, target, extra, false));
+            }
+            PreloadKind::HasMany { fk, owner_key, target, .. } => {
                 let collect_keys = collect_owner_keys(owner_key);
                 let _ = write!(
                     src,
@@ -22409,7 +22517,7 @@ end
 "#
                 );
             }
-            PreloadKind::HasOne { fk, owner_key, target } => {
+            PreloadKind::HasOne { fk, owner_key, target, .. } => {
                 let collect_keys = collect_owner_keys(owner_key);
                 let _ = write!(
                     src,
