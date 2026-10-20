@@ -539,7 +539,11 @@ pub(crate) fn validation_statements_split<'v>(
                 let read_by_send = any_assoc
                     || read_through_method(model, &v.attribute, attr_ty)
                     || (!matches!(rule, ValidationRule::Numericality { .. }) && overrides_reader(model, &v.attribute))
-                    || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. });
+                    || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. })
+                    // A temporal column keeps its text in `@<attr>_raw`
+                    // and `@<attr>` is never assigned; presence reads the
+                    // stored text itself, every other rule the reader.
+                    || (is_temporal(attr_ty) && !matches!(rule, ValidationRule::Presence));
                 let value = if read_by_send {
                     reader
                 } else if matches!(rule, ValidationRule::Numericality { .. }) {
@@ -1781,6 +1785,12 @@ fn local_stem(attr: &Symbol) -> &str {
     attr.as_str().trim_end_matches(['?', '!'])
 }
 
+/// Whether the column is temporal: a `Time` or a date-only `Date`
+/// (nullable or not). Both keep their text in `@<attr>_raw`.
+fn is_temporal(attr_ty: Option<&Ty>) -> bool {
+    matches!(peel_nilable(attr_ty).0, Some(Ty::Time | Ty::Date))
+}
+
 /// `@<attr>` — direct ivar read passed as the `value` positional arg
 /// to every validates_* helper.
 fn ivar(attr: &Symbol) -> Expr {
@@ -1821,7 +1831,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, value: &Expr, text
     // true` on Username rejected every record. Blank on the stored
     // form is nil-or-empty text. A nullable column types `Time | nil`,
     // which stores the same way.
-    if matches!(peel_nilable(attr_ty).0, Some(Ty::Time)) {
+    if is_temporal(attr_ty) {
         let raw_ivar = ivar(&Symbol::from(format!("{}_raw", attr.as_str())));
         let cond = bool_op(
             BoolOpKind::Or,
@@ -3307,6 +3317,21 @@ mod tests {
             let dbg = format!("{:?}", expr);
             assert!(dbg.contains("title_raw"), "{ty:?} should read @title_raw; tree: {dbg}");
             assert!(!dbg.contains("\"Array\""), "{ty:?} has no Array arm; tree: {dbg}");
+            assert_eq!(collect_error_messages(&expr), vec!["Title can't be blank"]);
+        }
+    }
+
+    #[test]
+    fn presence_of_a_date_attr_reads_the_stored_text() {
+        // A date-only column stores canonical text in `@<attr>_raw` as
+        // well: `validates :cycle_ends_at, presence: true` read the
+        // never-assigned `@cycle_ends_at` and rejected every record.
+        let a = attr();
+        let nullable = Ty::Union { variants: vec![Ty::Date, Ty::Nil].into() };
+        for ty in [Ty::Date, nullable] {
+            let expr = inline_presence_check(&a, Some(&ty), &ivar(&a), &plain(&a));
+            let dbg = format!("{:?}", expr);
+            assert!(dbg.contains("title_raw"), "{ty:?} should read @title_raw; tree: {dbg}");
             assert_eq!(collect_error_messages(&expr), vec!["Title can't be blank"]);
         }
     }
