@@ -591,6 +591,21 @@ module ActiveRecord
     end
     singleton_class.send(:remove_method, :create!) if singleton_class.method_defined?(:create!, false)
 
+    # Rails' `attr_readonly :a, :b`: the names `readonly_attributes`
+    # answers, a subclass's added to its superclass's. Recorded only: an
+    # UPDATE still writes them and assigning one to a persisted record does
+    # not raise, which Rails does.
+    def self.attr_readonly(*names)
+      @_readonly_attributes = readonly_attributes | names.map { |name| name.to_s }
+      nil
+    end
+
+    def self.readonly_attributes
+      own = @_readonly_attributes
+      return own unless own.nil?
+      superclass.respond_to?(:readonly_attributes) ? superclass.readonly_attributes : []
+    end
+
     # Rails' `create!` saves with `save!` (`object.save!`), so a halted
     # save raises RecordNotSaved.
     def self.create!(attrs = {}, &block)

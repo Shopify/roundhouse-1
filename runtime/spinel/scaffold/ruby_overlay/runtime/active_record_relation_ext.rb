@@ -498,6 +498,24 @@ def aliased_join_sql(owner, reflection, kind)
   reflection_join_sql(owner, reflection, kind, join_alias_for(owner, reflection))
 end
 
+    # The table a `"table.column"` where key names, other than this
+    # relation's own; nil for any other key.
+    def dotted_reference(key)
+      return nil if key.is_a?(Array)
+      text = key.to_s
+      return nil unless text.include?(".")
+      qualifier = text.split(".").first.to_s.delete('"')
+      return nil if qualifier.empty? || qualifier == @table || qualifier == @model.table_name.to_s
+      qualifier
+    end
+
+    # A non-Array `?` or `:name` bind's SQL. A Relation is its own SQL
+    # (Rails' `replace_bind_variable`); anything else is quoted.
+    def bind_scalar_sql(value)
+      return value.to_sql if value.is_a?(Relation)
+      ActiveRecord.adapter.escape_value(value)
+    end
+
     # A nested where hash's column on its owner's table
     # (`where(condition_responders: {condition_id:})`): the owner's own
     # `alias_attribute` names the column, as `where(subdomain:)` does on

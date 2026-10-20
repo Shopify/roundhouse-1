@@ -1426,13 +1426,13 @@ module ActiveRecord
     def reference_tables(hash)
       added = []
       hash.each do |key, val|
-        if val.is_a?(Hash) && nested_hash?(key, val)
-          name = key.to_s
-        else
+        name = key.to_s
+        unless val.is_a?(Hash) && nested_hash?(key, val)
           # A dotted key (`where("definition.namespace": x)`) references
           # the table before the dot (predicate_builder `references`).
-          name = dotted_reference(key)
-          next if name.nil?
+          dotted = dotted_reference(key)
+          next if dotted.nil?
+          name = dotted
         end
         added << name unless @referenced.include?(name) || added.include?(name)
       end
@@ -3941,17 +3941,6 @@ module ActiveRecord
       end
     end
 
-    # The table a `"table.column"` where key names, other than this
-    # relation's own; nil for any other key.
-    def dotted_reference(key)
-      return nil if key.is_a?(Array)
-      text = key.to_s
-      return nil unless text.include?(".")
-      qualifier = text.split(".").first.to_s.delete('"')
-      return nil if qualifier.empty? || qualifier == @table || qualifier == @model.table_name.to_s
-      qualifier
-    end
-
     # A Hash value (callers check `is_a?(Hash)`) nests a table only when the key is not a column of this
     # model (predicate_builder `expand_from_hash`: `value.is_a?(Hash) &&
     # !table.has_column?(key)`): `where(context: {a: 1})` on a serialized
@@ -4257,8 +4246,7 @@ module ActiveRecord
     # escaped elements joined by commas, and an empty one as NULL. A
     # Relation is its own SQL (`replace_bind_variable`), a subquery.
     def bind_value_sql(value)
-      return value.to_sql if value.is_a?(Relation)
-      return ActiveRecord.adapter.escape_value(value) unless value.is_a?(Array)
+      return bind_scalar_sql(value) unless value.is_a?(Array)
       return "NULL" if value.empty?
       escape_list(value)
     end
