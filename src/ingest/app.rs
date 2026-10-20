@@ -4186,12 +4186,12 @@ fn keep_carried_body_statements(app: &mut App) {
         .library_classes
         .iter()
         .map(|lc| {
-            if !lc.unknown_calls.iter().any(|c| app_class_method_call(lc, c, app, &by_name)) {
+            if !lc.unknown_calls.iter().any(|c| is_self_writer_call(c) || app_class_method_call(lc, c, app, &by_name)) {
                 return Vec::new();
             }
             crate::emit::ruby::dropped_class_body_calls(lc, app)
                 .into_iter()
-                .filter(|c| app_class_method_call(lc, c, app, &by_name))
+                .filter(|c| is_self_writer_call(c) || app_class_method_call(lc, c, app, &by_name))
                 .filter_map(|c| lc.unknown_calls.iter().position(|u| std::ptr::eq(u, c)))
                 .collect()
         })
@@ -4274,6 +4274,24 @@ fn keep_carried_body_statements(app: &mut App) {
 /// `[…].m …` / `%i[…].m …`: a call whose receiver is a literal list.
 pub(super) fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
     matches!(&*call.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if matches!(&*r.node, crate::expr::ExprNode::Array { .. }))
+}
+
+/// `self.x = v` in a class body: a class-level attribute write through
+/// the writer the body (or an app superclass) defines. Ingest keeps it as
+/// a class-body call, replayed where the body replays; elsewhere it is a
+/// body statement, kept in place where the class answers the writer
+/// (`emit::ruby::carries_body_statement`), else the dropped call it was.
+/// Core's `MethodTimingRecorder < Module`: `class << self; attr_accessor
+/// :instances; end`, then `self.instances = []`.
+fn is_self_writer_call(call: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    matches!(&*call.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+        if matches!(&*r.node, ExprNode::SelfRef)
+            && args.len() == 1
+            && method.as_str().strip_suffix('=').is_some_and(|name| {
+                name.chars().next().is_some_and(|c| c == '_' || c.is_alphabetic())
+                    && name.chars().all(|c| c == '_' || c.is_alphanumeric())
+            }))
 }
 
 /// `Const.method(...)` in `lc`'s body where `Const`, looked up from
