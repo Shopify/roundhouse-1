@@ -17103,6 +17103,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || crate::lower::typed_store::replays_on_sti_subclass(lc, c, app)
                 || ruby2_keywords_call(lc, c)
                 || job_queue_adapter_assignment(lc, c, app)
+                || job_enqueue_after_commit_assignment(lc, c, app)
                 || splatted_delegate_call(c)
                 || podded_client_binding_call(c)
         })
@@ -17246,6 +17247,26 @@ fn job_queue_adapter_assignment(lc: &LibraryClass, call: &Expr, app: &App) -> bo
     matches!(&*value.node, ExprNode::Const { .. } | ExprNode::Lit { value: Literal::Sym { .. } })
         && !lc.is_module
         && crate::lower::job_class_side::job_class_names(&app.library_classes).contains(lc.name.0.as_str())
+}
+
+/// `self.enqueue_after_transaction_commit = true` (or `false`) in the body
+/// of a job on the ActiveJob::Callbacks port: the class attribute the
+/// port's `raw_enqueue` reads (runtime/spinel/active_job_callbacks.rb,
+/// `EnqueueAfterTransactionCommit`) to hold the enqueue until the open
+/// transaction commits. Replayed as written, where the value is a literal
+/// and the job is on the port; dropped, every port job read the app's
+/// `config.active_job.enqueue_after_transaction_commit`, so a job that
+/// opts out (`= false`) was deferred anyway. A job off the port keeps the
+/// payload plan's reading of the literal (`lower::job_payload`).
+fn job_enqueue_after_commit_assignment(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*call.node else { return false };
+    if method.as_str() != "enqueue_after_transaction_commit=" || !matches!(&*recv.node, ExprNode::SelfRef) {
+        return false;
+    }
+    let [value] = args.as_slice() else { return false };
+    matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } })
+        && !lc.is_module
+        && app.job_plans.iter().any(|p| p.port && p.job == lc.name.0.as_str())
 }
 
 /// `ruby2_keywords :a, :b` naming instance methods the class defines

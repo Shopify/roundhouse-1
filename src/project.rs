@@ -5392,6 +5392,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
     let deprecation_behavior = deprecation_behavior_block(app);
     let query_log_tags = query_log_tags_block(app);
+    let active_job_config = active_job_config_block(app);
     // Active Job's error classes (8.2.0.alpha enqueuing.rb, core.rb,
     // arguments.rb), which `require "active_job"` defines before app code.
     let job_errors = crate::runtime_files::read_to_string("runtime/spinel/active_job_errors.rb")
@@ -5972,6 +5973,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = at + deprecation_behavior.len();
             content.insert_str(at, &query_log_tags);
             let at = at + query_log_tags.len();
+            content.insert_str(at, &active_job_config);
+            let at = at + active_job_config.len();
             content.insert_str(at, &i18n_config);
             let at = at + i18n_config.len();
             content.insert_str(
@@ -7380,7 +7383,8 @@ fn test_case_load_hooks_block() -> String {
 /// ([`framework_load_hook_block`]): the app has initializers, or a
 /// support file or a carried railtie registers a hook.
 fn fires_framework_load_hooks(app: &App) -> bool {
-    if !app.initializer_programs.is_empty() {
+    // `active_job_config_block` waits on :active_job and :active_record.
+    if !app.initializer_programs.is_empty() || sets_active_job_enqueue_after_commit(app) {
         return true;
     }
     let mut registers = false;
@@ -7523,6 +7527,39 @@ fn deprecation_behavior_block(app: &App) -> String {
          # configure every registered deprecator (runtime/active_support_deprecation.rb).\n\
          Rails::Application.apply_deprecation_behavior({})\n",
         args.join(", ")
+    )
+}
+
+/// Whether the app's `config.active_job.enqueue_after_transaction_commit`
+/// was lifted onto the Application (the reader [`active_job_config_block`] reads).
+fn sets_active_job_enqueue_after_commit(app: &App) -> bool {
+    let reader = crate::ingest::app::applied_framework_config_reader("active_job.enqueue_after_transaction_commit");
+    app.rails_application.as_ref().is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == reader))
+}
+
+/// activejob 8.2.0.alpha railtie.rb:31
+/// (`active_job.enqueue_after_transaction_commit`): once Active Job and
+/// Active Record have loaded, the app's
+/// `config.active_job.enqueue_after_transaction_commit` becomes
+/// `ActiveJob::Base.enqueue_after_transaction_commit`, which every job
+/// class that sets nothing reads (runtime/active_job_callbacks.rb). The
+/// value is the reader ingest lifts onto the Application reopen
+/// (`ingest::app::APPLIED_FRAMEWORK_CONFIG_KEYS`); an app that never
+/// writes it leaves Rails' default (false).
+fn active_job_config_block(app: &App) -> String {
+    if !sets_active_job_enqueue_after_commit(app) {
+        return String::new();
+    }
+    let reader = crate::ingest::app::applied_framework_config_reader("active_job.enqueue_after_transaction_commit");
+    format!(
+        "# activejob's `active_job.enqueue_after_transaction_commit` initializer\n\
+         # (railtie.rb:31): the app's config.active_job value is the job base's\n\
+         # (runtime/active_job_callbacks.rb).\n\
+         ActiveSupport.on_load(:active_job) do\n  \
+           ActiveSupport.on_load(:active_record) do\n    \
+             ActiveJob::Base.enqueue_after_transaction_commit = Rails.application.{reader}\n  \
+           end\n\
+         end\n"
     )
 }
 

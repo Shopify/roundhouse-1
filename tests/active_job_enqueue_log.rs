@@ -72,6 +72,12 @@ class ThingTest < ActiveSupport::TestCase
     end
   end
 
+  test "enqueues a rooted job class" do
+    assert_enqueued_jobs 1, only: ::RootedJob do
+      nil
+    end
+  end
+
   test "enqueued with" do
     assert_enqueued_with(job: NotifyJob) do
       nil
@@ -191,4 +197,13 @@ fn job_classes_in_test_filters_become_names() {
         !ir.contains("Const { path: [Symbol(\"OtherJob\")] }"),
         "a filter-only job class must not survive as a constant:\n{ir}"
     );
+}
+
+/// A rooted constant (`only: ::RootedJob`) is the name the log records,
+/// without the leading `::` (Core's `only: ::ShopifyPayments::Job`).
+#[test]
+fn rooted_job_class_in_a_test_filter_becomes_its_name() {
+    let ir = test_bodies();
+    assert!(ir.contains("Str { value: \"RootedJob\" }"), "the rooted class must reach the helper as its name:\n{ir}");
+    assert!(!ir.contains("\"::RootedJob\""), "the name must not keep the rooted `::`:\n{ir}");
 }

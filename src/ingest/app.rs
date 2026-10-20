@@ -13785,6 +13785,7 @@ pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
         "active_record.maintain_test_schema",
         "runtime/database_configuration.rb DatabaseConfiguration.maintain_test_schema gates the boot schema load",
     ),
+    ("active_job.enqueue_after_transaction_commit", ENQUEUE_AFTER_COMMIT_APPLIED_BY),
     ("active_record.query_log_tags_enabled", QUERY_LOG_TAGS_APPLIED_BY),
     ("active_record.query_log_tags", QUERY_LOG_TAGS_APPLIED_BY),
     ("active_record.query_log_tags_format", QUERY_LOG_TAGS_APPLIED_BY),
@@ -13805,6 +13806,14 @@ pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
     ("i18n.locale", I18N_APPLIED_BY),
     ("i18n.raise_on_missing_translations", I18N_APPLIED_BY),
 ];
+
+/// `active_job.enqueue_after_transaction_commit`: activejob 8.2.0.alpha
+/// railtie.rb:31 assigns the app's value to
+/// `ActiveJob::Base.enqueue_after_transaction_commit` once Active Job and
+/// Active Record have loaded (`project::active_job_config_block`); the
+/// ActiveJob::Callbacks port's `raw_enqueue` reads it.
+const ENQUEUE_AFTER_COMMIT_APPLIED_BY: &str =
+    "runtime/active_job_callbacks.rb ActiveJob::EnqueueAfterTransactionCommit#raw_enqueue";
 
 /// `active_record.query_log_tags_*` (`project::QUERY_LOG_TAGS_KEYS`):
 /// activerecord 8.2.0.alpha railtie.rb:405-437 puts QueryLogs among the

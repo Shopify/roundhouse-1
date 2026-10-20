@@ -33,6 +33,11 @@ SIDES = { "native" => "#{DATABASE}_n", "emitted" => "#{DATABASE}_e" }.freeze
 PROBE = ARGV.fetch(3)
 DDL = File.read(File.join(app_root, "db/structure.sql")).freeze
 LOADS = ARGV.drop(4).freeze
+# A probe that needs more than Active Record natively (Active Job, an app
+# config the emitted side reads from config/application.rb) ships
+# `native_prelude.rb` beside its files; native requires it after Active Record.
+PRELUDE = File.join(app_root, "native_prelude.rb").then { |file| file if File.exist?(file) }
+GEMS = (["activesupport", "activemodel", "activerecord"] + (PRELUDE ? ["activejob"] : [])).freeze
 
 def admin(options)
   conn = PG.connect(**options)
@@ -64,8 +69,9 @@ clean = %w[RAILS_ENV RACK_ENV DATABASE_URL ROUNDHOUSE_DATABASE_URL].to_h { |k| [
 endpoint = { host: admin_options[:host], port: admin_options[:port], username: admin_options[:user], database: SIDES["native"] }
 native_script = <<~RUBY
   require #{File.join(__dir__, "rails_oracle").inspect}
-  RailsOracle.activate("activesupport", "activemodel", "activerecord")
+  RailsOracle.activate(#{GEMS.map(&:inspect).join(", ")})
   require "active_record"
+  #{PRELUDE ? "require \"active_job\"\n  require #{PRELUDE.inspect}" : ""}
   # Rails puts the app's lib/ on $LOAD_PATH (railties engine.rb, paths["lib"]),
   # so an initializer's `require "x/y"` reads lib/x/y.rb.
   $LOAD_PATH.unshift(#{File.join(app_root, "lib").inspect})

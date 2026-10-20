@@ -755,6 +755,29 @@ module ActiveJob
       # Job#arguments or +false+ if the enqueue did not succeed.
       #
       # After the attempted enqueue, the job will be yielded to an optional block.
+      # `class_attribute :enqueue_after_transaction_commit,
+      # instance_accessor: false, instance_predicate: false, default: false`
+      # (enqueuing.rb:53): the value the nearest class that assigned one
+      # holds. ActiveJob::Base holds the app's
+      # `config.active_job.enqueue_after_transaction_commit`
+      # (`ActiveJob::Base.enqueue_after_transaction_commit=`, below), false
+      # until one is assigned.
+      def enqueue_after_transaction_commit
+        owner = self
+        until owner.nil?
+          if owner.instance_variable_defined?(:@enqueue_after_transaction_commit)
+            return owner.instance_variable_get(:@enqueue_after_transaction_commit)
+          end
+          owner = owner.superclass
+          owner = nil unless owner.respond_to?(:enqueue_after_transaction_commit)
+        end
+        false
+      end
+
+      def enqueue_after_transaction_commit=(value)
+        @enqueue_after_transaction_commit = value
+      end
+
       def perform_later(...)
         job = job_or_instantiate(...)
         enqueue_result = job.enqueue
@@ -860,14 +883,75 @@ module ActiveJob
       end
   end
 
+  # ActiveJob::EnqueueAfterTransactionCommit (enqueue_after_transaction_commit.rb):
+  # a job whose class sets `enqueue_after_transaction_commit` is not
+  # enqueued while a transaction is open. `raw_enqueue` hands the enqueue
+  # (callbacks and all) to `ActiveRecord.after_all_transactions_commit`,
+  # which runs it at once outside a transaction, once the outermost
+  # joinable transaction commits inside one, and never when one rolls
+  # back. The job answers as enqueued meanwhile (`successfully_enqueued?`
+  # true, `enqueue` answering the job), as Rails' does.
+  #
+  # Rails includes the module in ActiveJob::Base once Active Record has
+  # loaded. A tree with no `ActiveRecord.after_all_transactions_commit`
+  # (no Active Record transaction manager carried: the shared runtime's
+  # `Model.transaction` reports its edges to `ActiveRecord::TransactionHooks`
+  # instead) enqueues at once, here too.
+  module EnqueueAfterTransactionCommit # :nodoc:
+    private
+      def raw_enqueue
+        if self.class.enqueue_after_transaction_commit &&
+            defined?(::ActiveRecord) && ::ActiveRecord.respond_to?(:after_all_transactions_commit)
+          self.successfully_enqueued = true
+          ::ActiveRecord.after_all_transactions_commit do
+            self.successfully_enqueued = false
+            super
+          end
+          self
+        else
+          super
+        end
+      end
+  end
+
+  # The app's `config.active_job.enqueue_after_transaction_commit`
+  # (railtie.rb:31 assigns it on ActiveJob::Base): the shared runtime's
+  # no-op writer is replaced by the class attribute's, so a job class
+  # that sets nothing reads the app's value.
+  class Base
+    def self.enqueue_after_transaction_commit
+      defined?(@enqueue_after_transaction_commit) ? @enqueue_after_transaction_commit : false
+    end
+
+    def self.enqueue_after_transaction_commit=(value)
+      @enqueue_after_transaction_commit = value
+    end
+  end
+
   # Push many jobs onto the queue at once without running enqueue callbacks.
   # Queue adapters may communicate the enqueue status of each job by setting
   # successfully_enqueued and/or enqueue_error on the passed-in job instances.
   # (activejob/lib/active_job.rb. The shared adapter takes each job
   # through `_raw_enqueue`, in place of the per-adapter `enqueue_all`, and
   # there is no `instrument_enqueue_all`.)
+  #
+  # Each job's `enqueue_after_transaction_commit` is honoured as
+  # EnqueueAfterTransactionCommit::ActiveJobMethods does: the jobs that set
+  # it are enqueued once the transaction commits (at once outside one),
+  # the others now.
   def self.perform_all_later(*jobs)
     jobs.flatten!
+    if defined?(::ActiveRecord) && ::ActiveRecord.respond_to?(:after_all_transactions_commit)
+      deferred_jobs, immediate_jobs = jobs.partition { |job| job.class.enqueue_after_transaction_commit }
+      enqueue_all_now(immediate_jobs) if immediate_jobs.any?
+      ::ActiveRecord.after_all_transactions_commit { enqueue_all_now(deferred_jobs) } if deferred_jobs.any?
+    else
+      enqueue_all_now(jobs)
+    end
+    nil
+  end
+
+  def self.enqueue_all_now(jobs) # :nodoc:
     jobs.each do |job|
       job.successfully_enqueued = false
       job.enqueue_error = nil
@@ -1217,6 +1301,7 @@ module ActiveJob
       base.include QueueName
       base.include Enqueuing
       base.extend Enqueuing::ClassMethods
+      base.include EnqueueAfterTransactionCommit
       base.include ActiveSupport::Rescuable
       base.include Execution
       base.extend Execution::ClassMethods

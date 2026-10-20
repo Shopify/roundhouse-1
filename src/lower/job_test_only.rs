@@ -111,8 +111,11 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
 fn class_names(value: &Expr) -> Option<Vec<String>> {
     let one = |e: &Expr| match &*e.node {
         ExprNode::Const { path } => Some(
+            // A rooted constant (`::ShopifyPayments::Job`) carries an empty
+            // leading segment; the name the log records has none.
             path.iter()
                 .map(|s| s.as_str().trim_start_matches("::"))
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("::"),
         ),
