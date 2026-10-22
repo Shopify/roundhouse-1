@@ -59,6 +59,7 @@
 //! port, a lib file boot already loads, nor a standard library feature;
 //! and a statement that does not ingest as app code.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

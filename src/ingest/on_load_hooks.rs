@@ -44,6 +44,7 @@
 //! refused statement as its own `initializer_unsupported` gap with the
 //! reason. The rest of the hook runs without it.
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::det::HashSet;
 use std::path::{Path, PathBuf};
 

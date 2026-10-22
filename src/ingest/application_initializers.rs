@@ -26,6 +26,7 @@
 //! ingest as app code is returned with the reason instead, so the caller
 //! reports it; nothing is dropped silently.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::expr::Expr;

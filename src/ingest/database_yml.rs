@@ -26,6 +26,7 @@
 //! `__FILE__`, `binding`, ...), and ERB forms stdlib ERB itself rejects,
 //! are named refusals: never silently compiled differently.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::path::Path;
 
 use crate::App;

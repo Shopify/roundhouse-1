@@ -58,6 +58,7 @@
 //! (`error[environment_statement_not_carried]`) when it selects that
 //! environment.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};

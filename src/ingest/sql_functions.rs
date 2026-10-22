@@ -29,6 +29,7 @@
 //! is not of these shapes, is skipped: registering a function whose
 //! shape we guessed would answer SQL with the wrong values.
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::app::{SqlFunction, SqlFunctionKind};
 use crate::dialect::{MethodDef, MethodReceiver, Param};
 use crate::expr::{Expr, ExprNode};

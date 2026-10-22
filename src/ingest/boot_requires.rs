@@ -74,6 +74,7 @@
 //! statements are only requires and these has no program: the walk's
 //! boot loads already load it in its order.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 

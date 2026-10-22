@@ -64,6 +64,7 @@
 //! or by `TestMixins` for a test-dir module's that this module neither
 //! expanded nor named (`macro_call_expanded`).
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

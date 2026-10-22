@@ -14,6 +14,7 @@
 //!
 //! Thread-local like [`super::survey`], so concurrent tests don't bleed.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 
 use super::IngestError;

@@ -19,6 +19,7 @@
 //! and don't pull this module. The target enum lives in [`crate::build_target`]
 //! so lowering and Ruby emit can name a target on wasm.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

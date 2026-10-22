@@ -18,6 +18,7 @@
 //! [`SELF_BINDING`](crate::expr::SELF_BINDING), which the typer reads
 //! as the new type of `self`.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 
 use ruby_prism::Node;

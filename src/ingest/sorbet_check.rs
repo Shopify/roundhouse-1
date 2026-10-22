@@ -43,6 +43,7 @@
 //! value alone, as is `checked: false`.
 //! `project` refuses the lowered call on every tree but CRuby / JRuby.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::Symbol;

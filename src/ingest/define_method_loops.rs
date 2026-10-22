@@ -104,6 +104,7 @@
 //! Two such calls defining one name keep the later one, as the replay
 //! does (`shadow_replayed`).
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::App;
 use crate::det::{HashMap, HashSet};
 use crate::diagnostic::DiagnosticKind;

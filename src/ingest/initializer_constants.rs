@@ -39,6 +39,7 @@
 //! `X = Class.new(Parent)` class declarations, constant-path writes
 //! (`A::B = …`) and writes nested in a block, branch or body.
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::det::HashSet;
 
 use ruby_prism::Node;

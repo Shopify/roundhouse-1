@@ -32,6 +32,7 @@
 //!   loads that is not an initializer (`config/application.rb`'s class
 //!   body) is a gap of its own: no survey walks that file.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 use crate::det::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};

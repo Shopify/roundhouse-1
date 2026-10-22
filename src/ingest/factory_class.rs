@@ -33,6 +33,7 @@
 //! module body the block-less form stays that scope's constant, which
 //! `analyze::data` reads.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::{BlockNode, CallNode, ConstantWriteNode, Node};
 
 use crate::dialect::{LibraryClass, LibraryClassOrigin, MethodReceiver};

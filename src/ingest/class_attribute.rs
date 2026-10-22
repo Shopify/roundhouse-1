@@ -34,6 +34,7 @@
 //! are expanded; anything else (a splat, a computed flag, a non-literal
 //! name) leaves the declaration to the caller's unsupported path.
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::dialect::MethodDef;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol};

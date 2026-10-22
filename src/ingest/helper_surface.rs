@@ -20,6 +20,7 @@
 //! and every `format("%06i", n)` in every model was rewritten to
 //! `MoneyHelper.format(…)`.
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::dialect::{MethodDef, MethodReceiver};
 
 /// Source positions of singleton-defined methods in one file.

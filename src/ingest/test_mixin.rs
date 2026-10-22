@@ -51,6 +51,7 @@
 //! or DSL call), gets its includers refused; a statement whose tests are not
 //! modeled (`generate_tests`, a computed name) records a gap on that module.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::dialect::{MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};

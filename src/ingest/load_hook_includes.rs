@@ -60,6 +60,7 @@
 //! first `require` are lifted (the hook's own `include` of a module the
 //! class already has is a no-op).
 
+use crate::ingest::prism_api::PrismLocation;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::{CallNode, Node};

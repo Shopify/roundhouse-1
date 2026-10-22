@@ -31,6 +31,7 @@
 //! (`String`, `T::Boolean`, a gem's) has no file of the tree to load and
 //! is not read. After the first call the reads load nothing.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::{Node, Visit};
 
 use crate::det::{HashMap, HashSet};

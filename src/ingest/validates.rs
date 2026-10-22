@@ -31,6 +31,7 @@
 //! that `roundhouse check` reports at the call, never a dropped or
 //! weakened check.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::dialect::{

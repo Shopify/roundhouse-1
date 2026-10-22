@@ -71,6 +71,7 @@
 //! object they share, or whose body assigns a bound variable again, is a
 //! named gap rather than a run that differs.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::rc::Rc;
 
 use ruby_prism::Node;

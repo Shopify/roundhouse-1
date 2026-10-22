@@ -49,6 +49,7 @@
 //! statements ingest. Anything else is left as it was, registered with the
 //! ported loader at run time.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::path::PathBuf;
 
 use ruby_prism::Node;

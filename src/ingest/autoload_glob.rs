@@ -28,6 +28,7 @@
 //! with `*`, `?` and `**/`. Anything else is not this shape, and the
 //! statement stays the walk's (reported where it is dropped).
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::det::HashMap;

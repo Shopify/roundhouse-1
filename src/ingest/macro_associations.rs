@@ -21,6 +21,7 @@
 //! declares that association with the options the call passes on
 //! ([`fixed_association`]).
 
+use crate::ingest::prism_api::PrismLocation;
 use crate::dialect::{MethodDef, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::Symbol;

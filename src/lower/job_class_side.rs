@@ -23,6 +23,7 @@
 //! ingest); runs on the post-analyze hook so every target's tree
 //! carries the wrappers.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::collections::BTreeSet;
 
 use crate::app::App;

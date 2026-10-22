@@ -7,6 +7,7 @@
 //! resolution, so this emitter is shorter than the TS analog: no ivar
 //! field block, no import partition.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::collections::{BTreeMap, BTreeSet};
 use crate::det::HashMap;
 use std::fmt::Write;

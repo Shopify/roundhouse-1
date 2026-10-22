@@ -5,6 +5,7 @@
 //! `module`, whose bodies are sequences of `test "name" do ... end`
 //! declarations.
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::Node;
 
 use crate::dialect::{

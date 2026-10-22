@@ -34,6 +34,7 @@
 //! write under `if` is not lifted.
 
 
+use crate::ingest::prism_api::PrismLocation;
 use ruby_prism::{Node, Visit};
 
 use super::util::{class_name_path, constant_id_str, flatten_statements, module_name_path};

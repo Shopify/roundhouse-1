@@ -103,6 +103,7 @@
 //! `ingest::app` drains it after the support walk and resolves the
 //! carried files against each loader.
 
+use crate::ingest::prism_api::PrismLocation;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
