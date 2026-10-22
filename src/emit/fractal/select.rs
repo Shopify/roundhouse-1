@@ -35,7 +35,7 @@ impl Selection {
         }
         let mut bodies: Vec<(String, Span)> = app
             .const_resolver
-            .for_sources(&app.sources)
+            .for_app(app)
             .class_bodies()
             .into_iter()
             .filter(|(_, span)| out.iter().any(|(f, _)| *f == span.file))

@@ -282,7 +282,7 @@ fn replay(statement: &Expr, owner: &ClassId, defaults: &mut indexmap::IndexMap<S
     let Some(program) = parsed.node().as_program_node() else { return unknown() };
     let mut items = Vec::new();
     for stmt in program.statements().body().iter() {
-        match super::model::ingest_model_body_items(&stmt, owner, "<class macro>", Vec::new(), Some(&mut *defaults), &super::model::ClassConsts::default()) {
+        match super::model::ingest_model_body_items(&stmt, owner, "<class macro>", Vec::new(), Some(&mut *defaults)) {
             Ok(mut ingested) => {
                 for item in &mut ingested {
                     mark_constants(item);

@@ -6311,7 +6311,7 @@ fn class_body_define_method(
                 || pn.requireds().iter().any(|r| r.as_required_parameter_node().is_none())
                 || pn.rest().is_some_and(|r| r.as_rest_parameter_node().is_none_or(|r| r.name().is_none()))
                 || pn.keyword_rest().is_some_and(|k| k.as_keyword_rest_parameter_node().is_none_or(|k| k.name().is_none()))
-                || pn.block().is_some_and(|b| b.name().is_none());
+                || super::prism_api::block_parameter(&pn).is_some_and(|b| b.name().is_none());
             if anonymous {
                 return Ok(None);
             }
@@ -8143,7 +8143,7 @@ pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId,
     let (has, _probe_diags) = super::prism::scope(|| {
         super::survey::without_recording(|| {
             stmts.iter().any(|stmt| {
-                super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None, &super::model::ClassConsts::default())
+                super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None)
                     .is_ok_and(|items| items.iter().any(super::concern_accessors::is_candidate))
             })
         })

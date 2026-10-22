@@ -20040,7 +20040,7 @@ fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
     if classes.is_empty()
         || !classes.iter().all(|c| c.is_module && c.origin.is_none())
         || is_model_named(owner, app)
-        || file_owner(owner, app, classes) != owner
+        || file_owner(owner, app, &app.library_classes) != owner
         // What the emit adds to a class by name (`extend`s, forwarders)
         // would be written into the constant's file too.
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
@@ -20050,7 +20050,7 @@ fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
         return None;
     }
     let qualified = format!("{owner}::{constant}");
-    if is_model_or_library_class(&qualified, app, classes) {
+    if is_model_or_library_class(&qualified, app, &app.library_classes) {
         return None;
     }
     let (holder, value) = classes.iter().find_map(|c| {
@@ -20145,7 +20145,7 @@ fn nested_file_constant(lc: &LibraryClass, constant: &str, app: &App) -> Option<
     if classes.is_empty()
         || !classes.iter().all(|c| c.is_module && c.origin.is_none())
         || is_model_named(owner, app)
-        || file_owner(owner, app, classes) != owner
+        || file_owner(owner, app, &app.library_classes) != owner
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
         || app.class_methods_blocks.contains_key(&classes[0].name)
         || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
@@ -20223,7 +20223,7 @@ fn statement_file(owner: &str, call: &Expr, app: &App) -> Option<String> {
     if classes.is_empty()
         || !classes.iter().all(|c| c.is_module && c.origin.is_none())
         || is_model_named(owner, app)
-        || file_owner(owner, app, classes) != owner
+        || file_owner(owner, app, &app.library_classes) != owner
     {
         return None;
     }
@@ -20254,7 +20254,7 @@ fn statement_file(owner: &str, call: &Expr, app: &App) -> Option<String> {
         .map(|c| c.name.0.as_str().trim_start_matches("::"))
         .filter(|name| name.starts_with(&prefix) && crate::naming::underscore(name) == stem)
         .find(|name| {
-            file_owner(name, app, classes) == *name
+            file_owner(name, app, &app.library_classes) == *name
                 && (declared_files(name, app).contains(&file) || body_files(name, app).contains(&file))
         })
         .map(str::to_string)
@@ -20280,7 +20280,7 @@ fn constant_file_for_path(path: &[String], app: &App, self_name: &str) -> Option
     }
     for scope in scopes {
         let classes = library_classes_named(&scope, app);
-        let defines = is_model_or_library_class(&format!("{scope}::{constant}"), app, classes)
+        let defines = is_model_or_library_class(&format!("{scope}::{constant}"), app, &app.library_classes)
             || classes.iter().any(|c| c.constants.iter().any(|(n, _)| n.as_str() == constant.as_str()));
         if defines {
             return constant_file(&scope, constant, app);
@@ -20349,7 +20349,7 @@ fn program_constants(lc: &LibraryClass, app: &App) -> Vec<(usize, String)> {
     if classes.is_empty()
         || !classes.iter().all(|c| c.is_module && c.origin.is_none())
         || is_model_named(owner, app)
-        || file_owner(owner, app, classes) != owner
+        || file_owner(owner, app, &app.library_classes) != owner
         || app.class_methods_carrier_splices.contains_key(&classes[0].name)
         || app.class_methods_blocks.contains_key(&classes[0].name)
         || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
@@ -22649,7 +22649,7 @@ end
 fn touches_default_scoped(model: &crate::dialect::Model, assoc: &crate::dialect::Association, app: &App) -> bool {
     use crate::dialect::Association;
     let scoped = |id: &ClassId| {
-        app.models.iter().any(|m| &m.name == id && crate::lower::default_scope::static_default_scope(m).is_some())
+        app.models.iter().any(|m| &m.name == id && crate::lower::default_scope::declares(m))
     };
     let (target, through) = match assoc {
         Association::BelongsTo { target, .. } => (target, None),

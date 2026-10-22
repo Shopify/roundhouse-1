@@ -2,7 +2,7 @@
 //! at ingest from `config/application.rb`, `config/environments/
 //! production.rb` and `config/initializers`, the last setting winning.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::diagnostic::{Diagnostic, DiagnosticKind};

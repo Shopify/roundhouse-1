@@ -3,7 +3,7 @@
 //! same body are that evidence: `double = ->(n) { n * 2 }; double.call(4)`
 //! types `n` as Integer.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::Param as RubyParam;
 use crate::expr::{Expr, ExprNode, LValue, Literal};

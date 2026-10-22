@@ -558,7 +558,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         // plain-read message its own.
         details_args = match &symbol_type {
             Some(t) => Some((str_lit(span, t.as_str()), msg.clone())),
-            None if msg.hint.is_none() && reads_without_effect_deep(&msg) => Some((msg.clone(), msg.clone())),
+            None if msg.hint().is_none() && reads_without_effect_deep(&msg) => Some((msg.clone(), msg.clone())),
             None => None,
         };
         let field_s = typed(
@@ -618,7 +618,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         _ => None,
     };
     if invalid_type {
-        message.hint = Some(crate::expr::IrHint::InvalidErrorType);
+        message.set_hint(Some(crate::expr::IrHint::InvalidErrorType));
     }
     let owner = match recv.as_ref().map(|r| &*r.node) {
         Some(ExprNode::Send { recv: owner, .. }) => owner.clone(),
@@ -628,7 +628,7 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
         span,
         ExprNode::Send { recv, method: Symbol::from("<<"), args: vec![message], block: None, parenthesized: false },
     );
-    push_message.hint = attribute;
+    push_message.set_hint(attribute);
     push_message.ty = recv_ty;
     // Every tree also keeps the push's `ErrorDetail` on the record.
     let (kind, bare) = details_args.expect("the record and message are plain reads");

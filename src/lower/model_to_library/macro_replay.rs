@@ -326,7 +326,7 @@ fn body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
 /// not count.
 fn emitted_raise(e: &Expr) -> Option<String> {
     use crate::diagnostic::DiagnosticKind;
-    match &e.diagnostic {
+    match e.diagnostic() {
         Some(DiagnosticKind::Unsupported { construct, detail, .. }) => {
             let as_written = (e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
                 && matches!(construct.as_str(), "declared type" | "constant"))
@@ -365,7 +365,7 @@ fn first_emitted_raise(e: &Expr) -> Option<String> {
 /// and the other targets read; the replay runs the macro itself, as Ruby
 /// does, so its own statement emits as written.
 fn expansion_refused(call: &Expr) -> bool {
-    matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+    matches!(call.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
         if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL)
 }
 
@@ -1798,7 +1798,7 @@ pub fn replay_model_macros(app: &mut crate::App) {
             if spans.contains(&expr.span) {
                 let mut expr = expr.clone();
                 if expansion_refused(&expr) {
-                    expr.diagnostic = None;
+                    expr.set_diagnostic(None);
                 }
                 if let Some(guarded) = guard_alias_method(&expr) {
                     expr = guarded;

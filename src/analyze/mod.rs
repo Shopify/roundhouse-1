@@ -52,7 +52,7 @@ mod body;
 mod class_configuration;
 mod data;
 mod class_new;
-pub(crate) use body::{indexed_pluck, string_answers};
+pub(crate) use body::{indexed_pluck, lexical_class, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
 pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index};
@@ -540,7 +540,7 @@ impl Analyzer {
 
             let mut cls = ClassInfo::default();
             cls.table = Some(model.table.clone());
-            cls.default_scoped = crate::lower::default_scope::static_default_scope(model).is_some();
+            cls.default_scoped = crate::lower::default_scope::declares(model);
             cls.attributes = model.attributes.clone();
             cls.primary_key = model.primary_key.clone().or_else(|| app.schema.tables.get(&model.table.0)
                 .and_then(|table| table.columns.iter().find(|column| column.primary_key))
@@ -11771,6 +11771,10 @@ mod concern_method_snapshot_tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
+            method_aliases: Vec::new(),
+            top_level_constants: Vec::new(),
+            conditional_definitions: Vec::new(),
         }
     }
 

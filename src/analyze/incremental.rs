@@ -209,7 +209,7 @@ fn walk(h: &mut Mix, e: &Expr) {
         None => h.write_u8(0),
     }
     h.write_u64(e.decisions);
-    if let Some(d) = &e.diagnostic {
+    if let Some(d) = e.diagnostic() {
         h.write(format!("{d:?}").as_bytes());
     }
     e.node.for_each_child(&mut |c| walk(h, c));

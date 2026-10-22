@@ -1831,6 +1831,8 @@ pub(super) mod consts {
 
     use ruby_prism::Node;
 
+    use crate::ingest::prism_api::PrismLocation;
+
     use super::super::super::sources;
     use super::super::super::util::{constant_id_str, flatten_statements};
     use super::{eval, Env, Mode, Value};

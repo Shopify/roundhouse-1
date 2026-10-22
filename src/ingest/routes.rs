@@ -2243,7 +2243,7 @@ fn redirect_status_from_call(call: &ruby_prism::CallNode<'_>) -> Option<u16> {
 }
 
 fn redirect_expression_is_string(expr: &crate::expr::Expr) -> bool {
-    redirect_expression_is_string_in(expr, &mut HashSet::new())
+    redirect_expression_is_string_in(expr, &mut HashSet::default())
 }
 
 /// A redirect block's value is a string. Locals count once this block

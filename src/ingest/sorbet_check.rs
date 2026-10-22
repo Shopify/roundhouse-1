@@ -561,7 +561,7 @@ pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<E
                 let loc = ty.location();
                 let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
                 let mut refused = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
-                refused.diagnostic = Some(refusal(reason));
+                refused.set_diagnostic(Some(refusal(reason)));
                 refused
             }
         }
@@ -609,7 +609,7 @@ pub(crate) fn alias_ty(expr: &Expr) -> Option<crate::ty::Ty> {
         return None;
     }
     let ExprNode::Lambda { body, .. } = &*block.node else { return None };
-    if body.diagnostic.is_some() {
+    if body.diagnostic().is_some() {
         // An alias no check reads (`alias_value`): untyped, as sorbet's
         // static reading of a member it cannot name would be.
         return Some(crate::ty::Ty::Untyped);

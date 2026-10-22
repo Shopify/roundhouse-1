@@ -833,7 +833,7 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         // already refused or rejected (reported above) is one gap with
         // its specific row: an `as_json` refused as an unported Object
         // extension is not also a method missing from its receiver.
-        ExprNode::Send { recv: Some(r), method, .. } if !explains_send(expr.diagnostic.as_ref()) => {
+        ExprNode::Send { recv: Some(r), method, .. } if !explains_send(expr.diagnostic().as_ref()) => {
             if !is_unknown_ty(r.ty.as_ref()) && is_unknown_ty(expr.ty.as_ref()) {
                 let recv_ty = r.ty.clone().unwrap_or_else(|| Ty::Var { var: crate::ident::TyVar(0) });
                 let kind = DiagnosticKind::SendDispatchFailed {

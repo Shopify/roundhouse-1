@@ -150,7 +150,7 @@ fn scope(module: &TestModule) -> Scope {
 }
 
 fn collect(expr: &Expr, scope: &Scope, app_namespace: &dyn Fn(&str) -> bool, out: &mut Found) {
-    if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
+    if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = expr.diagnostic() {
         let provided = match &*expr.node {
             ExprNode::Const { path } => {
                 let rooted = path[0].as_str().is_empty();

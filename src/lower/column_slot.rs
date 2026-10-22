@@ -395,6 +395,7 @@ mod tests {
             generated: None,
             generated_text_compatible: None,
             generated_int4_compatible: None,
+            default_function: false,
         }
     }
 

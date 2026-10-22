@@ -52,8 +52,8 @@ use crate::ty::Ty;
 /// Error`s, which the lowered read of the record's `error_details` does
 /// not. Every other target emits `new`.
 pub(crate) fn port_form(orig: Expr, mut new: Expr) -> Expr {
-    if orig.decisions & crate::expr::ERRORS_PORT_CALL != 0 && new.hint.is_none() {
-        new.hint = Some(crate::expr::IrHint::ErrorsPortOriginal(crate::expr::PortOriginal(Box::new(orig))));
+    if orig.decisions & crate::expr::ERRORS_PORT_CALL != 0 && new.hint().is_none() {
+        new.set_hint(Some(crate::expr::IrHint::ErrorsPortOriginal(crate::expr::PortOriginal(Box::new(orig)))));
     }
     new
 }
@@ -124,7 +124,7 @@ fn is_port_details(e: &Expr) -> bool {
             _ => false,
         }
     }
-    match &e.hint {
+    match e.hint() {
         Some(crate::expr::IrHint::ErrorsPortOriginal(original)) => written(&original.0),
         _ => match &*e.node {
             // `errors.details[:body]`, one attribute's entries.

@@ -2604,13 +2604,15 @@ fn raw_accessor_calls_to_super(e: &mut Expr) {
 /// checks and its transaction-callback chains (`lineage` the classes
 /// above it, `subclass_macros::lineage`). A hook starts with `super`:
 /// Rails' subclass chain is a copy of its model's with the subclass's
-/// callbacks appended. A method the subclass defines wins.
+/// callbacks appended. A method the subclass defines wins. Only the ruby
+/// family emits subclass views, so the runtime relation is present.
 pub(crate) fn push_subclass_model_methods(methods: &mut Vec<MethodDef>, view: &Model, lineage: &[Model], models: &[Model]) {
     let mut synthesized = Vec::new();
-    associations::push_association_methods(&mut synthesized, view, models);
+    let through_joins = ThroughJoins::decide(view, models);
+    associations::push_association_methods(&mut synthesized, view, models, &through_joins, RuntimeRelation::Present);
     let mut hooks = Vec::new();
     let mut lifted_callbacks = Vec::new();
-    push_dependent_destroy(&mut hooks, view);
+    push_dependent_destroy(&mut hooks, view, &through_joins);
     push_callback_methods(&mut hooks, &mut lifted_callbacks, view);
     for hook in &mut hooks {
         if hook.receiver != MethodReceiver::Instance || !hook.params.is_empty() {

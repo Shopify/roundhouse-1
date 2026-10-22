@@ -13,7 +13,7 @@ pub(crate) fn reader_columns(
     method: &Symbol,
     args: &[Expr],
     block: Option<&Expr>,
-    materialized: &std::collections::HashSet<Symbol>,
+    materialized: &crate::det::HashSet<Symbol>,
 ) -> Option<Vec<Symbol>> {
     if method.as_str() != "pluck" || block.is_some() || args.is_empty() {
         return None;

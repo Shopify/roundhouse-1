@@ -399,7 +399,7 @@ fn list_invalid_type_errors(expr: &mut Expr, messages: &[String]) {
         return;
     }
     let [message] = args.as_mut_slice() else { return };
-    let listed = message.hint == Some(crate::expr::IrHint::InvalidErrorType)
+    let listed = *message.hint() == Some(crate::expr::IrHint::InvalidErrorType)
         && matches!(&*message.node, ExprNode::Lit { value: Literal::Str { value } } if messages.contains(value));
     if listed {
         let text = message.clone();

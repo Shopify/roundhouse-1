@@ -69,6 +69,7 @@ fn rewrite_node(expr: &mut Expr) {
             block_param: None,
             body: work_body,
             block_style: BlockStyle::Brace,
+            signature: Default::default(),
         },
     );
     args.push(work);

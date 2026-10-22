@@ -10,7 +10,7 @@ use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{MethodDef, ModelBodyItem};
 use crate::ident::ClassId;
-use crate::ingest::model::{ClassConsts, ingest_model_body_items};
+use crate::ingest::model::ingest_model_body_items;
 use crate::ingest::prism::parse_silent;
 use crate::ingest::util::constant_id_str;
 use crate::span::SourceFile;
@@ -124,7 +124,7 @@ fn ingest_rewritten_body(
     let program = parsed.node().as_program_node()?;
     for stmt in program.statements().body().iter() {
         absorb_items(
-            ingest_model_body_items(&stmt, owner, file, Vec::new(), None, &ClassConsts::default()).ok()?,
+            ingest_model_body_items(&stmt, owner, file, Vec::new(), None).ok()?,
             methods,
             items,
         );

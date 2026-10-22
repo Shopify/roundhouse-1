@@ -704,7 +704,7 @@ fn refused_statement(stmt: &Node<'_>, file: &str, err: &IngestError) -> Expr {
     let span = Span { file: super::sources::file_id(file), start: start as u32, end: end as u32 };
     let IngestError::Unsupported { message, .. } = err else { unreachable!("only Unsupported is refused") };
     let mut expr = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
-    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused { detail: message.clone() });
+    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::IngestRefused { detail: message.clone() }));
     expr
 }
 
@@ -1047,7 +1047,7 @@ pub(super) fn source_file_path_lit(span: Span, path: String) -> Expr {
 /// the check would.
 fn sorbet_check_refused(span: Span, reason: &str) -> Expr {
     let mut expr = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
-    expr.diagnostic = Some(super::sorbet_check::refusal(reason.to_string()));
+    expr.set_diagnostic(Some(super::sorbet_check::refusal(reason.to_string())));
     expr
 }
 
@@ -1117,9 +1117,9 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         return Ok(match check {
             None => ascribed,
             // Refused off a self binding: the refusal is the value's.
-            Some(refused) if !self_bind && refused.diagnostic.is_some() => {
-                if ascribed.diagnostic.is_none() {
-                    ascribed.diagnostic = refused.diagnostic;
+            Some(mut refused) if !self_bind && refused.diagnostic().is_some() => {
+                if ascribed.diagnostic().is_none() {
+                    ascribed.set_diagnostic(refused.take_diagnostic());
                 }
                 ascribed
             }
@@ -4180,7 +4180,7 @@ fn block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Opti
     let Some(block) = params_node
         .and_then(|node| node.as_block_parameters_node())
         .and_then(|node| node.parameters())
-        .and_then(|params| params.block())
+        .and_then(|params| super::prism_api::block_parameter(&params))
     else {
         return Ok(None);
     };
@@ -4236,14 +4236,14 @@ fn refused_block_signature(
         end: loc.end_offset() as u32,
     };
     let mut body = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
-    body.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused {
+    body.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::IngestRefused {
         detail: format!(
             "block/lambda parameter{} {} not represented in block IR; the block was refused rather than run without {}",
             if unrepresented.len() == 1 { "" } else { "s" },
             unrepresented.join(", "),
             if unrepresented.len() == 1 { "it" } else { "them" },
         ),
-    });
+    }));
     Some(Expr::new(
         span,
         ExprNode::Lambda { signature: Default::default(), extra_params: Vec::new(),

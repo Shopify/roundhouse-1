@@ -431,7 +431,7 @@ pub(crate) fn rewrite_node(
                 *r = read;
             }
         }
-        expr.hint = Some(crate::expr::IrHint::AssociationProxy);
+        expr.set_hint(Some(crate::expr::IrHint::AssociationProxy));
         return;
     }
     let flat = if target_read {
@@ -769,7 +769,7 @@ fn rewrite_association_target(
     // declared association's read back (`emit::ruby::expr`). The other
     // trees keep the reader, which loads.
     if declared {
-        rewritten.hint = Some(crate::expr::IrHint::AssociationTarget);
+        rewritten.set_hint(Some(crate::expr::IrHint::AssociationTarget));
     }
     *expr = rewritten;
     true
@@ -791,7 +791,7 @@ pub(crate) fn materialize_association_targets(expr: &mut Expr) {
         expr.ty = ty;
         return;
     }
-    if expr.hint != Some(crate::expr::IrHint::AssociationTarget) {
+    if *expr.hint() != Some(crate::expr::IrHint::AssociationTarget) {
         return;
     }
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return };
@@ -829,7 +829,7 @@ pub(crate) fn materialize_association_targets(expr: &mut Expr) {
 /// :reload)` (runtime/spinel/active_record_associations.rb), for a tree
 /// that carries the association object (the caller gates).
 pub(crate) fn association_proxy_call(expr: &Expr) -> Option<Expr> {
-    if expr.hint != Some(crate::expr::IrHint::AssociationProxy) {
+    if *expr.hint() != Some(crate::expr::IrHint::AssociationProxy) {
         return None;
     }
     let ExprNode::Send { recv: Some(inner), method: call, args, block: None, .. } = &*expr.node else {

@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn views_keep_parameterize_and_still_ground_humanize() {
-        use std::collections::HashMap;
+        use crate::det::HashMap;
         use std::path::PathBuf;
 
         let files: HashMap<PathBuf, Vec<u8>> = [

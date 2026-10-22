@@ -279,7 +279,7 @@ pub(crate) fn push_error_details(e: &mut Expr, i18n: &crate::i18n::ModelI18n) {
         return;
     }
     e.node.for_each_child_mut(&mut |c| push_error_details(c, i18n));
-    let Some(crate::expr::IrHint::ErrorAttribute(tag)) = &e.hint else { return };
+    let Some(crate::expr::IrHint::ErrorAttribute(tag)) = e.hint() else { return };
     if !is_errors_push(e) {
         return;
     }
@@ -294,7 +294,7 @@ pub(crate) fn push_error_details(e: &mut Expr, i18n: &crate::i18n::ModelI18n) {
     let mut tag = tag.clone();
     if tag.short == crate::expr::ErrorShort::Unknown && !before.is_empty() && after.is_empty() {
         tag.short = crate::expr::ErrorShort::After(before);
-        e.hint = Some(crate::expr::IrHint::ErrorAttribute(tag.clone()));
+        e.set_hint(Some(crate::expr::IrHint::ErrorAttribute(tag.clone())));
     }
     let tag = &tag;
     // Rails' type for a String message is the message itself.
@@ -692,7 +692,7 @@ fn raise_instead_of_adding(check: &mut Expr, exception: &Expr) {
     if is_errors_push(check) {
         let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
         let message = args[0].clone();
-        check.hint = None;
+        check.set_hint(None);
         *check.node = ExprNode::Send {
             recv: None,
             method: Symbol::from("raise"),
@@ -786,9 +786,9 @@ pub(crate) fn tag_association_invalid(check: &mut Expr, attr: &Symbol, i18n: &cr
 /// `tag_error_attribute`, with the type and options Rails' Error keeps
 /// for each push (`errors.details`).
 fn tag_error_detail(check: &mut Expr, attr: &Symbol, detail: &crate::expr::ErrorDetail) {
-    if is_errors_push(check) && check.hint.is_none() {
+    if is_errors_push(check) && check.hint().is_none() {
         let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
-        check.hint = Some(crate::expr::IrHint::ErrorAttribute(error_tag(attr, &args[0], detail.clone())));
+        check.set_hint(Some(crate::expr::IrHint::ErrorAttribute(error_tag(attr, &args[0], detail.clone()))));
     }
     check.node.for_each_child_mut(&mut |c| tag_error_detail(c, attr, detail));
 }

@@ -337,6 +337,25 @@ fn model_for(model: &Model, schema: &Schema) -> String {
                     .map(|m| format!(", message: {}", crate::emit::ruby::expr::ruby_str_literal(&m.replace("%%", "%"))))
                     .unwrap_or_default();
                 for rule in &validation.rules {
+                    // `allow_nil:` / `allow_blank:` ride on a `Guarded` rule's
+                    // options; Sequel's format/numericality helpers take just
+                    // those two, so a rule guarded by anything more (a
+                    // `message:`, `if:`, `on:`, ...) stays unconverted.
+                    let (rule, allow_nil, allow_blank) = match rule {
+                        ValidationRule::Guarded { rule: inner, options }
+                            if matches!(
+                                **inner,
+                                ValidationRule::Format { .. } | ValidationRule::Numericality { .. }
+                            ) && (crate::dialect::RuleOptions {
+                                allow_nil: false,
+                                allow_blank: false,
+                                ..options.clone()
+                            }) == crate::dialect::RuleOptions::default() =>
+                        {
+                            (&**inner, options.allow_nil, options.allow_blank)
+                        }
+                        r => (r, false, false),
+                    };
                     match rule {
                         ValidationRule::Presence if !custom.is_empty() => {
                             validate_lines.push(format!("    validates_presence :{}{custom}", validation.attribute));
@@ -373,16 +392,16 @@ fn model_for(model: &Model, schema: &Schema) -> String {
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Format { pattern, flags, without: false, allow_nil, allow_blank } => {
+                        ValidationRule::Format { pattern, flags, without: false } => {
                             let body = crate::emit::shared::regex_literal::escape_regex_delimiters(pattern);
                             // Sequel's `allow_nil:` / `allow_blank:` (its
                             // `blank_object?` is Rails' `blank?`), as on the
                             // numericality helpers below.
                             let mut opts = String::new();
-                            if *allow_nil == Some(true) {
+                            if allow_nil {
                                 opts.push_str(", allow_nil: true");
                             }
-                            if *allow_blank == Some(true) {
+                            if allow_blank {
                                 opts.push_str(", allow_blank: true");
                             }
                             validate_lines.push(format!(
@@ -390,7 +409,7 @@ fn model_for(model: &Model, schema: &Schema) -> String {
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Numericality { only_integer, checks, allow_nil, allow_blank, .. }
+                        ValidationRule::Numericality { only_integer, checks }
                             if checks.iter().all(|c| numeric_check_operator(c).is_some()) =>
                         {
                             let helper =
@@ -401,10 +420,10 @@ fn model_for(model: &Model, schema: &Schema) -> String {
                             // under `allow_blank:`, on every helper the rule
                             // emits.
                             let mut opts = String::new();
-                            if *allow_nil == Some(true) {
+                            if allow_nil {
                                 opts.push_str(", allow_nil: true");
                             }
-                            if *allow_blank == Some(true) {
+                            if allow_blank {
                                 opts.push_str(", allow_blank: true");
                             }
                             validate_lines.push(format!(

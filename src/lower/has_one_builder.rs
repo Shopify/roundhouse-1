@@ -208,7 +208,7 @@ fn rewrite(expr: &mut Expr, table: &Builders, self_owner: Option<&ClassId>) {
     attrs.ty = Some(Ty::Untyped);
     // On the hash, which later rewrites of the constructor call keep
     // where they rebuild the call itself.
-    attrs.hint = Some(crate::expr::IrHint::SingularBuilder { method, synthesized });
+    attrs.set_hint(Some(crate::expr::IrHint::SingularBuilder { method, synthesized }));
     *expr = Expr::new(
         span,
         ExprNode::Send {

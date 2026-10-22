@@ -259,16 +259,16 @@ impl<'a> BodyTyper<'a> {
             _ => return None,
         };
         let fields = columns.iter().map(|name| {
-            let mut current = Some(id);
+            let mut current = Some(id.clone());
             for _ in 0..32 {
-                let class = self.classes().get(current?)?;
+                let class = self.classes().get(&current?)?;
                 if let Some(ty) = class.instance_methods.get(name) {
                     return Some(match ty {
                         Ty::Fn { ret, .. } => ret.as_ref().clone(),
                         value => value.clone(),
                     });
                 }
-                current = class.parent.as_ref();
+                current = class.parent.clone();
             }
             None
         }).collect::<Option<Vec<_>>>()?;

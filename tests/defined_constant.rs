@@ -105,7 +105,7 @@ fn argument_and_index_queries_stay_unsupported() {
         // the rest of the class is ingested.
         let source = format!("class Probe\n  def check\n    {guard}\n  end\nend\n");
         let body = method_body(&source);
-        let Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail }) = &body.diagnostic else {
+        let Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail }) = body.diagnostic() else {
             panic!("{guard}: not refused at its site: {body:?}");
         };
         assert!(detail.contains("defined? calls with arguments"), "{guard}: {detail}");

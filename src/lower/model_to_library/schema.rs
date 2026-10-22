@@ -596,7 +596,7 @@ pub(super) fn push_schema_methods(
     // lobsters emits.)
 
     // def initialize(attrs = {}); super(); per-column self.col = attrs[:col] [|| 0 for id]; end
-    methods.push(synth_initialize(owner, table, model, through_joins));
+    methods.push(synth_initialize(owner, table, model, models, through_joins));
 
     // def id; @identifier; end / def id=(value); @identifier = value; end
     // — when the key column is not called `id`. Rails' `record.id`
@@ -2815,6 +2815,7 @@ fn synth_initialize(
     owner: &ClassId,
     table: &Table,
     model: &Model,
+    models: &[Model],
     through_joins: &super::associations::ThroughJoins,
 ) -> MethodDef {
     let attrs = Symbol::from("attrs");
@@ -4853,10 +4854,13 @@ fn synth_update_hash(
 /// synthesizes for `table`, less what it synthesizes for the same table
 /// without columns. The Ruby family writes these into the module
 /// (`emit::ruby::library`); the IR keeps them on the model.
+///
+/// Only names are read, so the runtime relation, which shapes the bodies,
+/// is taken as present, as it is for its ruby-family caller.
 pub(crate) fn generated_attribute_method_names(model: &Model, models: &[Model], table: &Table) -> crate::det::HashSet<Symbol> {
     let instance_names = |t: &Table| -> crate::det::HashSet<Symbol> {
         let mut methods = Vec::new();
-        push_schema_methods(&mut methods, model, models, t);
+        push_schema_methods(&mut methods, model, models, t, &super::associations::ThroughJoins::decide(model, models));
         methods.into_iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name).collect()
     };
     let bare = Table { columns: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), ..table.clone() };
@@ -4869,7 +4873,7 @@ pub(crate) fn generated_attribute_method_names(model: &Model, models: &[Model], 
     // concern's `included` block) overrides them instead of being
     // shadowed by a class-body def.
     let mut attribute_api = Vec::new();
-    super::markers::push_attribute_api_methods(&mut attribute_api, model);
+    super::markers::push_attribute_api_methods(&mut attribute_api, model, super::RuntimeRelation::Present);
     names.extend(attribute_api.into_iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name));
     names
 }

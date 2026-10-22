@@ -124,7 +124,7 @@ impl Recipe {
             if !values_fold(&elements, consts) {
                 return None;
             }
-            let pairs = super::super::enum_label_pairs(elements.into_iter(), file, consts).ok()??;
+            let pairs = super::super::enum_label_pairs(elements.into_iter(), file, consts, &|_| None).ok()??;
             return literal_pairs(pairs).map(|pairs| Recipe::Fixed(Value::Map { pairs, indifferent: false }));
         }
         let call = node.as_call_node()?;

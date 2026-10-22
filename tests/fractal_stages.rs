@@ -4,7 +4,7 @@
 //! rewrote and declined. No pass is registered, so the passes here are
 //! test-only renames; this pins the view and `Cx::in_memory`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::analyze::Analyzer;

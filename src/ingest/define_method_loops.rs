@@ -434,7 +434,7 @@ impl<'a> Lineage<'a> {
 }
 
 fn refuse(call: &mut Expr, reason: String) {
-    call.diagnostic.get_or_insert(DiagnosticKind::Unsupported {
+    call.diagnostic_mut().get_or_insert(DiagnosticKind::Unsupported {
         target: None,
         construct: Symbol::from(REFUSAL_CONSTRUCT),
         detail: reason,
@@ -2352,7 +2352,7 @@ fn define_method_block_params(block: &ruby_prism::BlockNode<'_>) -> Result<Vec<S
         k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some())
     });
     let named_rest = list.rest().is_none_or(|r| r.as_rest_parameter_node().is_some_and(|r| r.name().is_some()));
-    let named_block = list.block().is_none_or(|b| b.name().is_some());
+    let named_block = list.block().is_none_or(|_| super::prism_api::block_parameter(&list).is_some_and(|b| b.name().is_some()));
     if !named_rest || !named_block || list.posts().iter().next().is_some() || !named_kwrest {
         return Err(
             "block parameters other than required, optional, named rest, keyword, named keyword-rest and named block ones"

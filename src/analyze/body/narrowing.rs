@@ -385,8 +385,8 @@ pub(super) fn narrow_locals(
     pred: &NarrowPred,
     then_branch: bool,
     current: &dyn Fn(&Symbol) -> Option<Ty>,
-) -> std::collections::HashMap<Symbol, Ty> {
-    let mut out = std::collections::HashMap::new();
+) -> crate::det::HashMap<Symbol, Ty> {
+    let mut out = crate::det::HashMap::default();
     narrowings(pred, then_branch, &mut |key, narrow| {
         if let VarKey::Local(name) = key {
             if let Some(ty) = out.get(name).cloned().or_else(|| current(name)) {
@@ -431,7 +431,7 @@ fn narrowings(pred: &NarrowPred, then_branch: bool, f: &mut dyn FnMut(&VarKey, &
         NarrowPred::SubclassOf(k, ty) | NarrowPred::NotSubclassOf(k, ty) => {
             let holds = matches!(pred, NarrowPred::SubclassOf(_, _)) == then_branch;
             if holds {
-                narrow_binding(&mut new_ctx, k, |current| narrow_class_object(current, ty));
+                f(k, &|current| narrow_class_object(current, ty));
             }
         }
         NarrowPred::IsPresent(k) | NarrowPred::IsBlank(k) => {

@@ -184,7 +184,7 @@ fn ingest<V: Vfs + ?Sized>(
                         &mut refusals,
                         at(to_template(loc.start_offset()), to_template(loc.end_offset())),
                         "database_yml_ruby",
-                        format!("`{PATH}`: the ERB code does not parse: {}", error.message()),
+                        format!("`{PATH}`: the ERB code does not parse: {}", super::prism_api::diagnostic_message(&error)),
                     );
                 }
                 // Tag code is copied byte for byte (a text literal never

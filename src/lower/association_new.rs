@@ -87,7 +87,7 @@ pub fn apply_association_new_lowering(app: &mut App) {
             // `new` as Rails' build; elsewhere it is left as written. The
             // last declaration of a name is the reader, so it alone
             // decides.
-            let mut names = HashMap::new();
+            let mut names = HashMap::default();
             for assoc in model.associations() {
                 let aliased = match assoc {
                     Association::HasMany { target, extension, .. }

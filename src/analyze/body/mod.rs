@@ -318,11 +318,6 @@ pub struct ClassInfo {
     /// singleton's ancestors, where a `class << self` body looks a
     /// constant up after its lexical scopes.
     pub extends: Vec<crate::ident::ClassId>,
-    /// The model declares a `default_scope` that `lower::default_scope`
-    /// reproduces at runtime: the arel pass leaves its queries (and its
-    /// STI subclasses', found through `parent`) on the runtime relation,
-    /// which applies the scope.
-    pub default_scoped: bool,
     /// Declared by a gem's RBI rather than by the app or the catalog
     /// (`crate::gem_boundary`). Its own table is the gem's whole
     /// declared surface, so a miss on the class itself is a real miss --
@@ -1993,11 +1988,6 @@ impl<'a> BodyTyper<'a> {
             current = self.classes().get(&id).and_then(|c| c.parent.clone());
         }
         false
-    }
-
-    fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
-        matches!(method.as_str(), "included" | "prepended" | "append_features" | "prepend_features")
-            && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes.get(id).is_some_and(|c| c.is_module && c.class_methods.contains_key(method)))
     }
 
     fn owns_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
@@ -4506,7 +4496,7 @@ impl<'a> BodyTyper<'a> {
                     );
                     let mut unknown_join = std::collections::HashSet::new();
                     if joins {
-                        let mut flowed = HashMap::new();
+                        let mut flowed = HashMap::default();
                         let _ = flow_locals(&exprs[i], &local_ctx.local_bindings, &mut flowed, &mut unknown_join);
                     }
                     for name in retired {
@@ -4600,7 +4590,7 @@ impl<'a> BodyTyper<'a> {
                         ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. }
                             | ExprNode::BeginRescue { .. } | ExprNode::BoolOp { .. })
                     {
-                        let mut flowed = HashMap::new();
+                        let mut flowed = HashMap::default();
                         let mut unknown = std::collections::HashSet::new();
                         if flow_locals(e, &local_ctx.local_bindings, &mut flowed, &mut unknown) {
                             for (name, ty) in flowed {
@@ -5751,7 +5741,7 @@ fn flow_locals(
         let mut names: Vec<&Symbol> = paths.iter().flat_map(|(w, _)| w.keys()).collect();
         names.sort();
         names.dedup();
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         for name in names {
             let mut tys = paths.iter().map(|(writes, narrowed)| {
                 writes.get(name).or_else(|| narrowed.get(name)).or_else(|| bound.get(name))
@@ -5821,7 +5811,7 @@ fn flow_locals(
                     Some(p) => narrowing::narrow_locals(p, then_side, &|name| {
                         flowed.get(name).or_else(|| bound.get(name)).cloned()
                     }),
-                    None => HashMap::new(),
+                    None => HashMap::default(),
                 };
                 // A name written before the branch (in the condition
                 // itself: `return if !(story = find_story)`) holds what
@@ -5845,13 +5835,13 @@ fn flow_locals(
                 let mut path = flowed.clone();
                 let completes = arm.guard.as_ref().is_none_or(|g| flow(g, &mut path, unknown))
                     && flow(&arm.body, &mut path, unknown);
-                if completes { paths.push((path, HashMap::new())); }
+                if completes { paths.push((path, HashMap::default())); }
             }
             // No catch-all arm: no arm may match, and the value is nil.
             let exhaustive = arms.iter().any(|a| {
                 matches!(a.pattern, crate::expr::Pattern::Wildcard) && a.guard.is_none()
             });
-            if !exhaustive { paths.push((flowed.clone(), HashMap::new())); }
+            if !exhaustive { paths.push((flowed.clone(), HashMap::default())); }
             match join(paths, bound) {
                 Some(joined) => { *flowed = joined; true }
                 None => false,
@@ -5864,14 +5854,14 @@ fn flow_locals(
             if !flow(cond, flowed, unknown) { return false; }
             let mut path = flowed.clone();
             flow(body, &mut path, unknown);
-            *flowed = join(vec![(flowed.clone(), HashMap::new()), (path, HashMap::new())], bound).unwrap_or_default();
+            *flowed = join(vec![(flowed.clone(), HashMap::default()), (path, HashMap::default())], bound).unwrap_or_default();
             true
         }
         ExprNode::BoolOp { left, right, .. } => {
             if !flow(left, flowed, unknown) { return false; }
             let mut path = flowed.clone();
-            let mut paths = vec![(flowed.clone(), HashMap::new())];
-            if flow(right, &mut path, unknown) { paths.push((path, HashMap::new())); }
+            let mut paths = vec![(flowed.clone(), HashMap::default())];
+            if flow(right, &mut path, unknown) { paths.push((path, HashMap::default())); }
             *flowed = join(paths, bound).unwrap_or_default();
             true
         }
@@ -5885,14 +5875,14 @@ fn flow_locals(
                     completes = flow(eb, &mut body_path, unknown);
                 }
             }
-            let entry = join(vec![(flowed.clone(), HashMap::new()), (body_path.clone(), HashMap::new())], bound)
+            let entry = join(vec![(flowed.clone(), HashMap::default()), (body_path.clone(), HashMap::default())], bound)
                 .unwrap_or_default();
             let mut paths = Vec::new();
-            if completes { paths.push((body_path, HashMap::new())); }
+            if completes { paths.push((body_path, HashMap::default())); }
             for rescue in rescues {
                 unknown.extend(rescue.binding.iter().cloned());
                 let mut path = entry.clone();
-                if flow(&rescue.body, &mut path, unknown) { paths.push((path, HashMap::new())); }
+                if flow(&rescue.body, &mut path, unknown) { paths.push((path, HashMap::default())); }
             }
             let joined = join(paths, bound);
             if let Some(ensure) = ensure {
@@ -8898,6 +8888,7 @@ mod tests {
                 value: empty_hash_lit(),
             }),
             block_style: Default::default(),
+            signature: Default::default(),
         });
         let arg_lambda = synth(ExprNode::Lambda {
             params: vec![],
@@ -8908,6 +8899,7 @@ mod tests {
                 value: empty_hash_lit(),
             }),
             block_style: Default::default(),
+            signature: Default::default(),
         });
         let mut body = synth(ExprNode::Send {
             recv: None,
@@ -8955,6 +8947,7 @@ mod tests {
                     value: empty_hash_lit(),
                 }),
                 block_style: Default::default(),
+                signature: Default::default(),
             });
             let mut body = synth(ExprNode::Send {
                 recv: None,

@@ -263,7 +263,7 @@ fn span_of(node: &Node<'_>, file: &str) -> Span {
 /// reported as `ingest_unsupported` (see `ingest::expr::refused_statement`).
 fn refusal(node: &Node<'_>, file: &str, detail: String) -> Expr {
     let mut expr = Expr::new(span_of(node, file), ExprNode::Lit { value: Literal::Nil });
-    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused { detail });
+    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::IngestRefused { detail }));
     expr
 }
 

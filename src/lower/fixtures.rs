@@ -706,6 +706,7 @@ pub fn column_cast_type(col: &ColumnType) -> &'static str {
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Uuid => "uuid",
+        ColumnType::Interval => "interval",
     }
 }
 

@@ -1976,7 +1976,7 @@ fn supply_accessor(
     use crate::dialect::{AccessorKind, MethodVisibility};
 
     let refuse = |detail: String| (expr.span, format!("concern attr_accessor on {owner}: {detail}"));
-    if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic
+    if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = expr.diagnostic()
         && detail != SHAPE_DETAIL
     {
         refusals.push((expr.span, format!("{construct} on {owner} {detail}")));

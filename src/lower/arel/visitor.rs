@@ -991,9 +991,9 @@ fn visit_insert(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Expr {
                 Span::synthetic(), None, "postgresql_insert_identity", detail,
             ));
             let mut stub = nil_lit();
-            stub.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+            stub.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                 target: None, construct: Symbol::from("postgresql_insert_identity"), detail: detail.into(),
-            });
+            }));
             return stub;
         }
         segments.push(lit_str(format!(" RETURNING {}", dialect.ident(keys[0].name.as_str()))));
@@ -1627,12 +1627,12 @@ mod tests {
         });
         schema.tables.get_mut(&Symbol::from("articles")).unwrap().columns[0].primary_key = false;
         let no_key = PostgresVisitor.visit(&op, &schema, &owner);
-        assert!(matches!(no_key.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
+        assert!(matches!(no_key.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
         let columns = &mut schema.tables.get_mut(&Symbol::from("articles")).unwrap().columns;
         columns[0].primary_key = true;
         columns[1].primary_key = true;
         let composite = PostgresVisitor.visit(&op, &schema, &owner);
-        assert!(matches!(composite.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
+        assert!(matches!(composite.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
     }
 
     #[test]

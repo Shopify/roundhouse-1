@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use super::super::EmittedFile;
 
 use crate::dialect::{
-    AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility,
+    AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver, MethodVisibility,
 };
 use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
 use crate::ty::{Param, ParamKind, Ty};

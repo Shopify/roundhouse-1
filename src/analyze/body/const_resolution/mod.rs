@@ -519,7 +519,7 @@ pub struct DefinitionIndex {
 /// answers. Cheaper than ingest: it parses each file once for constants
 /// and resolves names, and keeps nothing else.
 pub(crate) fn definition_index(sources: &[SourceFile]) -> DefinitionIndex {
-    let mut graph = crate::timings::phase("rubydex: index", || index_sources(sources));
+    let mut graph = crate::timings::phase("rubydex: index", || index_sources(sources, false));
     crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
     let app_paths: HashSet<&str> = sources.iter().map(|source| source.path.as_str()).collect();
     let mut index = DefinitionIndex::default();
@@ -927,7 +927,7 @@ impl PreparedConstResolver {
         self.for_sources_with(sources, false)
     }
 
-    fn for_sources_with(&self, sources: &[SourceFile], postgresql_runtime: bool) -> Arc<ConstResolver> {
+    pub(crate) fn for_sources_with(&self, sources: &[SourceFile], postgresql_runtime: bool) -> Arc<ConstResolver> {
         match &self.0 {
             Some(resolver)
                 if resolver.source_fingerprint == source_fingerprint(sources)
@@ -1270,7 +1270,7 @@ fn answer_file(
     };
     let mut bare_values = Vec::new();
     // Positions a whole-path reference filled, which an exact one replaces.
-    let mut path_keys = HashSet::new();
+    let mut path_keys = HashSet::default();
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;

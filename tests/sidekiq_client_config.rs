@@ -3,7 +3,7 @@
 //! `config/initializers`. Other keys, and values in forms ingest doesn't
 //! read, are warnings and are left to the environment fallbacks.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::app::{RedisSetting, SidekiqRedisConfig};

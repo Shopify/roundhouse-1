@@ -427,7 +427,7 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 },
             );
             if messages {
-                each.hint = Some(crate::expr::IrHint::ErrorMessagesEach);
+                each.set_hint(Some(crate::expr::IrHint::ErrorMessagesEach));
             }
             vec![each]
         }

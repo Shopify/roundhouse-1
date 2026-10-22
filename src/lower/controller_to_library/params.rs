@@ -175,27 +175,6 @@ impl ParamsSpecs {
             .find(|s| &s.resource == resource && s.is_canonical)
     }
 
-    /// Record the association names whose foreign key matches an owner
-    /// column other than `id` (`primary_key:`). The parent-ivar rewrite
-    /// (`@article.comments.build` -> `Comment.new(article_id:
-    /// @article.id)`) derives the foreign key from the ivar's name and
-    /// reads `.id`, which is wrong for these, so it declines them and
-    /// the typed association seed (which reads the declaration) handles
-    /// the call instead.
-    pub fn mark_keyed_associations(&mut self, models: &[crate::dialect::Model]) {
-        for model in models {
-            for assoc in model.associations() {
-                if crate::lower::assoc_primary_key::keyed(assoc) {
-                    self.keyed_assocs.insert(assoc.name().clone());
-                }
-            }
-        }
-    }
-
-    pub fn is_keyed_assoc(&self, name: &Symbol) -> bool {
-        self.keyed_assocs.contains(name)
-    }
-
     /// Mark each spec's `has_one_attached` fields (see
     /// `ParamsSpec::file_fields`). The resource names its model the way
     /// `scan_create_demand` matches them — `snake_case(Model) ==

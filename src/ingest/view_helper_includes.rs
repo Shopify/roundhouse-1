@@ -203,6 +203,7 @@ fn resolve_name(written: &ClassId, scope: &ClassId, names: &HashSet<ClassId>) ->
 
 /// Settle one class-body call of `owner`. Returns whether it stays.
 fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &mut Vec<ClassId>) -> bool {
+    let already_refused = call.diagnostic().is_some();
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *call.node else { return true };
     let side = match method.as_str() {
         "include" => Side::Instance,
@@ -210,7 +211,7 @@ fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &m
         _ => return true,
     };
     let markers: Vec<String> = args.iter().filter_map(marker_path).collect();
-    if markers.is_empty() || call.diagnostic.is_some() {
+    if markers.is_empty() || already_refused {
         return true;
     }
     let mut refusals = Vec::new();
@@ -220,11 +221,11 @@ fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &m
         }
     }
     if !refusals.is_empty() {
-        call.diagnostic = Some(DiagnosticKind::Unsupported {
+        call.set_diagnostic(Some(DiagnosticKind::Unsupported {
             target: None,
             construct: Symbol::from(CONSTRUCT),
             detail: refusals.join("; "),
-        });
+        }));
         return true;
     }
     // Answered: the include contributes nothing the emitted tree needs,

@@ -162,11 +162,11 @@ fn real_app_extension_selection_keeps_first_of_either_name_not_innermost_first()
         "Widget::Registry" => 0, "Registry" => 1, _ => 2,
     });
     let widget = app.library_classes.iter().find(|c| c.name.0.as_str() == "Widget").unwrap();
-    let scanned = app_extension_calls(widget, &app, &app.library_classes).iter().map(|e| super::super::emit_expr(e)).collect::<Vec<_>>();
+    let scanned = app_extension_calls(widget, &app).iter().map(|e| super::super::emit_expr(e)).collect::<Vec<_>>();
     assert!(scanned.iter().any(|s| s.trim() == "nested"));
     assert!(!scanned.iter().any(|s| s.trim() == "top"));
     let _guard = install_lookup_indexes(&app);
-    assert_eq!(app_extension_calls(widget, &app, &app.library_classes).iter().map(|e| super::super::emit_expr(e)).collect::<Vec<_>>(), scanned);
+    assert_eq!(app_extension_calls(widget, &app).iter().map(|e| super::super::emit_expr(e)).collect::<Vec<_>>(), scanned);
     assert_eq!(output(emit_library_class_decls(&app)), uncached(|| output(emit_library_class_decls(&app))));
 }
 
@@ -427,12 +427,12 @@ fn namespace_prefix_set_reuses_original_algorithm_without_changing_shadowing() {
     app.library_classes = classes("module Outer::Catalog\n VALUE = 1\nend\nclass Catalog::Base\n def label; 1; end\nend\nclass Root::Leaf\n def label; 1; end\nend\n");
     app.library_classes.iter_mut().find(|c| c.name.0.as_str() == "Root::Leaf").unwrap().name = ClassId(Symbol::from("::Root::Leaf"));
     let names = ["ModelSpace", "ModelSpace::Record", "Model", "Outer", "Outer::Catalog", "Outer::Cat", "Catalog", "Catalog::Base", "Root", "Root::Leaf", "Missing"];
-    let expected = names.map(|name| declares_constant_path(name, &app, &app.library_classes));
+    let expected = names.map(|name| declares_constant_path(name, &app));
     let qualified = lexically_qualified("Catalog::Base", &["Outer"], &app, &app.library_classes);
     assert_eq!(qualified, "::Catalog::Base");
     reset();
     let _guard = install_lookup_indexes(&app);
-    assert_eq!(names.map(|name| declares_constant_path(name, &app, &app.library_classes)), expected);
+    assert_eq!(names.map(|name| app_constant_paths(&app, &app.library_classes).contains(name)), expected);
     assert_eq!(lexically_qualified("Catalog::Base", &["Outer"], &app, &app.library_classes), qualified);
     assert_eq!(CONSTANT_PATH_BUILDS.get(), 1);
     assert_eq!(output(emit_library_class_decls(&app)), uncached(|| output(emit_library_class_decls(&app))));

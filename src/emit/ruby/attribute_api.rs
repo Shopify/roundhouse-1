@@ -298,5 +298,6 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
         ColumnType::Json | ColumnType::Jsonb => spec("json", None),
         ColumnType::Uuid if pg => spec("uuid", None),
         ColumnType::Uuid => unported("a uuid column type"),
+        ColumnType::Interval => unported("an interval column type"),
     }
 }

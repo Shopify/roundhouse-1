@@ -202,7 +202,7 @@ pub fn default_scope_gaps_for_target(app: &App, target: crate::build_target::Bui
     }
     let mut out = Vec::new();
     for model in &app.models {
-        if crate::lower::default_scope::static_default_scope(model).is_none() {
+        if !crate::lower::default_scope::declares(model) {
             continue;
         }
         let Some(item) = model.body.iter().find(|item| {

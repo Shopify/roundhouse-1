@@ -2200,6 +2200,10 @@ end
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
+            method_aliases: Vec::new(),
+            top_level_constants: Vec::new(),
+            conditional_definitions: Vec::new(),
         });
     }
 
@@ -3229,7 +3233,8 @@ end
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
     let const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
-    super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
+    let postgresql_runtime = app.carries_postgresql_runtime();
+    super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources_with(&sources, postgresql_runtime));
     // Ours-only: a relative `include` of a synthesized (load-hook) reopen has no
     // source position of its own for the resolution above, so it resolves lexically here.
     qualify_relative_includes(&mut app);
@@ -5031,10 +5036,12 @@ fn gap_numericality_allow_on_untyped(app: &mut App) {
                 continue;
             }
             for rule in &validation.rules {
-                if let ValidationRule::Numericality { allow_nil, allow_blank, .. } = rule {
-                    let option = if *allow_blank == Some(true) {
+                if let ValidationRule::Guarded { rule: inner, options } = rule
+                    && matches!(**inner, ValidationRule::Numericality { .. })
+                {
+                    let option = if options.allow_blank {
                         "allow_blank"
-                    } else if *allow_nil == Some(true) {
+                    } else if options.allow_nil {
                         "allow_nil"
                     } else {
                         continue;
@@ -6357,7 +6364,7 @@ fn refuse_copied_classvars(expr: &mut crate::expr::Expr, concern: &crate::ident:
         _ => false,
     };
     if classvar {
-        expr.diagnostic.get_or_insert(crate::diagnostic::DiagnosticKind::Unsupported {
+        expr.diagnostic_mut().get_or_insert(crate::diagnostic::DiagnosticKind::Unsupported {
             target: None,
             construct: crate::ident::Symbol::from("class variable in a copied concern class method"),
             detail: format!(

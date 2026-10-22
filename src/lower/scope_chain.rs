@@ -1709,6 +1709,7 @@ impl AssocRegistry {
             has_many_by_name: _,
             tables: _,
             has_many_unseedable,
+            has_many_unseedable_names,
             has_many_owner_key,
             assoc_extension,
             join_scoped,
@@ -1725,6 +1726,9 @@ impl AssocRegistry {
         aliased_join_tails.remove(&key);
         has_many_fk.remove(&key);
         has_many_unseedable.remove(&key);
+        if !has_many_unseedable.iter().any(|(_, n)| n == name) {
+            has_many_unseedable_names.remove(name);
+        }
         has_many_owner_key.remove(&key);
         assoc_extension.remove(&key);
         join_scoped.remove(&key);
@@ -2124,7 +2128,6 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
             }
         }
     }
-    scope_join_tails(&mut reg, models);
     // By name once every owner is down to the declaration it keeps, so a
     // model redeclaring a name is one declarer, not two disagreeing ones.
     for ((_, name), entry) in &reg.has_many_fk {
@@ -2158,76 +2161,6 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
         }
     }
     reg
-}
-
-/// A join into a model with a default scope carries the scope's
-/// predicate in its ON clause, as Rails' association join does
-/// (`Shelf.joins(:gadgets)` reads `… ON gadgets.shelf_id = shelves.id
-/// AND gadgets.archived = FALSE`). A `through:` join touching a scoped
-/// model, or a scope this cannot render, keeps no tail: the join is not
-/// composed rather than composed without the scope.
-fn scope_join_tails(reg: &mut AssocRegistry, models: &[Model]) {
-    use super::default_scope::{sql_predicate, static_default_scope};
-    let scoped: HashMap<ClassId, Vec<(Symbol, Literal)>> = models
-        .iter()
-        .filter_map(|m| static_default_scope(m).map(|s| (m.name.clone(), s)))
-        .collect();
-    if scoped.is_empty() {
-        return;
-    }
-    let keys: Vec<((ClassId, Symbol), ClassId)> =
-        reg.assoc_target.iter().map(|(k, t)| (k.clone(), t.clone())).collect();
-    for ((owner, name), target) in keys {
-        let through = models
-            .iter()
-            .find(|m| m.name == owner)
-            .and_then(|m| {
-                m.associations().find_map(|a| match a {
-                    Association::HasMany { name: n, through: Some(thr), .. } if *n == name => {
-                        m.associations().find_map(|t| match t {
-                            Association::HasMany { name: tn, target: tt, .. } if tn == thr => Some(tt.clone()),
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-            });
-        let key = (owner.clone(), name.clone());
-        let through_scoped = through.as_ref().is_some_and(|t| scoped.contains_key(t));
-        let Some(preds) = scoped.get(&target) else {
-            if through_scoped {
-                reg.join_tails.remove(&key);
-                reg.aliased_join_tails.remove(&key);
-            }
-            continue;
-        };
-        if through.is_some() {
-            reg.join_tails.remove(&key);
-            reg.aliased_join_tails.remove(&key);
-            continue;
-        }
-        let table = reg.table_for(&target);
-        let render = |alias: &str| -> Option<String> {
-            preds
-                .iter()
-                .map(|(col, lit)| sql_predicate(alias, col, lit).map(|p| format!(" AND {p}")))
-                .collect()
-        };
-        match (render(&table), render(name.as_str())) {
-            (Some(plain), Some(aliased)) => {
-                if let Some(tail) = reg.join_tails.get_mut(&key) {
-                    tail.push_str(&plain);
-                }
-                if let Some(tail) = reg.aliased_join_tails.get_mut(&key) {
-                    tail.push_str(&aliased);
-                }
-            }
-            _ => {
-                reg.join_tails.remove(&key);
-                reg.aliased_join_tails.remove(&key);
-            }
-        }
-    }
 }
 
 /// What the parent-ivar rewrite reads off one declaration (see
@@ -5989,10 +5922,17 @@ pub fn rewrite_call_site_seeded(
         assoc_class_methods: regs.assoc_class_methods,
         scope_body: None,
         self_const_is_implicit: false,
+        scope_self_dispatch: false,
         class_self: class_self.cloned(),
+        class_self_is_self: false,
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
+        track_targets: regs.track_targets,
+        plain_subclasses: regs.plain_subclasses,
+        shadowed: regs.shadowed,
+        wrapped_inserts: regs.wrapped_inserts,
         owner_objects: regs.owner_objects,
+        stubbed_sends: regs.stubbed_sends,
     };
     let mut locals = Locals::default();
     for (name, value) in seeds {

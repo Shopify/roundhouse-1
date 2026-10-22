@@ -456,6 +456,10 @@ pub(super) fn ingest<V: Vfs + ?Sized>(
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
+            method_aliases: Vec::new(),
+            top_level_constants: Vec::new(),
+            conditional_definitions: Vec::new(),
         });
     rails.methods.append(&mut methods);
     Ok(())

@@ -692,7 +692,7 @@ pub(crate) fn reads_error_attribute_names(app: &App) -> bool {
         }
         // The lowered read of a call routed to the port is written back as
         // the call on the trees that carry it (`lower::errors_index::port_form`).
-        let routed = match &e.hint {
+        let routed = match e.hint() {
             Some(crate::expr::IrHint::ErrorsPortOriginal(original)) => &*original.0,
             _ => e,
         };

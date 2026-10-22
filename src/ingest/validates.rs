@@ -130,6 +130,9 @@ pub(super) fn parse_validation_call(
         return Ok(Some(vec![Validation {
             attribute: attrs.first().cloned().unwrap_or_else(|| Symbol::from("base")),
             rules: vec![ValidationRule::Unsupported { construct, detail }],
+            if_cond: None,
+            unless_cond: None,
+            message: None,
         }]));
     }
 
@@ -157,6 +160,9 @@ pub(super) fn parse_validation_call(
                 construct,
                 detail: "no validator named (ActiveModel raises \"You need to supply at least one validation\")".into(),
             }],
+            if_cond: None,
+            unless_cond: None,
+            message: None,
         }]));
     }
 
@@ -181,6 +187,9 @@ pub(super) fn parse_validation_call(
                             construct: format!("`validates {key}:`"),
                             detail: detail.clone(),
                         }],
+                        if_cond: None,
+                        unless_cond: None,
+                        message: None,
                     });
                 }
                 continue;
@@ -199,7 +208,13 @@ pub(super) fn parse_validation_call(
                 _ => validator_rule(&key, attr, &defaults, &entries, None, bang, file)?,
             };
             if let Some(rule) = rule {
-                out.push(Validation { attribute: attr.clone(), rules: vec![rule] });
+                out.push(Validation {
+                    attribute: attr.clone(),
+                    rules: vec![rule],
+                    if_cond: None,
+                    unless_cond: None,
+                    message: None,
+                });
             }
         }
     }
@@ -207,7 +222,13 @@ pub(super) fn parse_validation_call(
     // which is the same run order.
     if attrs.len() == 1 && out.len() > 1 {
         let rules = out.drain(..).flat_map(|v| v.rules).collect();
-        out.push(Validation { attribute: attrs[0].clone(), rules });
+        out.push(Validation {
+            attribute: attrs[0].clone(),
+            rules,
+            if_cond: None,
+            unless_cond: None,
+            message: None,
+        });
     }
     // Empty when every validator was `key: false`/`nil`: nothing is declared.
     Ok(Some(out))
@@ -458,6 +479,9 @@ pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -
         Ok(Some(Validation {
             attribute: first_name.clone().unwrap_or_else(|| Symbol::from("base")),
             rules: vec![ValidationRule::Unsupported { construct: construct.clone(), detail }],
+            if_cond: None,
+            unless_cond: None,
+            message: None,
         }))
     };
     let mut entries: Vec<(String, Node<'_>)> = Vec::new();
@@ -590,7 +614,7 @@ pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -
     } else {
         rules.into_iter().map(|rule| ValidationRule::Guarded { rule: Box::new(rule), options: guard.clone() }).collect()
     };
-    Ok(Some(Validation { attribute, rules }))
+    Ok(Some(Validation { attribute, rules, if_cond: None, unless_cond: None, message: None }))
 }
 
 /// The validations the class-body statement at `start..end` of `text`

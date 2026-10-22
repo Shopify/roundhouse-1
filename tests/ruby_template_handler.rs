@@ -8,7 +8,7 @@
 //! of one `raw(( … ))` output, its ivars become the view's parameters,
 //! and the `format.rss` branch reaches it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

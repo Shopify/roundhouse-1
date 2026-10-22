@@ -30,7 +30,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::App;
 use crate::emit::{self, EmittedFile};
-use crate::gems::{GEM_REQUIRES, Marker, VARIATION_MARKER, compiler_runtime_gems};
+use crate::gems::{GEM_REQUIRES, Marker, VARIATION_MARKER};
 use crate::ingest::ingest_app;
 
 pub use crate::build_target::{BuildTarget, ParamBindCapability};
@@ -3066,7 +3066,7 @@ pub fn unparsable_ruby_files(files: &[(String, String)], target: BuildTarget) ->
         Some(UnparsableRuby {
             path: path.clone(),
             line: content.as_bytes()[..offset].iter().filter(|b| **b == b'\n').count() + 1,
-            message: error.message().to_string(),
+            message: crate::ingest::prism_api::diagnostic_message(&error),
         })
     };
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(32);

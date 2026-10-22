@@ -20,7 +20,7 @@
 //! own (`ClassConsts::collect` over its module body), under the same
 //! folding rules as a class body's.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::ValidationRule;

@@ -66,7 +66,7 @@ fn note_anonymous_restores(
                 );
                 let blocked = candidates.iter().any(|(lookup_owner, method)| {
                     hard_declaration_block(method)
-                        || contracts.unretained.contains(&method.name_span)
+                        || contracts.unretained(&method.name_span)
                         || contracts.reopened(lookup_owner)
                         || method
                             .enclosing_class
@@ -100,8 +100,8 @@ fn note_anonymous_restores(
 fn anonymous_packet(enclosing: &MethodDef, e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Send { args, .. } => has_source_packet(args),
-        ExprNode::Super { args: Some(args) } => has_source_packet(args),
-        ExprNode::Super { args: None } => enclosing.params.iter().any(|p| p.forwarding),
+        ExprNode::Super { args: Some(args), .. } => has_source_packet(args),
+        ExprNode::Super { args: None, .. } => enclosing.params.iter().any(|p| p.forwarding),
         _ => false,
     }
 }
@@ -112,8 +112,8 @@ fn source_packet_is_declared(enclosing: &MethodDef, e: &Expr) -> bool {
     }
     let args = match &*e.node {
         ExprNode::Send { args, .. } => Some(args.as_slice()),
-        ExprNode::Super { args: Some(args) } => Some(args.as_slice()),
-        ExprNode::Super { args: None } => None,
+        ExprNode::Super { args: Some(args), .. } => Some(args.as_slice()),
+        ExprNode::Super { args: None, .. } => None,
         _ => return false,
     };
     let keywords = args.is_some_and(|args| {
