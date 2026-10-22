@@ -1499,6 +1499,15 @@ impl Visibility {
                     "module_function on a nested singleton level or class-method carrier is not modeled",
                 ));
             }
+            // `concerning :Topic do … end` is a module of its own: its
+            // `def`s and `private` belong to `Owner::Topic`, whose
+            // visibility is resolved from the block's body when the
+            // library-class pass builds that module
+            // (`concerning_modules`), so a marker inside neither leaks
+            // into this body nor refuses the owner.
+            if !class_side && super::util::concerning_call(&statement).is_some() {
+                continue;
+            }
             // `included do def … end` is class_eval'd on each includer: a
             // body of its own that starts public, where `def self.x` is
             // the includer's class side. Its methods are kept on the
