@@ -1178,34 +1178,61 @@ pub fn rails_dependent_owner<'a>(
     app: &'a crate::App,
     detail: &str,
 ) -> Option<&'a crate::extensions::RailsDependentGem> {
+    let app_owned = AppConstants::of(app);
     app.extensions
         .rails_dependent
         .iter()
-        .find(|row| extension_owns_constant(app, &row.gem, detail))
+        .find(|row| extension_owns_constant(app, &app_owned, &row.gem, detail))
 }
 
-fn extension_owns_constant(app: &crate::App, gem: &str, path: &str) -> bool {
+/// Constants the app itself defines, indexed once so that asking whether a
+/// gem owns a path does not rescan every model, controller and class.
+struct AppConstants {
+    /// Names of models, controllers and library classes.
+    classes: crate::det::HashSet<String>,
+    /// `Owner::NAME` for each constant an app class or model body assigns.
+    values: crate::det::HashSet<String>,
+}
+
+impl AppConstants {
+    fn of(app: &crate::App) -> Self {
+        let mut classes = crate::det::HashSet::default();
+        let mut values = crate::det::HashSet::default();
+        classes.extend(app.models.iter().map(|model| model.name.0.as_str().to_string()));
+        classes.extend(app.controllers.iter().map(|controller| controller.name.0.as_str().to_string()));
+        classes.extend(app.library_classes.iter().map(|class| class.name.0.as_str().to_string()));
+        for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+            for (name, _) in &class.constants {
+                values.insert(format!("{}::{}", class.name.0.as_str(), name.as_str()));
+            }
+        }
+        for model in &app.models {
+            for item in &model.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                    if let crate::expr::ExprNode::Assign {
+                        target: crate::expr::LValue::Const { path: assigned }, ..
+                    } = &*expr.node {
+                        if let [name] = assigned.as_slice() {
+                            values.insert(format!("{}::{}", model.name.0.as_str(), name.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        AppConstants { classes, values }
+    }
+
+    fn defines(&self, path: &str) -> bool {
+        self.classes.contains(path) || self.values.contains(path)
+    }
+}
+
+fn extension_owns_constant(app: &crate::App, app_owned: &AppConstants, gem: &str, path: &str) -> bool {
     let path = path.trim_start_matches("::");
     if crate::gem_boundary::RUBY_CORE.contains(&path) {
         return false;
     }
-    if app.models.iter().any(|model| model.name.0.as_str() == path)
-        || app.controllers.iter().any(|controller| controller.name.0.as_str() == path)
-        || app.library_classes.iter().any(|class| class.name.0.as_str() == path)
-    {
-        return false;
-    }
-    let owns_value = |owner: &str, name: &str| {
-        path.strip_prefix(owner).and_then(|rest| rest.strip_prefix("::")) == Some(name)
-    };
-    if app.library_classes.iter().chain(app.rails_application.iter()).any(|class| {
-        class.constants.iter().any(|(name, _)| owns_value(class.name.0.as_str(), name.as_str()))
-    }) || app.models.iter().any(|model| model.body.iter().any(|item| {
-        matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
-            if matches!(&*expr.node, crate::expr::ExprNode::Assign {
-                target: crate::expr::LValue::Const { path: assigned }, ..
-            } if matches!(assigned.as_slice(), [name] if owns_value(model.name.0.as_str(), name.as_str()))))
-    })) {
+    if app_owned.defines(path) {
         return false;
     }
     if app.gem_boundary.classes.get(&crate::ident::ClassId(crate::ident::Symbol::from(path)))
@@ -1237,49 +1264,85 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
     {
         return Vec::new();
     }
-    fn refusal(app: &crate::App, target: Option<&str>, path: &str, span: Span) -> Option<Diagnostic> {
-        if let Some(row) = rails_dependent_owner(app, path) {
-            return Some(Diagnostic::unsupported(
-                span,
-                None,
-                "gem_requires_rails",
-                format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why),
-            ));
+/// What owns a constant path; the same path recurs across many references.
+#[derive(Clone, Copy)]
+enum Owner<'a> {
+    None,
+    RailsDependent(&'a crate::extensions::RailsDependentGem),
+    Native(&'a str),
+}
+struct Refuser<'a> {
+    app: &'a crate::App,
+    target: Option<&'a str>,
+    app_owned: AppConstants,
+    owners: std::cell::RefCell<crate::det::HashMap<String, Owner<'a>>>,
+}
+impl<'a> Refuser<'a> {
+    fn owner(&self, path: &str) -> Owner<'a> {
+        if let Some(owner) = self.owners.borrow().get(path) {
+            return *owner;
         }
-        let target = target.filter(|target| !matches!(*target, "ruby" | "jruby"))?;
-        let owner = app.extensions.runtime_gems.iter().map(|row| row.gem.as_str())
-            .chain(app.gem_boundary.loaded.iter().map(String::as_str))
-            .find(|gem| extension_owns_constant(app, gem, path))?;
-        Some(Diagnostic::unsupported(
+        let app = self.app;
+        let owner = if let Some(row) = app.extensions.rails_dependent.iter()
+            .find(|row| extension_owns_constant(app, &self.app_owned, &row.gem, path))
+        {
+            Owner::RailsDependent(row)
+        } else if self.target.is_some_and(|target| !matches!(target, "ruby" | "jruby")) {
+            app.extensions.runtime_gems.iter().map(|row| row.gem.as_str())
+                .chain(app.gem_boundary.loaded.iter().map(String::as_str))
+                .find(|gem| extension_owns_constant(app, &self.app_owned, gem, path))
+                .map_or(Owner::None, Owner::Native)
+        } else {
+            Owner::None
+        };
+        self.owners.borrow_mut().insert(path.to_string(), owner);
+        owner
+    }
+}
+fn refusal(refuser: &Refuser, path: &str, span: Span) -> Option<Diagnostic> {
+    match refuser.owner(path) {
+        Owner::RailsDependent(row) => Some(Diagnostic::unsupported(
             span,
-            Some(crate::ident::Symbol::from(target)),
-            "native_extension_gem",
-            format!("{path} is provided by gem {owner}; this target does not load native Ruby gems"),
-        ))
-    }
-    fn visit(
-        expr: &Expr, app: &crate::App, target: Option<&str>,
-        defined: &impl Fn(Span, &[crate::ident::Symbol]) -> bool, out: &mut Vec<Diagnostic>,
-    ) {
-        if let ExprNode::Const { path } = &*expr.node {
-            if expr.decisions & crate::expr::GENERATED_CONST_REF == 0 && defined(expr.span, path) {
-                return;
-            }
-            let path = path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::");
-            if let Some(diagnostic) = refusal(app, target, &path, expr.span) {
-                out.push(diagnostic);
-            }
+            None,
+            "gem_requires_rails",
+            format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why),
+        )),
+        Owner::Native(owner) => {
+            let target = refuser.target?;
+            Some(Diagnostic::unsupported(
+                span,
+                Some(crate::ident::Symbol::from(target)),
+                "native_extension_gem",
+                format!("{path} is provided by gem {owner}; this target does not load native Ruby gems"),
+            ))
         }
-        expr.node.for_each_child(&mut |child| visit(child, app, target, defined, out));
+        Owner::None => None,
     }
+}
+fn visit(
+    expr: &Expr, refuser: &Refuser,
+    defined: &impl Fn(Span, &[crate::ident::Symbol]) -> bool, out: &mut Vec<Diagnostic>,
+) {
+    if let ExprNode::Const { path } = &*expr.node {
+        if expr.decisions & crate::expr::GENERATED_CONST_REF == 0 && defined(expr.span, path) {
+            return;
+        }
+        let path = path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::");
+        if let Some(diagnostic) = refusal(refuser, &path, expr.span) {
+            out.push(diagnostic);
+        }
+    }
+    expr.node.for_each_child(&mut |child| visit(child, refuser, defined, out));
+}
+let refuser = Refuser { app, target, app_owned: AppConstants::of(app), owners: Default::default() };
     let mut out = Vec::new();
     let resolver = app.const_resolver.for_app(app);
     let defined = |span, path: &[crate::ident::Symbol]| resolver.has_definition(span, path);
-    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, app, target, &defined, &mut out));
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, &refuser, &defined, &mut out));
     for model in &app.models {
         for item in &model.body {
             if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
-                visit(expr, app, target, &defined, &mut out);
+                visit(expr, &refuser, &defined, &mut out);
             }
         }
     }
@@ -1289,7 +1352,7 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
             if defined_names.contains(parent.0.as_str()) {
                 continue;
             }
-            if let Some(diagnostic) = refusal(app, target, parent.0.as_str(), class.parent_span) {
+            if let Some(diagnostic) = refusal(&refuser, parent.0.as_str(), class.parent_span) {
                 out.push(diagnostic);
             }
         }
