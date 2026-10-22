@@ -44,7 +44,10 @@
 #                    adds it in a `Gemfile.falcon` beside the emit, at the
 #                    version tobi's lock pins, so the two lanes run the
 #                    same server.
-#     spinel         the roundhouse spinel BINARY, workers autodetected
+#     spinel         the roundhouse spinel BINARY, workers autodetected,
+#                    with Thruster's response cache in process
+#                    (runtime/spinel/tep/thruster_cache.rb), as the
+#                    CRuby lanes carry it and the rails lane has Thruster
 #     jruby          the roundhouse emit for the JVM (`--target jruby`:
 #                    the same tree over JDBC), ONE process, one Puma
 #                    thread per hardware thread — JRuby has no GVL, so
@@ -201,8 +204,16 @@
 #   --socket-per-room N     subscribers per room (default 50, which is
 #                     the shape the runtime ledger's tiers were measured
 #                     at; the sweep derives the room count from it)
+#   --ruby DIR        the CRuby every Ruby lane runs (rails, ruby,
+#                     ruby-falcon, tobi, the oracle's bundle, the socket
+#                     phase): an install prefix or its bin/. Default: the
+#                     newest plain mise MRI. The box's nightly passes the
+#                     build of ruby/ruby master that scripts/ruby-head-build
+#                     made, because Ruby head is the number Shopify's Ruby
+#                     team works from; env.json's `ruby -v` names its commit.
 #   --skip-prepare    reuse the oracle tree, emit and spinel binary
-#                     already on disk
+#                     already on disk (not across a change of --ruby: the
+#                     bundles belong to the Ruby that installed them)
 #   --keep            leave servers running on exit
 #
 # --http-suite: signed-in HTTP, optional gzip, 16 concurrent clients, the
@@ -339,6 +350,7 @@ while [[ $# -gt 0 ]]; do
         --socket-db)    SOCKET_DB="$2"; shift 2 ;;
         --socket-cookies) SOCKET_COOKIES="$2"; shift 2 ;;
         --socket-per-room) SOCKET_PER_ROOM="$2"; shift 2 ;;
+        --ruby)        RUBY_DIR="$2"; shift 2 ;;
         --skip-prepare) SKIP_PREPARE=1; shift ;;
         --keep)        KEEP=1; shift ;;
         -h|--help)     sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
@@ -348,6 +360,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 (( ${#LANES[@]} )) || LANES=(rails ruby spinel)
+if [[ -n "${RUBY_DIR:-}" ]]; then
+    [[ -x "$RUBY_DIR/bin/ruby" ]] && RUBY_DIR="$RUBY_DIR/bin"
+    [[ -x "$RUBY_DIR/ruby" ]] || { echo "bench-campfire: no ruby in --ruby $RUBY_DIR" >&2; exit 2; }
+    PATH="$(cd "$RUBY_DIR" && pwd -P):$PATH"
+    export PATH
+fi
 GET_LUA="$REPO_ROOT/scripts/bench-campfire-wrk-get.lua"
 POST_LUA="$REPO_ROOT/scripts/bench-campfire-wrk-post.lua"
 [[ -n "$OUT_DIR" ]] || OUT_DIR="$REPO_ROOT/bench/results/campfire-$(date +%Y%m%d-%H%M%S)"

@@ -58,9 +58,10 @@ pub(super) fn push_adapter_methods(
     table: &Table,
     schema: &Schema,
     dialect: SqlDialect,
+    param_binds: bool,
 ) {
     let owner = &model.name;
-    methods.push(synth_adapter_find_by_id(model, table, schema, dialect));
+    methods.push(synth_adapter_find_by_id(model, table, schema, dialect, param_binds));
     methods.push(synth_adapter_all(owner, table, schema, dialect));
     methods.push(synth_adapter_last(model, table, schema, dialect));
     methods.push(synth_adapter_insert(model, table, schema, dialect));
@@ -72,10 +73,14 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_adapter_delete(model, table, schema, dialect));
     methods.push(synth_adapter_count(owner, table, schema, dialect));
     methods.push(synth_adapter_any(owner, table, schema, dialect));
-    methods.push(synth_adapter_exists_by_id(model, table, schema, dialect));
+    methods.push(synth_adapter_exists_by_id(model, table, schema, dialect, param_binds));
     methods.push(synth_adapter_truncate(owner, table, schema, dialect));
-    methods.push(synth_delete_all(owner, table, dialect));
-    methods.push(synth_adapter_reload(model, table, dialect));
+    // A default-scoped model's `delete_all` deletes the rows its scope
+    // keeps: the runtime's `Base.delete_all` goes through its Relation.
+    if !crate::lower::default_scope::declares(model) {
+        methods.push(synth_delete_all(owner, table, dialect));
+    }
+    methods.push(synth_adapter_reload(model, table, dialect, param_binds));
     methods.push(synth_columns_sql(owner, table, dialect));
     methods.push(synth_hydrate_all(owner, dialect));
     if !model.query_constraints.is_empty() {
@@ -193,7 +198,7 @@ fn synth_primary_key_input(
     }
 }
 
-fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect, param_binds: bool) -> MethodDef {
     let owner = &model.name;
     let id = Symbol::from("id");
     let key_ty = key_ty(model, table);
@@ -219,7 +224,7 @@ fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, diale
         name: Symbol::from("_adapter_find_by_id"),
         receiver: MethodReceiver::Class,
         params: vec![Param::positional(id.clone())],
-        body: dialect.visit(&op, schema, owner),
+        body: dialect.visit_with_param_binds(&op, schema, owner, param_binds),
         signature: Some(fn_sig(vec![(id, key_ty)], nilable_owner)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -1055,7 +1060,7 @@ fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema, diale
 /// reload needs to write into self. Generalizing the visitor with
 /// a "hydrate target = bare ivar / passed-in symbol" option is the
 /// right cleanup once a second use surfaces.
-fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect, param_binds: bool) -> MethodDef {
     use crate::expr::{ExprNode, LValue, Literal};
     use crate::span::Span;
 
@@ -1076,12 +1081,13 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Placeholder-bind gate (roundhouse#12). Reload is a `Db.prepare`
+    // The same read-bind policy as the Arel visitor (roundhouse#12). Reload
+    // is a `Db.prepare`
     // read — it hits the prepared-statement cache with a per-id key when
     // inlined, so parameterize its `@id` predicate too, keeping it in
-    // step with the visitor-emitted find/exists paths. Gate off ⇒
+    // step with the visitor-emitted find/exists paths. Binding disabled ⇒
     // inline-escape, byte-identical to before.
-    let param = dialect == SqlDialect::Postgres || crate::lower::arel::visitor::param_binds_enabled();
+    let param = dialect == SqlDialect::Postgres || param_binds;
     // The key column and its ivar, bound with the key's type — the same
     // column the visitor-emitted find/exists paths compare.
     let key = key_column_name(model, table);

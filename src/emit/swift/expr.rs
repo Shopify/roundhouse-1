@@ -1171,7 +1171,7 @@ pub fn emit_expr(e: &Expr) -> String {
 /// append is amortized O(1)); mirrors `kotlin::expr::try_string_builder`.
 /// Non-hinted sites fall through to the normal walkers.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         crate::expr::IrHint::MutableStringLiteral => None, // emitted as the plain literal
         crate::expr::IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         crate::expr::IrHint::AssociationTarget | crate::expr::IrHint::AssociationProxy | crate::expr::IrHint::ErrorAttribute(_) | crate::expr::IrHint::ErrorAttributeLocal(_) | crate::expr::IrHint::InvalidErrorType | crate::expr::IrHint::ErrorMessagesEach | crate::expr::IrHint::ErrorsPortOriginal(_) | crate::expr::IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -1456,9 +1456,67 @@ fn emit_literal(lit: &Literal) -> String {
         Literal::Str { value } => format!("\"{}\"", escape_str(value)),
         // No symbol type in Swift → string.
         Literal::Sym { value } => format!("\"{}\"", escape_str(value.as_str())),
-        Literal::Regex { pattern, .. } => {
-            format!("try! NSRegularExpression(pattern: \"{}\")", escape_str(pattern))
+        Literal::Regex { pattern, flags } => {
+            let options = swift_regex_options(flags);
+            if options.is_empty() {
+                format!("try! NSRegularExpression(pattern: \"{}\")", escape_str(pattern))
+            } else {
+                format!(
+                    "try! NSRegularExpression(pattern: \"{}\", options: [{options}])",
+                    escape_str(pattern)
+                )
+            }
         }
+    }
+}
+
+/// Ruby regex flags this build can reproduce exactly: `i` →
+/// `.caseInsensitive`. Ruby's `m` (dot-matches-newline) is
+/// `.dotMatchesLineSeparators`. Ruby's `^`/`$` are always line
+/// anchors, so a flagged `m` also adds `.anchorsMatchLines`. Any
+/// other flag character stays an ingest-time gap, so none reaches
+/// here.
+fn swift_regex_options(flags: &str) -> String {
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
+    let mut parts: Vec<&str> = Vec::new();
+    if bits.ignore_case {
+        parts.push(".caseInsensitive");
+    }
+    if bits.dot_matches_newline {
+        parts.push(".dotMatchesLineSeparators");
+        parts.push(".anchorsMatchLines");
+    }
+    parts.join(", ")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(swift_regex_options("m"), ".dotMatchesLineSeparators, .anchorsMatchLines");
+    }
+
+    use super::{emit_literal, swift_regex_options};
+    use crate::expr::Literal;
+
+    #[test]
+    fn no_flags_drop_the_options_argument() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "".into() };
+        assert_eq!(emit_literal(&lit), r#"try! NSRegularExpression(pattern: "a.b")"#);
+    }
+
+    #[test]
+    fn ignore_case_maps_to_case_insensitive() {
+        assert_eq!(swift_regex_options("i"), ".caseInsensitive");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine_in_the_options_array() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "im".into() };
+        assert_eq!(
+            emit_literal(&lit),
+            r#"try! NSRegularExpression(pattern: "a.b", options: [.caseInsensitive, .dotMatchesLineSeparators, .anchorsMatchLines])"#
+        );
     }
 }
 
@@ -2588,6 +2646,10 @@ fn emit_send(
     args: &[Expr],
     block: Option<&Expr>,
 ) -> String {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
+        let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
     let args_s: Vec<String> = args.iter().map(emit_expr).collect();
 
     // Temporal reader intrinsic: `ActiveSupport.parse_db_time(s)` parses a

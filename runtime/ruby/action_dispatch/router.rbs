@@ -146,6 +146,8 @@ module ActionDispatch
     def self.segment_pattern_class_match: (String quant, String neg, String any, String set, String value, Integer start) -> Integer
     def self.segment_pattern_item_match: (String tag, String quant, String neg, String any, String text, String value, Integer start) -> Integer
     def self.segment_pattern_match: (String pattern, String value) -> bool
+    def self.segment_pattern_alt_match: (String pattern, String value) -> bool
+    def self.segment_pattern_seq_match: (String pattern, String value) -> bool
 
     # A decoded capture path-escaped again, as Rails fills a routing
     # redirect's `%{name}`; see the .rb. Byte-oriented after UTF-8 decode.

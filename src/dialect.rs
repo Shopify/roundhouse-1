@@ -824,6 +824,34 @@ pub enum Dependent {
 pub struct Validation {
     pub attribute: Symbol,
     pub rules: Vec<ValidationRule>,
+    /// `if: :pred` / `if: -> { … }` / `if: lambda { … }` / `if: proc { … }`.
+    /// A Symbol and a zero-arity lambda/proc both become the guard
+    /// expression `callback_condition` already builds for a callback:
+    /// a Symbol is the predicate called on the record, and a lambda
+    /// body is spliced where Rails `instance_exec`s it with `self` the
+    /// record. `None` runs the rules on every save. When both this and
+    /// `unless_cond` are set, the rules run only when `if:` holds and
+    /// `unless:` does not. Anything else (an arity>0 lambda, a String,
+    /// a captured local, a body survey mode had to stub with `nil`) is
+    /// not stored; ingest refuses the whole call instead of checking
+    /// unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_cond: Option<Expr>,
+    /// `unless:` — see `if_cond`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_cond: Option<Expr>,
+    /// A literal String `message:` from the rule's own hash, in place of
+    /// the default message for every error the rules record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Inclusive or exclusive numeric range from `inclusion: { in: 1..3 }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InclusionRange {
+    pub begin: f64,
+    pub end: f64,
+    pub exclusive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2047,6 +2075,8 @@ pub enum LibraryClassOrigin {
         members: Vec<Symbol>,
         span: Span,
     },
+    /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
+    Oj,
 }
 
 impl LibraryClassOrigin {

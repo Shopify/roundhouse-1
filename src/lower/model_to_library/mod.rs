@@ -10,8 +10,9 @@
 //! Rails DSL.
 //!
 //! This module is pure: input is one `Model` plus the app `Schema`, output
-//! is one `LibraryClass`. No side-effects, no per-target choices. Per-Rails-
-//! idiom lowering is a separate function so each can be tested in
+//! is one `LibraryClass`. No side-effects; target capabilities are supplied
+//! by the caller. Per-Rails-idiom lowering is a separate function so each
+//! can be tested in
 //! isolation (skeleton, schema columns, has_many, belongs_to, validates,
 //! callbacks, …).
 //!
@@ -50,7 +51,8 @@ use crate::schema::{Column, ColumnType, Schema, Table};
 use crate::span::Span;
 use crate::ty::{Row, Ty};
 
-use self::associations::{push_association_methods, push_dependent_destroy};
+use self::associations::{push_association_methods, push_dependent_destroy, ThroughJoins};
+pub(crate) use self::associations::{ThroughWriterJoin, through_writer_join};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::symbol_after_initialize;
@@ -123,6 +125,17 @@ pub(crate) enum FinderInputs {
 pub(crate) enum ErrorsReaders {
     FieldRead,
     CreatedOnFirstRead,
+}
+
+/// Whether the target ships the runtime `ActiveRecord::Relation`
+/// (`BuildTarget::has_runtime_relation`): the ruby-family targets do, so a
+/// validation that needs a query at validation time (`uniqueness:`) can
+/// run one. A strict target has only the chains the Arel builder folds,
+/// and keeps such a validation as a reported gap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRelation {
+    Absent,
+    Present,
 }
 
 /// Probe bodies expose framework ownership hidden by source overrides,
@@ -264,7 +277,7 @@ pub(crate) fn lower_models_inner(
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     lower_models_inner_with_ruby_values(
         models, schema, extra_class_infos, params_specs, unfolded, materialization,
-        finder_inputs, false, ErrorsReaders::FieldRead,
+        finder_inputs, false, false, ErrorsReaders::FieldRead, RuntimeRelation::Absent,
     )
 }
 
@@ -277,11 +290,13 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     materialization: Materialization<'_>,
     finder_inputs: FinderInputs,
     ruby_read_values: bool,
+    param_binds: bool,
     errors_readers: ErrorsReaders,
+    runtime_relation: RuntimeRelation,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     lower_models_inner_for_dialect(models, schema, extra_class_infos, params_specs,
-        unfolded, materialization, finder_inputs, ruby_read_values, errors_readers,
-        crate::lower::arel::SqlDialect::Sqlite)
+        unfolded, materialization, finder_inputs, ruby_read_values, param_binds, errors_readers,
+        runtime_relation, crate::lower::arel::SqlDialect::Sqlite)
 }
 
 /// Database-aware model lowering. Existing target entry points retain SQLite
@@ -295,7 +310,9 @@ pub(crate) fn lower_models_inner_for_dialect(
     materialization: Materialization<'_>,
     finder_inputs: FinderInputs,
     ruby_read_values: bool,
+    param_binds: bool,
     errors_readers: ErrorsReaders,
+    runtime_relation: RuntimeRelation,
     dialect: crate::lower::arel::SqlDialect,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
@@ -303,7 +320,7 @@ pub(crate) fn lower_models_inner_for_dialect(
     let _body_names = schema::share_model_body_names(models, &Default::default());
     for model in models {
         let methods = build_methods_for_dialect(
-            model, models, schema, params_specs, finder_inputs, errors_readers, dialect,
+            model, models, schema, params_specs, finder_inputs, param_binds, errors_readers, runtime_relation, dialect,
         );
         let table = schema.tables.get(&model.table.0);
         // Register actual production definitions, even for unselected
@@ -324,7 +341,8 @@ pub(crate) fn lower_models_inner_for_dialect(
                     _ => true,
                 });
                 let mut methods = build_methods_for_dialect(
-                    &definitions, models, schema, params_specs, finder_inputs, errors_readers, dialect,
+                    &definitions, models, schema, params_specs, finder_inputs, param_binds, errors_readers,
+                    runtime_relation, dialect,
                 );
                 // Preserve original source inputs for late derivations
                 // (e.g. raw helpers) without treating them as framework
@@ -450,6 +468,7 @@ pub(crate) fn lower_models_inner_for_dialect(
                 crate::lower::arel::rewrite_arel_in_method_with_ruby_values(
                     &mut method.body, schema, &classes, &[], ruby_read_values, dialect,
                     &HashSet::default(),
+                    crate::lower::arel::SqliteVisitor { param_binds },
                     (method.receiver == crate::dialect::MethodReceiver::Class).then_some(&model.name),
                 );
             }
@@ -611,7 +630,7 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
 
 /// Canonical class envelope for both production lowering and ownership
 /// observation. Typing and method selection remain the caller's job.
-fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
+fn model_class(model: &Model, models: &[Model], mut methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
     // ActiveRecord::Base includes ActiveSupport::Callbacks; the runtime
     // base does not, so a model that runs the module's class side
     // (`callback_dsl_calls`) includes the port itself, ahead of its own
@@ -640,6 +659,7 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
         })
         .cloned()
         .collect();
+    apply_inherited_visibility(model, &mut methods);
     LibraryClass {
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
@@ -657,7 +677,13 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
         methods,
         nullable_columns: nullable_column_names(table),
         origin: None,
-        constants: collect_model_constants(model),
+        constants: {
+            let mut constants = collect_model_constants(model);
+            if let Some(table) = table {
+                constants.extend(schema::enum_constants(model, table));
+            }
+            constants
+        },
         unknown_calls,
         class_ivar_initializers: collect_class_attr_initializers(model, &port_macros),
         visibility_overrides: model.visibility_overrides.clone(),
@@ -730,6 +756,43 @@ fn collect_class_attr_initializers(model: &Model, port_macros: &[&Expr]) -> Vec<
             _ => None,
         }))
         .collect()
+}
+
+/// `private :comments` on a method the lowering synthesizes; a name it does not synthesize (a gem's) has no method here to mark.
+fn apply_inherited_visibility(model: &Model, methods: &mut [MethodDef]) {
+    for (class_side, name, visibility) in inherited_visibility(model) {
+        let side = if class_side { MethodReceiver::Class } else { MethodReceiver::Instance };
+        for m in methods.iter_mut().filter(|m| m.name.as_str() == name && m.receiver == side) {
+            m.visibility = visibility;
+        }
+    }
+}
+
+/// `(class side, name, visibility)` per name a model's `private :x` gives a method its body does not define.
+pub(crate) fn inherited_visibility(model: &Model) -> Vec<(bool, &str, crate::dialect::MethodVisibility)> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if expr.decisions & crate::expr::INHERITED_VISIBILITY == 0 {
+            continue;
+        }
+        let ExprNode::Send { method: marker, args, .. } = &*expr.node else { continue };
+        let visibility = match marker.as_str() {
+            "public" | "public_class_method" => crate::dialect::MethodVisibility::Public,
+            "protected" => crate::dialect::MethodVisibility::Protected,
+            _ => crate::dialect::MethodVisibility::Private,
+        };
+        let class_side = marker.as_str().ends_with("_class_method");
+        for arg in args {
+            let name = match &*arg.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
+                ExprNode::Lit { value: Literal::Str { value } } => value.as_str(),
+                _ => continue,
+            };
+            out.push((class_side, name, visibility));
+        }
+    }
+    out
 }
 
 /// `self.x op= v` for an arithmetic or bitwise `op` (`+=`, `-=`, `|=`,
@@ -885,7 +948,7 @@ fn user_validate_conflict(model: &Model, models: &[Model]) -> Option<crate::diag
     })?;
     // The rules the lowering would put under `validate`.
     let mut synthesized = Vec::new();
-    push_validate_method(&mut synthesized, model, models, ErrorsReaders::FieldRead, false);
+    push_validate_method(&mut synthesized, model, models, ErrorsReaders::FieldRead, false, RuntimeRelation::Absent);
     let has_rules = synthesized.iter().any(|m| m.name.as_str() == "validate");
     // A parent whose `valid?` calls `validate`: ActiveRecord's, or an app
     // model's (the AR hierarchy, or a tableless class's synthesized one).
@@ -1025,6 +1088,10 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // a class macro's expansion) is a class-ivar initializer
         // (`collect_class_attr_initializers`), written in the body.
         if writes_class_ivar(expr) {
+            continue;
+        }
+        // Claimed by `apply_inherited_visibility` and `analyze::private_calls`.
+        if expr.decisions & crate::expr::INHERITED_VISIBILITY != 0 {
             continue;
         }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
@@ -1942,6 +2009,7 @@ pub fn writable_field_set(
     }
     if let Some(attr) = crate::lower::secure_password::secure_password_attr(&model.body) {
         writable.insert(Symbol::from(format!("{}_confirmation", attr.as_str())));
+        writable.insert(Symbol::from(format!("{}_challenge", attr.as_str())));
         writable.insert(attr);
     }
     for (name, _ty) in self::markers::attribute_api_decls(&model.body) {
@@ -2105,8 +2173,8 @@ pub(crate) fn build_methods(
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
 ) -> Vec<MethodDef> {
     build_methods_for_dialect(
-        model, models, schema, params_specs, FinderInputs::Scalar, ErrorsReaders::FieldRead,
-        crate::lower::arel::SqlDialect::Sqlite,
+        model, models, schema, params_specs, FinderInputs::Scalar, false, ErrorsReaders::FieldRead,
+        RuntimeRelation::Absent, crate::lower::arel::SqlDialect::Sqlite,
     )
 }
 
@@ -2133,9 +2201,12 @@ fn build_methods_for_dialect(
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
     finder_inputs: FinderInputs,
+    param_binds: bool,
     errors_readers: ErrorsReaders,
+    runtime_relation: RuntimeRelation,
     dialect: crate::lower::arel::SqlDialect,
 ) -> Vec<MethodDef> {
+    let through_joins = ThroughJoins::decide(model, models);
     let mut methods: Vec<MethodDef> = Vec::new();
 
     if let Some(table) = schema.tables.get(&model.table.0) {
@@ -2156,7 +2227,7 @@ fn build_methods_for_dialect(
         let writable_fields =
             permitted_fields.map(|fields| writable_permit_fields(model, table, fields));
         let permitted_fields = writable_fields.as_deref();
-        push_schema_methods(&mut methods, model, models, table);
+        push_schema_methods(&mut methods, model, models, table, &through_joins);
         // The PostgreSQL CRuby tree ships Rails' mass assignment
         // (runtime/spinel/cruby/active_record_core.rb); a PostgreSQL
         // app's ruby family is that tree.
@@ -2176,7 +2247,7 @@ fn build_methods_for_dialect(
             methods.push(adapter_emit::synth_find_primary_key_input(model, table));
             methods.push(adapter_emit::synth_exists_primary_key_input(model, table));
         }
-        push_adapter_methods(&mut methods, model, table, schema, dialect);
+        push_adapter_methods(&mut methods, model, table, schema, dialect, param_binds);
         // `from_params(p: <Resource>Params)` — typed factory matching the
         // (resource, fields) tuple a controller's `permit(...)` declared.
         // Skipped silently when the model isn't permitted by any
@@ -2245,10 +2316,10 @@ fn build_methods_for_dialect(
 
     // Every tree carries each error's detail as `error_details`; the CRuby
     // and JRuby trees record it in the runtime's `ErrorAttributes` too.
-    push_validate_method(&mut methods, model, models, errors_readers, true);
-    push_association_methods(&mut methods, model, models);
+    push_validate_method(&mut methods, model, models, errors_readers, true, runtime_relation);
+    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation);
     self::macro_associations::push_reflection_methods(&mut methods, model, models);
-    push_dependent_destroy(&mut methods, model);
+    push_dependent_destroy(&mut methods, model, &through_joins);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);
     // AFTER the accessors: the constructor assigns exactly what they
@@ -2256,7 +2327,7 @@ fn build_methods_for_dialect(
     self::validations::push_active_model_constructor(&mut methods, model);
     // `attribute :name, :type` (Rails Attributes API) — typed virtual
     // readers + cast writers; same before-user-methods ordering.
-    self::markers::push_attribute_api_methods(&mut methods, model);
+    self::markers::push_attribute_api_methods(&mut methods, model, runtime_relation);
     // typed_store virtual attributes — reader/predicate/writer per
     // declared attr, routing through the `TypedStore` runtime (the
     // YAML seam). Before `push_user_methods` so a custom method in the
@@ -2423,9 +2494,8 @@ fn push_user_methods(
             let incoming_is_real = matches!(method.kind, AccessorKind::Method);
             // Only bare-ivar attr_* halves (attr_accessor/reader/writer
             // synth, which carry no signature) yield to a later real
-            // `def`. Schema column AttributeReaders are also bare
-            // `@col` reads for scalar columns, but they stamp a
-            // signature — keep those winning (documented above).
+            // `def`. Schema column writers carry a signature and keep
+            // their storage casts.
             let existing_is_attr_half = existing.signature.is_none()
                 && match existing.kind {
                     AccessorKind::AttributeReader => {
@@ -3261,8 +3331,21 @@ fn build_class_info_with_finder_inputs(
 ) -> crate::analyze::ClassInfo {
     let mut info = crate::analyze::ClassInfo::default();
     info.table = Some(model.table.clone());
-    info.parent = model.parent.clone();
     info.default_scoped = crate::lower::default_scope::declares(model);
+    info.parent = model.parent.clone();
+    // The analyzer's registry is not this map. Arel's `ids` / `pluck`
+    // and the source-method decline read these two fields, so they have
+    // to be filled here or a model method inlines `SELECT id` and a
+    // `def self.pluck` becomes SQL.
+    info.primary_key = model.primary_key.clone().or_else(|| {
+        table.and_then(|t| t.columns.iter().find(|column| column.primary_key).map(|column| column.name.clone()))
+    });
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Method { method, .. } = item else { continue };
+        if method.receiver == MethodReceiver::Class {
+            info.source_class_methods.insert(method.name.clone());
+        }
+    }
 
     // Attributes row from schema columns.
     if let Some(t) = table {
@@ -3921,23 +4004,26 @@ fn type_method_body(
     // Opt-in to `recv: Some(SelfRef)` rewriting on bare Sends —
     // matches the pattern view_to_library uses.
     ctx.annotate_self_dispatch = true;
-    let body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    let mut body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    if crate::lower::enumerable_ext::rewrite_squish_body(&mut method.body) {
+        body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    }
     backfill_scalar_signature(method, body_ty);
 }
 
 /// Backfill a signature for a user-defined method whose body types to a
-/// concrete scalar. User methods carry `signature: None`, so the
+/// concrete scalar or Time. User methods carry `signature: None`, so the
 /// emitted `.rbs` says `-> untyped` even when the body is trivially
 /// typed — and under spinel AOT an untyped return turns every chained
 /// call into a whole-program poly dispatch (lobsters:
 /// `User.username_regex_s[1...-1]` became a 26-class `[]` switch that
-/// doesn't C-compile). Scalars only, and only when the body has no
+/// doesn't C-compile). Scalars and Time only, and only when the body has no
 /// explicit `return` (an early return of another type would make the
 /// trailing-expression type a lie — in Ruby a `return` inside a block
 /// exits the method, so the walk counts those too). If/Case bodies
 /// union their branches, so divergent shapes fail the scalar gate on
 /// their own. Param types stay untyped — this pins only the return.
-/// A scalar, or a scalar unioned with nil — `String?` and friends.
+/// A scalar or Time, optionally unioned with nil — `String?`, `Time?` and friends.
 ///
 /// The nullable arm matters because a `rescue` contributes one: a body
 /// of `uri.to_s … rescue nil` types `Str | Nil`, and refusing to
@@ -3947,7 +4033,7 @@ fn type_method_body(
 /// costs nothing here — widening to `untyped` does.
 fn scalar_or_nullable_scalar(ty: &Ty) -> bool {
     fn is_scalar(t: &Ty) -> bool {
-        matches!(t, Ty::Str | Ty::Int | Ty::Float | Ty::Bool)
+        matches!(t, Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Time)
     }
     match ty {
         t if is_scalar(t) => true,
@@ -4076,6 +4162,9 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
         // (`lower::has_json`), not as a Hash the whole column decodes to.
         ColumnType::Json | ColumnType::Jsonb => Ty::Str,
         ColumnType::Uuid => Ty::Str,
+        // Whole seconds. The public reader is ActiveSupport::Duration;
+        // this is the storage slot, an integer so order matches the count.
+        ColumnType::Interval => Ty::Int,
         ColumnType::Reference { .. } => Ty::Int,
     }
 }

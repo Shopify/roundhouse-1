@@ -833,7 +833,7 @@ pub fn emit_expr(e: &Expr) -> String {
 /// Mirrors `crystal::expr::try_string_builder`. Non-hinted sites fall
 /// through to the normal node emit.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -1018,13 +1018,68 @@ fn emit_literal(lit: &Literal) -> String {
         Literal::Str { value } => format!("\"{}\"", escape_str(value)),
         // No symbol type in Kotlin → string.
         Literal::Sym { value } => format!("\"{}\"", escape_str(value.as_str())),
-        Literal::Regex { pattern, .. } => {
+        Literal::Regex { pattern, flags } => {
             // Ruby `/[\r\n\0\t]/` carries a backslash-zero NUL escape.
             // Java `Pattern` rejects `\0` (octal needs more digits); use
             // `\u0000` which both Kotlin's string literal and Pattern accept.
             let normalized = normalize_java_regex_nul(pattern);
-            format!("Regex(\"{}\")", escape_str(&normalized))
+            let options = kotlin_regex_options(flags);
+            if options.is_empty() {
+                format!("Regex(\"{}\")", escape_str(&normalized))
+            } else {
+                format!("Regex(\"{}\", setOf({options}))", escape_str(&normalized))
+            }
         }
+    }
+}
+
+/// Ruby regex flags this build can reproduce exactly: `i` →
+/// `RegexOption.IGNORE_CASE`. Ruby's `m` (dot-matches-newline) is
+/// `RegexOption.DOT_MATCHES_ALL`. Ruby's `^`/`$` are always line
+/// anchors, so a flagged `m` also adds `RegexOption.MULTILINE`.
+/// Any other flag character stays an ingest-time gap, so none
+/// reaches here.
+fn kotlin_regex_options(flags: &str) -> String {
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
+    let mut parts: Vec<&str> = Vec::new();
+    if bits.ignore_case {
+        parts.push("RegexOption.IGNORE_CASE");
+    }
+    if bits.dot_matches_newline {
+        parts.push("RegexOption.DOT_MATCHES_ALL");
+        parts.push("RegexOption.MULTILINE");
+    }
+    parts.join(", ")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(kotlin_regex_options("m"), "RegexOption.DOT_MATCHES_ALL, RegexOption.MULTILINE");
+    }
+
+    use super::{emit_literal, kotlin_regex_options};
+    use crate::expr::Literal;
+
+    #[test]
+    fn no_flags_drop_the_options_set() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "".into() };
+        assert_eq!(emit_literal(&lit), r#"Regex("a.b")"#);
+    }
+
+    #[test]
+    fn ignore_case_maps_to_regexoption_ignore_case() {
+        assert_eq!(kotlin_regex_options("i"), "RegexOption.IGNORE_CASE");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine_in_a_set() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "im".into() };
+        assert_eq!(
+            emit_literal(&lit),
+            r#"Regex("a.b", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL, RegexOption.MULTILINE))"#
+        );
     }
 }
 
@@ -1562,6 +1617,10 @@ fn emit_send(
     args: &[Expr],
     block: Option<&Expr>,
 ) -> String {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
+        let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
     // A bare implicit-self zero-arg send that names a parameter is a
     // reference to that local, not a method call — emit the identifier
     // without `()`. (See `PARAM_NAMES`: the view lowerer renders a partial

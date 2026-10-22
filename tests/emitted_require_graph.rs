@@ -268,6 +268,20 @@ fn ruby_family_runtime_constants_are_ledgered_on_other_targets() {
       head :not_found
     end
   end
+
+  def surface
+    [Arel::Nodes, Arel::Nodes::Node, Arel::Nodes::SqlLiteral, Arel::Nodes::Quoted,
+     Arel::Nodes::Not, Arel::Nodes::Case, Arel::Nodes::NamedFunction,
+     Arel::Nodes::Ascending, Arel::Nodes::Descending, Arel::Nodes::Predicate,
+     ActiveRecord::ConnectionFailed, ActiveRecord::ConnectionTimeoutError,
+     ActiveRecord::Encryption::Errors::Decryption,
+     ActiveRecord::Encryption::Errors::Configuration,
+     ActiveRecord::Associations::Preloader,
+     ActiveRecord::Type::String, ActiveRecord::Type::Integer, ActiveRecord::Type::Value,
+     ActiveSupport::IsolatedExecutionState, ActiveSupport::Notifications,
+     ActiveSupport::Notifications::Event, ActiveSupport::ConfigurationFile,
+     ActiveJob::EnqueueError, ActiveJob::Continuable]
+  end
 end
 "#),
     ].into_iter().map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec())).collect();
@@ -284,14 +298,36 @@ end
         let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
             target_files(&app, Path::new("."), target)
         });
-        files.expect("target files");
+        let emitted = files.expect("target files");
+        let has_configuration = emitted
+            .iter()
+            .any(|(path, _)| path == "runtime/active_support_configuration_file.rb");
+        let rails = emitted.iter().find(|(path, _)| path == "runtime/rails.rb");
+        if target == BuildTarget::Spinel {
+            assert!(!has_configuration, "spinel must not boot the YAML configuration file");
+            let rails = rails.expect("runtime/rails.rb");
+            assert!(
+                !rails.1.contains("active_support_configuration_file"),
+                "spinel rails.rb still requires the YAML configuration file"
+            );
+        }
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+            assert!(has_configuration, "{target:?} dropped ConfigurationFile");
+        }
         let gaps: Vec<_> = diags.iter().filter(|d| matches!(
             &d.kind,
             roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
                 if construct.as_str() == "ruby_family_runtime_constant"
         )).collect();
-        if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
             assert!(gaps.is_empty(), "{target:?}: {gaps:?}");
+            continue;
+        }
+        if target == BuildTarget::Spinel {
+            assert_eq!(gaps.len(), 4, "{gaps:?}");
+            for name in ["ActiveSupport::ConfigurationFile", "Arel::Nodes::Ascending", "Arel::Nodes::Descending", "Arel::Nodes::Predicate"] {
+                assert!(gaps.iter().any(|g| g.message.contains(name)), "{name}: {gaps:?}");
+            }
             continue;
         }
         assert_eq!(gaps.len(), RUBY_FAMILY_RUNTIME_CONSTANTS.len(), "{target:?}: {gaps:?}");
@@ -305,6 +341,18 @@ end
             assert!(!gap.span.is_synthetic(), "{gap:?}");
         }
     }
+    // The toolchain lane compiles `spinel_base_files`, not `target_files`.
+    // That tree has to drop the YAML configuration file too.
+    let base = spinel_base_files(&app, Path::new(".")).expect("spinel base files");
+    assert!(
+        !base.iter().any(|(path, _)| path == "runtime/active_support_configuration_file.rb"),
+        "spinel base files still ship the YAML configuration file"
+    );
+    let rails = base.iter().find(|(path, _)| path == "runtime/rails.rb").expect("runtime/rails.rb");
+    assert!(
+        !rails.1.contains("active_support_configuration_file"),
+        "spinel base rails.rb still requires the YAML configuration file"
+    );
 }
 
 /// Both Spinel dispatchers rescue `ActionController::RoutingError` and

@@ -35,3 +35,18 @@ fn a_parameterized_action_types_its_argument() {
 fn a_parameterized_action_types_its_argument_on_spinel() {
     app().run_spinel(ASSERTIONS).assert_passes();
 }
+
+/// Rails' `params` is an empty hash until `with` gives it one.
+#[test]
+fn an_unparameterized_action_reads_empty_params() {
+    let app = emit_and_run::real_blog()
+        .write("app/mailers/title_mailer.rb", "class TitleMailer < ApplicationMailer\n  def titled(article)\n    @article = article\n    mail(to: params.fetch(:to, \"default@example.com\"), subject: \"Titled\")\n  end\nend\n")
+        .write("app/views/title_mailer/titled.text.erb", "Title: <%= @article.title %>\n")
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def announce\n    TitleMailer.titled(self).deliver_now.to\n  end\n",
+        );
+    app.run_ruby("got = Article.new(title: \"x\").announce\nraise got.inspect unless got == [\"default@example.com\"]\nputs \"empty params passed\"\n")
+        .assert_passes();
+}

@@ -483,6 +483,61 @@ pub(crate) fn tree_answer(catalog: &Catalog, recv: Option<&Expr>, method: &str, 
     every.then_some(full)
 }
 
+/// `t("views.calendar.weekdays")` landing on an Array, a number or a
+/// boolean, which I18n answers as it is: its full key and the runtime
+/// method answering it, when every locale's lookup lands on a value of
+/// one kind (an Array's items Strings in one locale and Symbols in
+/// another, as rails-i18n's `date.order` is, are both). Not an `_html`
+/// key, whose Array ActionView marks html-safe item by item.
+pub(crate) fn value_answer(catalog: &Catalog, recv: Option<&Expr>, method: &str, args: &[Expr], block: Option<&Expr>, site: Site<'_>) -> Option<(String, &'static str, Ty)> {
+    use crate::i18n::Opaque;
+    let call = parse(recv, method, args, block, site)?.ok()?;
+    if call.dynamic.is_some() || call.lookup.counted || !call.lookup.defaults.is_empty() || !call.lookup.values.is_empty() {
+        return None;
+    }
+    let full = Translate::full_key(&call.lookup, &call.lookup.key).ok()?;
+    if crate::i18n::is_html_safe_key(&full) {
+        return None;
+    }
+    let mut locales = catalog.locales();
+    for other in &catalog.others {
+        if !locales.contains(&other.locale) {
+            locales.push(other.locale.clone());
+        }
+    }
+    let lands = |c: &Catalog| c.entries.contains_key(&full) || c.opaque.contains(&full) || c.is_subtree(&full);
+    let mut found: Vec<&Opaque> = Vec::new();
+    for v in catalog.variants(&locales) {
+        let chain = match &v.fallbacks {
+            Some(defaults) => crate::i18n::fallback_chain(&v.locale, defaults),
+            None => vec![v.locale.clone()],
+        };
+        found.push(chain.iter().filter_map(|l| catalog.catalog_for(l)).find(|c| lands(c))?.values.get(&full)?);
+    }
+    let first = found.first()?;
+    if !found.iter().all(|v| std::mem::discriminant(*v) == std::mem::discriminant(*first)) {
+        return None;
+    }
+    let array = |elem: Ty| Ty::Array { elem: std::sync::Arc::new(elem) };
+    Some(match first {
+        Opaque::Array(_) => {
+            let items = found.iter().flat_map(|v| match v {
+                Opaque::Array(items) => items.iter().map(|(sym, _)| *sym).collect(),
+                _ => Vec::new(),
+            });
+            let (strings, symbols) = items.fold((false, false), |(s, y), sym| (s || !sym, y || sym));
+            match (strings, symbols) {
+                (_, false) => (full, "translate_strings", array(Ty::Str)),
+                (false, true) => (full, "translate_symbols", array(Ty::Sym)),
+                (true, true) => (full, "translate_items", array(Ty::Union { variants: vec![Ty::Str, Ty::Sym].into() })),
+            }
+        }
+        Opaque::Int(_) => (full, "translate_integer", Ty::Int),
+        Opaque::Float(_) => (full, "translate_float", Ty::Float),
+        Opaque::Bool(_) => (full, "translate_boolean", Ty::Bool),
+    })
+}
+
 const COUNT_BY_RULE: &str = "a count whose form a locale's own plural rule picks";
 
 /// A count meets a locale's own rule only when the call runs.
@@ -617,6 +672,9 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
     let helpers: crate::det::HashSet<crate::ident::ClassId> = app.helper_method_index.values().cloned().collect();
     for lc in app.library_classes.iter_mut().filter(|lc| helpers.contains(&lc.name)) {
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                rewrite_default(default, &catalog, Site::View(None));
+            }
             rewrite(&mut m.body, &catalog, Site::View(None));
         }
     }
@@ -626,14 +684,17 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
                     for (_name, default) in &mut action.opt_params {
-                        rewrite(default, &catalog, Site::Controller(scope));
+                        rewrite_default(default, &catalog, Site::Controller(scope));
+                    }
+                    for default in action.kw_params.iter_mut().filter_map(|(_, d)| d.as_mut()) {
+                        rewrite_default(default, &catalog, Site::Controller(scope));
                     }
                     rewrite(&mut action.body, &catalog, Site::Controller(scope));
                 }
                 crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
                     for p in &mut method.params {
                         if let Some(default) = &mut p.default {
-                            rewrite(default, &catalog, Site::Other);
+                            rewrite_default(default, &catalog, Site::Other);
                         }
                     }
                     rewrite(&mut method.body, &catalog, Site::Other);
@@ -681,6 +742,15 @@ fn translates(app: &App, controller: &crate::dialect::Controller) -> bool {
         });
     }
     false
+}
+
+// A parameter default has no statement ahead of it to hoist a `Seq` into, so a dynamic key's `__k = …; case __k …` keeps its own `begin`.
+fn rewrite_default(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
+    rewrite(expr, catalog, site);
+    if matches!(&*expr.node, ExprNode::Seq { exprs } if exprs.len() > 1) {
+        let body = expr.clone();
+        *expr = Expr { ty: body.ty.clone(), ..Expr::new(body.span, ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: None, implicit: false }) };
+    }
 }
 
 fn rewrite(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
@@ -745,7 +815,12 @@ fn rewrite_one(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
         }
     };
     if let Some(full) = tree_answer(catalog, recv.as_ref(), method.as_str(), args, block.as_ref()) {
-        *expr = tree_call(expr.span, &full, args.get(1));
+        let hash_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
+        *expr = tree_call(expr.span, "translate_tree", hash_ty, &full, args.get(1));
+        return;
+    }
+    if let Some((full, method, ty)) = value_answer(catalog, recv.as_ref(), method.as_str(), args, block.as_ref(), site) {
+        *expr = tree_call(expr.span, method, ty, &full, args.get(1));
         return;
     }
     let call = match parsed {
@@ -853,8 +928,9 @@ fn fold_variants(call: &Call, plans: Vec<(Variant, Plan)>, span: Span, in_view: 
 /// them, and in a template the answer marked raw, the runtime having
 /// escaped what is not html-safe.
 /// `I18n.translate_tree(full_key, options)`: the node's Strings as a
-/// nested Hash, built from the app's catalog when the call runs.
-fn tree_call(span: Span, full: &str, options: Option<&Expr>) -> Expr {
+/// nested Hash, built from the app's catalog when the call runs; the
+/// other `translate_*` answer an opaque value the same way.
+fn tree_call(span: Span, method: &str, ty: Ty, full: &str, options: Option<&Expr>) -> Expr {
     RUNTIME_SITES.with(|r| {
         let mut r = r.borrow_mut();
         r.0.push(span);
@@ -871,8 +947,8 @@ fn tree_call(span: Span, full: &str, options: Option<&Expr>) -> Expr {
         }
         None => Expr { ty: Some(hash_ty.clone()), ..Expr::new(span, ExprNode::Hash { entries: Vec::new(), kwargs: false }) },
     };
-    let mut call = const_send(span, "I18n", "translate_tree", vec![lit(span, full.to_string()), options]);
-    call.ty = Some(hash_ty);
+    let mut call = const_send(span, "I18n", method, vec![lit(span, full.to_string()), options]);
+    call.ty = Some(ty);
     call
 }
 

@@ -100,13 +100,23 @@ end
 /// writes exactly this shape (`validate :direct_rooms_keep_their_type,
 /// on: :update`).
 #[test]
-fn a_validate_carrying_on_is_not_promoted_to_an_always_on_check() {
+fn a_validate_carrying_on_runs_only_in_that_context() {
     let src = emitted(
         r#"class Post < ApplicationRecord
   validate :type_is_unchanged, on: :update
+  validate :fresh_only, on: :create
+  validate :at_publish, on: :publish
 
   def type_is_unchanged
     errors.add :url, "changed"
+  end
+
+  def fresh_only
+    errors.add :url, "fresh"
+  end
+
+  def at_publish
+    errors.add :url, "publish"
   end
 end
 "#,

@@ -98,6 +98,7 @@ fn routing_redirects_override_only_the_controller_host_policy() {
     let app = app_with("  get \"/outside\", to: redirect(\"https://other.test/landing\")\n");
     let emitted = redirect_controller(&app);
     assert!(emitted.contains("def same_host_location(location)"), "{emitted}");
+    assert!(emitted.contains("def absolute_redirect_location(location)"), "{emitted}");
     assert!(emitted.contains("redirect_to(\"https://other.test/landing\", status: :moved_permanently)"), "{emitted}");
 }
 
@@ -108,20 +109,26 @@ fn routing_redirects_override_only_the_controller_host_policy() {
 fn routing_redirect_host_policy_keeps_the_base_string_signature() {
     let app = app_with("  get \"/outside\", to: redirect(\"https://other.test/landing\")\n");
     let classes = roundhouse::lower::lower_controllers_to_library_classes(&app.controllers, Vec::new());
-    let method = classes
+    let redirect = classes
         .iter()
         .find(|class| class.name.0.as_str() == "RoundhouseRedirectsController")
-        .and_then(|class| class.methods.iter().find(|method| method.name.as_str() == "same_host_location"))
-        .expect("lowered host policy");
-    match method.signature.as_ref() {
-        Some(roundhouse::ty::Ty::Fn { params, ret, .. }) => {
-            assert!(
-                matches!(params.first().map(|param| param.ty.as_ref()), Some(roundhouse::ty::Ty::Str)),
-                "{params:?}"
-            );
-            assert!(matches!(ret.as_ref(), roundhouse::ty::Ty::Str), "{ret:?}");
+        .expect("redirect controller");
+    for name in ["same_host_location", "absolute_redirect_location"] {
+        let method = redirect
+            .methods
+            .iter()
+            .find(|method| method.name.as_str() == name)
+            .unwrap_or_else(|| panic!("lowered {name}"));
+        match method.signature.as_ref() {
+            Some(roundhouse::ty::Ty::Fn { params, ret, .. }) => {
+                assert!(
+                    matches!(params.first().map(|param| param.ty.as_ref()), Some(roundhouse::ty::Ty::Str)),
+                    "{name} {params:?}"
+                );
+                assert!(matches!(ret.as_ref(), roundhouse::ty::Ty::Str), "{name} {ret:?}");
+            }
+            other => panic!("{name} signature: {other:?}"),
         }
-        other => panic!("host policy signature: {other:?}"),
     }
     let controller_file = |files: Vec<roundhouse::emit::EmittedFile>, needle: &str| {
         files
@@ -138,9 +145,19 @@ fn routing_redirect_host_policy_keeps_the_base_string_signature() {
         "{}",
         kotlin.content
     );
+    assert!(
+        kotlin.content.contains("override fun absoluteRedirectLocation(location: String): String"),
+        "{}",
+        kotlin.content
+    );
     let csharp = controller_file(roundhouse::emit::csharp::emit(&app), "RoundhouseRedirectsController");
     assert!(
         csharp.content.contains("override string SameHostLocation(string location)"),
+        "{}",
+        csharp.content
+    );
+    assert!(
+        csharp.content.contains("override string AbsoluteRedirectLocation(string location)"),
         "{}",
         csharp.content
     );
@@ -149,6 +166,26 @@ fn routing_redirect_host_policy_keeps_the_base_string_signature() {
         swift.content.contains("override func sameHostLocation(_ location: String) -> String"),
         "{}",
         swift.content
+    );
+    assert!(
+        swift.content.contains("override func absoluteRedirectLocation(_ location: String) -> String"),
+        "{}",
+        swift.content
+    );
+}
+
+#[test]
+fn an_integer_status_outside_the_redirect_set_is_not_served() {
+    let app = app_with(
+        "  get \"/reports\", to: \"reports#index\"\n  get \"/nope\", to: redirect(\"/reports\", status: 200)\n  get \"/teapot\", to: redirect(\"/reports\", status: 418)\n  get \"/old\", to: redirect(\"/reports\", status: 301)\n",
+    );
+    let emitted = redirect_controller(&app);
+    assert!(!emitted.contains("def nope"), "200 is not a redirect code; got:\n{emitted}");
+    assert!(!emitted.contains("def teapot"), "418 is not a redirect code; got:\n{emitted}");
+    assert!(emitted.contains("def old"), "301 stays a redirect; got:\n{emitted}");
+    assert!(
+        emitted.contains("redirect_to(\"/reports\", status: :moved_permanently)"),
+        "{emitted}"
     );
 }
 
@@ -266,6 +303,43 @@ fn engine_routes_stay_explicit_gaps() {
 }
 
 #[test]
+fn an_if_publishes_a_string_assigned_on_both_branches() {
+    let app = app_with(
+        "  get \"/reports\", to: \"reports#index\"\n  get \"/branched\", to: redirect { |request|\n    if request.query_string.empty?\n      path = \"/reports\"\n    else\n      path = \"/reports?#{request.query_string}\"\n    end\n    path\n  }\n  get \"/half\", to: redirect { |request|\n    if request.query_string.empty?\n      path = \"/reports\"\n    end\n    path\n  }\n  get \"/flag\", to: redirect { |request| request.query_string.empty? }\n  get \"/present\", to: redirect { |request| request.query_string.present? }\n  get \"/stripped\", to: redirect { |request| request.query_string.strip }\n",
+    );
+    let emitted = redirect_controller(&app);
+    assert!(
+        emitted.contains("def branched") && emitted.contains("query_string"),
+        "a string assigned on both branches is the redirect; got:\n{emitted}"
+    );
+    assert!(
+        !app.routes.entries.iter().any(|entry| matches!(
+            entry,
+            roundhouse::dialect::RouteSpec::Explicit { path, .. } if path == "/half"
+        )),
+        "one branch leaves the name unset; routes = {:?}",
+        app.routes.entries
+    );
+    assert!(
+        !app.routes.entries.iter().any(|entry| matches!(
+            entry,
+            roundhouse::dialect::RouteSpec::Explicit { path, .. } if path == "/flag"
+        )),
+        "empty? is a boolean, not a string; routes = {:?}",
+        app.routes.entries
+    );
+    assert!(
+        !app.routes.entries.iter().any(|entry| matches!(
+            entry,
+            roundhouse::dialect::RouteSpec::Explicit { path, .. } if path == "/present"
+        )),
+        "present? is a boolean, not a string; routes = {:?}",
+        app.routes.entries
+    );
+    assert!(emitted.contains("def stripped"), "strip stays a string; got:\n{emitted}");
+}
+
+#[test]
 fn a_block_redirect_is_still_dropped_with_its_ledger_line() {
     // There is no literal to serve, so the #82 contract stands.
     let app = app_with(
@@ -324,6 +398,24 @@ fn a_path_option_redirect_is_the_same_location_as_a_positional_string() {
         !served(&app, "/store/:name"),
         "a host-changing options redirect is never dispatched; routes = {:?}",
         app.routes.entries
+    );
+}
+
+#[test]
+fn a_symbol_status_and_a_constraint_stay_on_the_redirect() {
+    let app = app_with(
+        "  get \"/reports\", to: \"reports#index\"\n  get \"/old/:id\", to: redirect(status: :found) { |params| \"/reports/#{params[:id]}\" }, constraints: { id: /\\d+/ }\n  resources :reports, only: [:index] do\n    get \"legacy\", to: redirect(\"/archive\"), on: :member\n  end\n",
+    );
+    let emitted = redirect_controller(&app);
+    assert!(emitted.contains("status: :found"), "a symbol status is the code Rails names; got:\n{emitted}");
+    assert!(emitted.contains("params[:id]") || emitted.contains("@params"), "block interpolation; got:\n{emitted}");
+    let flat = roundhouse::lower::routes::flatten_routes(&app);
+    let old = flat.iter().find(|route| route.path == "/old/:id").expect("constrained redirect is dispatched");
+    assert_eq!(old.int_params, vec!["id".to_string()], "the digit constraint is enforced, not dropped: {old:?}");
+    assert!(
+        flat.iter().any(|route| route.path == "/reports/:id/legacy"),
+        "on: :member nests under :id; paths: {:?}",
+        flat.iter().map(|route| route.path.clone()).collect::<Vec<_>>()
     );
 }
 

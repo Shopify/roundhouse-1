@@ -109,6 +109,28 @@ class ActionDispatchRequestTest < Minitest::Test
     assert !r.headers.key?("X-Missing")
   end
 
+  def test_wire_names_are_distinct_from_trusted_env_keys
+    expected = {
+      "rack.session" => "HTTP_RACK.SESSION",
+      "action_dispatch.foo" => "HTTP_ACTION,DISPATCH.FOO",
+      "X-Test" => "HTTP_X_TEST",
+      "X_Test" => "HTTP_X,TEST",
+      "HTTP_ACCEPT" => "HTTP_HTTP,ACCEPT",
+      "HTTPS" => "HTTP_HTTPS",
+      "Server-Port" => "HTTP_SERVER_PORT",
+      "content-type" => "CONTENT_TYPE",
+      "cOnTeNt-LeNgTh" => "CONTENT_LENGTH",
+      "Content_Length" => "HTTP_CONTENT,LENGTH",
+    }
+    expected.each do |name, key|
+      assert_equal key, ActionDispatch::Http::Headers.env_name_from_header(name)
+    end
+    assert_equal "rack.session", ActionDispatch::Http::Headers.env_name("rack.session")
+    assert_equal "HTTP_ACCEPT", ActionDispatch::Http::Headers.env_name(:HTTP_ACCEPT)
+    assert_equal "HTTPS", ActionDispatch::Http::Headers.env_name("HTTPS")
+    assert_equal "CONTENT_LENGTH", ActionDispatch::Http::Headers.env_name("Content_Length")
+  end
+
   def test_authorization_checks_rack_and_legacy_env_keys
     assert_equal "Bearer key", ActionDispatch::Request.for(
       { "HTTP_AUTHORIZATION" => "Bearer key" }
@@ -179,6 +201,19 @@ class ActionDispatchRequestTest < Minitest::Test
     assert_equal 8123, ActionDispatch::Request.for({ "SERVER_NAME" => "chat.test", "SERVER_PORT" => "8123" }).port
     assert_equal 8123, ActionDispatch::Request.for({ "SERVER_NAME" => "[::1]", "SERVER_PORT" => "8123" }).port
     assert_equal 80, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test", "SERVER_PORT" => "8123" }).port
+  end
+
+  def test_a_public_peer_does_not_override_host_with_x_forwarded_host
+    req = ActionDispatch::Request.for({
+      "HTTP_HOST" => "chat.test", "HTTP_X_FORWARDED_HOST" => "evil.com", "REMOTE_ADDR" => "203.0.113.5"
+    })
+    assert_equal "chat.test", req.host
+    blank = ActionDispatch::Request.for({
+      "HTTP_HOST" => "chat.test", "HTTP_X_FORWARDED_HOST" => "evil.com", "REMOTE_ADDR" => ""
+    })
+    assert_equal "chat.test", blank.host
+    assert_equal "http://chat.test", req.base_url
+    assert_equal 80, req.port
   end
 
   def test_the_first_forwarded_scheme_is_the_clients

@@ -42,6 +42,10 @@ pub(super) struct DelegateEligibility<'a> {
     called_with_args: &'a CallsWithArguments,
     blocked_names: &'a HashSet<String>,
     supported_target_methods: Option<&'a HashSet<(String, String, usize)>>,
+    /// Targets the forwarder calls as a method of the declaring class
+    /// itself, whose answer only analysis can type: exempt from
+    /// `supported_target_methods`, which knows association targets only.
+    method_targets: &'a HashSet<String>,
 }
 
 impl<'a> DelegateEligibility<'a> {
@@ -50,12 +54,14 @@ impl<'a> DelegateEligibility<'a> {
         called_with_args: &'a CallsWithArguments,
         blocked_names: &'a HashSet<String>,
         supported_target_methods: Option<&'a HashSet<(String, String, usize)>>,
+        method_targets: &'a HashSet<String>,
     ) -> Self {
         Self {
             methods,
             called_with_args,
             blocked_names,
             supported_target_methods,
+            method_targets,
         }
     }
 
@@ -122,7 +128,8 @@ impl<'a> DelegateEligibility<'a> {
         }
         if self.supported_target_methods.is_some_and(|supported| {
             entries.iter().any(|entry| {
-                !supported.contains(&(
+                !self.method_targets.contains(entry.target.as_str())
+                    && !supported.contains(&(
                     entry.target.as_str().to_string(),
                     entry.method.as_str().to_string(),
                     synthesized_arity(entry.method.as_str()),
@@ -200,7 +207,7 @@ fn parse_declaration(call: &Expr) -> Option<ParsedDeclaration> {
     else {
         return None;
     };
-    if call.diagnostic.is_some() || method.as_str() != "delegate" {
+    if call.diagnostic().is_some() || method.as_str() != "delegate" {
         return None;
     }
 

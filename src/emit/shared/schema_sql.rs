@@ -471,7 +471,7 @@ fn is_integer(ct: &ColumnType) -> bool {
 /// through both stacks.
 fn sqlite_type(ct: &ColumnType) -> &'static str {
     match ct {
-        ColumnType::Integer | ColumnType::BigInt => "INTEGER",
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Interval => "INTEGER",
         ColumnType::Float | ColumnType::Decimal { .. } => "REAL",
         ColumnType::Boolean => "INTEGER",
         ColumnType::Binary => "BLOB",
@@ -515,6 +515,7 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::Json => "json".into(),
         ColumnType::Jsonb => "jsonb".into(),
         ColumnType::Uuid => "uuid".into(),
+        ColumnType::Interval => "interval".into(),
     }
 }
 
@@ -865,6 +866,7 @@ end
             (ColumnType::Json, "json"),
             (ColumnType::Jsonb, "jsonb"),
             (ColumnType::Uuid, "uuid"),
+            (ColumnType::Interval, "interval"),
             // Not something Rails emits (it rejects a scale without a
             // precision): the scale is dropped rather than a precision
             // invented.

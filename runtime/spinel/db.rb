@@ -102,6 +102,9 @@ module SQL
   # which now runs only at pool shutdown (see DbConn#finalize_all).
   ffi_func :sqlite3_reset,             [:ptr],                                :int
   ffi_func :sqlite3_clear_bindings,    [:ptr],                                :int
+  # SQLITE_STMTSTATUS_RUN: first native steps, including replay promotions.
+  # Only the boot-time opt-in diagnostic reads this native counter.
+  ffi_func :sqlite3_stmt_status,       [:ptr, :int, :int],                     :int
   # Placeholder binding (roundhouse#12, Path A.2). `bind_int64` binds a
   # `?` param to an integer (int64 so lobsters-scale ids don't truncate);
   # `bind_text` binds the full byte length, including embedded
@@ -207,6 +210,15 @@ class Stmt
     @cached = cached
     @in_use = true
     @closed = false
+    @stat_runs = 0
+  end
+
+  def cached
+    @cached
+  end
+
+  def stat_runs
+    @stat_runs
   end
 
   def sql
@@ -240,6 +252,8 @@ class Stmt
       @cached = false if rc != SQL::OK
     end
     if !@cached
+      # Read before finalize, which destroys the pointer even on failure.
+      @stat_runs = SQL.sqlite3_stmt_status(@ptr, 6, 0) if DbConn::STMT_STATS
       close_rc = SQL.sqlite3_finalize(@ptr)
       rc = close_rc if rc == SQL::OK
       # sqlite3_finalize destroys the statement even when it reports the
@@ -405,6 +419,11 @@ end
 
 class DbConn
   CAP = 128
+  # Distinct prepared SQL retained for RH_STMT_STATS. Past this, the snapshot
+  # keeps the cap and sets distinct_sql_capped instead of storing every string.
+  STAT_SQL_CAP = 4096
+  STMT_STATS_DEST = ENV.fetch("RH_STMT_STATS", "")
+  STMT_STATS = STMT_STATS_DEST != "" && STMT_STATS_DEST != "0"
 
   def initialize(dbh)
     @dbh = dbh
@@ -439,6 +458,21 @@ class DbConn
     @holds_permit = false
     # wal_autocheckpoint=0 applied (Db.checkpoint_in_background!).
     @manual_ckpt = false
+    @stat_hits = 0
+    @stat_misses = 0
+    @stat_failures = 0
+    @stat_peak = 0
+    @stat_trims = 0
+    @stat_evictions = 0
+    @stat_finalizations = 0
+    @stat_runs = 0
+    @stat_transient = 0
+    @stat_qc_hits = 0
+    @stat_qc_misses = 0
+    @stat_qc_bypasses = 0
+    @stat_sql = nil
+    @stat_sql_capped = false
+    @stat_sql = {} if STMT_STATS
   end
 
   def dbh
@@ -527,6 +561,7 @@ class DbConn
         if !e.in_use
           # Only a successful release makes a statement idle; its cursor
           # and bindings are already reset and cleared.
+          @stat_hits += 1 if STMT_STATS
           e.checkout
           @open.push(e)
           return e.ptr
@@ -579,11 +614,18 @@ class DbConn
       st = rc == SQL::OK ? SQL.read_ptr(SQL.stmt_out) : 0
     end
     if rc != SQL::OK
+      @stat_failures += 1 if STMT_STATS
       Db.raise_statement_error("Db.prepare failed (" + rc.to_s + "): " + SQL.sqlite3_errmsg(@dbh) + " — sql: " + sql, rc == SQL::BUSY)
     end
     entry = Stmt.new(sql, st, cached)
     index_cached(entry) if cached
     @open.push(entry)
+    if STMT_STATS
+      @stat_misses += 1
+      @stat_transient += 1 if !cached
+      remember_stat_sql(sql)
+      @stat_peak = @entries.length if @entries.length > @stat_peak
+    end
     st
   end
 
@@ -597,6 +639,7 @@ class DbConn
       e = @open[i]
       if e.ptr == ptr
         rc = e.release
+        stats_released(e) if STMT_STATS && e.closed
         @open.delete_at(i)
         if rc != SQL::OK
           discard_closed
@@ -616,6 +659,7 @@ class DbConn
     i = 0
     while i < @open.length
       release_rc = @open[i].release
+      stats_released(@open[i]) if STMT_STATS && @open[i].closed
       rc = release_rc if rc == SQL::OK
       i += 1
     end
@@ -632,6 +676,7 @@ class DbConn
     while i >= 0
       if @entries[i].closed
         unindex_cached(@entries[i])
+        @stat_evictions += 1 if STMT_STATS
         @entries.delete_at(i)
       end
       i -= 1
@@ -652,10 +697,15 @@ class DbConn
     return nil if @entries.length <= CAP
     keep = []
     drop_before = @entries.length - CAP
+    @stat_trims += 1 if STMT_STATS
     i = 0
     while i < @entries.length
       if i < drop_before && !@entries[i].in_use
         unindex_cached(@entries[i])
+        if STMT_STATS
+          @stat_evictions += 1
+          stats_finalize(@entries[i].ptr)
+        end
         SQL.sqlite3_finalize(@entries[i].ptr)
       else
         keep.push(@entries[i])
@@ -723,9 +773,17 @@ class DbConn
   # (recording its rows as they are stepped, when the cache is on).
   # Returns 0 as "no replay" so `Db.prepare` can tell the two apart.
   def qc_lookup(sql, preparable = true)
-    return 0 if !@qc_on || sql.include?("?")
+    # SQL-only replay cannot distinguish values bound to the same shape.
+    if !@qc_on || sql.include?("?")
+      @stat_qc_bypasses += 1 if STMT_STATS
+      return 0
+    end
     e = @qc_by_sql[sql]
-    return 0 if e.nil?
+    if e.nil?
+      @stat_qc_misses += 1 if STMT_STATS
+      return 0
+    end
+    @stat_qc_hits += 1 if STMT_STATS
     @qc_cursors.push(QcCursor.new(e, preparable))
     @qc_cursors.length
   end
@@ -942,12 +1000,72 @@ class DbConn
     ensure
       i = 0
       while i < @entries.length
+        stats_finalize(@entries[i].ptr) if STMT_STATS
         SQL.sqlite3_finalize(@entries[i].ptr)
         i += 1
       end
       @entries.clear
       # Bulk wipe: no per-entry unindex; the map goes with the array.
       @entry_by_sql = {}
+    end
+    nil
+  end
+
+  # Keep distinct SQL only while diagnostics are on, and only up to the cap.
+  def remember_stat_sql(sql)
+    return nil if @stat_sql[sql]
+    if @stat_sql.length >= STAT_SQL_CAP
+      @stat_sql_capped = true
+      return nil
+    end
+    @stat_sql[sql] = true
+    nil
+  end
+
+  # Stmt#release read this counter while a transient or failed cached
+  # pointer was still alive. It can now be collected without rereading it.
+  def stats_released(entry)
+    @stat_runs += entry.stat_runs
+    @stat_finalizations += 1
+    nil
+  end
+
+  def stats_finalize(ptr)
+    @stat_runs += SQL.sqlite3_stmt_status(ptr, 6, 0)
+    @stat_finalizations += 1
+    nil
+  end
+
+  # Snapshots are for an idle pool or the owning script's thread. They add
+  # no locks to a connection's exclusively leased request path.
+  def dump_stmt_stats(phase, connection)
+    return nil unless STMT_STATS
+    runs = @stat_runs
+    @entries.each { |entry| runs += SQL.sqlite3_stmt_status(entry.ptr, 6, 0) }
+    # Explicit transient reads outside a lease can remain live at snapshot.
+    @open.each do |entry|
+      runs += SQL.sqlite3_stmt_status(entry.ptr, 6, 0) if !entry.cached && !entry.closed
+    end
+    line = "RH_STMT_STATS phase=" + phase + " connection=" + connection +
+      " hits=" + @stat_hits.to_s + " misses=" + @stat_misses.to_s +
+      " prepare_failures=" + @stat_failures.to_s +
+      " entries=" + @entries.length.to_s + " peak_entries=" + @stat_peak.to_s +
+      " distinct_sql=" + @stat_sql.length.to_s +
+      " distinct_sql_capped=" + (@stat_sql_capped ? "1" : "0") +
+      " trims=" + @stat_trims.to_s + " evictions=" + @stat_evictions.to_s +
+      " finalizations=" + @stat_finalizations.to_s +
+      " transient_prepares=" + @stat_transient.to_s +
+      " qc_hits=" + @stat_qc_hits.to_s + " qc_misses=" + @stat_qc_misses.to_s +
+      " qc_bypasses=" + @stat_qc_bypasses.to_s +
+      " executions=" + runs.to_s
+    if STMT_STATS_DEST == "1"
+      $stderr.puts line
+    else
+      begin
+        File.open(STMT_STATS_DEST, "a") { |file| file.puts line }
+      rescue StandardError => e
+        $stderr.puts "RH_STMT_STATS write failed: " + e.message
+      end
     end
     nil
   end
@@ -1137,6 +1255,15 @@ class DbPool
       i += 1
     end
     raise error if !error.nil?
+  end
+
+  def dump_stmt_stats(phase, shard)
+    i = 0
+    while i < @conns.length
+      @conns[i].dump_stmt_stats(phase, shard.to_s + ":" + i.to_s)
+      i += 1
+    end
+    nil
   end
 end
 
@@ -1369,6 +1496,32 @@ module Db
     records
   end
 
+  # The work `current_transaction.after_commit` holds for the COMMIT
+  # (ActiveRecord::Base._after_commit), beside the records above. Seeded
+  # and cleared, as the records are, so the element type is the work's.
+  def self._txn_callbacks
+    work = Thread.current[:ar_txn_callbacks]
+    if work.nil?
+      work = [-> { nil }]
+      work.clear
+      Thread.current[:ar_txn_callbacks] = work
+    end
+    work
+  end
+
+  # The tables whose model is inside `Model.unscoped { … }` on this
+  # thread (relation.rb's `Relation.unscoped_tables`). Seeded and
+  # cleared, as the records are, so the element type is String.
+  def self._unscoped_tables
+    tables = Thread.current[:ar_unscoped_tables]
+    if tables.nil?
+      tables = [""]
+      tables.clear
+      Thread.current[:ar_unscoped_tables] = tables
+    end
+    tables
+  end
+
   # Request-scoped connection lease for the thread-per-connection
   # server. Leases a connection index (parking on the pool's condition
   # variable while none is free), binds its DbConn to this thread's
@@ -1451,32 +1604,45 @@ module Db
       request_error = e
     ensure
       cleanup_error = nil
-      # Close a leftover snapshot before rolling back an abandoned app
-      # transaction, then drain readers before eviction. Each stage runs
-      # even when an earlier cleanup failed, without replacing the request error.
-      begin
-        if conn.snap_depth > 0
-          conn.snap_depth = 1
-          read_snapshot_end
+      # `Db.close` inside the lease drops `@pools` and closes `conn`.
+      # Snapshot and rollback cleanup talk to SQLite, so skip them when
+      # this pool is no longer the live one. The lease index still goes
+      # back to the pool that issued it.
+      pool_live = false
+      if !@pools.nil?
+        pi = 0
+        while pi < @pools.length
+          pool_live = true if @pools[pi].equal?(pool)
+          pi += 1
         end
-      rescue StandardError => e
-        cleanup_error = e
       end
-      begin
-        release_abandoned_write(conn)
-      rescue StandardError => e
-        cleanup_error = e if cleanup_error.nil?
-      end
-      begin
-        conn.qc_end
-        conn.release_all
-      rescue StandardError => e
-        cleanup_error = e if cleanup_error.nil?
-      ensure
-        conn.trim!
+      if pool_live
+        begin
+          if conn.snap_depth > 0
+            conn.snap_depth = 1
+            read_snapshot_end
+          end
+        rescue StandardError => e
+          cleanup_error = e
+        end
+        begin
+          release_abandoned_write(conn)
+        rescue StandardError => e
+          cleanup_error = e if cleanup_error.nil?
+        end
+        begin
+          conn.qc_end
+          conn.release_all
+        rescue StandardError => e
+          cleanup_error = e if cleanup_error.nil?
+        ensure
+          conn.trim!
+          Thread.current[:db_conn] = nil
+        end
+      else
         Thread.current[:db_conn] = nil
-        pool.release(idx)
       end
+      pool.release(idx)
       raise cleanup_error if !cleanup_error.nil? && request_error.nil?
     end
     raise request_error if !request_error.nil?
@@ -1484,22 +1650,44 @@ module Db
   end
 
   def self.close
-    return if @pools.nil?
+    # A closed handle left in the thread slot is the next statement's
+    # connection. Schema purge closes and reopens the same path.
+    Thread.current[:db_conn] = nil
+    Thread.current[:db_pool] = nil
+    # A pin left set would `release(0)` on the pool `configure` opens next.
+    Thread.current[:db_txn_pin] = false
     error = nil
-    begin
-      i = 0
-      while i < @pools.length
-        begin
-          @pools[i].close_all
-        rescue StandardError => e
-          error = e if error.nil?
+    if !@pools.nil?
+      begin
+        i = 0
+        while i < @pools.length
+          begin
+            @pools[i].close_all
+            @pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
+          rescue StandardError => e
+            error = e if error.nil?
+          end
+          i += 1
         end
-        i += 1
+      ensure
+        @pools = nil
       end
-    ensure
-      @pools = nil
     end
+    # Lease cleanup skips `release_abandoned_write` once this pool is
+    # gone. An open BEGIN would otherwise leave `@permit_held` set, and
+    # the next write waits out the permit timeout.
+    release_permit
     raise error if !error.nil?
+  end
+
+  def self.dump_stmt_stats(phase = "snapshot")
+    return nil if !DbConn::STMT_STATS || @pools.nil?
+    i = 0
+    while i < @pools.length
+      @pools[i].dump_stmt_stats(phase, i)
+      i += 1
+    end
+    nil
   end
 
   # DDL + INSERT/UPDATE/DELETE. `sqlite3_exec` doesn't return rows;
@@ -2006,6 +2194,9 @@ module Db
   # No-op (single nil check) when no capture is installed.
   def self.record_query(sql)
     @query_log.push(sql) unless @query_log.nil?
+    if defined?(ActiveSupport::Notifications) && ActiveSupport::Notifications.respond_to?(:sql)
+      ActiveSupport::Notifications.sql(sql)
+    end
     if @sql_trace
       $stderr.puts "  SQL " + sql
     end

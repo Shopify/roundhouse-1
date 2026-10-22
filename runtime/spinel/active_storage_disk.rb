@@ -442,6 +442,7 @@ module ActiveStorage
       initializer_filters(action_name)
       return nil if performed?
       create
+      initializer_after_filters(action_name)
       nil
     end
 
@@ -449,6 +450,12 @@ module ActiveStorage
     # `project::apply_module_mixins`. Redefined by the generated reopen
     # at the end of boot.rb when the app registers one.
     def initializer_filters(action_name)
+      nil
+    end
+
+    # The same for an initializer's `after_action`, asked once the
+    # action has answered.
+    def initializer_after_filters(action_name)
       nil
     end
 
@@ -504,12 +511,17 @@ module ActiveStorage
       else
         show
       end
+      initializer_after_filters(action_name)
       nil
     end
 
-    # The seam an initializer's `before_action` is written into — see
-    # `DirectUploadsController#initializer_filters`.
+    # The seams an initializer's `before_action` and `after_action` are
+    # written into — see `DirectUploadsController#initializer_filters`.
     def initializer_filters(action_name)
+      nil
+    end
+
+    def initializer_after_filters(action_name)
       nil
     end
 
@@ -556,7 +568,6 @@ module ActiveStorage
         head(:not_found)
         return nil
       end
-      headers["Cache-Control"] = "max-age=3600, public"
       send_data(service.download(key), type: blob.content_type_for_serving, disposition: disposition)
       # send_data writes only `inline`/`attachment`; restore the
       # sanitized filename after that overwrite.

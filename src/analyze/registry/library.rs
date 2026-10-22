@@ -258,6 +258,7 @@ pub(in crate::analyze) fn register(
             id: ClassId(Symbol::from("ActionMailer::MessageDelivery")),
             args: vec![].into(),
         };
+        let own_with = crate::lower::mailer_class_side::defines_with(app);
         for lc in &app.library_classes {
             if !is_mailer(&lc.name) {
                 continue;
@@ -279,7 +280,7 @@ pub(in crate::analyze) fn register(
                     .entry(method.name.clone())
                     .or_insert_with(|| delivery_ty.clone());
             }
-            if !lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "with") {
+            if !own_with.contains(lc.name.0.as_str()) {
                 cls.class_methods
                     .entry(Symbol::from("with"))
                     .or_insert_with(|| Ty::Class { id: lc.name.clone(), args: vec![].into() });
@@ -489,6 +490,7 @@ fn ar_instance_ty(kind: crate::catalog::ReturnKind) -> Option<Ty> {
         ReturnKind::IntOrNil => Some(Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() }),
         ReturnKind::Bool => Some(Ty::Bool),
         ReturnKind::Str => Some(Ty::Str),
+        ReturnKind::StrOrNil => Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
         ReturnKind::HashSymStr => {
             Some(Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) })
         }

@@ -1102,28 +1102,10 @@ ActionController::Base.perform_caching = false
 
 # ---- Query assertions ------------------------------------------------
 #
-# Rails' `ActiveSupport::Notifications.subscribed(callback,
-# "sql.active_record") { … }` and the `ActiveRecord::Assertions::
-# QueryAssertions` built on it, over `Db.capture_sql`, which records
-# every statement a prepare/exec issues and skips a query-cache replay,
-# as Rails' counter skips CACHE events. The callback gets Rails' five
-# arguments; the payload carries `:sql` and `:name` ("SQL", since the
-# runtime does not name its queries). Called after the block rather than
-# during it, which no test can tell: they collect, then inspect.
-# Legacy query capture for backends without synchronous event delivery.
-unless defined?(ActiveSupport::Notifications::Event)
-module ActiveSupport
-  module Notifications
-    def self.subscribed(callback, name, &block)
-      return block.call unless name == "sql.active_record"
-      result = nil
-      statements = Db.capture_sql { result = block.call }
-      statements.each { |sql| callback.call(name, nil, nil, nil, { sql: sql, name: "SQL" }) }
-      result
-    end
-  end
-end
-end
+# `ActiveSupport::Notifications.subscribed` lives in
+# runtime/ruby/active_support_notifications.rb. SQL for that name drains
+# `Db.capture_sql` after the block. QueryAssertions below read the same
+# log directly and skip schema statements.
 
 module ActiveRecord
   module Assertions
@@ -1987,6 +1969,15 @@ module RequestDispatch
   # actually use — were a NoMethodError on the test instance.
   def response
     @__response
+  end
+
+  # The last request's flash, as Rails' integration tests read it
+  # (`assert_equal "✓", flash[:notice]` after an unfollowed redirect).
+  # The dispatch already keeps it in `@__flash` to carry into the next
+  # request; this is its reader.
+  def flash
+    @__flash = ActionDispatch::Flash.new if @__flash.nil?
+    @__flash
   end
 
   # `host! "once.campfire.test"` — the Host every subsequent request in

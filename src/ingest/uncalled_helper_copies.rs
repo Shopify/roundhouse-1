@@ -60,6 +60,12 @@ pub(super) fn mark(app: &mut App) {
             if let ControllerBodyItem::Action { action, .. } = item
                 && action.name == method
             {
+                for (_, default) in &mut action.opt_params {
+                    mark_translate(default);
+                }
+                for default in action.kw_params.iter_mut().filter_map(|(_, d)| d.as_mut()) {
+                    mark_translate(default);
+                }
                 mark_translate(&mut action.body);
             }
         }

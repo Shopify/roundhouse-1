@@ -16,7 +16,8 @@
 //! build time, so the binary emits every target from any working
 //! directory; the app's own directories are still walked on disk. The
 //! emit dispatch is host-only; WASM builds use a different entry point
-//! and don't pull this module.
+//! and don't pull this module. The target enum lives in [`crate::build_target`]
+//! so lowering and Ruby emit can name a target on wasm.
 
 use std::fs;
 use std::io::Write;
@@ -31,219 +32,7 @@ use crate::emit::{self, EmittedFile};
 use crate::gems::{GEM_REQUIRES, Marker, VARIATION_MARKER, compiler_runtime_gems};
 use crate::ingest::ingest_app;
 
-/// Targets the `roundhouse` binary can produce, plus the `Blog`
-/// pseudo-target (verbatim source archive).
-///
-/// The transpile targets (`Spinel` through `TypescriptWorker`) are
-/// valid for both `--target LANG` and `--site` modes. `Blog` is only
-/// valid for `--site` — it's the source fixture, not a transpile
-/// output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuildTarget {
-    /// Source fixture, walked verbatim. `--site` only.
-    Blog,
-    /// Spinel-target emit: scaffold + runtime + lowered app, FFI db.rb.
-    Spinel,
-    /// CRuby-target emit: spinel files + ruby_overlay + gem db.rb +
-    /// fixture's app/javascript + public assets.
-    Ruby,
-    /// JRuby-target emit: byte-identical to the Ruby target except the
-    /// SQLite backend — ships the JDBC `db_jruby.rb` (the `sqlite3` gem
-    /// is a C extension with no JRuby build) so the same emitted source
-    /// runs on the JVM.
-    Jruby,
-    /// Rails → Roda + Sequel source conversion (issue #67 spike). Runs
-    /// on the real roda/sequel gems, not the roundhouse runtime, and
-    /// emits from the INGEST-shape App (`bin/roundhouse` skips
-    /// `analyze_and_lower` for it) — see `emit::roda`.
-    Roda,
-    /// Rails → Ruby as a partial evaluator: specialize what the analysis
-    /// can resolve, leave the rest as residual Ruby running on the real
-    /// gems (Rails included). Stage 0 is the identity — the residue is
-    /// the whole app, walked verbatim — so the gate (`tests/futamura.rs`:
-    /// the app's own Rails suite, run against the output) exists before
-    /// the first specialization does. Like `Roda`, skips
-    /// `analyze_and_lower` in `bin/roundhouse`.
-    Futamura,
-    Crystal,
-    Elixir,
-    Go,
-    /// Kotlin/JVM emit (backend-only). In the `ALL` `--site` archive
-    /// matrix as of the e2e-kotlin gate (the emitted archive builds via
-    /// `gradle installDist` and boots — see `scripts/e2e kotlin`).
-    /// Still incomplete (partial e2e/compare coverage), like several
-    /// published targets — see `docs/archive/kotlin-migration-plan.md`.
-    Kotlin,
-    Python,
-    Rust,
-    /// Swift emit (backend-only). In the `ALL` `--site` archive matrix
-    /// as of the compare/bench/CI gates closing (the emitted archive
-    /// builds via `swift build` and boots; Server.swift serves
-    /// `/assets/*`). Still incomplete (no frameworks/e2e gates, like
-    /// several published targets) — see `docs/archive/swift-migration-plan.md`
-    /// and issue #34.
-    Swift,
-    /// C# / .NET emit (backend-only). Scaffold stage — `emit` produces the
-    /// .NET project scaffold (`roundhouse-app.csproj`, `Program.cs`) and the
-    /// `ty`/`naming` mappings; models/controllers/views/runtime land in later
-    /// phases. See `docs/archive/csharp-migration-plan.md`.
-    CSharp,
-    Typescript,
-    /// TypeScript emit under the `worker` deployment profile
-    /// (SharedWorker browser deployment).
-    TypescriptWorker,
-}
-
-impl BuildTarget {
-    /// All targets that participate in `--site` archive generation,
-    /// in site-archive order.
-    pub const ALL: &'static [BuildTarget] = &[
-        BuildTarget::Blog,
-        BuildTarget::Spinel,
-        BuildTarget::Ruby,
-        BuildTarget::Jruby,
-        BuildTarget::Crystal,
-        BuildTarget::Elixir,
-        BuildTarget::Go,
-        BuildTarget::Kotlin,
-        BuildTarget::Python,
-        BuildTarget::Rust,
-        BuildTarget::Swift,
-        BuildTarget::CSharp,
-        BuildTarget::Typescript,
-        BuildTarget::TypescriptWorker,
-    ];
-
-    /// Targets the `--site` build archives beyond [`Self::ALL`]: they
-    /// get a browse archive, but sit outside the per-target test
-    /// matrices that iterate `ALL` (futamura's gate is the app's own
-    /// Rails suite, `tests/futamura.rs`).
-    pub const SITE_ONLY: &'static [BuildTarget] = &[BuildTarget::Futamura];
-
-    /// Targets valid for `--target LANG` (transpile to directory).
-    /// Excludes `Blog` (source-only) — `--target blog` would mean
-    /// "copy the input to the output," which is a `cp -r`, not a
-    /// transpile.
-    pub const TRANSPILE: &'static [BuildTarget] = &[
-        BuildTarget::Spinel,
-        BuildTarget::Ruby,
-        BuildTarget::Jruby,
-        BuildTarget::Roda,
-        BuildTarget::Futamura,
-        BuildTarget::Crystal,
-        BuildTarget::Elixir,
-        BuildTarget::Go,
-        BuildTarget::Kotlin,
-        BuildTarget::Python,
-        BuildTarget::Rust,
-        BuildTarget::Swift,
-        BuildTarget::CSharp,
-        BuildTarget::Typescript,
-        BuildTarget::TypescriptWorker,
-    ];
-
-    /// CLI name. Stable — used in `--target X` and in
-    /// `_site/browse/<name>.{json,tgz,zip}` archive filenames.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BuildTarget::Blog => "blog",
-            BuildTarget::Spinel => "spinel",
-            BuildTarget::Ruby => "ruby",
-            BuildTarget::Jruby => "jruby",
-            BuildTarget::Roda => "roda",
-            BuildTarget::Futamura => "futamura",
-            BuildTarget::Crystal => "crystal",
-            BuildTarget::Elixir => "elixir",
-            BuildTarget::Go => "go",
-            BuildTarget::Kotlin => "kotlin",
-            BuildTarget::Python => "python",
-            BuildTarget::Rust => "rust",
-            BuildTarget::Swift => "swift",
-            BuildTarget::CSharp => "csharp",
-            BuildTarget::Typescript => "typescript",
-            BuildTarget::TypescriptWorker => "typescript-worker",
-        }
-    }
-
-    /// Does this target ship a runtime `ActiveRecord::Relation` for a
-    /// query chain the Arel builder could not fold to SQL?
-    ///
-    /// The ruby-family targets (`ruby`, `jruby`, `spinel`) emit
-    /// `runtime/ruby/active_record/relation.rb`, so an unfolded chain
-    /// executes there — a missed specialization, not a defect. Nothing
-    /// under `runtime/{rust,go,crystal,python,typescript,…}` defines a
-    /// Relation or any of its methods, so for those targets the same
-    /// chain is a call into a type that does not exist: uncompilable
-    /// output. That is what makes the `relation_residue` ledger's
-    /// "unsupported at strict-target emit" a WARNING on one side of
-    /// this predicate and an ERROR on the other (issue #76).
-    ///
-    /// `Roda` converts to real Sequel datasets and `Futamura` leaves an
-    /// unfolded chain on real ActiveRecord; both skip the lowerings
-    /// entirely (`bin/roundhouse`), so no residue is ever raised
-    /// against them; `Blog` is the source fixture walked verbatim.
-    /// Matched exhaustively on purpose — a new target has to answer
-    /// this question rather than inherit an answer.
-    pub fn has_runtime_relation(self) -> bool {
-        match self {
-            BuildTarget::Blog
-            | BuildTarget::Spinel
-            | BuildTarget::Ruby
-            | BuildTarget::Jruby
-            | BuildTarget::Roda
-            | BuildTarget::Futamura => true,
-            BuildTarget::Crystal
-            | BuildTarget::Elixir
-            | BuildTarget::Go
-            | BuildTarget::Kotlin
-            | BuildTarget::Python
-            | BuildTarget::Rust
-            | BuildTarget::Swift
-            | BuildTarget::CSharp
-            | BuildTarget::Typescript
-            | BuildTarget::TypescriptWorker => false,
-        }
-    }
-
-    /// Does the emitted persistence runtime provide the single-statement
-    /// `Db.exec_returning` operation needed to hydrate generated columns
-    /// from the INSERT that created them? The Ruby-family runtimes each
-    /// implement it (SQLite adapters require SQLite 3.35+); the SDK-backed
-    /// targets do not ship a matching database runtime yet. `Blog` is only
-    /// the source fixture, so it is not a runtime support claim.
-    fn supports_generated_column_insert_returning(self) -> bool {
-        match self {
-            BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel => true,
-            // Real Rails persists generated columns itself; `target_files`
-            // returns the verbatim tree before this question is asked.
-            BuildTarget::Futamura => true,
-            BuildTarget::Blog
-            | BuildTarget::Roda
-            | BuildTarget::Crystal
-            | BuildTarget::Elixir
-            | BuildTarget::Go
-            | BuildTarget::Kotlin
-            | BuildTarget::Python
-            | BuildTarget::Rust
-            | BuildTarget::Swift
-            | BuildTarget::CSharp
-            | BuildTarget::Typescript
-            | BuildTarget::TypescriptWorker => false,
-        }
-    }
-
-    /// Parse a CLI string. Returns `None` for unknown names. Chains
-    /// `TRANSPILE` after `ALL` so transpile-only targets not in the
-    /// `--site` matrix (e.g. `kotlin`) still parse for `--target`.
-    pub fn from_str(s: &str) -> Option<BuildTarget> {
-        for t in BuildTarget::ALL.iter().chain(BuildTarget::TRANSPILE.iter()) {
-            if t.as_str() == s {
-                return Some(*t);
-            }
-        }
-        None
-    }
-}
+pub use crate::build_target::{BuildTarget, ParamBindCapability};
 
 /// Quick-start README for a transpile target. Injected into every
 /// file set by `target_files` (so both `--target` output and the
@@ -706,14 +495,20 @@ pub fn target_readme(target: BuildTarget) -> String {
 /// The three lines are matched exactly so a drift in the sidecar is a
 /// build error here, not a silent narrowing.
 fn widen_key_contract(app: &App, files: &mut [(String, String)]) -> Result<(), String> {
+    let string_key = |col: &crate::schema::Column| {
+        !matches!(
+            col.col_type,
+            crate::schema::ColumnType::Integer | crate::schema::ColumnType::BigInt
+        )
+    };
     let has_string_key = app.schema.tables.values().any(|t| {
-        t.columns.iter().any(|c| {
-            c.primary_key
-                && !matches!(
-                    c.col_type,
-                    crate::schema::ColumnType::Integer | crate::schema::ColumnType::BigInt
-                )
-        })
+        t.columns.iter().any(|c| c.primary_key && string_key(c))
+    }) || app.models.iter().any(|model| {
+        let Some(name) = &model.primary_key else { return false };
+        app.schema
+            .tables
+            .get(&model.table.0)
+            .is_some_and(|table| table.columns.iter().any(|c| &c.name == name && string_key(c)))
     });
     if !has_string_key {
         return Ok(());
@@ -725,6 +520,7 @@ fn widen_key_contract(app: &App, files: &mut [(String, String)]) -> Result<(), S
     for (narrow, wide) in [
         ("    def id: () -> Integer\n", "    def id: () -> (Integer | String)\n"),
         ("    def id=: (Integer) -> Integer\n", "    def id=: (Integer | String) -> (Integer | String)\n"),
+        ("    def _primary_key_value: () -> Integer\n", "    def _primary_key_value: () -> (Integer | String)\n"),
         ("    def _adapter_insert: () -> Integer\n", "    def _adapter_insert: () -> (Integer | String)\n"),
     ] {
         if !text.contains(narrow) {
@@ -781,6 +577,21 @@ fn widen_spinel_base_on_sigs(src: &str) -> String {
         widened.push('\n');
     }
     widened
+}
+
+/// Spinel has no unboxed `Array[HashConfig]`. An RBS that claims one is
+/// misread at call sites as a String, so `with_temporary_connection`
+/// refuses the element (`sp_HashConfig *`). Roundhouse keeps the
+/// precise array type for Bar A/B; only the Spinel tree widens it.
+pub fn widen_spinel_hash_config_arrays(files: &mut [(String, String)]) {
+    const NARROW: &str = "Array[ActiveRecord::DatabaseConfigurations::HashConfig]";
+    const WIDE: &str = "Array[untyped]";
+    for (path, content) in files.iter_mut() {
+        if !path.ends_with(".rbs") || !content.contains(NARROW) {
+            continue;
+        }
+        *content = content.replace(NARROW, WIDE);
+    }
 }
 
 pub fn spinel_relation_model_handle(files: &mut [(String, String)]) -> Result<(), String> {
@@ -1022,6 +833,26 @@ fn target_emits_app_library_classes(target: BuildTarget) -> bool {
             | BuildTarget::Futamura
         // Roda omitted: spike emit does not walk `app.library_classes`.
     )
+}
+
+/// A gem's class method called where the receiver may be a relation:
+/// only the Ruby family hands a relation on (`lower::relation_class_calls`).
+fn report_relation_class_calls(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Futamura) {
+        return;
+    }
+    for (span, method) in crate::lower::relation_class_calls::untyped_calls(app) {
+        emit::diagnostics::report_unsupported(
+            span,
+            target.as_str(),
+            "class method on a relation",
+            format!(
+                "`{}` is a class method the model takes from a gem module, called on a receiver whose type is unknown; \
+                 Rails' relation answers it, and this target has no relation to hand it",
+                method.as_str()
+            ),
+        );
+    }
 }
 
 fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
@@ -2050,7 +1881,8 @@ fn report_alias_super_copies(app: &App, target: BuildTarget) {
 
 /// Sends the analyzer types for every target but whose runtime only the
 /// Ruby family has: `Array#fetch`, `each_slice`, `each_cons`, an
-/// enumerator's `with_object`, `Array[...]` and `Hash[...]`, `include?` on
+/// enumerator's `with_object`, `Array[...]` and `Hash[...]`,
+/// `Array.try_convert` (what a nested splat desugars to), `include?` on
 /// a `Class`/`Module` value (Module's ancestry query, which the other
 /// targets' `include?` is not), Kernel's `Rational(...)`, which a
 /// rational literal ingests as, and Kernel's `Integer(...)` and
@@ -2084,6 +1916,10 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
                     ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Hash" => Some("Hash[]"),
                     _ => None,
                 },
+                (Some(r), "try_convert") => match &*r.node {
+                    ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Array" => Some("Array.try_convert"),
+                    _ => None,
+                },
                 (Some(_), "fetch") if matches!(recv_ty, Some(Ty::Array { .. })) => Some("Array#fetch"),
                 (Some(_), "each_slice") if matches!(recv_ty, Some(Ty::Array { .. })) => Some("Array#each_slice"),
                 (Some(_), "each_cons") if matches!(recv_ty, Some(Ty::Array { .. })) => Some("Array#each_cons"),
@@ -2105,11 +1941,11 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target, &kernel));
 }
 
-/// A send on a typed Array or number receiver that the TypeScript emit has
+/// A send on a typed Array, number or String receiver that the TypeScript emit has
 /// no translation for: it writes the Ruby name on the JS value
 /// (`xs.zip(ys)`, `n.digits` as a property read), which throws or reads
-/// `undefined`. `emit::typescript::array_method_handled` and
-/// `numeric_method_handled` name what it does translate.
+/// `undefined`. `emit::typescript::array_method_handled`,
+/// `numeric_method_handled` and `string_method_handled` name what it does translate.
 fn report_typescript_array_sends(app: &App, target: BuildTarget) {
     if !matches!(target, BuildTarget::Typescript | BuildTarget::TypescriptWorker) {
         return;
@@ -2196,6 +2032,21 @@ fn report_typescript_array_sends(app: &App, target: BuildTarget) {
                         "the TypeScript emit has no translation for it and would call the Ruby name on a JS number",
                     );
                 }
+            }
+            let string = match r.ty.as_ref() {
+                Some(Ty::Str) => true,
+                Some(Ty::Union { variants }) => {
+                    variants.len() == 2 && variants.iter().any(|v| matches!(v, Ty::Nil)) && variants.iter().any(|v| matches!(v, Ty::Str))
+                }
+                _ => false,
+            };
+            if string && !crate::emit::typescript::string_method_handled(method.as_str(), args, block.as_ref()) {
+                crate::emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target.as_str(),
+                    format!("String#{}", method.as_str()).as_str(),
+                    "the TypeScript emit has no translation for it and would call the Ruby name on a JS string",
+                );
             }
         }
         expr.node.for_each_child(&mut |child| visit(child, target, records));
@@ -2457,6 +2308,37 @@ fn target_files_inner(
         }
         None => app,
     };
+    // One gate for the Oj stand-in: ruby, jruby and spinel keep the class
+    // ingest installed. Every other transpile target drops it here, before
+    // the bundled-constant and TypeScript walks, so a missing `JSON` or
+    // `String#read` inside the class is not a second, incidental error.
+    let without_oj;
+    let app = match crate::lower::oj::without_unrun_stand_in(app, target) {
+        Some(trimmed) => {
+            without_oj = trimmed;
+            &without_oj
+        }
+        None => app,
+    };
+    // The gems only the ruby family ships (Faraday, Retryable, JWT, ...) run
+    // as the real gems on ruby and jruby; every other target refuses each
+    // reference (`lower::ruby_family_gems`).
+    let without_ruby_family_gems;
+    let app = match crate::lower::ruby_family_gems::without_unshipped_gems(app, target) {
+        Some(trimmed) => {
+            without_ruby_family_gems = trimmed;
+            &without_ruby_family_gems
+        }
+        None => app,
+    };
+    let with_closed_constantize;
+    let app = match crate::lower::constantize::lower_for_target(app, target) {
+        Some(lowered) => {
+            with_closed_constantize = lowered;
+            &with_closed_constantize
+        }
+        None => app,
+    };
     if target == BuildTarget::Roda {
         if let Some((table, column)) = app.schema.tables.values().find_map(|table| {
             table
@@ -2495,6 +2377,11 @@ fn target_files_inner(
     report_unsupported_bundled_constants(app, target);
     report_strict_validation_contexts(app, target);
     report_i18n_table_sites(app, target);
+    // Snapshot the optional measurement override at the target boundary. The
+    // lowerers receive a value; they never consult process-global environment.
+    let param_binds = target.param_binds_enabled(
+        std::env::var("ROUNDHOUSE_PARAM_BINDS").ok().as_deref(),
+    );
     reject_unsupported_pattern_matches(app, target)?;
     reject_file_blob_fixtures(app, target)?;
     reject_unsupported_data_factories(app, target)?;
@@ -2507,9 +2394,24 @@ fn target_files_inner(
     report_inherited_visibility_overrides(app, target);
     report_test_helper_connection(app, target);
     report_unemitted_library_classes(app, target);
+    report_relation_class_calls(app, target);
     report_typescript_error_class(app, target);
     report_replayed_class_bodies(app, target);
     report_controller_sibling_classes(app, target);
+    // `validates …, uniqueness:` left out of a target with no runtime
+    // Relation: reported here, where the CLI and the MCP `wont_lower`
+    // both collect a target's gaps, so neither reports a clean emit.
+    for d in crate::lower::relation_residue::uniqueness_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
+    // `acceptance:` on an `attribute :x, :boolean`, left out where the
+    // writer cannot keep Rails' nil.
+    for d in crate::lower::validations::acceptance_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
+    for d in crate::lower::relation_residue::default_scope_gaps_for_target(app, target) {
+        emit::diagnostics::push(d);
+    }
     report_mailers(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
@@ -2663,16 +2565,17 @@ fn target_files_inner(
     let files = crate::timings::phase(format_args!("emit {}: assemble", target.as_str()), || match target {
         BuildTarget::Blog => blog_files(fixture),
         BuildTarget::Futamura => futamura_files(fixture),
-        BuildTarget::Spinel => spinel_files_with_source_markers(app, fixture).and_then(|(mut files, _)| {
+        BuildTarget::Spinel => spinel_files_with_source_markers(app, fixture, param_binds).and_then(|(mut files, _)| {
             spinel_relation_model_handle(&mut files)?;
+            widen_spinel_hash_config_arrays(&mut files);
             spin_shape(files)
         }),
         // The ruby family gets the bundled-library requires too: the
         // table used to live inside `spin_shape` and so reached only
         // the spinel tree, which cost campfire two test files on a
         // Ruby 3.4 runner (`Pathname()`).
-        BuildTarget::Ruby => ruby_runtime_files(app, fixture).map(with_bundled_requires),
-        BuildTarget::Jruby => jruby_runtime_files(app, fixture).map(with_bundled_requires),
+        BuildTarget::Ruby => ruby_runtime_files(app, fixture, param_binds).map(with_bundled_requires),
+        BuildTarget::Jruby => jruby_runtime_files(app, fixture, param_binds).map(with_bundled_requires),
         BuildTarget::Roda => Ok(sort_files(emit::roda::emit(app))),
         BuildTarget::Crystal => Ok(sort_files(emit::crystal::emit(app))),
         BuildTarget::Elixir => Ok(sort_files(emit::elixir::emit(app))),
@@ -2747,7 +2650,7 @@ fn target_files_inner(
     } else {
         let files = ensure_seed_sql(files, app)?;
         let files = ensure_storage_keep(files, target);
-        let files = ensure_static_assets(files, target);
+        let files = ensure_static_assets(files, target, app);
         ensure_e2e(files, target)
     };
     Ok(ensure_readme(files, target))
@@ -3004,9 +2907,59 @@ fn ensure_readme(
 /// in that job), and its binary sendfiles `static/assets/` the same way
 /// jruby's `Rack::Static` does. Without baked assets either serves no
 /// tailwind.css / turbo.min.js and Turbo never boots.
+/// The fingerprinted stylesheet Propshaft will request for a baked
+/// logical file such as `tailwind.css`. Nested paths stay put: the
+/// asset graph bakes those under the logical name the importmap uses.
+fn propshaft_content_digest(content: &str) -> String {
+    use sha1::Digest;
+    let digest = format!("{:x}", sha1::Sha1::digest(content.as_bytes()));
+    digest[..8].to_string()
+}
+
+/// Write `content` at the fingerprint of those bytes and point every
+/// Propshaft lookup of the ingest-time name at that path. The old
+/// fingerprinted path stays free so `write_binary_assets` can still
+/// materialize the source-compiled bytes there.
+fn place_baked_stylesheet(files: &mut Vec<(String, String)>, app: &App, rel: &str, content: &str) {
+    let Some(old) = baked_propshaft_name(app, rel) else {
+        return;
+    };
+    let Some(stem) = rel.strip_suffix(".css") else {
+        return;
+    };
+    let name = format!("{stem}-{}", propshaft_content_digest(content));
+    let digested = format!("{name}.css");
+    let digested_path = format!("static/assets/{digested}");
+    if !files.iter().any(|(path, _)| path == &digested_path) {
+        files.push((digested_path, content.to_string()));
+    }
+    if digested != old {
+        let old_url = format!("/assets/{old}");
+        let new_url = format!("/assets/{digested}");
+        for (_, file) in files.iter_mut() {
+            if file.contains(&old_url) {
+                *file = file.replace(&old_url, &new_url);
+            }
+        }
+    }
+}
+
+fn baked_propshaft_name(app: &App, rel: &str) -> Option<String> {
+    let stem = rel.strip_suffix(".css")?;
+    if stem.contains('/') {
+        return None;
+    }
+    let prefix = format!("static/assets/{stem}-");
+    app.binary_assets.iter().find_map(|(path, _)| {
+        (path.starts_with(&prefix) && path.ends_with(".css"))
+            .then(|| path["static/assets/".len()..].to_string())
+    })
+}
+
 fn ensure_static_assets(
     mut files: Vec<(String, String)>,
     target: BuildTarget,
+    app: &App,
 ) -> Vec<(String, String)> {
     let bakes_assets = matches!(
         target,
@@ -3038,8 +2991,13 @@ fn ensure_static_assets(
     for (rel, content) in injected {
         let path = format!("static/assets/{rel}");
         if !files.iter().any(|(p, _)| p == &path) {
-            files.push((path, content));
+            files.push((path, content.clone()));
         }
+        // The layout asks for the fingerprinted name. That name has to be
+        // the digest of these bytes, not of the unbuilt source Propshaft
+        // hashed at ingest, or the archive serves CSS that does not match
+        // its fingerprint.
+        place_baked_stylesheet(&mut files, app, &rel, &content);
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
@@ -3447,6 +3405,19 @@ module MochaBridge
       else
         Object.const_get(konst)
       end
+    # A model class method a relation reaches (`User.active.find_by_x(id)`)
+    # takes the relation as a trailing `__rel`, the lowering's spelling of
+    # Rails' implicit scoping, so the call carries one argument more than
+    # the test's `with(...)` names. It is matched by an optional
+    # `anything` — the stubbed method is the one the test wrote either way.
+    # Read before the first stub replaces the method's parameter list, and
+    # remembered, since a second stub of the same method sees mocha's.
+    @rel_params ||= {}
+    rel_param =
+      %w[stubs expects].include?(kind.to_s) &&
+      @rel_params.fetch([target, meth.to_sym]) do |key|
+        @rel_params[key] = target.respond_to?(meth) && target.method(meth).parameters.last&.last == :__rel
+      end
     expectation =
       case kind.to_s
       when "stubs" then target.stubs(meth)
@@ -3458,6 +3429,7 @@ module MochaBridge
     ops.each do |op, args|
       kw = args.last.is_a?(KwArgs) ? args.pop.hash : nil
       args = args.map { |a| resolve(a) }
+      args = args + [matcher(:optionally, matcher(:anything))] if op == :with && rel_param && !blk
       expectation =
         if op == :with && blk
           expectation.with(&blk)
@@ -3895,8 +3867,9 @@ enum RubyFlavor {
 fn ruby_runtime_files(
     app: &App,
     fixture: &Path,
+    param_binds: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    ruby_family_runtime_files(app, fixture, RubyFlavor::CRuby)
+    ruby_family_runtime_files(app, fixture, RubyFlavor::CRuby, param_binds)
 }
 
 /// "jruby" archive: byte-identical to the "ruby" tree except the SQLite
@@ -3908,8 +3881,9 @@ fn ruby_runtime_files(
 fn jruby_runtime_files(
     app: &App,
     fixture: &Path,
+    param_binds: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    ruby_family_runtime_files(app, fixture, RubyFlavor::JRuby)
+    ruby_family_runtime_files(app, fixture, RubyFlavor::JRuby, param_binds)
 }
 
 fn primary_postgresql(app: &App) -> bool {
@@ -4115,6 +4089,7 @@ fn ruby_family_runtime_files(
     app: &App,
     fixture: &Path,
     flavor: RubyFlavor,
+    param_binds: bool,
 ) -> Result<Vec<(String, String)>, String> {
     // An app that reads `errors.attribute_names` gets each error
     // message's attribute recorded beside it (`emit::ruby::expr::
@@ -4123,7 +4098,7 @@ fn ruby_family_runtime_files(
     emit::ruby::with_native_keyword_splats(|| {
         let scoped = emit::ruby::singleton_scoped(app);
         emit::ruby::with_singleton_scoped(scoped, || {
-            emit::ruby::with_error_attributes(error_attributes, || ruby_family_files(app, fixture, flavor))
+            emit::ruby::with_error_attributes(error_attributes, || ruby_family_files(app, fixture, flavor, param_binds))
         })
     })
 }
@@ -4132,6 +4107,7 @@ fn ruby_family_files(
     app: &App,
     fixture: &Path,
     flavor: RubyFlavor,
+    param_binds: bool,
 ) -> Result<Vec<(String, String)>, String> {
     if primary_postgresql(app) && flavor != RubyFlavor::CRuby {
         return Err("postgresql database: only the CRuby runtime has a pg driver (not substituted)".into());
@@ -4154,7 +4130,7 @@ fn ruby_family_files(
     // bodies serves them all, as in the model lowering.
     let _library_demand = crate::lower::model_to_library::schema::share_library_demand(&app.library_classes);
     let _body_names = crate::lower::model_to_library::schema::share_model_body_names(&app.models, &Default::default());
-    let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
+    let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode, param_binds)?;
     crate::timings::lap_start();
     if matches!(flavor, RubyFlavor::CRuby) {
         files.push(("test/minitest_runner.rb".to_string(),
@@ -4182,6 +4158,24 @@ fn ruby_family_files(
     // superclasses is a `TypeError: superclass mismatch` at REQUIRE
     // time — campfire's suite went 219/240 to 0/240, every file dying
     // on the same line.
+    let sidekiq = needs_redis(app);
+    // On these lanes the redis gem is required at the first push, not at
+    // boot: a tree whose tests record pushes through `SidekiqPush`'s seam
+    // then boots without the gem installed. Spinel resolves requires at
+    // compile time, so its tree keeps the file's top-level require.
+    let sidekiq_client = if sidekiq {
+        let client = crate::runtime_files::read_to_string(SIDEKIQ_REDIS_CLIENT)?;
+        const AT_LOAD: &str = "require \"redis\"\n";
+        const OPEN: &str = "    conn = password == \"\" ? Redis.new(url: url, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT) : Redis.new(url: url, password: password, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT)\n";
+        if !client.contains(AT_LOAD) || !client.contains(OPEN) {
+            return Err(format!("{SIDEKIQ_REDIS_CLIENT}: the require or the connect line moved"));
+        }
+        client
+            .replacen(AT_LOAD, "# `require \"redis\"` is at the first connect on this lane.\n", 1)
+            .replacen(OPEN, &format!("    require \"redis\"\n{OPEN}"), 1)
+    } else {
+        String::new()
+    };
     for (path, content) in files.iter_mut() {
         if path == "runtime/ipaddr.rb" {
             *content = IPADDR_STDLIB.to_string();
@@ -4290,6 +4284,11 @@ fn ruby_family_files(
         // it. The spinel file re-renders because it has no alias.
         if path == "runtime/secure_random_stub.rb" {
             *content = SECURE_RANDOM_STUB_REOPEN.to_string();
+        }
+        // `SidekiqRedis`: the real connection, over the redis-rb gem, for
+        // a tree on queue_adapter :sidekiq (`needs_redis`).
+        if path == "runtime/sidekiq_redis.rb" && sidekiq {
+            *content = sidekiq_client.clone();
         }
         // `TcpSocketStub`: the table as written, and `TCPSocket.open`
         // reopened to consult it — the seam the strict client asks from
@@ -4970,7 +4969,7 @@ fn ruby_family_files(
     // scope. The plain spinel target keeps unwrapped controllers (its
     // dispatch wraps body-only).
     crate::timings::lap("ruby family: overlays");
-    files.extend(sort_files(emit::ruby::emit_lowered_controllers_with_layout(app)));
+    files.extend(sort_files(emit::ruby::emit_lowered_controllers_with_layout_and_param_binds(app, param_binds)));
     crate::timings::lap("ruby family: layout controllers");
 
     // The source app's `app/javascript/` + `public/` static assets are
@@ -5026,6 +5025,9 @@ fn ruby_family_files(
     // gets the block exactly once; this is the ruby family's turn, and
     // the ruby family is the one that can run the lines.
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
+    // Overlay boot replaced the spinel boot, so the flags written into
+    // that file in `spinel_files` are gone. Write them again here.
+    apply_environment_flags(&mut files, app);
     apply_app_requires(&mut files, app, RequireTarget::RubyFamily);
     apply_rails_version(&mut files, app);
     if matches!(flavor, RubyFlavor::CRuby) {
@@ -8246,7 +8248,8 @@ fn i18n_table_text(app: &App) -> String {
                 }
             }
             for key in &c.opaque {
-                out.push_str(&format!("O\u{1f}{locale}.{key}\u{1f}.\u{1e}"));
+                let fields = c.values.get(key).map_or_else(|| vec!["?".to_string()], |v| v.fields());
+                out.push_str(&format!("O\u{1f}{locale}.{key}\u{1f}{}\u{1f}.\u{1e}", fields.join("\u{1f}")));
             }
         }
         for variant in catalog.variants(&locales) {
@@ -9011,12 +9014,60 @@ fn apply_database_pragmas(files: &mut [(String, String)], app: &App) {
 /// `App::job_plans`. A span replace between markers, like
 /// `apply_global_id_locate`; an app with no payload jobs keeps a
 /// registry whose `perform` answers false.
+/// Whether a tree pushes jobs to Redis: the app is on `queue_adapter
+/// :sidekiq` and has at least one payload job (`lower::job_payload`). An
+/// app on `:sidekiq` whose jobs all keep their Proc, or that has no
+/// ActiveJob jobs at all (Mastodon's are native Sidekiq workers), gets
+/// no Redis client and no dependency.
+pub(crate) fn needs_redis(app: &App) -> bool {
+    app.queue_adapter.as_deref() == Some("sidekiq") && app.job_plans.iter().any(|p| p.is_payload())
+}
+
+/// The `JobRegistry.sidekiq?` body `apply_job_registry` writes for a tree
+/// that [`needs_redis`]. `spin_shape` keys the Redis package on it, since
+/// it sees files, not the `App`.
+const SIDEKIQ_REGISTRY_FLAG: &str = "  def self.sidekiq?\n    true\n  end\n";
+
+/// The real Redis connection for a tree on `:sidekiq`, swapped in for the
+/// raising façade at `runtime/sidekiq_redis.rb` on every Ruby-family lane.
+const SIDEKIQ_REDIS_CLIENT: &str = "runtime/spinel/sidekiq/sidekiq_redis.rb";
+
+/// The body of `JobRegistry.sidekiq_redis_url` or `_password` for one
+/// `configure_client` setting: `""` when the app gives none, so the push
+/// falls back to the environment. `SidekiqPush.setting` reads a variable
+/// when the push first needs it, as Sidekiq reads it at boot.
+fn redis_setting_source(setting: Option<&crate::app::RedisSetting>) -> String {
+    use crate::app::RedisSetting;
+    use crate::emit::ruby::expr::ruby_str_literal;
+    match setting {
+        None => "\"\"".to_string(),
+        Some(RedisSetting::Literal(value)) => ruby_str_literal(value),
+        Some(RedisSetting::Env(name)) => format!("SidekiqPush.setting({})", ruby_str_literal(name)),
+        Some(RedisSetting::EnvFetch { name, default: None }) => {
+            format!("SidekiqPush.required_setting({})", ruby_str_literal(name))
+        }
+        Some(RedisSetting::EnvFetch { name, default: Some(default) }) => {
+            format!("SidekiqPush.setting_or({}, {})", ruby_str_literal(name), ruby_str_literal(default))
+        }
+    }
+}
+
 fn apply_job_registry(files: &mut [(String, String)], app: &App) {
     const HEAD: &str = "  # >>> generated: job-registry\n";
     const TAIL: &str = "  # <<< generated: job-registry\n";
+    let flag = if needs_redis(app) {
+        SIDEKIQ_REGISTRY_FLAG.to_string()
+    } else {
+        "  def self.sidekiq?\n    false\n  end\n".to_string()
+    };
+    let redis = format!(
+        "\n  def self.sidekiq_redis_url\n    {}\n  end\n\n  def self.sidekiq_redis_password\n    {}\n  end\n",
+        redis_setting_source(app.sidekiq_redis.url.as_ref()),
+        redis_setting_source(app.sidekiq_redis.password.as_ref()),
+    );
     let generated = format!(
-        "{HEAD}{}{TAIL}",
-        crate::lower::job_payload::registry_source(&app.job_plans)
+        "{HEAD}{}\n{flag}{redis}{TAIL}",
+        crate::lower::job_payload::registry_source(&app.job_plans, needs_redis(app))
     );
     for (path, content) in files.iter_mut() {
         if !path.ends_with("job_registry.rb") {
@@ -9510,6 +9561,34 @@ fn apply_rails_version(files: &mut [(String, String)], app: &App) {
     }
 }
 
+/// `AppEnvironment` at the end of boot.rb. `assume_ssl?(env)` is
+/// `config.assume_ssl = true` in that environment (Rails'
+/// `ActionDispatch::AssumeSSL`). `serving_assume_ssl?` reads
+/// `RAILS_ENV` (development when unset) so both dispatchers share one
+/// check. Always defined, so a tree with the flag off still answers
+/// false.
+fn apply_environment_flags(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "# Per-environment flags, from config/environments/*.rb";
+    let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else {
+        return;
+    };
+    if boot.contains(MARK) {
+        return;
+    }
+    let cond = if app.assume_ssl_envs.is_empty() {
+        "false".to_string()
+    } else {
+        app.assume_ssl_envs.iter().map(|e| format!("env == {e:?}")).collect::<Vec<_>>().join(" || ")
+    };
+    boot.push_str(&format!(
+        "\n{MARK} (see project.rs::apply_environment_flags).\n\
+         module AppEnvironment\n  def self.assume_ssl?(env)\n    {cond}\n  end\n  \
+         def self.serving_assume_ssl?\n    name = ENV[\"RAILS_ENV\"].to_s\n    \
+         if name.empty?\n      name = \"development\"\n    end\n    \
+         assume_ssl?(name)\n  end\nend\n"
+    ));
+}
+
 /// THE FORM DIFFERS BY TARGET, and the reason is spinel's, not ours.
 /// `X.prepend Y` through an explicit receiver is refused outright there
 /// — "the class graph, ancestor chain, and method/ivar layout are baked
@@ -9539,7 +9618,11 @@ fn apply_rails_version(files: &mut [(String, String)], app: &App) {
 fn apply_module_mixins(files: &mut Vec<(String, String)>, app: &App, form: MixinForm) {
     use std::fmt::Write;
 
-    if app.module_mixins.is_empty() && app.initializer_filters.is_empty() && app.collection_cache_store.is_none() {
+    if app.module_mixins.is_empty()
+        && app.initializer_filters.is_empty()
+        && app.initializer_response_headers.is_empty()
+        && app.collection_cache_store.is_none()
+    {
         return;
     }
     let mut block = String::from(match form {
@@ -9617,6 +9700,35 @@ fn apply_module_mixins(files: &mut Vec<(String, String)>, app: &App, form: Mixin
                 let _ = writeln!(block, "    {} if [{}].include?(action_name)", f.method.as_str(), only.join(", "));
             }
             let _ = writeln!(block, "    return nil if performed?");
+        }
+        let _ = writeln!(block, "    nil\n  end\nend");
+    }
+    // The headers, one reopen per target, after the action as Rails runs
+    // an `after_action`: the controller asks this once the action has
+    // answered, and a `before_action` that answered skips it.
+    let mut header_targets: Vec<&str> =
+        app.initializer_response_headers.iter().map(|h| h.target.as_str()).collect();
+    header_targets.dedup();
+    for target in header_targets {
+        let _ = writeln!(
+            block,
+            "\n# `after_action` the app registers on a framework controller in\n\
+             # config/initializers/ (generated — see apply_module_mixins). The\n\
+             # controller asks this after its action.\n\
+             class {target}\n  def initializer_after_filters(action_name)"
+        );
+        for h in app.initializer_response_headers.iter().filter(|h| h.target.as_str() == target) {
+            let write = format!(
+                "headers[{}] = {}",
+                crate::emit::ruby::expr::ruby_str_literal(&h.name),
+                crate::emit::ruby::expr::ruby_str_literal(&h.value)
+            );
+            if h.only.is_empty() {
+                let _ = writeln!(block, "    {write}");
+            } else {
+                let only: Vec<String> = h.only.iter().map(|a| format!(":{}", a.as_str())).collect();
+                let _ = writeln!(block, "    {write} if [{}].include?(action_name)", only.join(", "));
+            }
         }
         let _ = writeln!(block, "    nil\n  end\nend");
     }
@@ -13061,6 +13173,7 @@ fn scaffold_readme_to_specimen(files: &mut [(String, String)]) {
 /// `spinel: main.rb: cannot load such file` rather than as anything a
 /// unit test could see. A toolchain test should drive what ships.
 pub fn spinel_base_files(app: &App, fixture: &Path) -> Result<Vec<(String, String)>, String> {
+    let param_binds = BuildTarget::Spinel.param_binds_enabled(None);
     // The bundled-library requires belong HERE, not only in
     // `spin_shape`. This is the tree `tests/spinel_toolchain.rs`
     // compiles, and without them it compiles something the CLI never
@@ -13074,8 +13187,9 @@ pub fn spinel_base_files(app: &App, fixture: &Path) -> Result<Vec<(String, Strin
     // got it — one layer down. A lane is evidence only if it runs the
     // same code. Idempotent: the gap scan skips a file that already
     // requires the library, so `spin_shape` running it again is inert.
-    let (mut files, _) = spinel_files_with_source_markers(app, fixture)?;
+    let (mut files, _) = spinel_files_with_source_markers(app, fixture, param_binds)?;
     spinel_relation_model_handle(&mut files)?;
+    widen_spinel_hash_config_arrays(&mut files);
 
     write_bundled_requires(&mut files);
     Ok(files)
@@ -13431,7 +13545,7 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         // A declared type only such a gem provides at runtime
         // (`DECLARED_TYPE_RUNTIME_CONSTANT`), refused the same way.
         if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 && target != BuildTarget::Ruby {
-            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, construct, .. }) = &expr.diagnostic {
+            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, construct, .. }) = expr.diagnostic() {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target.as_str(),
@@ -13692,6 +13806,44 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "AbstractController::ActionNotFound",
     "ActionView::MissingTemplate",
     "ActiveModel::StrictValidationFailed",
+    // `runtime/ruby/active_record/arel.rb` — node constructors the ruby
+    // family and spinel load with that file. A strict target has no Arel
+    // text nodes to construct.
+    "Arel::Nodes",
+    "Arel::Nodes::Node",
+    "Arel::Nodes::SqlLiteral",
+    "Arel::Nodes::Quoted",
+    "Arel::Nodes::Not",
+    "Arel::Nodes::Case",
+    "Arel::Nodes::NamedFunction",
+    "Arel::Nodes::Ascending",
+    "Arel::Nodes::Descending",
+    "Arel::Nodes::Predicate",
+    // `runtime/ruby/active_record/connection_not_established.rb` and
+    // `encryption_errors.rb`. A rescue of ConnectionNotEstablished
+    // catches the two children. Strict targets do not load the files.
+    "ActiveRecord::ConnectionFailed",
+    "ActiveRecord::ConnectionTimeoutError",
+    "ActiveRecord::Encryption::Errors::Decryption",
+    "ActiveRecord::Encryption::Errors::Configuration",
+    // `runtime/ruby/active_record/preloading.rb`. The two-keyword call
+    // lowers away; the class value does not ship on a strict target.
+    "ActiveRecord::Associations::Preloader",
+    // `runtime/ruby/active_record/types.rb`. Boolean stays on the cast
+    // lowerer; these two classes are the ruby-family casters.
+    "ActiveRecord::Type::String",
+    "ActiveRecord::Type::Integer",
+    "ActiveRecord::Type::Value",
+    // Thread-local state and the notification fan-out. ruby family and
+    // spinel, required from rails.rb. ConfigurationFile parses YAML, which
+    // Spinel does not ship, so that class stays on the ruby family.
+    "ActiveSupport::IsolatedExecutionState",
+    "ActiveSupport::Notifications",
+    "ActiveSupport::Notifications::Event",
+    "ActiveSupport::ConfigurationFile",
+    // `runtime/ruby/active_job.rb`.
+    "ActiveJob::EnqueueError",
+    "ActiveJob::Continuable",
 ];
 
 /// Availability policy for class/module *values* that inference
@@ -13712,8 +13864,14 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     // and net/http's `HTTPHeaderSyntaxError` (a CRuby-only constant gap
     // until Spinel grows it). The names only the CRuby tree supplies
     // (the SQLite3 adapter's) fall through to their refusal below.
-    if target == "spinel" && matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError") {
-        return Some("bundled_constant");
+    if target == "spinel" {
+        // The Arel ordering and predicate nodes live on the CRuby overlay (`arel_predicates.rb`).
+        if matches!(name, "ActiveSupport::ConfigurationFile" | "Arel::Nodes::Ascending" | "Arel::Nodes::Descending" | "Arel::Nodes::Predicate") {
+            return Some("ruby_family_runtime_constant");
+        }
+        if matches!(name, "JSON::GeneratorError" | "Net::HTTPBadResponse" | "Net::HTTPHeaderSyntaxError") {
+            return Some("bundled_constant");
+        }
     }
     if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
         // JRuby, Spinel and Roda ship the same runtime files as CRuby.
@@ -13749,6 +13907,9 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Struct" | "Mutex" | "Fiber" | "Process" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
         | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"
+        | "LoadError" | "Proc" | "Range" | "Method" | "Gem::Version"
+        // `runtime/ruby/ipaddr.rb` ships to spinel only; no strict runtime list carries it.
+        | "IPAddr" | "IPAddr::InvalidAddressError"
         | "JSON::GeneratorError"
         // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
         // the ruby family; no strict target loads either.
@@ -13765,6 +13926,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "FileUtils" | "ActiveRecord::ConnectionAdapters::SQLite3Adapter"
         // runtime/spinel/active_support_cache.rb.
         | "ActiveSupport::Cache" | "ActiveSupport::Cache::MemoryStore"
+        | "ActiveSupport::Cache::NullStore"
         // rqrcode_core's / spinel-rqrcode's.
         | "RQRCodeCore::QRCodeRunTimeError" | "RQRCodeCore::QRCodeArgumentError"
         | "GC" | "OpenSSL::HMAC" | "CSV::MalformedCSVError"
@@ -13802,6 +13964,12 @@ const RUBY_SPINEL_ONLY_METHODS: &[(&str, &str)] = &[
     // `lower::errors_index`'s `errors.to_hash`, `messages`,
     // `attribute_names`, `delete`, `details`, `import` and `merge!`: the helpers are
     // `runtime/ruby/active_support_ext.rb`, which no strict target loads.
+    // The ActiveModel::Attributes writers call the same module. Flattening
+    // the include is not a claim that a strict target can run the cast.
+    ("ActiveSupport", "cast_string"),
+    ("ActiveSupport", "cast_integer"),
+    ("ActiveSupport", "cast_boolean"),
+    ("ActiveSupport", "cast_datetime"),
     ("ActiveSupport", "errors_to_hash"),
     ("ActiveSupport", "errors_messages"),
     ("ActiveSupport", "errors_attribute_names"),
@@ -14016,12 +14184,78 @@ fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
 /// reproduce. The PostgreSQL tree carries Rails' TransactionManager
 /// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
 /// `requires_new:`, `joinable:`, `isolation:`).
+///
+/// Also ledgers superclass Consts (via `parent_span`) and lowering-added
+/// exception Consts surveyed from a throwaway controller lower (emit still
+/// lowers controllers after this gate today).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;
     }
+    // Column readers are synthesized inside the emitter, after this walk,
+    // so a Send match never sees them. The schema column is the fact.
+    // Ruby, JRuby, and Spinel ship the interval intrinsics. Roda is Sequel:
+    // it has no parser, so a text column typed as Duration is not a runtime.
+    if !matches!(
+        target,
+        BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel
+    ) {
+        for table in app.schema.tables.values() {
+            for column in &table.columns {
+                if column.col_type == crate::schema::ColumnType::Interval {
+                    emit::diagnostics::report_unsupported(
+                        crate::span::Span::synthetic(),
+                        target.as_str(),
+                        "interval",
+                        format!(
+                            "PostgreSQL interval column `{}.{}` lowers to ActiveSupport interval intrinsics; the {} runtime has no interval column runtime",
+                            table.name.as_str(),
+                            column.name.as_str(),
+                            target.as_str()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // TypeScript emitted `class Enum extends Hash` and `this.is_has_key(...)`, neither of which exists there.
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Roda | BuildTarget::Jruby | BuildTarget::Spinel) {
+        let classes = app.library_classes.iter().chain(app.test_modules.iter().flat_map(|tm| tm.inner_classes.iter()));
+        for lc in classes.filter(|lc| !lc.is_module) {
+            if let Some(parent) = lc.parent.as_ref().filter(|p| matches!(p.0.as_str(), "Hash" | "Array" | "String" | "Set")) {
+                emit::diagnostics::report_unsupported(
+                    lc.parent_span,
+                    target.as_str(),
+                    "builtin subclass",
+                    format!("`{}` subclasses {}, which the {} emit has no class to extend", lc.name.0.as_str(), parent.0.as_str(), target.as_str()),
+                );
+            }
+        }
+    }
     let bundled = !matches!(target, BuildTarget::Spinel | BuildTarget::Roda);
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str, bundled: bool) {
+        // Not the whole constant: spinel answers `Method` as a value, and refuses only a class test against it.
+        if target == "spinel" {
+            let names_method = |e: &crate::expr::Expr| matches!(&*e.node, crate::expr::ExprNode::Const { path }
+                if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).eq(["Method"]));
+            let class_test = match &*expr.node {
+                crate::expr::ExprNode::Send { method, args, .. } => {
+                    matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") && args.first().is_some_and(names_method)
+                }
+                crate::expr::ExprNode::Case { arms, .. } => arms.iter().any(|arm| {
+                    matches!(&arm.pattern, crate::expr::Pattern::Expr { expr } if names_method(expr))
+                }),
+                _ => false,
+            };
+            if class_test {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "Method",
+                    "a class test against `Method`, which the spinel emit refuses".to_string(),
+                );
+            }
+        }
         // Spinel matches this exception by its rescue name, but does not
         // expose its class as a constant. Keep the value guard below while
         // permitting the supported literal rescue clause, including ::JSON.
@@ -14104,7 +14338,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // The assertion ingest synthesizes for `#: as !nil` already
         // carries its own refusal.
         if let crate::expr::ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node {
-            if method.as_str() == "not_nil!" && args.is_empty() && expr.diagnostic.is_none()
+            if method.as_str() == "not_nil!" && args.is_empty() && expr.diagnostic().is_none()
                 && !matches!(target, "ruby" | "jruby")
             {
                 emit::diagnostics::report_unsupported(
@@ -14199,6 +14433,21 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     format!("ActiveSupport::Duration is the Ruby-family runtime's value class; the {target} runtime ships none"),
                 );
             }
+            // Interval columns lower to these intrinsics. Ruby, JRuby, and
+            // Spinel ship them; a strict target must not emit a call it
+            // cannot run.
+            if let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
+                && matches!(method.as_str(), "parse_db_interval" | "format_db_interval")
+                && matches!(&*recv.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport"]))
+            {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "interval",
+                    format!("PostgreSQL interval columns use ActiveSupport.{}; the {target} runtime has no interval column runtime", method.as_str()),
+                );
+            }
         }
         // A regexp literal maps to each target's own; the `Regexp` class does not, so its methods were emitted as names nothing defines.
         if !matches!(target, "jruby" | "spinel")
@@ -14239,6 +14488,29 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 target,
                 "bundled_constant",
                 format!("`{name}` is Ruby's process stream, which the {target} emit does not map"),
+            );
+        }
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && matches!(path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..], ["RUBY_VERSION"] | ["Object", "RUBY_VERSION"])
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("`RUBY_VERSION` is the running Ruby's, which the {target} emit has none of"),
+            );
+        }
+        // A strict emit spelled these as methods its class objects do not have.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Send { method, .. } = &*expr.node
+            && expr.decisions & crate::expr::MODULE_QUERY != 0
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "Module protocol",
+                format!("`{}` asks a class object what it holds when the program runs, which the {target} emit cannot answer", method.as_str()),
             );
         }
         // A name computed when it runs: the Ruby family defines it then, which no compiled target can.
@@ -14601,26 +14873,32 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
 fn spinel_files_with_source_markers(
     app: &App,
     fixture: &Path,
+    param_binds: bool,
 ) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let (mut files, stems) =
-        emit::ruby::source_markers::with_source_markers(app, || spinel_files(app, fixture))?;
+        emit::ruby::source_markers::with_source_markers(app, || spinel_files(app, fixture, param_binds))?;
     for (path, content) in files.iter_mut() {
         if path.ends_with(".rb") {
             *content = emit::ruby::source_markers::finish(content);
         }
     }
+    // `spinel_base_files` (the toolchain tree) and `--target spinel`
+    // both come through here. The ruby family calls `spinel_files`
+    // directly and keeps `ConfigurationFile`.
+    drop_yaml_configuration_file(&mut files);
     Ok((files, stems))
 }
 
-fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     spinel_files_with_assertions(app, fixture,
-        crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline)
+        crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline, param_binds)
 }
 
 fn spinel_files_with_assertions(
     app: &App,
     fixture: &Path,
     assertion_mode: crate::lower::test_module_to_library::inline_assertions::AssertionMode,
+    param_binds: bool,
 ) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let mut files: Vec<(String, String)> = Vec::new();
 
@@ -14655,6 +14933,12 @@ fn spinel_files_with_assertions(
         files.push((
             "sig/runtime/active_support_time_parsing.rbs".to_string(),
             rbs,
+        ));
+        let interval_rbs = crate::runtime_files::read_to_string("runtime/spinel/active_support_interval.rbs")
+            .map_err(|e| format!("read runtime/spinel/active_support_interval.rbs: {e}"))?;
+        files.push((
+            "sig/runtime/active_support_interval.rbs".to_string(),
+            interval_rbs,
         ));
     }
 
@@ -14718,6 +15002,15 @@ fn spinel_files_with_assertions(
         let rbs = crate::runtime_files::read_to_string("runtime/spinel/active_job_serialization.rbs")
             .map_err(|e| format!("read runtime/spinel/active_job_serialization.rbs: {e}"))?;
         files.push(("sig/runtime/active_job_serialization.rbs".to_string(), rbs));
+    }
+
+    // Sidekiq pushes (queue_adapter :sidekiq): the envelope writer and
+    // the Redis façade. `spin_shape` drops the façade's sidecar when it
+    // swaps in the real client, whose surface is inferred.
+    for name in ["sidekiq_push", "sidekiq_redis"] {
+        let src = format!("runtime/spinel/{name}.rbs");
+        let rbs = crate::runtime_files::read_to_string(&src).map_err(|e| format!("read {src}: {e}"))?;
+        files.push((format!("sig/runtime/{name}.rbs"), rbs));
     }
 
     // Duration sidecar — pins @seconds Integer so ago/from_now stay
@@ -15065,6 +15358,8 @@ fn spinel_files_with_assertions(
         "action_view",
         "action_controller",
         "action_dispatch",
+        // `Rake::Task`. `active_record.rb` requires `rake/task`.
+        "rake",
     ] {
         crate::runtime_files::walk_partitioned(
             &format!("runtime/ruby/{sub}"),
@@ -15072,6 +15367,14 @@ fn spinel_files_with_assertions(
             &format!("sig/runtime/{sub}/"),
             &mut files,
         )?;
+    }
+    if let Some(source) = app.rake_tasks_source.as_deref() {
+        if let Some((_, content)) = files
+            .iter_mut()
+            .find(|(path, _)| path == "runtime/active_record/app_rake_tasks.rb")
+        {
+            *content = source.to_string();
+        }
     }
     widen_key_contract(app, &mut files)?;
     // Relation Base→untyped rewrite is Spinel-only (see
@@ -15118,6 +15421,9 @@ fn spinel_files_with_assertions(
         // `Rails.event` / `Rails.error`: the reporters, ParameterFilter and
         // ExecutionContext. rails.rb requires it, so it ships beside rails.
         "active_support_reporters",
+        "active_support_isolated_execution_state",
+        "active_support_notifications",
+        "active_support_configuration_file",
         "hash_deep_merge",
         "security_utils",
         "params",
@@ -15188,6 +15494,8 @@ fn spinel_files_with_assertions(
         // into its cache keys; per thread, the app's default until a
         // request sets one (see the file's header).
         "i18n_locale",
+        // The i18n gem's `I18n::Locale::Tag`, which `i18n_locale.rb` requires.
+        "i18n_locale_tag",
     ] {
         let rb = format!("runtime/ruby/{stem}.rb");
         let content = crate::runtime_files::read_to_string(&rb)?;
@@ -15256,7 +15564,7 @@ fn spinel_files_with_assertions(
     }
 
     let app_files = crate::timings::phase("emit ruby: app files", || {
-        emit::ruby::emit_with_assertions(app, assertion_mode)
+        emit::ruby::emit_with_assertions_and_param_binds(app, assertion_mode, param_binds)
     });
     let test_stems = app_test_stems(&app_files);
     files.extend(sort_files(app_files));
@@ -15391,6 +15699,7 @@ fn spinel_files_with_assertions(
     apply_models_aggregator(&mut files);
     apply_route_helpers_demand(&mut files);
     apply_module_mixins(&mut files, app, MixinForm::Reopen);
+    apply_environment_flags(&mut files, app);
     apply_app_requires(&mut files, app, RequireTarget::Spinel);
     apply_rails_version(&mut files, app);
     // All three scaffold targets (spinel + the ruby/jruby trees derived
@@ -15424,6 +15733,22 @@ fn spinel_files_with_assertions(
 /// ivar with the base's `Page`, which spinel refuses as a class-layout
 /// conflict (and which a Rails app without the gem never has). campfire,
 /// which paginates through it, keeps both.
+/// `ConfigurationFile.parse` loads YAML. Spinel's require gate treats
+/// `require "yaml"` as fatal (`SPINEL_LACKS`), and `rails.rb` would
+/// pull that file into every Spinel boot. The ruby family keeps both.
+fn drop_yaml_configuration_file(files: &mut Vec<(String, String)>) {
+    const REQUIRE: &str = "require_relative \"active_support_configuration_file\"\n";
+    if let Some((_, rails)) = files.iter_mut().find(|(path, _)| path == "runtime/rails.rb") {
+        if rails.contains(REQUIRE) {
+            *rails = rails.replacen(REQUIRE, "", 1);
+        }
+    }
+    files.retain(|(path, _)| {
+        path != "runtime/active_support_configuration_file.rb"
+            && path != "sig/runtime/active_support_configuration_file.rbs"
+    });
+}
+
 fn apply_pagination_demand(files: &mut Vec<(String, String)>) -> Result<(), String> {
     let wanted = files.iter().any(|(p, c)| {
         (p.starts_with("app/") || p.starts_with("test/")) && p.ends_with(".rb") && c.contains("set_page_and_extract_portion_from")
@@ -16702,6 +17027,16 @@ fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App,
             needed.push(gem);
         }
     }
+    // redis-rb, for a tree on queue_adapter :sidekiq. Its demand is the
+    // generated registry's flag, not a constant in app/: the client that
+    // names `Redis` is the runtime's own `sidekiq_redis.rb`.
+    if files
+        .iter()
+        .any(|(p, c)| p == "runtime/job_registry.rb" && c.contains(SIDEKIQ_REGISTRY_FLAG))
+        && !needed.contains(&"redis")
+    {
+        needed.push("redis");
+    }
     // The lock-gated Bundler.require entries load whatever app/ names,
     // so a GIT-sourced one (Core's sprockets fork) is activated too.
     let gated: Vec<&str> = lock
@@ -16993,8 +17328,7 @@ fn apply_locked_external_gem_wiring(files: &mut Vec<(String, String)>, app: &App
     let eager = app.bundler_gems.is_empty();
     let mut eager_requires = Vec::new();
     for gem in needed {
-        let namespace = crate::gems::namespace_of(&gem.name).to_ascii_lowercase();
-        if eager && namespace == gem.name {
+        if eager && crate::gems::loads_by_gem_name(&gem.name) {
             eager_requires.push(gem.name.clone());
         }
         let version = gem.version.as_deref();
@@ -17289,6 +17623,51 @@ fn apply_makefile_asset_list(files: &mut [(String, String)], app: &App) {
 /// uses Tailwind iff `tailwind` is one of its stylesheet stems, which is
 /// exactly what `app/assets/builds/tailwind.css` (tailwindcss-rails'
 /// output path) puts there.
+fn propshaft_stylesheet_asset_name(app: &App, stem: &str) -> Option<String> {
+    let propshaft = app
+        .gem_lock
+        .as_ref()
+        .is_some_and(|lock| lock.has("propshaft"))
+        && app.rails_application.as_ref().is_some_and(|class| {
+            class
+                .methods
+                .iter()
+                .any(|method| method.name.as_str() == "propshaft_asset_path")
+        });
+    if !propshaft {
+        return None;
+    }
+    let prefix = format!("static/assets/{stem}-");
+    app.binary_assets
+        .iter()
+        .find(|(path, _)| path.starts_with(&prefix) && path.ends_with(".css"))
+        .map(|(path, _)| path["static/assets/".len()..].to_string())
+}
+
+fn insert_propshaft_stylesheet_copy_rules(makefile: &mut String, app: &App) {
+    const ANCHOR: &str = "$(ASSETS)/%.css: app/assets/stylesheets/%.css";
+    let Some(at) = makefile.find(ANCHOR) else {
+        return;
+    };
+    let mut rules = String::new();
+    for stem in &app.stylesheets {
+        if stem == "tailwind" {
+            continue;
+        }
+        let Some(out) = propshaft_stylesheet_asset_name(app, stem) else {
+            continue;
+        };
+        rules.push_str(&format!(
+            "$(ASSETS)/{out}: app/assets/stylesheets/{stem}.css\n\
+             \t@mkdir -p $(dir $@)\n\
+             \tcp $< $@\n\n"
+        ));
+    }
+    if !rules.is_empty() {
+        makefile.insert_str(at, &rules);
+    }
+}
+
 fn apply_makefile_stylesheet_list(files: &mut [(String, String)], app: &App) {
     const BLOG_LIST: &str = "ASSET_CSS := $(ASSETS)/application.css \\\n\
                              \x20            $(ASSETS)/tailwind.css";
@@ -17306,7 +17685,11 @@ fn apply_makefile_stylesheet_list(files: &mut [(String, String)], app: &App) {
             "ASSET_CSS := {}",
             app.stylesheets
                 .iter()
-                .map(|s| format!("$(ASSETS)/{s}.css"))
+                .map(|s| {
+                    propshaft_stylesheet_asset_name(app, s)
+                        .map(|name| format!("$(ASSETS)/{name}"))
+                        .unwrap_or_else(|| format!("$(ASSETS)/{s}.css"))
+                })
                 .collect::<Vec<_>>()
                 .join(" \\\n             ")
         )
@@ -17319,9 +17702,17 @@ fn apply_makefile_stylesheet_list(files: &mut [(String, String)], app: &App) {
         if content.contains(BLOG_LIST) {
             *content = content.replace(BLOG_LIST, &list);
         }
-        if !uses_tailwind {
+        if uses_tailwind {
+            if let Some(digested) = propshaft_stylesheet_asset_name(app, "tailwind") {
+                *content = content.replace(
+                    "$(ASSETS)/tailwind.css: app/assets/tailwind.css",
+                    &format!("$(ASSETS)/{digested}: app/assets/tailwind.css"),
+                );
+            }
+        } else {
             strip_tailwind_rule(content);
         }
+        insert_propshaft_stylesheet_copy_rules(content, app);
     }
 }
 
@@ -18741,6 +19132,25 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         apply_spinel_css_select(&mut files);
     }
 
+    // redis: the same swap, for a tree on queue_adapter :sidekiq with a
+    // payload job (`needs_redis`, recorded as the registry's `sidekiq?`).
+    // `runtime/sidekiq_redis.rb` becomes the real connection over
+    // spinel-redis, and the manifest gains the package. Every other tree
+    // keeps the raising façade and no dependency.
+    let needs_redis = files
+        .iter()
+        .any(|(p, c)| p == "runtime/job_registry.rb" && c.contains(SIDEKIQ_REGISTRY_FLAG));
+    if needs_redis {
+        let client = crate::runtime_files::read_to_string(SIDEKIQ_REDIS_CLIENT)?;
+        let facade = files
+            .iter_mut()
+            .find(|(p, _)| p == "runtime/sidekiq_redis.rb")
+            .ok_or("spin_shape: the app is on queue_adapter :sidekiq but runtime/sidekiq_redis.rb \
+                    is not in the spinel file set")?;
+        facade.1 = client;
+        files.retain(|(p, _)| p != "runtime/sidekiq_redis.rbs");
+    }
+
     // commonmarker: no façade to swap (Markdowner's own façade stands aside
     // when the app's Markdowner names Commonmarker and Nokogiri — see
     // `Facade::lifted_by_constants`), only the package to declare: the
@@ -18868,6 +19278,20 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              commonmarker = { git = \"https://github.com/rubys/spinel-commonmarker\", ref = \"v0.1.0\" }\n",
         );
     }
+    if needs_redis {
+        if !manifest.lines().any(|l| l.trim() == "[dependencies]") {
+            manifest.push_str("\n[dependencies]\n");
+        }
+        manifest.push_str(
+            "# Redis, for queue_adapter :sidekiq: jobs are pushed in Sidekiq's\n\
+             # format for a Sidekiq process to run. spinel-redis, pure Ruby over\n\
+             # sp_net. Git form, pinned to a tag because `ref` takes a branch\n\
+             # or tag, never a SHA. 0.3.0 adds the connect_timeout: and\n\
+             # read_timeout: this push sets to 0.2.0's url:, AUTH, zadd and\n\
+             # pipelined.\n\
+             redis = { git = \"https://github.com/rubys/spinel-redis\", ref = \"v0.3.0\" }\n",
+        );
+    }
     files.push(("spin.toml".to_string(), manifest));
     files.push((
         "bin/blog.rb".to_string(),
@@ -18993,7 +19417,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             for (from, to) in dep_patches {
                 makefile.1 = makefile.1.replacen(from, to, 1);
             }
-        } else if needs_bcrypt || needs_vips || needs_rqrcode || needs_nokogiri || needs_commonmarker {
+        } else if needs_bcrypt || needs_vips || needs_rqrcode || needs_nokogiri || needs_commonmarker || needs_redis {
             return Err(
                 "spin_shape: Makefile dep-patch anchors not found (scaffold \
                  Makefile changed?) and this tree carries a package"
@@ -20566,6 +20990,40 @@ mod tests {
         assert!(files[0].1.contains("node_modules/.installed:\n"));
     }
 
+    #[test]
+    fn baked_css_also_lands_at_the_propshaft_name() {
+        let mut app = App::new();
+        app.binary_assets
+            .push(("static/assets/tailwind-be38fee9.css".into(), Vec::new()));
+        assert_eq!(
+            baked_propshaft_name(&app, "tailwind.css").as_deref(),
+            Some("tailwind-be38fee9.css")
+        );
+        assert_eq!(baked_propshaft_name(&app, "controllers/index.js"), None);
+    }
+
+    #[test]
+    fn baked_css_fingerprint_is_the_injected_bytes() {
+        let mut app = App::new();
+        app.binary_assets
+            .push(("static/assets/tailwind-be38fee9.css".into(), b"source".to_vec()));
+        let css = "compiled-tailwind {}\n";
+        let mut files = vec![(
+            "config/application.rb".to_string(),
+            "def propshaft_asset_path(source)\nwhen \"tailwind.css\"\n\"/assets/tailwind-be38fee9.css\"\nend\nend\n"
+                .to_string(),
+        )];
+        place_baked_stylesheet(&mut files, &app, "tailwind.css", css);
+        let digested = format!("tailwind-{}.css", propshaft_content_digest(css));
+        assert!(files.iter().any(|(path, body)| {
+            path == &format!("static/assets/{digested}") && body == css
+        }));
+        assert!(!files.iter().any(|(path, _)| path == "static/assets/tailwind-be38fee9.css"));
+        let ruby = &files.iter().find(|(path, _)| path == "config/application.rb").unwrap().1;
+        assert!(ruby.contains(&format!("/assets/{digested}")));
+        assert!(!ruby.contains("be38fee9"));
+    }
+
     /// Both dispatchers reset the app's `CurrentAttributes` subclass.
     ///
     /// There are two — `main.rb` serves and `test/test_helper.rb`
@@ -21579,13 +22037,46 @@ mod tests {
             "#<SPINEL_SOURCE>real-blog/app/views/articles/_article.html.erb:1",
             "{view}"
         );
-        let ruby = ruby_runtime_files(&app, fixture).expect("ruby tree");
+        let ruby = ruby_runtime_files(&app, fixture, BuildTarget::Ruby.param_binds_enabled(None)).expect("ruby tree");
         let marked: Vec<&str> = ruby
             .iter()
             .filter(|(_, c)| c.contains("#<SPINEL_SOURCE>"))
             .map(|(p, _)| p.as_str())
             .collect();
         assert!(marked.is_empty(), "ruby tree carries spinel markers: {marked:?}");
+    }
+
+    /// DatabaseTasks keeps `Array[HashConfig]` for Roundhouse; Spinel
+    /// emit must widen those to `Array[untyped]` or call sites see a
+    /// String and refuse `with_temporary_connection`.
+    #[test]
+    fn spinel_emit_widens_hash_config_arrays_to_untyped() {
+        let fixture = Path::new("fixtures/tiny-blog");
+        if !fixture.is_dir() {
+            eprintln!("skip: fixtures/tiny-blog absent");
+            return;
+        }
+        let app = crate::ingest::ingest_app(fixture).expect("ingest tiny-blog");
+        let files = spinel_base_files(&app, fixture).expect("spinel base files");
+        let tasks = files
+            .iter()
+            .find(|(p, _)| p.ends_with("active_record/tasks.rbs"))
+            .map(|(_, c)| c.as_str())
+            .expect("tasks.rbs in spinel tree");
+        assert!(
+            !tasks.contains("Array[ActiveRecord::DatabaseConfigurations::HashConfig]"),
+            "Spinel must not keep Array[HashConfig]: {tasks}"
+        );
+        assert!(
+            tasks.contains("def self.configs_for: (String env_name) -> Array[untyped]"),
+            "Spinel must widen configs_for to Array[untyped]: {tasks}"
+        );
+        assert!(
+            tasks.contains(
+                "def self.with_temporary_connection: (ActiveRecord::DatabaseConfigurations::HashConfig db_config)"
+            ),
+            "Spinel must keep HashConfig on with_temporary_connection: {tasks}"
+        );
     }
 
     /// Shared relation.rbs types `initialize` / terminals as `Base` for
@@ -21674,7 +22165,7 @@ mod tests {
             "shared relation.rbs must keep Base for Bar A/B"
         );
         // CRuby/JRuby share `spinel_files` but must NOT get the rewrite.
-        let ruby = ruby_runtime_files(&app, fixture).expect("ruby runtime files");
+        let ruby = ruby_runtime_files(&app, fixture, BuildTarget::Ruby.param_binds_enabled(None)).expect("ruby runtime files");
         let ruby_relation = ruby
             .iter()
             .find(|(p, _)| p.ends_with("active_record/relation.rbs"))
@@ -21697,5 +22188,34 @@ mod tests {
             ruby_connection.contains("def self.first: () -> Base?"),
             "CRuby connection.rbs must keep Base.first:()->Base?: {ruby_connection}"
         );
+    }
+}
+
+#[cfg(test)]
+mod param_binds_tests {
+    use super::{BuildTarget, ParamBindCapability};
+
+    #[test]
+    fn every_target_has_an_explicit_bind_capability() {
+        use BuildTarget::*;
+        use ParamBindCapability::*;
+        let cases = [
+            (Blog, Unsupported), (Spinel, DefaultOn), (Ruby, OptIn), (Jruby, OptIn),
+            (Roda, Unsupported), (Futamura, Unsupported), (Crystal, Unsupported), (Elixir, Unsupported),
+            (Go, Unsupported), (Kotlin, Unsupported), (Python, Unsupported),
+            (Rust, Unsupported), (Swift, Unsupported), (CSharp, Unsupported),
+            (Typescript, Unsupported), (TypescriptWorker, Unsupported),
+        ];
+        assert_eq!(cases.len(), BuildTarget::TRANSPILE.len() + 1);
+        for (target, capability) in cases {
+            assert_eq!(target.param_bind_capability(), capability, "{target:?}");
+            for value in [None, Some(""), Some("unexpected")] {
+                assert_eq!(target.param_binds_enabled(value), capability == DefaultOn,
+                    "{target:?}: {value:?}");
+            }
+            assert_eq!(target.param_binds_enabled(Some("1")), capability != Unsupported,
+                "{target:?}: =1");
+            assert!(!target.param_binds_enabled(Some("0")), "{target:?}");
+        }
     }
 }

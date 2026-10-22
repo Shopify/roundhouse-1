@@ -1151,7 +1151,7 @@ fn emit_expr_inner(e: &Expr) -> String {
                     }
                 }
             }
-            let base = emit_send(recv.as_ref(), method.as_str(), args, e.ty.as_ref());
+            let base = emit_send(recv.as_ref(), method.as_str(), args, block.as_ref(), e.ty.as_ref());
             // A Send with attached block becomes a closure passed as
             // the last arg. `other.each do |k, v| ... end` (Ruby) →
             // `other.each(|k, v| { ... })` (Rust). Whether the

@@ -1581,8 +1581,8 @@ fn generated_column_from_options(
 /// `ColumnType`. The Postgres-only types map to their SQLite storage:
 /// `uuid`, `json`, and `jsonb` retain distinct schema variants even when
 /// their shared SQLite/runtime representation uses text;
-/// `citext` is text; `timestamptz` is a datetime; the network types
-/// and a PG `enum` are strings. `timestamp` is Rails' own alias for
+/// `citext` is text; `timestamptz` is a datetime; `interval` keeps its
+/// own variant; the network types and a PG `enum` are strings. `timestamp` is Rails' own alias for
 /// `datetime` (`TableDefinition#timestamp`), which a MySQL-backed
 /// app's `schema.rb` dumps for a `TIMESTAMP` column — lobsters'
 /// `story_texts.created_at`. A type not listed is an error, not a
@@ -1619,6 +1619,9 @@ fn column_with_type(
         "json" => ColumnType::Json,
         "jsonb" => ColumnType::Jsonb,
         "uuid" => ColumnType::Uuid,
+        // Rails' PostgreSQL adapter: `t.interval` / `t.column :span, :interval`.
+        // `precision:` is the typmod Rails may dump; the value is still one interval.
+        "interval" => ColumnType::Interval,
         "references" | "belongs_to" => {
             ColumnType::Reference { table: TableRef(Symbol::from(col_name.as_str())) }
         }
@@ -1639,7 +1642,7 @@ fn column_with_type(
     // Rails `string`/`text` columns.
     let generated_text_compatible = (opts.array || matches!(
         type_name,
-        "inet" | "cidr" | "macaddr" | "enum" | "citext"
+        "inet" | "cidr" | "macaddr" | "enum" | "citext" | "interval"
     ) || (type_name == "text" && opts.limit.is_some()))
     .then_some(false);
     // Rails' PostgreSQL adapter maps integer limits 1 and 2 to smallint,

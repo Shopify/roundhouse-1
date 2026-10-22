@@ -28,3 +28,12 @@ fn self_and_implicit_receivers_reach_a_private_method() {
         assert!(errors.is_empty(), "{caller}: {errors:#?}");
     }
 }
+
+#[test]
+fn a_module_s_private_class_method_is_an_error_from_outside() {
+    let errors = emit_and_run::real_blog()
+        .write("lib/toolkit.rb", "module Toolkit\n  def self.secret\n    1\n  end\n  private_class_method :secret\n\n  def self.open\n    secret\n  end\nend\n")
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", "  validates :title, presence: true\n\n  def self.peek\n    Toolkit.secret + Toolkit.open\n  end\n")
+        .check_errors();
+    assert_eq!(errors.iter().filter(|e| e.contains("private method `secret` called on Toolkit")).count(), 1, "{errors:#?}");
+}

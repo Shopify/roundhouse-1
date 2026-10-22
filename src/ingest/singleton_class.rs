@@ -44,6 +44,7 @@ use super::library_class::{
 use super::util::{constant_id_str, flatten_statements, symbol_value};
 use super::{IngestError, IngestResult};
 
+use crate::ingest::prism_api::PrismLocation;
 /// What one `class << self` block declares.
 #[derive(Default)]
 pub(super) struct SingletonBody {
@@ -145,8 +146,8 @@ fn walk_statement(
                 "unsupported statement inside `class << self`: `alias` of a method the block does not define",
             );
         };
-        let mut copy = out.methods[source].clone();
-        copy.name = Symbol::from(to.as_str());
+        let mut copy =
+            super::library_class::copy_aliased_method(&out.methods[source], to.as_str());
         copy.name_span = crate::span::Span {
             file: super::sources::file_id(file),
             start: alias.location().start_offset() as u32,
@@ -218,8 +219,8 @@ fn walk_statement(
         // Copies the method as it stands, like the library-class walk.
         "alias_method" => match alias_source(&call, &out.methods, true) {
             Some((to, source)) => {
-                let mut copy = out.methods[source].clone();
-                copy.name = Symbol::from(to.as_str());
+                let copy =
+                    super::library_class::copy_aliased_method(&out.methods[source], to.as_str());
                 out.methods.push(copy);
                 Ok(())
             }

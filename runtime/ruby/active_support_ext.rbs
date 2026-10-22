@@ -1,12 +1,14 @@
 module ActiveSupport
   module JSON
     def self.encode: (untyped value) -> String
+    def self.encode_without_escape: (untyped value) -> String
     def self.decode: (String text) -> untyped
     def self.jsonable: (untyped value) -> untyped
     def self.time_json: (::Time t) -> String
     def self.time_fragment: (::Time? t) -> String
     def self.written: (String text) -> String
     def self.utc_zone?: () -> bool
+    def self.utc_zone_name?: (String name) -> bool
     UTC_ZONE_NAMES: Array[String]
   end
   def self.deep_dup: (untyped value) -> untyped
@@ -60,6 +62,15 @@ module ActiveSupport
   def self.indifferent_keys: (Array[untyped] keys) -> Array[untyped]
   def self.indifferent_to_hash: (untyped value) -> untyped
   def self.cast_boolean: (untyped value) -> bool?
+  # Any object or nil. The body calls `nil?`, `==`, `is_a?`, `to_s`, and
+  # `class` on that object, and `is_a?` narrows a branch to String, Integer,
+  # or Float before the cast uses that class.
+  def self.cast_string: (::Object? value) -> String?
+  def self.cast_integer: (::Object? value) -> Integer?
+  def self.integer_from_string: (String value) -> Integer?
+  def self.integer_from_bytes: (Array[Integer] raw) -> Integer
+  def self.string_first: (String text, Integer limit) -> String
+  def self.string_last: (String text, Integer limit) -> String
   def self.squish: (String text) -> String
   def self.squish!: (String text) -> String
   def self.truncate: (String text, Integer truncate_to, String? omission, String? separator) -> String
@@ -144,6 +155,7 @@ module ActiveSupport
   def self.current_zone: () -> TimeZoneData?
   def self.use_zone: (String? zone) { () -> untyped } -> untyped
   def self.present: (Time t) -> Time
+  def self.present_in_zone: (Time t, TimeZoneData zone) -> Time
   def self.present_db: (Time? t) -> Time?
   def self.in_time_zone: (Time t, String? zone) -> Time
   def self.zone_name: (TimeZone? zone) -> String?

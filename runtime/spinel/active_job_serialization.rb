@@ -278,12 +278,26 @@ module ActiveJob
     # app that changes either is a known gap). `job_id` is a fresh v4
     # UUID, as `SecureRandom.uuid` gives Rails.
     def self.build(job_class, queue_name, arguments_json)
-      build_as(job_class, SecureRandom.uuid, queue_name, arguments_json)
+      build_at(job_class, queue_name, 0.0, arguments_json)
     end
 
     # `build` for a job that already has its id (a job on the callbacks
     # port, whose instance carries the one its enqueue callbacks saw).
     def self.build_as(job_class, job_id, queue_name, arguments_json)
+      build_as_at(job_class, job_id, queue_name, 0.0, arguments_json)
+    end
+
+    # `build` for a job scheduled at `at` (epoch seconds; 0.0 when it
+    # isn't scheduled). Rails writes `scheduled_at.utc.iso8601(9)` from
+    # an exact Time; this derives it from the Float epoch, so the digits
+    # below about a microsecond are float noise.
+    def self.build_at(job_class, queue_name, at, arguments_json)
+      build_as_at(job_class, SecureRandom.uuid, queue_name, at, arguments_json)
+    end
+
+    # Both: a known job id and a schedule.
+    def self.build_as_at(job_class, job_id, queue_name, at, arguments_json)
+      scheduled = at > 0.0 ? Arguments.str(Time.at(at).utc.iso8601(9)) : "null"
       "{\"job_class\":" + Arguments.str(job_class) +
         ",\"job_id\":" + Arguments.str(job_id) +
         ",\"provider_job_id\":null" +
@@ -295,7 +309,7 @@ module ActiveJob
         ",\"locale\":\"en\"" +
         ",\"timezone\":\"UTC\"" +
         ",\"enqueued_at\":" + Arguments.str(Time.now.utc.iso8601(9)) +
-        ",\"scheduled_at\":null}"
+        ",\"scheduled_at\":" + scheduled + "}"
     end
   end
 end

@@ -5,7 +5,7 @@ use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::lower::arel::{
-    ArelOp, ArelVisitor, ColumnSpec, LimitSpec, Predicate, Select, SqlDialect,
+    ArelOp, ColumnSpec, LimitSpec, Predicate, Select, SqlDialect,
 };
 use crate::schema::{Schema, Table};
 use crate::ty::Ty;
@@ -25,6 +25,7 @@ fn synth_exists_probe(
     conditions: Option<Predicate>,
     params: Vec<Param>,
     param_tys: Vec<(Symbol, Ty)>,
+    param_binds: bool,
 ) -> MethodDef {
     let op = ArelOp::Select(Select {
         single_record: false,
@@ -44,7 +45,7 @@ fn synth_exists_probe(
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body: dialect.visit(&op, schema, owner),
+        body: dialect.visit_with_param_binds(&op, schema, owner, param_binds),
         signature: Some(fn_sig(param_tys, Ty::Bool)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -58,10 +59,16 @@ fn synth_exists_probe(
 /// Unscoped emptiness without COUNT(*) — `Base.any?` / `none?` on
 /// Level-3 models. Same Exists emit as `_adapter_exists_by_id?`, no WHERE.
 pub(super) fn synth_adapter_any(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
-    synth_exists_probe(owner, table, schema, dialect, "_adapter_any?", None, vec![], vec![])
+    synth_exists_probe(owner, table, schema, dialect, "_adapter_any?", None, vec![], vec![], false)
 }
 
-pub(super) fn synth_adapter_exists_by_id(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+pub(super) fn synth_adapter_exists_by_id(
+    model: &Model,
+    table: &Table,
+    schema: &Schema,
+    dialect: SqlDialect,
+    param_binds: bool,
+) -> MethodDef {
     let owner = &model.name;
     let id = Symbol::from("id");
     let key = key_ty(model, table);
@@ -74,6 +81,7 @@ pub(super) fn synth_adapter_exists_by_id(model: &Model, table: &Table, schema: &
         Some(eq_id_param(model, table, &id)),
         vec![Param::positional(id.clone())],
         vec![(id, key)],
+        param_binds,
     )
 }
 

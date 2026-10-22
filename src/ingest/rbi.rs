@@ -127,7 +127,7 @@ fn read_gem_rbis<V: Vfs + ?Sized>(
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
         let Some((name, version)) = stem.split_once('@') else { continue };
-        if lock.is_in_repo(name) || !wanted(name) {
+        if lock.is_in_repo(name) || lock.is_source(name) || !wanted(name) {
             continue;
         }
         let Some(locked) = lock.version_of(name) else { continue };
@@ -171,7 +171,7 @@ fn read_gem_rbis<V: Vfs + ?Sized>(
 /// across files (or twice in one) accumulates: the first parent wins,
 /// methods and ancestry union.
 pub fn read_rbi(source: &[u8], gem: &str, out: &mut GemBoundary) {
-    let result = ruby_prism::parse(source);
+    let result = super::prism::parse_silent(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else { return };
     let statements = program.statements().body().iter().collect::<Vec<_>>();

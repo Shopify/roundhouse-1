@@ -32,6 +32,7 @@ fn ingest_branch_body(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     out
 }
 
+use crate::ingest::prism_api::PrismLocation;
 pub fn ingest_expr(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Survey-mode gate: when active, intercept Err returns and
     // substitute a `Literal::Nil` placeholder so the surrounding
@@ -132,9 +133,13 @@ fn multi_write_target(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::
 /// value is splatted with `to_ary`), which every consumer of
 /// `MultiAssign` already implements.
 ///
-/// A splat or post-splat target inside the parentheses is refused
-/// rather than dropped: the flat rest desugar in `ingest_multi_write`
-/// needs an array-literal RHS this source never has.
+/// A splat inside the parentheses (`(month, *row)`, `(a, *b, c)`,
+/// `(*row)`) cannot be a `MultiAssign`: that node has no rest. The
+/// source here is the element already pulled out of the outer RHS, so
+/// it is never the array literal the top-level post-rest desugar
+/// demands. Bind it once, coerce with `to_ary` (wrapping when that is
+/// missing or nil), then the same positional `[]` / `drop` / `take`
+/// reads.
 fn destructure_target(
     mt: &ruby_prism::MultiTargetNode<'_>,
     source: Expr,
@@ -142,10 +147,16 @@ fn destructure_target(
     file: &str,
 ) -> IngestResult<Vec<Expr>> {
     if mt.rest().is_some() || !mt.rights().is_empty() {
-        return Err(IngestError::Unsupported {
-            file: file.into(),
-            message: "splat inside a nested destructuring target is not supported".into(),
-        });
+        return desugar_rest_targets(
+            mt.lefts().iter().collect(),
+            mt.rest(),
+            mt.rights().iter().collect(),
+            source,
+            span,
+            &mt.location(),
+            file,
+            RestDesugar::Nested,
+        );
     }
     let mut targets: Vec<crate::expr::LValue> = Vec::new();
     let mut nested: Vec<Expr> = Vec::new();
@@ -178,63 +189,105 @@ fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> 
         if let Some(t) = node.as_instance_variable_target_node() {
             return Some(constant_id_str(&t.name()).to_string());
         }
+        if let Some(t) = node.as_required_parameter_node() {
+            return Some(constant_id_str(&t.name()).to_string());
+        }
+        if let Some(t) = node.as_constant_target_node() {
+            return Some(constant_id_str(&t.name()).to_string());
+        }
+        if let Some(t) = node.as_constant_path_target_node() {
+            let mut path = t
+                .parent()
+                .and_then(|parent| crate::ingest::util::constant_path_segments_strs(&parent))
+                .unwrap_or_default();
+            if let Some(id) = t.name() {
+                path.push(constant_id_str(&id).to_string());
+            }
+            return Some(path.join("::"));
+        }
+        // `h[0]` written twice is the same slot even though the two
+        // targets are different nodes. The source text is the identity
+        // the level-at-a-time desugar can move.
+        if node.as_index_target_node().is_some() {
+            return Some(String::from_utf8_lossy(node.location().as_slice()).into_owned());
+        }
         None
     }
-    fn source_order<'pr>(
+    fn record(node: &Node<'_>, writes: &mut Vec<(String, usize)>, targets: &mut Vec<usize>) {
+        let at = node.location().start_offset();
+        targets.push(at);
+        if let Some(name) = name_of(node) {
+            writes.push((name, at));
+        }
+    }
+    // Depth first, in source order: each parenthesized group, then the
+    // splat target, then targets after the splat. An anonymous `*` is
+    // not a write.
+    fn ruby_slots<'pr>(
         lefts: impl Iterator<Item = Node<'pr>>,
+        rest: Option<Node<'pr>>,
+        rights: impl Iterator<Item = Node<'pr>>,
         writes: &mut Vec<(String, usize)>,
         targets: &mut Vec<usize>,
     ) {
-        for left in lefts {
-            if let Some(group) = left.as_multi_target_node() {
-                source_order(group.lefts().iter(), writes, targets);
-            } else {
-                let at = left.location().start_offset();
-                targets.push(at);
-                if let Some(name) = name_of(&left) {
-                    writes.push((name, at));
-                }
-            }
+        for slot in lefts.chain(rest).chain(rights) {
+            ruby_node(slot, writes, targets);
         }
     }
-    // The desugar's order: this level's plain targets, then each group's
-    // (recursively, in the same shape).
-    fn desugar_order<'pr>(
-        lefts: Vec<Node<'pr>>,
+    fn ruby_node<'pr>(
+        node: Node<'pr>,
+        writes: &mut Vec<(String, usize)>,
+        targets: &mut Vec<usize>,
+    ) {
+        if let Some(group) = node.as_multi_target_node() {
+            ruby_slots(group.lefts().iter(), group.rest(), group.rights().iter(), writes, targets);
+        } else if let Some(splat) = node.as_splat_node() {
+            if let Some(expr) = splat.expression() {
+                ruby_node(expr, writes, targets);
+            }
+        } else {
+            record(&node, writes, targets);
+        }
+    }
+    // The desugar's order: this level's plain targets (including the
+    // splat and post-splat names), then each group. A group is one slot
+    // here; its leaves are written after the level that contains it.
+    fn desugar_slots<'pr>(
+        lefts: impl Iterator<Item = Node<'pr>>,
+        rest: Option<Node<'pr>>,
+        rights: impl Iterator<Item = Node<'pr>>,
         writes: &mut Vec<(String, usize)>,
         targets: &mut Vec<usize>,
     ) {
         let mut groups = Vec::new();
-        for left in lefts {
-            if let Some(group) = left.as_multi_target_node() {
+        for slot in lefts.chain(rest).chain(rights) {
+            if let Some(group) = slot.as_multi_target_node() {
                 groups.push(group);
-            } else {
-                let at = left.location().start_offset();
-                targets.push(at);
-                if let Some(name) = name_of(&left) {
-                    writes.push((name, at));
+            } else if let Some(splat) = slot.as_splat_node() {
+                if let Some(expr) = splat.expression() {
+                    if let Some(group) = expr.as_multi_target_node() {
+                        groups.push(group);
+                    } else {
+                        record(&expr, writes, targets);
+                    }
                 }
+            } else {
+                record(&slot, writes, targets);
             }
         }
         for group in groups {
-            desugar_order(group.lefts().iter().collect(), writes, targets);
+            desugar_slots(group.lefts().iter(), group.rest(), group.rights().iter(), writes, targets);
         }
     }
-    fn has_setter_target<'pr>(lefts: impl Iterator<Item = Node<'pr>>) -> bool {
-        lefts.into_iter().any(|left| {
-            if let Some(group) = left.as_multi_target_node() {
-                has_setter_target(group.lefts().iter())
-            } else {
-                left.as_call_target_node().is_some()
-            }
-        })
+    fn has_setter_target(node: &Node<'_>) -> bool {
+        any_write_leaf(node, &mut |leaf| leaf.as_call_target_node().is_some())
     }
     let mut ruby_targets = Vec::new();
     let mut ruby = Vec::new();
-    source_order(mw.lefts().iter(), &mut ruby, &mut ruby_targets);
+    ruby_slots(mw.lefts().iter(), mw.rest(), mw.rights().iter(), &mut ruby, &mut ruby_targets);
     let mut ours_targets = Vec::new();
     let mut ours = Vec::new();
-    desugar_order(mw.lefts().iter().collect(), &mut ours, &mut ours_targets);
+    desugar_slots(mw.lefts().iter(), mw.rest(), mw.rights().iter(), &mut ours, &mut ours_targets);
     let last = |writes: &[(String, usize)], name: &str| {
         writes.iter().rev().find(|(n, _)| n == name).map(|(_, at)| *at)
     };
@@ -244,7 +297,7 @@ fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> 
             message: "nested multi-write that writes one variable twice out of source order is not modeled".into(),
         });
     }
-    let has_setter = has_setter_target(mw.lefts().iter());
+    let has_setter = mw.lefts().iter().chain(mw.rest()).chain(mw.rights().iter()).any(|n| has_setter_target(&n));
     if has_setter && ruby_targets != ours_targets {
         return Err(IngestError::Unsupported {
             file: file.into(),
@@ -258,14 +311,233 @@ fn reject_reordered_rewrite(mw: &ruby_prism::MultiWriteNode<'_>, file: &str) -> 
 /// node's offset and clear of every name the source already uses.
 fn nested_temp(node: &Node<'_>, _span: Span) -> Symbol {
     let loc = node.location();
-    let stem = format!("__mt_{}", loc.start_offset());
-    let mut name = stem.clone();
+    fresh_reserved_local(&loc, &format!("__mt_{}", loc.start_offset()))
+}
+
+/// Walk a multi-write slot: a parenthesized group, a splat, or a leaf.
+fn any_write_leaf(node: &Node<'_>, pred: &mut dyn FnMut(&Node<'_>) -> bool) -> bool {
+    if let Some(group) = node.as_multi_target_node() {
+        return group.lefts().iter().any(|n| any_write_leaf(&n, pred))
+            || group.rest().is_some_and(|n| any_write_leaf(&n, pred))
+            || group.rights().iter().any(|n| any_write_leaf(&n, pred));
+    }
+    if let Some(splat) = node.as_splat_node() {
+        return splat.expression().is_some_and(|expr| any_write_leaf(&expr, pred));
+    }
+    pred(node)
+}
+
+/// A receiver, index, or constant on a post-rest LHS is evaluated
+/// before the RHS in Ruby. The desugar evaluates the RHS first, so
+/// those targets stay refused. Locals, ivars, and block parameters
+/// have no such read; a nested group is safe when every leaf is.
+fn post_rest_target_reorders_lhs(node: &Node<'_>) -> bool {
+    any_write_leaf(node, &mut |leaf| {
+        leaf.as_local_variable_target_node().is_none()
+            && leaf.as_instance_variable_target_node().is_none()
+            && leaf.as_required_parameter_node().is_none()
+    })
+}
+
+fn fresh_reserved_local(loc: &ruby_prism::Location<'_>, stem: &str) -> Symbol {
+    let mut name = stem.to_string();
     let mut suffix = 0;
-    while super::sources::generated_local_is_reserved(&loc, &name) {
+    while super::sources::generated_local_is_reserved(loc, &name) {
         suffix += 1;
         name = format!("{stem}_{suffix}");
     }
     Symbol::from(name)
+}
+
+/// Where a rest desugar sits. The two shapes are not a product of
+/// flags: a nested group coerces and does not produce the expression
+/// value; a top-level rest does the opposite.
+enum RestDesugar {
+    /// `a, *b = rhs`. The sequence's value is that RHS.
+    TopLevel,
+    /// `a, *b = rhs` where `rhs` is not an array literal: coerced as
+    /// `Nested` is, and the sequence's value is still the RHS.
+    TopLevelCoerce,
+    /// `(a, *b)` as one target. Coerce the element; the caller owns
+    /// the expression value.
+    Nested,
+}
+
+/// `a, *rest = expr` and `(a, *rest, b)` share this desugar. `MultiAssign`
+/// has no rest, so the IR is a temp, positional `[]`, and `drop`/`take`.
+/// Those nodes already survive analyze and every emitter.
+///
+/// Nested groups coerce with `Array.try_convert`, which is MRI's
+/// `rb_check_array_type` (`to_ary`, including a private one, or nil).
+/// The `Array` constant is synthetic so it is not indexed as a constant
+/// the source wrote. A nil conversion wraps the element. A top-level
+/// RHS that is an array literal is indexed directly; any other is
+/// coerced the same way (`TopLevelCoerce`).
+fn desugar_rest_targets<'pr>(
+    lefts: Vec<Node<'pr>>,
+    rest: Option<Node<'pr>>,
+    rights: Vec<Node<'pr>>,
+    value: Expr,
+    span: Span,
+    reserve_at: &ruby_prism::Location<'_>,
+    file: &str,
+    mode: RestDesugar,
+) -> IngestResult<Vec<Expr>> {
+    let coerce = matches!(mode, RestDesugar::Nested | RestDesugar::TopLevelCoerce);
+    let yield_rhs = matches!(mode, RestDesugar::TopLevel | RestDesugar::TopLevelCoerce);
+    if !rights.is_empty()
+        && lefts.iter().chain(rest.iter()).chain(rights.iter()).any(|node| post_rest_target_reorders_lhs(node))
+    {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "post-rest multi-write with non-variable targets requires preserved LHS evaluation order".into(),
+        });
+    }
+    let stem_at = reserve_at.start_offset();
+    let tmp = fresh_reserved_local(reserve_at, &format!("__mw_{stem_at}"));
+    let read_var = |name: Symbol| {
+        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name })
+    };
+    let tmp_read = || read_var(tmp.clone());
+    let int_lit = |v: i64| Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v } });
+    let send = |recv: Expr, method: &str, args: Vec<Expr>| {
+        let parenthesized = !args.is_empty() && !matches!(method, "<" | "-");
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized,
+            },
+        )
+    };
+    let n_lefts = lefts.len();
+    let n_rights = rights.len();
+    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + n_rights + 4);
+    exprs.push(Expr::new(
+        span,
+        ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: tmp.clone() },
+            value,
+        },
+    ));
+    let indexed = if coerce {
+        // `Array.try_convert` calls `to_ary` the way multiple assignment
+        // does, including a private method, and returns nil when the
+        // object does not convert. A nil result wraps the element. A
+        // non-Array `to_ary` raises TypeError inside `try_convert`.
+        // The constant uses a synthetic span so it is not indexed as a
+        // written `Array` reference.
+        let converted = fresh_reserved_local(reserve_at, &format!("__mc_{stem_at}"));
+        let ary = fresh_reserved_local(reserve_at, &format!("__ma_{stem_at}"));
+        exprs.push(Expr::new(
+            span,
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: converted.clone() },
+                value: send(
+                    Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("Array")] }),
+                    "try_convert",
+                    vec![tmp_read()],
+                ),
+            },
+        ));
+        exprs.push(Expr::new(
+            span,
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: ary.clone() },
+                value: Expr::new(
+                    span,
+                    ExprNode::If {
+                        cond: send(read_var(converted.clone()), "nil?", vec![]),
+                        then_branch: Expr::new(
+                            span,
+                            ExprNode::Array {
+                                elements: vec![tmp_read()],
+                                style: Default::default(),
+                            },
+                        ),
+                        else_branch: read_var(converted),
+                    },
+                ),
+            },
+        ));
+        ary
+    } else {
+        tmp.clone()
+    };
+    let indexed_read = || read_var(indexed.clone());
+    let index_read = |index: Expr| send(indexed_read(), "[]", vec![index]);
+    // Leading bindings consume first. A short RHS supplies the remaining
+    // values to the right targets from left to right, then pads with nil;
+    // negative indexing alone would reuse values already claimed by the head.
+    let short_rhs = || {
+        send(send(indexed_read(), "length", vec![]), "<", vec![int_lit((n_lefts + n_rights) as i64)])
+    };
+    let mut groups: Vec<(Node<'pr>, Symbol)> = Vec::new();
+    let assign_slot = |node: Node<'pr>, read: Expr, exprs: &mut Vec<Expr>, groups: &mut Vec<(Node<'pr>, Symbol)>| -> IngestResult<()> {
+        if node.as_multi_target_node().is_some() {
+            let name = nested_temp(&node, span);
+            exprs.push(Expr::new(
+                span,
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() },
+                    value: read,
+                },
+            ));
+            groups.push((node, name));
+            return Ok(());
+        }
+        let target = multi_write_target(&node, file)?;
+        exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
+        Ok(())
+    };
+    for (i, left) in lefts.into_iter().enumerate() {
+        assign_slot(left, index_read(int_lit(i as i64)), &mut exprs, &mut groups)?;
+    }
+    // Anonymous splat (`a, * = c` / `a, *, c = x`) discards the rest —
+    // only a named target gets a binding.
+    if let Some(rest_node) = rest.as_ref().and_then(|node| node.as_splat_node()).and_then(|splat| splat.expression()) {
+        let tail = send(indexed_read(), "drop", vec![int_lit(n_lefts as i64)]);
+        let rest_value = if n_rights == 0 {
+            tail
+        } else {
+            let count = Expr::new(
+                span,
+                ExprNode::If {
+                    cond: short_rhs(),
+                    then_branch: int_lit(0),
+                    else_branch: send(
+                        send(indexed_read(), "length", vec![]),
+                        "-",
+                        vec![int_lit((n_lefts + n_rights) as i64)],
+                    ),
+                },
+            );
+            send(tail, "take", vec![count])
+        };
+        assign_slot(rest_node, rest_value, &mut exprs, &mut groups)?;
+    }
+    for (i, right) in rights.into_iter().enumerate() {
+        let read = Expr::new(
+            span,
+            ExprNode::If {
+                cond: short_rhs(),
+                then_branch: index_read(int_lit((n_lefts + i) as i64)),
+                else_branch: index_read(int_lit(-((n_rights - i) as i64))),
+            },
+        );
+        assign_slot(right, read, &mut exprs, &mut groups)?;
+    }
+    for (group, name) in groups {
+        let Some(inner) = group.as_multi_target_node() else { continue };
+        exprs.extend(destructure_target(&inner, read_var(name), span, file)?);
+    }
+    if yield_rhs {
+        exprs.push(tmp_read());
+    }
+    Ok(exprs)
 }
 
 /// Ingest a `MultiWriteNode` (`a, b = …`, `a, *rest = …`). Split out of
@@ -276,12 +548,20 @@ fn ingest_multi_write(
     span: Span,
     file: &str,
 ) -> IngestResult<ExprNode> {
+    // Flat `a, b = x` records the same leaves in both orders, so the
+    // check is a no-op there. A nested group, including one that holds
+    // a splat, is where the two orders diverge.
+    reject_reordered_rewrite(mw, file)?;
     // `a, (b, c) = x` — a nested target binds a temp here and is
     // destructured from it after the flat assignment. The whole
-    // expression still answers the RHS, as Ruby's does.
+    // expression still answers the RHS, as Ruby's does. A splat inside
+    // the group is `desugar_rest_targets`, not a second `MultiAssign`.
     if mw.rest().is_none() && mw.lefts().iter().any(|l| l.as_multi_target_node().is_some()) {
-        reject_reordered_rewrite(mw, file)?;
-        let rhs = nested_temp(&mw.as_node(), span);
+        // The group at column 0 shares this node's start offset, so it
+        // cannot reuse `__mt_`. Overwriting that temp drops the RHS the
+        // expression has to answer.
+        let loc = mw.as_node().location();
+        let rhs = fresh_reserved_local(&loc, &format!("__mv_{}", loc.start_offset()));
         let rhs_read =
             || Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: rhs.clone() });
         let mut exprs = vec![Expr::new(
@@ -308,158 +588,31 @@ fn ingest_multi_write(
         exprs.push(rhs_read());
         return Ok(ExprNode::Seq { exprs });
     }
-    let mut targets: Vec<crate::expr::LValue> = Vec::new();
-    for left in mw.lefts().iter() {
-        targets.push(multi_write_target(&left, file)?);
-    }
     let value = ingest_expr(&mw.value(), file)?;
-    let rest = match mw.rest() {
+    let Some(rest) = mw.rest() else {
         // `a, b = expr` — no splat. Native destructuring node; each
         // target consumes the RHS array positionally.
-        None => return Ok(ExprNode::MultiAssign { targets, value }),
-        Some(rest) => rest,
-    };
-    if !mw.rights().is_empty() {
-        // Receiver/index expressions on an assignment LHS run BEFORE the
-        // RHS in Ruby. This desugar only preserves variable targets; do not
-        // accept the new post-rest shape with a different evaluation order.
-        for target in mw.lefts().iter().chain(mw.rights().iter())
-            .chain(rest.as_splat_node().and_then(|s| s.expression()))
-        {
-            if target.as_local_variable_target_node().is_none()
-                && target.as_instance_variable_target_node().is_none()
-            {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "post-rest multi-write with non-variable targets requires preserved LHS evaluation order".into(),
-                });
-            }
+        let mut targets: Vec<crate::expr::LValue> = Vec::new();
+        for left in mw.lefts().iter() {
+            targets.push(multi_write_target(&left, file)?);
         }
-    }
-    // `a, *rest = expr` — trailing splat. The shared IR has no rest-aware
-    // destructuring node, so desugar to a temp bind + positional `[]`
-    // reads + `rest = temp.drop(n)`. Every resulting node (Assign / `[]`
-    // / `drop`) is already handled by analyze and all seven emitters, so
-    // splat support stays contained to ingest rather than threading a
-    // rest flag through ~15 MultiAssign consumers. The Seq ends in the
-    // temp read so the whole expression's value is the RHS array —
-    // matching Ruby, where `(a, *b = arr)` evaluates to `arr`.
-    let fresh = |stem: String| {
-        let mut name = stem.clone();
-        let mut suffix = 0;
-        while super::sources::generated_local_is_reserved(&mw.location(), &name) {
-            suffix += 1;
-            name = format!("{stem}_{suffix}");
-        }
-        Symbol::from(name)
+        return Ok(ExprNode::MultiAssign { targets, value });
     };
-    let value_tmp = fresh(format!("__mw_{}", span.start));
-    // Ruby destructures what `Array.try_convert` gives (rb_check_array_type:
-    // an Array as is, else `to_ary`, private or method_missing included,
-    // with a TypeError when it answers a non-Array), and wraps any other
-    // value as `[value]`; `*a, b = "x"` binds `b = "x"`, and a Hash is
-    // wrapped, not `to_a`'d. An array literal is already an Array, so it
-    // is indexed directly. The expression's value stays the original RHS.
-    let coerce = mw.value().as_array_node().is_none();
-    let tmp = if coerce { fresh(format!("__mw_{}_a", span.start)) } else { value_tmp.clone() };
-    let var_read = |name: &Symbol| {
-        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() })
-    };
-    let tmp_read = || var_read(&tmp);
-    let int_lit = |v: i64| {
-        Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v } })
-    };
-    let send = |recv: Expr, method: &str, args: Vec<Expr>| {
-        let parenthesized = !args.is_empty() && !matches!(method, "<" | "-");
-        Expr::new(
-            span,
-            ExprNode::Send {
-                recv: Some(recv),
-                method: Symbol::from(method),
-                args,
-                block: None,
-                parenthesized,
-            },
-        )
-    };
-    let index_read = |index: Expr| send(tmp_read(), "[]", vec![index]);
-    let rights: Vec<Node<'_>> = mw.rights().iter().collect();
-    let n_lefts = targets.len();
-    let n_rights = rights.len();
-    // Leading bindings consume first. A short RHS supplies the remaining
-    // values to the right targets from left to right, then pads with nil;
-    // negative indexing alone would reuse values already claimed by the head.
-    let short_rhs = || send(
-        send(tmp_read(), "length", vec![]), "<", vec![int_lit((n_lefts + n_rights) as i64)],
-    );
-    let mut exprs: Vec<Expr> = Vec::with_capacity(n_lefts + n_rights + 3);
-    exprs.push(Expr::new(
+    // `a, *rest = expr` — trailing splat. The Seq ends in the temp read
+    // so the whole expression's value is the RHS array — matching Ruby,
+    // where `(a, *b = arr)` evaluates to `arr`.
+    let exprs = desugar_rest_targets(
+        mw.lefts().iter().collect(),
+        Some(rest),
+        mw.rights().iter().collect(),
+        value,
         span,
-        ExprNode::Assign {
-            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: value_tmp.clone() },
-            value,
-        },
-    ));
-    if coerce {
-        // Synthetic: the core class this desugar names, not a constant
-        // the source wrote (a source span would ask the source index).
-        let array_const = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("Array")] });
-        let converted = send(array_const, "try_convert", vec![var_read(&value_tmp)]);
-        let wrapped = Expr::new(
-            span,
-            ExprNode::Array { elements: vec![var_read(&value_tmp)], style: crate::expr::ArrayStyle::Brackets },
-        );
-        let coerced = Expr::new(
-            span,
-            ExprNode::BoolOp {
-                op: crate::expr::BoolOpKind::Or,
-                surface: crate::expr::BoolOpSurface::Symbol,
-                left: converted,
-                right: wrapped,
-            },
-        );
-        exprs.push(Expr::new(
-            span,
-            ExprNode::Assign {
-                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: tmp.clone() },
-                value: coerced,
-            },
-        ));
-    }
-    for (i, target) in targets.into_iter().enumerate() {
-        let read = index_read(int_lit(i as i64));
-        exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
-    }
-    // Anonymous splat (`a, * = c` / `a, *, c = x`) discards the rest —
-    // only a named target gets a binding.
-    if let Some(rest_node) = rest.as_splat_node().and_then(|s| s.expression()) {
-        let rest_target = multi_write_target(&rest_node, file)?;
-        let tail = send(tmp_read(), "drop", vec![int_lit(n_lefts as i64)]);
-        let rest_value = if n_rights == 0 {
-            tail
-        } else {
-            let count = Expr::new(
-                span,
-                ExprNode::If {
-                    cond: short_rhs(),
-                    then_branch: int_lit(0),
-                    else_branch: send(send(tmp_read(), "length", vec![]), "-", vec![int_lit((n_lefts + n_rights) as i64)]),
-                },
-            );
-            send(tail, "take", vec![count])
-        };
-        exprs.push(Expr::new(span, ExprNode::Assign { target: rest_target, value: rest_value }));
-    }
-    for (i, right_node) in rights.iter().enumerate() {
-        let target = multi_write_target(right_node, file)?;
-        let read = Expr::new(span, ExprNode::If {
-            cond: short_rhs(),
-            then_branch: index_read(int_lit((n_lefts + i) as i64)),
-            else_branch: index_read(int_lit(-((n_rights - i) as i64))),
-        });
-        exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
-    }
-    exprs.push(var_read(&value_tmp));
+        &mw.location(),
+        file,
+        // A literal array is indexed directly; any other RHS is coerced
+        // as Ruby destructures it (`to_ary`, else wrapped).
+        if mw.value().as_array_node().is_some() { RestDesugar::TopLevel } else { RestDesugar::TopLevelCoerce },
+    )?;
     Ok(ExprNode::Seq { exprs })
 }
 
@@ -1051,6 +1204,12 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 };
                 return Ok(source_file_path_lit(span, dir));
             }
+            if let Some(body) = writing_connection_block(&c) {
+                return match body {
+                    Some(body) => ingest_expr(&body, file),
+                    None => Ok(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
+                };
+            }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
             } else {
@@ -1123,7 +1282,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                         ExprNode::Lit { value: Literal::Str { .. } }
                     ) {
                         let mut lit = recv.unwrap();
-                        lit.hint = Some(crate::expr::IrHint::MutableStringLiteral);
+                        lit.set_hint(Some(crate::expr::IrHint::MutableStringLiteral));
                         return Ok(lit);
                     }
                 }
@@ -2971,10 +3130,10 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // going. There is no real construct here to ingest — ledgered
         // by name rather than falling through to the generic message,
         // which would misleadingly imply a real Ruby node was rejected.
-        n if n.as_missing_node().is_some() => {
+        n if let Some(recovery) = n.as_error_recovery_node() => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
-                message: "unparsed fragment (Prism recovery node)".into(),
+                message: super::prism_api::recovery_unsupported_message(&recovery),
             });
         }
         // `class`/`module` at expression position — e.g. inside a
@@ -3221,7 +3380,7 @@ fn ingest_find_pattern(
         .iter()
         .map(|n| ingest_pattern(&n, file))
         .collect::<IngestResult<Vec<_>>>()?;
-    let post_rest = splat_name(&find.right(), file)?;
+    let post_rest = splat_name(&find.right().as_node(), file)?;
     Ok(MatchPattern::Find { constant, pre_rest, middle, post_rest })
 }
 
@@ -4166,8 +4325,8 @@ fn block_signature(params_node: Option<Node<'_>>, file: &str) -> IngestResult<cr
 /// value as the first name). Dropping it left the body reading unbound
 /// `k` and `v` and shifted `memo` onto the pair. A nested one
 /// (`|(a, (b, c))|`) binds its inner pattern through a fresh name of its
-/// own the same way, after the outer one. Splatting destructures are
-/// refused, not dropped.
+/// own the same way, after the outer one. A splatting one (`|(a, *b)|`)
+/// binds through the shared rest desugar (`destructure_target`).
 fn positional_param(node: &Node<'_>, destructures: &mut Vec<Expr>, file: &str) -> IngestResult<Option<Symbol>> {
     if let Some(rp) = node.as_required_parameter_node() {
         return Ok(Some(Symbol::from(constant_id_str(&rp.name()))));
@@ -4199,10 +4358,10 @@ fn destructure_param(
     file: &str,
 ) -> IngestResult<()> {
     if mt.rest().is_some() || !mt.rights().is_empty() {
-        return Err(IngestError::Unsupported {
-            file: file.into(),
-            message: "splatting destructuring block parameter `|(a, *b)|`".into(),
-        });
+        // `MultiAssign` has no rest: the shared rest desugar binds it.
+        let source = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+        destructures.extend(destructure_target(mt, source, span, file)?);
+        return Ok(());
     }
     let mut targets = Vec::new();
     let mut nested = Vec::new();
@@ -4783,4 +4942,59 @@ fn binary_string(s: &ruby_prism::StringNode<'_>, span: Span, file: &str) -> Inge
         value = send(value, "freeze", Vec::new());
     }
     Ok(*value.node)
+}
+
+/// `ActiveRecord::Base.connected_to(role: :writing) do … end` runs its
+/// block on the writing connection, the primary: the only one an emitted
+/// app has. So the call is its block's body. A reading role (Rails then
+/// refuses writes), a shard, `prevent_writes:`, block parameters, or a
+/// `next`/`break`/`redo` whose meaning the block gives keep the call, an
+/// unsupported `connected_to`.
+/// ponytail: a local first assigned in the block outlives it once inlined;
+/// a later bare call of that name would read it.
+fn writing_connection_block<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<Option<Node<'pr>>> {
+    if constant_id_str(&c.name()) != "connected_to"
+        || c.receiver().and_then(|r| super::util::constant_path_of(&r)).as_deref() != Some(&["ActiveRecord".to_string(), "Base".to_string()])
+    {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = c.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let elements: Vec<Node<'pr>> = arg.as_keyword_hash_node()?.elements().iter().collect();
+    let [element] = elements.as_slice() else { return None };
+    let assoc = element.as_assoc_node()?;
+    if symbol_value(&assoc.key()).as_deref() != Some("role") || symbol_value(&assoc.value()).as_deref() != Some("writing") {
+        return None;
+    }
+    let block = c.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    struct Jumps(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Jumps {
+        fn visit_next_node(&mut self, _: &ruby_prism::NextNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_break_node(&mut self, _: &ruby_prism::BreakNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_redo_node(&mut self, _: &ruby_prism::RedoNode<'pr>) {
+            self.0 = true;
+        }
+        // An inner block, lambda or loop owns its own jumps.
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_while_node(&mut self, _: &ruby_prism::WhileNode<'pr>) {}
+        fn visit_until_node(&mut self, _: &ruby_prism::UntilNode<'pr>) {}
+        fn visit_for_node(&mut self, _: &ruby_prism::ForNode<'pr>) {}
+    }
+    let body = block.body();
+    if let Some(body) = &body {
+        let mut jumps = Jumps(false);
+        ruby_prism::Visit::visit(&mut jumps, body);
+        if jumps.0 {
+            return None;
+        }
+    }
+    Some(body)
 }

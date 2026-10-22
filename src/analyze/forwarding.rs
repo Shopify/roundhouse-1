@@ -17,7 +17,9 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 mod external;
+mod anonymous;
 mod constructor;
+pub(crate) use anonymous::restore_anonymous_forward_contracts;
 pub(crate) use constructor::ConstructorContract;
 
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
@@ -184,7 +186,7 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         e: &Expr,
     ) -> bool {
         let rest = |m: &MethodDef| m.params.iter().any(crate::dialect::Param::is_nameless_rest);
-        destination(app, contracts, context, e).is_some_and(|resolved| !rest(resolved.method))
+        destination(app, contracts, context, e, None).is_some_and(|resolved| !rest(resolved.method))
             && virtual_destinations(contracts, context, e).is_ok_and(|v| v.iter().all(|(_, (m, _))| !rest(m)))
     }
     #[allow(clippy::too_many_arguments)]
@@ -726,7 +728,7 @@ fn walk(
             .params
             .iter()
             .any(|p| p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding);
-        let resolved = destination(app, contracts, Some((owner, enclosing)), e);
+        let resolved = destination(app, contracts, Some((owner, enclosing)), e, None);
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
@@ -776,7 +778,7 @@ fn walk(
             contract_error(
                 Some((owner, enclosing)),
                 e,
-                destination(app, contracts, Some((owner, enclosing)), e)
+                destination(app, contracts, Some((owner, enclosing)), e, None)
                     .map(|resolved| (resolved.method, resolved.model)),
                 contracts,
             )
@@ -942,6 +944,7 @@ fn destination<'a>(
     contracts: &SourceContractIndex<'a>,
     context: Option<(&ClassId, &MethodDef)>,
     e: &Expr,
+    resolver: Option<&super::body::ConstResolver>,
 ) -> Option<ResolvedDestination<'a>> {
     let owner_dependent = match &*e.node {
         ExprNode::Send { recv: None, .. } | ExprNode::Super { .. } => true,
@@ -968,6 +971,17 @@ fn destination<'a>(
                 _ if class_object => MethodReceiver::Class,
                 _ => MethodReceiver::Instance,
             };
+            // Held for the lookup below: the const arm returns a reference
+            // into this value, and the other arms borrow `ty` or the owner.
+            // Before typing, `ty` is empty. The same resolver the body typer
+            // uses names the class; a fragment counter does not.
+            let written_const = match recv.as_ref() {
+                Some(r) if r.ty.is_none() => resolver.and_then(|resolver| match &*r.node {
+                    ExprNode::Const { path } => resolver.namespace(r.span, path).cloned(),
+                    _ => None,
+                }),
+                _ => None,
+            };
             let class = match recv {
                 None => context.map(|(owner, _)| owner),
                 Some(r) if matches!(&*r.node, ExprNode::SelfRef) => context.map(|(owner, _)| owner),
@@ -978,6 +992,7 @@ fn destination<'a>(
                         // Do not admit the base contract for that source name.
                         constant_names_class(r, id).then_some(id)
                     }
+                    (ExprNode::Const { .. }, None) => written_const.as_ref(),
                     (_, Some(Ty::Class { id, .. })) => Some(id),
                     // `@memo ||= new` on the class side: the class itself, which the
                     // reader check below admits only while nothing descends from it.
@@ -1320,7 +1335,7 @@ fn keyword_calls_with_index(
                 // scanning receiver provenance and hierarchies for each of
                 // their keyword calls in a large application.
                 if matches!(&*e.node, ExprNode::Super { .. })
-                    && destination(app, contracts, context, e).is_none()
+                    && destination(app, contracts, context, e, None).is_none()
                 {
                     if super_leaves_source(contracts, context, e, in_block) {
                         KeywordPolicy::NativeSuper
@@ -1333,7 +1348,7 @@ fn keyword_calls_with_index(
                     KeywordPolicy::Legacy
                 }
             } else {
-                let resolved = destination(app, contracts, context, e);
+                let resolved = destination(app, contracts, context, e, None);
                 // What the Ruby family can carry where the shared lowering
                 // proves neither form: a send reaches whatever method Ruby
                 // dispatches to with the splat as written; of a `super`,
@@ -1930,6 +1945,13 @@ impl<'a> SourceContractIndex<'a> {
             };
             declarations.insert((owner.clone(), method.name.clone()), (method, model));
         }
+    }
+
+    /// A second source fragment can replace the keyword contract the
+    /// first fragment declared. Anonymous packets have no keys to
+    /// re-bind, so a reopened owner stays refused.
+    fn reopened(&self, owner: &ClassId) -> bool {
+        self.fragments.get(owner).copied().unwrap_or(0) > 1
     }
 
     fn parent(&self, owner: &ClassId) -> Option<&'a ClassId> {

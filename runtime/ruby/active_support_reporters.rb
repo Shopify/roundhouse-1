@@ -143,14 +143,16 @@ module ActiveSupport
     end
 
     def value_for_key(key, value, full_parent_key, original_params)
-      full_key = full_parent_key.nil? ? key.to_s : "#{full_parent_key}.#{key}"
+      # One `to_s` of the untyped key. The path and the regexp both use it.
+      key_text = key.to_s
+      full_key = full_parent_key.nil? ? key_text : "#{full_parent_key}.#{key_text}"
       # `=~`, not `match?`: Spinel types `r` as poly (the filters arrive
       # untyped), and a poly `match?` dispatch reaches PlatformAgent's
       # private `match?(pattern)` with a String, after which Spinel
       # compiles that method's own `String#match?` as an unconditional
       # NoMethodError (campfire's /rooms/1 under a Chrome user agent;
       # matz/spinel#8633).
-      if @regexps.any? { |r| !(r =~ key.to_s).nil? }
+      if @regexps.any? { |r| !(r =~ key_text).nil? }
         @mask
       elsif @deep_regexps.any? { |r| !(r =~ full_key).nil? }
         @mask
@@ -434,18 +436,21 @@ module ActiveSupport
     # name alone, before the payload is built; with no subscriber left,
     # nothing is built.
     def deliver(name_or_object, payload, kwargs, filter_payload, depth)
-      name = resolve_name(name_or_object)
-      named = { name: name }
+      # One pair of `is_a?` reads. `resolve_name` and `resolve_payload`
+      # both asked the same question of the untyped name.
+      named = name_or_object.is_a?(String) || name_or_object.is_a?(Symbol)
+      name = named ? name_or_object.to_s : name_or_object.class.name
+      name_only = { name: name }
       subscribers = []
       @subscribers.each do |entry|
         filter = entry[:filter]
-        subscribers << entry[:subscriber] if filter.nil? || filter.call(named)
+        subscribers << entry[:subscriber] if filter.nil? || filter.call(name_only)
       end
       return nil if subscribers.empty?
 
       event = {
         name: name,
-        payload: resolve_payload(name_or_object, payload, kwargs, filter_payload),
+        payload: resolve_payload(named, name_or_object, payload, kwargs, filter_payload),
         tags: TagStack.tags,
         context: self.class.context_store.context,
         timestamp: Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond),
@@ -477,16 +482,8 @@ module ActiveSupport
       self.class.filter_parameters || ActiveSupport.filter_parameters
     end
 
-    def resolve_name(name_or_object)
-      if name_or_object.is_a?(String) || name_or_object.is_a?(Symbol)
-        name_or_object.to_s
-      else
-        name_or_object.class.name
-      end
-    end
-
-    def resolve_payload(name_or_object, payload, kwargs, filter)
-      if name_or_object.is_a?(String) || name_or_object.is_a?(Symbol)
+    def resolve_payload(named, name_or_object, payload, kwargs, filter)
+      if named
         handle_unexpected_args(name_or_object, payload, kwargs) if !payload.nil? && kwargs.any?
         if kwargs.any?
           resolved = symbolize(kwargs)
@@ -643,7 +640,7 @@ module ActiveSupport
       @subscribers.each do |subscriber|
         begin
           unless !disabled.nil? && disabled.any? { |s| s === subscriber }
-            subscriber.report(error, handled: handled, severity: severity, context: deep_dup(full_context), source: source)
+            subscriber.report(error, handled: handled, severity: severity, context: ActiveSupport.deep_dup(full_context), source: source)
           end
         rescue StandardError => subscriber_error
           raise if @logger.nil?
@@ -679,32 +676,6 @@ module ActiveSupport
         Rails.logger.error(message)
       end
       nil
-    end
-
-    # Object#deep_dup (core_ext/object/deep_dup.rb): each subscriber gets
-    # its own copy of the context.
-    def deep_dup(value)
-      if value.is_a?(Hash)
-        copy = value.dup
-        value.each_pair do |key, item|
-          if key.is_a?(String) || key.is_a?(Symbol)
-            copy[key] = deep_dup(item)
-          else
-            copy.delete(key)
-            copy[deep_dup(key)] = deep_dup(item)
-          end
-        end
-        copy
-      elsif value.is_a?(Array)
-        value.map { |item| deep_dup(item) }
-      elsif value.is_a?(Method) || value.is_a?(UnboundMethod) || (defined?(::Singleton) && value.is_a?(::Singleton))
-        # Not duplicable? (core_ext/object/duplicable.rb): the value itself.
-        value
-      elsif value.respond_to?(:duplicable?) && !value.duplicable?
-        value
-      else
-        value.dup
-      end
     end
 
     def disabled_for_thread

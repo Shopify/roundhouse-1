@@ -134,6 +134,11 @@ pub enum ColumnType {
     /// Not modeled as `String` at ingest so a schema round-trip and a
     /// per-dialect renderer can still tell the two apart.
     Uuid,
+    /// `t.interval` — a Postgres `interval` column. SQLite stores the
+    /// canonical whole-second count as INTEGER. The public reader is an
+    /// `ActiveSupport::Duration`; keeping a distinct variant lets
+    /// PostgreSQL DDL still say `interval`.
+    Interval,
     Reference { table: TableRef },
 }
 
@@ -162,6 +167,22 @@ pub struct ForeignKey {
     pub to_column: Symbol,
     pub on_delete: ReferentialAction,
     pub on_update: ReferentialAction,
+}
+
+/// Column a `pluck` or `pick` argument selects.
+///
+/// Rails 8.1.4 selects a real `id` column from `pluck(:id)`. `:id` is
+/// the primary-key alias only when the table has no column of that
+/// name. `ids` does not use this: that terminal always reads the key,
+/// which the caller expresses with `id_is_column: false`.
+///
+/// `Relation#pluck` applies the same rule against `schema_columns`.
+pub fn pluck_argument(requested: Symbol, id_is_column: bool, primary_key: Option<&Symbol>) -> Symbol {
+    if requested.as_str() == "id" && !id_is_column {
+        primary_key.cloned().unwrap_or(requested)
+    } else {
+        requested
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

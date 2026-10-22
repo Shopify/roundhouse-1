@@ -17,6 +17,9 @@ require_relative "active_support_reporters"
 # backend is wired.
 
 require_relative "active_support_reporters"
+require_relative "active_support_isolated_execution_state"
+require_relative "active_support_notifications"
+require_relative "active_support_configuration_file"
 
 module Rails
   class << self
@@ -503,9 +506,8 @@ module Rails
     # DEFAULT, not a stub for un-ingested app config: Rails always has a
     # session cookie name (it derives one from the app name when the app
     # declares none), and the dispatch has to know it before any app code
-    # runs. `config/initializers/session_store.rb`'s
-    # `config.session_store :cookie_store, key: "..."` is lifted at
-    # ingest into a `session_cookie_key` def on the app's
+    # runs. The application class name and `config.session_store`
+    # declarations are lifted at ingest into a `session_cookie_key` def on the app's
     # `Rails::Application` reopen, which is required right after this
     # file and so overrides this default.
     #
@@ -515,6 +517,10 @@ module Rails
     # disagreement clears the session on every request.
     def session_cookie_key
       "_session"
+    end
+
+    def propshaft_asset_path(source)
+      "/assets/#{source}"
     end
 
     # `config.action_controller.forgery_protection_verification_strategy`,
@@ -683,7 +689,10 @@ module Rails
     # masks (Rails' `rails new` initializer lists `:passw`, `:token`,
     # ...). Same framework-default shape as `config_time_zone` above:
     # Rails' default list is empty, and ingest lifts an app's Symbol and
-    # String filters, each as its String, into an override on the reopen.
+    # String filters, each as its String, and its Regexp literals as
+    # written, into an override on the reopen. The signature names
+    # Regexp too: Spinel compiles to the declared element type, and a
+    # Regexp filter typed as a String is silently never applied.
     def config_filter_parameters
       []
     end

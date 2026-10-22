@@ -102,6 +102,7 @@ module ActiveRecord
   end
 
   class RawConnection
+    def self._rollback_savepoint: (String name) -> nil
     def transaction: (?Symbol mode) { () -> untyped } -> untyped
   end
 
@@ -127,6 +128,10 @@ module ActiveRecord
     def exec_insert: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Result
   end
 
+  class Transaction
+    def after_commit: (^() -> nil work) -> nil
+  end
+
   class EnlistedRecord
     @record: Base
     @kind: Integer
@@ -137,6 +142,15 @@ module ActiveRecord
 
   class Base
     self.@__declared_attribute_types: Hash[String, [Symbol | ActiveModel::Type::Value, Hash[Symbol, untyped]]]?
+    def read_attribute: (Symbol name) -> untyped
+    def write_attribute: (Symbol name, untyped value) -> untyped
+    def self.default_scoped: () -> Relation
+    # cache_key / cache_version / cache_key_with_version — see
+    # connection.rb for why these live in this ruby-family/Spinel-only
+    # reopen rather than base.rb.
+    def cache_key: () -> String
+    def cache_version: () -> String?
+    def cache_key_with_version: () -> String
     # Request values stay intact until the schema-selected scalar adapter.
     def self.find: (Integer | Float | String | nil id) -> Base
     def self.find_by!: (Hash[String | Symbol, untyped] conditions) -> Base
@@ -148,6 +162,10 @@ module ActiveRecord
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
     def self.find_by_sql: (String | Array[untyped] sql, ?Array[untyped] binds, ?preparable: bool?, ?allow_retry: bool) ?{ (Base) -> untyped } -> Array[Base]
+    def self.current_transaction: () -> ActiveRecord::Transaction
+    def self._after_commit: (^() -> nil work) -> nil
+    def self._run_after_commits_from: (Integer from) -> nil
+    def self._drop_after_commits_from: (Integer from) -> nil
     def self.uncached: () { () -> untyped } -> untyped
     def self.sanitize_sql_like: (String string, ?String escape_character) -> String
     def self.clear_query_caches_for_current_thread: () -> nil
@@ -233,11 +251,11 @@ module ActiveRecord
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Nil and uncastable request keys reject before the scalar adapter.
     # Not `?id`: the def takes `*ids`, and spinel types a positional field by the def's own slot.
-    def self.exists?: (*(Integer | Float | String | nil) ids) -> bool
+    def self.exists?: (*(Integer | Float | String | Hash[String | Symbol, untyped] | nil) ids) -> bool
     def self._exists_primary_key_input: (Integer | Float | String | nil id) -> bool
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
-    def self.where: (?(Hash[Symbol, untyped] | String | Array[untyped] | nil) conditions, *untyped args) -> Relation
-    def self.find_by: (Hash[String | Symbol, untyped] conditions) -> Base?
+    def self.where: (?(Hash[Symbol, untyped] | String | Array[untyped] | nil) condition, *untyped args) -> Relation
+    def self.find_by: (Hash[String | Symbol, untyped] | String | nil conditions) -> Base?
     def self.find_sole_by: (Hash[String | Symbol, untyped] conditions) -> Base
     def self.find_or_initialize_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
     def self.find_or_create_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
@@ -307,6 +325,27 @@ module ActiveRecord
     def self._join_scope_sql: () -> String
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def _seed_default_scope_attributes: (Hash[Symbol, untyped] attrs) -> void
+    def self.delete_by: (Hash[Symbol, untyped] | String conditions) -> Integer
+    def self.destroy_by: (Hash[Symbol, untyped] | String conditions) -> Array[Base]
+    def self.excluding: (*untyped records) -> Relation
+    def self.find_each: () { (Base) -> void } -> Relation
+    def self.find_in_batches: () { (Array[Base]) -> void } -> Relation
+    def self.first_or_initialize: () -> Base
+    def self.first!: () -> Base
+    def self.ids: () -> Array[Integer]
+    def self.many?: () -> bool
+    def self.maximum: (String | Symbol expr) -> untyped
+    def self.merge: (Relation other) -> Relation
+    def self.minimum: (String | Symbol expr) -> untyped
+    def self.one?: () -> bool
+    def self.pick: (String | Symbol col) -> untyped
+    def self.pluck: (String | Symbol col) -> Array[untyped]
+    def self.references: (*Symbol names) -> Relation
+    def self.sum: (String | Symbol expr) -> Float
+    def self.touch_all: (?Symbol? name) -> Integer
+    def self.update_all: (Hash[Symbol, untyped] | String updates) -> Integer
+    def self.with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
+    def self.without: (*untyped records) -> Relation
     def self.count: () -> Integer
     def self.last: () -> Base?
     def self.destroy_all: () -> Array[Base]
@@ -337,7 +376,6 @@ module ActiveRecord
     def attribute_previously_was: (String | Symbol name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?
-    def self.first!: () -> Base
     def self.last!: () -> Base
     def self.take!: () -> Base
     def self._hydrate_all: (String sql) -> Array[Base]
@@ -360,9 +398,13 @@ module ActiveRecord
     def _adopt_touch_owner: (Base owner) -> nil
     def _touch_owner: () -> nil
     def _transaction_committed: () -> nil
+    def touch_later: () -> bool
+    def self._flush_deferred_touches: () -> nil
+    def self._flush_deferred_touches_from: (Integer from) -> nil
     def self._txn_parent_joinable?: (Integer depth) -> bool
     def self._txn_note_joinable: (Integer depth, bool joinable) -> nil
     def self._commit_enlisted: () -> nil
+    def self._take_enlisted: (Integer from) -> Array[ActiveRecord::EnlistedRecord]?
     def self._commit_enlisted_from: (Integer from) -> nil
     def self._rollback_enlisted: (Integer from) -> nil
     def _restore_after_rollback: (Integer kind) -> nil

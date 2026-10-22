@@ -322,6 +322,13 @@ module ActiveRecord
       raise NotImplementedError, "id=: subclasses must override"
     end
 
+    # The primary key, which is `id` unless the model names another
+    # column. A table can have both; `id` then stays that column and
+    # this method still answers the key. Models override it.
+    def _primary_key_value
+      id
+    end
+
     # `to_param` — the same contract. The lowerer synthesizes it on
     # ApplicationRecord (the key as a String, Rails' `id&.to_s`) and a
     # model may override it (lobsters' Story answers `short_id`).
@@ -1414,6 +1421,15 @@ module ActiveRecord
       after_touch
       _transaction_write_end
       true
+    end
+
+    # `touch_later` — what Rails' `belongs_to …, touch: true` calls.
+    # Rails defers the write to just before the transaction's COMMIT and
+    # stamps each record once, however many children asked; the
+    # ruby-family reopen (connection.rb) does that. A strict target has
+    # no transaction to wait on, so here it is `touch`.
+    def touch_later
+      touch
     end
 
     # `touch` after a call-site column write (`touch :connected_at`,

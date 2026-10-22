@@ -224,7 +224,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         let (items, enums) = roundhouse::ingest::library_class::ingest_concern_model_items(source.as_bytes(), "draft_state.rb");
         assert_eq!(items.len(), 1, "recognized declaration must be retained: {declaration}");
         let [ModelBodyItem::Unknown { expr, .. }] = items[0].1.as_slice() else { panic!("{items:?}") };
-        assert!(expr.diagnostic.is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
+        assert!(expr.diagnostic().is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
         assert!(enums.is_empty());
 
         let files = [
@@ -245,7 +245,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         assert_eq!(gaps.len(), 2, "one refusal per includer: {declaration}: {gaps:?}");
         let declaration_span = app.concern_model_items.values().flatten().find_map(|item| {
             let ModelBodyItem::Unknown { expr, .. } = item else { return None };
-            expr.diagnostic.as_ref().map(|_| expr.span)
+            expr.diagnostic().as_ref().map(|_| expr.span)
         }).expect("original refused declaration retains its source span");
         for name in ["Message", "Note"] {
             assert!(gaps.iter().any(|gap| gap.to_string().contains(&format!("on {name}"))), "{gaps:?}");
@@ -392,6 +392,26 @@ fn source_visibility_refusals_precede_concern_accessor_admission() {
         files.insert("app/models/message.rb".into(), model.replace("include DraftState", "").into_bytes());
         assert_eq!(ingest_app_from_tree(files).unwrap_err().to_string(), error,
             "the marker is unsupported even without a carried accessor");
+    }
+}
+
+/// A static marker naming the concern's accessor is the model's own
+/// visibility change on a method its body does not define: carried, and
+/// applied to the accessor the lowering synthesizes.
+#[test]
+fn a_marker_on_a_concern_accessor_applies_to_it() {
+    for (marker, name, keyword) in [
+        ("private :scratch=", "scratch=", "private"),
+        ("private \"scratch=\"", "scratch=", "private"),
+        ("protected \"scratch\"", "scratch", "protected"),
+    ] {
+        let app = ingest_app_from_tree(tree(&[
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :messages do |t|\n    t.string :body\n  end\nend\n"),
+            ("app/models/concerns/draft_state.rb", "module DraftState\n  extend ActiveSupport::Concern\n  included { attr_accessor :scratch }\nend\n"),
+            ("app/models/message.rb", &format!("class Message < ApplicationRecord\n  include DraftState\n  {marker}\nend\n")),
+        ])).unwrap_or_else(|e| panic!("{marker}: {e}"));
+        let src = ruby::emit_lowered_models(&app).into_iter().find(|file| file.path.to_string_lossy().ends_with("message.rb")).unwrap().content;
+        assert!(src.contains(&format!("{keyword} :{name}")) || src.contains(&format!("{keyword}\n\n  def {name}")), "{marker}:\n{src}");
     }
 }
 
@@ -638,6 +658,10 @@ fn deferred_concern_dependencies_stay_dormant_and_use_lexical_names() {
         ("app/models/support.rb", "module Scope; module DraftState; def helper; 'local'; end; end; class Support; include DraftState; end; end"),
     ]);
     ingest_app_from_tree(files.clone()).expect("a Concern dependency is deferred, and the local namesake has no accessors");
+    // Inside `module Scope`, the model's `include DraftState` is the local
+    // namesake, as Ruby binds it. Ingest stores that name, so the Concern's
+    // accessors are never spliced into the model; the local module, which
+    // this file does not model, is refused by analysis instead.
     let mut shadowed = files.clone();
     let shadowed_source = "module Scope; module DraftState; def helper; 'local'; end; end; class Message < ApplicationRecord; self.table_name = 'messages'; include DraftState; end; end";
     shadowed.insert("app/models/support.rb".into(), shadowed_source.as_bytes().to_vec());

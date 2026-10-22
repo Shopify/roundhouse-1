@@ -178,6 +178,8 @@ fn build_and_run(test_file: &Path, tag: &str) {
     // `test_helper.rb: cannot load such file -- runtime/json_impl.rb`.
     for entry in [
         "active_support_time_parsing.rb",
+        "active_support_interval.rb",
+        "active_support_duration.rb",
         "base64.rb",
         "json_impl.rb",
         "message_digest.rb",

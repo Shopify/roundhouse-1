@@ -350,15 +350,9 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         };
         let assoc = first.as_assoc_node()?;
         let key_ty = type_of_literal_node(&assoc.key())?;
-        // A table of lists or of tables (`OPTION_ALIASES = { expires_in:
-        // [:expire_in, :expired_in].freeze }`) types by the same rules, one
-        // level in, frozen or not.
-        let value_ty = type_of_literal_node(&assoc.value()).or_else(|| {
-            let inner = peel_freeze(assoc.value());
-            (inner.as_array_node().is_some() || inner.as_hash_node().is_some())
-                .then(|| type_of_const_literal(&inner))
-                .flatten()
-        })?;
+        // A table of tables (`ActionCable::INTERNAL`'s `disconnect_reasons`)
+        // is typed as deep as its literals go.
+        let value_ty = type_of_const_literal(&assoc.value())?;
         return Some(Ty::Hash {
             key: std::sync::Arc::new(key_ty),
             value: std::sync::Arc::new(value_ty),
@@ -440,7 +434,7 @@ pub fn parse_methods(source: &str) -> Result<Vec<MethodDef>, String> {
 
     let errors: Vec<String> = result
         .errors()
-        .map(|e| e.message().to_string())
+        .map(|e| crate::ingest::prism_api::diagnostic_message(&e))
         .collect();
     if !errors.is_empty() {
         return Err(format!("parse error: {}", errors.join("; ")));
@@ -683,6 +677,7 @@ pub fn parse_library_with_rbs(
         let empty_ivars: crate::det::HashMap<Symbol, Ty> =
             crate::det::HashMap::default();
         for m in &mut lc.methods {
+            stamp_sig_return_on_empty_tail(m);
             let mut ctx = build_ctx(m, &empty_ivars);
             typer.seed_param_default_locals(&mut m.params, &mut ctx);
             typer.analyze_expr(&mut m.body, &ctx);
@@ -725,6 +720,7 @@ pub fn parse_library_with_rbs(
                 .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
                 .collect();
             for m in &mut lc.methods {
+                stamp_sig_return_on_empty_tail(m);
                 let mut ctx = build_ctx(m, &reseeded);
                 typer.seed_param_default_locals(&mut m.params, &mut ctx);
                 typer.analyze_expr(&mut m.body, &ctx);
@@ -1077,6 +1073,7 @@ pub fn parse_methods_with_rbs_in_ctx(
     let empty_ivars: crate::det::HashMap<Symbol, Ty> =
         crate::det::HashMap::default();
     for m in &mut methods {
+        stamp_sig_return_on_empty_tail(m);
         let mut ctx = build_ctx(m, &empty_ivars);
         typer.seed_param_default_locals(&mut m.params, &mut ctx);
         typer.analyze_expr(&mut m.body, &ctx);
@@ -1094,6 +1091,7 @@ pub fn parse_methods_with_rbs_in_ctx(
             .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
             .collect();
         for m in &mut methods {
+            stamp_sig_return_on_empty_tail(m);
             let mut ctx = build_ctx(m, &reseeded);
             typer.seed_param_default_locals(&mut m.params, &mut ctx);
             typer.analyze_expr(&mut m.body, &ctx);
@@ -1101,6 +1099,15 @@ pub fn parse_methods_with_rbs_in_ctx(
     }
 
     Ok(methods)
+}
+
+/// Forward a method's declared Hash/Array return onto a bare empty
+/// `{}` / `[]` tail before body-typing. See
+/// [`crate::analyze::stamp_expected_on_empty_return_tail`].
+fn stamp_sig_return_on_empty_tail(m: &mut MethodDef) {
+    if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+        crate::analyze::stamp_expected_on_empty_return_tail(&mut m.body, ret);
+    }
 }
 
 fn walk_scope(
@@ -1243,7 +1250,7 @@ fn collect_from_stmt(
                     if let Some(args) = call.arguments() {
                         for arg in args.arguments().iter() {
                             let Some(sym) = arg.as_symbol_node() else { continue };
-                            let Some(loc) = sym.value_loc() else { continue };
+                            let loc = sym.content_loc();
                             let attr_name = std::str::from_utf8(loc.as_slice())
                                 .map_err(|_| "attr name not UTF-8".to_string())?;
                             if mk_reader {
@@ -1641,7 +1648,7 @@ fn method_params(
 
     // Block: `&block` — populated into `block_param` slot, not the
     // flat list. Anonymous `&` has no name — return None.
-    let block_param = match params_node.block() {
+    let block_param = match crate::ingest::prism_api::block_parameter(&params_node) {
         Some(block) => match block.name() {
             Some(loc) => Some(Param::positional(Symbol::new(decode_utf8(
                 loc.as_slice(),
@@ -2155,6 +2162,57 @@ mod tests {
         let m = &methods[0];
         // The If as a whole unions its branches (both StringInterp → Str).
         assert_eq!(m.body.ty.as_ref(), Some(&Ty::Str));
+    }
+
+    /// Declared `-> Hash[Symbol, String]` must stamp a bare `{}` return
+    /// so Crystal emit renders `{} of Symbol => String`, not the
+    /// String=>String empty-hash default (FV compare-extra crystal:
+    /// `default_url_options` on ActionController::Base).
+    #[test]
+    fn rbs_return_stamps_empty_hash_on_default_url_options() {
+        let ruby = include_bytes!("../runtime/ruby/action_controller/base.rb");
+        let rbs = include_str!("../runtime/ruby/action_controller/base.rbs");
+        let classes = parse_library_with_rbs(ruby, rbs, "action_controller/base.rb")
+            .expect("action_controller/base parses and types");
+        let base = classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "ActionController::Base")
+            .expect("Base class");
+        let m = base
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == "default_url_options")
+            .expect("default_url_options");
+        match m.body.ty.as_ref() {
+            Some(Ty::Hash { key, value }) => {
+                assert!(
+                    matches!(key.as_ref(), Ty::Sym),
+                    "expected Hash[Symbol, _], key={key:?}"
+                );
+                assert!(
+                    matches!(value.as_ref(), Ty::Str),
+                    "expected Hash[_, String], value={value:?}"
+                );
+            }
+            other => panic!("default_url_options body must be Hash[Symbol, String], got {other:?}"),
+        }
+        // End-to-end Crystal emit (the FV failure surface): annotation
+        // and empty-hash `of` clause must agree on Symbol keys.
+        let crystal = crate::emit::crystal::emit_library_class(base)
+            .expect("Crystal emit of ActionController::Base");
+        let needle = "def default_url_options : Hash(Symbol, String)";
+        let idx = crystal
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in Crystal emit"));
+        let window = &crystal[idx..crystal.len().min(idx + 200)];
+        assert!(
+            window.contains("{} of Symbol => String"),
+            "Crystal empty-hash return must match declared Hash(Symbol, String):\n{window}"
+        );
+        assert!(
+            !window.contains("{} of String => String"),
+            "Crystal must not emit String-keyed empty hash for default_url_options:\n{window}"
+        );
     }
 
     /// RBS `@keys`/`@vals` must stamp empty `[]` initializers so

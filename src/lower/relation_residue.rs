@@ -159,13 +159,75 @@ fn walk(e: &Expr, in_chain: bool, ctx: &FoldCtx, diags: &mut Vec<Diagnostic>) {
 /// The invariant: a residue that predicts "unsupported at emit" for the
 /// target being emitted must fail that emit.
 ///
-/// Host-only, like the `project::BuildTarget` it reads and the CLI that
-/// calls it: the wasm build excludes `project` (see `lib.rs`), and the
+/// Host-only: the CLI is the emit gate that raises these, and the
 /// playground has no emit gate to raise anything for.
+/// `validates :attr, uniqueness: …` needs a query at validation time,
+/// which only the targets that ship the runtime Relation lower
+/// (`model_to_library::RuntimeRelation::Present`). Elsewhere the rule is
+/// not lowered, and this reports it, as the gap it was before, once per
+/// validation, so the emit says what it leaves out.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn uniqueness_gaps_for_target(app: &App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
+    if target.has_runtime_relation() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Validation { validation, .. } = item else { continue };
+            if !validation.rules.iter().any(|r| matches!(r, crate::dialect::ValidationRule::Uniqueness { .. })) {
+                continue;
+            }
+            let mut d = Diagnostic::unsupported(
+                item.span(),
+                Some(crate::ident::Symbol::from(target.as_str())),
+                format!("validates :{}, uniqueness:", validation.attribute.as_str()),
+                "the uniqueness query needs the runtime Relation, which this target does not ship; Rails rejects records this build saves",
+            );
+            d.severity = crate::diagnostic::Severity::Warning;
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// `default_scope { where(…) }` is applied by the runtime Relation when a
+/// relation is built (`lower::default_scope`). A target without one would
+/// answer every query on the model from the whole table, so the scope is
+/// an error there, once per model, never a silent unscoped read.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_scope_gaps_for_target(app: &App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
+    if target.has_runtime_relation() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for model in &app.models {
+        if crate::lower::default_scope::static_default_scope(model).is_none() {
+            continue;
+        }
+        let Some(item) = model.body.iter().find(|item| {
+            matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                if matches!(&*expr.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "default_scope"))
+        }) else {
+            continue;
+        };
+        out.push(Diagnostic::unsupported(
+            item.span(),
+            Some(crate::ident::Symbol::from(target.as_str())),
+            "default_scope",
+            format!(
+                "`{}`'s default scope is applied by the runtime Relation, which this target does not ship; its queries would read the rows the scope hides",
+                model.name.0.as_str()
+            ),
+        ));
+    }
+    out
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn elevate_dynamic_relation_for_target(
     diags: &mut [Diagnostic],
-    target: crate::project::BuildTarget,
+    target: crate::build_target::BuildTarget,
 ) {
     if target.has_runtime_relation() {
         return;

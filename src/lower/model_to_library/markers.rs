@@ -610,17 +610,36 @@ pub(crate) fn virtual_default_attribute_decl(expr: &Expr) -> Option<(Symbol, Sym
     }
 }
 
+/// `attr` is an `attribute :attr, :boolean` whose reader and writer are the
+/// synthesized ones (the model defines neither itself), so its value is
+/// what `push_attribute_api_methods`' Boolean cast stores.
+pub(crate) fn synthesized_boolean_attribute(model: &Model, attr: &Symbol) -> bool {
+    let setter = Symbol::from(format!("{}=", attr.as_str()));
+    attribute_api_decls(&model.body).iter().any(|(name, ty)| name == attr && ty.as_str() == "boolean")
+        && !crate::lower::model_to_library::model_defines_instance_method(model, attr)
+        && !crate::lower::model_to_library::model_defines_instance_method(model, &setter)
+}
+
 /// `attribute :name, :type` — typed virtual attributes (lobsters'
 /// `attribute :mod_note, :boolean` on Message, `:is_unread` on the
 /// SQL-view-backed ReplyingComment). Reader is a typed ivar read;
-/// the `:boolean` writer applies Rails' Type::Boolean cast over the
-/// realistic value space via to_s (`"" / "0" / "false" / "f"` →
-/// false, anything else → true — the form roundtrip assigns "0"/"1"
-/// strings, and an uncast write would leave "0" truthy). Other types
-/// assign verbatim. A custom method in the model body wins (the
+/// the `:boolean` writer applies Rails 8.1.4's Type::Boolean cast via
+/// `to_s`, inline so every target compiles it: `"0" / "f" / "F" /
+/// "false" / "FALSE" / "off" / "OFF"` (and `false`, `0`, `:off`) →
+/// false; anything else → true. On the ruby family `""` (and nil, whose
+/// `to_s` it is) → nil, as Rails casts it, and the reader is `bool?`. A
+/// strict target keeps a non-nil `Bool` field, so there nil and `""` are
+/// still `false`. The form roundtrip assigns "0"/"1" strings, and an
+/// uncast write would leave "0" truthy. Other types assign verbatim. A custom method in the model body wins (the
 /// synthesizers run before `push_user_methods`, which drops
 /// collisions — same dance as attr_accessor).
-pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+fn nilable_bool() -> Ty {
+    Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() }
+}
+
+pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &Model, runtime_relation: super::RuntimeRelation) {
+    let keeps_nil = runtime_relation == super::RuntimeRelation::Present;
+    let bool_ty = || if keeps_nil { nilable_bool() } else { Ty::Bool };
     if is_primary_abstract_class(model) {
         return;
     }
@@ -663,12 +682,12 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                         },
                     )
                 } else if is_bool {
-                    with_ty(ivar(), Ty::Bool)
+                    with_ty(ivar(), bool_ty())
                 } else {
                     ivar()
                 },
                 signature: if is_bool {
-                    Some(super::fn_sig(vec![], Ty::Bool))
+                    Some(super::fn_sig(vec![], bool_ty()))
                 } else {
                     None
                 },
@@ -723,7 +742,9 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
             );
             let body = if is_bool {
                 // s = value.to_s
-                // @name = (s == "" || s == "0" || s == "false" || s == "f" ? false : true)
+                // @name = if s == "" then nil            (ruby family)
+                //         elsif s == "0" || s == "f" || … || s == "OFF" then false
+                //         else true end
                 let s = Symbol::from("s");
                 let s_ref = |_: ()| {
                     Expr::new(
@@ -774,8 +795,8 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                         },
                     )
                 };
-                let falsey = or(or(or(eq(""), eq("0")), eq("false")), eq("f"));
-                let cast = Expr::new(
+                let falsey = ["f", "F", "false", "FALSE", "off", "OFF"].into_iter().fold(eq("0"), |acc, lit| or(acc, eq(lit)));
+                let cast_present = with_ty(Expr::new(
                     Span::synthetic(),
                     ExprNode::If {
                         cond: falsey,
@@ -794,7 +815,22 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                             Ty::Bool,
                         ),
                     },
-                );
+                ), Ty::Bool);
+                let cast = if keeps_nil {
+                    with_ty(
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::If {
+                                cond: eq(""),
+                                then_branch: with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil),
+                                else_branch: cast_present,
+                            },
+                        ),
+                        nilable_bool(),
+                    )
+                } else {
+                    cast_present
+                };
                 let assign = Expr::new(
                     Span::synthetic(),
                     ExprNode::Assign {
@@ -1288,7 +1324,7 @@ fn str_method(model: &Model, name: &str, body: Expr) -> MethodDef {
 ///
 ///   def after_create
 ///     __touch_message = message
-///     __touch_message.touch unless __touch_message.nil?
+///     __touch_message.touch_later unless __touch_message.nil?
 ///   end
 ///
 /// and the same in `after_update`, `after_destroy` and `after_touch`.
@@ -1370,9 +1406,14 @@ fn push_belongs_to_touches(methods: &mut Vec<MethodDef>, model: &Model) {
             ));
         }
         // A stamped column has to reach the row with the timestamp, so
-        // that form finishes with the whole-row `touch_written`; the bare
-        // form's `touch` writes `updated_at` alone, as Rails' does.
-        let finish = if matches!(touch, Touch::Column(_)) { "touch_written" } else { "touch" };
+        // that form finishes with the whole-row `touch_written`, at once.
+        // The bare form is Rails' `touch_later`: inside the save's
+        // transaction the parent is stamped once, just before COMMIT,
+        // however many of this record's hooks (and its siblings') asked
+        // (runtime/ruby/active_record/connection.rb); outside one, and on
+        // a strict target (base.rb), it is `touch`, which writes
+        // `updated_at` alone, as Rails' does.
+        let finish = if matches!(touch, Touch::Column(_)) { "touch_written" } else { "touch_later" };
         guarded.push(Expr::new(
             span,
             ExprNode::Send {
@@ -1642,7 +1683,7 @@ fn push_symbol_callback(
     }
 }
 
-/// Wrap a validation-hook body in the `new_record?` guard its `on:`
+/// Wrap a validation-hook body in the `persisted?` guard its `on:`
 /// restriction lowers to — accurate at validation time, since the
 /// insert hasn't happened yet. `on: :destroy` has no reading here
 /// (validations never run on destroy) and returns None: drop the
@@ -1654,28 +1695,33 @@ fn guard_validation_on(
 ) -> Option<Expr> {
     use crate::dialect::CallbackOn as On;
 
-    let new_record = Expr::new(
+    // `self.persisted?`, not a bare `new_record?`: `persisted?` is
+    // synthesized per model on every target, while `new_record?` lives on
+    // the runtime Base, which a rust or go struct does not inherit (rust
+    // read the bare call as a free `new_record_pred()`, go as a missing
+    // `self.NewRecord` field). Same spelling as the cache-key marker above.
+    let persisted = Expr::new(
         span,
         ExprNode::Send {
-            recv: None,
-            method: Symbol::from("new_record?"),
+            recv: Some(Expr::new(span, ExprNode::SelfRef)),
+            method: Symbol::from("persisted?"),
             args: vec![],
             block: None,
             parenthesized: false,
         },
     );
     let cond = match on {
-        On::Create => new_record,
-        On::Update => Expr::new(
+        On::Create => Expr::new(
             span,
             ExprNode::Send {
-                recv: Some(new_record),
+                recv: Some(persisted),
                 method: Symbol::from("!"),
                 args: vec![],
                 block: None,
                 parenthesized: false,
             },
         ),
+        On::Update => persisted,
         On::Destroy => return None,
     };
     let mut guarded = Expr::new(

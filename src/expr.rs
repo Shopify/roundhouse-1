@@ -324,6 +324,32 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 42;
 /// replays where the source has it (`ingest::app_extension_calls`).
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 43;
 
+// Upstream numbered the next four 20-23; this lane owns those
+// (RUNTIME_VALUE_REF .. ERRORS_PORT_CALL), so they take the next free
+// cross-target bits above REPLAYED_CLASS_BODY.
+
+/// A model's `private :has_role?` naming a method its body does not
+/// define (generated, a superclass's or a gem's): kept as a statement for
+/// the lowering to apply and the analyzer to enforce.
+pub const INHERITED_VISIBILITY: u64 = 1 << 44;
+
+/// `time_calendar` renamed a zero-arg `iso8601` to `to_rfc3339`. Later
+/// re-analysis can widen the receiver (`minimum(:col) || Time.utc`), so
+/// emitters cannot rediscover the rename from the type alone. Ruby prints
+/// `iso8601`; the other targets keep their time-format mapping.
+pub const GROUNDED_TIME_FORMAT: u64 = 1 << 45;
+
+/// `written_names` has applied Rubydex to this mixin path. The stored
+/// spelling is the answer, including when Rubydex left a short name
+/// because the reference is top-level. Absent on a per-file ingest,
+/// which never ran that pass.
+pub const RESOLVED_MIXIN: u64 = 1 << 46;
+
+/// Analysis admitted this send as a read-only Module query (`const_defined?`,
+/// `include?`, …) on a class object, which only the ruby family and spinel
+/// can ask; `project::report_unsupported_bundled_constants` reports it elsewhere.
+pub const MODULE_QUERY: u64 = 1 << 47;
+
 /// An `Expr` held by an [`IrHint`]. Hints compare by kind, so it is equal
 /// to any other: the expression is data for an emitter, not identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -535,6 +561,32 @@ pub struct Expr {
     /// at ingest time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub leading_blank_line: bool,
+    /// Rarely-set annotations (`diagnostic`, `hint`), boxed so a node
+    /// that has none of them pays one pointer. Read them through
+    /// [`Expr::diagnostic`] and [`Expr::hint`]; write them through
+    /// [`Expr::set_diagnostic`] and [`Expr::set_hint`], which drop the box
+    /// again once both are `None`. Flattened, so the serialized shape is
+    /// unchanged.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_cold")]
+    pub cold: Option<Box<ExprCold>>,
+    /// Bit-packed source facts and target decisions. Bits 0–31 are
+    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, source-resolution facts);
+    /// the analyzer sets source facts and the decide passes set the rest.
+    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
+    /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
+    /// rust bit allocation. Default `0` = "no decisions" — emitters
+    /// that don't run a decide pass see no behavioral change.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub decisions: u64,
+}
+
+/// The annotations most nodes never carry, stored behind
+/// [`Expr::cold`]. Inline, `diagnostic` alone made up over half of every
+/// `Expr`, and each node pays for `Expr` about four times over: once in
+/// its parent and three times inside its boxed `ExprNode`, whose largest
+/// variants hold three `Expr`s.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExprCold {
     /// Analyzer-set diagnostic annotation — present when the body-
     /// typer detected a user error (Incompatible `+`, etc.) at this
     /// site. Emitters read this first on the expr: if set, they
@@ -550,21 +602,98 @@ pub struct Expr {
     /// nothing tagged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<IrHint>,
-    /// Bit-packed source facts and target decisions. Bits 0–31 are
-    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, source-resolution facts);
-    /// the analyzer sets source facts and the decide passes set the rest.
-    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
-    /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
-    /// rust bit allocation. Default `0` = "no decisions" — emitters
-    /// that don't run a decide pass see no behavioral change.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub decisions: u64,
+    /// The method `ingest` parsed for a `def` at expression position.
+    /// The node stays the nil that carries the nested-def diagnostic;
+    /// this is that same parse, so a hoist does not read the source again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_def: Option<crate::dialect::MethodDef>,
     /// The source keyword a [`SOURCE_KEYWORD_ARG`] or
-    /// [`KEYWORD_DEFAULT_FILL`] argument was bound to. Boxed so the field
-    /// costs one pointer on every other node.
+    /// [`KEYWORD_DEFAULT_FILL`] argument was bound to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyword_arg: Option<Box<Symbol>>,
 }
+
+static EMPTY_COLD: ExprCold = ExprCold {
+    diagnostic: None,
+    hint: None,
+    nested_def: None,
+    keyword_arg: None,
+};
+
+impl ExprCold {
+    fn is_empty(&self) -> bool {
+        self.diagnostic.is_none()
+            && self.hint.is_none()
+            && self.nested_def.is_none()
+            && self.keyword_arg.is_none()
+    }
+
+    /// Apply `f` to the annotations in `slot` (an [`Expr::cold`] field),
+    /// allocating the box only when `f` leaves something set and
+    /// dropping it when nothing is. Takes the field rather than the
+    /// `Expr` so callers holding a borrow of `node` can still write.
+    pub fn update(slot: &mut Option<Box<ExprCold>>, f: impl FnOnce(&mut ExprCold)) {
+        match slot {
+            Some(cold) => {
+                f(cold);
+                if cold.is_empty() {
+                    *slot = None;
+                }
+            }
+            None => {
+                let mut cold = ExprCold::default();
+                f(&mut cold);
+                if !cold.is_empty() {
+                    *slot = Some(Box::new(cold));
+                }
+            }
+        }
+    }
+
+    /// The annotations in `slot`; all `None` when it is empty.
+    pub fn of(slot: &Option<Box<ExprCold>>) -> &ExprCold {
+        slot.as_deref().unwrap_or(&EMPTY_COLD)
+    }
+
+    /// Field-level forms of [`Expr::diagnostic`] / [`Expr::set_diagnostic`]
+    /// and the hint equivalents, for callers that hold a borrow of the
+    /// node while reading or writing an annotation.
+    pub fn diagnostic(slot: &Option<Box<ExprCold>>) -> &Option<DiagnosticKind> {
+        &Self::of(slot).diagnostic
+    }
+
+    pub fn set_diagnostic(slot: &mut Option<Box<ExprCold>>, diagnostic: Option<DiagnosticKind>) {
+        Self::update(slot, |c| c.diagnostic = diagnostic);
+    }
+
+    /// Field-level form of [`Expr::diagnostic_mut`]; allocates the box.
+    pub fn diagnostic_mut(slot: &mut Option<Box<ExprCold>>) -> &mut Option<DiagnosticKind> {
+        &mut slot.get_or_insert_with(Default::default).diagnostic
+    }
+
+    pub fn hint(slot: &Option<Box<ExprCold>>) -> &Option<IrHint> {
+        &Self::of(slot).hint
+    }
+
+    pub fn set_hint(slot: &mut Option<Box<ExprCold>>, hint: Option<IrHint>) {
+        Self::update(slot, |c| c.hint = hint);
+    }
+}
+
+/// A flattened `Option` deserializes as `Some` even when none of its
+/// fields are present, which would give every node read back an empty
+/// box. Read an empty one as `None`.
+fn deserialize_cold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<ExprCold>>, D::Error> {
+    let cold = ExprCold::deserialize(d)?;
+    Ok(if cold.is_empty() { None } else { Some(Box::new(cold)) })
+}
+
+// A field that grows `Expr` grows every tree about fourfold (see
+// `ExprCold`). Put rare data in `ExprCold` instead of raising these.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Expr>() <= 120);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ExprNode>() <= 392);
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -580,10 +709,8 @@ impl PartialEq for Expr {
             && self.ty == other.ty
             && self.effects == other.effects
             && self.leading_blank_line == other.leading_blank_line
-            && self.diagnostic == other.diagnostic
-            && self.hint == other.hint
+            && self.cold() == other.cold()
             && self.decisions == other.decisions
-            && self.keyword_arg == other.keyword_arg
     }
 }
 
@@ -595,10 +722,8 @@ impl Expr {
             ty: None,
             effects: EffectSet::pure(),
             leading_blank_line: false,
-            diagnostic: None,
-            hint: None,
+            cold: None,
             decisions: 0,
-            keyword_arg: None,
         }
     }
 
@@ -607,7 +732,7 @@ impl Expr {
     pub fn mark_source_keyword(&mut self, key: Symbol) {
         self.decisions |= SOURCE_KEYWORD_ARG;
         self.decisions &= !KEYWORD_DEFAULT_FILL;
-        self.keyword_arg = Some(Box::new(key));
+        ExprCold::update(&mut self.cold, |c| c.keyword_arg = Some(Box::new(key)));
     }
 
     /// Mark this call argument as a filled-in default for the omitted
@@ -615,12 +740,73 @@ impl Expr {
     pub fn mark_keyword_default_fill(&mut self, key: Symbol) {
         self.decisions |= KEYWORD_DEFAULT_FILL;
         self.decisions &= !SOURCE_KEYWORD_ARG;
-        self.keyword_arg = Some(Box::new(key));
+        ExprCold::update(&mut self.cold, |c| c.keyword_arg = Some(Box::new(key)));
     }
 
     /// The keyword a marked argument stands for, if any.
     pub fn keyword_arg(&self) -> Option<&Symbol> {
-        self.keyword_arg.as_deref()
+        self.cold().keyword_arg.as_deref()
+    }
+
+    /// The rarely-set annotations; all `None` when the node has none.
+    pub fn cold(&self) -> &ExprCold {
+        ExprCold::of(&self.cold)
+    }
+
+    /// The analyzer's diagnostic annotation, if any.
+    pub fn diagnostic(&self) -> &Option<DiagnosticKind> {
+        &self.cold().diagnostic
+    }
+
+    /// Set or clear the diagnostic annotation.
+    pub fn set_diagnostic(&mut self, diagnostic: Option<DiagnosticKind>) {
+        ExprCold::set_diagnostic(&mut self.cold, diagnostic);
+    }
+
+    /// Mutable access to the diagnostic annotation. Allocates the cold
+    /// box, so prefer [`Expr::set_diagnostic`] when only writing.
+    pub fn diagnostic_mut(&mut self) -> &mut Option<DiagnosticKind> {
+        ExprCold::diagnostic_mut(&mut self.cold)
+    }
+
+    /// Remove and return the diagnostic annotation.
+    pub fn take_diagnostic(&mut self) -> Option<DiagnosticKind> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.diagnostic.take());
+        taken
+    }
+
+    /// The cross-target intent annotation, if any.
+    pub fn hint(&self) -> &Option<IrHint> {
+        &self.cold().hint
+    }
+
+    /// Set or clear the cross-target intent annotation.
+    pub fn set_hint(&mut self, hint: Option<IrHint>) {
+        ExprCold::set_hint(&mut self.cold, hint);
+    }
+
+    /// Mutable access to the hint annotation. Allocates the cold box,
+    /// so prefer [`Expr::set_hint`] when only writing.
+    pub fn hint_mut(&mut self) -> &mut Option<IrHint> {
+        &mut self.cold.get_or_insert_with(Default::default).hint
+    }
+
+    /// Remove and return the hint annotation.
+    pub fn take_hint(&mut self) -> Option<IrHint> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.hint.take());
+        taken
+    }
+
+    /// The method parsed at a nested `def`, when ingest kept one.
+    pub fn nested_def(&self) -> Option<&crate::dialect::MethodDef> {
+        self.cold().nested_def.as_ref()
+    }
+
+    /// Remember the method ingest parsed for this nested `def`.
+    pub fn set_nested_def(&mut self, method: crate::dialect::MethodDef) {
+        ExprCold::update(&mut self.cold, |c| c.nested_def = Some(method));
     }
 
     /// Provenance backfill for lowerer-synthesized subtrees: every node
@@ -2174,5 +2360,59 @@ mod tests {
         let mut e = var("x", Span::synthetic());
         e.inherit_span(Span::synthetic());
         assert!(e.span.is_synthetic());
+    }
+}
+
+#[cfg(test)]
+mod cold_tests {
+    use super::{Expr, ExprNode, IrHint, Literal};
+    use crate::diagnostic::DiagnosticKind;
+    use crate::span::Span;
+
+    fn nil() -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
+    }
+
+    /// A node with no rare annotations carries no cold box, writes
+    /// none of their keys, and reads back without allocating one.
+    #[test]
+    fn absent_annotations_round_trip_without_a_box() {
+        let e = nil();
+        assert!(e.cold.is_none());
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_none() && json.get("hint").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.cold.is_none());
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Set annotations serialize flat, beside `node`, and survive a
+    /// round trip.
+    #[test]
+    fn present_annotations_round_trip_flat() {
+        let mut e = nil();
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_some() && json.get("hint").is_some());
+        assert!(json.get("cold").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.diagnostic(), e.diagnostic());
+        assert_eq!(back.hint(), &Some(IrHint::MutableStringLiteral));
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Clearing the last annotation drops the box.
+    #[test]
+    fn cold_box_dropped_when_emptied() {
+        let mut e = nil();
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(None);
+        assert!(e.cold.is_some());
+        assert!(e.take_diagnostic().is_some());
+        assert!(e.cold.is_none());
+        e.set_diagnostic(None);
+        assert!(e.cold.is_none());
     }
 }

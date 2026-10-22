@@ -885,7 +885,7 @@ pub fn emit_expr_for_runtime(e: &Expr) -> String {
 ///   - `Append` `io << chunk`     → `io.Append(chunk)`
 ///   - `Result` terminal `io`     → `io.ToString()`
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -1025,7 +1025,64 @@ fn emit_literal(lit: &Literal) -> String {
         }
         Literal::Str { value } => format!("\"{}\"", escape_str(value)),
         Literal::Sym { value } => format!("\"{}\"", escape_str(value.as_str())),
-        Literal::Regex { pattern, .. } => format!("new Regex(\"{}\")", escape_str(pattern)),
+        Literal::Regex { pattern, flags } => {
+            let options = csharp_regex_options(flags);
+            if options.is_empty() {
+                format!("new Regex(\"{}\")", escape_str(pattern))
+            } else {
+                format!("new Regex(\"{}\", {options})", escape_str(pattern))
+            }
+        }
+    }
+}
+
+/// Ruby regex flags this build can reproduce exactly on .NET: `i` is
+/// `RegexOptions.IgnoreCase`. Ruby's `m` (dot-matches-newline) is
+/// `RegexOptions.Singleline`. Ruby's `^`/`$` are always line anchors,
+/// so a flagged `m` also adds `RegexOptions.Multiline`. Any other
+/// flag character stays an ingest-time gap
+/// (`ValidationRule::Format` never carries one), so none reaches here.
+fn csharp_regex_options(flags: &str) -> String {
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
+    let mut parts: Vec<&str> = Vec::new();
+    if bits.ignore_case {
+        parts.push("RegexOptions.IgnoreCase");
+    }
+    if bits.dot_matches_newline {
+        parts.push("RegexOptions.Singleline");
+        parts.push("RegexOptions.Multiline");
+    }
+    parts.join(" | ")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(csharp_regex_options("m"), "RegexOptions.Singleline | RegexOptions.Multiline");
+    }
+
+    use super::{csharp_regex_options, emit_literal};
+    use crate::expr::Literal;
+
+    #[test]
+    fn no_flags_drop_the_options_argument() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "".into() };
+        assert_eq!(emit_literal(&lit), r#"new Regex("a.b")"#);
+    }
+
+    #[test]
+    fn ignore_case_maps_to_regexoptions_ignorecase() {
+        assert_eq!(csharp_regex_options("i"), "RegexOptions.IgnoreCase");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine_in_the_constructor() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "im".into() };
+        assert_eq!(
+            emit_literal(&lit),
+            r#"new Regex("a.b", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Multiline)"#
+        );
     }
 }
 
@@ -1309,6 +1366,10 @@ fn emit_send(
     args: &[Expr],
     block: Option<&Expr>,
 ) -> String {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
+        let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
     if recv.is_none() && args.is_empty() && block.is_none() && is_param(method) {
         return camel(method);
     }

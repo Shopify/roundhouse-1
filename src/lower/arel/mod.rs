@@ -80,7 +80,7 @@ pub fn rewrite_arel_in_expr_for_dialect(
     dialect: SqlDialect,
 ) -> bool {
     let no_scopes = crate::det::HashSet::default();
-    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, dialect, &no_scopes)
+    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, dialect, &no_scopes, SqliteVisitor::default())
 }
 
 /// Ruby-family values preserve SQL NULL without changing strict-target emit.
@@ -96,8 +96,9 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     ruby_read_values: bool,
     dialect: SqlDialect,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
-    rewrite_arel_in_method_with_ruby_values(expr, schema, registry, assocs, ruby_read_values, dialect, scopes, None)
+    rewrite_arel_in_method_with_ruby_values(expr, schema, registry, assocs, ruby_read_values, dialect, scopes, visitor, None)
 }
 
 /// As [`rewrite_arel_in_expr_with_ruby_values`] for a method body;
@@ -116,6 +117,7 @@ pub(crate) fn rewrite_arel_in_method_with_ruby_values(
     ruby_read_values: bool,
     dialect: SqlDialect,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
     class_self: Option<&ClassId>,
 ) -> bool {
     // The CRuby/JRuby trees only: spinel and the strict targets keep
@@ -131,7 +133,7 @@ pub(crate) fn rewrite_arel_in_method_with_ruby_values(
     collect_relation_refined_names(expr, scopes, &mut refined);
     HOIST_TEMPORARIES.with(|c| c.set(0));
     let mut changed =
-        rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, implicit_self, dialect, scopes);
+        rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
     // Both call sites hand us a METHOD BODY, and a body that is a
     // single statement is not a `Seq` — so the hoist post-pass inside
     // `rewrite_arel_inner`, which walks a Seq's statement list, had no
@@ -195,11 +197,12 @@ fn hydrate_through_self(expr: &mut Expr, owner: &ClassId) {
     expr.node.for_each_child_mut(&mut |c| hydrate_through_self(c, owner));
 }
 
-const RELATION_REFINERS: &[&str] = &[
-    "where", "not", "joins", "left_outer_joins", "left_joins", "order", "group", "having",
-    "limit", "offset", "merge", "includes", "preload", "eager_load", "references", "distinct",
-    "select", "where!", "order!", "reorder", "rewhere", "extending",
-];
+/// A catalog Builder (any receiver) or a [`crate::catalog::BUILDER_ALIASES`]
+/// spelling. Hydrating the receiver of one of these to an Array strands
+/// the call. Same set as [`crate::lower::scope_chain::is_relation_chain_method`].
+pub(crate) fn is_relation_refiner(method: &str) -> bool {
+    crate::catalog::is_relation_builder_name(method)
+}
 
 /// A finder terminates a relation but still needs that relation as its
 /// receiver. If the whole call cannot lift, hydrating only its receiver
@@ -209,7 +212,7 @@ const RELATION_REFINERS: &[&str] = &[
 /// Rails' per-column dynamic finders (`find_by_id`, `find_by_email!`, …)
 /// are the same shape as `find_by` and need the same treatment (#558).
 fn requires_relation_receiver(method: &str) -> bool {
-    RELATION_REFINERS.contains(&method)
+    is_relation_refiner(method)
         || matches!(method, "find_by" | "find_by!" | "exists?" | "sole" | "find_sole_by")
         // Not a lifted SELECT: Array answers none of the bulk writes, so the hydrated rows would raise NoMethodError.
         || matches!(method, "delete_all" | "update_all" | "destroy_all" | "touch_all")
@@ -491,6 +494,7 @@ fn rewrite_arel_inner(
     implicit_self: Option<&ClassId>,
     dialect: SqlDialect,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     if let ExprNode::Assign { target, value } = expr.node.as_ref() {
         let name = match target {
@@ -512,7 +516,7 @@ fn rewrite_arel_inner(
             if ruby_read_values {
                 ruby_values::normalize(&mut op, schema);
             }
-            let mut replacement = dialect.visit(&op, schema, &owner);
+            let mut replacement = dialect.visit_with_param_binds(&op, schema, &owner, visitor.param_binds);
             if implicit_self == Some(&owner) && rooted_on_implicit_self(expr, &owner) {
                 let preloads_self = matches!(&op, ArelOp::Select(sel)
                     if sel.preloads.iter().any(|p| p.target_class == owner));
@@ -556,15 +560,15 @@ fn rewrite_arel_inner(
         let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else {
             unreachable!("matched Send with recv above");
         };
-        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes);
+        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
         }
         return changed;
     }
     let mut changed = false;
     walk_subexprs_mut(expr, &mut |e| {
-        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes)
+        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor)
     });
     // Post-pass: when an Arel rewrite landed a multi-stmt hydrate Seq
     // in a *value* position — directly as an Assign value
@@ -600,17 +604,18 @@ fn rewrite_arel_spine_args(
     implicit_self: Option<&ClassId>,
     dialect: SqlDialect,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     let mut changed = false;
     if let ExprNode::Send { recv, args, block, .. } = &mut *expr.node {
         if let Some(r) = recv {
-            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes);
+            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
         }
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
         }
         if let Some(b) = block {
-            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes);
+            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect, scopes, visitor);
         }
     }
     changed

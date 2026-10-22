@@ -1083,4 +1083,28 @@ mod tests {
         let bad = call(&server(), "wont_lower", json!({ "target": "fortran" }));
         assert_eq!(bad["result"]["isError"], true);
     }
+
+    /// A strict target leaves `validates …, uniqueness:` out (it has no
+    /// runtime Relation to query), and `wont_lower` says so, as the CLI
+    /// does; a ruby-family target lowers the check and lists nothing for it.
+    #[test]
+    fn wont_lower_reports_uniqueness_only_where_it_is_not_lowered() {
+        let root = std::env::temp_dir().join(format!("roundhouse-mcp-wont-lower-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, body) in [
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+            ("app/models/widget.rb", "class Widget < ApplicationRecord\n  validates :uri, uniqueness: true\nend\n"),
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"uri\"\n  end\nend\n"),
+        ] {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        let server = Server { root: root.clone() };
+        let rust = text_of(&call(&server, "wont_lower", json!({ "target": "rust" })));
+        let ruby = text_of(&call(&server, "wont_lower", json!({ "target": "ruby" })));
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(rust.matches("validates :uri, uniqueness:").count(), 1, "{rust}");
+        assert!(!ruby.contains("uniqueness:"), "{ruby}");
+    }
 }

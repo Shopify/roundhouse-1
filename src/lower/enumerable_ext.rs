@@ -67,12 +67,30 @@ pub(crate) fn rewrite_body(expr: &mut Expr) -> bool {
     rewrite_node(expr) || changed
 }
 
+pub(crate) fn rewrite_squish_body(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |child| {
+        changed |= rewrite_squish_body(child);
+    });
+    if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "squish") {
+        changed |= rewrite_node(expr);
+    }
+    changed
+}
+
 fn rewrite(expr: &mut Expr) {
     let _ = rewrite_body(expr);
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     let span = expr.span;
+    // AS `String#first` / `String#last`, before the counted-terminal arm
+    // below, which answers every other `first(n)` / `last(n)` receiver.
+    let string_access = matches!(&*expr.node,
+        ExprNode::Send { method, block: None, .. } if matches!(method.as_str(), "first" | "last"));
+    if string_access && ground_string_access(expr) {
+        return true;
+    }
     let ExprNode::Send { recv, method, args, block, parenthesized } = &mut *expr.node else {
         return false;
     };
@@ -84,7 +102,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     // `first` takes no count (ArgumentError, every sidebar render for a
     // member of a group direct room). Both halves answer `to_a`, and
     // on the Array that follows `first(n)` means what Ruby means.
-    if matches!(method.as_str(), "first" | "last") && args.len() == 1 && block.is_none() {
+    if crate::catalog::counted_relation_terminal(method.as_str(), args.len(), block.is_some()).is_some() {
         if let Some(array_ty) = recv.as_ref().and_then(|r| relation_or_array_half(r.ty.as_ref())) {
             let receiver = recv.take().expect("checked above");
             let mut to_a = Expr::new(
@@ -599,6 +617,45 @@ fn bind_once_as(span: crate::span::Span, arg: &Expr, name: &str, skip_simple: bo
 /// parameter is a String on every target). Arguments keep their
 /// evaluation order: the options are reordered to the positional
 /// order only when neither value can have an effect.
+/// AS `String#first(limit = 1)` / `String#last(limit = 1)` ->
+/// `ActiveSupport.string_first(text, limit)` / `string_last`. Only a
+/// receiver the analyzer typed as a String, or as `String | nil` (the
+/// temporary a safe navigation binds, `password_salt&.last(10)`, before
+/// the `&&` that guards it narrows): a nil there raises NoMethodError in
+/// the module function as `nil.last` does in Ruby. `first`/`last` on an
+/// Array, a Relation or any other union is that class's own method, and
+/// stays it.
+fn ground_string_access(expr: &mut Expr) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv, method, args, parenthesized, .. } = &mut *expr.node else {
+        return false;
+    };
+    let stringish = match recv.as_ref().and_then(|r| r.ty.as_ref()) {
+        Some(Ty::Str) => true,
+        Some(Ty::Union { variants }) => {
+            variants.len() == 2
+                && variants.iter().any(|v| matches!(v, Ty::Str))
+                && variants.iter().any(|v| matches!(v, Ty::Nil))
+        }
+        _ => false,
+    };
+    if !stringish || args.len() > 1 {
+        return false;
+    }
+    let limit = args.pop().unwrap_or_else(|| {
+        let mut one = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Int { value: 1 } });
+        one.ty = Some(Ty::Int);
+        one
+    });
+    let receiver = recv.take().expect("checked above");
+    *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+    *method = Symbol::from(if method.as_str() == "first" { "string_first" } else { "string_last" });
+    args.push(receiver);
+    args.push(limit);
+    *parenthesized = true;
+    true
+}
+
 fn ground_string_truncate(expr: &mut Expr) -> bool {
     let span = expr.span;
     let ExprNode::Send { recv, args, parenthesized, .. } = &mut *expr.node else {

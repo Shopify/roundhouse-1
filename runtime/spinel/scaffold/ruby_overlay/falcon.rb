@@ -18,10 +18,18 @@
 # config.ru's GzipCache already compresses HTML, as Rack::Deflater does in
 # campfire's own config.ru.
 #
-# FORKED, ONE SOCKET. The parent binds; each child loads config.ru itself,
-# so each opens its own SQLite handle (what config/puma.rb's
-# before_worker_boot does for Puma) and the kernel spreads accept()s
-# across them.
+# FORKED, ONE SOCKET, PRELOADED. The parent loads config.ru, binds, and
+# forks; the kernel spreads accept()s across the children. Loading in the
+# parent is what config/puma.rb's preload_app! does, and for the same
+# reason: the app's code, constants and boot-time heap are then shared
+# copy-on-write instead of loaded once per child. Measured 2026-10-22 on
+# campfire (11 workers, rubix2): 699 -> 131 MB PSS at boot, 1,092 -> 822
+# MB serving /rooms/1. `Process.warmup` before the fork (GC, compaction,
+# old-generation promotion) took that to 725. Each child still opens its
+# own SQLite handles: Db.adopt_after_fork replaces the parent's pool on
+# the first request in a new pid, as it does under Puma.
+#
+# ROUNDHOUSE_PRELOAD=0 restores the per-child load, for A/B measurement.
 
 require "etc"
 require "async"
@@ -37,6 +45,7 @@ COUNT = Integer(ENV.fetch("WEB_CONCURRENCY", Etc.nprocessors.to_s))
 # ROUNDHOUSE_CHECKPOINTER=0, for A/B measurement, leaves checkpoints to
 # config.ru's per-worker thread, as under Puma.
 CHECKPOINTER = ENV["ROUNDHOUSE_CHECKPOINTER"] != "0"
+PRELOAD = ENV["ROUNDHOUSE_PRELOAD"] != "0"
 
 # async-container's controller owns the children: INT/TERM stop them
 # (gracefully first) before the parent exits, so the port is free when
@@ -53,7 +62,7 @@ class FalconController < Async::Container::Controller
     container.run(count: COUNT, restart: true) do |instance|
       Sync do
         Dir.chdir(ROOT)
-        app, = Rack::Builder.parse_file(File.join(ROOT, "config.ru"))
+        app, = PRELOAD ? APP : Rack::Builder.parse_file(File.join(ROOT, "config.ru"))
         # The WAL checkpoints run in the checkpointer process below, not
         # on a thread here that would freeze this event loop
         # (db.rb's checkpoint_in_own_process!).
@@ -73,7 +82,7 @@ class FalconController < Async::Container::Controller
     if CHECKPOINTER
       container.spawn(name: "checkpointer", restart: true) do |instance|
         Dir.chdir(ROOT)
-        Rack::Builder.parse_file(File.join(ROOT, "config.ru"))
+        Rack::Builder.parse_file(File.join(ROOT, "config.ru")) unless PRELOAD
         instance.ready!
         Db.run_checkpointer
         sleep
@@ -84,6 +93,11 @@ class FalconController < Async::Container::Controller
   end
 end
 
+if PRELOAD
+  Dir.chdir(ROOT)
+  APP, = Rack::Builder.parse_file(File.join(ROOT, "config.ru"))
+  Process.warmup
+end
 endpoint = Async::HTTP::Endpoint.parse(URL).with(reuse_address: true)
 bound = Sync { endpoint.bound }
 FalconController.new(endpoint, bound).run

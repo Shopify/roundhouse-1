@@ -439,6 +439,7 @@ pub(super) fn expand_delegates(
     additional_method_bodies: &[Expr],
     blocked_names: &crate::det::HashSet<String>,
     supported_target_methods: Option<&crate::det::HashSet<(String, String, usize)>>,
+    method_targets: &crate::det::HashSet<String>,
 ) -> Vec<MethodDef> {
     let called_with_args =
         declarations::names_called_with_arguments(methods, additional_method_bodies);
@@ -447,6 +448,7 @@ pub(super) fn expand_delegates(
         &called_with_args,
         blocked_names,
         supported_target_methods,
+        method_targets,
     );
     let delegates = declarations::take_delegate_decls_from_calls(unknown_calls, &mut eligibility);
     if delegates.is_empty() {

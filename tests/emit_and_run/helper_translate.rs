@@ -42,12 +42,36 @@ fn a_controller_s_called_copy_keeps_the_controller_s_t() {
     assert!(errors.iter().any(|e| e.contains("an `_html` key in a controller")), "{errors:#?}");
 }
 
+fn with_defaults(app: emit_and_run::Overlay) -> emit_and_run::Overlay {
+    app.edit(
+        "app/helpers/agreement_helper.rb",
+        "  def greeting_label\n",
+        "  def framed_label(label = t('probe.agree_html', path: '/t', name: '<n>'))\n    label\n  end\n\n  def framed_title(title: t('probe.agree_html', path: '/k', name: '<k>'))\n    title\n  end\n\n  def framed_link(text = link_to('x', '/y'), suffix = greeting_label)\n    text + suffix\n  end\n\n  def greeting_label\n",
+    )
+    .edit("app/views/articles/index.html.erb", "<h1", "<p id=\"fl\"><%= framed_label %></p><p id=\"ft\"><%= framed_title %></p><p id=\"fk\"><%= framed_link %></p>\n<h1")
+    .edit(
+        "test/controllers/agreement_controller_test.rb",
+        "    get articles_url\n",
+        "    get articles_url\n    assert_includes response.body, \"<p id=\\\"fl\\\">I agree to <a href=\\\"/t\\\">the terms</a> of &lt;n&gt;</p>\"\n    assert_includes response.body, \"<p id=\\\"ft\\\">I agree to <a href=\\\"/k\\\">the terms</a> of &lt;k&gt;</p>\"\n    assert_includes response.body, \"<p id=\\\"fk\\\"><a href=\\\"/y\\\">x</a>Hello world</p>\"\n",
+    )
+}
+
+/// A parameter default is helper code as the body is: its `t` is
+/// ActionView's in the module and in a copy no controller calls, and
+/// its view helpers and sibling helpers resolve as the body's do. Each
+/// was left a bare call the emitted module function does not answer,
+/// and the copy's defaults were never checked, so nothing reported it.
 #[test]
 fn an_uncalled_copy_s_parameter_defaults_take_the_view_s_t() {
-    let (_emitted, errors) = included(helper_app())
-        .edit("app/helpers/agreement_helper.rb", "  def greeting_label\n", "  def framed(label = t('probe.agree_html', path: '/t', name: 'n'), title: t('probe.agree_html', path: '/k', name: 'k'))\n    [label, title]\n  end\n\n  def greeting_label\n")
+    with_defaults(included(helper_app())).run_test("test/controllers/agreement_controller_test.rb").assert_passes();
+}
+
+#[test]
+fn a_called_copy_s_parameter_default_keeps_the_controller_s_t() {
+    let (_emitted, errors) = with_defaults(included(helper_app()))
+        .edit("app/controllers/articles_controller.rb", "  def index\n", "  def index\n    @label = framed_title\n")
         .emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(!errors.iter().any(|e| e.contains("an `_html` key in a controller")), "{errors:#?}");
+    assert!(errors.iter().any(|e| e.contains("an `_html` key in a controller")), "{errors:#?}");
 }
 
 /// A name in a controller outside the copy's family does not call it.

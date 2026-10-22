@@ -390,7 +390,7 @@ fn try_emit_raise_stmt(e: &Expr) -> Option<String> {
 /// form for Init/Append; Result is expr-position (the function's return
 /// tail) and is handled in `emit_expr`.
 fn try_string_builder_stmt(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -816,14 +816,14 @@ pub(super) fn emit_expr(e: &Expr) -> String {
     // (e.g., Incompatible `+`). If so, emit the target raise-
     // equivalent instead of the normal rendering — matches Ruby's
     // behavior of raising at runtime.
-    if let Some(kind) = &e.diagnostic {
+    if let Some(kind) = &e.diagnostic() {
         return crate::emit::diagnostics::StubStyle::PythonThrow
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
     }
     // String-accumulator hints in expression position: an Append inside a
     // lambda (the partial collection-render shape) and the terminal Result
     // read at the function's return tail.
-    match e.hint {
+    match e.hint() {
         Some(IrHint::StringBuilderAppend) => {
             if let Some(s) = string_builder_append(e) {
                 return s;
@@ -859,6 +859,14 @@ pub(super) fn emit_expr(e: &Expr) -> String {
             }
         }
         ExprNode::Send { recv, method, args, parenthesized, .. } => {
+            if e.decisions & crate::expr::GROUNDED_TIME_FORMAT != 0
+                && method.as_str() == "to_rfc3339"
+                && args.is_empty()
+            {
+                if let Some(r) = recv {
+                    return format!("{}.isoformat()", emit_expr(r));
+                }
+            }
             emit_send(recv.as_ref(), method.as_str(), args, *parenthesized)
         }
         ExprNode::Assign { target: _, value } => emit_expr(value),
@@ -1002,6 +1010,10 @@ pub(super) fn emit_expr(e: &Expr) -> String {
 }
 
 pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parenthesized: bool) -> String {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, None) {
+        let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
     // Index / slice. Handle before computing `args_s`: a Range arg
     // (`x[a..b]`) must be destructured into slice syntax, and the eager
     // `args_s` below would emit the Range node — firing a degrade — as a
@@ -1142,25 +1154,32 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
     // timestamp columns; `.utc` is then a no-op (the value is already
     // UTC) and `.iso8601` becomes `.isoformat()`. `import datetime` is
     // injected for active_record_base via the runtime-loader import list.
-    if method == "now" && args.is_empty() {
+    if matches!(method, "now" | "utc") && args.is_empty() {
         if let Some(r) = recv {
             if let ExprNode::Const { path } = &*r.node {
-                if path.len() == 1 && path[0].as_str() == "Time" {
+                // Bare `Time` and rooted `::Time`. `Foo::Time.now` keeps its own method.
+                if path.last().is_some_and(|s| s.as_str() == "Time")
+                    && path.iter().rev().skip(1).all(|s| s.as_str().is_empty())
+                {
                     return "datetime.datetime.now(datetime.timezone.utc)".to_string();
                 }
             }
         }
     }
     // `<time>.utc` → no-op: the `Time.now` mapping is already UTC-aware.
+    // The class-method clock `Time.utc` was handled above.
     if method == "utc" && args.is_empty() {
         if let Some(r) = recv {
             return emit_expr(r);
         }
     }
-    // `<time>.iso8601` → `.isoformat()` (ISO-8601 timestamp string).
-    if method == "iso8601" && args.is_empty() {
+    // Zero-arg `iso8601` on a time is `to_rfc3339` after `time_calendar`.
+    // An application method of that name keeps normal dispatch.
+    if method == "to_rfc3339" && args.is_empty() {
         if let Some(r) = recv {
-            return format!("{}.isoformat()", emit_expr(r));
+            if crate::lower::time_calendar::is_time_rfc3339_receiver(r) {
+                return format!("{}.isoformat()", emit_expr(r));
+            }
         }
     }
     // Ruby's binary operators ride the Send channel (`a == b` is
@@ -1653,9 +1672,38 @@ pub(super) fn emit_literal(lit: &Literal) -> String {
 }
 
 fn python_regex_flag_expr(flags: &str) -> String {
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
     let mut parts: Vec<&str> = Vec::new();
-    if flags.contains('i') { parts.push("re.IGNORECASE"); }
-    if flags.contains('m') { parts.push("re.MULTILINE"); }
-    if flags.contains('x') { parts.push("re.VERBOSE"); }
+    if bits.ignore_case {
+        parts.push("re.IGNORECASE");
+    }
+    // Ruby's `m` → `re.DOTALL`; Ruby's always-on line anchors → `re.MULTILINE`.
+    if bits.dot_matches_newline {
+        parts.push("re.DOTALL");
+        parts.push("re.MULTILINE");
+    }
+    if bits.extended {
+        parts.push("re.VERBOSE");
+    }
     parts.join(" | ")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(python_regex_flag_expr("m"), "re.DOTALL | re.MULTILINE");
+    }
+
+    use super::python_regex_flag_expr;
+
+    #[test]
+    fn ignore_case_maps_to_re_ignorecase() {
+        assert_eq!(python_regex_flag_expr("i"), "re.IGNORECASE");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine() {
+        assert_eq!(python_regex_flag_expr("im"), "re.IGNORECASE | re.DOTALL | re.MULTILINE");
+    }
 }

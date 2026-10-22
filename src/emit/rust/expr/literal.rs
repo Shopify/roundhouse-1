@@ -114,6 +114,12 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
                         v_raw.clone()
                     };
                     format!("{bare}.clone()")
+                } else if matches!(v_ty, crate::ty::Ty::Str | crate::ty::Ty::Sym)
+                    && matches!(&*v.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                    && !str_color_handled
+                {
+                    // The key's spelling, for the same reason: a literal is `&str`, the slot an owned String
+                    format!("{v_raw}.to_string()")
                 } else {
                     coerce_arg_for_param_ty(v, v_ty)
                 }
@@ -243,6 +249,48 @@ pub(super) fn attach_block(base: &str, block: &Expr) -> String {
     }
 }
 
+/// `is_a?` on a column whose Rust type is already that class. A
+/// `serde_json` predicate does not exist on `Option<i64>` / `String`,
+/// and `false` would reject every numeric value.
+fn static_is_a(recv: &Expr, recv_s: &str, class_name: &str) -> Option<String> {
+    use crate::ty::Ty;
+    let ty = match &*recv.node {
+        ExprNode::Ivar { name } => super::ivar_field_ty(name.as_str())?,
+        _ => recv.ty.clone()?,
+    };
+    let optional = super::util::is_option_ty(&ty);
+    let peeled = super::util::peel_nil(&ty);
+    let present = if optional { format!("{recv_s}.is_some()") } else { "true".to_string() };
+    let answer = match (peeled, class_name) {
+        (Ty::Int, "Integer" | "Numeric") => Some(present),
+        (Ty::Int, "Float" | "String") => Some("false".to_string()),
+        (Ty::Float, "Numeric" | "Float") => Some(present),
+        // `2.0.is_a?(Integer)` is false. `only_integer` uses this check.
+        (Ty::Float, "Integer" | "String") => Some("false".to_string()),
+        (Ty::Str | Ty::Sym, "String") => Some(present),
+        (Ty::Str | Ty::Sym, "Integer" | "Float" | "Numeric") => Some("false".to_string()),
+        _ => None,
+    }?;
+    Some(keep_receiver(recv, recv_s, answer))
+}
+
+/// A folded `true` / `false` never mentions the receiver. An ivar or
+/// literal has no side effect to keep; a call does.
+fn keep_receiver(recv: &Expr, recv_s: &str, answer: String) -> String {
+    let pure = matches!(
+        &*recv.node,
+        ExprNode::Ivar { .. }
+            | ExprNode::Lit { .. }
+            | ExprNode::Var { .. }
+            | ExprNode::Const { .. }
+    );
+    if pure || answer.contains(recv_s) {
+        answer
+    } else {
+        format!("{{ let _ = {recv_s}; {answer} }}")
+    }
+}
+
 /// `recv.is_a?(Class)` → serde_json predicate where the class name
 /// maps to a Value variant, else `false` with a marker comment.
 pub(super) fn emit_is_a(recv: &Expr, class_arg: &Expr) -> String {
@@ -251,6 +299,9 @@ pub(super) fn emit_is_a(recv: &Expr, class_arg: &Expr) -> String {
         _ => return format!("/* is_a? unknown class: {} */ false", emit_expr(class_arg)),
     };
     let recv_s = emit_expr(recv);
+    if let Some(answer) = static_is_a(recv, &recv_s, &class_name) {
+        return answer;
+    }
     let predicate = match class_name.as_str() {
         "Hash" => Some("is_object"),
         "Array" => Some("is_array"),
@@ -418,6 +469,62 @@ pub(crate) fn emit_literal(lit: &Literal) -> String {
         }
         Literal::Str { value } => format!("{value:?}"),
         Literal::Sym { value } => format!("{:?}", value.as_str()),
-        Literal::Regex { pattern, .. } => format!("/* TODO rust2: Regex({pattern:?}) */"),
+        Literal::Regex { pattern, flags } => {
+            // Ruby's `m` is Rust `s` (dot-all); Ruby's `^`/`$` are always
+            // line anchors, so flagged `m` also needs Rust `m`.
+            let source = crate::emit::shared::regex_literal::re2_style_regex_source(pattern, flags);
+            format!("regex::Regex::new({source:?}).unwrap()")
+        }
+    }
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(emit_literal(&regex("^b.c$", "m")), r#"regex::Regex::new("(?sm)^b.c$").unwrap()"#);
+    }
+
+    use super::emit_literal;
+    use crate::expr::Literal;
+
+    fn regex(pattern: &str, flags: &str) -> Literal {
+        Literal::Regex { pattern: pattern.to_string(), flags: flags.to_string() }
+    }
+
+    #[test]
+    fn empty_flags_render_a_bare_pattern_not_an_invalid_group() {
+        // `regex::Regex::new("(?)…")` is a parse error — empty flags
+        // must not grow an empty `(?...)` prefix.
+        assert_eq!(
+            emit_literal(&regex("a.b", "")),
+            r#"regex::Regex::new("a.b").unwrap()"#
+        );
+    }
+
+    #[test]
+    fn ignore_case_passes_through_as_rust_i() {
+        assert_eq!(
+            emit_literal(&regex("a.b", "i")),
+            r#"regex::Regex::new("(?i)a.b").unwrap()"#
+        );
+    }
+
+    #[test]
+    fn rubys_m_maps_to_rusts_s_and_m() {
+        // Ruby's `m` is Rust `s` (dot-all). Ruby's `^`/`$` are always
+        // line anchors, so flagged `m` also needs Rust `m`.
+        assert_eq!(
+            emit_literal(&regex("a.b", "m")),
+            r#"regex::Regex::new("(?sm)a.b").unwrap()"#
+        );
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine() {
+        assert_eq!(
+            emit_literal(&regex("a.b", "im")),
+            r#"regex::Regex::new("(?ism)a.b").unwrap()"#
+        );
     }
 }

@@ -949,6 +949,9 @@ fn emit_dispatch_file(app: &App) -> EmittedFile {
     s.push_str("\tif strings.HasSuffix(r.URL.Path, \".json\") {\n");
     s.push_str("\t\trequestFormat = \"json\"\n");
     s.push_str("\t}\n");
+    // Read by format-dispatched actions only; an app without one still
+    // has to compile (Go rejects a declared-and-unused local).
+    s.push_str("\t_ = requestFormat\n");
     // Reset content_for / yield slot store at dispatch entry. The
     // slots are a module-singleton package-var map in Go; Rails
     // resets them per request via ActionView's slot lifecycle. The

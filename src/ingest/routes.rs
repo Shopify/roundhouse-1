@@ -45,6 +45,7 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+use crate::ingest::prism_api::PrismLocation;
 /// Source-backed Rails engines that the whole-app walker can identify
 /// without booting Rails. Keys are exact fully-qualified engine constants
 /// (`Catalog::Engine`); `namespace` is the explicit literal
@@ -446,8 +447,9 @@ fn refused_route_diagnostics(entries: &[RouteSpec], source: &[u8], file: &str) -
             "route constraint",
             format!(
                 "{verb} {} is not dispatched: `{param}:` requirement `{rx}` is outside the \
-                 router's segment-pattern subset (no lookahead, backreference, alternation, \
-                 anchors, or backtracking); its URL helper is still generated",
+                 router's segment-pattern subset (no lookahead, backreference, anchors, \
+                 unbounded repetition of an alternation, or a repeat that would backtrack); \
+                 its URL helper is still generated",
                 route.path
             ),
         ));
@@ -729,7 +731,7 @@ fn diagnose_engine_helper_uses(
     let helper_sources = cx.helper_sources.get_or_init(|| (cx.load_helper_sources)());
     for source in helper_sources {
         let engine_origin = source.engine_class.as_deref() == Some(engine_class);
-        let parsed = ruby_prism::parse(&source.source);
+        let parsed = super::prism::parse_silent(&source.source);
         let mut finder = HelperUseFinder {
             engine_helpers: &engine_helpers,
             mounted_helpers: &mounted_helpers,
@@ -1429,14 +1431,29 @@ fn ingest_route_stmts<'pr>(
                         // A lambda/object arg (`constraints(SomeGuard.new)`)
                         // yields no hash here, so it changes nothing — that
                         // request-based shape stays unenforced, as before.
+                        // Non-literal / modified regex values refuse via
+                        // the shared reader (same fail-closed policy as
+                        // the `constraints:` kwarg on a route/resource).
+                        // Survey recovery matches the per-entry path below:
+                        // record the gap, drop THIS block's children, keep
+                        // sibling routes outside the block.
                         if method == "constraints" {
-                            let block_constraints = call
-                                .arguments()
-                                .map(|args| block_constraints_hash(&args))
-                                .unwrap_or_default();
-                            merge_outer_constraints(&mut inner, &block_constraints);
+                            match call.arguments() {
+                                None => entries.extend(inner),
+                                Some(args) => match block_constraints_hash(&args, file) {
+                                    Ok(block_constraints) => {
+                                        merge_outer_constraints(&mut inner, &block_constraints);
+                                        entries.extend(inner);
+                                    }
+                                    Err(err) if super::survey::is_active() => {
+                                        super::survey::record(&err);
+                                    }
+                                    Err(err) => return Err(err),
+                                },
+                            }
+                        } else {
+                            entries.extend(inner);
                         }
-                        entries.extend(inner);
                     }
                 }
             }
@@ -1777,15 +1794,60 @@ fn merge_outer_constraints(entries: &mut [RouteSpec], outer: &IndexMap<Symbol, S
     }
 }
 
+/// Param→regex-source map from a `constraints:` / `constraints(...)`
+/// hash's assoc elements. Fail-closed: a value that isn't a literal
+/// regex, or a literal carrying `/i`/`/x`/`/m` (which `regex_source`
+/// cannot express), is `Unsupported` rather than silently omitted or
+/// stripped (#857/#1087). Shared by the explicit-route kwarg, the
+/// `resources`/`resource` kwarg, and the block-form reader below.
+fn read_param_regex_constraints<'a>(
+    elements: impl IntoIterator<Item = Node<'a>>,
+    file: &str,
+    context: &str,
+) -> IngestResult<IndexMap<Symbol, String>> {
+    let mut out = IndexMap::new();
+    for el in elements {
+        let Some(a) = el.as_assoc_node() else { continue };
+        let Some(param) = symbol_value(&a.key()) else { continue };
+        let constraint_value = a.value();
+        match regex_source(&constraint_value) {
+            Some(_) if regex_has_unsupported_modifiers(&constraint_value) => {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!(
+                        "{context} constraints: {param}: regex modifiers (/i, /x, /m) are not carried into the lowered constraint"
+                    ),
+                });
+            }
+            Some(src) => {
+                out.insert(Symbol::from(param.as_str()), src);
+            }
+            None => {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!(
+                        "{context} constraints: {param} is not a literal regex"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The param→regex-source map from a `constraints(...)` call's own
 /// arguments — the block-level counterpart of the route-level
-/// `constraints:` kwarg hash parsed in `ingest_explicit_route`. Accepts
-/// both the bare-kwargs spelling (`constraints(slug: /.../)`, an
-/// implicit keyword hash) and an explicit Hash literal
-/// (`constraints({slug: /.../})`). A non-hash arg — the request-based
-/// `constraints(SomeGuard.new)` shape — yields an empty map, which is
-/// exactly "change nothing": that shape stays unenforced, as before.
-fn block_constraints_hash(args: &ruby_prism::ArgumentsNode<'_>) -> IndexMap<Symbol, String> {
+/// `constraints:` kwarg hash. Accepts both the bare-kwargs spelling
+/// (`constraints(slug: /.../)`, an implicit keyword hash) and an
+/// explicit Hash literal (`constraints({slug: /.../})`). A non-hash
+/// arg — the request-based `constraints(SomeGuard.new)` shape — yields
+/// an empty map, which is exactly "change nothing": that shape stays
+/// unenforced, as before (#727). Hash entries ride the shared
+/// fail-closed reader.
+fn block_constraints_hash(
+    args: &ruby_prism::ArgumentsNode<'_>,
+    file: &str,
+) -> IngestResult<IndexMap<Symbol, String>> {
     let mut out = IndexMap::new();
     for arg in args.arguments().iter() {
         let elements: Vec<Node<'_>> = if let Some(kh) = arg.as_keyword_hash_node() {
@@ -1795,15 +1857,13 @@ fn block_constraints_hash(args: &ruby_prism::ArgumentsNode<'_>) -> IndexMap<Symb
         } else {
             continue;
         };
-        for el in elements {
-            let Some(assoc) = el.as_assoc_node() else { continue };
-            let Some(param) = symbol_value(&assoc.key()) else { continue };
-            if let Some(src) = regex_source(&assoc.value()) {
-                out.insert(Symbol::from(param.as_str()), src);
-            }
-        }
+        out.extend(read_param_regex_constraints(
+            elements,
+            file,
+            "constraints block",
+        )?);
     }
-    out
+    Ok(out)
 }
 
 /// The `Unsupported` error for a route-body statement that is not a
@@ -2077,7 +2137,7 @@ fn redirect_literal(node: &Node<'_>) -> Option<(String, u16, bool)> {
         return None;
     }
     if let Some(block) = call.block().and_then(|block| block.as_block_node()) {
-        let (location, status) = redirect_block(block, redirect_status_from_call(&call))?;
+        let (location, status) = redirect_block(block, redirect_status_from_call(&call)?)?;
         return Some((location, status, false));
     }
     let Some(arguments) = call.arguments() else { return None };
@@ -2094,14 +2154,7 @@ fn redirect_literal(node: &Node<'_>) -> Option<(String, u16, bool)> {
             let Some(assoc) = element.as_assoc_node() else { continue };
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             match key.as_str() {
-                "status" => {
-                    let value = assoc.value();
-                    let code = value
-                        .as_integer_node()
-                        .and_then(|i| super::util::integer_i64(&i.value()))
-                        .and_then(|i| u16::try_from(i).ok())?;
-                    status = code;
-                }
+                "status" => status = redirect_status_code(&assoc.value())?,
                 // `redirect(path: "/login")` is Rails' options form of a
                 // path-only redirect: the same location a positional
                 // string carries, without host, protocol, or query.
@@ -2153,54 +2206,110 @@ fn redirect_block(block: ruby_prism::BlockNode<'_>, status: u16) -> Option<(Stri
     Some((format!("\u{0}{rendered}"), status))
 }
 
-fn redirect_status_from_call(call: &ruby_prism::CallNode<'_>) -> u16 {
-    let Some(arguments) = call.arguments() else { return 301 };
+/// `status:` on `redirect`. An integer is the code. A symbol is read
+/// from the runtime status table, and kept only when
+/// `redirect_status_symbol` would emit that same name. Every other
+/// code is emitted as `:moved_permanently`, so accepting it here would
+/// serve the route at the wrong status. A string or an unknown symbol
+/// is not a redirect this can serve.
+fn redirect_status_code(node: &Node<'_>) -> Option<u16> {
+    let code = if let Some(code) = node
+        .as_integer_node()
+        .and_then(|i| super::util::integer_i64(&i.value()))
+        .and_then(|i| u16::try_from(i).ok())
+    {
+        code
+    } else {
+        crate::lower::status_literal::status_sym_code(&symbol_value(node)?)?
+    };
+    // `redirect_status_symbol` maps every other code to
+    // `:moved_permanently`. Accepting 200 or 418 here would serve 301.
+    matches!(code, 300 | 301 | 302 | 303 | 304 | 307 | 308).then_some(code)
+}
+
+fn redirect_status_from_call(call: &ruby_prism::CallNode<'_>) -> Option<u16> {
+    let Some(arguments) = call.arguments() else { return Some(301) };
     for argument in arguments.arguments().iter() {
         let Some(hash) = argument.as_keyword_hash_node() else { continue };
         for element in hash.elements().iter() {
             let Some(assoc) = element.as_assoc_node() else { continue };
             let Some(key) = symbol_value(&assoc.key()) else { continue };
-            if key.as_str() != "status" {
-                continue;
-            }
-            if let Some(code) = assoc
-                .value()
-                .as_integer_node()
-                .and_then(|i| super::util::integer_i64(&i.value()))
-                .and_then(|i| u16::try_from(i).ok())
-            {
-                return code;
+            if key.as_str() == "status" {
+                return redirect_status_code(&assoc.value());
             }
         }
     }
-    301
+    Some(301)
 }
 
 fn redirect_expression_is_string(expr: &crate::expr::Expr) -> bool {
+    redirect_expression_is_string_in(expr, &mut HashSet::new())
+}
+
+/// A redirect block's value is a string. Locals count once this block
+/// has assigned them a string (`base = "/widgets/#{params[:id]}"`, then
+/// `query.empty? ? base : "#{base}?#{query}"`). Each branch of an `if`
+/// sees the assignments from before it, not from the other branch. A
+/// name both branches assign a string is visible after the `if`.
+fn redirect_expression_is_string_in(
+    expr: &crate::expr::Expr,
+    strings: &mut HashSet<Symbol>,
+) -> bool {
+    use crate::expr::{ExprNode, LValue, Literal};
     match &*expr.node {
-        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Str { .. } } => true,
-        crate::expr::ExprNode::StringInterp { .. } => true,
-        crate::expr::ExprNode::If { then_branch, else_branch, .. } => {
-            redirect_expression_is_string(then_branch) && redirect_expression_is_string(else_branch)
+        ExprNode::Lit { value: Literal::Str { .. } } => true,
+        ExprNode::StringInterp { .. } => true,
+        ExprNode::Var { name, .. } => strings.contains(name),
+        ExprNode::If { then_branch, else_branch, .. } => {
+            let mut then_strings = strings.clone();
+            let mut else_strings = strings.clone();
+            let then_ok = redirect_expression_is_string_in(then_branch, &mut then_strings);
+            let else_ok = redirect_expression_is_string_in(else_branch, &mut else_strings);
+            // A name both branches still treat as a string is a string
+            // after the `if`. A name written on only one side stays local
+            // to that side.
+            strings.clear();
+            strings.extend(then_strings.intersection(&else_strings).cloned());
+            then_ok && else_ok
         }
-        crate::expr::ExprNode::Send { method, recv, args, .. } => {
-            // `present?` is rewritten to `!(...).strip.empty?` before this
-            // check. The result is a string when that call's argument is.
-            if method.as_str() == "!" {
-                return args.iter().any(redirect_expression_is_string);
+        ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+            let ok = redirect_expression_is_string_in(value, strings);
+            if ok {
+                strings.insert(name.clone());
+            } else {
+                strings.remove(name);
             }
-            if matches!(method.as_str(), "strip" | "empty?") {
-                return recv.as_ref().is_some_and(redirect_expression_is_string)
-                    || args.iter().any(redirect_expression_is_string);
-            }
-            matches!(
-                method.as_str(),
-                "query_string" | "path" | "fullpath" | "to_s" | "+" | "[]" | "present?"
-            )
+            ok
         }
-        crate::expr::ExprNode::Seq { exprs } => exprs
-            .last()
-            .is_some_and(redirect_expression_is_string),
+        ExprNode::Send { method, recv, args, .. } => {
+            // `strip` returns a string. `empty?`, `present?`, and `!`
+            // return booleans (`present?` lowers to `!(...).strip.empty?`),
+            // so a redirect whose value is that predicate stays unsupported.
+            if matches!(method.as_str(), "!" | "empty?" | "present?") {
+                for arg in args {
+                    redirect_expression_is_string_in(arg, strings);
+                }
+                if let Some(recv) = recv {
+                    redirect_expression_is_string_in(recv, strings);
+                }
+                return false;
+            }
+            if method.as_str() == "strip" {
+                let recv_ok = recv.as_ref().is_some_and(|recv| redirect_expression_is_string_in(recv, strings));
+                for arg in args {
+                    redirect_expression_is_string_in(arg, strings);
+                }
+                return recv_ok;
+            }
+            matches!(method.as_str(), "query_string" | "path" | "fullpath" | "to_s" | "+" | "[]")
+        }
+        ExprNode::Seq { exprs } => {
+            let mut last = false;
+            for expr in exprs {
+                last = redirect_expression_is_string_in(expr, strings);
+            }
+            last
+        }
         _ => false,
     }
 }
@@ -2971,7 +3080,7 @@ mod eval {
             return Some(RVal::Str(String::from_utf8_lossy(s.unescaped()).into_owned()));
         }
         if let Some(s) = node.as_symbol_node() {
-            let loc = s.value_loc()?;
+            let loc = s.content_loc();
             return Some(RVal::Sym(String::from_utf8_lossy(loc.as_slice()).into_owned()));
         }
         if node.as_nil_node().is_some() {
@@ -3313,6 +3422,19 @@ fn regex_source(node: &Node<'_>) -> Option<String> {
     Some(String::from_utf8_lossy(r.content_loc().as_slice()).into_owned())
 }
 
+/// `true` when a `constraints:` regex literal carries a modifier
+/// (`/i`, `/x`, `/m`) that `regex_source`'s raw-source text can't
+/// express on its own. Rails applies the modifier when it matches a
+/// request; the segment-pattern compiler `lower::routes` hands the
+/// source to (`compile_seg_patterns`) only ever matches
+/// case-sensitively, so lowering `/[a-z]+/i`'s source without the
+/// modifier would silently accept a different set of paths than Rails
+/// does (#857/#1087). Full modifier support is a follow-up.
+fn regex_has_unsupported_modifiers(node: &Node<'_>) -> bool {
+    node.as_regular_expression_node()
+        .is_some_and(|r| r.is_ignore_case() || r.is_extended() || r.is_multi_line())
+}
+
 fn ingest_explicit_route(
     call: &ruby_prism::CallNode<'_>,
     method: HttpMethod,
@@ -3333,6 +3455,7 @@ fn ingest_explicit_route(
     let mut as_name: Option<Symbol> = None;
     let mut action_kwarg: Option<String> = None;
     let mut controller_kwarg: Option<String> = None;
+    let mut defaults_format: Option<String> = None;
     // The INLINE spelling of `member do … end` / `collection do … end`.
     // Rails accepts both, and campfire writes `delete :clear, on:
     // :collection`; only the block form was recognized, so the route was
@@ -3450,23 +3573,32 @@ fn ingest_explicit_route(
                     // `expand_match_via` once the entry is built. Other
                     // string-value options become routing constraints.
                     "via" => {}
-                    // `constraints: { id: /\d+/, tag: /[^,.\/]+/ }` —
-                    // per-param regex restrictions. Capture each param's
-                    // regex SOURCE (raw text between the delimiters, so
-                    // `\/` etc. survive back into a Ruby literal) keyed
-                    // by param name. digit-class regexes drive the runtime
-                    // router's Integer matcher; the rest let the roda
-                    // converter disambiguate two routes that share a
-                    // path+verb and differ only by the constraint (#67).
-                    "constraints" => {
-                        if let Some(h) = value.as_hash_node() {
-                            for el in h.elements().iter() {
-                                let Some(a) = el.as_assoc_node() else { continue };
-                                let Some(param) = symbol_value(&a.key()) else { continue };
-                                if let Some(src) = regex_source(&a.value()) {
-                                    constraints.insert(Symbol::from(param.as_str()), src);
+                    "defaults" => {
+                        if let Some(defaults) = value.as_hash_node() {
+                            for entry in defaults.elements().iter() {
+                                if let Some(pair) = entry.as_assoc_node()
+                                    && symbol_value(&pair.key()).as_deref() == Some("format")
+                                {
+                                    defaults_format = rname(&pair.value());
                                 }
                             }
+                        }
+                    }
+                    // `constraints: { id: /\d+/, tag: /[^,.\/]+/ }` —
+                    // per-param regex restrictions (#67). Shared
+                    // fail-closed reader with `resources`/`resource`
+                    // and the `constraints(...) do` block form (#1087).
+                    "constraints" => {
+                        if let Some(h) = value.as_hash_node() {
+                            let ctx = format!(
+                                "route {:?}",
+                                path.as_deref().unwrap_or("?")
+                            );
+                            constraints.extend(read_param_regex_constraints(
+                                h.elements().iter(),
+                                file,
+                                &ctx,
+                            )?);
                         }
                     }
                     other => {
@@ -3495,6 +3627,10 @@ fn ingest_explicit_route(
         controller_kwarg = cx.scope_controller.borrow().clone();
     }
 
+    if let Some(format) = defaults_format {
+        constraints.insert(Symbol::from("format"), format);
+    }
+
     if let Some((location, status, keep_query)) = redirect_target {
         // Served by a synthesized action rather than dropped: the app
         // gets the 301 it asked for, and no emitter learns a new route
@@ -3511,8 +3647,10 @@ fn ingest_explicit_route(
             controller: ClassId(Symbol::from(REDIRECT_CONTROLLER)),
             action,
             as_name,
-            constraints: IndexMap::new(),
-            scope: ResourceScope::default(),
+            constraints,
+            // `on: :member` / `on: :collection` still decide the path.
+            // Nested is the default a bare verb inside `resources` gets.
+            scope: on_scope.unwrap_or(ResourceScope::Nested),
         }));
     }
     if let Some(kind) = to_is_unsupported {
@@ -3806,6 +3944,13 @@ fn ingest_resources_route(
     let mut path: Option<String> = None;
     let mut concern_names: Vec<String> = Vec::new();
     let mut only_none = false;
+    // `constraints: { id: /.../ }` — read the same way
+    // `ingest_explicit_route` reads it (#857), so a member/nested route
+    // this resource generates carries the same per-param regex Rails
+    // applies to every route with that segment. Merged into `nested`
+    // and into this node's own `constraints` field below, once the
+    // block body has been ingested.
+    let mut constraints: IndexMap<Symbol, String> = IndexMap::new();
     for arg in iter {
         let Some(kh) = arg.as_keyword_hash_node() else { continue };
         for el in kh.elements().iter() {
@@ -3913,6 +4058,19 @@ fn ingest_resources_route(
                         None => rname(&value).into_iter().collect(),
                     };
                 }
+                // `constraints: { id: /[A-Z]{2}\d+/ }` — per-param regex
+                // restriction (#857). Shared fail-closed reader with
+                // the explicit-route kwarg and the block form (#1087).
+                "constraints" => {
+                    if let Some(h) = value.as_hash_node() {
+                        let ctx = format!("resources :{name_str}");
+                        constraints.extend(read_param_regex_constraints(
+                            h.elements().iter(),
+                            file,
+                            &ctx,
+                        )?);
+                    }
+                }
                 // `shallow:` lands when a fixture demands it.
                 _ => {}
             }
@@ -3938,6 +4096,14 @@ fn ingest_resources_route(
             run_concerns(&concern_names, &none, file, Some(name_str.as_str()), cx)
         })?);
     }
+    // Push the inline `constraints:` kwarg down into every `member do`/
+    // `collection do` route and nested resource this call's block
+    // flattens to — the same merge an enclosing `constraints(...) do
+    // … end` block already runs on ITS `nested` (merge_outer_constraints
+    // above). Without this, `resources :x, constraints: { id: /.../ }
+    // do member { ... } end` reads the option (above) but never reaches
+    // the member route it was meant to narrow (#857).
+    merge_outer_constraints(&mut nested, &constraints);
 
     Ok(RouteSpec::Resources {
         name,
@@ -3949,7 +4115,7 @@ fn ingest_resources_route(
         controller,
         param,
         path,
-        constraints: IndexMap::new(),
+        constraints,
     })
 }
 

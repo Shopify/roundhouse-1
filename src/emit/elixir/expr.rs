@@ -455,7 +455,7 @@ fn implicit_record_send(e: &Expr) -> bool {
 /// Safe-by-construction: every `io` reference flows through one of the
 /// three tagged sites, so nothing else observes its iolist shape.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -489,7 +489,7 @@ fn try_string_builder(e: &Expr) -> Option<String> {
 /// `if` branch thread `io` through `Enum.reduce` / `io = if … end`
 /// rather than emit a dead, unused-variable rebind.
 fn string_builder_append_local(e: &Expr) -> Option<&str> {
-    if e.hint != Some(IrHint::StringBuilderAppend) {
+    if e.hint() != &Some(IrHint::StringBuilderAppend) {
         return None;
     }
     match &*e.node {
@@ -744,10 +744,21 @@ pub(super) fn emit_expr(e: &Expr) -> String {
         // A bare module-state `@ivar` read → the whole process-dictionary
         // store. (Element/method access is intercepted in `emit_send`.)
         ExprNode::Ivar { name } => ivar_pd_get_typed(name.as_str(), e.ty.as_ref()),
-        ExprNode::Send { recv, method, args, block, .. } => match block {
-            Some(blk) => emit_block_call(recv.as_ref(), method.as_str(), args, blk),
-            None => emit_send(recv.as_ref(), method.as_str(), args),
-        },
+        ExprNode::Send { recv, method, args, block, .. } => {
+            if e.decisions & crate::expr::GROUNDED_TIME_FORMAT != 0
+                && method.as_str() == "to_rfc3339"
+                && args.is_empty()
+                && block.is_none()
+            {
+                if let Some(r) = recv {
+                    return format!("DateTime.to_iso8601({})", emit_expr(r));
+                }
+            }
+            match block {
+                Some(blk) => emit_block_call(recv.as_ref(), method.as_str(), args, blk),
+                None => emit_send(recv.as_ref(), method.as_str(), args),
+            }
+        }
         ExprNode::Return { value } => emit_expr(value),
         // `next` inside a fold yields the accumulator unchanged (`next v`
         // yields `v`). Outside a fold there's no accumulator to yield —
@@ -1322,10 +1333,13 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
     // idiom `Time.now.utc.iso8601` maps to
     // `DateTime.to_iso8601(DateTime.utc_now())`: `.utc` is the identity
     // (already UTC) and `.iso8601` wraps in `DateTime.to_iso8601`.
-    if method == "now" && args.is_empty() {
+    if matches!(method, "now" | "utc") && args.is_empty() {
         if let Some(r) = recv {
             if let ExprNode::Const { path } = &*r.node {
-                if path.last().map(|s| s.as_str()) == Some("Time") {
+                // Bare `Time` and rooted `::Time`. `Foo::Time.now` keeps its own method.
+                if path.last().map(|s| s.as_str()) == Some("Time")
+                    && path.iter().rev().skip(1).all(|s| s.as_str().is_empty())
+                {
                     return "DateTime.utc_now()".to_string();
                 }
             }
@@ -1336,9 +1350,13 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
             return emit_expr(r);
         }
     }
-    if method == "iso8601" && args.is_empty() {
+    // Zero-arg `iso8601` on a time is `to_rfc3339` after `time_calendar`.
+    // An application method of that name keeps normal dispatch.
+    if method == "to_rfc3339" && args.is_empty() {
         if let Some(r) = recv {
-            return format!("DateTime.to_iso8601({})", emit_expr(r));
+            if crate::lower::time_calendar::is_time_rfc3339_receiver(r) {
+                return format!("DateTime.to_iso8601({})", emit_expr(r));
+            }
         }
     }
 
@@ -2405,7 +2423,7 @@ mod tests {
             block: None,
             parenthesized: false,
         });
-        append.hint = Some(IrHint::StringBuilderAppend);
+        append.set_hint(Some(IrHint::StringBuilderAppend));
         let e = block_send("articles", "each", &["a"], append);
         let out = emit_expr(&e);
         assert_eq!(
@@ -2430,7 +2448,7 @@ mod tests {
             block: None,
             parenthesized: false,
         });
-        append.hint = Some(IrHint::StringBuilderAppend);
+        append.set_hint(Some(IrHint::StringBuilderAppend));
         let if_stmt = Expr::new(crate::span::Span::synthetic(), ExprNode::If {
             cond: var_t("cond", Ty::Bool),
             then_branch: append,
@@ -3096,10 +3114,9 @@ mod tests {
 
     #[test]
     fn time_now_utc_iso8601_maps_to_datetime() {
-        // Time.now.utc.iso8601 → DateTime.to_iso8601(DateTime.utc_now())
-        let now = call(const_path("Time"), "now", vec![]);
-        let utc = call(now, "utc", vec![]);
-        let iso = call(utc, "iso8601", vec![]);
+        // Lowered `Time.utc.to_rfc3339` → DateTime.to_iso8601(DateTime.utc_now())
+        let utc = call(const_path("Time"), "utc", vec![]);
+        let iso = call(utc, "to_rfc3339", vec![]);
         assert_eq!(emit_expr(&iso), "DateTime.to_iso8601(DateTime.utc_now())");
     }
 
@@ -3410,21 +3427,37 @@ fn emit_str_literal(value: &str) -> String {
 }
 
 /// Ruby `/pat/flags` → Elixir `~r/pat/flags`. `pattern` is the regex
-/// source text (backslash escapes preserved). Ruby's `m` flag (dotall)
-/// maps to Elixir's `s`; `i`/`x` carry over.
+/// source text (backslash escapes preserved). Ruby's `m` (dotall) is
+/// Elixir/Oniguruma `s`; Ruby's always-on line anchors need Elixir
+/// `m` as well, so a flagged Ruby `m` becomes `sm`. `i`/`x` carry over.
 fn emit_regex(pattern: &str, flags: &str) -> String {
     // Escape-aware: a source `\/` must not become `\\/`.
     let escaped = crate::emit::shared::regex_literal::escape_regex_delimiters(pattern);
-    let ex_flags: String = flags
-        .chars()
-        .filter_map(|f| match f {
-            'i' => Some('i'),
-            'm' => Some('s'),
-            'x' => Some('x'),
-            _ => None,
-        })
-        .collect();
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
+    let mut ex_flags = String::new();
+    if bits.ignore_case {
+        ex_flags.push('i');
+    }
+    if bits.dot_matches_newline {
+        ex_flags.push('s');
+        ex_flags.push('m');
+    }
+    if bits.extended {
+        ex_flags.push('x');
+    }
     format!("~r/{escaped}/{ex_flags}")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    use super::emit_regex;
+
+    #[test]
+    fn rubys_m_maps_to_elixir_s_and_m() {
+        assert_eq!(emit_regex("^b.c$", "m"), "~r/^b.c$/sm");
+        assert_eq!(emit_regex("a.b", "im"), "~r/a.b/ism");
+        assert_eq!(emit_regex("a.b", "i"), "~r/a.b/i");
+    }
 }
 
 fn is_screaming_snake(s: &str) -> bool {

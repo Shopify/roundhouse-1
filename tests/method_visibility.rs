@@ -264,6 +264,31 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
     }
 }
 
+/// A model carries a marker naming a method its body does not define
+/// (generated, a superclass's or a gem's) for the lowering and the
+/// analyzer; a library class still refuses it.
+#[test]
+fn an_inherited_visibility_change_is_carried_by_a_model() {
+    for body in ["private :inherited", "private_class_method :inherited"] {
+        let source = format!("class Thing < ApplicationRecord\n{body}\nend");
+        let model = ingest_model(source.as_bytes(), "thing.rb", &Schema::default(), &Default::default())
+            .unwrap_or_else(|e| panic!("model refused {body}: {e:?}"))
+            .expect("a model");
+        assert!(
+            model.body.iter().any(|item| matches!(item,
+                roundhouse::dialect::ModelBodyItem::Unknown { expr, .. }
+                    if expr.decisions & roundhouse::expr::INHERITED_VISIBILITY != 0)),
+            "{body}"
+        );
+        assert!(ingest_library_class(source.as_bytes(), "thing.rb").is_err(), "library accepted {body}");
+    }
+    let nested = "class Thing < ApplicationRecord\nclass << self\n  private :inherited\nend\nend";
+    assert!(
+        ingest_model(nested.as_bytes(), "thing.rb", &Schema::default(), &Default::default()).is_err(),
+        "a marker in `class << self` has no statement to carry it"
+    );
+}
+
 #[test]
 fn dynamic_and_ambiguous_changes_stay_errors() {
     // A name without a local definition is an override instead

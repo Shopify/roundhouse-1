@@ -221,7 +221,21 @@ module ActiveRecord
   # record, and what the write was (0 create, 1 update, 2 destroy).
   # `Base.transaction` runs the held callbacks after its outermost
   # COMMIT and drops them on a ROLLBACK, restoring the record's
-  # persisted state as Rails' `rolledback!` does.
+  # persisted state as Rails' `rolledback!` does. Kind 3 is not a
+  # write yet: a `touch_later` the outermost transaction applies just
+  # before its COMMIT (`Base._flush_deferred_touches`), whose own touch
+  # then enlists as an update.
+  # Rails 7.2's `Model.current_transaction`: the open transaction, or
+  # none (Rails' NullTransaction), as far as `after_commit` is concerned.
+  # `after_commit` takes its work as a lambda, as ActiveJob's queue does:
+  # `lower::transaction_after_commit` turns the app's block into one, so
+  # the runtime types fully on every lane.
+  class Transaction
+    def after_commit(work)
+      ActiveRecord::Base._after_commit(work)
+    end
+  end
+
   class EnlistedRecord
     attr_reader :record, :kind
 
@@ -348,6 +362,18 @@ module ActiveRecord
 
   # `connection.raw_connection` — see `Connection#raw_connection`.
   class RawConnection
+    # ROLLBACK TO plus RELEASE. A SQLite error here means the transaction
+    # already ended; the caller's exception is the one that matters.
+    def self._rollback_savepoint(name)
+      begin
+        Db.exec("ROLLBACK TO SAVEPOINT #{name}")
+        Db.exec("RELEASE SAVEPOINT #{name}")
+      rescue StandardError
+        # SQLite may already have ended the transaction itself.
+      end
+      nil
+    end
+
     # SQLite3::Database#transaction: BEGIN in the given mode, the block,
     # COMMIT; ROLLBACK and re-raise on an exception.
     #
@@ -371,15 +397,14 @@ module ActiveRecord
       begin
         result = yield
       rescue Exception => e
-        begin
-          if nested
-            Db.exec("ROLLBACK TO SAVEPOINT #{name}")
-            Db.exec("RELEASE SAVEPOINT #{name}")
-          else
+        if nested
+          RawConnection._rollback_savepoint(name)
+        else
+          begin
             Db.exec("ROLLBACK")
+          rescue StandardError
+            # SQLite may have ended the transaction itself already.
           end
-        rescue StandardError
-          # SQLite may have ended the transaction itself already.
         end
         raise e
       end
@@ -420,17 +445,7 @@ module ActiveRecord
     # `Db.escape_string` already wraps in single quotes (sqlite literal
     # syntax with '' doubling).
     def quote(value)
-      if value.nil?
-        "NULL"
-      elsif value.is_a?(Integer) || value.is_a?(Float)
-        value.to_s
-      elsif value.is_a?(TrueClass)
-        "1"
-      elsif value.is_a?(FalseClass)
-        "0"
-      else
-        Db.escape_string(value.to_s)
-      end
+      Arel::Nodes.quote_scalar(value)
     end
 
     # Rails `quote_string`: escaped but UNquoted (callers embed it
@@ -554,6 +569,22 @@ module ActiveRecord
   # walked only into the ruby-family trees, and active_record.rb
   # requires it AFTER base.rb so the reopen sees the real class.
   class Base
+    # Ruby-family only, beside the other reopens here: strict targets have
+    # no `Type::Value`, no untyped `self[name]` and no relation `all`.
+    def read_attribute(name)
+      self[name]
+    end
+
+    def write_attribute(name, value)
+      self[name] = value
+    end
+
+    # Rails' `default_scoped`: `all`, which applies the model's
+    # `default_scope`.
+    def self.default_scoped
+      all
+    end
+
     # Keep public input intact until schema-selected normalization, then raise
     # the same RecordNotFound for an invalid key or an absent record.
     # Reject nil before a key-typed adapter can coerce it to a real
@@ -633,6 +664,9 @@ module ActiveRecord
       raise ArgumentError, "wrong number of arguments (given #{ids.length}, expected 0..1)" if ids.length > 1
       id = ids[0]
       return false if id.nil?
+      # Conditions, not a key (Rails' `exists?(name: "x")`): the Relation
+      # answers them, through the default scope when the model has one.
+      return all.exists?(id) if id.is_a?(Hash)
       return all.exists?(id) if _scoped_reads?
       _exists_primary_key_input(id)
     end
@@ -748,6 +782,51 @@ module ActiveRecord
       end
       records.each(&block) if block
       records
+    end
+
+    # Rails' `current_transaction`. One database, so every model's is the
+    # same; what `after_commit` asks of it is whether one is open.
+    def self.current_transaction
+      ActiveRecord::Transaction.new
+    end
+
+    # `current_transaction.after_commit { ... }`: run the work once the
+    # outermost transaction commits (`Base.transaction` runs what is held
+    # after the records' commit callbacks), drop it on a ROLLBACK, and
+    # run it at once when none is open, as Rails' NullTransaction does.
+    # Campfire's password change closes the user's live connections this
+    # way: a later save in the same transaction could undo the change an
+    # after_commit condition would read.
+    #
+    # A transaction that cannot be joined is no `current_transaction`
+    # either (Rails 7.2's `user_transaction` is NULL_TRANSACTION for it):
+    # a transactional test's own never commits, so work registered
+    # directly under it runs at once, as Rails runs it.
+    def self._after_commit(work)
+      depth = Db._txn_depth
+      if depth == 0 || !_txn_parent_joinable?(depth)
+        work.call
+      else
+        Db._txn_callbacks << work
+      end
+      nil
+    end
+
+    # The held work registered at and after `from`, run (a COMMIT) or
+    # dropped (a ROLLBACK).
+    def self._run_after_commits_from(from)
+      held = Db._txn_callbacks
+      return nil if held.length <= from
+      work = held[from, held.length - from]
+      held.pop while held.length > from
+      work.each { |w| w.call }
+      nil
+    end
+
+    def self._drop_after_commits_from(from)
+      held = Db._txn_callbacks
+      held.pop while held.length > from
+      nil
     end
 
     # Rails' `uncached { }`: the block's reads go to the database, not
@@ -883,6 +962,7 @@ module ActiveRecord
         # The writes a ROLLBACK TO this savepoint undoes are the ones
         # enlisted after this mark.
         mark = Db._txn_records.length
+        after_mark = Db._txn_callbacks.length
         new_depth = depth + 1
         Db._txn_depth = new_depth
         if open_savepoint
@@ -894,6 +974,10 @@ module ActiveRecord
         begin
           begin
             result = yield
+            # Where this savepoint runs its writes' commit callbacks (an
+            # unjoinable parent: a transactional test's), it is where
+            # their deferred touches land too, before the RELEASE.
+            ActiveRecord::Base._flush_deferred_touches_from(mark) if run_callbacks
             Db.exec("RELEASE SAVEPOINT #{savepoint}") unless savepoint.nil?
             finished = true
             result
@@ -902,27 +986,17 @@ module ActiveRecord
             # outer transaction carries on and commits.
             Db._txn_depth = depth
             unless savepoint.nil?
-              begin
-                Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
-                Db.exec("RELEASE SAVEPOINT #{savepoint}")
-              rescue StandardError
-                # SQLite may already have ended the whole transaction; the
-                # Rollback still answers nil, as the outer ROLLBACK's does.
-              end
+              RawConnection._rollback_savepoint(savepoint)
               ActiveRecord::Base._rollback_enlisted(mark)
+              ActiveRecord::Base._drop_after_commits_from(after_mark)
             end
             result = nil
           rescue Exception => e
             Db._txn_depth = depth
             unless savepoint.nil?
-              begin
-                Db.exec("ROLLBACK TO SAVEPOINT #{savepoint}")
-                Db.exec("RELEASE SAVEPOINT #{savepoint}")
-              rescue StandardError
-                # SQLite may already have ended the whole transaction (see
-                # the outer ROLLBACK below); that must not hide `e`.
-              end
+              RawConnection._rollback_savepoint(savepoint)
               ActiveRecord::Base._rollback_enlisted(mark)
+              ActiveRecord::Base._drop_after_commits_from(after_mark)
             end
             raise e
           end
@@ -933,6 +1007,7 @@ module ActiveRecord
           # re-raises; `finished` is false on that path anyway.
           if finished && run_callbacks
             ActiveRecord::Base._commit_enlisted_from(mark)
+            ActiveRecord::Base._run_after_commits_from(after_mark)
           end
         end
       elsif Db.transaction_open?
@@ -956,12 +1031,18 @@ module ActiveRecord
         begin
           begin
             result = yield
+            # Rails' `before_committed!`: the touches deferred by
+            # `touch_later` are written now, while the transaction is
+            # still open, so a failed one rolls the whole write back.
+            ActiveRecord::Base._flush_deferred_touches
+            result
           rescue ActiveRecord::Rollback
             # Rails' quiet way out: roll back, raise nothing, answer nil.
             rolled_back = true
             Db._txn_depth = 0
             Db.exec("ROLLBACK")
             ActiveRecord::Base._rollback_enlisted(0)
+            ActiveRecord::Base._drop_after_commits_from(0)
             ActiveRecord::TransactionHooks.rolled_back
             result = nil
           rescue Exception => e
@@ -976,6 +1057,7 @@ module ActiveRecord
               # ROLLBACK's own failure must not hide the real error below.
             end
             ActiveRecord::Base._rollback_enlisted(0)
+            ActiveRecord::Base._drop_after_commits_from(0)
             ActiveRecord::TransactionHooks.rolled_back
             raise e
           end
@@ -996,11 +1078,20 @@ module ActiveRecord
                 # Already ended; the COMMIT's error is the one to raise.
               end
               ActiveRecord::Base._rollback_enlisted(0)
+              ActiveRecord::Base._drop_after_commits_from(0)
               ActiveRecord::TransactionHooks.rolled_back
               raise e
             end
-            ActiveRecord::TransactionHooks.committed
-            ActiveRecord::Base._commit_enlisted
+            # The records' commit callbacks first, then the held jobs,
+            # as Rails enqueues after them. A job that fails to enqueue
+            # (a Sidekiq push to a down Redis) raises after both, so no
+            # callback is skipped or left to fire at a later COMMIT.
+            begin
+              ActiveRecord::Base._commit_enlisted
+              ActiveRecord::Base._run_after_commits_from(0)
+            ensure
+              ActiveRecord::TransactionHooks.committed
+            end
           end
         end
       end
@@ -1038,6 +1129,7 @@ module ActiveRecord
     # rather than counted beforehand. Ruby-family-only because
     # `changes` is — see base.rb's default.
     def self.delete_all
+      return all.delete_all if _scoped_reads?
       ActiveRecord.adapter.delete_all(table_name)
       ActiveRecord.adapter.changes
     end
@@ -1099,8 +1191,9 @@ module ActiveRecord
     # row every call and then trip the UNIQUE index on `key`.
     #
     # `on_duplicate:` replaces the generated SET clause with a raw
-    # fragment (`Arel.sql("value = value + 1")` — Arel.sql is the
-    # identity here, so it arrives as a String). Otherwise every
+    # fragment (`Arel.sql("value = value + 1")`). `Arel.sql` answers an
+    # `Arel::Nodes::SqlLiteral` whose `to_s` is that text, which the
+    # interpolation below reads. Otherwise every
     # non-conflict column is assigned from `excluded`, matching Rails.
     # `update_only:` (a column or list of columns, insert_all.rb) narrows
     # that default to the named columns; the rest keep their stored value.
@@ -2084,18 +2177,19 @@ module ActiveRecord
     # version, which stays for the strict-target runtime transpiles
     # (no Relation class in their tables); this file is walked only
     # into the ruby-family trees. Lowered call-sites don't land here —
-    # they drive a Relation or `_adapter_*` directly. A String or an
+    # they drive a Relation or `_adapter_*` directly. Every form Rails
+    # takes forwards as written — a Hash, a SQL string, an `[sql, *values]`
     # Array (`where(["state IN (?)", values])`, state_machines' `with_*`
-    # scopes) is Relation#where's SQL form.
+    # scopes), a string with positional or named binds — as
+    # `Relation#where` already takes them.
     #
     # With no argument, Rails answers a `WhereChain` (`Model.where.not(…)`,
     # `Model.where.missing(:assoc)`); here the fresh relation is that
     # chain, `Relation#where` and `#not` being what `where` answers on a
     # relation already.
-    def self.where(conditions = nil, *args)
-      return ActiveRecord::Relation.new(self).where if conditions.nil? && args.empty?
-      return ActiveRecord::Relation.new(self).where(conditions, *args) if conditions.is_a?(String) || conditions.is_a?(Array)
-      ActiveRecord::Relation.new(self).where(conditions.to_h)
+    def self.where(condition = nil, *args)
+      return ActiveRecord::Relation.new(self).where if condition.nil? && args.empty?
+      ActiveRecord::Relation.new(self).where(condition, *args)
     end
 
     # `Model.lock` / `Model.unscope(…)`: Rails delegates both to `all`
@@ -2124,11 +2218,11 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).or(other)
     end
 
-    # Model Hash finders use the relation's NULL / IN predicates too.
-    # `.to_h` matches `where` above: Hash is a no-op (nil / Array values
-    # survive); non-Hash inputs raise rather than reach Relation's SQL path.
+    # Model finders use the relation's NULL / IN predicates too. A SQL
+    # string reaches Relation#find_by's raw-SQL path, as Rails'
+    # `find_by("score > 6")` does.
     def self.find_by(conditions)
-      ActiveRecord::Relation.new(self).find_by(conditions.to_h)
+      ActiveRecord::Relation.new(self).find_by(conditions)
     end
 
     # `Model.find_or_initialize_by` / `find_or_create_by` /
@@ -2434,6 +2528,97 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).first
     end
 
+    # Not left to the lowerings: they re-root only the class-side shapes they recognize, and Rails' `Querying` hands every one of these to `all`.
+    def self.delete_by(conditions)
+      all.delete_by(conditions)
+    end
+
+    def self.destroy_by(conditions)
+      all.destroy_by(conditions)
+    end
+
+    def self.excluding(*records)
+      all.excluding(*records)
+    end
+
+    def self.find_each
+      relation = all
+      records = relation.loaded_records
+      i = 0
+      n = records.length
+      while i < n
+        yield records[i]
+        i += 1
+      end
+      relation
+    end
+
+    def self.find_in_batches
+      relation = all
+      yield relation.loaded_records
+      relation
+    end
+
+    def self.first_or_initialize
+      all.first_or_initialize
+    end
+
+    def self.ids
+      all.ids
+    end
+
+    def self.many?
+      all.many?
+    end
+
+    def self.maximum(expr)
+      all.maximum(expr)
+    end
+
+    def self.merge(other)
+      all.merge(other)
+    end
+
+    def self.minimum(expr)
+      all.minimum(expr)
+    end
+
+    def self.one?
+      all.one?
+    end
+
+    def self.pick(col)
+      all.pick(col)
+    end
+
+    def self.pluck(col)
+      all.pluck(col)
+    end
+
+    def self.references(*names)
+      all.references(*names)
+    end
+
+    def self.sum(expr)
+      all.sum(expr)
+    end
+
+    def self.touch_all(name = nil)
+      all.touch_all(name)
+    end
+
+    def self.update_all(updates)
+      all.update_all(updates)
+    end
+
+    def self.with_recursive(ctes)
+      all.with_recursive(ctes)
+    end
+
+    def self.without(*records)
+      all.without(*records)
+    end
+
     # `User.take` — the Rails 8 authentication generator's tests set up
     # with it (`setup { @user = User.take }`), so the Rails Guides store
     # reaches here. No order imposed (Relation#take).
@@ -2557,7 +2742,48 @@ module ActiveRecord
 
     def _touch_owner
       owner = @__touch_owner
-      owner.touch if !owner.nil? && owner.persisted?
+      owner.touch_later if !owner.nil? && owner.persisted?
+      nil
+    end
+
+    # Rails' `touch_later`, which `belongs_to …, touch: true` calls.
+    # Inside a transaction the touch waits for the outermost COMMIT and
+    # is written once per record: a message's rich text and the message
+    # itself both touch the room, and Rails stamps the room once.
+    # Waiting also keeps the UPDATE out of the middle of the save, which
+    # holds SQLite's one write lock. Outside a transaction it is `touch`.
+    def touch_later
+      return touch if Db._txn_depth == 0
+      records = Db._txn_records
+      already = records.any? { |entry| entry.kind == 3 && entry.record.equal?(self) }
+      records << ActiveRecord::EnlistedRecord.new(self, 3) unless already
+      true
+    end
+
+    # Just before the outermost COMMIT: each record a `touch_later`
+    # enlisted is touched, once. A touch fires `after_touch`, which can
+    # defer its own parent's touch (Boost -> Message -> Room), so the
+    # walk goes on until no deferred touch is left. The touch joins the
+    # still-open transaction and enlists as an update, so its commit
+    # callbacks run after the COMMIT with everyone else's.
+    def self._flush_deferred_touches
+      _flush_deferred_touches_from(0)
+    end
+
+    # The deferred touches enlisted at and after `from`: the outermost
+    # COMMIT's (0), or a savepoint's that runs its own commit callbacks.
+    def self._flush_deferred_touches_from(from)
+      touched = []
+      i = from
+      while i < Db._txn_records.length
+        entry = Db._txn_records[i]
+        i += 1
+        next unless entry.kind == 3
+        record = entry.record
+        next if touched.any? { |other| other.equal?(record) }
+        touched << record
+        record.touch
+      end
       nil
     end
 
@@ -2607,23 +2833,34 @@ module ActiveRecord
       _commit_enlisted_from(0)
     end
 
-    # Run commit callbacks for the writes enlisted at and after `from`,
-    # and drop them from the list. Writes enlisted earlier stay for the
-    # parent transaction. Called for the outermost COMMIT (`from` 0)
-    # and for a savepoint whose parent is not joinable.
-    def self._commit_enlisted_from(from)
+    # The writes enlisted at and after `from`, dropped from the list.
+    # nil when that range is empty. Commit and rollback both start here.
+    def self._take_enlisted(from)
       records = Db._txn_records
       return nil if records.length <= from
       held = records[from, records.length - from]
       records.pop while records.length > from
+      held
+    end
+
+    # Run commit callbacks for the writes enlisted at and after `from`.
+    # Writes enlisted earlier stay for the parent transaction. Called
+    # for the outermost COMMIT (`from` 0) and for a savepoint whose
+    # parent is not joinable.
+    def self._commit_enlisted_from(from)
+      held = _take_enlisted(from)
+      return nil if held.nil?
       seen = []
       held.each do |entry|
+        # A deferred touch is not a write; its touch enlisted one.
+        next if entry.kind == 3
         record = entry.record
         next if seen.any? { |other| other.equal?(record) }
         seen << record
         kind = entry.kind
         held.each do |other|
           next unless other.record.equal?(record)
+          next if other.kind == 3
           kind = other.kind if other.kind == 2 || (other.kind == 0 && kind == 1)
         end
         record._run_enlisted_commit(kind)
@@ -2637,10 +2874,8 @@ module ActiveRecord
     # the database now has it -- a create is a new record again, a
     # destroy persisted again -- as Rails' `rolledback!` restores them.
     def self._rollback_enlisted(from)
-      records = Db._txn_records
-      return nil if records.length <= from
-      undone = records[from, records.length - from]
-      records.pop while records.length > from
+      undone = _take_enlisted(from)
+      return nil if undone.nil?
       undone.each { |entry| entry.record._restore_after_rollback(entry.kind) }
       nil
     end
@@ -4196,6 +4431,126 @@ module ActiveRecord
 
     def upsert(attrs, unique_by: nil, on_duplicate: nil, update_only: nil, returning: nil, record_timestamps: nil)
       upsert_all([attrs], unique_by: unique_by, on_duplicate: on_duplicate, update_only: update_only, returning: returning, record_timestamps: record_timestamps)
+    end
+
+    # ---- cache_key / cache_version / cache_key_with_version ---------
+    #
+    # Lives HERE, not base.rb, for the same reason as the rest of this
+    # file (see the class comment above): base.rb is transpiled into
+    # every strict target's runtime, and `self[:updated_at]` below
+    # compiles to whatever each target represents an untyped value as
+    # (Rust: `serde_json::Value`), which has no `.to_i` — roundhouse
+    # #1034's compare(rust)/compare-extra(kotlin,swift)/smoke(rust)/
+    # smoke-extra(swift) all failed to compile their OWN runtime
+    # library over this before it moved here. No real_blog app code on
+    # a strict target calls `Base#cache_key_with_version` (ActiveRecord
+    # there is base.rb's bare validation/errors surface, not a
+    # queryable model), so moving it out costs strict targets nothing
+    # they had.
+    #
+    # Placed at the END of this reopen, after every other method,
+    # simply because this is where the rebase onto main landed it —
+    # this block originally sat right after `_pend_preload`/
+    # `_await_preload`, a deferred-preload mechanism main removed
+    # (replaced by `Relation#preload_associations`/`_preload_<assoc>`)
+    # between this PR's fork point and the rebase. The first rebase
+    # attempt's conflict resolution wrongly kept `_pend_preload`/
+    # `_await_preload` (their diff hunk's "ours" side was empty, which
+    # read as "nothing to merge" rather than "main deleted this"), which
+    # left `ActiveRecord::PendingPreload` referenced with no class
+    # anywhere left to declare it — confirmed by grepping the whole
+    # tree, `.rb`/`.rbs`/`.rs` alike, for `PendingPreload` and finding
+    # only this file. That orphaned pair is gone now; nothing else in
+    # the tree ever called them.
+    #
+    # Rails' `ActiveRecord::Integration` (`active_record/integration.rb`):
+    # a single record's half of the same fragment-cache key Relation's
+    # `cache_key_with_version` (`relation.rb`) answers for a collection.
+    # A jbuilder `cache!` key naming one record — `json.cache!([
+    # current_account, @widget]) do … end`, `current_account` a
+    # `helper_method` answering a record — calls this the same way an
+    # app controller or view does, and `cache!`'s `key` is a plain
+    # positional parameter (jbuilder 2.15.1's `jbuilder_template.rb`),
+    # so it is evaluated whether or not the controller is caching.
+    #
+    # Exact Rails parity except the timestamp rendering (see below):
+    # `id` and `table_name` are real facts here, not a digest over SQL
+    # text the way Relation's collection key has to approximate, so
+    # there is nothing to trade off on the key/version SHAPE itself —
+    # only on how the updated_at TIMESTAMP inside it is written.
+    #
+    # Rails always takes the `cache_versioning = true` shape (the
+    # default since Rails 5.2; this runtime never models it as
+    # configurable), under which `cache_key` carries no timestamp at
+    # all and `cache_version` carries it alone:
+    #   new record       cache_key "<table>/new",   cache_version nil
+    #   saved record      cache_key "<table>/<id>",
+    #                      cache_version "<updated_at>" (nil without an
+    #                      updated_at column)
+    #   cache_key_with_version   "<key>-<version>", or just <key> when
+    #                      <version> is nil (an unsaved record, or no
+    #                      updated_at column)
+    def cache_key
+      tbl = self.class.table_name
+      return "#{tbl}/new" if new_record?
+      rid = id
+      "#{tbl}/#{rid}"
+    end
+
+    # Reads `updated_at` through `self[:updated_at]`, not the bare
+    # per-model-synthesized `updated_at` reader: that reader is not a
+    # method Base itself declares (every concrete model synthesizes its
+    # own), so a bare call from this body has no declared return type
+    # to seed from and came back an unresolved type variable in the
+    # hand-RBS-typed `every_runtime_method_body_is_fully_typed` gate,
+    # which allows the declared `Untyped` gradual escape but not a true
+    # inference gap.
+    #
+    # `[]` is the established escape for exactly this (`fill_timestamps`,
+    # base.rb, writes `self[:updated_at] = now` for the identical
+    # reason, the write side of this same problem). Base's own `[]` is
+    # typed `Str` in the catalog — a known, already-accepted
+    # approximation ("Imprecise for non-string columns (`article[:id]`
+    # is actually Int), but matches the existing declared shape",
+    # `catalog/mod.rs`) for the STATIC type only: the CONCRETE per-model
+    # `[]` the lowerer synthesizes (`model_to_library/schema.rs`)
+    # answers the REAL column value through a `case` on the attribute
+    # name, declared `Untyped` there — but for a `datetime`/`timestamp`
+    # column (`ColumnSlot::index_read`, `index_reads_logical: false`:
+    # only `date` reads its logical value through `[]`) that REAL value
+    # is the RAW STORED TEXT, not a hydrated `Time` — the same storage
+    # `@updated_at_raw` ivar `format_db_time` writes. `Str` is therefore
+    # exactly what `self[:updated_at]` answers here, not merely an
+    # approximation of it.
+    #
+    # Parse it with `ActiveSupport.parse_db_time` BEFORE calling `to_f`
+    # (roundhouse #1034, CodeRabbit): a raw timestamp string's `to_f`
+    # parses only its leading digits — `"2026-10-19 14:17:00".to_f` is
+    # `2026.0`, the year alone, because `String#to_f` stops at the first
+    # byte that cannot continue a float literal and `-` after 4 digits
+    # does not qualify as a continuation. Every update within the same
+    # YEAR then answered the identical `cache_version`, not merely the
+    # same SECOND the first fix (below) addressed for the already-parsed
+    # `Time` `Relation#compute_cache_version` aggregates through `MAX()`.
+    #
+    # `parsed.to_f` (seconds with a fractional part), not Rails'
+    # `to_fs(:usec)` string — the same tradeoff `Relation#
+    # compute_cache_version` documents, and the same fix (roundhouse
+    # #1034, CodeRabbit: `to_i` truncated to whole seconds, so two
+    # updates inside the same second answered the same
+    # `cache_key_with_version`). `Time#to_f` is confirmed directly
+    # against the installed Spinel compiler.
+    def cache_version
+      return nil unless has_attribute?(:updated_at)
+      ts = self[:updated_at]
+      return nil if ts.nil?
+      parsed = ActiveSupport.parse_db_time(ts)
+      parsed.nil? ? nil : parsed.to_f.to_s
+    end
+
+    def cache_key_with_version
+      version = cache_version
+      version.nil? ? cache_key : "#{cache_key}-#{version}"
     end
   end
 end

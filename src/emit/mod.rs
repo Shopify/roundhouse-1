@@ -3,10 +3,12 @@
 //! Each emitter takes an `&App` and produces a set of files (`EmittedFile`s).
 //! Emitters are pure: no I/O, no filesystem — the caller decides where to write.
 
+pub mod audit;
 pub mod crystal;
 pub mod csharp;
 pub mod diagnostics;
 pub mod elixir;
+pub mod fractal;
 pub mod futamura;
 pub mod go;
 pub mod kotlin;

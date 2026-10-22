@@ -153,7 +153,7 @@ module ActionMailer
     end
 
     def params
-      @params
+      @params ||= {}
     end
 
     def _with_params(params)

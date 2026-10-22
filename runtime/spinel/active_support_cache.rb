@@ -66,6 +66,47 @@ module ActiveSupport
         hash_digest_class.hexdigest(arg)[0...32]
       end
     end
+
+    # A store that keeps nothing. `fetch` and `fetch_str` still answer
+    # the block, and they do not write it. A subclass of `Rails::Cache`,
+    # so it can stand in for `Rails.cache`.
+    class NullStore < Rails::Cache
+      def read(name, options = nil)
+        nil
+      end
+
+      def write(name, value, options = nil)
+        true
+      end
+
+      def fetch(name)
+        yield
+      end
+
+      def delete(name)
+        false
+      end
+
+      def exist?(name)
+        false
+      end
+
+      def clear
+        nil
+      end
+
+      def read_str(key)
+        nil
+      end
+
+      def write_str(key, value, ttl)
+        value
+      end
+
+      def fetch_str(key, ttl)
+        yield
+      end
+    end
   end
 
   module Cache

@@ -26,7 +26,7 @@ comments, nested routes, validations, Turbo Streams, Action Cable,
 Tailwind, JSON endpoints) is the shared DOM-equivalence fixture for
 **every server target** in scheduled full validation. Ordinary PRs run the
 Ruby floor plus selected target lanes; pushes to canonical `main` run Ruby
-plus Spinel. The extra-language matrix waits for the four-hour schedule or
+plus Spinel. The extra-language matrix waits for the three-hour schedule or
 `ci:full`. See [CI coverage](../ci/README.md).
 A passing target's comparison proves the blog's features on that target.
 
@@ -148,7 +148,7 @@ diagnostic corpus until its independent framework and Spinel gaps close.
 |---|---|---|
 | Attributes | From `db/schema.rb` (migrations as fallback), typed per column; `id`, timestamps, defaults, nullability | + `enum`, `serialize`/`has_json` columns, `has_secure_token`, `has_secure_password` (real bcrypt) |
 | Associations | `belongs_to`, `has_many` (with `dependent:`), `has_one`; association readers, builders, `<assoc>_ids` | + `has_many :through`, polymorphic, `touch:`, `has_one_attached`/`has_many_attached`, `has_rich_text` |
-| Validations | `presence`, `absence`, `length` (min/max), `numericality` (bounds, `only_integer`), `format`, `inclusion`, `uniqueness`; `errors`, `full_messages`, `valid?` | + custom `validate` methods, conditional `if:`/`unless:` |
+| Validations | `presence`, `absence`, `length` (min/max), `numericality` (bounds, `only_integer`), `format`, `inclusion`; `errors`, `full_messages`, `valid?` | + custom `validate` methods, conditional `if:`/`unless:`, `uniqueness` (`scope:`, `case_sensitive:`, `allow_nil:`/`allow_blank:`; a reported gap on the strict targets) |
 | Callbacks | `after_create_commit` and the Turbo `broadcasts_to` family | + `before_save`/`after_save`, `before_destroy`, `after_touch`, STI-aware callback inheritance |
 | Queries | `where` (hash and string), `order`, `limit`, `find`, `find_by`, `first`/`last`, `count`, `exists?`, `includes`, `pluck`, named `scope`s — folded to SQL by the Arel builder | + `joins`, `left_joins`, `group`/`count`, `select`, `distinct`, `or`, `none`, `find_or_create_by`, `insert_all`, `update_all`, `in_batches`, `sum`; a live `Relation` for chains the builder can't fold |
 | Persistence | `create`, `save`, `update`, `destroy`, `new`/`build` | + `destroy!`, `increment!`, `update_columns`, transactions, dirty tracking predicates |

@@ -67,6 +67,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
     }
 
     let parameterized = parameterized_mailers(app, &mailers);
+    let own_with = defines_with(app);
     for lc in app.library_classes.iter_mut() {
         if !mailers.contains(lc.name.0.as_str()) {
             continue;
@@ -79,7 +80,11 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             .collect();
         let mut wrappers: Vec<crate::dialect::MethodDef> = Vec::new();
         for m in &lc.methods {
+            // ActionMailer's class-side proxy answers only the public
+            // action methods (`action_methods`): a private or protected
+            // helper or filter is never reachable as `Mailer.name`.
             if m.receiver != crate::dialect::MethodReceiver::Instance
+                || m.visibility != crate::dialect::MethodVisibility::Public
                 || m.name.as_str() == "initialize"
                 || class_side.contains(m.name.as_str())
             {
@@ -168,7 +173,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             w.body = body;
             wrappers.push(w);
         }
-        if parameterized.contains(lc.name.0.as_str()) && !class_side.contains("with") {
+        if parameterized.contains(lc.name.0.as_str()) && !own_with.contains(lc.name.0.as_str()) {
             wrappers.push(parameterized_constructor(&lc.name));
         }
         lc.methods.extend(wrappers);
@@ -176,15 +181,46 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
     diags
 }
 
+/// Mailers whose own or an ancestor's `def self.with` answers `with`; Ruby would pick a generated one over the inherited.
+pub(crate) fn defines_with(app: &App) -> BTreeSet<String> {
+    let parents: std::collections::HashMap<&str, &str> = app
+        .library_classes
+        .iter()
+        .filter_map(|lc| lc.parent.as_ref().map(|p| (lc.name.0.as_str(), p.0.as_str())))
+        .collect();
+    let own: BTreeSet<&str> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "with"))
+        .map(|lc| lc.name.0.as_str())
+        .collect();
+    let mut out = BTreeSet::new();
+    for lc in &app.library_classes {
+        let mut cur = Some(lc.name.0.as_str());
+        for _ in 0..32 {
+            let Some(name) = cur else { break };
+            if own.contains(name) {
+                out.insert(lc.name.0.as_str().to_string());
+                break;
+            }
+            cur = parents.get(name).copied();
+        }
+    }
+    out
+}
+
 // Not on every mailer: a target without the ActionMailer runtime has no `_with_params` to call.
 fn parameterized_mailers(app: &App, mailers: &BTreeSet<String>) -> BTreeSet<String> {
     fn visit(e: &Expr, mailers: &BTreeSet<String>, out: &mut BTreeSet<String>) {
         if let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node
             && method.as_str() == "with"
-            && let ExprNode::Const { path } = &*recv.node
         {
-            let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
-            if mailers.contains(&name) {
+            let name = match (&*recv.node, &recv.ty) {
+                (ExprNode::Const { path }, _) => Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")),
+                (_, Some(Ty::Class { id, .. })) => Some(id.0.as_str().to_string()),
+                _ => None,
+            };
+            if let Some(name) = name.filter(|n| mailers.contains(n)) {
                 out.insert(name);
             }
         }
@@ -196,6 +232,10 @@ fn parameterized_mailers(app: &App, mailers: &BTreeSet<String>) -> BTreeSet<Stri
     }
     for controller in &app.controllers {
         controller.actions().for_each(|a| visit(&a.body, mailers, &mut out));
+        controller.class_methods().for_each(|m| visit(&m.body, mailers, &mut out));
+    }
+    for view in &app.views {
+        visit(&view.body, mailers, &mut out);
     }
     for lc in &app.library_classes {
         lc.methods.iter().for_each(|m| visit(&m.body, mailers, &mut out));

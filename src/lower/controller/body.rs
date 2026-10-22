@@ -196,10 +196,8 @@ fn unwrap_respond_to_inner(expr: &Expr, with_format_dispatch: bool, breadth: For
         ty: expr.ty.clone(),
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
-        diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint.clone(),
+        cold: expr.cold.clone(),
         decisions: expr.decisions,
-        keyword_arg: expr.keyword_arg.clone(),
     }
 }
 
@@ -1028,6 +1026,9 @@ const RESPONSE_TERMINALS: &[&str] = &[
     "render_inertia_json",
     // responders: GET renders, POST renders 201, the rest answer 204.
     "respond_with",
+    // Always responds: 409 + X-Inertia-Location, or a 302. Without this
+    // the implicit `head :no_content` runs second and raises.
+    "inertia_location",
 ];
 
 /// Rails' HTTP auth helpers that render the 401 challenge when the

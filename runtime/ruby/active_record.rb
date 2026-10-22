@@ -3,6 +3,7 @@ require_relative "active_record/errors"
 # The rest of Rails' exception hierarchy, Ruby-family only (not on the
 # strict-target transpile tables, unlike errors.rb).
 require_relative "active_record/error_classes"
+require_relative "active_record/encryption_errors"
 require_relative "active_record/connection_pool"
 require_relative "active_record/registry"
 require_relative "active_record/base"
@@ -55,3 +56,12 @@ module ActiveRecord
     gem_version
   end
 end
+require_relative "active_record/types"
+# Database tasks (`db:schema:load`, `prepare_all`, `migrate`). After
+# connection.rb: the task runner calls `Connection`. The readers load
+# before `tasks.rb`, which prepends the app rake file onto the methods
+# they defined.
+require_relative "rake/task"
+require_relative "active_record/schema_reader"
+require_relative "active_record/migration_runner"
+require_relative "active_record/tasks"

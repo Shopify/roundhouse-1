@@ -109,8 +109,9 @@ fn server_source_for_active_profile() -> &'static str {
     }
 }
 
+mod char_set;
 mod expr;
-pub(crate) use expr::{array_method_handled, numeric_method_handled};
+pub(crate) use expr::{array_method_handled, numeric_method_handled, string_method_handled};
 pub mod js_ast;
 mod library;
 mod naming;
@@ -1871,6 +1872,26 @@ pub(super) fn js_library_class(
 
     let mut wrote_fields = false;
     let has_parent = effective_parent.is_some();
+    // Class-body constants (`WEIGHTS = { "small" => 1 }.freeze`) as
+    // `static WEIGHTS = { "small": 1 };`, so a `Klass.WEIGHTS` read
+    // resolves (#1223). Only a literal value TS renders as written is
+    // declared; a constant whose name a method or field also takes is
+    // left out, as is any other value.
+    for (name, value) in &class.constants {
+        let Some(value) = declarable_constant_value(value) else { continue };
+        if fields.iter().any(|f| f.0 == name.as_str()) || class.methods.iter().any(|m| m.name.as_str() == name.as_str()) {
+            continue;
+        }
+        members.push(JsClassMember::Field {
+            is_static: true,
+            declare: false,
+            name: name.as_str().to_string(),
+            ty: None,
+            init: Some(expr::js_expr(value)),
+            span: value.span,
+        });
+        wrote_fields = true;
+    }
     // Field names declared by the framework Base (active_record_base.ts)
     // — every model extends ActiveRecordBase transitively, so these
     // need a `declare` modifier on the subclass to avoid TS2612.
@@ -2024,6 +2045,31 @@ pub(super) fn js_library_class(
         members,
         span: crate::span::Span::synthetic(),
     })
+}
+
+/// A class-body constant's value as TypeScript declares it: `.freeze`
+/// stripped (it has no TS analog), when what is left is a literal TS
+/// renders as written: `nil`, a Boolean, number, String, Symbol or
+/// regexp, or an Array or Hash of those. Anything else (a call, a
+/// constant read, `Struct.new`) is `None`.
+pub(super) fn declarable_constant_value(value: &crate::expr::Expr) -> Option<&crate::expr::Expr> {
+    use crate::expr::ExprNode;
+    let value = match &*value.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => r,
+        _ => value,
+    };
+    fn literal(e: &crate::expr::Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(literal),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| literal(k) && literal(v)),
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => {
+                literal(r)
+            }
+            _ => false,
+        }
+    }
+    literal(value).then_some(value)
 }
 
 /// True when a method's signature return type is `Ty::Time` (or a

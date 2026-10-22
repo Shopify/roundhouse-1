@@ -32,6 +32,7 @@ thread_local! {
     static STATEMENT: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
 }
 
+use crate::ingest::prism_api::PrismLocation;
 const PRIVATE_HOOKS: &[&str] = &[
     "initialize", "initialize_copy", "initialize_dup", "initialize_clone",
 ];

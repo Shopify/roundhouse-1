@@ -291,6 +291,9 @@ pub fn apply_sti_subclass_validations(app: &mut App) {
                 },
                 type_column: sti.get(&lc.name).map(|c| c.as_str().to_string()).unwrap_or_default(),
             },
+            // A post-analyze pass knows no target; the ruby family's reads
+            // of an uncast raw value are the safe ones on every target.
+            runtime_relation: crate::lower::model_to_library::RuntimeRelation::Present,
         };
         let spanned = read.declared.iter().flat_map(|(_, span, vs, _)| vs.iter().map(move |v| (*span, v)));
         // `prepend: true` checks run ahead of the inherited ones.

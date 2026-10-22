@@ -12,6 +12,7 @@ use crate::ident::Symbol;
 use super::{Slot, slot_of};
 use super::owned::{Defined, OwnerIndex, Side};
 
+use crate::ingest::prism_api::PrismLocation;
 pub(super) struct InstanceCallParams {
     pub(super) slots: HashMap<(String, Symbol), Vec<Slot>>,
     pub(super) custom_new_slots: HashMap<(String, Symbol), Vec<Slot>>,
@@ -603,7 +604,7 @@ fn rewrite_instance_call(
     diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
     if matches!(
-        &expr.diagnostic,
+        &expr.diagnostic(),
         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
             if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
     ) {
@@ -861,7 +862,7 @@ fn refuse_constructor(
         crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS,
         detail,
     );
-    expr.diagnostic = Some(diagnostic.kind.clone());
+    expr.set_diagnostic(Some(diagnostic.kind.clone()));
     if as_written {
         expr.decisions |= crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN;
     }
