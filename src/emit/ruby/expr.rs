@@ -61,6 +61,9 @@ thread_local! {
     static EXTERNAL_GEM_NAMESPACES: RefCell<std::collections::BTreeSet<String>> = const {
         RefCell::new(std::collections::BTreeSet::new())
     };
+    /// The same namespaces as a hash index with a per-detail memo, so the
+    /// per-constant check is not a scan of every namespace.
+    static EXTERNAL_ROOT_INDEX: RefCell<crate::gems::ExternalRootIndex> = RefCell::new(crate::gems::ExternalRootIndex::default());
     /// `gems::statically_resolved_external_includes` of the app being
     /// emitted, computed once with the namespaces above: it scans every
     /// class, and asked per class it was most of Mastodon's emit.
@@ -290,8 +293,11 @@ pub(super) fn with_external_gem_namespaces<R>(
 ) -> R {
     let previous = EXTERNAL_GEM_NAMESPACES
         .with(|current| std::mem::replace(&mut *current.borrow_mut(), namespaces.clone()));
+    let previous_index = EXTERNAL_ROOT_INDEX
+        .with(|current| current.replace(crate::gems::ExternalRootIndex::new(namespaces)));
     let previous_includes = EXTERNAL_INCLUDES.with(|current| current.replace(includes));
     let result = f();
+    EXTERNAL_ROOT_INDEX.with(|current| current.replace(previous_index));
     EXTERNAL_GEM_NAMESPACES.with(|current| {
         *current.borrow_mut() = previous;
     });
@@ -808,12 +814,7 @@ fn is_locked_external_gem_constant(expr: &Expr) -> bool {
     if construct.as_str() != "constant" {
         return false;
     }
-    EXTERNAL_GEM_NAMESPACES.with(|namespaces| {
-        namespaces
-            .borrow()
-            .iter()
-            .any(|root| crate::gems::detail_names_external_namespace(detail, root))
-    })
+    EXTERNAL_ROOT_INDEX.with(|index| index.borrow_mut().names_any(detail))
 }
 
 /// A string literal ingested from `+"literal"`. Written back with its

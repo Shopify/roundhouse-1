@@ -462,17 +462,14 @@ fn run_transpile(
         } else {
             (roundhouse::gems::native_extension_gem_namespaces(&app), Default::default())
         };
+        let mut external_roots = roundhouse::gems::ExternalRootIndex::new(&external_namespaces);
         analyze_diags.retain(|diagnostic| match &diagnostic.kind {
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 construct, detail, ..
             } if construct.as_str() == "include" => !supported_includes.contains_key(detail),
             roundhouse::diagnostic::DiagnosticKind::Unsupported {
                 construct, detail, ..
-            } if construct.as_str() == "constant" => !external_namespaces
-                .iter()
-                .any(|namespace| {
-                    roundhouse::gems::detail_names_external_namespace(detail, namespace)
-                }),
+            } if construct.as_str() == "constant" => !external_roots.names_any(detail),
             _ => true,
         });
     }

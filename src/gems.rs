@@ -1021,11 +1021,17 @@ pub fn statically_resolved_external_includes(
     };
     let census = GemCensus::of(lock);
     let mut resolved = std::collections::BTreeMap::new();
+    // Per-include gem lookup, and the file-level requires of each source
+    // (keyed by its address in `app.sources`): both repeat across classes,
+    // and the source lookup itself scans, so it waits for a gem match.
+    let mut owner_of: crate::det::HashMap<&str, Option<&str>> = Default::default();
+    let mut requires_of: crate::det::HashMap<*const crate::span::SourceFile, Vec<String>> = Default::default();
     for class in &app.library_classes {
-        let source = source_for_library_class(app, class);
-        let Some(source) = source else { continue };
         for included in &class.includes {
-            let Some(gem) = gem_owning_constant(&census, included.0.as_str()) else {
+            let gem = *owner_of
+                .entry(included.0.as_str())
+                .or_insert_with(|| gem_owning_constant(&census, included.0.as_str()));
+            let Some(gem) = gem else {
                 continue;
             };
             // Fail-closed: Git-sourced gems have no Gemfile pin path that
@@ -1038,16 +1044,21 @@ pub fn statically_resolved_external_includes(
             if app.extensions.is_rails_dependent(gem) {
                 continue;
             }
+            let Some(source) = source_for_library_class(app, class) else { continue };
+            let file_requires = requires_of
+                .entry(source as *const _)
+                .or_insert_with(|| literal_file_level_requires(&source.text));
             let gem_name = gem.to_ascii_lowercase();
             let namespace = namespace_of(gem).to_ascii_lowercase();
-            let requires: Vec<String> = literal_file_level_requires(&source.text)
-                .into_iter()
+            let requires: Vec<String> = file_requires
+                .iter()
                 .filter(|feature| {
                     feature
                         .split('/')
                         .next()
                         .is_some_and(|head| head == namespace || head == gem_name)
                 })
+                .cloned()
                 .collect();
             if !requires.is_empty() {
                 resolved.insert(
@@ -1330,6 +1341,70 @@ pub fn detail_names_external_namespace(detail: &str, root: &str) -> bool {
     false
 }
 
+/// Hash index over external gem namespace roots: answers
+/// `roots.iter().any(|r| detail_names_external_namespace(detail, r))` by
+/// probing the roots a detail could contain instead of scanning every root,
+/// memoized per detail (the same details repeat across an app).
+#[derive(Default)]
+pub struct ExternalRootIndex {
+    roots: std::collections::HashSet<String>,
+    memo: std::collections::HashMap<String, bool>,
+}
+
+impl ExternalRootIndex {
+    pub fn new<'a>(namespaces: impl IntoIterator<Item = &'a String>) -> Self {
+        Self { roots: namespaces.into_iter().cloned().collect(), memo: Default::default() }
+    }
+
+    /// True when some root satisfies `detail_names_external_namespace`.
+    pub fn names_any(&mut self, detail: &str) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        if let Some(&hit) = self.memo.get(detail) {
+            return hit;
+        }
+        let hit = self.probe(detail);
+        self.memo.insert(detail.to_string(), hit);
+        hit
+    }
+
+    fn probe(&self, detail: &str) -> bool {
+        if self.roots.contains(detail.trim_start_matches("::")) {
+            return true;
+        }
+        let bytes = detail.as_bytes();
+        // Every `::` is where a root-plus-`::` needle could end.
+        let seps: Vec<usize> = (0..bytes.len().saturating_sub(1))
+            .filter(|&i| bytes[i] == b':' && bytes[i + 1] == b':')
+            .collect();
+        if seps.is_empty() {
+            return false;
+        }
+        for abs in 0..bytes.len() {
+            if !detail.is_char_boundary(abs) {
+                continue;
+            }
+            // The path-start rule of `detail_names_external_namespace`.
+            let boundary_ok = match abs {
+                0 => true,
+                _ if bytes[abs - 1] == b':' => {
+                    abs >= 2 && bytes[abs - 2] == b':' && (abs == 2 || !is_ruby_ident_byte(bytes[abs - 3]))
+                }
+                _ => !is_ruby_ident_byte(bytes[abs - 1]),
+            };
+            if !boundary_ok {
+                continue;
+            }
+            let first = seps.partition_point(|&p| p < abs);
+            if seps[first..].iter().any(|&p| self.roots.contains(&detail[abs..p])) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn is_ruby_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -1485,6 +1560,33 @@ pub(crate) fn gems_owning_constant_with<'a>(census: &'a GemCensus, constant_path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_root_index_matches_the_linear_scan() {
+        let roots: std::collections::BTreeSet<String> =
+            ["Rouge", "Outer::Root", "Root", "A", "Foo::Bar::Baz", "Zeitwerk"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let details = [
+            "Rouge", "::Rouge", "::::Rouge", "Rouge::X", "::Rouge::X", "NotRouge::X",
+            "App::Types::Rouge::X", "App::Rouge", "Outer::Root::X", "::Outer::Root::X",
+            "X::Outer::Root::Y", "XRoot::Y", "Root::Y::Z", "Q::Root::Y", "_Root::Y", "9Root::Y",
+            "Foo::Bar::Baz::Q", "Foo::Bar::Baz", "X::Foo::Bar::Baz::Q", "Bar::Baz::Q", "A::B",
+            "A", "::A", "", "::", ":::", "::::", "Rouge:Rouge::X", " Rouge::X", "(Rouge::X)",
+            "Rouge::Rouge", "Zeitwerk::Loader::Foo", "Zeit::Foo", "Rouge::", "::Rouge::",
+            "É::Rouge::X", "ÉRouge::X", "Foo::Bar::Qux::Baz::Q", "Outer::Outer::Root::X",
+            "Outer:: Root::X", "Root::", "X Root::Y",
+        ];
+        for set in [roots, std::collections::BTreeSet::new(), ["".to_string()].into()] {
+            let mut index = ExternalRootIndex::new(&set);
+            for detail in details {
+                let linear = set.iter().any(|root| detail_names_external_namespace(detail, root));
+                assert_eq!(index.names_any(detail), linear, "{detail:?} against {set:?}");
+                assert_eq!(index.names_any(detail), linear, "memoized {detail:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_release_version_drops_only_a_listed_platform() {
