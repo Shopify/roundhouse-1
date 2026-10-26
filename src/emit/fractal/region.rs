@@ -6,7 +6,7 @@
 //! place, so any `def` can be edited whatever surrounds it; a region is
 //! just where the analyzer's facts about one are found.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use ruby_prism::Visit;
 use serde::Serialize;
@@ -228,7 +228,7 @@ impl<'a> IrMethod<'a> {
 
 /// Every analyzed method, keyed by the span of the name in its `def`.
 fn analyzed_by_name(app: &App) -> HashMap<Span, Vec<IrMethod<'_>>> {
-    let mut index: HashMap<Span, Vec<IrMethod<'_>>> = HashMap::new();
+    let mut index: HashMap<Span, Vec<IrMethod<'_>>> = HashMap::default();
     fn add<'a>(index: &mut HashMap<Span, Vec<IrMethod<'a>>>, span: Span, method: IrMethod<'a>) {
         if !span.is_synthetic() {
             index.entry(span).or_default().push(method);

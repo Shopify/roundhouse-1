@@ -525,7 +525,7 @@ fn tags(manifest: &ViteManifest, entries: &[&ViteChunk], options: &TagOptions) -
     let crossorigin_attr =
         options.crossorigin.as_ref().map(|v| format!(" crossorigin=\"{v}\"")).unwrap_or_default();
     let type_attr = options.script_type.as_ref().map(|v| format!(" type=\"{v}\"")).unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     let mut imports: Vec<&ViteChunk> = Vec::new();
     for entry in entries {
         import_chunks(manifest, entry, &mut seen, &mut imports)?;
@@ -581,7 +581,7 @@ fn tags(manifest: &ViteManifest, entries: &[&ViteChunk], options: &TagOptions) -
 fn import_chunks<'a>(
     manifest: &'a ViteManifest,
     chunk: &ViteChunk,
-    seen: &mut std::collections::HashSet<String>,
+    seen: &mut crate::det::HashSet<String>,
     out: &mut Vec<&'a ViteChunk>,
 ) -> Result<(), String> {
     for name in &chunk.imports {

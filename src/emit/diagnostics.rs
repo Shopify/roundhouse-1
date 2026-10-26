@@ -48,7 +48,7 @@ pub fn scope<T>(f: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
     // model-body ledger entry was pushed — and printed — once per
     // slice: five identical lines for one `validate` on campfire. One
     // gap, one line; first occurrence keeps its place in the order.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     collected.retain(|d| seen.insert((d.span, d.message.clone(), d.severity as u8)));
     (result, collected)
 }

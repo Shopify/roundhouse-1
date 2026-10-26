@@ -8,7 +8,7 @@
 //! the way they read `def self.x`. A method the model defines itself
 //! wins, as it does in Ruby.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::App;
 use crate::dialect::{LibraryClass, MethodReceiver, ModelBodyItem};
@@ -50,7 +50,7 @@ pub(super) fn splice_sole_extended_modules(app: &mut App) {
             continue;
         }
         let own: HashSet<_> = model.methods().filter(|m| m.receiver == MethodReceiver::Class).map(|m| m.name.clone()).collect();
-        let mut added = HashSet::new();
+        let mut added = HashSet::default();
         for (id, includes) in spliced {
             for include in includes {
                 let mut arg = Expr::new(Span::synthetic(), ExprNode::Const { path: include.0.as_str().split("::").map(Symbol::from).collect() });

@@ -31,7 +31,7 @@
 //! `extend Foo` with no receiver, or `Foo.extend Bar` on a constant,
 //! is the class-body form. Ingest and `fold_extended_modules` own it.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, NESTED_DEF, Severity};
@@ -116,8 +116,8 @@ fn library_index(app: &App) -> LibraryIndex {
         .iter()
         .map(|m| m.name.0.as_str().to_string())
         .collect();
-    let mut classes = HashSet::new();
-    let mut modules = HashSet::new();
+    let mut classes = HashSet::default();
+    let mut modules = HashSet::default();
     for lc in &app.library_classes {
         note_class(lc, &models, &mut classes, &mut modules);
     }
@@ -158,7 +158,7 @@ fn extend_defined_names<'a>(
     classes: impl IntoIterator<Item = &'a LibraryClass>,
 ) -> HashSet<String> {
     let classes: Vec<&LibraryClass> = classes.into_iter().collect();
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut grew = true;
     while grew {
         grew = false;

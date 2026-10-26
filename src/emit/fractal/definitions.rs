@@ -9,7 +9,7 @@
 //! with a computed name), which a pass relying on this must treat as
 //! unknown, so [`collect`] also records those calls under `"*"`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::path::Path;
 
 use ruby_prism::Visit;
@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     fn names(src: &str) -> Vec<String> {
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         collect(&SourceFile { path: "/app/x.rb".into(), text: src.into() }, Path::new("/app"), &mut out);
         let mut names: Vec<String> = out.into_keys().collect();
         names.sort();

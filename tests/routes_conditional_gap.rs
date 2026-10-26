@@ -7,7 +7,7 @@
 //! survey mode records a gap naming the construct and its line, and the
 //! sibling routes still ingest.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 
 use roundhouse::ingest::routes::ingest_routes_with_draws;
 use roundhouse::ingest::{survey, IngestError};
@@ -18,7 +18,7 @@ const IF_BLOCK: &[u8] = b"Rails.application.routes.draw do\n  root \"pages#home\
 
 fn ingest(source: &[u8]) -> Result<roundhouse::dialect::RouteTable, IngestError> {
     let (result, _) = roundhouse::ingest::prism::scope(|| {
-        ingest_routes_with_draws(source, "config/routes.rb", &HashMap::new())
+        ingest_routes_with_draws(source, "config/routes.rb", &HashMap::default())
     });
     result
 }

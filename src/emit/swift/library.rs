@@ -108,7 +108,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
     let methods: &[MethodDef] = match methods.first().and_then(|m| m.enclosing_class.as_ref()) {
         Some(owner) => {
             let owner = crate::ident::ClassId(owner.clone());
-            let names: std::collections::HashSet<crate::ident::Symbol> = methods.iter().map(|m| m.name.clone()).collect();
+            let names: crate::det::HashSet<crate::ident::Symbol> = methods.iter().map(|m| m.name.clone()).collect();
             qualified = methods
                 .iter()
                 .cloned()
@@ -156,13 +156,13 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
 /// install as instance props so reads/assigns resolve.
 fn emit_module_ivars(methods: &[MethodDef], exclude: &BTreeMap<String, Ty>) -> String {
     let mut ivars: BTreeMap<String, IvarInfo> = BTreeMap::new();
-    let mut containers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut containers: crate::det::HashMap<String, String> =
+        crate::det::HashMap::default();
     for m in methods {
         collect_ivars(&m.body, &mut ivars);
         containers.extend(super::expr::container_scan(&m.body));
     }
-    let mut props: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+    let mut props: crate::det::HashMap<String, Ty> = crate::det::HashMap::default();
     let mut out = String::new();
     for (n, info) in &ivars {
         props.insert(n.clone(), info.ty.clone().unwrap_or(Ty::Untyped));
@@ -258,7 +258,7 @@ pub fn emit_test_class(
         collect_ivars(&m.body, &mut body_ivars);
     }
 
-    let mut all_props: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+    let mut all_props: crate::det::HashMap<String, Ty> = crate::det::HashMap::default();
     // RoundhouseTestCase (RhTestSupport.swift): XCTestCase + the per-test
     // DB-reset/fixture-reload hook + the controller-test dispatch surface.
     out.push_str(&format!("final class {class_name}: RoundhouseTestCase {{\n"));
@@ -385,7 +385,7 @@ pub fn register_classes(lcs: &[LibraryClass]) {
         // Pure readers collapse into properties, so they're NOT methods
         // at call sites; the merged subscript registers under a marker
         // key for override detection.
-        let mut methods: std::collections::HashSet<String> = lc
+        let mut methods: crate::det::HashSet<String> = lc
             .methods
             .iter()
             .filter(|m| {
@@ -412,7 +412,7 @@ pub fn register_classes(lcs: &[LibraryClass]) {
                 super::expr::register_class_parent(cls.clone(), type_name(p.0.as_str()));
             }
         }
-        let mut statics: std::collections::HashMap<String, String> = lc
+        let mut statics: crate::det::HashMap<String, String> = lc
             .methods
             .iter()
             .filter(|m| m.receiver == MethodReceiver::Class && m.kind == AccessorKind::Method)
@@ -535,7 +535,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
             m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref())
         })
         .collect();
-    let temporal_cols: std::collections::HashSet<String> =
+    let temporal_cols: crate::det::HashSet<String> =
         temporal_readers.iter().map(|m| camel(m.name.as_str())).collect();
 
     // 1. Accessor-derived properties (name → type), and the set of method
@@ -594,7 +594,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // collapsed readers) so the expression walker can coerce
     // untyped-map → typed-property assigns and resolve self-receiver
     // property-vs-method reads.
-    let mut all_props: std::collections::HashMap<String, Ty> =
+    let mut all_props: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (n, info) in &body_ivars {
         let ty = pure_readers
@@ -970,8 +970,8 @@ fn is_pure_reader(m: &MethodDef) -> bool {
 
 /// All stored-property names a class declares: instance accessors, body
 /// ivars, collapsed pure readers.
-fn instance_prop_names(lc: &LibraryClass) -> std::collections::HashSet<String> {
-    let mut props: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn instance_prop_names(lc: &LibraryClass) -> crate::det::HashSet<String> {
+    let mut props: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in &lc.methods {
         match m.kind {
             AccessorKind::AttributeReader => {

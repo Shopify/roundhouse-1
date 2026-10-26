@@ -39,7 +39,7 @@
 //! per value from its analyzed type after inference, and removes the
 //! writer when a value has no encoding there.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{LibraryClass, LibraryClassOrigin, RepresentableField};
 use crate::expr::Expr;
@@ -88,8 +88,8 @@ pub(super) fn lower_representable_decorators(
         return Ok(());
     }
     // Per class: its declarations, or why it is outside the subset.
-    let mut decls: HashMap<ClassId, Decl> = HashMap::new();
-    let mut refused: HashMap<ClassId, IngestError> = HashMap::new();
+    let mut decls: HashMap<ClassId, Decl> = HashMap::default();
+    let mut refused: HashMap<ClassId, IngestError> = HashMap::default();
     for source in sources {
         if !source.text.contains(DECORATOR) {
             continue;

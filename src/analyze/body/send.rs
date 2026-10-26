@@ -3892,7 +3892,7 @@ mod float_rounding_tests {
         let program = parsed.node();
         let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
         let mut expr = crate::ingest::expr::ingest_expr(&stmt, "probe.rb").unwrap();
-        let classes = std::collections::HashMap::new();
+        let classes = crate::det::HashMap::default();
         let mut ctx = super::super::Ctx::default();
         ctx.local_bindings.insert(Symbol::from("x"), Ty::Float);
         ctx.local_bindings.insert(Symbol::from("n"), Ty::Int);

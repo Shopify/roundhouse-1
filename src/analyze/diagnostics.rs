@@ -10,7 +10,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ty::Ty;
 use crate::ident::{ClassId, Symbol};
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use super::{ClassInfo, PreloadCoverage};
 use super::preload;
@@ -172,7 +172,7 @@ fn unshipped_gem_helpers(app: &App, out: &mut Vec<Diagnostic>) {
     // Not only a typed app method: one whose body answers no type yet is still the app's, if the call reaches it
     let controller_defines = |controller: &crate::dialect::Controller, method: &str| {
         let mut current = Some(controller);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(c) = current {
             if !seen.insert(c.name.0.as_str()) {
                 break;
@@ -372,7 +372,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
     // escape. Every other action's tail is its value.
-    let filter_targets: std::collections::HashSet<Symbol> = app
+    let filter_targets: crate::det::HashSet<Symbol> = app
         .controllers
         .iter()
         .flat_map(|c| c.body.iter())
@@ -429,7 +429,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     let (preload_diags, coverage) = preload::missing_preload_report(app);
     out.extend(preload_diags);
     unshipped_gem_helpers(app, &mut out);
-    let refused_gem_sites: std::collections::HashSet<_> = out.iter().filter_map(|diagnostic| {
+    let refused_gem_sites: crate::det::HashSet<_> = out.iter().filter_map(|diagnostic| {
         matches!(&diagnostic.kind, DiagnosticKind::Unsupported { construct, .. }
             if construct.as_str() == "gem_requires_rails").then_some(diagnostic.span)
     }).collect();
@@ -448,11 +448,11 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // walker emits the outer node before recursing, that's the longest,
     // outermost span. Self-correcting: once span preservation gives links
     // distinct starts, they survive on their own again.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     out.retain(|d| seen.insert((d.span.file, d.span.start, d.code(), d.message.clone())));
     // A template no request reaches (`ingest::unreachable_views`): its errors stay visible, as warnings.
     if !app.unreachable_views.is_empty() {
-        let files: std::collections::HashSet<crate::span::FileId> = app
+        let files: crate::det::HashSet<crate::span::FileId> = app
             .views
             .iter()
             .filter(|v| app.unreachable_views.contains(&v.name))
@@ -499,7 +499,7 @@ fn runtime_defined_surfaces(app: &App) -> Vec<Diagnostic> {
 fn overridden_synthesized_accessors(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for model in &app.models {
-        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut taken: crate::det::HashSet<String> = crate::det::HashSet::default();
         for item in &model.body {
             if let crate::dialect::ModelBodyItem::Association { assoc, .. } = item {
                 taken.insert(assoc.name().as_str().to_string());
@@ -532,7 +532,7 @@ fn overridden_synthesized_accessors(app: &App) -> Vec<Diagnostic> {
 /// An `app/helpers` module runs in the view, so it is checked as one,
 /// not under the library policy.
 pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
-    let helper_modules: std::collections::HashSet<&crate::ident::ClassId> = app.helper_method_index.values().chain(app.helper_modules.iter()).collect();
+    let helper_modules: crate::det::HashSet<&crate::ident::ClassId> = app.helper_method_index.values().chain(app.helper_modules.iter()).collect();
     let mut helper_out = Vec::new();
     for class in app.library_classes.iter().filter(|c| helper_modules.contains(&c.name)) {
         for method in &class.methods {
@@ -656,7 +656,7 @@ pub fn unknown_receiver_sends(app: &App, classes: &HashMap<ClassId, ClassInfo>) 
     }
     let mut out = Vec::new();
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, classes, &mut out));
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     out.retain(|s| seen.insert((s.span.file, s.span.start, s.span.end, s.method.clone())));
     out
 }

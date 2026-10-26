@@ -57,17 +57,17 @@ const RECORD: &str = "record";
 pub struct Registry {
     /// Methods that mutate `record` and return it (no value return) —
     /// a self-call statement `m` becomes `record = m(record)`.
-    pub record_returning: std::collections::HashSet<String>,
+    pub record_returning: crate::det::HashSet<String>,
     /// Mutate-AND-return-value methods (`save`/`valid?`) DEFINED in this
     /// class that emit a `{record, value}` tuple — a self-call
     /// destructures the tuple (`{record, ok} = m(record)`).
-    pub dual_return: std::collections::HashSet<String>,
+    pub dual_return: crate::det::HashSet<String>,
     /// Dual methods defined in OTHER classes that this class CALLS on a
     /// typed field/local (a controller's `@article.save`/`.update`). Used
     /// only to destructure those call sites — NOT to classify a same-named
     /// method defined here (the controller's own `update` action is not
     /// dual just because the model's `update` is).
-    pub external_dual: std::collections::HashSet<String>,
+    pub external_dual: crate::det::HashSet<String>,
 }
 
 impl Registry {
@@ -167,7 +167,7 @@ pub fn compute_registry(methods: &[MethodDef]) -> Registry {
 /// `destroy`) so a controller's field-receiver call sites
 /// (`@article.save`) destructure the tuple — see
 /// [`functionalize_with_external_duals`](super::functionalize_with_external_duals).
-pub fn dual_method_names(methods: &[MethodDef]) -> std::collections::HashSet<String> {
+pub fn dual_method_names(methods: &[MethodDef]) -> crate::det::HashSet<String> {
     let after_while: Vec<_> = methods
         .iter()
         .cloned()

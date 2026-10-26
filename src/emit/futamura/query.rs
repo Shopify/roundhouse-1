@@ -32,7 +32,7 @@
 //! may have a `default_scope` is never specialized: ingest does not model
 //! it, so the generated root `where` could not be trusted to be complete.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{Association, Model, ModelBodyItem, Scope};
@@ -109,7 +109,7 @@ pub struct Specializer<'a> {
 impl<'a> Specializer<'a> {
     pub fn new(app: &'a App) -> Self {
         let models = app.models.iter().map(|m| (m.name.0.as_str(), m)).collect();
-        let mut int_consts: HashMap<String, Option<i64>> = HashMap::new();
+        let mut int_consts: HashMap<String, Option<i64>> = HashMap::default();
         for (name, value) in app.library_classes.iter().flat_map(|lc| lc.constants.iter()) {
             if let ExprNode::Lit { value: Literal::Int { value } } = &*value.node {
                 let entry = int_consts.entry(name.as_str().to_string()).or_insert(Some(*value));
@@ -140,14 +140,14 @@ impl<'a> Specializer<'a> {
     /// Every query site in a method body: specialized, or left with a reason.
     /// `owner`: the model whose method this is, for its receiverless column reads.
     pub fn method_body(&self, owner: Option<&str>, body: &Expr, sites: &mut Vec<Site>, residue: &mut Vec<Residue>) {
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         collect_locals(body, &mut locals);
         let cx = Cx {
             locals: &locals,
             depth: Default::default(),
-            args: HashMap::new(),
-            arg_tys: HashMap::new(),
-            array_args: HashSet::new(),
+            args: HashMap::default(),
+            arg_tys: HashMap::default(),
+            array_args: HashSet::default(),
             self_chain: None,
             owner,
         };
@@ -450,9 +450,9 @@ impl<'a> Specializer<'a> {
             }
             _ => &scope.body,
         };
-        let mut bound = HashMap::new();
-        let mut bound_tys = HashMap::new();
-        let mut array_args = HashSet::new();
+        let mut bound = HashMap::default();
+        let mut bound_tys = HashMap::default();
+        let mut array_args = HashSet::default();
         for (p, a) in scope.params.iter().zip(args) {
             bound.insert(p.name.clone(), self.value(a, cx)?);
             bound_tys.insert(p.name.clone(), cx.ty_of(a));

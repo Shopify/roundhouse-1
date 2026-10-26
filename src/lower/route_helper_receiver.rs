@@ -70,7 +70,7 @@
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 /// Route helpers `RouteHelpers` answers that no app route declares —
 /// mounted engines. Kept in step with the `module RouteHelpers` reopen

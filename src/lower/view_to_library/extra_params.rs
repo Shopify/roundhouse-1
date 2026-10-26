@@ -7,7 +7,7 @@
 //! through [`rewritten_extras`] so the three sites cannot disagree.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::dialect::View;
 use crate::expr::{Expr, ExprNode, InterpPart, LValue};

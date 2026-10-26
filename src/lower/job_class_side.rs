@@ -693,7 +693,7 @@ const SIDEKIQ_CLASS_MACROS: &[&str] = &["sidekiq_options", "sidekiq_retry_in", "
 /// Library classes that include a Sidekiq worker module, or descend from
 /// one that does (mastodon's `UpdateDistributionWorker < RawDistributionWorker`).
 fn sidekiq_workers(app: &App) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     let mut out = BTreeSet::new();
     for lc in &app.library_classes {
@@ -711,7 +711,7 @@ fn sidekiq_workers(app: &App) -> BTreeSet<String> {
 }
 
 fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     let mut out = BTreeSet::new();
     for name in workers {
@@ -755,7 +755,7 @@ fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTr
 /// treated the same as an unresolved include: it may provide
 /// `perform`, so the worker is not stripped as abstract.
 fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
 
     fn defines_instance_perform(c: &crate::dialect::LibraryClass) -> bool {
@@ -777,8 +777,8 @@ fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<S
     // than being silently stripped.
     fn include_provides_perform(
         id: &crate::ident::ClassId,
-        by_name: &std::collections::HashMap<&str, &crate::dialect::LibraryClass>,
-        seen: &mut std::collections::HashSet<crate::ident::ClassId>,
+        by_name: &crate::det::HashMap<&str, &crate::dialect::LibraryClass>,
+        seen: &mut crate::det::HashSet<crate::ident::ClassId>,
     ) -> bool {
         if SIDEKIQ_MODULES.contains(&id.0.as_str()) {
             return false;
@@ -796,7 +796,7 @@ fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<S
     let mut out = BTreeSet::new();
     for name in workers {
         let mut cur = by_name.get(name.as_str()).copied();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         for _ in 0..32 {
             let Some(c) = cur else { break };
             let found = defines_instance_perform(c)
@@ -823,7 +823,7 @@ fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<S
 }
 
 fn without_delayed_enqueue_overrides(app: &App, wrapped: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     wrapped
         .iter()

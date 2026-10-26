@@ -4,7 +4,8 @@
 //! `synthesize_implicit_render` so the synthesized symbol-form render
 //! shows up here as a plain `Send`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 
 use crate::dialect::Action;
 use crate::expr::{ArrayStyle, Expr, ExprNode, LValue, Literal};
@@ -1211,10 +1212,10 @@ pub(super) fn rewrite_assoc_through_parent_typed(
         helper_specs.iter().map(|(name, spec)| (name.clone(), spec.class_id.clone())).collect(),
         params_specs,
     );
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     collect_build_local_names(expr, &mut names);
     let names = std::cell::RefCell::new(names);
-    let mut expression_assigns = HashSet::new();
+    let mut expression_assigns = HashSet::default();
     collect_expression_assigns(expr, true, &mut expression_assigns);
     map_expr(expr, &|e| {
         let ExprNode::Assign { target, value } = &*e.node else {
@@ -2388,7 +2389,7 @@ fn sym_or_str_arg(arg: &Expr) -> Option<String> {
 
 pub(super) fn rewrite_redirect_to(
     expr: &Expr,
-    route_helpers: &std::collections::HashMap<String, Vec<bool>>,
+    route_helpers: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, .. }
@@ -2645,7 +2646,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
 pub fn rewrite_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     rewrite_route_helpers_with(expr, shadowed, id_segments, false)
 }
@@ -2666,7 +2667,7 @@ pub fn rewrite_route_helpers(
 pub fn rewrite_controller_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     rewrite_route_helpers_with(expr, shadowed, id_segments, true)
 }
@@ -2674,7 +2675,7 @@ pub fn rewrite_controller_route_helpers(
 fn rewrite_route_helpers_with(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
     absolute_urls: bool,
 ) -> Expr {
     let expr = &strip_url_helpers_receiver(expr);
@@ -2867,7 +2868,7 @@ fn rewrite_route_helpers_with(
 pub fn route_helper_query_splat_index(
     method: &str,
     args: &[Expr],
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Option<usize> {
     let dispatch = method
         .strip_suffix("_url")

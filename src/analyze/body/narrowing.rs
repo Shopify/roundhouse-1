@@ -342,8 +342,8 @@ pub(super) fn narrow_locals(
     pred: &NarrowPred,
     then_branch: bool,
     current: &dyn Fn(&Symbol) -> Option<Ty>,
-) -> std::collections::HashMap<Symbol, Ty> {
-    let mut out = std::collections::HashMap::new();
+) -> crate::det::HashMap<Symbol, Ty> {
+    let mut out = crate::det::HashMap::default();
     narrowings(pred, then_branch, &mut |key, narrow| {
         if let VarKey::Local(name) = key {
             if let Some(ty) = out.get(name).cloned().or_else(|| current(name)) {
@@ -569,7 +569,7 @@ pub(super) fn drop_unstable_members(ctx: &mut Ctx, scope: &[&Expr]) {
     if !ctx.local_bindings.keys().any(|k| k.as_str().contains('.')) {
         return;
     }
-    let mut touched: std::collections::HashSet<Symbol> = Default::default();
+    let mut touched: crate::det::HashSet<Symbol> = Default::default();
     for e in scope {
         collect_touched_locals(e, &mut touched);
     }
@@ -586,8 +586,8 @@ pub(super) fn drop_unstable_members(ctx: &mut Ctx, scope: &[&Expr]) {
 /// Locals that `e` rebinds (assignment, block/let parameter, pattern or rescue
 /// binding) or writes through (`x.attr = v`, `x.reload`, `x.update(…)`,
 /// any bang method).
-fn collect_touched_locals(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
-    fn lvalue(t: &LValue, out: &mut std::collections::HashSet<Symbol>) {
+fn collect_touched_locals(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+    fn lvalue(t: &LValue, out: &mut crate::det::HashSet<Symbol>) {
         if let LValue::Var { name, .. } = t {
             out.insert(name.clone());
         }

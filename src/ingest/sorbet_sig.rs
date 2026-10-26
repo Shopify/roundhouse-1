@@ -18,7 +18,7 @@
 //! `spinel_rbs_extract` drops RBS it cannot represent. Dropping is a
 //! no-op; guessing is not.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use ruby_prism::Node;
 
@@ -42,22 +42,22 @@ pub fn ingest_sorbet_declarations(
     source: &[u8],
 ) -> (
     HashMap<ClassId, HashMap<Symbol, Ty>>,
-    HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    HashMap<ClassId, crate::det::HashSet<Symbol>>,
 ) {
     let result = super::prism::parse_silent(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else {
-        return (HashMap::new(), HashMap::new());
+        return (HashMap::default(), HashMap::default());
     };
-    let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
-    let mut abstracts = HashMap::new();
-    let mut sides = MethodSides::new();
+    let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+    let mut abstracts = HashMap::default();
+    let mut sides = MethodSides::default();
     walk(
         &program.statements().body().iter().collect::<Vec<_>>(),
         None,
         false,
-        &HashMap::new(),
-        &HashMap::new(),
+        &HashMap::default(),
+        &HashMap::default(),
         &mut out,
         &mut abstracts,
         &mut sides,
@@ -97,7 +97,7 @@ fn walk(
     aliases: &HashMap<String, Ty>,
     rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
-    abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    abstracts: &mut HashMap<ClassId, crate::det::HashSet<Symbol>>,
     sides: &mut MethodSides,
     source: &[u8],
 ) {
@@ -238,7 +238,7 @@ fn collect_struct_properties(
         let Some(arguments) = call.arguments() else { continue };
         let mut arguments = arguments.arguments().iter();
         let Some(name) = arguments.next().and_then(|n| symbol_name(&n)) else { continue };
-        let Some(ty) = arguments.next().and_then(|n| sorbet_ty(&n, true, &HashMap::new())) else { continue };
+        let Some(ty) = arguments.next().and_then(|n| sorbet_ty(&n, true, &HashMap::default())) else { continue };
         let reader = Ty::Fn {
             params: Vec::new().into(),
             block: None,
@@ -420,7 +420,7 @@ fn signature_ty(
     let body = body.as_statements_node()?;
     let declaration = body.body().iter().next()?;
 
-    let mut declared: HashMap<String, Ty> = HashMap::new();
+    let mut declared: HashMap<String, Ty> = HashMap::default();
     let mut returns: Option<Ty> = None;
     let mut saw_return_clause = false;
     // `params(...).returns(X)`, `void`, `override.returns(X)`,
@@ -1041,5 +1041,5 @@ fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
 /// A Sorbet type expression (`T.nilable(Foo)`, `T::Array[String]`, ...)
 /// read as a `Ty`, for `T.let(x, Type)`.
 pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
-    sorbet_ty(node, true, &HashMap::new())
+    sorbet_ty(node, true, &HashMap::default())
 }

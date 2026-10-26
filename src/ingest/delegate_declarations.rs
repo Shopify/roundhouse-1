@@ -4,7 +4,7 @@ use super::*;
 use crate::dialect::MethodVisibility;
 use crate::expr::{ExprNode, Literal};
 use crate::ident::Symbol;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 /// One expanded `delegate` entry: `<name>` forwards to `<target>.<method>`.
 pub(super) struct Delegation {
@@ -72,7 +72,7 @@ impl<'a> DelegateEligibility<'a> {
             supported_target_methods,
             method_targets,
             sources,
-            visibility_cache: HashMap::new(),
+            visibility_cache: HashMap::default(),
         }
     }
 
@@ -365,7 +365,7 @@ pub(super) fn names_called_with_arguments(
     methods: &[MethodDef],
     additional_method_bodies: &[Expr],
 ) -> CallsWithArguments {
-    let mut out = CallsWithArguments::new();
+    let mut out = CallsWithArguments::default();
     // Class-side bodies cannot call these instance delegates without an
     // explicit receiver, so only instance methods constrain forwarding.
     for method in methods

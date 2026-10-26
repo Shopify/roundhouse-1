@@ -13,7 +13,7 @@
 //! `check` does not apply post-analyze passes, so this is the path
 //! both check and emit share.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::App;
 use crate::dialect::{MethodDef, ModelBodyItem, Association};
@@ -30,7 +30,7 @@ use super::{
 pub(crate) fn restore_anonymous_forward_contracts(app: &mut App, resolver: &ConstResolver) {
     let actions = controller_defs(app);
     let contracts = SourceContractIndex::new(app, &actions);
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for (owner, method) in methods(app).chain(actions.iter().map(|(c, m)| (c, m))) {
         note_anonymous_restores(app, resolver, &contracts, owner, method, &method.body, &mut spans);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {

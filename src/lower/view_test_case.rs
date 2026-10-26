@@ -43,14 +43,14 @@ use crate::app::App;
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 const VIEW_TEST_CASE: &str = "ActionView::TestCase";
 
 pub fn apply_view_test_case_lowering(app: &mut App) -> Vec<Diagnostic> {
     let index: HashMap<Symbol, ClassId> = app.helper_method_index.clone();
     // Each app module's own methods, for the bare-call half below.
-    let module_methods: HashMap<ClassId, std::collections::HashSet<Symbol>> = app
+    let module_methods: HashMap<ClassId, crate::det::HashSet<Symbol>> = app
         .library_classes
         .iter()
         .filter(|lc| lc.is_module)
@@ -69,7 +69,7 @@ pub fn apply_view_test_case_lowering(app: &mut App) -> Vec<Diagnostic> {
         // ancestor order has it; the test's own methods win over all.
         let mut bare_modules: Vec<ClassId> = tm.includes.iter().rev().cloned().collect();
         bare_modules.extend(tm.target.iter().cloned());
-        let own: std::collections::HashSet<Symbol> =
+        let own: crate::det::HashSet<Symbol> =
             tm.helpers.iter().map(|m| m.name.clone()).collect();
         let bare: HashMap<Symbol, ClassId> = bare_modules
             .iter()

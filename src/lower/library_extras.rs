@@ -11,7 +11,7 @@
 //! body-typer's `Const { path }` resolver instantiates by `path.last()`,
 //! so the alias keeps bare references resolvable.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::dialect::{LibraryClass, LibraryFunction};
@@ -21,7 +21,7 @@ use crate::ident::{ClassId, Symbol};
 /// from the same dir share a `Views::X` ClassId), then register each
 /// group under both its full ClassId and its last-segment alias.
 pub fn extras_from_lcs(lcs: &[LibraryClass]) -> Vec<(ClassId, ClassInfo)> {
-    let mut grouped: HashMap<ClassId, ClassInfo> = HashMap::new();
+    let mut grouped: HashMap<ClassId, ClassInfo> = HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = crate::lower::class_info_from_library_class(lc);
@@ -57,7 +57,7 @@ pub fn extras_from_lcs(lcs: &[LibraryClass]) -> Vec<(ClassId, ClassInfo)> {
 /// function becomes a class-method entry whose Ty is the function's
 /// signature.
 pub fn extras_from_funcs(funcs: &[LibraryFunction]) -> Vec<(ClassId, ClassInfo)> {
-    let mut grouped: HashMap<ClassId, ClassInfo> = HashMap::new();
+    let mut grouped: HashMap<ClassId, ClassInfo> = HashMap::default();
     for func in funcs {
         let raw = func
             .module_path

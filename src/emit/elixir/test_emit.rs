@@ -85,7 +85,7 @@ fn known_models(app: &App) -> Vec<Symbol> {
 /// `*` and the model's dual-return `save` (`{record, _} = …`); the
 /// saved record carries its assigned id, so `register` uses `record.id`
 /// rather than `Roundhouse.Db.last_insert_rowid()`.
-fn emit_fixture(lowered: &crate::lower::LoweredFixture, temporal: &std::collections::HashMap<Symbol, bool>) -> EmittedFile {
+fn emit_fixture(lowered: &crate::lower::LoweredFixture, temporal: &crate::det::HashMap<Symbol, bool>) -> EmittedFile {
     let fixture_name = lowered.name.as_str();
     let class_name = lowered.class.0.as_str();
     let ns = camelize(fixture_name);

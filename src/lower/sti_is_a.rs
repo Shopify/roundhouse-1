@@ -43,7 +43,7 @@
 //! column. `x.is_a?(String)`, `image.is_a?(Symbol)` and every other
 //! ordinary type test are left exactly alone.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -79,7 +79,7 @@ pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, Vec<String>> {
     }
     let chains: HashMap<&ClassId, Vec<&ClassId>> =
         bases.keys().map(|other| (other, ancestors(&lc_parent, other))).collect();
-    let mut names: HashMap<ClassId, Vec<String>> = HashMap::new();
+    let mut names: HashMap<ClassId, Vec<String>> = HashMap::default();
     for sub in bases.keys() {
         let mut set: Vec<String> = vec![sub.0.as_str().to_string()];
         for other in bases.keys() {

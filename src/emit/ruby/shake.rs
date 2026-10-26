@@ -35,7 +35,7 @@
 //!
 //! Kill switch: `ROUNDHOUSE_NO_TREESHAKE=1` skips the pass entirely.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 /// Methods Ruby (or the runtime idiom) dispatches without a textual
 /// call site: constructors via `.new`, `to_s` via interpolation,
@@ -306,7 +306,7 @@ pub fn shake_tree(
             || (path.ends_with(".rb")
                 && (is_framework_runtime(path) || path.starts_with("app/models/")))
     }).collect();
-    let mut stable_usage: HashSet<String> = HashSet::new();
+    let mut stable_usage: HashSet<String> = HashSet::default();
     let mut total_runtime = 0usize;
     let mut total_synth = 0usize;
     for pass in 0..10 {
@@ -316,8 +316,8 @@ pub fn shake_tree(
         // names, so these borrows end before any file is rewritten.
         // Only membership matters: occurrence counts and per-line
         // deduplication do not affect whether a method is unreachable.
-        let mut usage = HashSet::new();
-        let mut stable_tokens = HashSet::new();
+        let mut usage = HashSet::default();
+        let mut stable_tokens = HashSet::default();
         for ((path, content), &rescan) in files.iter().zip(&rescan) {
             let is_rb = path.ends_with(".rb") || path.ends_with(".ru");
             if !rescan && (pass != 0 || !is_rb) {
@@ -345,7 +345,7 @@ pub fn shake_tree(
             if !runtime && !model {
                 continue;
             }
-            let mut dead: HashSet<String> = HashSet::new();
+            let mut dead: HashSet<String> = HashSet::default();
             for line in content.lines() {
                 if let Some(name) = def_line_name(line) {
                     if EXEMPT.contains(&name) {
@@ -410,21 +410,21 @@ mod tests {
 
     #[test]
     fn borrowed_tokens_preserve_suffixes_operator_boundaries_and_line_deduplication() {
-        let mut found = HashSet::new();
+        let mut found = HashSet::default();
         tokens("ready! ready!=other next? next? _keep", &mut found, None);
         assert_eq!(
             found,
-            HashSet::from(["ready!", "ready", "other", "next?", "_keep"])
+            HashSet::from_iter(["ready!", "ready", "other", "next?", "_keep"])
         );
     }
 
     #[test]
     fn definition_exclusion_keeps_prior_roots_and_other_calls_on_the_same_line() {
-        let mut found = HashSet::new();
+        let mut found = HashSet::default();
         tokens("kept", &mut found, None);
         tokens("def kept; kept; leaf; end", &mut found, Some("kept"));
         tokens("def orphan; orphan; twig; end", &mut found, Some("orphan"));
-        assert_eq!(found, HashSet::from(["kept", "def", "leaf", "end", "twig"]));
+        assert_eq!(found, HashSet::from_iter(["kept", "def", "leaf", "end", "twig"]));
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
             ("app/entry.rb".into(), "Probe.live!\ndeadly\n# mentioned? is a textual root\n".into()),
         ];
         let entry = files[2].clone();
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(
             files[0].1,
             "module Probe\n  def live!; 3; end\n  def mentioned?; 4; end\n  def initialize; 7; end\nend\n"
@@ -477,7 +477,7 @@ mod tests {
             ("runtime/rails.rb".into(), "class App\n  def from_rack; 1; end\n  def unused; 2; end\nend\n".into()),
             ("config.ru".into(), "HEADERS = App.new.from_rack\nrun ->(env) { [200, {}, []] }\n".into()),
         ];
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(files[0].1, "class App\n  def from_rack; 1; end\nend\n");
     }
 
@@ -492,7 +492,7 @@ mod tests {
              "# external! is a textual root\ndef generated?; false; end\n".into()),
         ];
         let roots = files[2].clone();
-        let synth = HashSet::from(["generated?".into()]);
+        let synth = HashSet::from_iter(["generated?".into()]);
         shake_tree(&mut files, &synth, "test");
         assert_eq!(files[0].1, "module Probe\n  def external!; 1; end\nend\n");
         assert_eq!(files[1].1, "class Probe\n  def user_method; 4; end\nend\n");
@@ -512,7 +512,7 @@ mod tests {
             ("sig/runtime/active_record/probe.rbs".into(),
              "module Probe\n  def stale: () -> Integer # orphan\n           | () -> String # leaf\n  def orphan: () -> Integer\n  def leaf: () -> Integer\nend\n".into()),
         ];
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(files[0].1, "module Probe\nend\n");
         assert_eq!(files[1].1, "module Probe\nend\n");
     }
@@ -525,7 +525,7 @@ mod tests {
         }
         body.push_str("  def step10; 7; end\nend\n");
         let mut files = vec![("runtime/active_record/probe.rb".into(), body)];
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(files[0].1, "module Probe\n  def step10; 7; end\nend\n");
     }
 }

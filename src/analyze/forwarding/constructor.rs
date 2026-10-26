@@ -4,7 +4,7 @@
 //! flattened parameter signature: custom class-side `new`, mixins, mutation
 //! hooks and method-lookup edits can all invalidate the default forwarder.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver};
@@ -57,7 +57,7 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
                     owner,
                     &Symbol::from("new"),
                     MethodReceiver::Instance,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 )
                 .is_some()
         })
@@ -72,7 +72,7 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
                     owner,
                     &Symbol::from("initialize"),
                     MethodReceiver::Instance,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 )
                 .is_some()
         })
@@ -83,7 +83,7 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
     // anything may replace `new` itself. An own `initialize` shadows what a
     // mixin supplies, never what replaces `new`
     // (`shadows_supplied_initialize`).
-    let no_initializers = HashSet::new();
+    let no_initializers = HashSet::default();
     for question in [Question::NewOrInitialize, Question::New] {
         let modules_with_custom_initialize = match question {
             Question::NewOrInitialize => &modules_with_custom_initialize,
@@ -151,7 +151,7 @@ fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
                 && (target == full || full.ends_with(&format!("::{target}")) || target.ends_with(&format!("::{full}")))
         })
     };
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for class in super::classes(app).filter(|class| !class.is_module) {
         let defs: Vec<&MethodDef> = class
             .methods
@@ -284,7 +284,7 @@ fn initial_mutating_hook_modules(
     known_modules
         .iter()
         .filter(|module| {
-            !module_graph_is_complete(index, module, known_modules, question, &mut HashSet::new())
+            !module_graph_is_complete(index, module, known_modules, question, &mut HashSet::default())
         })
         .cloned()
         .collect()
@@ -481,20 +481,20 @@ fn constructor_contract<'a>(
     contracts: &SourceContractIndex<'a>,
     owner: &ClassId,
 ) -> Option<ConstructorContract<'a>> {
-    if !contracts.verified_hierarchy(owner, &mut HashSet::new()) {
+    if !contracts.verified_hierarchy(owner, &mut HashSet::default()) {
         return Some(ConstructorContract::UnknownLookup);
     }
     // `new` itself may be replaced: no own `initialize` changes that.
     // Otherwise only a mixin's `initialize` is unmodeled, and the owner's
     // own plain one, which never passes the call on, shadows it.
-    let unmodeled = inherits_unmodeled_constructor_lookup(contracts, owner, Question::New, &mut HashSet::new())
-        || (inherits_unmodeled_constructor_lookup(contracts, owner, Question::NewOrInitialize, &mut HashSet::new())
+    let unmodeled = inherits_unmodeled_constructor_lookup(contracts, owner, Question::New, &mut HashSet::default())
+        || (inherits_unmodeled_constructor_lookup(contracts, owner, Question::NewOrInitialize, &mut HashSet::default())
             && !contracts.shadowing_initializers.contains(owner));
     if unmodeled {
         // An unmodeled mixin with no source constructor anywhere in the
         // modeled lookup chain: nothing was flattened that a verbatim
         // keyword call could mis-bind to, so keep the call as written.
-        if !declares_source_constructor(contracts, owner, &mut HashSet::new()) {
+        if !declares_source_constructor(contracts, owner, &mut HashSet::default()) {
             return None;
         }
         return Some(ConstructorContract::UnknownLookup);
@@ -503,7 +503,7 @@ fn constructor_contract<'a>(
         owner,
         &Symbol::from("new"),
         MethodReceiver::Class,
-        &mut HashSet::new(),
+        &mut HashSet::default(),
     ) {
         return Some(ConstructorContract::CustomNew(Some(method)));
     }
@@ -712,8 +712,8 @@ impl ConstructorOwnerAliases {
 pub(super) fn constructor_owner_aliases(
     owners: impl Iterator<Item = ClassId>,
 ) -> ConstructorOwnerAliases {
-    let mut exact: HashMap<String, HashSet<ClassId>> = HashMap::new();
-    let mut suffixes: HashMap<String, HashSet<ClassId>> = HashMap::new();
+    let mut exact: HashMap<String, HashSet<ClassId>> = HashMap::default();
+    let mut suffixes: HashMap<String, HashSet<ClassId>> = HashMap::default();
     for owner in owners {
         exact
             .entry(owner.0.as_str().to_string())
@@ -835,7 +835,7 @@ fn mutates_constructor_lookup_method(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use crate::det::HashSet;
 
     use super::constructor_owner_aliases;
     use crate::ident::{ClassId, Symbol};
@@ -851,12 +851,12 @@ mod tests {
             .resolve("A::Item", false)
             .map(|owner| owner.0.as_str())
             .collect();
-        assert_eq!(relative, HashSet::from(["A::Item", "Outer::A::Item"]));
+        assert_eq!(relative, HashSet::from_iter(["A::Item", "Outer::A::Item"]));
         let short: HashSet<_> = aliases
             .resolve("Item", false)
             .map(|owner| owner.0.as_str())
             .collect();
-        assert_eq!(short, HashSet::from(["A::Item", "Outer::A::Item"]));
+        assert_eq!(short, HashSet::from_iter(["A::Item", "Outer::A::Item"]));
         let rooted: Vec<_> = aliases
             .resolve("A::Item", true)
             .map(|owner| owner.0.as_str())

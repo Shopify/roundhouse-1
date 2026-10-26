@@ -11,7 +11,7 @@
 //! the delegate. Other targets have no relation to hand on, and are
 //! refused by name at emit (`project::report_relation_class_calls`).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::MethodReceiver;
@@ -22,7 +22,7 @@ use crate::ty::Ty;
 
 /// Each spliced class method name, with the one model that has it.
 pub fn spliced_owners(app: &App) -> HashMap<Symbol, ClassId> {
-    let mut owners: HashMap<Symbol, HashSet<ClassId>> = HashMap::new();
+    let mut owners: HashMap<Symbol, HashSet<ClassId>> = HashMap::default();
     for model in &app.models {
         for m in model.methods().filter(|m| m.receiver == MethodReceiver::Class && app.spliced_class_methods.contains(&m.name)) {
             owners.entry(m.name.clone()).or_default().insert(model.name.clone());

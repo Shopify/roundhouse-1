@@ -37,7 +37,7 @@
 //! keep no declarations, so constructing one is reported, not emitted to
 //! fail.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{LibraryClass, LibraryClassOrigin, MethodReceiver};
@@ -116,7 +116,7 @@ pub(super) fn lower_dry_initializers(app: &mut App, sources: &[crate::span::Sour
         .iter()
         .map(|lc| lc.name.0.as_str().to_string())
         .collect();
-    let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+    let mut parent_of: HashMap<String, Option<String>> = HashMap::default();
     for lc in &app.library_classes {
         if !lc.is_module && lc.unknown_calls.iter().any(extends_initializer) {
             parent_of.insert(lc.name.0.as_str().to_string(), None);
@@ -160,8 +160,8 @@ pub(super) fn lower_dry_initializers(app: &mut App, sources: &[crate::span::Sour
     // an option its parent's names.
     let mut order: Vec<String> = parent_of.keys().cloned().collect();
     order.sort_by_key(|n| chain_of(n).len());
-    let mut read: HashMap<String, Vec<Declared>> = HashMap::new();
-    let mut refused: HashSet<String> = HashSet::new();
+    let mut read: HashMap<String, Vec<Declared>> = HashMap::default();
+    let mut refused: HashSet<String> = HashSet::default();
     for name in &order {
         let lc = app
             .library_classes
@@ -201,8 +201,8 @@ pub(super) fn lower_dry_initializers(app: &mut App, sources: &[crate::span::Sour
 
     // Build every class's methods before committing to any.
     let mut built: HashMap<String, (Vec<crate::dialect::MethodDef>, Vec<(Symbol, Expr)>)> =
-        HashMap::new();
-    let mut failed: HashSet<String> = HashSet::new();
+        HashMap::default();
+    let mut failed: HashSet<String> = HashSet::default();
     for (name, declared) in &read {
         if chain_of(name).iter().any(|n| refused.contains(n)) {
             continue;

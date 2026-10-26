@@ -71,7 +71,7 @@
 //! `as_json` is outside the two idioms or has a value with no encoding
 //! here (a nested record, a Hash).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -94,9 +94,9 @@ pub fn apply_as_json_synthesis(app: &mut App, registry: &HashMap<ClassId, ClassI
     // the pass was silently inert.
     // The classes given a writer, so the call sites below rewrite for
     // exactly those and no other.
-    let mut written: HashSet<ClassId> = HashSet::new();
+    let mut written: HashSet<ClassId> = HashSet::default();
     let option_sites = serialize_option_sites(app);
-    let mut variants: HashSet<(ClassId, String)> = HashSet::new();
+    let mut variants: HashSet<(ClassId, String)> = HashSet::default();
     for model in &mut app.models {
         if !wanted.contains(&model.name) {
             continue;
@@ -260,9 +260,9 @@ fn settle_representable_writers(
     registry: &HashMap<ClassId, ClassInfo>,
 ) -> HashSet<ClassId> {
     use crate::dialect::LibraryClassOrigin;
-    let mut valid: HashSet<ClassId> = HashSet::new();
+    let mut valid: HashSet<ClassId> = HashSet::default();
     let mut nested_on: Vec<(ClassId, ClassId)> = Vec::new();
-    let mut renames: HashMap<ClassId, Vec<Symbol>> = HashMap::new();
+    let mut renames: HashMap<ClassId, Vec<Symbol>> = HashMap::default();
     for lc in &app.library_classes {
         let Some(LibraryClassOrigin::RepresentableDecorator { fields, .. }) = &lc.origin else { continue };
         let mut ok = true;
@@ -693,7 +693,7 @@ fn as_json_str_method(owner: &ClassId, readers: &[Symbol]) -> MethodDef {
 /// calls plus a payload still rendered as `to_s` — two failures for one
 /// guess.
 fn json_rendered_classes(app: &App) -> HashSet<ClassId> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut to_json_ids = Vec::new();
     let mut collect = |e: &Expr| {
         walk(e, &mut |e| {
@@ -854,7 +854,7 @@ fn variant_text(value: &Expr, opts: &super::as_json_record::SerializeOpts, varia
 
 /// Each class's `only:`/`except:`/`methods:` sets, from `render json:` and `to_json` sites, for the demand gate.
 fn serialize_option_sites(app: &App) -> HashMap<ClassId, HashSet<super::as_json_record::SerializeOpts>> {
-    let mut out: HashMap<ClassId, HashSet<super::as_json_record::SerializeOpts>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<super::as_json_record::SerializeOpts>> = HashMap::default();
     let mut note = |value: &Expr, entries: &[(Expr, Expr)], ignore: &[&str]| {
         let Ok(Some(opts)) = super::as_json_record::SerializeOpts::read(entries, ignore) else { return };
         if let Some((id, _)) = value.ty.as_ref().and_then(rendered_class) {

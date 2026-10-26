@@ -1,6 +1,6 @@
 // Not a fixed hook list like `CallbackHook`: an app or gem names its own events, so each chain is built as Rails builds it.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{Model, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -311,8 +311,8 @@ fn buildable(
 
 pub(super) fn expand_model_callbacks(app: &mut crate::App) {
     let parents: HashMap<ClassId, ClassId> = app.models.iter().filter_map(|m| Some((m.name.clone(), m.parent.clone()?))).collect();
-    let mut declared: HashMap<ClassId, indexmap::IndexMap<Symbol, Event>> = HashMap::new();
-    let mut runners: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut declared: HashMap<ClassId, indexmap::IndexMap<Symbol, Event>> = HashMap::default();
+    let mut runners: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     let mut order: Vec<usize> = (0..app.models.len()).collect();
     let depth = |m: &Model| {
         let mut d = 0;

@@ -78,7 +78,7 @@
 //! too; the literal is exactly what Ruby's `defined?` returns for a
 //! constant that exists/doesn't, so behaviour is unchanged.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{BoolOpKind, Expr, ExprNode, Literal};
@@ -211,7 +211,7 @@ struct Facts {
 
 impl Facts {
     fn of(app: &App) -> Facts {
-        let mut tree: HashSet<String> = HashSet::new();
+        let mut tree: HashSet<String> = HashSet::default();
         for m in &app.models {
             tree.insert(m.name.0.as_str().to_string());
         }
@@ -226,7 +226,7 @@ impl Facts {
             tree.insert(name);
         }
         let mut tree_and_prefixes = tree.clone();
-        let mut segments = HashSet::new();
+        let mut segments = HashSet::default();
         for name in &tree {
             let mut acc = String::new();
             for seg in name.split("::") {
@@ -395,8 +395,8 @@ struct LoadTimeRoots {
 
 impl LoadTimeRoots {
     fn of(app: &App) -> LoadTimeRoots {
-        let mut class_stmts: HashSet<usize> = HashSet::new();
-        let mut load_time: HashSet<usize> = HashSet::new();
+        let mut class_stmts: HashSet<usize> = HashSet::default();
+        let mut load_time: HashSet<usize> = HashSet::default();
         for m in &app.models {
             for item in &m.body {
                 if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {

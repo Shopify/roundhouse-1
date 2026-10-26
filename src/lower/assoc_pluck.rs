@@ -99,10 +99,10 @@ pub fn apply_assoc_pluck_lowering(app: &mut App) {
 /// plain on one model and `:through` on another is EXCLUDED rather than
 /// guessed at — being wrong in the Relation direction costs a
 /// single-column SELECT, and this pass is not worth that.
-pub(crate) fn materialized_assoc_names(app: &App) -> std::collections::HashSet<Symbol> {
+pub(crate) fn materialized_assoc_names(app: &App) -> crate::det::HashSet<Symbol> {
     use crate::lower::model_associations::AssocKind;
-    let mut plain = std::collections::HashSet::new();
-    let mut relational = std::collections::HashSet::new();
+    let mut plain = crate::det::HashSet::default();
+    let mut relational = crate::det::HashSet::default();
     for edge in crate::lower::model_associations::compute_association_graph(app) {
         // `through` is carried as a FIELD as well as a kind, and the
         // graph does not always spell the kind `HasManyThrough` — a
@@ -127,12 +127,12 @@ pub(crate) fn materialized_assoc_names(app: &App) -> std::collections::HashSet<S
     plain
 }
 
-fn rewrite(expr: &mut Expr, materialized: &std::collections::HashSet<Symbol>) {
+fn rewrite(expr: &mut Expr, materialized: &crate::det::HashSet<Symbol>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, materialized));
     rewrite_node(expr, materialized);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &std::collections::HashSet<Symbol>) {
+pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &crate::det::HashSet<Symbol>) {
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else { return };
     let Some(cols) = crate::analyze::assoc_pluck::reader_columns(recv, method, args, block.as_ref(), materialized) else { return };
     let span = expr.span;

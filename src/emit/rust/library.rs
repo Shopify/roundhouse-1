@@ -129,7 +129,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // case: pure value-transformation, no instance state. The
     // companion call-site rewrite in `expr.rs::emit_send` routes
     // `self.method(args)` for these methods to `Self::method(args)`.
-    let static_method_names: std::collections::HashSet<String> = class
+    let static_method_names: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| {
@@ -167,7 +167,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // closure. Build the per-class mutating-name set from the flags
     // for the `static_method_names` exclusion check + the existing
     // call-site method-mutates logic that the body emit consults.
-    let mutating_methods: std::collections::HashSet<String> = class
+    let mutating_methods: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| m.mutates_self)
@@ -224,7 +224,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // commonly `self.body = ""` where field is `String` and `""` is
     // `&str`. Empty outside class-body scope; scoped per-class to
     // prevent bleeding between siblings.
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_ivar_types(ivar_type_map, || super::expr::with_static_methods(static_method_names.clone(), || {
@@ -375,7 +375,7 @@ fn emit_module_singleton(
         out.push('\n');
     }
     writeln!(out, "impl {name} {{").unwrap();
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_module_singleton(true, thread_local, || {
@@ -511,9 +511,9 @@ fn method_reads_self(body: &Expr) -> bool {
 /// lookup in emit_send for `Self::method(args)` calls.
 fn collect_class_method_param_tys(
     methods: &[MethodDef],
-) -> std::collections::HashMap<String, Vec<Ty>> {
+) -> crate::det::HashMap<String, Vec<Ty>> {
     use crate::ty::ParamKind;
-    let mut out = std::collections::HashMap::new();
+    let mut out = crate::det::HashMap::default();
     for m in methods {
         let tys: Vec<Ty> = match m.signature.as_ref() {
             Some(Ty::Fn { params, .. }) => params
@@ -557,12 +557,12 @@ fn collect_ivar_types(methods: &[MethodDef]) -> Vec<(String, Ty)> {
     // by writes get widened by re-observation and break framework
     // runtime emit (e.g. `Base.flash` typed Option<Flash> mistakenly).
     let mut order: Vec<String> = Vec::new();
-    let mut observed: std::collections::HashMap<String, Vec<Ty>> =
-        std::collections::HashMap::new();
+    let mut observed: crate::det::HashMap<String, Vec<Ty>> =
+        crate::det::HashMap::default();
     for m in methods {
         walk_collect_ivars(&m.body, &mut order, &mut observed);
     }
-    let written: std::collections::HashSet<String> =
+    let written: crate::det::HashSet<String> =
         observed.keys().cloned().collect();
     for m in methods {
         walk_collect_ivar_reads(&m.body, &written, &mut order, &mut observed);
@@ -646,13 +646,13 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
 fn walk_collect_ivars(
     e: &Expr,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {
@@ -760,15 +760,15 @@ fn walk_collect_ivars(
 /// this pass entirely — the write-based ty rules already cover them.
 fn walk_collect_ivar_reads(
     e: &Expr,
-    written: &std::collections::HashSet<String>,
+    written: &crate::det::HashSet<String>,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {

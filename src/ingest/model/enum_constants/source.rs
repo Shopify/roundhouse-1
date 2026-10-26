@@ -56,7 +56,7 @@ impl EnumConstants {
             parents: Vec<Node<'pr>>,
             /// Offsets of the plain `NAME = …` writes at a file's or a
             /// body's top level, the one write a constant may have.
-            direct_writes: std::collections::HashSet<usize>,
+            direct_writes: crate::det::HashSet<usize>,
         }
         impl Collector<'_, '_> {
             fn scoped(&self, path: String) -> ScopedName {
@@ -468,7 +468,7 @@ impl EnumConstants {
                 // the scan skips a receiver rooted at a class or module
                 // (`ConstTaint::names_boot_namespace`).
                 SourceKind::Boot => {
-                    let namespaces: std::collections::HashSet<String> = self
+                    let namespaces: crate::det::HashSet<String> = self
                         .values
                         .iter()
                         .filter(|(_, value)| matches!(value, EnumConstant::Namespace))

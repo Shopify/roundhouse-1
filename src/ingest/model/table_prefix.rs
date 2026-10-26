@@ -17,7 +17,7 @@ use super::super::util::{
 /// campfire's `app/models/push.rb` is four lines and exists solely for
 /// this: without it `Push::Subscription` reads `subscriptions`, and its
 /// table is `push_subscriptions`.
-pub type TablePrefixes = std::collections::HashMap<String, String>;
+pub type TablePrefixes = crate::det::HashMap<String, String>;
 
 /// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`,
 /// or the same def inside the module's `class << self`.
@@ -37,7 +37,7 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     }
     let result = super::super::prism::parse(source, file);
     let root = result.node();
-    let mut out = TablePrefixes::new();
+    let mut out = TablePrefixes::default();
     for (scope, module) in super::super::util::find_all_modules_with_scope(&root) {
         let Some(name_path) = super::super::util::module_name_path(&module) else {
             continue;
@@ -176,7 +176,7 @@ pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
 /// `pairs` are the pre-pass's `(abstract class, parent)` pairs; a bare
 /// parent is found the way Ruby finds it, the child's enclosing scopes first.
 pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)]) -> TablePrefixes {
-    let parents: std::collections::HashMap<&str, &str> = pairs
+    let parents: crate::det::HashMap<&str, &str> = pairs
         .iter()
         .map(|(c, p)| (c.as_str(), p.as_str()))
         .collect();

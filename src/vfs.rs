@@ -11,7 +11,8 @@
 //! Directories are derived from file paths: a path is "a directory" iff
 //! some other path starts with it. There's no separate directory entry.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+use crate::det::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -84,11 +85,11 @@ impl Vfs for FsVfs {
 /// are inferred from path prefixes; there are no explicit directory
 /// entries. Used by the wasm transpile entry point.
 pub struct MapVfs {
-    files: HashMap<PathBuf, Vec<u8>>,
+    files: std::collections::HashMap<PathBuf, Vec<u8>>,
 }
 
 impl MapVfs {
-    pub fn new(files: HashMap<PathBuf, Vec<u8>>) -> Self {
+    pub fn new(files: std::collections::HashMap<PathBuf, Vec<u8>>) -> Self {
         Self { files }
     }
 }
@@ -167,7 +168,7 @@ impl<'a, V: Vfs + ?Sized> ScopedVfs<'a, V> {
     /// the walker will ask for them (absolute under the same root).
     pub fn new(inner: &'a V, visible: impl IntoIterator<Item = PathBuf>) -> Self {
         let files: HashSet<PathBuf> = visible.into_iter().collect();
-        let mut dirs = HashSet::new();
+        let mut dirs = HashSet::default();
         for file in &files {
             let mut current = file.parent();
             while let Some(dir) = current {

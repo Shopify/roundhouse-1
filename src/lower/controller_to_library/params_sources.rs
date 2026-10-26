@@ -2,7 +2,8 @@
 //! a later assignment, a conditional write, or a block parameter can change
 //! what a local contains. This table does not change the analyzer's types.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::det::HashMap;
 
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
@@ -30,7 +31,7 @@ impl ParamsSources {
         helpers: BTreeMap<Symbol, ClassId>,
         specs: &ParamsSpecs,
     ) -> Self {
-        let mut sources = Self { reads: HashMap::new(), helpers };
+        let mut sources = Self { reads: HashMap::default(), helpers };
         sources.visit(body, &mut Locals::new(), specs);
         sources
     }

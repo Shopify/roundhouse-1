@@ -18,7 +18,7 @@
 //! routes, or Devise controller bodies. Unsupported options (`skip:`,
 //! `only:`, `as:`, `class_name:`, `module:`, …) fail loud.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use indexmap::IndexMap;
 
@@ -294,9 +294,9 @@ pub(super) fn ingest_devise_for(
         });
     };
     let mut resource: Option<String> = None;
-    let mut controllers: HashMap<String, String> = HashMap::new();
+    let mut controllers: HashMap<String, String> = HashMap::default();
     let mut path: Option<String> = None;
-    let mut path_name_overrides: HashMap<String, String> = HashMap::new();
+    let mut path_name_overrides: HashMap<String, String> = HashMap::default();
     for arg in args_node.arguments().iter() {
         if let Some(name) = symbol_value(&arg) {
             if resource.is_none() {
@@ -492,7 +492,7 @@ pub(super) fn ingest_devise_for(
             None => default_controller_marker(mapping),
         }
     };
-    let mut resolved: HashMap<&str, String> = HashMap::new();
+    let mut resolved: HashMap<&str, String> = HashMap::default();
     for route in DEVISE_ROUTES {
         resolved
             .entry(route.mapping)

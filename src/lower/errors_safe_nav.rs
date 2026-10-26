@@ -28,7 +28,7 @@ use crate::ident::ClassId;
 use crate::ty::Ty;
 
 /// Every app model, with its has_many names.
-type Models = std::collections::HashMap<ClassId, std::collections::HashSet<crate::ident::Symbol>>;
+type Models = crate::det::HashMap<ClassId, crate::det::HashSet<crate::ident::Symbol>>;
 
 /// Rails' query methods: each answers a relation, never nil.
 const QUERY_METHODS: &[&str] = &[

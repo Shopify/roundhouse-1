@@ -3,7 +3,7 @@
 //! Only a keyword-rest hash writer paired with `@slot || {}` is expanded.
 //! Methods inherit; stored values and fresh default allocations do not.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{
@@ -141,7 +141,7 @@ pub(super) fn verified_framework_concerns(
     module_includes: &HashMap<ClassId, Vec<ClassId>>,
     framework_shadows: &HashSet<ClassId>,
 ) -> HashSet<ClassId> {
-    let mut extensions: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::new();
+    let mut extensions: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::default();
     for carrier in carriers {
         extensions
             .entry(carrier.owner.clone())
@@ -213,8 +213,8 @@ fn expand_controller(
         }
     }
     let mut methods = Vec::new();
-    let mut names = HashSet::new();
-    let mut slots = HashSet::new();
+    let mut names = HashSet::default();
+    let mut slots = HashSet::default();
     for config in configurations {
         for method in &catalog[&config.carrier].0 {
             if method.name_span != config.writer.name_span

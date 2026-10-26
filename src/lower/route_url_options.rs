@@ -124,8 +124,8 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
 /// flattened routes share (lobsters' `/s/:id/(:title)` flattens to
 /// `/s/:id/:title` and `/s/:id`) answers its longest list — the helper
 /// the generator builds takes every slot.
-pub(crate) fn helper_path_params(app: &App) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+pub(crate) fn helper_path_params(app: &App) -> crate::det::HashMap<String, Vec<String>> {
+    let mut out: crate::det::HashMap<String, Vec<String>> = Default::default();
     for route in super::routes::flatten_routes_for_helpers(app) {
         if !route.named {
             continue;
@@ -150,7 +150,7 @@ pub(crate) fn helper_path_params(app: &App) -> std::collections::HashMap<String,
 /// `nil`, which is what the helper's own default would have been.
 fn position_path_params(
     expr: &mut Expr,
-    params: &std::collections::HashMap<String, Vec<String>>,
+    params: &crate::det::HashMap<String, Vec<String>>,
 ) {
     expr.node.for_each_child_mut(&mut |c| position_path_params(c, params));
     rewrite_position_node(expr, params);
@@ -158,7 +158,7 @@ fn position_path_params(
 
 pub(crate) fn rewrite_position_node(
     expr: &mut Expr,
-    params: &std::collections::HashMap<String, Vec<String>>,
+    params: &crate::det::HashMap<String, Vec<String>>,
 ) {
     let span = expr.span;
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node else {
@@ -241,12 +241,12 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
     Some(out)
 }
 
-fn rewrite(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
     rewrite_node(expr, helpers);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     ground_symbol_query_values(expr, helpers);
     let Some((stem, host, protocol)) = strip_host_options(expr, helpers) else {
         return;
@@ -297,7 +297,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<
 /// Symbol at the call (`no implicit conversion of Symbol into String`
 /// took two of campfire's logo tests). `format:` is not here: the
 /// suffix pass ran first and consumed it.
-fn ground_symbol_query_values(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+fn ground_symbol_query_values(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     if !helpers.contains(method.as_str()) {
         return;
@@ -324,7 +324,7 @@ fn ground_symbol_query_values(expr: &mut Expr, helpers: &std::collections::HashS
 /// by the strip alone and answers None.
 fn strip_host_options(
     expr: &mut Expr,
-    helpers: &std::collections::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
 ) -> Option<(String, Expr, Option<Expr>)> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return None;

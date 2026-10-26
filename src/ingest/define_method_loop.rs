@@ -20,7 +20,7 @@
 //! (Ruby refuses implicit arguments from a `define_method` body).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use ruby_prism::{CallNode, Node};
 
@@ -70,7 +70,7 @@ pub(super) struct ConstTable {
 
 impl ConstTable {
     pub(super) fn of(owner: &ClassId, statements: &[Node<'_>]) -> Self {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         for stmt in statements {
             let Some(write) = stmt.as_constant_write_node() else { continue };
             if let Some(entries) = literal_entries(&write.value()) {

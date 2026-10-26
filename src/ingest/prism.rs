@@ -59,7 +59,7 @@ pub fn scope<T>(f: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
     // syntax error arrives message-only and then located. Keep the
     // located copy.
     let unlocated = |d: &Diagnostic| d.span.file.0 == 0;
-    let located: std::collections::HashSet<String> = collected
+    let located: crate::det::HashSet<String> = collected
         .iter()
         .filter(|d| !unlocated(d))
         .map(|d| d.message.clone())

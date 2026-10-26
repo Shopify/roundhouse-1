@@ -22,7 +22,7 @@
 //! `class_attribute` or filter DSL, or a class method that touches the
 //! attribute any other way, leaves the carrier as it was, ledgered.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{ClassConfigurationRole, ControllerBodyItem, MethodDef, MethodReceiver};
@@ -51,7 +51,7 @@ pub(super) fn expand(
     let surfaces = controller_concern_surfaces(app);
     let verified = verified_framework_concerns(carriers, &surfaces.module_includes, framework_shadows);
 
-    let mut admitted: HashMap<ClassId, Carrier> = HashMap::new();
+    let mut admitted: HashMap<ClassId, Carrier> = HashMap::default();
     for lc in &app.library_classes {
         if !verified.contains(&lc.name) {
             continue;
@@ -173,7 +173,7 @@ pub(super) fn expand(
         let mut body = Vec::new();
         // Rails Concern inclusion is once per class; a second textual
         // `include` must not re-seed the default after macros have run.
-        let mut seeded: HashSet<ClassId> = HashSet::new();
+        let mut seeded: HashSet<ClassId> = HashSet::default();
         for item in std::mem::take(&mut controller.body) {
             match &item {
                 ControllerBodyItem::Unknown { expr, leading_comments, leading_blank_line } => {

@@ -1,7 +1,7 @@
 //! Class identities for literal Data.define constants on source library classes,
 //! and for library classes that a file-level Data.define creates.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::Diagnostic;
@@ -22,7 +22,7 @@ pub(super) fn register(
     resolver: &ConstResolver,
     classes: &mut HashMap<ClassId, ClassInfo>,
 ) -> HashMap<Span, Ty> {
-    let mut factories = HashMap::new();
+    let mut factories = HashMap::default();
     // Source overrides can replace `.define`; only the built-in factory is modeled here.
     if resolver.has_source_namespace("Data") {
         return factories;
@@ -44,7 +44,7 @@ pub(super) fn register(
         if method.as_str() != "define" || !resolver.is_runtime_class(recv.span, path, "Data") {
             return;
         }
-        let mut members = HashSet::new();
+        let mut members = HashSet::default();
         for arg in args {
             let ExprNode::Lit {
                 value: Literal::Sym { value: member },

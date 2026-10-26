@@ -4,7 +4,7 @@
 //!
 //! Also owns `InertiaRails.configure` extraction from initializers.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::path::Path;
 
 use crate::App;
@@ -211,7 +211,7 @@ pub fn lower_inertia(app: &mut App) {
     for controller in &mut app.controllers {
         let mut chain = vec![controller.name.clone()];
         let mut cur = controller.parent.clone();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         seen.insert(controller.name.clone());
         while let Some(p) = cur {
             if !seen.insert(p.clone()) {

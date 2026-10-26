@@ -9,7 +9,7 @@
 //! Ordinary class headers define the superclass parity bar. Constructor
 //! mutations need separate checks because those headers never call Class.new.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{MethodReceiver, ModelBodyItem};
@@ -27,7 +27,7 @@ pub(super) fn register(
     resolver: &ConstResolver,
     classes: &mut HashMap<ClassId, ClassInfo>,
 ) -> HashMap<Span, Ty> {
-    let mut factories = HashMap::new();
+    let mut factories = HashMap::default();
     // This declaration calls Class.new, unlike a class keyword. A replacement
     // of that factory itself cannot establish an ordinary subclass identity.
     if resolver.has_source_namespace("Class") {
@@ -187,7 +187,7 @@ pub(super) fn register(
         .collect();
     for id in &factory_ids {
         let mut cursor = id;
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let positional = loop {
             if !seen.insert(cursor) {
                 break false;
@@ -273,7 +273,7 @@ fn has_unsupported_ancestry(
     inherited_hooks: &HashSet<ClassId>,
 ) -> bool {
     let mut pending = vec![parent.clone()];
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
             continue;
@@ -867,12 +867,12 @@ fn source_mutations(app: &App, resolver: &ConstResolver) -> Mutations {
     }
     let mut scan = Scan {
         mutations: Mutations::default(),
-        aliases: HashMap::new(),
+        aliases: HashMap::default(),
         resolver,
         file: crate::span::FileId(0),
         owners: Vec::new(),
         singleton_receivers: Vec::new(),
-        declarations: HashSet::new(),
+        declarations: HashSet::default(),
     };
     for (index, source) in app
         .sources
@@ -916,11 +916,11 @@ fn source_mutations(app: &App, resolver: &ConstResolver) -> Mutations {
     // a literal mutation of the aliased identity. Ordinary parent bodies
     // themselves remain modeled by main, rather than vetoing subclasses.
     for declaration in &scan.declarations {
-        let mut targets = HashSet::new();
+        let mut targets = HashSet::default();
         expand(
             declaration,
             &scan.aliases,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
             &mut targets,
             true,
         );
@@ -938,7 +938,7 @@ fn source_mutations(app: &App, resolver: &ConstResolver) -> Mutations {
             expand(
                 &name,
                 &scan.aliases,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
                 targets,
                 follow_value,
             );
@@ -946,8 +946,8 @@ fn source_mutations(app: &App, resolver: &ConstResolver) -> Mutations {
     }
     let shadows = std::mem::take(&mut scan.mutations.constructor_shadows);
     for (owner, file, offset) in shadows {
-        let mut names = HashSet::new();
-        expand(&owner, &scan.aliases, &mut HashSet::new(), &mut names, true);
+        let mut names = HashSet::default();
+        expand(&owner, &scan.aliases, &mut HashSet::default(), &mut names, true);
         for name in names {
             scan.mutations
                 .constructor_shadows

@@ -165,12 +165,12 @@ pub const EXTRAS_FACADES: &[Facade] = &[
 /// onto its hardcoded catalog (see `analyzer_rbs_signatures_overlay_the_hardcoded_catalog`).
 pub fn signatures_for(
     app: &crate::App,
-) -> std::collections::HashMap<crate::ClassId, std::collections::HashMap<crate::Symbol, crate::Ty>>
+) -> crate::det::HashMap<crate::ClassId, crate::det::HashMap<crate::Symbol, crate::Ty>>
 {
-    let mut out: std::collections::HashMap<
+    let mut out: crate::det::HashMap<
         crate::ClassId,
-        std::collections::HashMap<crate::Symbol, crate::Ty>,
-    > = std::collections::HashMap::new();
+        crate::det::HashMap<crate::Symbol, crate::Ty>,
+    > = crate::det::HashMap::default();
     for f in EXTRAS_FACADES {
         let defined = app
             .library_classes

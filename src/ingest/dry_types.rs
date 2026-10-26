@@ -10,7 +10,7 @@
 //! `.constrained`, `.fallback`, `.meta`, `.default`; a constant holding
 //! any of these.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
@@ -709,7 +709,7 @@ pub(super) fn plain_constants(
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut plain: HashSet<String> = HashSet::new();
+    let mut plain: HashSet<String> = HashSet::default();
     loop {
         let found: Vec<String> = classes
             .iter()

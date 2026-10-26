@@ -1,6 +1,6 @@
 //! `render json: <value>` whose value holds a record, a Time or a Date — a Hash or Array literal, a typed collection — written down from its static type as the JSON text Rails' `to_json` answers.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::sync::Arc;
 
 use crate::expr::{BlockStyle, Expr, ExprNode, Literal};

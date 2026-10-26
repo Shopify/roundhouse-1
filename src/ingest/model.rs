@@ -140,7 +140,7 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
     let visibility = Visibility::resolve_carrying_inherited(class.body().as_ref(), file, None)?;
-    let mut carried_markers: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut carried_markers: crate::det::HashSet<usize> = crate::det::HashSet::default();
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
         // Constants the class body assigns, for `enum :x, CONST` and for
@@ -1529,23 +1529,23 @@ const READ_ONLY_CONST_METHODS: &[&str] = &[
 /// The names a class body writes, or may mutate, anywhere other than
 /// one plain top-level `NAME = …` (see [`ClassConsts::collect`]).
 struct ConstTaint {
-    top_level: std::collections::HashSet<usize>,
-    top_writes: std::collections::HashMap<String, usize>,
-    tainted: std::collections::HashSet<String>,
+    top_level: crate::det::HashSet<usize>,
+    top_writes: crate::det::HashMap<String, usize>,
+    tainted: crate::det::HashSet<String>,
     /// `ALIAS = MODES` / `ALIAS = MODES.freeze` (any constant the
     /// right-hand side reads): the two may be one object, so a mutation
     /// through either taints both.
     aliases: Vec<(String, String)>,
     /// The constants a [`REFLECTION_METHODS`] call's receiver chain is
     /// rooted at (`Rule.const_set`): owners whose constants it may replace.
-    reflected: std::collections::HashSet<String>,
+    reflected: crate::det::HashSet<String>,
     /// The constant a `const_set(:NAME, …)` / `remove_const(:NAME)` call
     /// names, whatever its receiver.
-    named_writes: std::collections::HashSet<String>,
+    named_writes: crate::det::HashSet<String>,
     /// For a boot source: the qualified classes and modules the inputs
     /// define. A call on one, or a variable holding one, is not a change
     /// to a constant (`Gadget.count`); see [`ConstTaint::names_boot_namespace`].
-    boot_namespaces: Option<std::collections::HashSet<String>>,
+    boot_namespaces: Option<crate::det::HashSet<String>>,
 }
 
 /// Calls on an owner that can write or remove its constants, run code in
@@ -1670,7 +1670,7 @@ fn constant_reads(node: &Node<'_>) -> Vec<String> {
 }
 
 impl ConstTaint {
-    fn scan(stmts: &[Node<'_>]) -> std::collections::HashSet<String> {
+    fn scan(stmts: &[Node<'_>]) -> crate::det::HashSet<String> {
         let mut scan = ConstTaint {
             top_level: stmts
                 .iter()
@@ -1701,8 +1701,8 @@ impl ConstTaint {
     /// Returns the tainted names and the [`REFLECTION_METHODS`] receivers.
     fn scan_tree(
         root: &Node<'_>,
-        direct_writes: std::collections::HashSet<usize>,
-    ) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+        direct_writes: crate::det::HashSet<usize>,
+    ) -> (crate::det::HashSet<String>, crate::det::HashSet<String>) {
         let mut scan = ConstTaint {
             top_level: direct_writes,
             top_writes: Default::default(),
@@ -1726,9 +1726,9 @@ impl ConstTaint {
     /// block is scanned on its own.
     pub(super) fn scan_boot(
         root: &Node<'_>,
-        direct_writes: std::collections::HashSet<usize>,
-        namespaces: std::collections::HashSet<String>,
-    ) -> (std::collections::HashSet<String>, Vec<(String, String)>) {
+        direct_writes: crate::det::HashSet<usize>,
+        namespaces: crate::det::HashSet<String>,
+    ) -> (crate::det::HashSet<String>, Vec<(String, String)>) {
         let mut scan = ConstTaint {
             top_level: direct_writes,
             top_writes: Default::default(),
@@ -1749,7 +1749,7 @@ impl ConstTaint {
 
     /// [`Self::alias_closure`] for a caller that collects taints and alias
     /// edges from several sources before closing them.
-    pub(super) fn close_aliases(tainted: &mut std::collections::HashSet<String>, aliases: &[(String, String)]) {
+    pub(super) fn close_aliases(tainted: &mut crate::det::HashSet<String>, aliases: &[(String, String)]) {
         Self::alias_closure(tainted, aliases);
     }
 
@@ -1772,7 +1772,7 @@ impl ConstTaint {
         }
     }
 
-    fn alias_closure(tainted: &mut std::collections::HashSet<String>, aliases: &[(String, String)]) {
+    fn alias_closure(tainted: &mut crate::det::HashSet<String>, aliases: &[(String, String)]) {
         // Across alias edges, both ways, until nothing changes.
         loop {
             let before = tainted.len();
@@ -1981,24 +1981,24 @@ fn regexp_escape(text: &str) -> String {
 #[derive(Default)]
 pub(super) struct ClassConsts {
     /// `NAME = "x"`, `NAME = :x`, `NAME = 3`, `NAME = OTHER`.
-    scalars: std::collections::HashMap<String, Literal>,
+    scalars: crate::det::HashMap<String, Literal>,
     /// `NAME = %i[…]` / `{ … }`, as the mapping an enum would build.
-    mappings: std::collections::HashMap<String, Vec<(String, EnumStored)>>,
+    mappings: crate::det::HashMap<String, Vec<(String, EnumStored)>>,
     /// `NAME = %i[…]` / `%w[…]` — the bare labels, for the idioms that
     /// derive a mapping from them (`NAME.index_by(&:to_s)`).
-    labels: std::collections::HashMap<String, Vec<String>>,
+    labels: crate::det::HashMap<String, Vec<String>>,
     /// `NAME = /pattern/flags`, `.freeze`d, aliased, or an interpolation
     /// of one other folded regex constant — `(pattern, flags)`. Used to
     /// resolve `validates …, format: { with: NAME }` (#985 follow-up).
-    regexes: std::collections::HashMap<String, (String, String)>,
+    regexes: crate::det::HashMap<String, (String, String)>,
     /// `NAME = %w[…]` / `%i[…]` / `[…]` of literals, `.freeze`d or an
     /// alias of another folded list: the literals with their kind kept
     /// (a Symbol is not a String), for `inclusion: { in: NAME }`.
-    lists: std::collections::HashMap<String, Vec<Literal>>,
+    lists: crate::det::HashMap<String, Vec<Literal>>,
     /// Every constant, module, or class name the body itself defines,
     /// folded or not — anything an unqualified constant path's first
     /// segment could resolve to before Ruby reaches the top level.
-    defined_names: std::collections::HashSet<String>,
+    defined_names: crate::det::HashSet<String>,
     /// The class sits directly at the top level (`class User`, not
     /// `module Admin; class User` nor `class Admin::User`), so its
     /// lexical scope is only its own body. Set by `ingest_model`;
@@ -2007,19 +2007,19 @@ pub(super) struct ClassConsts {
     /// Names any app source defines below the top level
     /// (`EnumConstants::nested_names`): what an ancestor of the class
     /// (its superclass chain, an included module) could define.
-    app_nested_names: std::collections::HashSet<String>,
+    app_nested_names: crate::det::HashSet<String>,
     /// First segments of every name the app defines or reopens
     /// (`EnumConstants::top_level_names`): a top-level namespace the app
     /// touches, whose standard-library contents it may have replaced.
-    app_top_level_names: std::collections::HashSet<String>,
+    app_top_level_names: crate::det::HashSet<String>,
     /// `NAME = 3`, `NAME = (2**31) - 1`, `NAME = 4 * (OTHER + 1)`: every
     /// Integer the class body folds, at the width Ruby computes it (an
     /// `i128`, so `2**63` is kept exactly; `scalars` holds the ones that
     /// fit an `i64`).
-    integers: std::collections::HashMap<String, i128>,
+    integers: crate::det::HashMap<String, i128>,
     /// The `regexes` built with `Regexp.union` (directly, or reading one
     /// that was), which only hold while `Regexp` is Ruby's own.
-    from_union: std::collections::HashSet<String>,
+    from_union: crate::det::HashSet<String>,
     /// The app defines a constant named `Regexp` somewhere, which a
     /// body's `Regexp.union` may resolve to: no union folds. Set by
     /// [`ClassConsts::import`].
@@ -2028,13 +2028,13 @@ pub(super) struct ClassConsts {
     /// the keys, each a literal kept with its kind, in order. The values
     /// are never read. For `inclusion: { in: NAME.keys }` and
     /// `inclusion: { in: NAME }` (`Hash#include?` is `key?`).
-    hash_keys: std::collections::HashMap<String, Vec<Literal>>,
+    hash_keys: crate::det::HashMap<String, Vec<Literal>>,
     /// An enum the class body declared so far, by the class method Rails
     /// names after it (`enum :status` → `statuses`): its labels, which
     /// `statuses.keys` answers. Only an enum whose every label is also the
     /// String it stores (`{ password: "password" }`): a lowered check
     /// reads the stored value, and only there do the two agree.
-    enum_labels: std::collections::HashMap<String, Vec<String>>,
+    enum_labels: crate::det::HashMap<String, Vec<String>>,
 }
 
 /// The operators [`ClassConsts::int_expr`] folds.
@@ -2194,8 +2194,8 @@ impl ClassConsts {
     pub(super) fn set_lexical_scope(
         &mut self,
         top_level: bool,
-        app_nested_names: std::collections::HashSet<String>,
-        app_top_level_names: std::collections::HashSet<String>,
+        app_nested_names: crate::det::HashSet<String>,
+        app_top_level_names: crate::det::HashSet<String>,
     ) {
         self.top_level = top_level;
         self.app_nested_names = app_nested_names;

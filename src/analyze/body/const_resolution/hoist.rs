@@ -4,7 +4,7 @@
 //! Kept beside the resolver so the public facade file stays under the
 //! ~1k-line bar while these helpers grow with Rubydex naming quirks.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::sync::Arc;
 
 use crate::ty::Ty;
@@ -32,7 +32,7 @@ pub(super) fn hoisted_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// Map each source namespace to the classes/modules declared inside it
 /// (`A` → `A::B`, `A::B::C`).
 pub(super) fn nested_namespaces_index(declared: &[&str]) -> HashMap<Box<str>, Vec<Box<str>>> {
-    let mut nested_namespaces: HashMap<Box<str>, Vec<Box<str>>> = HashMap::new();
+    let mut nested_namespaces: HashMap<Box<str>, Vec<Box<str>>> = HashMap::default();
     for name in declared {
         for (at, _) in name.match_indices("::") {
             if declared.binary_search(&&name[..at]).is_ok() {
@@ -52,8 +52,8 @@ pub(super) fn nested_namespaces_index(declared: &[&str]) -> HashMap<Box<str>, Ve
 pub(super) fn runtime_value_types() -> &'static HashMap<String, Arc<Ty>> {
     static VALUES: std::sync::OnceLock<HashMap<String, Arc<Ty>>> = std::sync::OnceLock::new();
     VALUES.get_or_init(|| {
-        let mut values: HashMap<String, Arc<Ty>> = HashMap::new();
-        let mut ambiguous = std::collections::HashSet::new();
+        let mut values: HashMap<String, Arc<Ty>> = HashMap::default();
+        let mut ambiguous = crate::det::HashSet::default();
         for (_, text) in crate::runtime_files::ruby_sources() {
             let (_, owners) = crate::runtime_src::parse_module_constant_tables(text, true);
             for (owner, constants) in owners {

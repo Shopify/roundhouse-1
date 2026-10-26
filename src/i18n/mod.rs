@@ -130,8 +130,8 @@ impl Opaque {
 /// Strings, and those it writes plain, which it loads as Symbols.
 #[derive(Default)]
 struct Colons {
-    quoted: std::collections::HashSet<String>,
-    plain: std::collections::HashSet<String>,
+    quoted: crate::det::HashSet<String>,
+    plain: crate::det::HashSet<String>,
 }
 
 impl Colons {
@@ -209,7 +209,7 @@ impl Catalog {
 
 /// The keys a YAML file names at its top level (`en:`, `"pt-BR":`), as
 /// `Catalog::merge_source` looks for them.
-fn top_level_keys(source: &str) -> std::collections::HashSet<String> {
+fn top_level_keys(source: &str) -> crate::det::HashSet<String> {
     source
         .lines()
         .filter(|l| !l.starts_with([' ', '\t', '#', '-']))
@@ -310,7 +310,7 @@ impl Catalog {
         }
         files.sort_by(|a, b| a.0.cmp(&b.0));
         // Not every file for every locale: a hundred locales each scanned every line of every file.
-        let tops: Vec<std::collections::HashSet<String>> = gems.iter().chain(files.iter()).map(|(_, src)| top_level_keys(src)).collect();
+        let tops: Vec<crate::det::HashSet<String>> = gems.iter().chain(files.iter()).map(|(_, src)| top_level_keys(src)).collect();
         self.others = wanted
             .iter()
             .map(|l| {
@@ -727,8 +727,8 @@ impl Catalog {
     /// the files give them, as a Ruby Hash built from them iterates.
     pub fn ordered_nodes(&self) -> Vec<(String, Option<&String>)> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a String>)>, seen: &mut std::collections::HashSet<String>) {
+        let mut seen = crate::det::HashSet::default();
+        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a String>)>, seen: &mut crate::det::HashSet<String>) {
             for child in c.order.get(node).into_iter().flatten() {
                 let path = if node.is_empty() { child.clone() } else { format!("{node}.{child}") };
                 if let Some(v) = c.entries.get(&path) {
@@ -1001,7 +1001,7 @@ fn merge_text(parts: Vec<Part>) -> Vec<Part> {
 #[derive(Clone, Debug, Default)]
 pub struct FormI18n {
     catalog: Catalog,
-    models: std::collections::HashMap<String, ModelI18n>,
+    models: crate::det::HashMap<String, ModelI18n>,
 }
 
 impl FormI18n {
@@ -1067,8 +1067,8 @@ impl FormI18n {
 /// ActiveModel class, looked up under `activemodel`.
 pub fn model_i18n_keys(
     app: &crate::app::App,
-) -> std::collections::HashMap<crate::ident::ClassId, (String, Vec<String>)> {
-    let by_name: std::collections::HashMap<_, _> =
+) -> crate::det::HashMap<crate::ident::ClassId, (String, Vec<String>)> {
+    let by_name: crate::det::HashMap<_, _> =
         app.models.iter().map(|m| (m.name.clone(), m)).collect();
     app.models
         .iter()

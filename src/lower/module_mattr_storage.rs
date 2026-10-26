@@ -18,7 +18,7 @@
 //! (shared with its subclasses) and a module whose `@@x` another body
 //! reads are left as they are.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -26,7 +26,7 @@ use crate::ident::Symbol;
 
 pub fn apply_module_mattr_storage(app: &mut App) {
     // Every `@@name` each body names, by the module that owns the body.
-    let mut outside: HashSet<Symbol> = HashSet::new();
+    let mut outside: HashSet<Symbol> = HashSet::default();
     let module_names: HashSet<crate::ident::ClassId> = app
         .library_classes
         .iter()
@@ -41,7 +41,7 @@ pub fn apply_module_mattr_storage(app: &mut App) {
     });
 
     for lc in app.library_classes.iter_mut().filter(|lc| lc.is_module) {
-        let mut names: HashSet<Symbol> = HashSet::new();
+        let mut names: HashSet<Symbol> = HashSet::default();
         for method in &lc.methods {
             collect_cvars(&method.body, &mut names);
         }
@@ -50,7 +50,7 @@ pub fn apply_module_mattr_storage(app: &mut App) {
         }
         // The module's own instance variables, so a rewrite cannot merge a
         // class variable into an instance variable of the same name.
-        let mut ivars: HashSet<Symbol> = HashSet::new();
+        let mut ivars: HashSet<Symbol> = HashSet::default();
         for method in &lc.methods {
             collect_ivars(&method.body, &mut ivars);
         }
@@ -58,7 +58,7 @@ pub fn apply_module_mattr_storage(app: &mut App) {
             collect_ivars(init, &mut ivars);
         }
         // Not one an instance method reads: that method runs on whoever includes or extends the module, where `@x` is the other object's.
-        let mut shared: HashSet<Symbol> = HashSet::new();
+        let mut shared: HashSet<Symbol> = HashSet::default();
         for method in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
             collect_cvars(&method.body, &mut shared);
         }

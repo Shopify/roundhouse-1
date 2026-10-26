@@ -3,7 +3,8 @@
 //! Split out of `mod.rs` so the dirty-set / views-only work has a
 //! named home instead of growing the analyzer god file further.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
@@ -31,7 +32,7 @@ pub(super) enum TypingMode<'a> {
     /// of their bodies are retyped (`None` is every one of them); see
     /// [`super::Analyzer::type_production_bodies`].
     Production {
-        dirty: Option<&'a std::collections::HashSet<ClassId>>,
+        dirty: Option<&'a crate::det::HashSet<ClassId>>,
     },
     /// Views, partials, the original test scopes, and `db/seeds.rb`,
     /// against the channel the last production pass harvested.

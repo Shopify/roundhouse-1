@@ -28,7 +28,7 @@
 //! overrides; it does not claim Warden or Devise controller runtime.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use ruby_prism::Node;
@@ -70,7 +70,7 @@ pub(super) struct RouteHelperSource {
 }
 
 pub fn ingest_routes(source: &[u8], file: &str) -> IngestResult<RouteTable> {
-    ingest_routes_with_draws(source, file, &HashMap::new())
+    ingest_routes_with_draws(source, file, &HashMap::default())
 }
 
 /// `draws` maps a route-file key to the split file Rails loads into the
@@ -84,7 +84,7 @@ pub fn ingest_routes_with_draws(
     file: &str,
     draws: &HashMap<String, (Vec<u8>, String)>,
 ) -> IngestResult<RouteTable> {
-    ingest_routes_with_dsl(source, file, draws, &HashSet::new())
+    ingest_routes_with_dsl(source, file, draws, &HashSet::default())
 }
 
 /// [`ingest_routes_with_draws`] plus the block-taking methods an app
@@ -103,7 +103,7 @@ pub fn ingest_routes_with_dsl(
         file,
         draws,
         block_wrappers,
-        &HashMap::new(),
+        &HashMap::default(),
         &OnceCell::new(),
         &|| Vec::new(),
     )
@@ -132,12 +132,12 @@ pub(super) fn ingest_routes_with_engines(
         engine_routes,
         helper_sources,
         load_helper_sources,
-        concerns: RefCell::new(HashMap::new()),
+        concerns: RefCell::new(HashMap::default()),
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
-        mounted_engines: RefCell::new(HashSet::new()),
+        mounted_engines: RefCell::new(HashSet::default()),
     };
 
     // Every `Rails.application.routes.draw do … end` in the file: Rails
@@ -299,7 +299,7 @@ fn runtime_cable_mount(call: &ruby_prism::CallNode<'_>) -> bool {
 /// still generated, so links to the route keep working; a request for it
 /// is not served. Located at the regex literal when it can be found.
 fn refused_route_diagnostics(entries: &[RouteSpec], source: &[u8], file: &str) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut out = Vec::new();
     for route in crate::lower::routes::flatten_route_entries(entries) {
         let Some((param, rx)) = &route.refused else { continue };
@@ -425,9 +425,9 @@ fn ingest_literal_engine_mount(
         return unsupported("engine route source must contain exactly one top-level matching `<Engine>.routes.draw` block and no other top-level code");
     }
     let mut entries = Vec::new();
-    let empty_draws = HashMap::new();
-    let empty_wrappers = HashSet::new();
-    let empty_engine_routes = HashMap::new();
+    let empty_draws = HashMap::default();
+    let empty_wrappers = HashSet::default();
+    let empty_engine_routes = HashMap::default();
     let empty_helper_sources = OnceCell::new();
     let empty_helper_loader = || Vec::new();
     for draw in draws {
@@ -474,12 +474,12 @@ fn ingest_literal_engine_mount(
             engine_routes: &empty_engine_routes,
             helper_sources: &empty_helper_sources,
             load_helper_sources: &empty_helper_loader,
-            concerns: RefCell::new(HashMap::new()),
+            concerns: RefCell::new(HashMap::default()),
             active: RefCell::new(Vec::new()),
             hoisted: RefCell::new(Vec::new()),
             diagnostics: RefCell::new(Vec::new()),
             mount_scope_depth: Cell::new(1),
-            mounted_engines: RefCell::new(HashSet::new()),
+            mounted_engines: RefCell::new(HashSet::default()),
         };
         match ingest_route_body(body, &engine.file, None, &engine_cx) {
             Ok(mut inner) => {
@@ -522,7 +522,7 @@ fn diagnose_engine_helper_uses(
     let engine_helpers = engine_route_helper_methods(entries);
     let proxy = namespace.split("::").map(crate::naming::snake_case).collect::<Vec<_>>().join("_");
     let proxy = if proxy.is_empty() { "engine".to_string() } else { proxy };
-    let mounted_helpers = HashSet::from([
+    let mounted_helpers = HashSet::from_iter([
         format!("{proxy}_path"),
         format!("{proxy}_url"),
     ]);
@@ -585,7 +585,7 @@ fn engine_route_helper_methods(entries: &[RouteSpec]) -> HashSet<String> {
         suppress_helpers: false,
         entries: entries.to_vec(),
     });
-    let mut methods = HashSet::new();
+    let mut methods = HashSet::default();
     for route in crate::lower::routes::flatten_routes_for_helpers(&app) {
         if !route.named || route.as_name.is_empty() {
             continue;
@@ -2027,7 +2027,7 @@ fn redirect_status_from_call(call: &ruby_prism::CallNode<'_>) -> Option<u16> {
 }
 
 fn redirect_expression_is_string(expr: &crate::expr::Expr) -> bool {
-    redirect_expression_is_string_in(expr, &mut HashSet::new())
+    redirect_expression_is_string_in(expr, &mut HashSet::default())
 }
 
 /// A redirect block's value is a string. Locals count once this block
@@ -2726,7 +2726,7 @@ fn run_concerns(
 /// an unknown name drops its route exactly as before.
 mod eval {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use crate::det::HashMap;
 
     use ruby_prism::Node;
 
@@ -2746,7 +2746,7 @@ mod eval {
     }
 
     pub(super) fn push_frame() {
-        FRAMES.with(|f| f.borrow_mut().push(HashMap::new()));
+        FRAMES.with(|f| f.borrow_mut().push(HashMap::default()));
     }
 
     /// A frame that starts as a copy of the enclosing one: a block body
@@ -3773,7 +3773,7 @@ mod lazy_helper_source_tests {
     }
 
     fn eligible_engines() -> HashMap<String, EngineRouteSource> {
-        HashMap::from([
+        HashMap::from_iter([
             (
                 "Catalog::Engine".to_string(),
                 engine_source("Catalog::Engine", "Catalog", "products"),
@@ -3794,8 +3794,8 @@ mod lazy_helper_source_tests {
         ingest_routes_with_engines(
             source.as_bytes(),
             "config/routes.rb",
-            &HashMap::new(),
-            &HashSet::new(),
+            &HashMap::default(),
+            &HashSet::default(),
             engines,
             helper_sources,
             load_helper_sources,

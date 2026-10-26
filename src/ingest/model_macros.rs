@@ -12,7 +12,7 @@
 //! captures, block parameters, nested blocks, control flow, side
 //! effects outside the definitions and redefinitions stay unexpanded.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};
@@ -44,8 +44,8 @@ pub(crate) fn expand_model_macros(
         .iter()
         .map(|id| (id, MethodReceiver::Class))
         .chain(app.load_hook_extended_macros.iter().map(|id| (id, MethodReceiver::Instance)));
-    let mut hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = HashMap::new();
-    let mut hook_providers: HashMap<Symbol, usize> = HashMap::new();
+    let mut hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = HashMap::default();
+    let mut hook_providers: HashMap<Symbol, usize> = HashMap::default();
     for (id, receiver) in hook_sources {
         let Some(class) = app.library_classes.iter().find(|c| &c.name == id) else {
             if receiver == MethodReceiver::Instance {
@@ -91,8 +91,8 @@ pub(crate) fn expand_model_macros(
             continue;
         }
         let mut candidates = Vec::new();
-        let mut calls = HashMap::<Symbol, usize>::new();
-        let mut included = HashSet::new();
+        let mut calls = HashMap::<Symbol, usize>::default();
+        let mut included = HashSet::default();
         for (index, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Unknown { expr, .. } = item else {
                 continue;
@@ -235,14 +235,14 @@ pub(crate) fn expand_model_macros(
         // the model lowerer currently keeps the first definition, whereas
         // Ruby keeps the last. An invalid second call must not let the
         // first one become a misleading partial expansion either.
-        let mut names = HashMap::<Symbol, usize>::new();
+        let mut names = HashMap::<Symbol, usize>::default();
         for (_, _, methods) in &candidates {
             let Some(expansion) = methods else { continue };
             for m in &expansion.methods {
                 *names.entry(m.name.clone()).or_default() += 1;
             }
         }
-        let mut expansions = HashMap::new();
+        let mut expansions = HashMap::default();
         // An opaque macro could define any of the same names. Do not
         // invent a partial class when one candidate's effects are unknown.
         let opaque = candidates.iter().any(|(_, _, methods)| methods.is_none());
@@ -596,7 +596,7 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         return None;
     }
     let mut positional = args;
-    let mut keywords = HashMap::new();
+    let mut keywords = HashMap::default();
     if let Some(Expr { node, .. }) = args.last() {
         if let ExprNode::Hash {
             entries,
@@ -615,7 +615,7 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         }
     }
     let mut positional = positional.iter();
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for param in &def.params {
         let value = if param.keyword || param.from_keyword {
             match keywords.remove(&param.name) {
@@ -702,7 +702,7 @@ fn expand_define_methods(
         }
         if method.as_str() == "define_method" {
             let [name] = args.as_slice() else { return None };
-            let name = substitute(name.clone(), &bindings, &HashSet::new())?;
+            let name = substitute(name.clone(), &bindings, &HashSet::default())?;
             let name = interned_name(&name)?;
             // Ruby accepts arbitrary interned names in define_method,
             // but an emitted `def` must be syntactically valid.
@@ -764,7 +764,7 @@ fn expand_define_methods(
             {
                 return None;
             }
-            let helpers = HashSet::new();
+            let helpers = HashSet::default();
             for arg in args {
                 let name = substitute(arg.clone(), &bindings, &helpers)?;
                 let name = interned_name(&name)?;

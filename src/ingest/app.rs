@@ -9,7 +9,7 @@
 //! convenience wrapper for the disk case.
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use ruby_prism::Node;
@@ -93,7 +93,7 @@ pub fn ingest_app(dir: &Path) -> IngestResult<App> {
 /// are interpreted relative to a virtual root (typically a single
 /// segment like `app/`); the tree itself defines the root layout, so
 /// callers usually pass `Path::new("")` for `root`.
-pub fn ingest_app_from_tree(tree: HashMap<PathBuf, Vec<u8>>) -> IngestResult<App> {
+pub fn ingest_app_from_tree(tree: std::collections::HashMap<PathBuf, Vec<u8>>) -> IngestResult<App> {
     ingest_app_with_vfs(&MapVfs::new(tree), Path::new(""))
 }
 
@@ -490,7 +490,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         })
     };
 
-    let mut table_prefixes = super::model::TablePrefixes::new();
+    let mut table_prefixes = super::model::TablePrefixes::default();
     // Action Text engine `isolate_namespace` → `action_text_` prefix.
     // Writebook's Markdown model lives under `module ActionText` without
     // an app-declared `table_name_prefix`, but its schema table is
@@ -506,7 +506,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // Qualified enum arrays can live in a later file (e.g. a service
     // module). Collect literal inputs before expanding any model DSL.
     let mut enum_constants = super::model::EnumConstants::default();
-    let mut enum_input_files = std::collections::HashSet::new();
+    let mut enum_input_files = crate::det::HashSet::default();
     // The same pre-pass answers a second question: which classes are
     // ActiveRecord bases. A model descending through the app's own
     // abstract base was classified a library class and lost its DSL,
@@ -713,7 +713,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         })
     };
     let nested_app_roots: Vec<PathBuf> = roots.iter().skip(1).map(|root| dir.join(root)).collect();
-    let mut support_seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut support_seen: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
     let boot_required = boot_required_files(vfs, dir);
     let mut support_batches: Vec<(String, PathBuf, Vec<PathBuf>)> = Vec::new();
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
@@ -1603,7 +1603,7 @@ end
             // `ingest_draw_route`'s `resolve_draw_name` still falls back to
             // the bare stem when it is unambiguous, for `draw(:name)` calls
             // written against a flat `config/routes/` layout.
-            let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::new();
+            let mut draw_files: HashMap<String, (Vec<u8>, String)> = HashMap::default();
             let routes_dir = dir.join("config/routes");
             if vfs.is_dir(&routes_dir) {
                 for entry in read_rb_files(vfs, &routes_dir)? {
@@ -1693,7 +1693,7 @@ end
     // not the file, so an `.erb` override shadows a `.haml` original;
     // another FORMAT of the same name is a different template and stays.
     // Only across roots — within one, nothing changes.
-    let mut view_owner: HashMap<(Symbol, Symbol), usize> = HashMap::new();
+    let mut view_owner: HashMap<(Symbol, Symbol), usize> = HashMap::default();
     for (root_index, root) in roots.iter().enumerate() {
         let mut keep = |view: &crate::dialect::View| {
             let owner = *view_owner
@@ -2181,7 +2181,7 @@ end
 
     // The boot sources were observed before the folds; observing them
     // again would count each of their writes twice.
-    let observed: std::collections::HashSet<PathBuf> =
+    let observed: crate::det::HashSet<PathBuf> =
         enum_input_files.iter().chain(boot_files.iter()).cloned().collect();
     enum_constants.validate_consumed_sources(&app, &sources, &observed)?;
     keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
@@ -2209,7 +2209,7 @@ end
     // Carrier provenance must not depend on where a module lives:
     // models, services, helpers and lib all use the same splice.
     let mut concern_class_method_spans = Vec::new();
-    let mut framework_shadow_scopes = std::collections::HashSet::new();
+    let mut framework_shadow_scopes = crate::det::HashSet::default();
     for source in sources.iter().filter(|source| source.path.ends_with(".rb")) {
         let (carriers, shadows) = ingest_concern_class_method_spans(source.text.as_bytes(), &source.path);
         concern_class_method_spans.extend(carriers);
@@ -2227,7 +2227,7 @@ end
     // class nested in the model's own file does. This runs after every
     // walk, because `app/services` and `lib` can hold the same reopen,
     // and `lib` can hold the model.
-    let model_names: std::collections::HashSet<&str> =
+    let model_names: crate::det::HashSet<&str> =
         app.models.iter().map(|m| m.name.0.as_str()).collect();
     app.library_classes.retain(|lc| {
         let bodiless = !lc.is_module
@@ -2738,7 +2738,7 @@ fn refuse_validates_calls(
     gaps: &mut Vec<(crate::span::Span, String)>,
 ) {
     use crate::dialect::ModelBodyItem;
-    let calls: std::collections::HashSet<(crate::span::FileId, u32, u32)> =
+    let calls: crate::det::HashSet<(crate::span::FileId, u32, u32)> =
         refused.iter().map(|(_, span, _)| (span.file, span.start, span.end)).collect();
     model.body.retain(|item| {
         !matches!(item, ModelBodyItem::Validation { .. }) || {
@@ -2807,7 +2807,7 @@ fn gap_uniqueness_on_polymorphic_attribute(app: &mut App) {
                 .then(|| (item.span(), format!("validates :{}, uniqueness:", validation.attribute.as_str())))
             })
             .collect();
-        let calls: std::collections::HashSet<(crate::span::FileId, u32, u32)> =
+        let calls: crate::det::HashSet<(crate::span::FileId, u32, u32)> =
             refused.iter().map(|(span, _)| (span.file, span.start, span.end)).collect();
         model.body.retain(|item| {
             !matches!(item, ModelBodyItem::Validation { .. }) || {
@@ -2868,7 +2868,7 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
     }
 
     // A carried statement keeps the concern's lexical constants.
-    let mut defined = std::collections::HashSet::new();
+    let mut defined = crate::det::HashSet::default();
     for class in &app.library_classes {
         defined.insert(class.name.0.as_str().to_string());
         for (name, _) in &class.constants {
@@ -2878,7 +2878,7 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
     defined.extend(app.models.iter().map(|model| model.name.0.as_str().to_string()));
     // Each concern's own constants whose value is a literal count or
     // duration, for `inline_concern_literals`.
-    let literals: std::collections::HashMap<crate::ident::ClassId, Vec<(crate::ident::Symbol, crate::expr::Expr)>> = app
+    let literals: crate::det::HashMap<crate::ident::ClassId, Vec<(crate::ident::Symbol, crate::expr::Expr)>> = app
         .library_classes
         .iter()
         .map(|class| {
@@ -2901,8 +2901,8 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         // itself be an `include` (a concern's `included do include
         // Other end`), whose own items are spliced in turn; a concern
         // is spliced once, so an include cycle terminates.
-        let mut spliced: std::collections::HashSet<crate::ident::ClassId> =
-            std::collections::HashSet::new();
+        let mut spliced: crate::det::HashSet<crate::ident::ClassId> =
+            crate::det::HashSet::default();
         let mut i = 0;
         while i < model.body.len() {
             // `include Attachment, Broadcasts, Mentionee` is one
@@ -3023,7 +3023,7 @@ fn inline_concern_literals(
 fn qualify_carried_constants(
     expr: &mut crate::expr::Expr,
     concern: &str,
-    defined: &std::collections::HashSet<String>,
+    defined: &crate::det::HashSet<String>,
 ) {
     use crate::expr::ExprNode;
     let Some((enclosing, _)) = concern.rsplit_once("::") else { return };
@@ -3056,7 +3056,7 @@ fn qualify_carried_constants(
 fn concern_named<V>(
     owner: &str,
     path: &[crate::ident::Symbol],
-    concerns: &std::collections::HashMap<crate::ident::ClassId, V>,
+    concerns: &crate::det::HashMap<crate::ident::ClassId, V>,
 ) -> crate::ident::ClassId {
     let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
     if let Some(top) = written.strip_prefix("::") {
@@ -3122,13 +3122,13 @@ fn rehome_default_fk(
 pub(super) fn concern_class_method_catalog(
     classes: &[LibraryClass],
     carriers: &[ConcernClassMethodSpans],
-) -> HashMap<crate::ident::ClassId, (Vec<crate::dialect::MethodDef>, std::collections::HashSet<Symbol>)> {
-    use std::collections::HashSet;
-    let mut carried: HashMap<&crate::ident::ClassId, HashSet<&crate::span::Span>> = HashMap::new();
+) -> HashMap<crate::ident::ClassId, (Vec<crate::dialect::MethodDef>, crate::det::HashSet<Symbol>)> {
+    use crate::det::HashSet;
+    let mut carried: HashMap<&crate::ident::ClassId, HashSet<&crate::span::Span>> = HashMap::default();
     for carrier in carriers {
         carried.entry(&carrier.owner).or_default().extend(&carrier.methods);
     }
-    let mut class_side: HashMap<_, (Vec<crate::dialect::MethodDef>, HashSet<Symbol>)> = HashMap::new();
+    let mut class_side: HashMap<_, (Vec<crate::dialect::MethodDef>, HashSet<Symbol>)> = HashMap::default();
     for lc in classes {
         let Some(spans) = carried.get(&lc.name) else { continue };
         let (methods, consts) = class_side.entry(lc.name.clone()).or_default();
@@ -3185,18 +3185,18 @@ fn splice_concern_class_methods_into_includers(
 ) {
     use crate::dialect::ModelBodyItem;
     use crate::ident::{ClassId, Symbol};
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
 
     let nested_carriers: HashSet<&ClassId> = carriers.iter()
         .filter(|c| c.has_nested_carrier).map(|c| &c.owner).collect();
-    let mut bridges: HashMap<&ClassId, HashSet<&crate::span::Span>> = HashMap::new();
+    let mut bridges: HashMap<&ClassId, HashSet<&crate::span::Span>> = HashMap::default();
     for carrier in carriers {
         if nested_carriers.contains(&carrier.owner) {
             bridges.entry(&carrier.owner).or_default().extend(&carrier.bridges);
         }
     }
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
-    let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
     }
@@ -3218,7 +3218,7 @@ fn splice_concern_class_methods_into_includers(
     let copies = |mut queue: Vec<ClassId>, mut taken: HashSet<Symbol>| {
         // Transitive closure of the includer's includes, in ancestor order.
         let mut order: Vec<ClassId> = Vec::new();
-        let mut seen: HashSet<ClassId> = HashSet::new();
+        let mut seen: HashSet<ClassId> = HashSet::default();
         while !queue.is_empty() {
             let id = queue.remove(0);
             if !seen.insert(id.clone()) {
@@ -3230,7 +3230,7 @@ fn splice_concern_class_methods_into_includers(
             }
         }
         let mut added = Vec::new();
-        let mut provenance: HashMap<Symbol, ClassId> = HashMap::new();
+        let mut provenance: HashMap<Symbol, ClassId> = HashMap::default();
         for concern in &order {
             let Some((methods, consts)) = class_side.get(concern) else { continue };
             for m in methods {
@@ -3253,7 +3253,7 @@ fn splice_concern_class_methods_into_includers(
         (added, provenance)
     };
 
-    let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::new();
+    let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::default();
     for model in &mut app.models {
         let taken = model.methods()
             .filter(|m| m.receiver == MethodReceiver::Class)
@@ -3304,7 +3304,8 @@ fn splice_concern_class_methods_into_includers(
 /// A template no route reaches stays the unreachable file it is.
 fn synthesize_template_only_actions(app: &mut App) {
     use crate::dialect::{Action, ControllerBodyItem, RenderTarget};
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
+    use crate::det::HashSet;
 
     let view_names: HashSet<&str> = app.views.iter().map(|v| v.name.as_str()).collect();
     let has_template = |prefix: &str, action: &str| {
@@ -3420,7 +3421,7 @@ fn synthesize_template_only_actions(app: &mut App) {
 /// `rbs_signatures` as the module's declaration; only the empty body goes.
 fn drop_abstract_stubs(
     app: &mut App,
-    abstracts: &HashMap<crate::ident::ClassId, std::collections::HashSet<crate::ident::Symbol>>,
+    abstracts: &HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>>,
 ) {
     for lc in &mut app.library_classes {
         let Some(names) = abstracts.get(&lc.name) else { continue };
@@ -3553,13 +3554,13 @@ fn splice_concerns_into_controllers(app: &mut App) {
     // which no controller includes, and a method that is spliced has
     // its body cloned below anyway.
     let mut module_methods: HashMap<crate::ident::ClassId, Vec<&crate::dialect::MethodDef>> =
-        HashMap::new();
+        HashMap::default();
     let mut module_constants: HashMap<
         crate::ident::ClassId,
-        std::collections::HashSet<crate::ident::Symbol>,
-    > = HashMap::new();
+        crate::det::HashSet<crate::ident::Symbol>,
+    > = HashMap::default();
     let mut module_includes: HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> =
-        HashMap::new();
+        HashMap::default();
     for lc in &app.library_classes {
         module_methods.insert(
             lc.name.clone(),
@@ -3581,9 +3582,9 @@ fn splice_concerns_into_controllers(app: &mut App) {
     let mut spliced_origin: HashMap<
         crate::ident::ClassId,
         HashMap<crate::ident::Symbol, crate::ident::ClassId>,
-    > = HashMap::new();
-    let mut posts_spliced: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
-        std::collections::HashSet::new();
+    > = HashMap::default();
+    let mut posts_spliced: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+        crate::det::HashSet::default();
 
     // Per controller, the action names a route reaches on it or on a
     // controller that inherits from it. A module method that is PUBLIC
@@ -3626,7 +3627,7 @@ fn splice_concerns_into_controllers(app: &mut App) {
             }
         }
 
-        let mut defined: std::collections::HashSet<crate::ident::Symbol> = controller
+        let mut defined: crate::det::HashSet<crate::ident::Symbol> = controller
             .body
             .iter()
             .filter_map(|item| match item {
@@ -3837,14 +3838,14 @@ fn splice_concerns_into_controllers(app: &mut App) {
 /// its ancestor defines).
 fn routed_actions_with_descendants(
     app: &App,
-) -> HashMap<crate::ident::ClassId, std::collections::HashSet<crate::ident::Symbol>> {
+) -> HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> {
     let parents: HashMap<&crate::ident::ClassId, &crate::ident::ClassId> = app
         .controllers
         .iter()
         .filter_map(|c| c.parent.as_ref().map(|p| (&c.name, p)))
         .collect();
-    let mut out: HashMap<crate::ident::ClassId, std::collections::HashSet<crate::ident::Symbol>> =
-        HashMap::new();
+    let mut out: HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> =
+        HashMap::default();
     for route in crate::lower::routes::flatten_routes(app) {
         let mut cur = Some(&route.controller);
         let mut depth = 0;
@@ -3919,16 +3920,16 @@ pub(super) struct ControllerConcernSurfaces {
 }
 
 pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurfaces {
-    let mut module_includes: HashMap<_, Vec<_>> = HashMap::new();
+    let mut module_includes: HashMap<_, Vec<_>> = HashMap::default();
     for lc in &app.library_classes {
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
     }
-    let mut controllers = HashMap::new();
+    let mut controllers = HashMap::default();
     for controller in &app.controllers {
         let mut direct_includes = Vec::new();
         let mut inherited = Vec::new();
         let mut cur = Some(controller);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(c) = cur {
             if !seen.insert(&c.name) {
                 break;
@@ -4011,7 +4012,7 @@ fn dedup_repeated_filters(app: &mut App) {
 fn qualify_lexical_consts(
     expr: &mut crate::expr::Expr,
     owner: &crate::ident::ClassId,
-    consts: &std::collections::HashSet<crate::ident::Symbol>,
+    consts: &crate::det::HashSet<crate::ident::Symbol>,
 ) {
     use crate::expr::ExprNode;
 
@@ -4070,7 +4071,7 @@ fn qualify_model_class_method_ar_calls(app: &mut App) {
     const AR_CLASS_METHODS: &[&str] = &["all", "count", "where", "find_by", "exists?"];
 
     for model in &mut app.models {
-        let own: std::collections::HashSet<String> = model
+        let own: crate::det::HashSet<String> = model
             .methods()
             .map(|m| m.name.as_str().to_string())
             .collect();
@@ -4082,7 +4083,7 @@ fn qualify_model_class_method_ar_calls(app: &mut App) {
             fn walk(
                 expr: &mut Expr,
                 recv: &Expr,
-                own: &std::collections::HashSet<String>,
+                own: &crate::det::HashSet<String>,
                 ar: &[&str],
             ) {
                 expr.node.for_each_child_mut(&mut |c| walk(c, recv, own, ar));
@@ -4234,8 +4235,8 @@ fn respond_to_macro_is_consumed(
     controller: &crate::dialect::Controller,
     all: &[crate::dialect::Controller],
 ) -> bool {
-    use std::collections::HashSet;
-    let mut seen: HashSet<crate::ident::ClassId> = HashSet::new();
+    use crate::det::HashSet;
+    let mut seen: HashSet<crate::ident::ClassId> = HashSet::default();
     let mut cur = Some(controller);
     while let Some(c) = cur {
         if !seen.insert(c.name.clone()) {
@@ -4603,13 +4604,13 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
     }
 
     let surfaces = controller_concern_surfaces(app);
-    let inherited_class_methods: HashMap<_, std::collections::HashSet<_>> = app
+    let inherited_class_methods: HashMap<_, crate::det::HashSet<_>> = app
         .controllers
         .iter()
         .map(|controller| {
-            let mut methods = std::collections::HashSet::new();
+            let mut methods = crate::det::HashSet::default();
             let mut current = Some(controller);
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::det::HashSet::default();
             while let Some(ancestor) = current {
                 if !seen.insert(&ancestor.name) {
                     break;
@@ -4633,7 +4634,7 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
     // the borrowed body. A later reopening of the same name replaces
     // the earlier def, as the owned table did. Library classes are only
     // read here; the loop below mutates controllers.
-    let mut macros: HashMap<crate::ident::ClassId, Vec<&MethodDef>> = HashMap::new();
+    let mut macros: HashMap<crate::ident::ClassId, Vec<&MethodDef>> = HashMap::default();
     for lc in &app.library_classes {
         for method in lc
             .methods
@@ -4655,7 +4656,7 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
             continue;
         }
         let surface = &surfaces.controllers[&controller.name];
-        let mut macro_definitions = HashMap::<crate::ident::Symbol, usize>::new();
+        let mut macro_definitions = HashMap::<crate::ident::Symbol, usize>::default();
         for included in &surface.includes {
             if let Some(methods) = macros.get(included) {
                 for method in methods {
@@ -4663,7 +4664,7 @@ fn expand_class_body_macros(app: &mut App) -> IngestResult<()> {
                 }
             }
         }
-        let mut shadowed_macros: std::collections::HashSet<_> = macro_definitions
+        let mut shadowed_macros: crate::det::HashSet<_> = macro_definitions
             .into_iter()
             .filter_map(|(name, definitions)| (definitions > 1).then_some(name))
             .collect();
@@ -4904,7 +4905,7 @@ fn expand_nested_filter_macros(
     body: &crate::expr::Expr,
     module: &crate::ident::ClassId,
     macros: &HashMap<crate::ident::ClassId, Vec<&crate::dialect::MethodDef>>,
-    shadowed: &std::collections::HashSet<crate::ident::Symbol>,
+    shadowed: &crate::det::HashSet<crate::ident::Symbol>,
     stack: &mut Vec<crate::ident::Symbol>,
 ) -> Option<crate::expr::Expr> {
     use crate::expr::{Expr, ExprNode};
@@ -4915,7 +4916,7 @@ fn expand_nested_filter_macros(
         body: &Expr,
         module: &crate::ident::ClassId,
         macros: &HashMap<crate::ident::ClassId, Vec<&crate::dialect::MethodDef>>,
-        shadowed: &std::collections::HashSet<crate::ident::Symbol>,
+        shadowed: &crate::det::HashSet<crate::ident::Symbol>,
         stack: &mut Vec<crate::ident::Symbol>,
         remaining: &mut usize,
     ) -> Option<Vec<Expr>> {
@@ -6619,7 +6620,7 @@ fn resolve_polymorphic_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
 
     let mut implementors: HashMap<crate::ident::Symbol, Vec<crate::ident::ClassId>> =
-        HashMap::new();
+        HashMap::default();
     for model in &app.models {
         for assoc in model.associations() {
             let (Association::HasMany { as_interface: Some(intf), .. }
@@ -7265,7 +7266,7 @@ fn literal_require_relative_targets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, file: 
 fn boot_source_files<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,
-    inputs: &std::collections::HashSet<PathBuf>,
+    inputs: &crate::det::HashSet<PathBuf>,
 ) -> IngestResult<Vec<PathBuf>> {
     let config = dir.join("config");
     let mut files: Vec<PathBuf> = ["application.rb", "environment.rb", "boot.rb"]
@@ -7285,7 +7286,7 @@ fn boot_source_files<V: Vfs + ?Sized>(
     // paths it can't follow for `application.rb` / `environment.rb` once,
     // and feeds the support-root batch, which this list does not.
     // To the end of each chain (`a.rb` requires `b.rb`), each file once.
-    let mut visited: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
+    let mut visited: crate::det::HashSet<PathBuf> = files.iter().cloned().collect();
     let mut pending: Vec<PathBuf> = files.clone();
     while let Some(file) = pending.pop() {
         for target in literal_require_relative_targets(vfs, dir, &file) {
@@ -7894,7 +7895,7 @@ fn engine_route_sources<V: Vfs + ?Sized>(
         plain_source_file: bool,
     }
 
-    let mut declarations: HashMap<String, Vec<Declaration>> = HashMap::new();
+    let mut declarations: HashMap<String, Vec<Declaration>> = HashMap::default();
     for engine_dir in path_gems {
         if !vfs.is_dir(&engine_dir.join("app")) {
             continue;
@@ -7944,7 +7945,7 @@ fn engine_route_sources<V: Vfs + ?Sized>(
         }
     }
 
-    let mut sources = HashMap::new();
+    let mut sources = HashMap::default();
     for (class_name, declarations) in declarations {
         if declarations.len() != 1 {
             continue;
@@ -11278,8 +11279,8 @@ fn splice_test_helpers(tm: &mut TestModule, helpers: &[LibraryClass]) {
     }
 
     // Every name the class's OWN code mentions, as reachability roots.
-    let mut wanted: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
-    let mut consts: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+    let mut wanted: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
+    let mut consts: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
     for t in &tm.tests {
         collect_referenced_names(&t.body, &mut wanted, &mut consts);
     }
@@ -11369,8 +11370,8 @@ fn splice_test_helpers(tm: &mut TestModule, helpers: &[LibraryClass]) {
 /// `splice_test_helpers`).
 fn collect_referenced_names(
     expr: &crate::expr::Expr,
-    methods: &mut std::collections::HashSet<Symbol>,
-    consts: &mut std::collections::HashSet<Symbol>,
+    methods: &mut crate::det::HashSet<Symbol>,
+    consts: &mut crate::det::HashSet<Symbol>,
 ) {
     use crate::expr::ExprNode as EN;
     match &*expr.node {
@@ -11430,7 +11431,7 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
     app: &App,
     vfs: &V,
     dir: &Path,
-) -> std::collections::HashSet<String> {
+) -> crate::det::HashSet<String> {
     const TARGET: &str = "Routing::Mapper";
     let mut modules: Vec<String> = Vec::new();
     for sub in ["config/initializers", "lib"] {
@@ -11477,7 +11478,7 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
         "resources", "resource", "collection", "member", "namespace", "scope", "constraints",
         "concern", "concerns",
     ];
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     for name in modules {
         // Top-level `Mapper.prepend(Const)` resolves `Const` by its
         // written name; a suffix match would also pull in unrelated
@@ -11502,9 +11503,9 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
 
 // Not left on the declaring base: an abstract base's `enum :state` reads through the subclass's own column reader, which has to know the mapping.
 fn inherit_enums(models: &mut [crate::dialect::Model]) {
-    let declared: std::collections::HashMap<crate::ident::ClassId, (Option<crate::ident::ClassId>, indexmap::IndexMap<crate::ident::Symbol, Vec<(String, crate::expr::Literal)>>)> =
+    let declared: crate::det::HashMap<crate::ident::ClassId, (Option<crate::ident::ClassId>, indexmap::IndexMap<crate::ident::Symbol, Vec<(String, crate::expr::Literal)>>)> =
         models.iter().map(|m| (m.name.clone(), (m.parent.clone(), m.enums.clone()))).collect();
-    let defaults: std::collections::HashMap<crate::ident::ClassId, indexmap::IndexMap<crate::ident::Symbol, crate::expr::Literal>> =
+    let defaults: crate::det::HashMap<crate::ident::ClassId, indexmap::IndexMap<crate::ident::Symbol, crate::expr::Literal>> =
         models.iter().map(|m| (m.name.clone(), m.enum_defaults.clone())).collect();
     for m in models.iter_mut() {
         let mut current = m.parent.clone();

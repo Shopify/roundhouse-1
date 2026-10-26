@@ -35,7 +35,7 @@
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 const URL_POSITION_HELPERS: &[&str] =
     &["image_tag", "image_path", "url_for", "polymorphic_url", "polymorphic_path"];

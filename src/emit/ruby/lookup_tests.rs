@@ -334,7 +334,9 @@ fn installed_indexes_keep_the_app_and_models_slice_immutably_borrowed() {
     let body_names = between(schema, "#[derive(Default)]\npub(crate) struct ModelBodyNames", "/// Every method name a model body SENDS");
     let prelude = r#"
         #![allow(dead_code)]
-        use std::collections::{HashMap, HashSet, BTreeSet};
+        use std::collections::BTreeSet;
+        mod det { pub use std::collections::{HashMap, HashSet}; }
+        use det::{HashMap, HashSet};
         type Symbol = String;
         #[derive(Default)] struct ClassId(String);
         #[derive(Default)] struct Model { name: ClassId }

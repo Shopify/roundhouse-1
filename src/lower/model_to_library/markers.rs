@@ -1951,7 +1951,7 @@ fn reads_only(expr: &Expr, bound: &[&Symbol]) -> bool {
     }
 }
 
-fn collect_local_names(expr: &Expr, names: &mut std::collections::HashSet<Symbol>) {
+fn collect_local_names(expr: &Expr, names: &mut crate::det::HashSet<Symbol>) {
     match &*expr.node {
         ExprNode::Var { name, .. } => {
             names.insert(name.clone());
@@ -1982,7 +1982,7 @@ fn collect_local_names(expr: &Expr, names: &mut std::collections::HashSet<Symbol
 fn fresh_callback_local(
     span: Span,
     index: usize,
-    occupied: &mut std::collections::HashSet<Symbol>,
+    occupied: &mut crate::det::HashSet<Symbol>,
 ) -> Symbol {
     let base = format!("__roundhouse_callback_{}_{}", span.start, index);
     let mut suffix = 0;
@@ -1998,7 +1998,7 @@ fn fresh_callback_local(
 /// Rename callback-local references while respecting nested lambda bindings.
 /// Unshadowed nested lambdas deliberately follow the renamed outer binding so
 /// each folded callback closure retains its own value.
-fn rename_callback_locals(expr: &mut Expr, renames: &std::collections::HashMap<Symbol, Symbol>) {
+fn rename_callback_locals(expr: &mut Expr, renames: &crate::det::HashMap<Symbol, Symbol>) {
     match &mut *expr.node {
         ExprNode::Var { name, .. } => {
             if let Some(replacement) = renames.get(name) {
@@ -2024,7 +2024,7 @@ fn rename_callback_locals(expr: &mut Expr, renames: &std::collections::HashMap<S
             expr.node.for_each_child_mut(&mut |child| rename_callback_locals(child, renames));
         }
         ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
-            let visible: std::collections::HashMap<Symbol, Symbol> = renames
+            let visible: crate::det::HashMap<Symbol, Symbol> = renames
                 .iter()
                 .filter(|(name, _)| {
                     !params.contains(name)
@@ -2062,7 +2062,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let lambda_body = if extra_params.is_empty() {
             lambda_body.clone()
         } else {
-            let mut occupied = std::collections::HashSet::new();
+            let mut occupied = crate::det::HashSet::default();
             for method in methods.iter() {
                 occupied.extend(method.params.iter().map(|p| p.name.clone()));
                 if let Some(param) = &method.block_param {
@@ -2077,7 +2077,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
                     collect_local_names(default, &mut occupied);
                 }
             }
-            let renames: std::collections::HashMap<Symbol, Symbol> = extra_params
+            let renames: crate::det::HashMap<Symbol, Symbol> = extra_params
                 .iter()
                 .enumerate()
                 .map(|(index, param)| {

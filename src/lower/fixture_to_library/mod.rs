@@ -12,7 +12,7 @@
 //! Rails's AUTOINCREMENT-on-load behavior. Predictable so test
 //! setups can `Article.find(1)` if they need to.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::effect::EffectSet;
@@ -82,7 +82,7 @@ pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
 /// and dropping them from the list would be worse than emitting them
 /// in the order that exists today.
 fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
-    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::default();
     for f in &lowered.fixtures {
         let entry = deps.entry(f.name.as_str()).or_default();
         for rec in &f.records {
@@ -98,7 +98,7 @@ fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
             }
         }
     }
-    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut emitted: HashSet<&str> = HashSet::default();
     let mut out: Vec<&LoweredFixture> = Vec::new();
     // At most one pass per fixture: each round emits every fixture whose
     // dependencies are already out, so a chain of depth N settles in N
@@ -136,9 +136,9 @@ fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
 /// `users(user)` rather than `users(:david)`. campfire's spliced
 /// `SessionTestHelper#sign_in` is the only shape in the corpus that
 /// does this.
-fn fixtures_reached_by_variable(app: &App) -> std::collections::HashSet<Symbol> {
+fn fixtures_reached_by_variable(app: &App) -> crate::det::HashSet<Symbol> {
     let names: Vec<Symbol> = app.fixtures.iter().map(|f| f.name.clone()).collect();
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     for tm in &app.test_modules {
         let bodies = tm
             .tests
@@ -156,7 +156,7 @@ fn fixtures_reached_by_variable(app: &App) -> std::collections::HashSet<Symbol> 
 fn collect_variable_fixture_calls(
     e: &Expr,
     names: &[Symbol],
-    out: &mut std::collections::HashSet<Symbol>,
+    out: &mut crate::det::HashSet<Symbol>,
 ) {
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node {
         if args.len() == 1

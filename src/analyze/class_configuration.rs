@@ -3,7 +3,7 @@
 //! here, and `ClassAttribute` methods, whose parameters are typed from
 //! their call sites like any method's (class-body macro calls included).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{ClassConfigurationRole, Controller, ControllerBodyItem};
 use crate::expr::{Expr, ExprNode, LValue};
@@ -14,7 +14,7 @@ use super::{Analyzer, Ctx, union_of};
 
 impl Analyzer {
     pub(super) fn analyze_class_configuration(&mut self, controllers: &mut [Controller]) {
-        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::new();
+        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::default();
         for controller in controllers.iter_mut() {
             for item in &mut controller.body {
                 let ControllerBodyItem::ClassIvarInit { expr, carrier, .. } = item else {

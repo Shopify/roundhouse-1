@@ -44,14 +44,14 @@ use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 /// `has_one` declarations by owner: assoc name → (target, foreign key, as:,
 /// owner key the foreign key matches — `primary_key:`, else `id`).
 type Builders = HashMap<ClassId, HashMap<Symbol, (ClassId, Symbol, Option<Symbol>, Symbol, Ty)>>;
 
 pub fn apply_has_one_builder_lowering(app: &mut App) {
-    let mut table: Builders = HashMap::new();
+    let mut table: Builders = HashMap::default();
     for model in &app.models {
         for assoc in model.associations() {
             // Polymorphic `has_one ..., as:` needs the interface TYPE
@@ -88,7 +88,7 @@ pub fn apply_has_one_builder_lowering(app: &mut App) {
 
     // Concern module → the single model that includes it, when there is
     // exactly one. `None` for a module two models share: see the header.
-    let mut sole_includer: HashMap<ClassId, Option<ClassId>> = HashMap::new();
+    let mut sole_includer: HashMap<ClassId, Option<ClassId>> = HashMap::default();
     for model in &app.models {
         for m in crate::analyze::model_includes(model) {
             sole_includer

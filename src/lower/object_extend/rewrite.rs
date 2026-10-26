@@ -4,7 +4,7 @@
 //! one `.new` plus setter calls. The `extend` stays a statement, which
 //! is where Spinel flips that object's class.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use super::{Factory, const_name, plain_new_class, statements, var_is, var_name};
 use crate::dialect::Param;

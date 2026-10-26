@@ -50,7 +50,7 @@
 //! an earlier parameter (`def f(a, b = a)`) or the callee's `self` means
 //! something different there, and such a call is left alone.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -60,7 +60,7 @@ mod constructor;
 mod owned;
 use constructor::InstanceCallParams;
 
-pub(super) fn lexical_refinement_calls(app: &App) -> std::collections::HashSet<crate::span::Span> {
+pub(super) fn lexical_refinement_calls(app: &App) -> crate::det::HashSet<crate::span::Span> {
     constructor::lexical_refinement_calls(app)
 }
 
@@ -114,7 +114,7 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagn
     super::kwsplat::restore_kwrest_in_test_helpers(app);
     // One call can be reached by the owner-relative walk and by the
     // typed-receiver one; it is one refusal.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     diagnostics.retain(|d| !is_flattened_refusal(d) || seen.insert(d.span));
     let params = helper_param_names(app);
     if params.is_empty() {
@@ -140,7 +140,7 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagn
 /// positional (`def f(x, opts = {})`) called with `f(x, opts: 1)` is
 /// handed the Hash `{opts: 1}` by Ruby, and must keep it.
 fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
-    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if m.receiver != crate::dialect::MethodReceiver::Class {
@@ -239,7 +239,7 @@ pub(crate) fn refuse_flattened_keyword_splats(app: &mut App) -> Vec<crate::diagn
     super::for_each_hook_body(app, &mut |e| {
         refuse_typed_splats(e, &class_params, &instance_slots, &mut diagnostics);
     });
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     diagnostics.retain(|d| !is_flattened_refusal(d) || seen.insert(d.span));
     diagnostics
 }
@@ -362,7 +362,7 @@ fn carries_keywords(args: &[Expr]) -> bool {
 /// because then the call site genuinely does not say which.
 fn apply_to_test_modules(app: &mut App) {
     for tm in &mut app.test_modules {
-        let mut params: HashMap<Symbol, Vec<Slot>> = HashMap::new();
+        let mut params: HashMap<Symbol, Vec<Slot>> = HashMap::default();
         let mut ambiguous: Vec<Symbol> = Vec::new();
         for m in &tm.helpers {
             // Same two exclusions as the module path: a `rest` parameter
@@ -420,7 +420,7 @@ fn slot_of(p: &crate::dialect::Param) -> Slot {
 /// call site alone, and binding it to the wrong signature is exactly
 /// the failure being fixed.
 fn helper_param_names(app: &App) -> HashMap<Symbol, Vec<Slot>> {
-    let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::new();
+    let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::default();
     let mut ambiguous: Vec<Symbol> = Vec::new();
     for (name, owner) in &app.helper_method_index {
         let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {

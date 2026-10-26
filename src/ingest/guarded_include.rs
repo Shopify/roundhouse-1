@@ -42,7 +42,7 @@
 //! own nest (`A::B::Chime` inside `A::B`) then the root; it does **not**
 //! invent parent scopes (`class A::B` does not open `A`).
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::dialect::{MethodReceiver, ModelBodyItem};

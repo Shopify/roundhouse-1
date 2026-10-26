@@ -4,7 +4,7 @@
 //! reader must have the declared collection's analyzed type before `.new`
 //! becomes `.build`.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{Association, MethodReceiver, ModelBodyItem};
@@ -38,7 +38,7 @@ pub fn apply_association_new_lowering(app: &mut App) {
         .models
         .iter()
         .map(|model| {
-            let mut overrides: HashSet<Symbol> = HashSet::new();
+            let mut overrides: HashSet<Symbol> = HashSet::default();
             for item in &model.body {
                 match item {
                     ModelBodyItem::Method { method, .. }
@@ -87,7 +87,7 @@ pub fn apply_association_new_lowering(app: &mut App) {
             // `new` as Rails' build; elsewhere it is left as written. The
             // last declaration of a name is the reader, so it alone
             // decides.
-            let mut names = HashMap::new();
+            let mut names = HashMap::default();
             for assoc in model.associations() {
                 let aliased = match assoc {
                     Association::HasMany { target, extension, .. }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
@@ -14,7 +14,7 @@ struct Owners<'a> {
 
 impl<'a> Owners<'a> {
     fn of(app: &'a App) -> Self {
-        let mut out = Owners { parents: HashMap::new(), defined: HashMap::new() };
+        let mut out = Owners { parents: HashMap::default(), defined: HashMap::default() };
         let mut define = |owner: &'a ClassId, methods: &mut dyn Iterator<Item = &'a MethodDef>| {
             for m in methods {
                 let key = (owner, m.receiver == MethodReceiver::Class, m.name.as_str());

@@ -17,7 +17,7 @@
 //! Hash literals, string interpolation (syntax matches Ruby).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::expr::{BoolOpKind, Expr, ExprNode, InterpPart, IrHint, LValue, Literal};
 
@@ -28,7 +28,7 @@ thread_local! {
     /// inside `ActionDispatch.Router`, or `Session` from another file)
     /// the way Ruby's lexical scoping does, so `emit_const` rewrites such
     /// refs to the fully-qualified module name using this map.
-    static MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
 
     /// `"{simple_module}#{elixir_fn}"` → that function's declared params,
     /// across ALL registered modules in the overlay. The cross-module
@@ -42,7 +42,7 @@ thread_local! {
     /// defeat the helper — `String.length(s) <= %{length: 100}` is always
     /// true in Elixir term ordering). Populated by `register_modules`.
     static MODULE_METHOD_PARAMS: RefCell<HashMap<String, Vec<crate::dialect::Param>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 
     /// Elixir function names of the CURRENT class's instance methods that
     /// thread a leading `record` param. A self-call (`record.foo(args)`)
@@ -50,14 +50,14 @@ thread_local! {
     /// instance method (e.g. `resolve_status`, which reads only a module
     /// constant) is NOT, so its self-call stays arity-correct as
     /// `foo(args)`. Set per class by `emit_library_class`.
-    static RECORD_METHODS: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
+    static RECORD_METHODS: RefCell<crate::det::HashSet<String>> =
+        RefCell::new(crate::det::HashSet::default());
 }
 
 /// Set the current class's record-threading instance-method names (see
 /// `RECORD_METHODS`). Called by `emit_library_class` before emitting a
 /// class's methods.
-pub(super) fn set_record_methods(names: std::collections::HashSet<String>) {
+pub(super) fn set_record_methods(names: crate::det::HashSet<String>) {
     RECORD_METHODS.with(|m| *m.borrow_mut() = names);
 }
 
@@ -68,7 +68,7 @@ thread_local! {
     /// defaulted positionals by name (`render(record, body, :x)`) — Elixir
     /// has no Ruby keyword args. Set per class by `emit_library_class`.
     static METHOD_PARAMS: RefCell<HashMap<String, Vec<crate::dialect::Param>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 /// Set the current class's per-method declared params (see `METHOD_PARAMS`).
@@ -83,12 +83,12 @@ thread_local! {
     /// before a method), not a call — emit the bare name. Needed for
     /// view partials whose param (`article`) collides with a same-named
     /// view function (`Views::Articles.article`). Set by `emit_fn`.
-    static CURRENT_PARAMS: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
+    static CURRENT_PARAMS: RefCell<crate::det::HashSet<String>> =
+        RefCell::new(crate::det::HashSet::default());
 }
 
 /// Set the param names in scope for the method being emitted.
-pub(super) fn set_current_params(names: std::collections::HashSet<String>) {
+pub(super) fn set_current_params(names: crate::det::HashSet<String>) {
     CURRENT_PARAMS.with(|p| *p.borrow_mut() = names);
 }
 
@@ -136,10 +136,10 @@ thread_local! {
 
 thread_local! {
     /// The current module's ivars a load-once method fills (`library::load_once_ivars`).
-    static PROCESS_WIDE_IVARS: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+    static PROCESS_WIDE_IVARS: RefCell<crate::det::HashSet<String>> = RefCell::new(crate::det::HashSet::default());
 }
 
-pub(super) fn set_process_wide_ivars(names: std::collections::HashSet<String>) {
+pub(super) fn set_process_wide_ivars(names: crate::det::HashSet<String>) {
     PROCESS_WIDE_IVARS.with(|n| *n.borrow_mut() = names);
 }
 
@@ -163,8 +163,8 @@ thread_local! {
     /// to a module attribute (`@html_escapes`) only when it's in here —
     /// so an all-caps *module* reference (`JSON`, `IO`, `URI`) is NOT
     /// mistaken for a constant and stays a module name.
-    static DECLARED_CONSTANTS: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
+    static DECLARED_CONSTANTS: RefCell<crate::det::HashSet<String>> =
+        RefCell::new(crate::det::HashSet::default());
 }
 
 /// Reset the declared-constant registry (start of an overlay emit).
@@ -189,7 +189,7 @@ thread_local! {
     /// Runtime classes register names only (`Ty::Untyped`); model + Row
     /// classes register schema-derived column types.
     static FIELD_TYPES: RefCell<HashMap<String, HashMap<String, crate::ty::Ty>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 /// Reset the field registry (start of an overlay emit).
@@ -250,7 +250,7 @@ thread_local! {
     /// resource→model mapping; read by `effective_recv_ty` for a `Var`
     /// matching a param of the method being emitted.
     static PARAM_TYPES: RefCell<HashMap<String, HashMap<String, crate::ty::Ty>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 /// Reset the param-type registry (start of an overlay emit).
@@ -294,7 +294,7 @@ thread_local! {
 
 thread_local! {
     /// Ruby error class name → the `defexception` module it emits as.
-    static ERROR_MODULES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static ERROR_MODULES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
 }
 
 pub(super) fn register_error_module(ruby_name: &str, module: &str) {
@@ -3255,7 +3255,7 @@ mod tests {
             Param::with_default(Symbol::from("content_type"), nil()),
             Param::with_default(Symbol::from("location"), nil()),
         ];
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert("render".to_string(), params);
         set_method_params(map);
 
@@ -3277,7 +3277,7 @@ mod tests {
 
         // An unknown callee falls back to a plain per-arg render.
         assert_eq!(unpack_kwargs("unknown_fn", &only_status).len(), 2);
-        set_method_params(HashMap::new());
+        set_method_params(HashMap::default());
     }
 
     #[test]
@@ -3386,10 +3386,10 @@ mod tests {
 
         // A name that ISN'T a param of the current method doesn't resolve
         // (no phantom typing of an unrelated local).
-        set_current_params(std::collections::HashSet::new());
+        set_current_params(crate::det::HashSet::default());
         assert_ne!(emit_expr(&call(errors(), "count", vec![])), "Enum.count(article.errors)");
 
-        set_current_params(std::collections::HashSet::new());
+        set_current_params(crate::det::HashSet::default());
         set_current_class_name("");
         clear_param_types();
         clear_field_names();

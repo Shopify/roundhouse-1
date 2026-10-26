@@ -26,7 +26,7 @@ use crate::ident::Symbol;
 use crate::App;
 
 pub(super) fn inherit_tableless_parents(app: &mut App) {
-    let index: std::collections::HashMap<String, usize> =
+    let index: crate::det::HashMap<String, usize> =
         app.models.iter().enumerate().map(|(i, m)| (m.name.0.as_str().to_string(), i)).collect();
     let resolved: Vec<Option<usize>> = app
         .models
@@ -80,7 +80,7 @@ pub(super) fn inherit_tableless_parents(app: &mut App) {
 
 /// `parent` as written in `child`'s file, resolved the way Ruby's
 /// constant lookup walks the child's enclosing modules.
-fn resolve_parent(index: &std::collections::HashMap<String, usize>, child: &str, parent: &str) -> Option<usize> {
+fn resolve_parent(index: &crate::det::HashMap<String, usize>, child: &str, parent: &str) -> Option<usize> {
     if !parent.contains("::") {
         let mut segs: Vec<&str> = child.split("::").collect();
         segs.pop();

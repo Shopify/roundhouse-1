@@ -31,7 +31,7 @@
 //! Not reproduced, and left alone rather than half-applied: a `with:`
 //! that is not a one-parameter lambda literal.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use indexmap::IndexMap;
 

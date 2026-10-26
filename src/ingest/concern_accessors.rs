@@ -2,7 +2,7 @@
 //! retains candidate declarations; only a concrete model inclusion
 //! commits to their ivar contract or reports a contextual refusal.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::diagnostic::DiagnosticKind;
 use crate::dialect::{MethodReceiver, ModelBodyItem};
@@ -128,7 +128,7 @@ fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<
     }
 
     let mut pending = crate::analyze::model_includes(model);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
             continue;
@@ -181,7 +181,7 @@ fn validate_activation(
     }
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
-    let mut modules = HashSet::new();
+    let mut modules = HashSet::default();
     let retained: HashSet<_> = app.library_classes.iter().map(|c| &c.name)
         .chain(app.models.iter().map(|m| &m.name))
         .chain(app.controllers.iter().map(|c| &c.name))
@@ -268,8 +268,8 @@ fn validate_activation(
             }
         }
         let mut pending = direct.clone();
-        let mut seen = HashSet::new();
-        let mut reported = HashSet::new();
+        let mut seen = HashSet::default();
+        let mut reported = HashSet::default();
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {
                 continue;
@@ -341,13 +341,13 @@ pub(super) fn validate(
     // a large app a second complete analysis. Only a name that passes every
     // syntactic check reads it, so a dry pass finds those models and the
     // probe covers just them (or does not run at all).
-    let mut probed = HashSet::new();
+    let mut probed = HashSet::default();
     let _ = refusals(app, &spans, &mut |model, _, _| {
         probed.insert(model.clone());
         false
     });
     let surfaces = if probed.is_empty() {
-        HashMap::new()
+        HashMap::default()
     } else {
         crate::timings::phase("concern-accessor-surface", || {
             crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
@@ -360,7 +360,7 @@ pub(super) fn validate(
     });
     let mut rejections = Vec::new();
     for (model_index, refused) in refused {
-        let mut rejected = HashSet::new();
+        let mut rejected = HashSet::default();
         for (span, message) in refused {
             let file = &app.sources[span.file.0 as usize - 1].path;
             unwrap_or_record::<()>(Err(IngestError::Unsupported {
@@ -393,7 +393,7 @@ fn refusals(
             continue;
         };
         let hook = unconsumed_included_hook(model, app);
-        let mut nonpublic_methods = HashSet::new();
+        let mut nonpublic_methods = HashSet::default();
         for item in &model.body {
             match item {
                 ModelBodyItem::Unknown { expr, .. } => {

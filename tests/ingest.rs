@@ -523,7 +523,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let session = by_name.get("new_user_session").expect("new_user_session");
     assert_eq!(session.path, "/users/sign_in");
@@ -561,7 +561,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let session = by_name.get("new_user_session").expect("new_user_session");
     assert_eq!(session.controller.0.as_str(), "Users::SessionsController");
@@ -609,7 +609,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let session = by_name.get("new_user_session").expect("new_user_session");
     assert_eq!(session.path, "/users/sign_in");
@@ -656,7 +656,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
 
     let new_session = by_name.get("new_widget_session").expect("new_widget_session");
@@ -717,7 +717,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let session = by_name.get("new_widget_session").expect("new_widget_session");
     assert_eq!(session.path, "/widgets/sign_in");
@@ -749,7 +749,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let session = by_name.get("new_widget_session").expect("new_widget_session");
     assert_eq!(session.controller.0.as_str(), "Widgets::SessionsController");
@@ -786,7 +786,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let new_session = by_name.get("new_widget_session").expect("new_widget_session");
     assert_eq!(new_session.path, "/widgets/login");
@@ -817,7 +817,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let new_session = by_name.get("new_widget_session").expect("new_widget_session");
     assert_eq!(new_session.path, "/sign_in");
@@ -850,7 +850,7 @@ end
     let mut app = roundhouse::App::default();
     app.routes = table;
     let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: std::collections::HashMap<_, _> =
+    let by_name: roundhouse::det::HashMap<_, _> =
         flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
     let new_session = by_name.get("new_widget_session").expect("new_widget_session");
     assert_eq!(new_session.path, "/auth/sign_in");
@@ -889,7 +889,7 @@ fn mounts_in_split_route_files_keep_the_split_file_span() {
     let table = roundhouse::ingest::routes::ingest_routes_with_draws(
         b"Rails.application.routes.draw do\n  draw :admin\nend\n",
         "config/routes.rb",
-        &std::collections::HashMap::from([("admin".to_string(), (
+        &roundhouse::det::HashMap::from_iter([("admin".to_string(), (
             b"mount Catalog::Engine, at: '/catalog'\nget '/ok', to: 'posts#index'\n".to_vec(),
             "config/routes/admin.rb".to_string(),
         ))]),
@@ -906,7 +906,7 @@ fn top_level_draw_preserves_runtime_cable_mount_context() {
     let table = roundhouse::ingest::routes::ingest_routes_with_draws(
         b"Rails.application.routes.draw do\n  draw :cable\nend\n",
         "config/routes.rb",
-        &std::collections::HashMap::from([("cable".to_string(), (
+        &roundhouse::det::HashMap::from_iter([("cable".to_string(), (
             b"mount ActionCable.server => '/cable'\n".to_vec(),
             "config/routes/cable.rb".to_string(),
         ))]),
@@ -917,7 +917,7 @@ fn top_level_draw_preserves_runtime_cable_mount_context() {
 /// Transparent draw/concern expansion inherits its invocation's mount scope.
 #[test]
 fn cable_mounts_inherit_draw_and_concern_scope() {
-    let draws = std::collections::HashMap::from([("cable".to_string(), (
+    let draws = roundhouse::det::HashMap::from_iter([("cable".to_string(), (
         b"mount ActionCable.server => '/cable'\n".to_vec(),
         "config/routes/cable.rb".to_string(),
     ))]);
@@ -981,7 +981,7 @@ fn loaded_route_draw_resets_and_restores_mount_scope() {
         let source = format!("Rails.application.routes.draw do\n namespace :admin do\n  {include}\n  mount ActionCable.server => '/cable'\n end\n mount ActionCable.server => '/cable'\nend\n");
         let table = roundhouse::ingest::routes::ingest_routes_with_draws(
             source.as_bytes(), "config/routes.rb",
-            &std::collections::HashMap::from([("cable".to_string(), (
+            &roundhouse::det::HashMap::from_iter([("cable".to_string(), (
                 loaded.to_vec(), "config/routes/cable.rb".to_string(),
             ))]),
         ).unwrap();
@@ -1876,7 +1876,6 @@ fn classifies_models_vs_library_classes() {
 #[test]
 fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
     use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[
@@ -1891,7 +1890,7 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
         // A RABL view: still an unsupported engine the analyzer skips.
         ("app/views/widgets/index.html.rabl", "object @widget\n"),
     ];
-    let tree = || -> HashMap<PathBuf, Vec<u8>> {
+    let tree = || -> std::collections::HashMap<PathBuf, Vec<u8>> {
         files
             .iter()
             .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
@@ -1943,7 +1942,6 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
 #[test]
 fn spelled_lambda_scope_ingests_like_arrow_form() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1956,7 +1954,7 @@ fn spelled_lambda_scope_ingests_like_arrow_form() {
             "end\n",
         ),
     )];
-    let tree: HashMap<PathBuf, Vec<u8>> = files
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
         .collect();
@@ -1980,7 +1978,6 @@ fn spelled_lambda_scope_ingests_like_arrow_form() {
 #[test]
 fn arrow_lambda_scope_do_end_and_defaulted_param_ingest() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1994,7 +1991,7 @@ fn arrow_lambda_scope_do_end_and_defaulted_param_ingest() {
             "end\n",
         ),
     )];
-    let tree: HashMap<PathBuf, Vec<u8>> = files
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
         .collect();
@@ -2027,7 +2024,6 @@ fn arrow_lambda_scope_do_end_and_defaulted_param_ingest() {
 #[test]
 fn parenthesized_lambda_scope_ingests() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -2044,7 +2040,7 @@ fn parenthesized_lambda_scope_ingests() {
             "end\n",
         ),
     )];
-    let tree: HashMap<PathBuf, Vec<u8>> = files
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
         .collect();
@@ -2070,7 +2066,6 @@ fn parenthesized_lambda_scope_ingests() {
 #[test]
 fn survey_mode_keeps_the_class_when_one_body_item_is_unsupported() {
     use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -2083,7 +2078,7 @@ fn survey_mode_keeps_the_class_when_one_body_item_is_unsupported() {
             "end\n",
         ),
     )];
-    let tree = || -> HashMap<PathBuf, Vec<u8>> {
+    let tree = || -> std::collections::HashMap<PathBuf, Vec<u8>> {
         files
             .iter()
             .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
@@ -2339,7 +2334,6 @@ fn multi_write_with_attr_targets_ingests_and_round_trips() {
 #[test]
 fn computed_enum_map_to_h_over_constant_ingests() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let computed_src = concat!(
@@ -2349,7 +2343,7 @@ fn computed_enum_map_to_h_over_constant_ingests() {
         "end\n",
     );
 
-    let tree_for = |src: &str| -> HashMap<PathBuf, Vec<u8>> {
+    let tree_for = |src: &str| -> std::collections::HashMap<PathBuf, Vec<u8>> {
         [(PathBuf::from("app/models/widget.rb"), src.as_bytes().to_vec())].into_iter().collect()
     };
 
@@ -2374,7 +2368,6 @@ fn computed_enum_map_to_h_over_constant_ingests() {
 #[test]
 fn computed_enum_index_by_and_index_with_over_constant_ingest() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -2387,7 +2380,7 @@ fn computed_enum_index_by_and_index_with_over_constant_ingest() {
             "end\n",
         ),
     )];
-    let tree: HashMap<PathBuf, Vec<u8>> = files
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
         .collect();
@@ -3311,7 +3304,6 @@ fn parameters_after_a_rest_are_popped_off_it() {
 #[test]
 fn recognized_wrap_parameters_forms_are_consumed_others_stay_in_the_survey() {
     use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[
@@ -3328,7 +3320,7 @@ fn recognized_wrap_parameters_forms_are_consumed_others_stay_in_the_survey() {
             "class GadgetsController < ApplicationController\n  wrap_parameters wrapper_options\nend\n",
         ),
     ];
-    let tree: HashMap<PathBuf, Vec<u8>> = files
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec()))
         .collect();

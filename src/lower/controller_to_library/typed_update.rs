@@ -7,7 +7,8 @@
 //! and the `to_attrs` method body stay there; this module owns when the
 //! typed variant applies and the late demand that grows `to_attrs`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::dialect::{LibraryClass, MethodDef};
 use crate::expr::{Expr, ExprNode, Literal};

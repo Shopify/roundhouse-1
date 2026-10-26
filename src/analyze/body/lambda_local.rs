@@ -3,7 +3,7 @@
 //! same body are that evidence: `double = ->(n) { n * 2 }; double.call(4)`
 //! types `n` as Integer.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::Param as RubyParam;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -297,9 +297,9 @@ pub(super) fn forget_nested_writes(
     }
     let expr = &exprs[index];
     let mut names = Vec::new();
-    let none = std::collections::HashSet::new();
+    let none = crate::det::HashSet::default();
     collect_executed_assigns(expr, true, &none, &mut names);
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     let mut queue: Vec<Symbol> = lambdas
         .keys()
         .filter(|name| !calls_in(expr, name).is_empty())
@@ -336,7 +336,7 @@ fn stored_lambda_expr<'a>(
 fn collect_executed_assigns(
     expr: &Expr,
     root: bool,
-    shadowed: &std::collections::HashSet<Symbol>,
+    shadowed: &crate::det::HashSet<Symbol>,
     out: &mut Vec<Symbol>,
 ) {
     match &*expr.node {
@@ -370,7 +370,7 @@ fn collect_executed_assigns(
 /// shadow the outer local of the same name.
 fn collect_executed_lambda(
     expr: &Expr,
-    outer: &std::collections::HashSet<Symbol>,
+    outer: &crate::det::HashSet<Symbol>,
     out: &mut Vec<Symbol>,
 ) {
     let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*expr.node else {
@@ -425,7 +425,7 @@ fn binds_name(pattern: &crate::expr::MatchPattern, name: &Symbol) -> bool {
 
 fn push_other_local_writes(
     expr: &Expr,
-    shadowed: &std::collections::HashSet<Symbol>,
+    shadowed: &crate::det::HashSet<Symbol>,
     out: &mut Vec<Symbol>,
 ) {
     match &*expr.node {

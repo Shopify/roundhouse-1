@@ -79,7 +79,7 @@
 //! conditional takes the weightiest holder among its branches. The holder
 //! changes no severity: it is what deciding one per holder will read.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;

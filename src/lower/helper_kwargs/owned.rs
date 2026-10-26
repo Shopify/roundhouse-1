@@ -35,7 +35,7 @@
 //! slot layout that moves the keywords differently, no one positional
 //! spelling is right for every receiver, so the call is refused.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::MethodReceiver;
@@ -81,11 +81,11 @@ impl OwnerIndex {
     pub(super) fn new(app: &App) -> Self {
         let names: HashSet<String> =
             app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
-        let mut parents = HashMap::new();
-        let mut includes: HashMap<String, Vec<String>> = HashMap::new();
-        let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut defined = HashMap::new();
-        let mut prepending = HashSet::new();
+        let mut parents = HashMap::default();
+        let mut includes: HashMap<String, Vec<String>> = HashMap::default();
+        let mut children: HashMap<String, Vec<String>> = HashMap::default();
+        let mut defined = HashMap::default();
+        let mut prepending = HashSet::default();
         for lc in &app.library_classes {
             let name = lc.name.0.as_str().to_string();
             if lc.unknown_calls.iter().any(|e| matches!(&*e.node,
@@ -116,7 +116,7 @@ impl OwnerIndex {
                 );
             }
         }
-        let mut includers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut includers: HashMap<String, Vec<String>> = HashMap::default();
         for (includer, modules) in &includes {
             for m in modules {
                 includers.entry(m.clone()).or_default().push(includer.clone());
@@ -154,7 +154,7 @@ impl OwnerIndex {
         }
         let mut out = Vec::new();
         let mut current = Some(class.to_string());
-        let mut chain = HashSet::new();
+        let mut chain = HashSet::default();
         while let Some(c) = current {
             if !chain.insert(c.clone()) {
                 return Err(());
@@ -249,7 +249,7 @@ impl OwnerIndex {
         };
         let mut out = Vec::new();
         let mut stack: Vec<String> = below(class);
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(c) = stack.pop() {
             if !seen.insert(c.clone()) {
                 continue;

@@ -536,7 +536,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // None` and the Vec bridges don't fire.
     let (mut model_lcs, model_registry): (
         Vec<crate::dialect::LibraryClass>,
-        std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+        crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) = if !app.models.is_empty() {
         let (mut lcs, registry) = crate::lower::lower_models_with_registry_and_params(
             &app.models,
@@ -551,7 +551,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         decide::decide_classes(&mut lcs);
         (lcs, registry)
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), crate::det::HashMap::default())
     };
 
     let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
@@ -1514,7 +1514,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // build-site's zip writer rejects duplicate filenames, so we
     // dedupe here instead. Iterate from the end so the most recent
     // write survives.
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
     let mut rev_kept: Vec<EmittedFile> = Vec::with_capacity(files.len());
     for f in files.into_iter().rev() {
         if seen.insert(f.path.clone()) {
@@ -1607,7 +1607,7 @@ fn render_axum_handler_wrappers(
     // the same action under multiple paths. The wrappers themselves
     // don't depend on the path (path params come in via extractors),
     // so one wrapper per (controller, action) suffices.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     let routes: Vec<&crate::lower::FlatRoute> = flat_routes
         .iter()
         .filter(|r| r.controller.0.as_str() == controller_name)
@@ -2325,13 +2325,13 @@ fn emit_controllers_mod_rs(entries: &[(String, String)]) -> EmittedFile {
 /// from `MethodDef.signature` when present; methods without a typed
 /// signature get an empty Tys vec and the Const-recv arity-pad path
 /// no-ops (same behavior as no entry).
-type GlobalMethodsMap = std::collections::HashMap<
+type GlobalMethodsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<crate::ty::Param>>,
+    crate::det::HashMap<String, Vec<crate::ty::Param>>,
 >;
-type GlobalDefaultsMap = std::collections::HashMap<
+type GlobalDefaultsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<Option<String>>>,
+    crate::det::HashMap<String, Vec<Option<String>>>,
 >;
 
 fn collect_global_class_methods(
@@ -2351,7 +2351,7 @@ fn collect_global_class_methods(
         lc: &LibraryClass,
         out: &mut GlobalMethodsMap,
         out_defaults: &mut GlobalDefaultsMap,
-        out_mutating: &mut std::collections::HashSet<String>,
+        out_mutating: &mut crate::det::HashSet<String>,
     ) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
@@ -2414,9 +2414,9 @@ fn collect_global_class_methods(
         }
     }
 
-    let mut out: GlobalMethodsMap = std::collections::HashMap::new();
-    let mut out_defaults: GlobalDefaultsMap = std::collections::HashMap::new();
-    let mut out_mutating: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: GlobalMethodsMap = crate::det::HashMap::default();
+    let mut out_defaults: GlobalDefaultsMap = crate::det::HashMap::default();
+    let mut out_mutating: crate::det::HashSet<String> = crate::det::HashSet::default();
     for lc in model_lcs {
         collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
     }

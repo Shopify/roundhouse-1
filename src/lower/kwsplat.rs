@@ -106,7 +106,7 @@
 //! exact. `fetch` would be closer for the missing-key half, but only
 //! elixir emits the one-argument form; `[]` every target handles.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -179,7 +179,7 @@ pub(crate) fn restore_kwrest_in_test_helpers(app: &mut App) {
 /// `ClassMethod` bodies use the class-method table — a receiverless
 /// call in a `def self.` reaches the class side.
 fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnostic>) {
-    let mut includes: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    let mut includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
         includes.insert(lc.name.clone(), lc.includes.clone());
     }
@@ -198,7 +198,7 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
         } else {
             &sigs.methods
         };
-        let mut out: HashMap<Symbol, Vec<Param>> = HashMap::new();
+        let mut out: HashMap<Symbol, Vec<Param>> = HashMap::default();
         let mut queue: Vec<ClassId> = vec![id.clone()];
         let mut seen: std::collections::BTreeSet<ClassId> = std::collections::BTreeSet::new();
         while let Some(cid) = queue.pop() {
@@ -266,7 +266,7 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
 /// helpers share is skipped — the call site does not say which.
 fn apply_to_test_modules(app: &mut App, diags: &mut Vec<Diagnostic>) {
     for tm in &mut app.test_modules {
-        let mut helpers: HashMap<Symbol, Vec<Param>> = HashMap::new();
+        let mut helpers: HashMap<Symbol, Vec<Param>> = HashMap::default();
         let mut ambiguous: Vec<Symbol> = Vec::new();
         for m in &tm.helpers {
             if helpers.insert(m.name.clone(), m.params.clone()).is_some() {

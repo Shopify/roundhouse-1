@@ -124,7 +124,7 @@ fn table_method(name: &str, rows: &[(String, Vec<(String, String)>)]) -> crate::
 /// Each model's stamped i18n, and the app's for an `errors` whose model
 /// is not known, held apart from the `App` the walk borrows mutably.
 pub(crate) struct LabelData {
-    models: std::collections::HashMap<crate::ident::ClassId, crate::i18n::ModelI18n>,
+    models: crate::det::HashMap<crate::ident::ClassId, crate::i18n::ModelI18n>,
     unknown: crate::i18n::ModelI18n,
     /// The app's whole catalog: the global error messages a run-time
     /// `errors.add` (`dynamic_add`) bakes for its kind.

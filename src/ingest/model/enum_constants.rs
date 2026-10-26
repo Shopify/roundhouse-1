@@ -71,27 +71,27 @@ enum SourceFact {
 
 #[derive(Default)]
 pub(in crate::ingest) struct EnumConstants {
-    values: std::collections::HashMap<String, EnumConstant>,
+    values: crate::det::HashMap<String, EnumConstant>,
     /// Lexical owners at each class/module open, keyed by (file, start).
     /// Concern `included do` resolution reads the same table models use.
-    pub(in crate::ingest) nesting: std::collections::HashMap<(String, usize), Vec<String>>,
+    pub(in crate::ingest) nesting: crate::det::HashMap<(String, usize), Vec<String>>,
     /// Superclass identities are lookup barriers, never additional enum inputs.
-    parents: std::collections::HashMap<String, Vec<ScopedName>>,
+    parents: crate::det::HashMap<String, Vec<ScopedName>>,
     facts: Vec<SourceFact>,
     /// Each class or module's folded constants, by qualified name, for a
     /// validation in another body that names them: every body that
     /// declares the owner, merged. `None`: a body not at a file's or
     /// body's top level, or a compact `class A::B` inside another
     /// namespace, whose owner is not certain.
-    owner_consts: std::collections::HashMap<String, Option<super::ClassConsts>>,
+    owner_consts: crate::det::HashMap<String, Option<super::ClassConsts>>,
     /// `NAME = …` writes per qualified name, at any depth and in every
     /// body: a name written twice (a reopened owner writing it again)
     /// has the value of whichever file loads last.
-    write_counts: std::collections::HashMap<String, usize>,
+    write_counts: crate::det::HashMap<String, usize>,
     /// Constant names some input file writes outside one plain top-level
     /// `NAME = …`, mutates, or lets a variable hold ([`super::ConstTaint`]
     /// over the whole file). By name, whatever owner the write names.
-    foreign_taint: std::collections::HashSet<String>,
+    foreign_taint: crate::det::HashSet<String>,
     /// `ALIAS = KINDS` edges the boot sources write, across all of them:
     /// closed over `foreign_taint` once they are all recorded, in
     /// `finish`, so an alias one initializer writes and a later one
@@ -102,21 +102,21 @@ pub(in crate::ingest) struct EnumConstants {
     /// `"Kinds".constantize`, a receiverless `const_set` in the owner's
     /// body): any of their constants may be replaced or mutated. `Object`
     /// reaches them all.
-    reflected: std::collections::HashSet<String>,
+    reflected: crate::det::HashSet<String>,
     /// Each owner's own `enum` declarations (bodies whose owner is
     /// certain), for another body reading `Owner.<plural>`.
-    enum_declarations: std::collections::HashMap<String, Vec<derived::Declaration>>,
+    enum_declarations: crate::det::HashMap<String, Vec<derived::Declaration>>,
     /// `(owner's last segment, method)` for `def self.m` and `class <<
     /// self; def m` in an owner's body.
-    singleton_methods: std::collections::HashSet<(String, String)>,
+    singleton_methods: crate::det::HashSet<(String, String)>,
     /// Singleton method names whose owner is not certain: `def Const.m`,
     /// and an enum's class method declared in a body whose owner is not
     /// certain.
-    uncertain_singleton_methods: std::collections::HashSet<String>,
+    uncertain_singleton_methods: crate::det::HashSet<String>,
     /// Owners (last segment) whose singleton class something opens:
     /// `singleton_class`, `define_singleton_method`, a non-`def` statement
     /// inside `class << self`.
-    open_singletons: std::collections::HashSet<String>,
+    open_singletons: crate::det::HashSet<String>,
     /// A singleton class opened on a receiver this pass cannot name.
     singletons_unknown: bool,
 }
@@ -137,7 +137,7 @@ impl EnumConstants {
     /// constant through a lexical owner or an ancestor (superclass or
     /// included module), so callers that fold a well-known top-level
     /// constant treat it as possibly shadowed.
-    pub(in crate::ingest) fn nested_names(&self) -> std::collections::HashSet<String> {
+    pub(in crate::ingest) fn nested_names(&self) -> crate::det::HashSet<String> {
         self.values
             .keys()
             .flat_map(|key| key.split("::").skip(1).map(str::to_string))
@@ -149,7 +149,7 @@ impl EnumConstants {
     /// `URI::MailTo::EMAIL_REGEXP = …`). A well-known top-level constant
     /// under one of these may have been replaced by the app, so callers
     /// must not fold it from a built-in table, whichever way it is spelled.
-    pub(in crate::ingest) fn top_level_names(&self) -> std::collections::HashSet<String> {
+    pub(in crate::ingest) fn top_level_names(&self) -> crate::det::HashSet<String> {
         self.values
             .keys()
             .filter_map(|key| key.split("::").next().map(str::to_string))
@@ -163,7 +163,7 @@ impl EnumConstants {
         &mut self,
         app: &crate::App,
         sources: &[crate::span::SourceFile],
-        input_files: &std::collections::HashSet<std::path::PathBuf>,
+        input_files: &crate::det::HashSet<std::path::PathBuf>,
     ) -> super::super::IngestResult<()> {
         for source in sources {
             let path = std::path::Path::new(&source.path);
@@ -195,14 +195,14 @@ impl EnumConstants {
     }
 
     fn resolve_name(&self, path: &str, owners: &[String]) -> Option<String> {
-        self.resolve_name_in(path, owners, &mut std::collections::HashSet::new())
+        self.resolve_name_in(path, owners, &mut crate::det::HashSet::default())
     }
 
     fn resolve_name_in(
         &self,
         path: &str,
         owners: &[String],
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut crate::det::HashSet<String>,
     ) -> Option<String> {
         if let Some(rooted) = path.strip_prefix("::") {
             return Some(rooted.to_string());
@@ -230,7 +230,7 @@ impl EnumConstants {
         &self,
         owner: &str,
         first: &str,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut crate::det::HashSet<String>,
     ) -> bool {
         if !visited.insert(owner.to_string()) {
             return true; // Cyclic ancestry is not a provable root lookup.

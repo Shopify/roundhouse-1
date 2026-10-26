@@ -16,7 +16,7 @@
 //! a `Model.where(...)` / `Model.all` chain-start (no scope) is seeded with
 //! `ActiveRecord::Relation.new(Model)` so it, too, is chainable.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{Association, Model, ModelBodyItem, Param};
 use crate::expr::{BlockStyle, Expr, ExprNode, Literal};
@@ -54,7 +54,7 @@ pub struct UniqueKey {
 
 /// Read the unique keys off the schema, keyed by model.
 pub fn build_unique_keys(models: &[Model], schema: &crate::schema::Schema) -> UniqueKeys {
-    let mut out: UniqueKeys = HashMap::new();
+    let mut out: UniqueKeys = HashMap::default();
     for m in models {
         let Some(table) = schema.tables.get(&m.table.0) else { continue };
         let not_null = |name: &Symbol| {
@@ -90,7 +90,7 @@ pub fn build_unique_keys(models: &[Model], schema: &crate::schema::Schema) -> Un
 /// entry here is what makes call sites `recv.arrange_for_user(u)` become
 /// `Comment.arrange_for_user(u, recv)`.
 pub fn build_scope_registry(models: &[Model]) -> ScopeRegistry {
-    let mut reg: ScopeRegistry = HashMap::new();
+    let mut reg: ScopeRegistry = HashMap::default();
     for m in models {
         let map = reg.entry(m.name.clone()).or_default();
         for item in &m.body {
@@ -370,9 +370,9 @@ pub fn build_user_method_returns(models: &[Model]) -> UserMethodReturns {
 /// constant that names no model. Anything else stays a relation, as
 /// before.
 fn non_relation_scopes(models: &[Model], model_ids: &HashSet<ClassId>) -> HashSet<(ClassId, Symbol)> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in models {
-        let mut bodies: HashMap<&Symbol, &Expr> = HashMap::new();
+        let mut bodies: HashMap<&Symbol, &Expr> = HashMap::default();
         for item in &m.body {
             match item {
                 ModelBodyItem::Scope { scope, .. } => {
@@ -584,7 +584,7 @@ fn assoc_scope_shape(
             .filter(|p| matches!(*p.ty, crate::ty::Ty::Hash { .. }))
             .map(|p| p.name.clone())
             .collect(),
-        _ => HashSet::new(),
+        _ => HashSet::default(),
     };
     #[allow(clippy::too_many_arguments)]
     fn walk(
@@ -667,7 +667,7 @@ pub fn collect_assoc_method_demand(
     scope_names: &HashSet<Symbol>,
     out: &mut HashSet<(Symbol, Symbol)>,
 ) {
-    let mut assoc_locals: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut assoc_locals: HashMap<Symbol, Symbol> = HashMap::default();
     walk_demand(expr, assocs, scope_names, &mut assoc_locals, out);
 }
 
@@ -829,8 +829,8 @@ pub fn survey_assoc_class_methods(
 ) -> (AssocClassMethods, Vec<DeclinedAssocScope>) {
     let scope_names = all_scope_names(scopes);
     let models_set = model_set(&app.models);
-    let mut demand: HashSet<(Symbol, Symbol)> = HashSet::new();
-    let mut model_demand: HashSet<(ClassId, Symbol)> = HashSet::new();
+    let mut demand: HashSet<(Symbol, Symbol)> = HashSet::default();
+    let mut model_demand: HashSet<(ClassId, Symbol)> = HashSet::default();
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
         collect_assoc_method_demand(body, assocs, &scope_names, &mut demand);
         collect_relation_class_method_demand(body, &models_set, &scope_names, &mut model_demand);
@@ -954,9 +954,9 @@ pub fn build_assoc_class_methods(
     demand: &HashSet<(Symbol, Symbol)>,
     model_demand: &HashSet<(ClassId, Symbol)>,
 ) -> (AssocClassMethods, Vec<DeclinedAssocScope>) {
-    let mut reg: AssocClassMethods = HashMap::new();
+    let mut reg: AssocClassMethods = HashMap::default();
     let mut declined: Vec<DeclinedAssocScope> = Vec::new();
-    let mut seen: HashSet<(ClassId, Symbol)> = HashSet::new();
+    let mut seen: HashSet<(ClassId, Symbol)> = HashSet::default();
     // Sorted so the declined ledger (and any emit that keys off the
     // registry) is byte-stable across runs.
     let mut wanted: Vec<&(Symbol, Symbol)> = demand.iter().collect();
@@ -1285,7 +1285,7 @@ pub struct AssocRegistry {
     ///
     /// Declining leaves the pre-existing NoMethodError-on-Array, which is
     /// loud and locatable. Wrong rows are neither.
-    has_many_unseedable: std::collections::HashSet<(ClassId, Symbol)>,
+    has_many_unseedable: crate::det::HashSet<(ClassId, Symbol)>,
     /// `(model, has_many name)` -> the OWNER column the foreign key
     /// matches, for every has_many declaring `primary_key:` (absent
     /// means `id`). The seed's `where(fk => owner.<key>)` and the
@@ -2334,7 +2334,7 @@ pub(crate) fn app_method(
                 .filter(|m| m.target == id.0)
                 .any(|m| visit(app, &ClassId(m.module.clone()), name, side, seen))
     }
-    visit(app, id, name, side, &mut HashSet::new())
+    visit(app, id, name, side, &mut HashSet::default())
 }
 
 /// True if `expr` (or a descendant) calls a method whose name is a scope.
@@ -2478,7 +2478,7 @@ pub fn mentions_assoc_alias(expr: &Expr, assocs: &AssocRegistry) -> bool {
         }
         e.node.for_each_child(&mut |c| chains_off(c, names, found));
     }
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     bound_names(expr, assocs, &mut names);
     if names.is_empty() {
         return false;
@@ -2605,7 +2605,7 @@ pub fn mentions_assoc_class_method(
     if acm.is_empty() {
         return false;
     }
-    let mut demand: HashSet<(Symbol, Symbol)> = HashSet::new();
+    let mut demand: HashSet<(Symbol, Symbol)> = HashSet::default();
     collect_assoc_method_demand(expr, assocs, scope_names, &mut demand);
     demand
         .iter()
@@ -5107,11 +5107,11 @@ fn rewrite_relation_taking_body(
     // (those are resolved from call-site demand, which is collected
     // after this runs) — conservative empty registries.
     let empty_returns = UserMethodReturns::new();
-    let empty_assoc_cm = AssocClassMethods::new();
+    let empty_assoc_cm = AssocClassMethods::default();
     // A scope body's `insert_all` (none in the corpus) keeps the
     // unguarded inline: this entry point takes registries, not the app,
     // so there is no schema here to read a conflict target from.
-    let empty_unique = UniqueKeys::new();
+    let empty_unique = UniqueKeys::default();
     let ctx = Ctx {
         scopes,
         models,
@@ -5474,12 +5474,12 @@ mod tests {
 
     fn empty_assoc_cm() -> &'static AssocClassMethods {
         static EMPTY: std::sync::OnceLock<AssocClassMethods> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(AssocClassMethods::new)
+        EMPTY.get_or_init(AssocClassMethods::default)
     }
 
     fn empty_unique_keys() -> &'static UniqueKeys {
         static EMPTY: std::sync::OnceLock<UniqueKeys> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(UniqueKeys::new)
+        EMPTY.get_or_init(UniqueKeys::default)
     }
 
     fn regs<'a>(
@@ -5524,7 +5524,7 @@ mod tests {
 
     #[test]
     fn joins_sym_expands_to_join_sql() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![sym_lit("hidings")];
         lower_relation_args(&story(), &Symbol::from("joins"), &mut args, &ctx);
@@ -5536,7 +5536,7 @@ mod tests {
 
     #[test]
     fn left_outer_joins_uses_left_outer_prefix() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![sym_lit("hidings")];
         lower_relation_args(&story(), &Symbol::from("left_outer_joins"), &mut args, &ctx);
@@ -5548,7 +5548,7 @@ mod tests {
 
     #[test]
     fn joins_unknown_assoc_left_untouched() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![sym_lit("taggings")];
         lower_relation_args(&story(), &Symbol::from("joins"), &mut args, &ctx);
@@ -5577,7 +5577,7 @@ mod tests {
     }
 
     fn where_record(value: Expr, reg: &AssocRegistry) -> Vec<(String, String)> {
-        let (scopes, models) = (ScopeRegistry::new(), HashSet::new());
+        let (scopes, models) = (ScopeRegistry::default(), HashSet::default());
         let ctx = ctx_with(&scopes, &models, reg);
         let mut args = vec![hash_arg(vec![(sym_lit("record"), value)])];
         lower_relation_args(&ClassId(Symbol::from("ActionText::RichText")), &Symbol::from("where"), &mut args, &ctx);
@@ -5616,7 +5616,7 @@ mod tests {
         assert_eq!(keys, ["record_id", "record_type"]);
         // The type switch has an otherwise-arm no stored row can match, so a
         // value that is none of the implementors finds nothing (not `IS NULL`).
-        let (scopes, models) = (ScopeRegistry::new(), HashSet::new());
+        let (scopes, models) = (ScopeRegistry::default(), HashSet::default());
         let ctx = ctx_with(&scopes, &models, &reg);
         let mut args = vec![hash_arg(vec![(sym_lit("record"), var("message"))])];
         lower_relation_args(&ClassId(Symbol::from("ActionText::RichText")), &Symbol::from("where"), &mut args, &ctx);
@@ -5650,7 +5650,7 @@ mod tests {
 
     #[test]
     fn joins_nested_hash_expands_both_hops() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![hash_arg(vec![(sym_lit("hidings"), sym_lit("user"))])];
         lower_relation_args(&story(), &Symbol::from("joins"), &mut args, &ctx);
@@ -5667,7 +5667,7 @@ mod tests {
     /// Every hop takes the call's own join kind.
     #[test]
     fn left_outer_joins_nested_hash_is_outer_at_every_hop() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![hash_arg(vec![(sym_lit("hidings"), sym_lit("user"))])];
         lower_relation_args(&story(), &Symbol::from("left_outer_joins"), &mut args, &ctx);
@@ -5683,7 +5683,7 @@ mod tests {
     /// rather than answering a half-joined row set.
     #[test]
     fn joins_nested_hash_with_an_unknown_inner_hop_is_left_untouched() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut args = vec![hash_arg(vec![(sym_lit("hidings"), sym_lit("taggings"))])];
         lower_relation_args(&story(), &Symbol::from("joins"), &mut args, &ctx);
@@ -5694,7 +5694,7 @@ mod tests {
     /// the same parent.
     #[test]
     fn joins_nested_array_value_expands_each_hop() {
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let arr = Expr::new(
             span(),
@@ -5716,7 +5716,7 @@ mod tests {
         // Vote.comments_flags), so the runtime's column_predicate
         // dispatches (record → id, array → ids IN). The old static
         // `user && user.id` narrowing broke the collection case.
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let user_var = Expr::new(span(), ExprNode::Var { id: VarId(1), name: Symbol::from("user") });
         let mut args = vec![Expr::new(
@@ -5747,7 +5747,7 @@ mod tests {
         // A value KNOWN to be a collection maps to ids statically —
         // `where(comment: comments)` with `comments: Array` becomes
         // `where(comment_id: comments.map { |r| r.id })`.
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let mut comments_var =
             Expr::new(span(), ExprNode::Var { id: VarId(1), name: Symbol::from("comments") });
@@ -5775,7 +5775,7 @@ mod tests {
     #[test]
     fn where_belongs_to_key_with_nil_value_renames_only() {
         // where(user: nil) → where(user_id: nil) — `user_id IS NULL`.
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let nil = Expr::new(span(), ExprNode::Lit { value: Literal::Nil });
         let mut args = vec![Expr::new(
@@ -5800,7 +5800,7 @@ mod tests {
     #[test]
     fn where_non_assoc_key_untouched() {
         // where(id: x) on Story — `id` is no association; nothing changes.
-        let (scopes, models, assocs) = (ScopeRegistry::new(), HashSet::new(), assoc_fixture());
+        let (scopes, models, assocs) = (ScopeRegistry::default(), HashSet::default(), assoc_fixture());
         let ctx = ctx_with(&scopes, &models, &assocs);
         let x = Expr::new(span(), ExprNode::Var { id: VarId(1), name: Symbol::from("x") });
         let mut args = vec![Expr::new(
@@ -5881,7 +5881,7 @@ mod tests {
     #[test]
     fn a_range_condition_becomes_comparisons() {
         let m = ClassId(Symbol::from("Membership"));
-        let (sc, md, ac) = (ScopeRegistry::new(), HashSet::new(), AssocRegistry::default());
+        let (sc, md, ac) = (ScopeRegistry::default(), HashSet::default(), AssocRegistry::default());
         let ctx = fragment_ctx(&sc, &md, &ac);
 
         let (sql, binds) = range_condition_fragment(
@@ -5930,7 +5930,7 @@ mod tests {
     #[test]
     fn an_array_of_alternatives_becomes_an_or() {
         let m = ClassId(Symbol::from("Membership"));
-        let (sc, md, ac) = (ScopeRegistry::new(), HashSet::new(), AssocRegistry::default());
+        let (sc, md, ac) = (ScopeRegistry::default(), HashSet::default(), AssocRegistry::default());
         let ctx = fragment_ctx(&sc, &md, &ac);
         let value = Expr::new(
             span(),
@@ -5957,7 +5957,7 @@ mod tests {
     #[test]
     fn an_array_with_a_scalar_member_declines() {
         let m = ClassId(Symbol::from("Membership"));
-        let (sc, md, ac) = (ScopeRegistry::new(), HashSet::new(), AssocRegistry::default());
+        let (sc, md, ac) = (ScopeRegistry::default(), HashSet::default(), AssocRegistry::default());
         let ctx = fragment_ctx(&sc, &md, &ac);
         let value = Expr::new(
             span(),

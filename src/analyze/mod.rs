@@ -77,7 +77,8 @@ use render::{
 pub(crate) use body::union_of;
 pub use preload::{missing_preload_report, PreloadCoverage};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+use crate::det::{HashMap, HashSet};
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::DeclarationId;
 
@@ -94,7 +95,7 @@ use crate::ty::{ParamKind, Row, Ty};
 
 pub struct Analyzer {
     classes: HashMap<ClassId, ClassInfo>,
-    materialized_associations: std::collections::HashSet<Symbol>,
+    materialized_associations: crate::det::HashSet<Symbol>,
     /// Inferred parameter types per (class, method). Empty after
     /// `Analyzer::new`; populated by `unify_params_from_call_sites`
     /// during the fixpoint loop in `analyze`. Consulted when seeding
@@ -108,7 +109,7 @@ pub struct Analyzer {
     /// to a `Fn` the registry stamped from the def itself. Only in the
     /// first is an `untyped` slot a statement rather than an inference
     /// gap.
-    declared_signatures: std::collections::HashSet<(ClassId, Symbol)>,
+    declared_signatures: crate::det::HashSet<(ClassId, Symbol)>,
     /// Backend-specific effect classification. The analyzer consults
     /// this when deciding whether a Send on an AR model carries
     /// `DbRead` or `DbWrite`. Defaults to `SqliteAdapter` via
@@ -129,12 +130,12 @@ pub struct Analyzer {
     /// Methods whose body ends in `.inquiry` — the evidence
     /// [`inquiry::is_inquiry_predicate`] needs to answer
     /// `content_type.attachment?` as Bool on a `Str` receiver.
-    inquirers: std::collections::HashSet<Symbol>,
+    inquirers: crate::det::HashSet<Symbol>,
     /// The app's translations, for `t` / `I18n.t` (see `crate::i18n`).
     i18n: crate::i18n::Catalog,
     /// `app/helpers` modules, whose bodies run in a view and take
     /// ActionView's `t`.
-    helper_modules: std::collections::HashSet<ClassId>,
+    helper_modules: crate::det::HashSet<ClassId>,
     open_classes: open_classes::OpenClasses,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
@@ -173,7 +174,7 @@ pub struct Analyzer {
     /// `inferred_params` is, it is a function of the trees the last
     /// typing pass wrote. Read by `dirty_classes_for_retype` to take
     /// a round's changed returns back to the bodies that read them.
-    callers_by_target: HashMap<(ClassId, Symbol), std::collections::HashSet<ClassId>>,
+    callers_by_target: HashMap<(ClassId, Symbol), crate::det::HashSet<ClassId>>,
     /// Per-controller concern/action bindings and bodies from the last
     /// round that retyped that controller. Reused when a clean
     /// controller still rebuilds channel metadata but skips concern
@@ -210,7 +211,7 @@ impl Analyzer {
     /// once non-sqlite adapters exist and you want effect inference
     /// to reflect that backend's capability profile.
     pub fn with_adapter(app: &App, adapter: Box<dyn DatabaseAdapter>) -> Self {
-        let mut classes: HashMap<ClassId, ClassInfo> = HashMap::new();
+        let mut classes: HashMap<ClassId, ClassInfo> = HashMap::default();
 
         // Module → its own `include`s, for chasing concern-of-concern
         // chains when registering concern-declared model DSL below.
@@ -581,7 +582,7 @@ impl Analyzer {
             // Scope bodies are typed separately; this only records the
             // call surface. `or_insert` so an explicit catalog method
             // still wins.
-            let scope_names: std::collections::HashSet<Symbol> =
+            let scope_names: crate::det::HashSet<Symbol> =
                 model.scopes().map(|s| s.name.clone()).collect();
             // Materializing scopes propagate through sibling chains:
             // `scope :page_before, ->(m) { before(m).last_page }` ends in
@@ -591,7 +592,7 @@ impl Analyzer {
             // materializing sibling (on a relation chain rooted here)
             // inherit that sibling's seed — to a fixpoint, so a chain of
             // such scopes resolves whatever order the file declares them.
-            let mut materializing: HashMap<Symbol, Ty> = HashMap::new();
+            let mut materializing: HashMap<Symbol, Ty> = HashMap::default();
             for scope in model.scopes() {
                 if body_tail_terminal_kind(&scope.body, &model.name, &scope_names).is_some() {
                     let seed = scope_return_seed(&scope.body, &model.name, &scope_names);
@@ -1264,16 +1265,16 @@ impl Analyzer {
         Self {
             materialized_associations: crate::lower::assoc_pluck::materialized_assoc_names(app),
             classes,
-            inferred_params: HashMap::new(),
+            inferred_params: HashMap::default(),
             declared_signatures: app
                 .rbs_signatures
                 .iter()
                 .flat_map(|(c, ms)| ms.keys().map(move |m| (c.clone(), m.clone())))
                 .collect(),
             adapter,
-            concern_folded: HashMap::new(),
-            host_folded: HashMap::new(),
-            refined_action_bindings: HashMap::new(),
+            concern_folded: HashMap::default(),
+            host_folded: HashMap::default(),
+            refined_action_bindings: HashMap::default(),
             inquirers: inquiry::inquirer_methods(app),
             i18n: app.i18n.clone(),
             helper_modules: app.helper_method_index.values().cloned().collect(),
@@ -1282,11 +1283,11 @@ impl Analyzer {
             source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
             data_factories,
-            class_factories: HashMap::new(),
+            class_factories: HashMap::default(),
             data_factories_without_custom_initialize,
             view_seeds: None,
-            callers_by_target: HashMap::new(),
-            controller_action_meta_cache: HashMap::new(),
+            callers_by_target: HashMap::default(),
+            controller_action_meta_cache: HashMap::default(),
             fixpoint_rounds: FixpointRounds::default(),
             fixpoint_checks: fixpoint_check::Checks::default(),
         }
@@ -1428,12 +1429,12 @@ impl Analyzer {
         const FIXPOINT_CAP: usize = 12;
         // View-name and dynamic-render ivar sets are invariant across
         // fixpoint rounds — they read source views, not the registry.
-        let mut dynamic_render_ivars: std::collections::HashSet<Symbol> =
-            std::collections::HashSet::new();
+        let mut dynamic_render_ivars: crate::det::HashSet<Symbol> =
+            crate::det::HashSet::default();
         for view in &app.views {
             collect_dynamic_render_ivars(&view.body, &mut dynamic_render_ivars);
         }
-        let existing_view_names: std::collections::HashSet<Symbol> =
+        let existing_view_names: crate::det::HashSet<Symbol> =
             app.views.iter().map(|v| v.name.clone()).collect();
         // Module includes and controller parent links are invariant
         // across fixpoint rounds. Method bodies are too, but typing
@@ -1624,7 +1625,7 @@ impl Analyzer {
             // predates every one of them — so the first absorb pass is
             // a full retype. Only the rounds after it can be narrowed
             // to what their predecessor moved.
-            let mut absorb_dirty: Option<std::collections::HashSet<ClassId>> = None;
+            let mut absorb_dirty: Option<crate::det::HashSet<ClassId>> = None;
             for round in 0..FIXPOINT_CAP {
                 crate::timings::phase(
                     if round == 0 {
@@ -1741,9 +1742,9 @@ impl Analyzer {
         // `helpers/_link_post` with `link:` a URL String, and nothing
         // else renders that partial. Harvested only now, off converged
         // bodies, and only where no view site already said something.
-        let helper_modules: std::collections::HashSet<ClassId> =
+        let helper_modules: crate::det::HashSet<ClassId> =
             app.helper_method_index.values().cloned().collect();
-        let mut helper_sites: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut helper_sites: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
         for lc in app.library_classes.iter().filter(|lc| helper_modules.contains(&lc.name)) {
             for m in &lc.methods {
                 let mut targets = Vec::new();
@@ -1837,7 +1838,7 @@ impl Analyzer {
         // call sites. `_path` and `_url` are the same helper.
         let stems: Vec<Symbol> =
             app.routes.direct_helpers.iter().map(|d| d.name.clone()).collect();
-        let mut seeds: HashMap<Symbol, Vec<Ty>> = HashMap::new();
+        let mut seeds: HashMap<Symbol, Vec<Ty>> = HashMap::default();
         {
             let mut collect = |e: &crate::expr::Expr| {
                 fn walk(
@@ -1900,7 +1901,7 @@ impl Analyzer {
 
         let mut helpers = std::mem::take(&mut app.routes.direct_helpers);
         for helper in &mut helpers {
-            let mut local_bindings: HashMap<Symbol, Ty> = HashMap::new();
+            let mut local_bindings: HashMap<Symbol, Ty> = HashMap::default();
             // The LAST parameter is Rails' always-supplied options hash,
             // never one of the helper's own arguments — see
             // `dialect::DirectHelper`. Bind it as the hash it is so a
@@ -1924,7 +1925,7 @@ impl Analyzer {
             let ctx = Ctx {
                 self_ty: None,
                 lexical_self: None,
-                ivar_bindings: HashMap::new(),
+                ivar_bindings: HashMap::default(),
                 local_bindings,
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
@@ -2237,8 +2238,8 @@ impl Analyzer {
                 ))
             })
             .collect();
-        let mut map: HashMap<Symbol, Ty> = HashMap::new();
-        let mut ambiguous: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+        let mut map: HashMap<Symbol, Ty> = HashMap::default();
+        let mut ambiguous: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
         let seeded = || -> IdentityHashMap<DeclarationId, Ty> { data_classes.iter().cloned().collect() };
         let mut resolved = seeded();
         // Each round can type one more link of a `B = A` chain, so n
@@ -2247,7 +2248,7 @@ impl Analyzer {
         // unknown, and the read reports it. The bound also stops values
         // that change on each round.
         for _ in 0..=entries.len() {
-            let mut next: HashMap<Symbol, Ty> = HashMap::new();
+            let mut next: HashMap<Symbol, Ty> = HashMap::default();
             let mut next_resolved = seeded();
             let shared = body::ConstScope::global(map.clone());
             let typer = BodyTyper::new(&self.classes)
@@ -2260,8 +2261,8 @@ impl Analyzer {
                 let ctx = Ctx {
                     self_ty: Some(self_ty.clone()),
                     lexical_self: None,
-                    ivar_bindings: HashMap::new(),
-                    local_bindings: HashMap::new(),
+                    ivar_bindings: HashMap::default(),
+                    local_bindings: HashMap::default(),
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     constants: shared.clone(),
@@ -2317,8 +2318,8 @@ impl Analyzer {
     fn run_typing_passes(
         &mut self,
         app: &mut App,
-        dynamic_render_ivars: &std::collections::HashSet<Symbol>,
-        existing_view_names: &std::collections::HashSet<Symbol>,
+        dynamic_render_ivars: &crate::det::HashSet<Symbol>,
+        existing_view_names: &crate::det::HashSet<Symbol>,
         module_methods: &HashMap<ClassId, Vec<MethodDef>>,
         module_includes: &HashMap<ClassId, Vec<ClassId>>,
         parent_link_by_name: &HashMap<ClassId, Option<ClassId>>,
@@ -2368,13 +2369,13 @@ impl Analyzer {
     fn type_production_bodies(
         &mut self,
         app: &mut App,
-        dynamic_render_ivars: &std::collections::HashSet<Symbol>,
-        existing_view_names: &std::collections::HashSet<Symbol>,
+        dynamic_render_ivars: &crate::det::HashSet<Symbol>,
+        existing_view_names: &crate::det::HashSet<Symbol>,
         module_methods: &HashMap<ClassId, Vec<MethodDef>>,
         module_includes: &HashMap<ClassId, Vec<ClassId>>,
         parent_link_by_name: &HashMap<ClassId, Option<ClassId>>,
         global_constants: &body::ConstScope,
-        dirty: Option<&std::collections::HashSet<ClassId>>,
+        dirty: Option<&crate::det::HashSet<ClassId>>,
     ) {
         // Type the actual initializer trees, not only registry clones.
         // Their lexical class references become load-time dependencies
@@ -2398,7 +2399,7 @@ impl Analyzer {
         // When we reach the view pass below, the view's Ctx is seeded from
         // this map so `@article.title` in `articles/show.html.erb` types
         // against the `@article` bound in `ArticlesController#show`.
-        let mut action_ivars_by_view: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut action_ivars_by_view: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
         let models_by_ivar =
             ivar_set::models_by_conventional_ivar(app.models.iter().map(|m| &m.name));
         // Sibling record of the same channel, persisted onto
@@ -2407,14 +2408,14 @@ impl Analyzer {
         // layouts, then closed over renderer→partial edges) so a view-side
         // diagnostic can be traced to the controller that seeded — or
         // failed to seed — its context.
-        let mut view_feeders: HashMap<Symbol, BTreeSet<ClassId>> = HashMap::new();
+        let mut view_feeders: HashMap<Symbol, BTreeSet<ClassId>> = HashMap::default();
         // Persisted onto `App::controller_resolutions`: the chained
         // filter list (with provenance) + effective layout that Phase B
         // resolves per controller — the same data the ivar seeding
         // consumes, kept instead of discarded so trace/attribution
         // consumers don't re-derive the ancestor walk.
         let mut controller_resolutions: HashMap<ClassId, crate::app::ControllerResolution> =
-            HashMap::new();
+            HashMap::default();
 
         // Content-partial channel: the `render partial: @above` idiom.
         // `dynamic_render_ivars` is the set of ivars any view renders
@@ -2424,7 +2425,7 @@ impl Analyzer {
         // Built during Pass B, consumed when seeding partials below.
         // The two sets are computed once in `analyze` and reused every
         // round — they do not depend on the refined registry.
-        let mut content_partial_ivars: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut content_partial_ivars: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Per-controller metadata captured during Pass A so Pass B
         // (below) can resolve parent-class filters + action bindings
@@ -2464,7 +2465,7 @@ impl Analyzer {
             class_constants: body::ConstScope,
             layout: LayoutDecl,
         }
-        let mut meta_by_name: HashMap<ClassId, ControllerMeta> = HashMap::new();
+        let mut meta_by_name: HashMap<ClassId, ControllerMeta> = HashMap::default();
         // Parent links and concern-module tables are cloned once in
         // `analyze` and reused every round — they do not depend on the
         // refined registry.
@@ -2494,7 +2495,7 @@ impl Analyzer {
             //    them — seed directly from schema metadata.
             // 3. Memoization ivars (`@_comments`) — discovered by the
             //    flow-sensitive pre-pass below.
-            let mut class_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            let mut class_ivars: HashMap<Symbol, Ty> = HashMap::default();
             class_ivars.insert(
                 Symbol::from("attributes"),
                 Ty::Hash {
@@ -2534,7 +2535,7 @@ impl Analyzer {
                 self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![].into() }),
                 lexical_self: None,
                 ivar_bindings: class_ivars.clone(),
-                local_bindings: HashMap::new(),
+                local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 constants: global_constants.clone(),
@@ -2552,7 +2553,7 @@ impl Analyzer {
                 self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![].into() }),
                 lexical_self: None,
                 ivar_bindings: class_ivars.clone(),
-                local_bindings: HashMap::new(),
+                local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 constants: class_constants.clone(),
@@ -2586,7 +2587,7 @@ impl Analyzer {
             // *before* the assignment lexically (e.g. the left side of
             // `@x ||= ...` lowered to `@x || (@x = ...)`) still resolve
             // cleanly.
-            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::default();
             for method in model.methods() {
                 extract_ivar_assignments(&method.body, &mut flow_ivars);
             }
@@ -2594,7 +2595,7 @@ impl Analyzer {
                 extract_ivar_assignments(&scope.body, &mut flow_ivars);
             }
             // Not in the shared map: the class body's `@x = …` is the class object's, which only its `def self.x` reads.
-            let mut class_body_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            let mut class_body_ivars: HashMap<Symbol, Ty> = HashMap::default();
             for item in &model.body {
                 if let ModelBodyItem::Unknown { expr, .. } = item
                     && crate::lower::model_to_library::writes_class_ivar(expr)
@@ -2623,7 +2624,7 @@ impl Analyzer {
                     self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![].into() }),
                     lexical_self: None,
                     ivar_bindings: reseeded,
-                    local_bindings: HashMap::new(),
+                    local_bindings: HashMap::default(),
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     constants: class_constants.clone(),
@@ -2683,8 +2684,8 @@ impl Analyzer {
             let const_ctx = Ctx {
                 self_ty: Some(self_ty.clone()),
                 lexical_self: None,
-                ivar_bindings: HashMap::new(),
-                local_bindings: HashMap::new(),
+                ivar_bindings: HashMap::default(),
+                local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 constants: global_constants.clone(),
@@ -2705,8 +2706,8 @@ impl Analyzer {
             let ctx = Ctx {
                 self_ty: Some(self_ty.clone()),
                 lexical_self: None,
-                ivar_bindings: HashMap::new(),
-                local_bindings: HashMap::new(),
+                ivar_bindings: HashMap::default(),
+                local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 constants: class_constants.clone(),
@@ -2784,7 +2785,7 @@ impl Analyzer {
             // methods). Parent actions are layered in by Phase B.
             let mut action_bindings: HashMap<Symbol, HashMap<Symbol, Ty>> = controller
                 .actions()
-                .map(|a| (a.name.clone(), HashMap::new()))
+                .map(|a| (a.name.clone(), HashMap::default()))
                 .collect();
             // Body-carrying twin of `action_bindings` — see the field
             // doc on `ControllerMeta::action_bodies`. Seeded
@@ -2890,7 +2891,7 @@ impl Analyzer {
                     models_by_ivar: Some(&models_by_ivar),
                 };
                 for (name, body) in &action_bodies {
-                    let mut ivars = HashMap::new();
+                    let mut ivars = HashMap::default();
                     extract_ivar_assignments_in(body, &mut ivars, &env);
                     action_bindings.insert(name.clone(), ivars);
                 }
@@ -2905,7 +2906,7 @@ impl Analyzer {
             // Effect sets for the persisted chain are stamped once after
             // the typing fixpoint (`stamp_body_effects`); this snapshot
             // is empty here and patched from the converged trees.
-            let action_effects: HashMap<Symbol, EffectSet> = HashMap::new();
+            let action_effects: HashMap<Symbol, EffectSet> = HashMap::default();
 
             let layout = controller.layout.clone();
             meta_by_name.insert(
@@ -2935,7 +2936,7 @@ impl Analyzer {
         // self) is `Inherit`, the layout name defaults to
         // `application` per Rails convention. `LayoutDecl::None`
         // (an explicit `layout false`) suppresses the contribution.
-        let mut layout_ivars_by_view: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut layout_ivars_by_view: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Each controller's controller-wide ivar environment, kept so
         // the CONCERN MODULES it includes can be typed against it
@@ -2947,7 +2948,7 @@ impl Analyzer {
         // its bindings, but the module's own body — the one `diagnose`
         // walks, and the one every emitted copy is cut from — was typed
         // with nothing.
-        let mut controller_ivar_env: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut controller_ivar_env: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Phase-B refinements, collected here and flushed into
         // `self.refined_action_bindings` after the loop — `self` is
@@ -3019,7 +3020,7 @@ impl Analyzer {
 
             // Build chained action_bindings: nearest parent's
             // overlay last so closer-defined targets win.
-            let mut chained_bindings: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+            let mut chained_bindings: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
             // Overlay each class's Phase-B refinements onto its Phase-A
             // harvest as we walk. Per-KEY, and only where the refined
             // value carries SHAPE — `is_unknown`, not `is_open`, because
@@ -3042,7 +3043,7 @@ impl Analyzer {
                 let mut merged = if calls_super {
                     dst.remove(name).unwrap_or_default()
                 } else {
-                    HashMap::new()
+                    HashMap::default()
                 };
                 merged.extend(ivars.iter().map(|(k, v)| (k.clone(), v.clone())));
                 if let Some(refined) =
@@ -3079,7 +3080,7 @@ impl Analyzer {
             // filter target's own receiverless calls into, immediately
             // below. Borrowed from `action_bodies` so we do not clone
             // every ancestor filter-target tree per controller per round.
-            let mut chained_bodies: HashMap<Symbol, &Expr> = HashMap::new();
+            let mut chained_bodies: HashMap<Symbol, &Expr> = HashMap::default();
             for (_, ancestor) in ancestors.iter().rev() {
                 for (name, body) in &ancestor.action_bodies {
                     chained_bodies.insert(name.clone(), body);
@@ -3105,7 +3106,7 @@ impl Analyzer {
                     models_by_ivar: Some(&models_by_ivar),
                 };
                 for (name, body) in &chained_bodies {
-                    let mut ivars = HashMap::new();
+                    let mut ivars = HashMap::default();
                     extract_ivar_assignments_in(body, &mut ivars, &env);
                     ivars.retain(|_, v| !v.is_open());
                     if ivars.is_empty() {
@@ -3201,7 +3202,7 @@ impl Analyzer {
             // cost.
             for sweep in 0..2 {
                 let controller_wide: HashMap<Symbol, Ty> = {
-                    let mut env: HashMap<Symbol, Ty> = HashMap::new();
+                    let mut env: HashMap<Symbol, Ty> = HashMap::default();
                     for ivars in chained_bindings.values() {
                         for (k, v) in ivars {
                             if v.is_open() {
@@ -3244,7 +3245,7 @@ impl Analyzer {
                             self_ty: Some(meta.self_ty.clone()),
                             lexical_self: None,
                             ivar_bindings: seed,
-                            local_bindings: HashMap::new(),
+                            local_bindings: HashMap::default(),
                             class_objects: Default::default(),
                             query_class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
@@ -3286,7 +3287,7 @@ impl Analyzer {
                     models_by_ivar: Some(&models_by_ivar),
                 };
                 for action in controller.actions() {
-                    let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                    let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                     extract_ivar_assignments_in(&action.body, &mut ivars, &env);
                     for (k, v) in ivars {
                         if v.is_open() {
@@ -3366,7 +3367,7 @@ impl Analyzer {
             // name a filter to remove, not code that runs, so they carry
             // neither.
             {
-                let mut chained_effects: HashMap<Symbol, EffectSet> = HashMap::new();
+                let mut chained_effects: HashMap<Symbol, EffectSet> = HashMap::default();
                 for (_, ancestor) in ancestors.iter().rev() {
                     for (name, eff) in &ancestor.action_effects {
                         chained_effects.insert(name.clone(), eff.clone());
@@ -3398,7 +3399,7 @@ impl Analyzer {
                                 })
                                 .unwrap_or_default()
                         } else {
-                            HashMap::new()
+                            HashMap::default()
                         };
                         let effects = if runs {
                             chained_effects.get(&filter.target).cloned().unwrap_or_default()
@@ -3431,7 +3432,7 @@ impl Analyzer {
             // (union of names, union of types across all contributing
             // actions and controllers).
             for action in controller.actions() {
-                let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                 let env = ivar_set::IvarNameEnv {
                     self_class: Some(&ctrl_name),
                     owned: None,
@@ -3470,7 +3471,7 @@ impl Analyzer {
                 // Only own-class sites are consumed below, so helper
                 // attribution is irrelevant — an empty index keeps
                 // this walk exactly as before.
-                self.collect_send_sites(&action.body, Some(&ctrl_name), false, &HashMap::new(), &mut sites);
+                self.collect_send_sites(&action.body, Some(&ctrl_name), false, &HashMap::default(), &mut sites);
                 for (class_id, method, _, _, _) in &sites {
                     if *class_id != ctrl_name {
                         continue;
@@ -3768,7 +3769,7 @@ impl Analyzer {
                         self_ty: Some(self_ty.clone()),
                         lexical_self: None,
                         ivar_bindings: seed,
-                        local_bindings: HashMap::new(),
+                        local_bindings: HashMap::default(),
                         class_objects: Default::default(),
                         query_class_objects: Default::default(),
                         constants: class_constants.clone(),
@@ -3808,7 +3809,7 @@ impl Analyzer {
         // Identify mailers by parent chain up front; the harvest itself
         // rides the library-class typing loop below, after each method
         // body has been typed once.
-        let mailer_names: std::collections::HashSet<ClassId> = {
+        let mailer_names: crate::det::HashSet<ClassId> = {
             let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
                 .library_classes
                 .iter()
@@ -3859,14 +3860,14 @@ impl Analyzer {
         // entry (see `dirty_retype`); mailers stay surveyed either way
         // because their ivar harvest feeds views.
         let current_attribute_writes: HashMap<ClassId, HashMap<Symbol, Ty>> = {
-            let targets: std::collections::HashSet<&ClassId> = app
+            let targets: crate::det::HashSet<&ClassId> = app
                 .current_attribute_classes
                 .iter()
                 .filter(|id| {
                     dirty.is_none_or(|d| d.contains(id)) || mailer_names.contains(id)
                 })
                 .collect();
-            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
             if !targets.is_empty() {
                 let mut collect = |body: &crate::expr::Expr| {
                     collect_const_attr_writes(body, &targets, &mut out);
@@ -3908,7 +3909,7 @@ impl Analyzer {
         // retype when the params row moved so `@x = params[:x]` ivars
         // in ViewSeeds stay aligned with template `params`.
         let params_sym = Symbol::from("params");
-        let mailers_needing_retype: std::collections::HashSet<ClassId> = mailer_names
+        let mailers_needing_retype: crate::det::HashSet<ClassId> = mailer_names
             .iter()
             .filter_map(|m| {
                 let row = mailer_with_params.get(m)?;
@@ -3924,7 +3925,7 @@ impl Analyzer {
                 }
             })
             .collect();
-        let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::new();
+        let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::default();
 
         let _typing_library = crate::timings::begin("typing: library");
         for lc in &mut app.library_classes {
@@ -3953,8 +3954,8 @@ impl Analyzer {
             let class_ctx = Ctx {
                 self_ty: Some(Ty::Class { id: self_id, args: vec![].into() }),
                 lexical_self: None,
-                ivar_bindings: HashMap::new(),
-                local_bindings: HashMap::new(),
+                ivar_bindings: HashMap::default(),
+                local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 query_class_objects: Default::default(),
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(),
@@ -3989,7 +3990,7 @@ impl Analyzer {
                 }
             }
 
-            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::default();
             for method in &lc.methods {
                 extract_ivar_assignments(&method.body, &mut flow_ivars);
             }
@@ -4047,7 +4048,7 @@ impl Analyzer {
                     {
                         continue;
                     }
-                    let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                    let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                     extract_ivar_assignments(&method.body, &mut ivars);
                     // Back-fill from the class-wide flow set, nil-widened:
                     // mailers set shared ivars in `before_action` filters
@@ -4073,7 +4074,7 @@ impl Analyzer {
 
             let initialized = ivars_initialized_by(lc.methods.iter());
             if retype && !flow_ivars.is_empty() {
-                let mut reseeded: HashMap<Symbol, Ty> = HashMap::new();
+                let mut reseeded: HashMap<Symbol, Ty> = HashMap::default();
                 for (name, ty) in flow_ivars {
                     // Nil-widening is right for a class whose ivars are
                     // set by SOME path through its own methods; it is
@@ -4100,7 +4101,7 @@ impl Analyzer {
                     self_ty: class_ctx.self_ty.clone(),
                     lexical_self: None,
                     ivar_bindings: reseeded,
-                    local_bindings: HashMap::new(),
+                    local_bindings: HashMap::default(),
                     class_objects: Default::default(),
                     query_class_objects: Default::default(),
                     constants: Default::default(), annotate_self_dispatch: false, in_view: false, view_name: None, class_side: false, claimed_macro_template: false, instance_body: false, method_body: false, building_self: false, live_class_locals: Default::default(),
@@ -4148,11 +4149,11 @@ impl Analyzer {
         // keying by the partial's view name, and analyze partials with that
         // seed. Nested partial-of-partial isn't handled here (would need a
         // fixpoint); real-blog's dependency graph is shallow enough to skip.
-        let mut partial_locals_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut partial_locals_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Renderer → partials-it-renders edges, harvested as views are
         // walked. Drives the ivar propagation below.
-        let mut render_edges: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+        let mut render_edges: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
 
         let view_ctx_for = |name: &Symbol, ivars: HashMap<Symbol, Ty>| {
             let mut view_ctx = Ctx::default();
@@ -4186,7 +4187,7 @@ impl Analyzer {
                 .unwrap_or_default();
             let view_ctx = view_ctx_for(&view.name, ivars);
             self.body_typer().analyze_expr(&mut view.body, &view_ctx);
-            let mut assigned = HashMap::new();
+            let mut assigned = HashMap::default();
             extract_ivar_assignments(&view.body, &mut assigned);
             if !assigned.is_empty() {
                 if let Some(feeders) = view_feeders.get(&view.name) {
@@ -4256,7 +4257,7 @@ impl Analyzer {
             if !is_partial_view_name(&view.name) {
                 continue;
             }
-            let mut throwaway = HashMap::new();
+            let mut throwaway = HashMap::default();
             let mut targets = Vec::new();
             extract_partial_render_sites(&view.body, &view.name, &mut throwaway, &mut targets);
             record_render_edges(&mut render_edges, &view.name, targets);
@@ -4274,7 +4275,7 @@ impl Analyzer {
         // seed (non-partial) or its accumulated partial ivars. `Var` /
         // `Untyped` are dropped on merge — they carry no shape and only
         // pollute the union (mirrors the layout-ivar merge above).
-        let mut partial_ivars_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let mut partial_ivars_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
         // Seed the content partials (`render partial: @above`) up front
         // so the fixpoint below propagates their ivars into any further
         // partials they render, just like a statically-resolved edge.
@@ -4766,8 +4767,8 @@ impl Analyzer {
     }
 
     fn capture_inference_sig(&self) -> InferenceSig {
-        let mut instance = HashMap::with_capacity(self.classes.len());
-        let mut class_methods = HashMap::with_capacity(self.classes.len());
+        let mut instance = HashMap::with_capacity_and_hasher(self.classes.len(), Default::default());
+        let mut class_methods = HashMap::with_capacity_and_hasher(self.classes.len(), Default::default());
         for (id, cls) in &self.classes {
             instance.insert(id.clone(), cls.instance_methods.clone());
             class_methods.insert(id.clone(), cls.class_methods.clone());
@@ -4780,7 +4781,7 @@ impl Analyzer {
     }
 
     fn capture_dirty_hints(&self) -> DirtyHints {
-        let mut block_value = HashMap::with_capacity(self.classes.len());
+        let mut block_value = HashMap::with_capacity_and_hasher(self.classes.len(), Default::default());
         for (id, cls) in &self.classes {
             if !cls.block_value_methods.is_empty() {
                 block_value.insert(id.clone(), cls.block_value_methods.clone());
@@ -4856,7 +4857,7 @@ impl Analyzer {
         &self,
         app: &App,
         prev: &DirtyHints,
-    ) -> Option<std::collections::HashSet<ClassId>> {
+    ) -> Option<crate::det::HashSet<ClassId>> {
         dirty_classes_for_retype(
             app,
             &self.classes,
@@ -4886,8 +4887,8 @@ impl Analyzer {
         caller: &ClassId,
         sites: &[SendSite],
     ) {
-        let mut seen: std::collections::HashSet<(&ClassId, &Symbol)> =
-            std::collections::HashSet::new();
+        let mut seen: crate::det::HashSet<(&ClassId, &Symbol)> =
+            crate::det::HashSet::default();
         for (class_id, method, _, _, _) in sites {
             if class_id == caller || !seen.insert((class_id, method)) {
                 continue;
@@ -4933,7 +4934,7 @@ impl Analyzer {
 
     fn harvest_one_model(&mut self, model: &Model) {
         let class_id = &model.name;
-        let scope_names: std::collections::HashSet<Symbol> =
+        let scope_names: crate::det::HashSet<Symbol> =
             model.scopes().map(|s| s.name.clone()).collect();
         for method in model.methods() {
             let ret = self.method_return_ty(class_id, method);
@@ -5231,7 +5232,7 @@ impl Analyzer {
                 wanted.push((lc.name.clone(), ext));
             }
         }
-        let module_ids: std::collections::HashSet<&ClassId> =
+        let module_ids: crate::det::HashSet<&ClassId> =
             app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
         for (id, modules) in wanted {
             let mut queue = modules;
@@ -5352,7 +5353,7 @@ impl Analyzer {
             return;
         }
         // Module → the non-module classes that include it, transitively.
-        let mut hosts: HashMap<ClassId, BTreeSet<ClassId>> = HashMap::new();
+        let mut hosts: HashMap<ClassId, BTreeSet<ClassId>> = HashMap::default();
         for (id, cls) in &self.classes {
             if modules.contains(id) || cls.includes.is_empty() {
                 continue;
@@ -5930,7 +5931,7 @@ impl Analyzer {
     /// the call sites are evidence about that def, and the module's
     /// same-named method is a different one Ruby never reaches.
     fn fold_concern_param_sites(&mut self, app: &App) {
-        let mut module_methods: HashMap<ClassId, BTreeSet<Symbol>> = HashMap::new();
+        let mut module_methods: HashMap<ClassId, BTreeSet<Symbol>> = HashMap::default();
         let mut owned: BTreeSet<(ClassId, Symbol)> = BTreeSet::new();
         for lc in &app.library_classes {
             let names: BTreeSet<Symbol> = lc.methods.iter().map(|m| m.name.clone()).collect();
@@ -6038,7 +6039,7 @@ impl Analyzer {
     /// worse than leaving the hash where it sits, which is the
     /// behaviour that stood before this table existed.
     fn param_shapes(app: &App) -> HashMap<ParamKey, ParamShape> {
-        let mut out: HashMap<ParamKey, Option<ParamShape>> = HashMap::new();
+        let mut out: HashMap<ParamKey, Option<ParamShape>> = HashMap::default();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
             let shape = ParamShape {
                 slots: m.params.iter().map(|p| (p.name.clone(), p.ty_kind())).collect(),
@@ -6651,7 +6652,7 @@ impl Analyzer {
 fn body_tail_yields_relation(
     body: &Expr,
     model_id: &ClassId,
-    scope_names: &std::collections::HashSet<Symbol>,
+    scope_names: &crate::det::HashSet<Symbol>,
 ) -> bool {
     let mut e = match &*body.node {
         ExprNode::Seq { exprs } => match exprs.last() {
@@ -6735,7 +6736,7 @@ fn body_tail_yields_relation(
 pub(crate) fn scope_return_seed(
     body: &Expr,
     model_id: &ClassId,
-    scope_names: &std::collections::HashSet<Symbol>,
+    scope_names: &crate::det::HashSet<Symbol>,
 ) -> Ty {
     if body_tail_yields_relation(body, model_id, scope_names) {
         return Ty::Relation { of: model_id.clone() };
@@ -6755,7 +6756,7 @@ pub(crate) fn scope_return_seed(
 pub(crate) fn body_is_relation_query(
     body: &Expr,
     model_id: &ClassId,
-    scope_names: &std::collections::HashSet<Symbol>,
+    scope_names: &crate::det::HashSet<Symbol>,
 ) -> bool {
     body_tail_yields_relation(body, model_id, scope_names)
         || body_tail_terminal_kind(body, model_id, scope_names).is_some()
@@ -6774,7 +6775,7 @@ pub(crate) fn body_is_relation_query(
 fn body_tail_terminal_kind(
     body: &Expr,
     model_id: &ClassId,
-    scope_names: &std::collections::HashSet<Symbol>,
+    scope_names: &crate::det::HashSet<Symbol>,
 ) -> Option<crate::catalog::ReturnKind> {
     let tail = match &*body.node {
         ExprNode::Seq { exprs } => exprs.last()?,
@@ -6836,7 +6837,7 @@ fn record_render_edges(
 fn scope_tail_materializing_sibling(
     body: &Expr,
     model_id: &ClassId,
-    scope_names: &std::collections::HashSet<Symbol>,
+    scope_names: &crate::det::HashSet<Symbol>,
     materializing: &HashMap<Symbol, Ty>,
 ) -> Option<Ty> {
     let tail = match &*body.node {
@@ -7017,11 +7018,11 @@ fn collect_transitive_filter_ivars(
     own: bool,
 ) -> HashMap<Symbol, Ty> {
     if depth == 0 {
-        return HashMap::new();
+        return HashMap::default();
     }
     match &*expr.node {
         ExprNode::Seq { exprs } => {
-            let mut out = HashMap::new();
+            let mut out = HashMap::default();
             for e in exprs {
                 union_ivar_maps(&mut out, collect_transitive_filter_ivars(e, bodies, depth, visited, own));
             }
@@ -7057,7 +7058,7 @@ fn collect_transitive_filter_ivars(
             // implicit empty alternative is added even when every
             // explicit arm agrees, otherwise an exhaustive-looking
             // `case` would wrongly type as non-nilable.
-            branches.push(HashMap::new());
+            branches.push(HashMap::default());
             union_ivar_maps(&mut out, merge_alternative_branches(branches));
             out
         }
@@ -7067,20 +7068,20 @@ fn collect_transitive_filter_ivars(
             // `right` only evaluates if `left` doesn't short-circuit
             // the operator — may-not-run, same treatment as an `If`
             // with no `else`.
-            union_ivar_maps(&mut out, merge_alternative_branches(vec![right_out, HashMap::new()]));
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![right_out, HashMap::default()]));
             out
         }
         ExprNode::While { cond, body, .. } => {
             let mut out = collect_transitive_filter_ivars(cond, bodies, depth, visited, own);
             let body_out = collect_transitive_filter_ivars(body, bodies, depth, visited, own);
             // The body may run zero times.
-            union_ivar_maps(&mut out, merge_alternative_branches(vec![body_out, HashMap::new()]));
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![body_out, HashMap::default()]));
             out
         }
         ExprNode::RescueModifier { expr: e, fallback } => {
             let mut out = collect_transitive_filter_ivars(e, bodies, depth, visited, own);
             let fb = collect_transitive_filter_ivars(fallback, bodies, depth, visited, own);
-            union_ivar_maps(&mut out, merge_alternative_branches(vec![fb, HashMap::new()]));
+            union_ivar_maps(&mut out, merge_alternative_branches(vec![fb, HashMap::default()]));
             out
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
@@ -7089,7 +7090,7 @@ fn collect_transitive_filter_ivars(
                 .iter()
                 .map(|r| collect_transitive_filter_ivars(&r.body, bodies, depth, visited, own))
                 .collect();
-            alt.push(HashMap::new()); // no rescue triggers
+            alt.push(HashMap::default()); // no rescue triggers
             union_ivar_maps(&mut out, merge_alternative_branches(alt));
             if let Some(e) = else_branch {
                 union_ivar_maps(&mut out, collect_transitive_filter_ivars(e, bodies, depth, visited, own));
@@ -7108,7 +7109,7 @@ fn collect_transitive_filter_ivars(
         // walked structurally so a self-call buried in its receiver,
         // args, or block is still found.
         ExprNode::Send { recv, method, args, block, .. } => {
-            let mut out = HashMap::new();
+            let mut out = HashMap::default();
             let is_self_call = match recv {
                 None => true,
                 Some(r) => matches!(&*r.node, ExprNode::SelfRef),
@@ -7181,7 +7182,7 @@ fn collect_transitive_filter_ivars(
             let mut out = collect_transitive_filter_ivars(value, bodies, depth, visited, own);
             if !own {
                 if let Some(ty) = value.ty.clone() {
-                    union_ivar_maps(&mut out, HashMap::from([(name.clone(), ty)]));
+                    union_ivar_maps(&mut out, HashMap::from_iter([(name.clone(), ty)]));
                 }
             }
             out
@@ -7193,7 +7194,7 @@ fn collect_transitive_filter_ivars(
             for (i, target) in targets.iter().enumerate() {
                 if let (LValue::Ivar { name }, false) = (target, own) {
                     if let Some(ty) = body::multiassign_target_ty(&value.ty, i) {
-                        union_ivar_maps(&mut out, HashMap::from([(name.clone(), ty)]));
+                        union_ivar_maps(&mut out, HashMap::from_iter([(name.clone(), ty)]));
                     }
                 }
             }
@@ -7214,7 +7215,7 @@ fn collect_transitive_filter_ivars(
             }
             out
         }
-        _ => HashMap::new(),
+        _ => HashMap::default(),
     }
 }
 
@@ -7243,7 +7244,7 @@ fn merge_alternative_branches(branches: Vec<HashMap<Symbol, Ty>>) -> HashMap<Sym
     for b in &branches {
         keys.extend(b.keys().cloned());
     }
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for k in keys {
         let mut ty: Option<Ty> = None;
         for b in &branches {
@@ -7265,7 +7266,7 @@ fn merged_before_seed(
     action_name: &Symbol,
     action_bindings: &HashMap<Symbol, HashMap<Symbol, Ty>>,
 ) -> HashMap<Symbol, Ty> {
-    let mut seed: HashMap<Symbol, Ty> = HashMap::new();
+    let mut seed: HashMap<Symbol, Ty> = HashMap::default();
     for (filter, _, _) in chained_filters {
         if !matches!(filter.kind, FilterKind::Before | FilterKind::Around) {
             continue;
@@ -7341,7 +7342,7 @@ fn build_sourced_filter_chain(
                             ExprNode::Lambda { body, .. } => body,
                             _ => block,
                         };
-                        let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                        let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                         extract_ivar_assignments(body, &mut ivars);
                         let target =
                             Symbol::from(format!("__{}_block_{idx}__", method.as_str()));
@@ -7390,7 +7391,7 @@ fn build_sourced_filter_chain(
                         } else {
                             FilterKind::Before
                         };
-                        let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                        let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                         extract_ivar_assignments(&target_info.body, &mut ivars);
                         let target =
                             Symbol::from(format!("__{}_block_{idx}__", method.as_str()));
@@ -7635,7 +7636,7 @@ pub(crate) fn view_name_for_action(controller: &ClassId, action: &Action) -> Opt
 /// the app didn't define. Used for the Ruby stdlib catalog (SecureRandom,
 /// File, Dir, Math, CGI, ERB::Util, Digest::*, URI, Set) in `Analyzer::new`.
 pub(crate) fn extract_const_assignments(body: &[ModelBodyItem]) -> HashMap<Symbol, Ty> {
-    let mut out: HashMap<Symbol, Ty> = HashMap::new();
+    let mut out: HashMap<Symbol, Ty> = HashMap::default();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         record_const(expr, &mut out);
@@ -7653,7 +7654,7 @@ pub(crate) fn extract_const_assignments(body: &[ModelBodyItem]) -> HashMap<Symbo
 pub(crate) fn extract_controller_const_assignments(
     body: &[ControllerBodyItem],
 ) -> HashMap<Symbol, Ty> {
-    let mut out: HashMap<Symbol, Ty> = HashMap::new();
+    let mut out: HashMap<Symbol, Ty> = HashMap::default();
     for item in body {
         let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
         record_const(expr, &mut out);
@@ -8410,7 +8411,7 @@ fn bind_framework_assigned_ivars(body: &Expr, ivars: &mut HashMap<Symbol, Ty>) {
 /// call cannot erase what another site established.
 fn collect_const_attr_writes(
     expr: &crate::expr::Expr,
-    targets: &std::collections::HashSet<&ClassId>,
+    targets: &crate::det::HashSet<&ClassId>,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
 ) {
     // `Current.user = bot` arrives as a SEND of `user=`, not as an
@@ -8464,7 +8465,7 @@ fn is_clean_binding(ty: &Ty) -> bool {
 /// The ivars `initialize` assigns as statements of its own, across `methods`.
 fn ivars_initialized_by<'a>(
     methods: impl Iterator<Item = &'a crate::dialect::MethodDef>,
-) -> std::collections::HashSet<Symbol> {
+) -> crate::det::HashSet<Symbol> {
     methods
         .filter(|m| {
             m.name.as_str() == "initialize"
@@ -8833,10 +8834,10 @@ fn collect_attr_accessor_names(body: &[ModelBodyItem]) -> Vec<Symbol> {
 /// exactly — `Mailer.with` chained onto anything else is not this.
 fn harvest_mailer_with_params(
     app: &App,
-    mailers: &std::collections::HashSet<ClassId>,
+    mailers: &crate::det::HashSet<ClassId>,
 ) -> HashMap<ClassId, crate::ty::Row> {
     use crate::expr::Literal;
-    let mut out: HashMap<ClassId, crate::ty::Row> = HashMap::new();
+    let mut out: HashMap<ClassId, crate::ty::Row> = HashMap::default();
     let mut visit = |e: &Expr| {
         let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { return };
         if method.as_str() != "with" {
@@ -9338,7 +9339,7 @@ mod typed_store_tests {
         );
         let body = vec![unknown_item(send("typed_store", vec![sym("settings")], Some(block)))];
 
-        let mut methods: HashMap<Symbol, Ty> = HashMap::new();
+        let mut methods: HashMap<Symbol, Ty> = HashMap::default();
         register_typed_store(&body, &mut methods);
 
         // string → getter + setter + presence predicate (typedstore
@@ -9355,7 +9356,7 @@ mod typed_store_tests {
     #[test]
     fn ignores_unknown_items_without_typed_store() {
         let body = vec![unknown_item(send("some_macro", vec![sym("x")], None))];
-        let mut methods: HashMap<Symbol, Ty> = HashMap::new();
+        let mut methods: HashMap<Symbol, Ty> = HashMap::default();
         register_typed_store(&body, &mut methods);
         assert!(methods.is_empty());
     }
@@ -9387,7 +9388,7 @@ mod typed_store_tests {
         );
         let body = vec![unknown_item(send("typed_store", vec![sym("settings")], Some(block)))];
 
-        let mut methods: HashMap<Symbol, Ty> = HashMap::new();
+        let mut methods: HashMap<Symbol, Ty> = HashMap::default();
         register_typed_store(&body, &mut methods);
 
         // `any` stays the gradual escape even with `array: true` — element
@@ -9405,7 +9406,7 @@ mod typed_store_tests {
     #[test]
     fn method_return_fallback_is_clobber_safe() {
         use crate::ident::TyVar;
-        let mut t: HashMap<Symbol, Ty> = HashMap::new();
+        let mut t: HashMap<Symbol, Ty> = HashMap::default();
 
         // Resolved body → register the real return type.
         Analyzer::register_method_return(&mut t, &Symbol::from("to_html"), Some(&Ty::Str));
@@ -9448,7 +9449,7 @@ mod rbs_ingestion_tests {
         // A user class not in any Rails convention: `Settings`.
         // RBS declares `theme` returns String.
         let mut app = App::new();
-        let mut settings_methods: HashMap<Symbol, Ty> = HashMap::new();
+        let mut settings_methods: HashMap<Symbol, Ty> = HashMap::default();
         settings_methods.insert(Symbol::from("theme"), fn_ty_returning(Ty::Str));
         app.rbs_signatures
             .insert(ClassId(Symbol::from("Settings")), settings_methods);
@@ -9478,7 +9479,7 @@ mod rbs_ingestion_tests {
         // overriding `find` on a model.
         let mut app = App::new();
         let model_name = ClassId(Symbol::from("Article"));
-        let mut article_methods: HashMap<Symbol, Ty> = HashMap::new();
+        let mut article_methods: HashMap<Symbol, Ty> = HashMap::default();
         // Pretend Article is a user class with a custom `find` that
         // returns a plain String (nonsense, but easy to detect).
         article_methods.insert(Symbol::from("find"), fn_ty_returning(Ty::Str));
@@ -9531,7 +9532,7 @@ fn concern_ivar_env_of(
     controller_ivar_env: &HashMap<ClassId, HashMap<Symbol, Ty>>,
     module_includes: &HashMap<ClassId, Vec<ClassId>>,
 ) -> HashMap<ClassId, HashMap<Symbol, Ty>> {
-            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
         let by_name: HashMap<&ClassId, &Controller> =
             app.controllers.iter().map(|c| (&c.name, c)).collect();
         for controller in &app.controllers {
@@ -9594,7 +9595,7 @@ fn concern_ivar_env_of(
 /// unknown there and as `String` everywhere else, which reads as "the
 /// runtime file is wrong" when the registry was.
 pub fn register_stdlib_classes(
-    classes: &mut std::collections::HashMap<crate::ident::ClassId, ClassInfo>,
+    classes: &mut crate::det::HashMap<crate::ident::ClassId, ClassInfo>,
 ) {
     registry::stdlib::register(classes);
 }
@@ -9618,12 +9619,12 @@ fn snapshot_rebuild(e: &Expr) -> bool {
 
 /// Locals every assignment of which in `body` is a bare `yield` — a
 /// method's own copy of its block's value (`records = yield; …; records`).
-fn yield_only_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
+fn yield_only_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
     fn walk(
         e: &Expr,
-        yields: &mut std::collections::HashSet<Symbol>,
-        other: &mut std::collections::HashSet<Symbol>,
-        shadowed: &std::collections::HashSet<Symbol>,
+        yields: &mut crate::det::HashSet<Symbol>,
+        other: &mut crate::det::HashSet<Symbol>,
+        shadowed: &crate::det::HashSet<Symbol>,
     ) {
         match &*e.node {
             ExprNode::Lambda { extra_params, params, rest_param, body, .. } => {
@@ -9658,9 +9659,9 @@ fn yield_only_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
             _ => e.node.for_each_child(&mut |c| walk(c, yields, other, shadowed)),
         }
     }
-    let mut yields = std::collections::HashSet::new();
-    let mut other = std::collections::HashSet::new();
-    walk(body, &mut yields, &mut other, &std::collections::HashSet::new());
+    let mut yields = crate::det::HashSet::default();
+    let mut other = crate::det::HashSet::default();
+    walk(body, &mut yields, &mut other, &crate::det::HashSet::default());
     yields.retain(|n| !other.contains(n));
     yields
 }

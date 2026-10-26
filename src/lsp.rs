@@ -39,7 +39,7 @@
 //! (stale-by-one-edit, the standard fast-language-server trade), and
 //! diagnostics catch up when the worker publishes.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -257,7 +257,7 @@ impl Server {
         Self {
             connection,
             root,
-            overlay: HashMap::new(),
+            overlay: HashMap::default(),
             open: Vec::new(),
             analysis,
             worker,
@@ -749,7 +749,7 @@ fn publish(sender: &crossbeam_channel::Sender<Message>, app: &App, open: &[Uri],
     // Group by source path, then convert. Grouping on the roundhouse
     // diagnostics (pre-conversion) lets us apply the mid-edit
     // suppression heuristic by kind.
-    let mut by_path: HashMap<PathBuf, Vec<RhDiagnostic>> = HashMap::new();
+    let mut by_path: HashMap<PathBuf, Vec<RhDiagnostic>> = HashMap::default();
     for d in diags {
         if let Some(src) = ide::source(app, d.span.file) {
             by_path.entry(canonical(Path::new(&src.path))).or_default().push(d);
@@ -1117,7 +1117,7 @@ mod tests {
         };
 
         // A bad on-disk configuration is reported before a first good snapshot exists.
-        run_and_publish(&root, request(HashMap::new()), &sender, &shared);
+        run_and_publish(&root, request(HashMap::default()), &sender, &shared);
         let errors = config_diagnostics();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1125,13 +1125,13 @@ mod tests {
         assert!(shared.lock().unwrap().is_none());
 
         // Unsaved valid content overrides disk, clears the error, and installs a snapshot.
-        let valid = HashMap::from([(config.clone(), "test_paths: []\n".to_string())]);
+        let valid = HashMap::from_iter([(config.clone(), "test_paths: []\n".to_string())]);
         run_and_publish(&root, request(valid.clone()), &sender, &shared);
         assert!(config_diagnostics().is_empty());
         let last_good = shared.lock().unwrap().clone().unwrap();
 
         // A subsequent invalid edit reports its error without replacing the last-good app.
-        let invalid = HashMap::from([(config, "test_paths: [../outside]\n".to_string())]);
+        let invalid = HashMap::from_iter([(config, "test_paths: [../outside]\n".to_string())]);
         run_and_publish(&root, request(invalid), &sender, &shared);
         let errors = config_diagnostics();
         assert_eq!(errors.len(), 1);

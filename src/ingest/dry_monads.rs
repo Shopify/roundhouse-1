@@ -35,7 +35,7 @@
 //! beside what it names that is; one the app never builds changes
 //! nothing and is dropped.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{LibraryClass, LibraryClassOrigin, MethodReceiver};
@@ -50,9 +50,9 @@ const RESULT_MIXIN: &str = "Dry::Monads::Result::Mixin";
 pub(super) fn lower_dry_monads(app: &mut App, sources: &[crate::span::SourceFile]) -> super::IngestResult<()> {
     let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
     let mut any = false;
-    let mut do_marked: HashSet<String> = HashSet::new();
+    let mut do_marked: HashSet<String> = HashSet::default();
     // `Do.for(...)`: per class, the methods and where the include stands.
-    let mut do_for: HashMap<String, HashMap<String, crate::span::Span>> = HashMap::new();
+    let mut do_for: HashMap<String, HashMap<String, crate::span::Span>> = HashMap::default();
     // A monad the app never builds is an include that changes nothing.
     let unused = |feature: &str| -> bool {
         let constructors: &[&str] = match feature {
@@ -95,7 +95,7 @@ pub(super) fn lower_dry_monads(app: &mut App, sources: &[crate::span::SourceFile
                         "do" => do_notation = true,
                         other if other.starts_with("for:") => {
                             for_methods
-                                .get_or_insert_with(HashMap::new)
+                                .get_or_insert_with(HashMap::default)
                                 .entry(other["for:".len()..].to_string())
                                 .or_insert(call.span);
                         }

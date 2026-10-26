@@ -15,7 +15,7 @@
 //! not define, keeps every template of the directory, since what it
 //! renders cannot be read here.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{Controller, ControllerBodyItem};

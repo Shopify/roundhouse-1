@@ -3,7 +3,7 @@
 //! This pass has stricter semantic constraints: moving keywords must preserve
 //! Ruby evaluation order and defaults must retain their lexical meaning.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -39,7 +39,7 @@ impl InstanceCallParams {
         >,
         names: &super::super::forwarding::ConstructorNames,
     ) -> Self {
-        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
         for class in &app.library_classes {
             for method in &class.methods {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -67,7 +67,7 @@ impl InstanceCallParams {
         // receiver types as `Message`. With several includers the
         // receiver still names one, but which module's definition wins
         // is the includer's ancestry, so those are left alone.
-        let mut defined: HashSet<(String, Symbol)> = HashSet::new();
+        let mut defined: HashSet<(String, Symbol)> = HashSet::default();
         for model in &app.models {
             for method in model.methods() {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -99,9 +99,9 @@ impl InstanceCallParams {
             }
         }
 
-        let mut custom_new = HashSet::new();
-        let mut custom_new_slots = HashMap::new();
-        let mut unknown_new = HashSet::new();
+        let mut custom_new = HashSet::default();
+        let mut custom_new_slots = HashMap::default();
+        let mut unknown_new = HashSet::default();
         let unqualified_class_ids = names.unqualified_class_ids.clone();
         for (class_id, contract) in constructors {
             add_constructor_slots(
@@ -239,7 +239,7 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
 
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for class in &app.library_classes {
         let refinements = refinements_for(class.name.0.as_str(), &activations);
         if !refinements.is_empty() {
@@ -791,7 +791,7 @@ fn respell_constructor(args: &mut Vec<Expr>, slots: &[Slot]) -> Result<(), ()> {
     }
 
     let mut supplied = Vec::with_capacity(entries.len());
-    let mut positions = HashSet::new();
+    let mut positions = HashSet::default();
     let mut previous_pos = None;
     for (key, value) in entries {
         let ExprNode::Lit {

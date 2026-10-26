@@ -1,6 +1,6 @@
 //! `render json: <record>` for a table-backed model with no `as_json`: Rails' `serializable_hash`, written down from the columns.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::dialect::{MethodDef, Model, ModelBodyItem};

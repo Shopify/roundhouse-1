@@ -3,7 +3,7 @@
 //! action → view-name mapping helpers. Extracted verbatim from
 //! `src/analyze/mod.rs` (pure code motion).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::Symbol;
@@ -140,7 +140,7 @@ pub(super) fn extract_partial_render_sites(
 /// assignments (`@above = 'for_domain'`) lets the analyzer seed the
 /// `_for_domain` partial with that action's ivars — the edge
 /// `extract_partial_render_sites` can't resolve statically.
-pub(super) fn collect_dynamic_render_ivars(expr: &Expr, out: &mut std::collections::HashSet<Symbol>) {
+pub(super) fn collect_dynamic_render_ivars(expr: &Expr, out: &mut crate::det::HashSet<Symbol>) {
     if let ExprNode::Send { recv, method, args, .. } = &*expr.node {
         if recv.is_none() && method.as_str() == "render" {
             for arg in args {
@@ -176,7 +176,7 @@ pub(super) fn collect_dynamic_render_ivars(expr: &Expr, out: &mut std::collectio
 /// value — the content-partial basename the action wants rendered.
 pub(super) fn collect_content_partial_literals(
     expr: &Expr,
-    targets: &std::collections::HashSet<Symbol>,
+    targets: &crate::det::HashSet<Symbol>,
     out: &mut Vec<String>,
 ) {
     if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*expr.node {
@@ -262,7 +262,7 @@ fn interpret_render_call(
     // `render @article` — first arg types as Array<Class> or Class.
     if let Some(ty) = first.ty.as_ref() {
         if let Some((partial, local_name, elem_ty)) = partial_from_receiver_type(ty) {
-            let mut locals = HashMap::new();
+            let mut locals = HashMap::default();
             locals.insert(Symbol::from(local_name.as_str()), elem_ty);
             return Some((Symbol::from(partial.as_str()), locals));
         }
@@ -271,7 +271,7 @@ fn interpret_render_call(
     // Named partial: `render "name", k: v, k: v` or `render "name"`.
     if let ExprNode::Lit { value: Literal::Str { value: name } } = &*first.node {
         let partial = resolve_partial_path(name, current_view);
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         for a in &args[1..] {
             if let ExprNode::Hash { entries, .. } = &*a.node {
                 for (k, v) in entries {
@@ -300,7 +300,7 @@ fn interpret_render_call(
         // any other partial. Keyed separately so an explicit
         // `partial:` in the same hash still wins.
         let mut layout_name: Option<String> = None;
-        let mut locals: HashMap<Symbol, Ty> = HashMap::new();
+        let mut locals: HashMap<Symbol, Ty> = HashMap::default();
         let mut collection_ty: Option<Ty> = None;
         let mut as_name: Option<Symbol> = None;
         for (k, v) in entries {

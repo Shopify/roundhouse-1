@@ -21,7 +21,7 @@
 //! (a polymorphic reader with no recorded targets) is refused with the
 //! reason rather than written as its `to_s`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::Association;
@@ -73,7 +73,7 @@ impl RecordShapes {
         }
         for m in &app.models {
             let name = m.name.0.as_str().to_string();
-            let mut readers = HashMap::new();
+            let mut readers = HashMap::default();
             for a in m.associations() {
                 let (reader, value) = match a {
                     Association::BelongsTo { name, polymorphic: true, polymorphic_targets, .. } => {
@@ -164,7 +164,7 @@ impl RecordShapes {
 /// by span, the outermost expression first when two share one (`a&.b`
 /// is `a && a.b` over the same source).
 pub(super) fn span_types(body: &Expr) -> HashMap<Span, Ty> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     collect(body, &mut out);
     out
 }

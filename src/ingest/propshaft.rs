@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -154,7 +155,7 @@ pub(super) fn read_version<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     if vfs.is_dir(&init_dir) {
         initializers.extend(super::app::read_rb_files(vfs, &init_dir)?);
     }
-    let mut versions = HashSet::new();
+    let mut versions = HashSet::default();
     for environment in environments {
         let mut value = base.clone();
         if let Some(path) = environment {
@@ -289,7 +290,7 @@ fn digested_paths(assets: &BTreeMap<String, Vec<u8>>, version: &str) -> BTreeMap
             hash.update(bytes);
             if pattern(logical).is_some() {
                 let mut refs = Vec::new();
-                referenced(logical, assets, &mut HashSet::new(), &mut refs);
+                referenced(logical, assets, &mut HashSet::default(), &mut refs);
                 for path in refs {
                     hash.update(&assets[&path]);
                 }

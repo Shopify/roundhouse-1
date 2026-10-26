@@ -52,7 +52,7 @@
 //!
 //! Silent: a method with no parameters, or no rebind, is a no-op.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{ControllerBodyItem, ModelBodyItem};
@@ -127,15 +127,15 @@ fn rewrite_method(body: &mut Expr, params: Vec<Symbol>) {
         return;
     }
     let param_set: HashSet<Symbol> = params.into_iter().collect();
-    let mut unsafe_params = HashSet::new();
+    let mut unsafe_params = HashSet::default();
     collect_unsafe_writes(body, &param_set, &mut unsafe_params, false);
     let safe: HashSet<Symbol> = param_set.difference(&unsafe_params).cloned().collect();
     if safe.is_empty() {
         return;
     }
-    let mut used = HashSet::new();
+    let mut used = HashSet::default();
     collect_names(body, &mut used);
-    let mut rebound = HashMap::new();
+    let mut rebound = HashMap::default();
     rewrite(body, &safe, &mut rebound, &used);
 }
 

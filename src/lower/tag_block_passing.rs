@@ -60,7 +60,7 @@
 //! Ruby-family only, like its sibling: the construct needs a mutable
 //! buffer a callee can write through.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::{LibraryClass, MethodDef, Param};
@@ -84,7 +84,7 @@ pub struct Variant {
 /// emit (which calls them) agree without one having to run before the
 /// other.
 pub fn variants(app: &App) -> HashMap<(String, String), Variant> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if let Some((parts, idx)) = tag_block_shape(m) {

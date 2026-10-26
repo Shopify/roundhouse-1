@@ -1,7 +1,7 @@
 //! Core container tests preserve known element types and the recursive request
 //! value contract; an arbitrary untyped input must keep its gradual escape.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{BodyTyper, ClassInfo, Ctx};
@@ -49,7 +49,7 @@ fn narrowed_branches(input: Ty, path: &[&str], predicate: &str) -> (Ty, Ty) {
             else_branch: variable(),
         },
     );
-    let classes: HashMap<ClassId, ClassInfo> = HashMap::new();
+    let classes: HashMap<ClassId, ClassInfo> = HashMap::default();
     let mut context = Ctx::default();
     context.local_bindings.insert(Symbol::from("value"), input);
     BodyTyper::new(&classes).analyze_expr(&mut expression, &context);
@@ -272,7 +272,7 @@ end
 fn arbitrary_runtime_array_items_remain_gradual_in_source_diagnostics() {
     let ruby = "class Probe < ApplicationRecord\n def first_item(value)\n if value.is_a?(Array)\n value.first\n else\n nil\n end\n end\nend";
     let rbs = "class Probe\n def first_item: (untyped value) -> untyped\nend";
-    let tree: HashMap<PathBuf, Vec<u8>> = [
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = [
         ("db/schema.rb", "ActiveRecord::Schema.define do\n create_table :probes do |t|; t.string :name; end\nend"),
         ("app/models/probe.rb", ruby),
     ].into_iter().map(|(path, source)| (PathBuf::from(path), source.as_bytes().to_vec())).collect();

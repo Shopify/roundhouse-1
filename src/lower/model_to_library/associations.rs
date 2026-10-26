@@ -5,7 +5,7 @@
 //! `preload`) and, when `autosave: true`, a writer plus `after_save`
 //! that stamps the child FK and saves.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{
     AccessorKind, Association, Dependent, MethodDef, MethodReceiver, Model, Param,
@@ -48,7 +48,7 @@ pub(super) struct ThroughJoins {
 
 impl ThroughJoins {
     pub(super) fn decide(model: &Model, models: &[Model]) -> Self {
-        let mut by_name = HashMap::new();
+        let mut by_name = HashMap::default();
         for assoc in model.associations() {
             if let Association::HasMany { name, through: Some(_), .. } = assoc {
                 by_name.insert(name.clone(), through_writer_join(model, models, name));

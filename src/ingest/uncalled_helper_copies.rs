@@ -18,7 +18,7 @@
 //! String / Symbol literal (`before_action :x`, `helper_method :x`,
 //! `send(:x)`), or a route's action.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::ControllerBodyItem;
@@ -115,7 +115,7 @@ fn family(app: &App, controller: &ClassId) -> Vec<ClassId> {
 
 /// Every method name each controller body calls or spells as a literal.
 fn names_in_controllers(app: &App) -> HashMap<ClassId, HashSet<String>> {
-    let mut by_controller = HashMap::new();
+    let mut by_controller = HashMap::default();
     for c in &app.controllers {
         let out: &mut HashSet<String> = by_controller.entry(c.name.clone()).or_default();
         for item in &c.body {

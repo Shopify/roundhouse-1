@@ -175,7 +175,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
 
 /// Mailers whose own or an ancestor's `def self.with` answers `with`; Ruby would pick a generated one over the inherited.
 pub(crate) fn defines_with(app: &App) -> BTreeSet<String> {
-    let parents: std::collections::HashMap<&str, &str> = app
+    let parents: crate::det::HashMap<&str, &str> = app
         .library_classes
         .iter()
         .filter_map(|lc| lc.parent.as_ref().map(|p| (lc.name.0.as_str(), p.0.as_str())))

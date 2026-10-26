@@ -57,7 +57,7 @@ pub fn apply_controller_class_render(app: &mut App) {
     if contracts.is_empty() {
         return;
     }
-    let none = std::collections::HashSet::new();
+    let none = crate::det::HashSet::default();
     super::for_each_hook_body(app, &mut |e| rewrite(e, &contracts, &none));
     for tm in &mut app.test_modules {
         let builders = attachment_builders(&tm.helpers);
@@ -87,8 +87,8 @@ pub fn apply_controller_class_render(app: &mut App) {
 /// content_attachment_for(…)]`, each of which ends in
 /// `attachment_from(…)`, which ends in `from_node`.
 pub(crate) struct Builders {
-    one: std::collections::HashSet<Symbol>,
-    many: std::collections::HashSet<Symbol>,
+    one: crate::det::HashSet<Symbol>,
+    many: crate::det::HashSet<Symbol>,
 }
 
 impl Builders {
@@ -124,7 +124,7 @@ fn tail_of(body: &Expr) -> &Expr {
     }
 }
 
-fn calls_builder(e: &Expr, builders: &std::collections::HashSet<Symbol>) -> bool {
+fn calls_builder(e: &Expr, builders: &crate::det::HashSet<Symbol>) -> bool {
     matches!(&*e.node, ExprNode::Send { recv: None, method, .. } if builders.contains(method))
 }
 
@@ -143,12 +143,12 @@ fn builds_attachment(tail: &Expr) -> bool {
 /// Locals in `body` holding an attachment: assigned from a call to a
 /// one-attachment builder, or the block parameter of `.map` / `.each`
 /// over a call to an Array one (`attachments_for(…).map do |attachment|`).
-pub(crate) fn attachment_locals(body: &Expr, builders: &Builders) -> std::collections::HashSet<Symbol> {
-    let mut out = std::collections::HashSet::new();
+pub(crate) fn attachment_locals(body: &Expr, builders: &Builders) -> crate::det::HashSet<Symbol> {
+    let mut out = crate::det::HashSet::default();
     if builders.is_empty() {
         return out;
     }
-    fn walk(e: &Expr, builders: &Builders, out: &mut std::collections::HashSet<Symbol>) {
+    fn walk(e: &Expr, builders: &Builders, out: &mut crate::det::HashSet<Symbol>) {
         if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node {
             if calls_builder(value, &builders.one) {
                 out.insert(name.clone());
@@ -169,12 +169,12 @@ pub(crate) fn attachment_locals(body: &Expr, builders: &Builders) -> std::collec
     out
 }
 
-fn rewrite(expr: &mut Expr, contracts: &Contracts, attachment_locals: &std::collections::HashSet<Symbol>) {
+fn rewrite(expr: &mut Expr, contracts: &Contracts, attachment_locals: &crate::det::HashSet<Symbol>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, contracts, attachment_locals));
     rewrite_node(expr, contracts, attachment_locals);
 }
 
-pub(crate) type Contracts = std::collections::HashMap<
+pub(crate) type Contracts = crate::det::HashMap<
     (String, String),
     crate::lower::view_to_library::PartialCallContract,
 >;
@@ -182,7 +182,7 @@ pub(crate) type Contracts = std::collections::HashMap<
 pub(crate) fn rewrite_node(
     expr: &mut Expr,
     contracts: &Contracts,
-    attachment_locals: &std::collections::HashSet<Symbol>,
+    attachment_locals: &crate::det::HashSet<Symbol>,
 ) {
     // `render_action_text_attachment(attachment)` — Action Text's own
     // helper for the same render: `ActionText::ContentHelper`'s, which
@@ -417,7 +417,7 @@ pub(crate) fn rewrite_node(
 fn attachments_own_partial(
     partial: Option<&Expr>,
     locals: Option<&Expr>,
-    attachment_locals: &std::collections::HashSet<Symbol>,
+    attachment_locals: &crate::det::HashSet<Symbol>,
 ) -> Option<Expr> {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*partial?.node
     else {

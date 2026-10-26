@@ -2,7 +2,7 @@
 //! `Rails`/`Time`/`Date`/`DateTime` singletons, and the gem-ecosystem
 //! catalog fold. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::ident::{ClassId, Symbol};

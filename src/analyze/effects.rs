@@ -3,7 +3,8 @@
 //! controller render/redirect). Inherent `Analyzer` methods extracted
 //! verbatim from `src/analyze/mod.rs` (pure code motion).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::adapter::ArMethodKind;
 use crate::App;
@@ -61,7 +62,7 @@ impl super::Analyzer {
             let _ = self.collect_effects(expr, &Ctx::default());
         }
 
-        let mut by_key: HashMap<(ClassId, Symbol), EffectSet> = HashMap::new();
+        let mut by_key: HashMap<(ClassId, Symbol), EffectSet> = HashMap::default();
         for controller in &app.controllers {
             for action in controller.actions() {
                 by_key.insert(
@@ -435,7 +436,7 @@ fn lookup_filter_effects(
         return effects.clone();
     }
     let mut current = rf.included_via.clone();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     while seen.insert(current.clone()) {
         let Some(parent) = parents.get(&current).and_then(|p| p.clone()) else {
             break;

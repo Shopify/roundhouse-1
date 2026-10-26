@@ -6,7 +6,7 @@
 //! program reads as a constant. Each one named by a qualified path from
 //! outside its owner is ingested again from its source as that module.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::App;
 use crate::dialect::ModelBodyItem;
@@ -20,7 +20,7 @@ const CARRIER: &str = "ClassMethods";
 
 pub(super) fn surface_referenced_carriers(app: &mut App, sources: &[SourceFile]) {
     let known: HashSet<String> = app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
-    let mut wanted: HashSet<String> = HashSet::new();
+    let mut wanted: HashSet<String> = HashSet::default();
     let mut note = |site: Option<&str>, expr: &Expr| {
         visit(expr, &mut |e| {
             let ExprNode::Const { path } = &*e.node else { return };

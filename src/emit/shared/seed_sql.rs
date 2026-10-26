@@ -147,7 +147,7 @@ struct Interp<'s> {
     schema: &'s Schema,
     models: &'s [Model],
     /// Next id per table, 1-indexed like AUTOINCREMENT.
-    next_id: std::collections::HashMap<String, i64>,
+    next_id: crate::det::HashMap<String, i64>,
     bindings: Vec<Binding>,
     /// Microseconds past `SEED_EPOCH` for the next row.
     tick: i64,
@@ -159,7 +159,7 @@ impl<'s> Interp<'s> {
         Self {
             schema,
             models,
-            next_id: std::collections::HashMap::new(),
+            next_id: crate::det::HashMap::default(),
             bindings: Vec::new(),
             tick: 0,
             out: Vec::new(),

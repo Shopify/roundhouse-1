@@ -53,7 +53,7 @@
 //! diagnostic `diagnose` would otherwise raise for `authenticate_by`
 //! resolves instead of accumulating as phantom modeling debt.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;

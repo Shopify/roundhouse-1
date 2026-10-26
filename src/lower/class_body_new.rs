@@ -148,7 +148,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// arm. The diagnostic is what stops it being silent.
 fn monomorphize_subclassed(
     app: &mut App,
-    subclassed: &std::collections::HashSet<String>,
+    subclassed: &crate::det::HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -180,14 +180,14 @@ fn monomorphize_subclassed(
     }
 
     // name -> index, and parent -> children, over library classes.
-    let index: std::collections::HashMap<String, usize> = app
+    let index: crate::det::HashMap<String, usize> = app
         .library_classes
         .iter()
         .enumerate()
         .map(|(i, lc)| (lc.name.0.as_str().to_string(), i))
         .collect();
-    let mut children: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut children: crate::det::HashMap<String, Vec<String>> =
+        crate::det::HashMap::default();
     for lc in &app.library_classes {
         if let Some(p) = &lc.parent {
             children
@@ -230,8 +230,8 @@ fn monomorphize_subclassed(
 fn plan_copies(
     owner: &str,
     method: &crate::dialect::MethodDef,
-    children: &std::collections::HashMap<String, Vec<String>>,
-    index: &std::collections::HashMap<String, usize>,
+    children: &crate::det::HashMap<String, Vec<String>>,
+    index: &crate::det::HashMap<String, usize>,
     classes: &[crate::dialect::LibraryClass],
     planned: &mut Vec<(usize, crate::dialect::MethodDef)>,
 ) {
@@ -272,8 +272,8 @@ fn constructs(expr: &Expr) -> bool {
 /// owner", and one recorded superclass edge is the whole of it. A class
 /// subclassed only OUTSIDE the tree (a gem's) is not in here and does
 /// not need to be: nothing outside the tree calls into it either.
-fn subclassed_names(app: &App) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+fn subclassed_names(app: &App) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
     for m in &app.models {
         if let Some(p) = &m.parent {
             out.insert(p.0.as_str().to_string());

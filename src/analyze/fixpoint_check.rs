@@ -57,7 +57,8 @@
 //!   pass for consumers after analysis; no round reads them.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::det::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,8 +128,8 @@ impl Loop {
 
 /// The inputs `analyze` computes once and hands every typing pass.
 pub(super) struct RoundInputs<'a> {
-    pub dynamic_render_ivars: &'a std::collections::HashSet<Symbol>,
-    pub existing_view_names: &'a std::collections::HashSet<Symbol>,
+    pub dynamic_render_ivars: &'a crate::det::HashSet<Symbol>,
+    pub existing_view_names: &'a crate::det::HashSet<Symbol>,
     pub module_methods: &'a HashMap<ClassId, Vec<MethodDef>>,
     pub module_includes: &'a HashMap<ClassId, Vec<ClassId>>,
     pub parent_link_by_name: &'a HashMap<ClassId, Option<ClassId>>,
@@ -632,7 +633,7 @@ class SamplesController < ActionController::Base
   end
 end
 "#);
-            let tree = HashMap::from([(
+            let tree = std::collections::HashMap::from_iter([(
                 std::path::PathBuf::from("app/controllers/samples_controller.rb"),
                 source.into_bytes(),
             )]);
@@ -699,14 +700,14 @@ end
             let resolution = ControllerResolution {
                 filter_chain: vec![ResolvedFilter {
                     filter, defined_in: id.clone(), included_via: id.clone(),
-                    assigns: HashMap::new(), effects: Default::default(),
+                    assigns: HashMap::default(), effects: Default::default(),
                 }],
                 layout: Some(Symbol::from("layouts/application")),
             };
             let app = App::default();
             let mut analyzer = Analyzer::new(&app);
             analyzer.view_seeds = Some(ViewSeeds {
-                controller_resolutions: HashMap::from([(id, resolution)]),
+                controller_resolutions: HashMap::from_iter([(id, resolution)]),
                 ..ViewSeeds::default()
             });
             analyzer.state_fp(&app).digests()["view_seeds"].clone()

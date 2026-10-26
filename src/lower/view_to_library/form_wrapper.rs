@@ -2,7 +2,7 @@
 //! still belong to the helper that defined them. Preserve that ownership with
 //! small typed callable bridges; never expose the source's private methods.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::analyze::ClassInfo;
@@ -46,7 +46,7 @@ fn wrapped_call(m: &MethodDef) -> Option<&Expr> {
 /// visible together, so these one-call wrappers are substituted before the
 /// view walk. Options-tail defaults and static merges are handled at the site.
 pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelper> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if app.helper_method_index.get(&m.name) != Some(&lc.name) {
@@ -78,8 +78,8 @@ pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelp
 /// and control-flow need a real wrapper-frame lowering, not this substitution.
 /// Existing argument/default/merge evaluation limitations are not expanded here.
 pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) {
-    let mut names: HashMap<_, HashSet<_>> = HashMap::new();
-    let mut counts: HashMap<_, usize> = HashMap::new();
+    let mut names: HashMap<_, HashSet<_>> = HashMap::default();
+    let mut counts: HashMap<_, usize> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             names.entry(lc.name.clone()).or_default().insert(m.name.clone());
@@ -96,7 +96,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
         let own_names = names[&lc.name].clone();
         let allocated = names.get_mut(&lc.name).expect("collected owner");
         let mut added = Vec::new();
-        let mut changed = HashSet::new();
+        let mut changed = HashSet::default();
         let original_len = lc.methods.len();
         for (index, m) in lc.methods.iter_mut().enumerate() {
             if app.helper_method_index.get(&m.name) != Some(&lc.name)
@@ -116,7 +116,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                     {
                         continue;
                     }
-                    let mut reads = HashSet::new();
+                    let mut reads = HashSet::default();
                     let mut needs_owner = false;
                     let mut effects = EffectSet::pure();
                     if !inspect_argument(
@@ -227,7 +227,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
         lc.methods.extend(added);
         for (index, method) in lc.methods.iter_mut().enumerate() {
             if index >= original_len || changed.contains(&index) {
-                crate::lower::typing::type_method_body(method, &classes, &HashMap::new());
+                crate::lower::typing::type_method_body(method, &classes, &HashMap::default());
             }
         }
     }

@@ -20,7 +20,8 @@
 //! build time must decline.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::App;
@@ -124,7 +125,7 @@ impl<'a> Cx<'a> {
     /// that runs.
     pub fn defined_methods(&self) -> &HashMap<String, Vec<String>> {
         self.defined.get_or_init(|| {
-            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            let mut out: HashMap<String, Vec<String>> = HashMap::default();
             for source in self.app_sources() {
                 super::definitions::collect(source, self.root, &mut out);
             }

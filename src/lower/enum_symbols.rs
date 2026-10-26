@@ -47,7 +47,7 @@ const ATTR_METHODS: &[&str] = &[
     "merge",
 ];
 
-type Mapping = std::collections::HashMap<String, Literal>;
+type Mapping = crate::det::HashMap<String, Literal>;
 
 /// model → column → (label → stored value), the model-agnostic column
 /// map for receivers that name no model, plus the class-body constants a
@@ -55,16 +55,16 @@ type Mapping = std::collections::HashMap<String, Literal>;
 #[derive(Default)]
 pub(crate) struct EnumMap {
     /// Every model's own enum columns.
-    by_model: std::collections::HashMap<crate::ident::ClassId, std::collections::HashMap<String, Mapping>>,
+    by_model: crate::det::HashMap<crate::ident::ClassId, crate::det::HashMap<String, Mapping>>,
     /// Every model of the app, with or without enums: a receiver that
     /// names one of these is mapped through that model's enums only.
-    models: std::collections::HashSet<crate::ident::ClassId>,
+    models: crate::det::HashSet<crate::ident::ClassId>,
     /// column → mapping, for columns every declaring model maps alike.
-    columns: std::collections::HashMap<String, Mapping>,
+    columns: crate::det::HashMap<String, Mapping>,
     /// `NAME = %i[a b]` (optionally `.freeze`) in a model or controller
     /// body: its Symbols, keyed by `NAME` and by `Owner::NAME`. A bare
     /// name two classes bind to different lists is left out.
-    symbol_lists: std::collections::HashMap<String, Vec<crate::ident::Symbol>>,
+    symbol_lists: crate::det::HashMap<String, Vec<crate::ident::Symbol>>,
 }
 
 impl EnumMap {
@@ -101,7 +101,7 @@ pub fn apply_enum_symbol_lowering(app: &mut App) {
 /// names no model has no single right answer for it, and guessing one
 /// would write the wrong integer into a real query.
 pub(crate) fn enum_columns(app: &App) -> EnumMap {
-    let by_model: std::collections::HashMap<_, _> = app
+    let by_model: crate::det::HashMap<_, _> = app
         .models
         .iter()
         .filter(|m| !m.enums.is_empty())
@@ -122,17 +122,17 @@ pub(crate) fn enum_columns(app: &App) -> EnumMap {
 
 fn enum_column_mappings(
     app: &App,
-) -> std::collections::HashMap<String, std::collections::HashMap<String, Literal>> {
-    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, Literal>> =
+) -> crate::det::HashMap<String, crate::det::HashMap<String, Literal>> {
+    let mut out: crate::det::HashMap<String, crate::det::HashMap<String, Literal>> =
         Default::default();
-    let mut conflicted: std::collections::HashSet<String> = Default::default();
+    let mut conflicted: crate::det::HashSet<String> = Default::default();
     for model in &app.models {
         for (column, labels) in &model.enums {
             let col = column.as_str().to_string();
             if conflicted.contains(&col) {
                 continue;
             }
-            let mapping: std::collections::HashMap<String, Literal> =
+            let mapping: crate::det::HashMap<String, Literal> =
                 labels.iter().cloned().collect();
             match out.get(&col) {
                 Some(existing) if !same_mapping(existing, &mapping) => {
@@ -151,10 +151,10 @@ fn enum_column_mappings(
 
 /// Every model's and controller's `NAME = %i[...]` / `NAME = [:a,
 /// :b].freeze` class-body constant whose elements are all Symbols.
-fn symbol_list_constants(app: &App) -> std::collections::HashMap<String, Vec<crate::ident::Symbol>> {
+fn symbol_list_constants(app: &App) -> crate::det::HashMap<String, Vec<crate::ident::Symbol>> {
     use crate::ident::Symbol;
-    let mut out: std::collections::HashMap<String, Vec<Symbol>> = Default::default();
-    let mut conflicted: std::collections::HashSet<String> = Default::default();
+    let mut out: crate::det::HashMap<String, Vec<Symbol>> = Default::default();
+    let mut conflicted: crate::det::HashSet<String> = Default::default();
     let mut add = |owner: &str, expr: &Expr| {
         let ExprNode::Assign { target: crate::expr::LValue::Const { path }, value } = &*expr.node else { return };
         let [name] = path.as_slice() else { return };
@@ -213,8 +213,8 @@ fn symbol_list(value: &Expr) -> Option<Vec<crate::ident::Symbol>> {
 }
 
 fn same_mapping(
-    a: &std::collections::HashMap<String, Literal>,
-    b: &std::collections::HashMap<String, Literal>,
+    a: &crate::det::HashMap<String, Literal>,
+    b: &crate::det::HashMap<String, Literal>,
 ) -> bool {
     a.len() == b.len()
         && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| literal_eq(v, w)))
@@ -311,7 +311,7 @@ fn receiver_model(recv: &Expr, map: &EnumMap) -> Option<crate::ident::ClassId> {
 fn expand_symbol_list_constant(
     value: &mut Expr,
     mapping: &Mapping,
-    lists: &std::collections::HashMap<String, Vec<crate::ident::Symbol>>,
+    lists: &crate::det::HashMap<String, Vec<crate::ident::Symbol>>,
 ) {
     let ExprNode::Const { path } = &*value.node else { return };
     let key = path.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("::");
@@ -347,7 +347,7 @@ fn expand_symbol_list_constant(
 /// Rails does with one.
 fn rewrite_value(
     value: &mut Expr,
-    mapping: &std::collections::HashMap<String, Literal>,
+    mapping: &crate::det::HashMap<String, Literal>,
 ) {
     if let ExprNode::Array { elements, .. } = &mut *value.node {
         let mut all_int = !elements.is_empty();
@@ -372,7 +372,7 @@ fn rewrite_value(
 /// stored literal when it did.
 fn rewrite_label(
     value: &mut Expr,
-    mapping: &std::collections::HashMap<String, Literal>,
+    mapping: &crate::det::HashMap<String, Literal>,
 ) -> Option<Literal> {
     let ExprNode::Lit { value: Literal::Sym { value: label } } = &*value.node else {
         return None;

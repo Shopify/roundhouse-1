@@ -4,7 +4,7 @@
 use crate::dialect::{LibraryClass, MethodReceiver};
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 const ERROR_CLASS: &str = "RoutePathEncodingError";
 

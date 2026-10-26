@@ -268,7 +268,7 @@ fn main() {{
         // Module-flat parsing needs the same cross-method return registry
         // as the runtime typing sweep. An empty registry leaves helper calls
         // unresolved and cannot establish emitted-runtime correctness.
-        let mut registry = std::collections::HashMap::new();
+        let mut registry = crate::det::HashMap::default();
         for (owner, signatures) in crate::rbs::parse_app_signatures(&rbs).unwrap() {
             let short = crate::ident::ClassId(crate::ident::Symbol::from(
                 owner.0.as_str().rsplit("::").next().unwrap(),

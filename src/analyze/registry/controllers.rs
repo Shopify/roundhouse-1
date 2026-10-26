@@ -7,7 +7,7 @@
 //! having been inserted here first. Runs after `view::register` because the
 //! Devise fold also augments `ActionView::Base`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::App;

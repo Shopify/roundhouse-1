@@ -16,7 +16,7 @@
 //! `ingest_app_from_tree`; the rest exercise `ingest_routes_with_draws`
 //! directly against a manually-built `draws` map.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::App;
@@ -42,7 +42,7 @@ fn flat_paths(table: roundhouse::dialect::RouteTable) -> Vec<(String, String)> {
 /// was keyed by `file_stem()` alone, so this never resolved.
 #[test]
 fn draw_resolves_subdirectory_relative_path() {
-    let tree: HashMap<PathBuf, Vec<u8>> = [
+    let tree: std::collections::HashMap<PathBuf, Vec<u8>> = [
         (
             "config/routes.rb",
             "Rails.application.routes.draw do\n  draw('financials/financials_erp_routes')\nend\n",
@@ -194,7 +194,7 @@ fn two_top_level_draw_blocks_both_ingest() {
     let source = b"Procore::Application.routes.draw do\n  get '/legacy', to: 'legacy#index'\nend\n\nRails.application.routes.draw do\n  get '/native', to: 'native#index'\nend\n";
 
     let (result, _) = roundhouse::ingest::prism::scope(|| {
-        ingest_routes_with_draws(source, "config/routes.rb", &HashMap::new())
+        ingest_routes_with_draws(source, "config/routes.rb", &HashMap::default())
     });
     let table = result.expect("two top-level draw blocks both ingest");
     let flat = flat_paths(table);

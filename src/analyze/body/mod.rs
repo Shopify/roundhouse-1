@@ -14,7 +14,7 @@
 //! [`BodyTyper`] with a simpler dispatch table (no user classes, just
 //! the primitive method tables).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::{DeclarationId, declaration_id_from_lookup_name};
 
@@ -133,9 +133,9 @@ pub struct Ctx {
     pub local_bindings: HashMap<Symbol, Ty>,
     /// Locals whose assigned value is proven to be a class/module object.
     /// Nominal instance types alone do not establish this identity.
-    pub class_objects: std::collections::HashSet<Symbol>,
+    pub class_objects: crate::det::HashSet<Symbol>,
     /// Locals an `is_a?(Class)` / `is_a?(Module)` guard proved class objects of unknown identity: Module queries only (`answers_module_queries`).
-    pub query_class_objects: std::collections::HashSet<Symbol>,
+    pub query_class_objects: crate::det::HashSet<Symbol>,
     /// Module/class-level typed constants such as
     /// `STATUS_CODES = { ok: 200, ... }.freeze`. Rubydex IDs resolve
     /// source-backed reads; this scope types generated expressions.
@@ -188,7 +188,7 @@ pub struct Ctx {
     pub building_self: bool,
     /// Locals bound to a class the program already has (a constant, or
     /// `self` on the class side), not one `Class.new` is building.
-    pub live_class_locals: std::collections::HashSet<Symbol>,
+    pub live_class_locals: crate::det::HashSet<Symbol>,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -214,18 +214,18 @@ pub struct ClassInfo {
     /// Attributes of `attributes` that the app's own `def` replaces. A
     /// `def confidence` computes whatever it likes, so two reads of it need
     /// not agree and a guard on one says nothing about the other.
-    pub overridden_attributes: std::collections::HashSet<Symbol>,
+    pub overridden_attributes: crate::det::HashSet<Symbol>,
     /// Methods callable on the class itself: `Post.all`, `Post.find(id)`.
     pub class_methods: HashMap<Symbol, Ty>,
     /// Catalog entries and source methods can have the same gradual
     /// return type, so a call-site refinement needs their provenance.
-    pub source_class_methods: std::collections::HashSet<Symbol>,
+    pub source_class_methods: crate::det::HashSet<Symbol>,
     /// Source declares its own class-side `new`, whose result need not be self.
     pub declares_constructor: bool,
     /// A source `new` that calls `super` still needs the inherited constructor.
     pub constructor_calls_super: bool,
     /// Source class methods that call `super`, reaching the inherited one.
-    pub delegating_class_methods: std::collections::HashSet<Symbol>,
+    pub delegating_class_methods: crate::det::HashSet<Symbol>,
     /// Source supplies an initializer body without delegating to `super`.
     pub implements_initializer: bool,
     /// Which of `class_methods` had their return type inferred FROM a
@@ -248,7 +248,7 @@ pub struct ClassInfo {
     /// return is a record and so matches no relation shape. Without it
     /// the chain typed to nothing and `room_url(…)` rendered
     /// `/rooms/#<Room:0x…>`.
-    pub relation_derived: std::collections::HashSet<Symbol>,
+    pub relation_derived: crate::det::HashSet<Symbol>,
     /// Scopes whose body the seed classifier read as ending in a
     /// MATERIALIZING terminal — `ordered.last(PAGE_SIZE)` — as opposed
     /// to the ones it could not read at all. Both kinds may carry the
@@ -257,7 +257,7 @@ pub struct ClassInfo {
     /// tells them apart at a Relation receiver: a materializing scope
     /// answers its Array, an unclassified one is assumed to still be a
     /// query and re-wraps as the relation.
-    pub materializing_scopes: std::collections::HashSet<Symbol>,
+    pub materializing_scopes: crate::det::HashSet<Symbol>,
     /// Methods whose every return is the value of the BLOCK they were
     /// called with — `yield` on each path, or the block handed on to
     /// another such method (lobsters' `get_from_cache(opts, &)`, which
@@ -267,7 +267,7 @@ pub struct ClassInfo {
     /// type for these, the way it already does for `then` and
     /// `transaction`. Harvested each fixpoint round
     /// (`Analyzer::harvest_method_returns`).
-    pub block_value_methods: std::collections::HashSet<Symbol>,
+    pub block_value_methods: crate::det::HashSet<Symbol>,
     /// Methods callable on an instance: `post.title`, `post.destroy`.
     pub instance_methods: HashMap<Symbol, Ty>,
     /// AccessorKind per method — lets the body-typer flag Method
@@ -300,7 +300,7 @@ pub struct ClassInfo {
     pub assoc_extensions: HashMap<(Symbol, Symbol), Ty>,
     /// has_many readers without `through:` — the ones `lower::scope_chain`
     /// roots onto a relation, so a relation terminal on them runs as SQL.
-    pub direct_has_many: std::collections::HashSet<Symbol>,
+    pub direct_has_many: crate::det::HashSet<Symbol>,
     /// Modules mixed in via `include` (e.g. a controller's
     /// `include IntervalHelper`). A mixed-in module's instance methods
     /// become instance methods of the includer, so dispatch consults
@@ -402,7 +402,7 @@ pub(crate) fn lexical_class<T>(
 /// without cloning.
 pub struct BodyTyper<'a> {
     classes: &'a HashMap<ClassId, ClassInfo>,
-    materialized_associations: Option<&'a std::collections::HashSet<Symbol>>,
+    materialized_associations: Option<&'a crate::det::HashSet<Symbol>>,
     const_resolver: Option<std::sync::Arc<ConstResolver>>,
     typed_constants: Option<&'a IdentityHashMap<DeclarationId, Ty>>,
     data_factories: Option<&'a HashMap<crate::span::Span, Ty>>,
@@ -410,10 +410,10 @@ pub struct BodyTyper<'a> {
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
-    inquirers: Option<&'a std::collections::HashSet<Symbol>>,
+    inquirers: Option<&'a crate::det::HashSet<Symbol>>,
     /// The app's translations; Rails' English when absent.
     i18n: Option<&'a crate::i18n::Catalog>,
-    helper_modules: Option<&'a std::collections::HashSet<ClassId>>,
+    helper_modules: Option<&'a crate::det::HashSet<ClassId>>,
     open_classes: Option<&'a crate::analyze::open_classes::OpenClasses>,
     /// Parameter types for the lambda assignment currently being retyped
     /// from its `.call` sites. Empty during an ordinary walk.
@@ -476,7 +476,7 @@ impl<'a> BodyTyper<'a> {
     fn app_defines_on_side(&self, self_ty: Option<&Ty>, method: &Symbol, instance: bool) -> bool {
         let Some(Ty::Class { id, .. }) = self_ty else { return false };
         let mut stack = vec![id];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(cid) = stack.pop() {
             if !seen.insert(cid) {
                 continue;
@@ -532,7 +532,7 @@ impl<'a> BodyTyper<'a> {
     fn app_defines(&self, self_ty: Option<&Ty>, method: &Symbol) -> bool {
         let Some(Ty::Class { id, .. }) = self_ty else { return false };
         let mut stack = vec![id];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(cid) = stack.pop() {
             if !seen.insert(cid) {
                 continue;
@@ -673,7 +673,7 @@ impl<'a> BodyTyper<'a> {
         changed
     }
 
-    pub(crate) fn with_materialized_associations(mut self, names: &'a std::collections::HashSet<Symbol>) -> Self {
+    pub(crate) fn with_materialized_associations(mut self, names: &'a crate::det::HashSet<Symbol>) -> Self {
         self.materialized_associations = Some(names);
         self
     }
@@ -683,7 +683,7 @@ impl<'a> BodyTyper<'a> {
         self
     }
 
-    pub(crate) fn with_i18n(mut self, catalog: &'a crate::i18n::Catalog, helper_modules: &'a std::collections::HashSet<ClassId>) -> Self {
+    pub(crate) fn with_i18n(mut self, catalog: &'a crate::i18n::Catalog, helper_modules: &'a crate::det::HashSet<ClassId>) -> Self {
         self.i18n = Some(catalog);
         self.helper_modules = Some(helper_modules);
         self
@@ -718,7 +718,7 @@ impl<'a> BodyTyper<'a> {
     /// type as Bool instead of failing dispatch on `Str`.
     pub fn with_inquirers(
         mut self,
-        inquirers: &'a std::collections::HashSet<Symbol>,
+        inquirers: &'a crate::det::HashSet<Symbol>,
     ) -> Self {
         self.inquirers = Some(inquirers);
         self
@@ -1049,7 +1049,7 @@ impl<'a> BodyTyper<'a> {
     fn self_is_module_instance(&self, ctx: &Ctx) -> bool {
         if ctx.class_side { return false; }
         let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return false };
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let mut current = self.classes().get(id).and_then(|c| c.parent.clone());
         while let Some(id) = current {
             if matches!(id.0.as_str(), "Module" | "Class") { return true; }
@@ -1061,7 +1061,7 @@ impl<'a> BodyTyper<'a> {
 
     // An app class over Hash/Array/String/Set answers `include?` as membership, not Module#include?.
     fn descends_from_collection(&self, id: &ClassId) -> bool {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let mut current = self.classes().get(id).and_then(|c| c.parent.clone());
         while let Some(id) = current {
             if matches!(id.0.as_str(), "Hash" | "Array" | "String" | "Set") { return true; }
@@ -2632,7 +2632,7 @@ impl<'a> BodyTyper<'a> {
                 // reads `user` as `User` in the then-branch, `User?`
                 // in the else-branch. (Narrowing before seeding would
                 // find no binding to narrow and leave the nil arm.)
-                let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::new();
+                let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::default();
                 collect_var_assignments_into(cond, &mut cond_assigns);
                 let mut base = ctx.clone();
                 for (k, v) in &cond_assigns {
@@ -2735,7 +2735,7 @@ impl<'a> BodyTyper<'a> {
                 // `strings.Join`). Recording the index lets the
                 // refinement retro-stamp the seed. A later reassignment
                 // of the name retires its entry.
-                let mut array_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::new();
+                let mut array_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::default();
                 // Statement index + accumulated type of each live
                 // nil-seeded LOCAL (`size = nil`). The scalar analog of
                 // `array_seed_idx`, and the same decl-site hazard: a
@@ -2754,14 +2754,14 @@ impl<'a> BodyTyper<'a> {
                 // path (`emit/go/expr.rs`, LValue::Var), and ivars emit
                 // through package vars / struct fields that never take a
                 // seed-derived decl type.
-                let mut nil_seed: HashMap<Symbol, (usize, Ty)> = HashMap::new();
+                let mut nil_seed: HashMap<Symbol, (usize, Ty)> = HashMap::default();
                 // Statement index of each live empty-hash seed (`attrs =
                 // {}`) — the Hash counterpart of `array_seed_idx`.
-                let mut hash_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::new();
+                let mut hash_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::default();
                 // Lambdas assigned to locals in this sequence. Later
                 // `.call` sites refine their parameter types and the
                 // assignment is retyped. A reassignment drops the entry.
-                let mut lambda_locals: HashMap<Symbol, lambda_local::Stored> = HashMap::new();
+                let mut lambda_locals: HashMap<Symbol, lambda_local::Stored> = HashMap::default();
                 for i in 0..exprs.len() {
                     let read_structurally_later = match &*exprs[i].node {
                         ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
@@ -2825,9 +2825,9 @@ impl<'a> BodyTyper<'a> {
                             | ExprNode::BeginRescue { .. }
                             | ExprNode::BoolOp { .. }
                     );
-                    let mut unknown_join = std::collections::HashSet::new();
+                    let mut unknown_join = crate::det::HashSet::default();
                     if joins {
-                        let mut flowed = HashMap::new();
+                        let mut flowed = HashMap::default();
                         let _ = flow_locals(&exprs[i], &local_ctx.local_bindings, &mut flowed, &mut unknown_join);
                     }
                     for name in retired {
@@ -2916,13 +2916,13 @@ impl<'a> BodyTyper<'a> {
                     // scripts/campfire-db-differential runs statement by
                     // statement (`user = User.find(id)` in a begin,
                     // `user.messages.create!` below).
-                    let mut flow_exported = std::collections::HashSet::new();
+                    let mut flow_exported = crate::det::HashSet::default();
                     if matches!(&*e.node,
                         ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. }
                             | ExprNode::BeginRescue { .. } | ExprNode::BoolOp { .. })
                     {
-                        let mut flowed = HashMap::new();
-                        let mut unknown = std::collections::HashSet::new();
+                        let mut flowed = HashMap::default();
+                        let mut unknown = crate::det::HashSet::default();
                         if flow_locals(e, &local_ctx.local_bindings, &mut flowed, &mut unknown) {
                             for (name, ty) in flowed {
                                 if !unknown.contains(&name) {
@@ -3196,7 +3196,7 @@ impl<'a> BodyTyper<'a> {
                     if let ExprNode::If { cond, .. } | ExprNode::While { cond, .. } =
                         &*e.node
                     {
-                        let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::new();
+                        let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::default();
                         collect_var_assignments_into(cond, &mut cond_assigns);
                         for (name, ty) in cond_assigns {
                             if ty.is_open() || flow_exported.contains(&name) {
@@ -3983,7 +3983,7 @@ fn flow_locals(
     expr: &Expr,
     bound: &HashMap<Symbol, Ty>,
     flowed: &mut HashMap<Symbol, Ty>,
-    unknown: &mut std::collections::HashSet<Symbol>,
+    unknown: &mut crate::det::HashSet<Symbol>,
 ) -> bool {
     // Each path is its writes plus what its condition narrowed. A
     // narrowing stands in for the entry type on a path that does not
@@ -3994,7 +3994,7 @@ fn flow_locals(
         let mut names: Vec<&Symbol> = paths.iter().flat_map(|(w, _)| w.keys()).collect();
         names.sort();
         names.dedup();
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         for name in names {
             let mut tys = paths.iter().map(|(writes, narrowed)| {
                 writes.get(name).or_else(|| narrowed.get(name)).or_else(|| bound.get(name))
@@ -4005,7 +4005,7 @@ fn flow_locals(
         }
         (!paths.is_empty()).then_some(out)
     }
-    fn unmodeled(expr: &Expr, unknown: &mut std::collections::HashSet<Symbol>) {
+    fn unmodeled(expr: &Expr, unknown: &mut crate::det::HashSet<Symbol>) {
         let mut names = Vec::new();
         match &*expr.node {
             ExprNode::Assign { target: LValue::Var { name, .. }, .. }
@@ -4064,7 +4064,7 @@ fn flow_locals(
                     Some(p) => narrowing::narrow_locals(p, then_side, &|name| {
                         flowed.get(name).or_else(|| bound.get(name)).cloned()
                     }),
-                    None => HashMap::new(),
+                    None => HashMap::default(),
                 };
                 // A name written before the branch (in the condition
                 // itself: `return if !(story = find_story)`) holds what
@@ -4088,13 +4088,13 @@ fn flow_locals(
                 let mut path = flowed.clone();
                 let completes = arm.guard.as_ref().is_none_or(|g| flow(g, &mut path, unknown))
                     && flow(&arm.body, &mut path, unknown);
-                if completes { paths.push((path, HashMap::new())); }
+                if completes { paths.push((path, HashMap::default())); }
             }
             // No catch-all arm: no arm may match, and the value is nil.
             let exhaustive = arms.iter().any(|a| {
                 matches!(a.pattern, crate::expr::Pattern::Wildcard) && a.guard.is_none()
             });
-            if !exhaustive { paths.push((flowed.clone(), HashMap::new())); }
+            if !exhaustive { paths.push((flowed.clone(), HashMap::default())); }
             match join(paths, bound) {
                 Some(joined) => { *flowed = joined; true }
                 None => false,
@@ -4107,14 +4107,14 @@ fn flow_locals(
             if !flow(cond, flowed, unknown) { return false; }
             let mut path = flowed.clone();
             flow(body, &mut path, unknown);
-            *flowed = join(vec![(flowed.clone(), HashMap::new()), (path, HashMap::new())], bound).unwrap_or_default();
+            *flowed = join(vec![(flowed.clone(), HashMap::default()), (path, HashMap::default())], bound).unwrap_or_default();
             true
         }
         ExprNode::BoolOp { left, right, .. } => {
             if !flow(left, flowed, unknown) { return false; }
             let mut path = flowed.clone();
-            let mut paths = vec![(flowed.clone(), HashMap::new())];
-            if flow(right, &mut path, unknown) { paths.push((path, HashMap::new())); }
+            let mut paths = vec![(flowed.clone(), HashMap::default())];
+            if flow(right, &mut path, unknown) { paths.push((path, HashMap::default())); }
             *flowed = join(paths, bound).unwrap_or_default();
             true
         }
@@ -4128,14 +4128,14 @@ fn flow_locals(
                     completes = flow(eb, &mut body_path, unknown);
                 }
             }
-            let entry = join(vec![(flowed.clone(), HashMap::new()), (body_path.clone(), HashMap::new())], bound)
+            let entry = join(vec![(flowed.clone(), HashMap::default()), (body_path.clone(), HashMap::default())], bound)
                 .unwrap_or_default();
             let mut paths = Vec::new();
-            if completes { paths.push((body_path, HashMap::new())); }
+            if completes { paths.push((body_path, HashMap::default())); }
             for rescue in rescues {
                 unknown.extend(rescue.binding.iter().cloned());
                 let mut path = entry.clone();
-                if flow(&rescue.body, &mut path, unknown) { paths.push((path, HashMap::new())); }
+                if flow(&rescue.body, &mut path, unknown) { paths.push((path, HashMap::default())); }
             }
             let joined = join(paths, bound);
             if let Some(ensure) = ensure {
@@ -4403,7 +4403,7 @@ mod tests {
     }
 
     fn empty_classes() -> HashMap<ClassId, ClassInfo> {
-        HashMap::new()
+        HashMap::default()
     }
 
     fn ctx_with_local(name: &str, ty: Ty) -> Ctx {
@@ -5810,7 +5810,7 @@ mod tests {
 
     /// The ivar's harvested type after `stmts`, run in the order given.
     fn harvested_ivar(name: &str, stmts: Vec<Expr>) -> Ty {
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         crate::analyze::extract_ivar_assignments(&synth(ExprNode::Seq { exprs: stmts }), &mut out);
         out.remove(&Symbol::from(name)).expect("ivar harvested")
     }
@@ -6340,7 +6340,7 @@ impl BodyTyper<'_> {
     fn has_declared_constructor(&self, ty: Option<&Ty>) -> bool {
         let Some(Ty::Class { id, .. }) = ty else { return false };
         let mut next = Some(id);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(id) = next {
             if !seen.insert(id) { break; }
             let Some(class) = self.classes().get(id) else { break };

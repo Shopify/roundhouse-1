@@ -16,7 +16,8 @@
 //! with a `format` block, `template_name:` / `template_path:`, an action
 //! with no template and no `body:`, and a `default` given a Proc.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;

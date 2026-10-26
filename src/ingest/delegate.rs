@@ -52,7 +52,7 @@ use crate::expr::{Expr, ExprNode};
 /// declarations on its own classes — so what reaches here is the
 /// general shape only.
 pub fn lower_delegates(app: &mut crate::App) {
-    let mut model_concerns = std::collections::HashSet::new();
+    let mut model_concerns = crate::det::HashSet::default();
     let mut pending: Vec<_> = app
         .models
         .iter()
@@ -76,7 +76,7 @@ pub fn lower_delegates(app: &mut crate::App) {
 
 fn lower_library_class_delegates(
     app: &mut crate::App,
-    model_concerns: &std::collections::HashSet<crate::ident::ClassId>,
+    model_concerns: &crate::det::HashSet<crate::ident::ClassId>,
 ) {
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
@@ -145,9 +145,9 @@ pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef>
         &lc.methods,
         &mut lc.unknown_calls,
         &[],
-        &std::collections::HashSet::new(),
+        &crate::det::HashSet::default(),
         None,
-        &std::collections::HashSet::new(),
+        &crate::det::HashSet::default(),
         &[],
     )
 }
@@ -157,9 +157,9 @@ pub(super) fn expand_delegates(
     methods: &[MethodDef],
     unknown_calls: &mut Vec<Expr>,
     additional_method_bodies: &[Expr],
-    blocked_names: &std::collections::HashSet<String>,
-    supported_target_methods: Option<&std::collections::HashSet<(String, String, usize)>>,
-    method_targets: &std::collections::HashSet<String>,
+    blocked_names: &crate::det::HashSet<String>,
+    supported_target_methods: Option<&crate::det::HashSet<(String, String, usize)>>,
+    method_targets: &crate::det::HashSet<String>,
     sources: &[crate::span::SourceFile],
 ) -> Vec<MethodDef> {
     let called_with_args = names_called_with_arguments(methods, additional_method_bodies);
@@ -312,7 +312,7 @@ fn synthesized_source(
         })
     };
     let mut body = String::new();
-    let mut generated_names = std::collections::HashSet::new();
+    let mut generated_names = crate::det::HashSet::default();
     for d in delegates.iter().rev() {
         // A later explicit definition wins, while a delegate declaration
         // that follows an earlier definition replaces it just as Rails does.
@@ -382,8 +382,8 @@ mod tests {
 
     fn take_delegate_decls(lc: &mut LibraryClass) -> Vec<Delegation> {
         let called_with_args = names_called_with_arguments(&lc.methods, &[]);
-        let blocked_names = std::collections::HashSet::new();
-        let no_targets = std::collections::HashSet::new();
+        let blocked_names = crate::det::HashSet::default();
+        let no_targets = crate::det::HashSet::default();
         let mut eligibility =
             DelegateEligibility::new(&lc.methods, &called_with_args, &blocked_names, None, &no_targets, &[]);
         take_delegate_decls_from_calls(&mut lc.unknown_calls, &mut eligibility)
@@ -560,8 +560,8 @@ mod tests {
             .map(|method| method.body.clone())
             .collect();
         let called_with_args = names_called_with_arguments(&model.methods, &concern_bodies);
-        let blocked_names = std::collections::HashSet::new();
-        let no_targets = std::collections::HashSet::new();
+        let blocked_names = crate::det::HashSet::default();
+        let no_targets = crate::det::HashSet::default();
         let mut eligibility =
             DelegateEligibility::new(&model.methods, &called_with_args, &blocked_names, None, &no_targets, &[]);
         let delegates = take_delegate_decls_from_calls(&mut model.unknown_calls, &mut eligibility);
@@ -581,7 +581,7 @@ mod tests {
         let mut model = library_class("class Post\n  delegate :title, to: :leaf\nend\n");
         let called_with_args = names_called_with_arguments(&model.methods, &[]);
         let blocked_names = ["title".to_string()].into_iter().collect();
-        let no_targets = std::collections::HashSet::new();
+        let no_targets = crate::det::HashSet::default();
         let mut eligibility =
             DelegateEligibility::new(&model.methods, &called_with_args, &blocked_names, None, &no_targets, &[]);
         let delegates = take_delegate_decls_from_calls(&mut model.unknown_calls, &mut eligibility);

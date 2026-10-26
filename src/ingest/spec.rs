@@ -35,7 +35,7 @@
 //!   `be_an_instance_of`, `be_<predicate>`, `have_<predicate>` and
 //!   `include` of plain values.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use ruby_prism::Node;
 
@@ -64,7 +64,7 @@ pub fn ingest_spec_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
         source,
         prefix: file_prefix(file),
         modules: Vec::new(),
-        module_names: HashMap::new(),
+        module_names: HashMap::default(),
     };
     let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
     for stmt in program.statements().body().iter() {
@@ -566,7 +566,7 @@ impl Reader<'_> {
             .then(|| Expr::new(Span::synthetic(), ExprNode::Seq { exprs: setup_stmts }));
 
         let mut tests = Vec::new();
-        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut seen: HashMap<String, usize> = HashMap::default();
         for (desc, node, body) in examples {
             let body = match body {
                 ExampleBody::Pending => continue,

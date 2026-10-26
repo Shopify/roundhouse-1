@@ -7,7 +7,8 @@
 use crate::ingest::prism_api::PrismLocation;
 mod hoist;
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::hash_map::Entry;
+use crate::det::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
@@ -906,7 +907,7 @@ fn parenthesized_factory_receivers(text: &str) -> HashSet<u32> {
         }
     }
     let parsed = ruby_prism::parse(text.as_bytes());
-    let mut receivers = Receivers(HashSet::new());
+    let mut receivers = Receivers(HashSet::default());
     if parsed.errors().next().is_none() {
         ruby_prism::Visit::visit(&mut receivers, &parsed.node());
     }
@@ -927,10 +928,10 @@ fn answer_file(
     {
         parenthesized_factory_receivers(&source.text)
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     // Positions a whole-path reference filled, which an exact one replaces.
-    let mut path_keys = HashSet::new();
+    let mut path_keys = HashSet::default();
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;
@@ -1287,7 +1288,7 @@ end
         use crate::{Expr, ExprNode};
         let sources = vec![source("app/services/first.rb", "First")];
         let resolver = Arc::new(ConstResolver::from_app_sources(&sources));
-        let classes = HashMap::from([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
+        let classes = HashMap::from_iter([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
         let typer = BodyTyper::new(&classes).with_const_resolver(resolver);
         let make = |file| {
             Expr::new(

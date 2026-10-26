@@ -382,7 +382,7 @@ impl Lockfile {
 
     /// Git specs in the requested dependency closure, dependencies first.
     pub fn git_specs_in_closure(&self, roots: &[&str]) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let mut out = Vec::new();
         for root in roots {
             let mut pending = vec![(*root, false)];
@@ -1255,7 +1255,7 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
             }
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     out.retain(|diagnostic| seen.insert((
         diagnostic.span.file.0, diagnostic.span.start, diagnostic.span.end, diagnostic.code(),
     )));

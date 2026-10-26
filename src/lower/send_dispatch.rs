@@ -46,7 +46,8 @@
 //! `lower::POST_ANALYZE_PASS_ORDER`) grounds into the Duration runtime
 //! unconditionally.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -109,7 +110,7 @@ fn apply_param_selector_dispatch(
     // while every call passes a Symbol literal there, None once one
     // does not.
     type Key = (ClassId, Symbol, bool);
-    let mut targets: HashMap<Key, usize> = HashMap::new();
+    let mut targets: HashMap<Key, usize> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             let positional = m.params.iter().filter(|p| !p.keyword && !p.rest && !p.forwarding).count();
@@ -141,8 +142,8 @@ fn apply_param_selector_dispatch(
         }
         found
     };
-    let mut seen: HashMap<Key, Vec<Option<Vec<String>>>> = HashMap::new();
-    let mut poisoned: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut seen: HashMap<Key, Vec<Option<Vec<String>>>> = HashMap::default();
+    let mut poisoned: crate::det::HashSet<Key> = crate::det::HashSet::default();
     let record = |key: &Key, args: &[Expr], seen: &mut HashMap<Key, Vec<Option<Vec<String>>>>| {
         let Some(&positional) = targets.get(key) else { return };
         let slots = seen.entry(key.clone()).or_insert_with(|| vec![Some(Vec::new()); positional]);
@@ -233,7 +234,7 @@ fn apply_param_selector_dispatch(
             }
             let bindings: Vec<IterBinding<'_>> =
                 owned.iter().map(|(n, e)| IterBinding { name: n, elems: e }).collect();
-            rewrite(&mut m.body, &HashMap::new(), providers, &HashMap::new(), &bindings, registry, diags);
+            rewrite(&mut m.body, &HashMap::default(), providers, &HashMap::default(), &bindings, registry, diags);
         }
     }
 }
@@ -303,7 +304,7 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
 /// non-literal, passing it as an argument, an un-allowlisted method
 /// call) poisons the entry — the set can no longer be proven complete.
 fn collect_var_element_sets(body: &Expr) -> HashMap<Symbol, Vec<Expr>> {
-    let mut sets: HashMap<Symbol, Vec<Expr>> = HashMap::new();
+    let mut sets: HashMap<Symbol, Vec<Expr>> = HashMap::default();
     let mut poisoned: BTreeSet<Symbol> = BTreeSet::new();
     walk_var_uses(body, &mut sets, &mut poisoned);
     for name in poisoned {
@@ -800,7 +801,7 @@ fn constant_key(path: &[Symbol]) -> String {
 }
 
 fn collect_hash_providers(app: &App) -> HashProviders {
-    let mut by_class_method = HashMap::new();
+    let mut by_class_method = HashMap::default();
     let mut register = |class: &str, consts: &HashMap<String, &Expr>, name: &Symbol, body: &Expr| {
         if let Some(keysets) = hash_return_key_sets(body, consts) {
             by_class_method.insert((Symbol::from(class), name.clone()), keysets);
@@ -827,7 +828,7 @@ fn collect_hash_providers(app: &App) -> HashProviders {
             }
         }
     }
-    let mut by_method_name: HashMap<Symbol, Option<(Symbol, Symbol)>> = HashMap::new();
+    let mut by_method_name: HashMap<Symbol, Option<(Symbol, Symbol)>> = HashMap::default();
     for key in by_class_method.keys() {
         by_method_name
             .entry(key.1.clone())
@@ -849,8 +850,8 @@ fn defined_method_name_counts(app: &App) -> HashMap<Symbol, usize> {
     // is included into three controllers and a model — four copies, one
     // definition, one meaning — and counting copies refused every bare
     // call to it. A synthesized method (no span) counts on its own.
-    let mut sites: HashMap<Symbol, std::collections::HashSet<Option<Span>>> = HashMap::new();
-    let mut synthetic: HashMap<Symbol, usize> = HashMap::new();
+    let mut sites: HashMap<Symbol, crate::det::HashSet<Option<Span>>> = HashMap::default();
+    let mut synthetic: HashMap<Symbol, usize> = HashMap::default();
     {
         let mut bump = |n: &Symbol, span: Span| {
             if span.is_synthetic() {
@@ -898,7 +899,7 @@ fn collect_provider_var_origins(
     providers: &HashProviders,
     defined: &HashMap<Symbol, usize>,
 ) -> HashMap<Symbol, (Symbol, Symbol)> {
-    let mut origins: HashMap<Symbol, (Symbol, Symbol)> = HashMap::new();
+    let mut origins: HashMap<Symbol, (Symbol, Symbol)> = HashMap::default();
     let mut poisoned: BTreeSet<Symbol> = BTreeSet::new();
     walk_provider_origins(body, providers, defined, &mut origins, &mut poisoned);
     for name in poisoned {
@@ -984,7 +985,7 @@ fn hash_return_key_sets(
             _ => lit,
         };
         let ExprNode::Hash { entries, .. } = &*lit.node else { return None };
-        let mut this: HashMap<Symbol, BTreeSet<String>> = HashMap::new();
+        let mut this: HashMap<Symbol, BTreeSet<String>> = HashMap::default();
         for (k, v) in entries {
             let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
                 continue;

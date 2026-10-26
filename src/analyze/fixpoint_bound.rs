@@ -257,7 +257,7 @@ mod tests {
             crate::span::Span::synthetic(),
             crate::expr::ExprNode::Assign { target: crate::expr::LValue::Ivar { name: Symbol::from("h") }, value },
         );
-        let mut ivars = std::collections::HashMap::new();
+        let mut ivars = crate::det::HashMap::default();
         super::super::extract_ivar_assignments(&write, &mut ivars);
         assert_eq!(measure(&ivars[&Symbol::from("h")]).0, MAX_DEPTH);
 
@@ -310,7 +310,7 @@ mod tests {
                 crate::span::Span::synthetic(),
                 crate::expr::ExprNode::Seq { exprs: order.iter().map(|&i| write(writers[i].clone())).collect() },
             );
-            let mut ivars = std::collections::HashMap::new();
+            let mut ivars = crate::det::HashMap::default();
             super::super::extract_ivar_assignments(&body, &mut ivars);
             ivars.remove(&Symbol::from("h")).unwrap()
         };
@@ -327,7 +327,7 @@ mod tests {
         let key = (ClassId(Symbol::from("C")), Symbol::from("m"), crate::dialect::MethodReceiver::Instance);
         let fold = |order: [usize; 3]| {
             let writers = bound_order_writers();
-            let mut rows = std::collections::HashMap::new();
+            let mut rows = crate::det::HashMap::default();
             let observations = order.iter().map(|&i| (key.clone(), vec![writers[i].clone()])).collect();
             super::super::fold_param_observations(&mut rows, observations);
             rows.remove(&key).unwrap()

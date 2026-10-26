@@ -37,7 +37,7 @@ use crate::ty::Ty;
 
 // A model remains in the map for the unsupported-call diagnostic even
 // when its constructor declares an initialization callback not yet lowered.
-type ModelColumns = std::collections::HashMap<ClassId, Option<std::collections::HashMap<Symbol, Ty>>>;
+type ModelColumns = crate::det::HashMap<ClassId, Option<crate::det::HashMap<Symbol, Ty>>>;
 
 pub fn apply_first_or_create_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
     let models = app.models.iter().map(|model| {

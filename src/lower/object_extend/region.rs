@@ -9,7 +9,7 @@
 //! Hoisting a module local and accepting an `extend` both read this
 //! walk. They do not walk the tree again.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use super::{instance_extend, plain_new_class, var_name};
 use crate::expr::{Expr, ExprNode, LValue, MatchPattern, Pattern};
@@ -74,7 +74,7 @@ struct Builder<'a> {
 pub(super) fn survey(body: &Expr) -> Survey<'_> {
     let mut builder = Builder {
         sites: Vec::new(),
-        rebinds: HashSet::new(),
+        rebinds: HashSet::default(),
     };
     let mut events = Vec::new();
     builder.statements(body, false, &mut events);
@@ -91,7 +91,7 @@ pub(super) fn survey(body: &Expr) -> Survey<'_> {
 pub(super) fn effect_before_extend(expr: &Expr) -> bool {
     let mut builder = Builder {
         sites: Vec::new(),
-        rebinds: HashSet::new(),
+        rebinds: HashSet::default(),
     };
     let mut events = Vec::new();
     let mut effect = false;

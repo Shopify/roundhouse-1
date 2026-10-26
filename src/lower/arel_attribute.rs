@@ -54,7 +54,7 @@ fn rewrite(expr: &mut Expr) {
 }
 
 // The receiver's stamped type is not enough: a source gem's module body has no typed `self`, so `t = arel_table` stays untyped
-fn rewrite_with(expr: &mut Expr, tables: &std::collections::HashSet<Symbol>) {
+fn rewrite_with(expr: &mut Expr, tables: &crate::det::HashSet<Symbol>) {
     expr.node.for_each_child_mut(&mut |c| rewrite_with(c, tables));
     if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node
         && method.as_str() == "[]"
@@ -73,8 +73,8 @@ fn is_arel_table_call(e: &Expr) -> bool {
 }
 
 /// Locals whose every write in `body` is `arel_table`.
-fn arel_table_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
-    fn walk(e: &Expr, tables: &mut std::collections::HashSet<Symbol>, other: &mut std::collections::HashSet<Symbol>) {
+fn arel_table_locals(body: &Expr) -> crate::det::HashSet<Symbol> {
+    fn walk(e: &Expr, tables: &mut crate::det::HashSet<Symbol>, other: &mut crate::det::HashSet<Symbol>) {
         let write = match &*e.node {
             ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } | ExprNode::Let { name, value, .. } => Some((name, value)),
             _ => None,
@@ -84,8 +84,8 @@ fn arel_table_locals(body: &Expr) -> std::collections::HashSet<Symbol> {
         }
         e.node.for_each_child(&mut |c| walk(c, tables, other));
     }
-    let mut tables = std::collections::HashSet::new();
-    let mut other = std::collections::HashSet::new();
+    let mut tables = crate::det::HashSet::default();
+    let mut other = crate::det::HashSet::default();
     walk(body, &mut tables, &mut other);
     tables.retain(|n| !other.contains(n));
     tables

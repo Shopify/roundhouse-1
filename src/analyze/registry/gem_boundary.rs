@@ -19,7 +19,7 @@
 //! * an app class that inherits a gem class keeps the gradual escape it
 //!   always had (see `ClassInfo::gem_boundary`).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::ident::{ClassId, Symbol};
@@ -75,8 +75,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
 
     // First pass: build every ClassInfo with resolved types and the
     // instance-method surface of each declared mixin.
-    let mut built: HashMap<ClassId, ClassInfo> = HashMap::new();
-    let mut open: HashSet<ClassId> = HashSet::new();
+    let mut built: HashMap<ClassId, ClassInfo> = HashMap::default();
+    let mut open: HashSet<ClassId> = HashSet::default();
     for id in &fresh {
         let gem = &declared[*id];
         let scope = id.0.as_str();

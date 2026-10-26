@@ -35,7 +35,7 @@
 //! as it was, ledgered, together with every contract it would inherit a
 //! `call` from or hand one to; one without a schema gets nothing.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{LibraryClass, LibraryClassOrigin};
@@ -183,7 +183,7 @@ pub(super) fn lower_dry_validation(
 ) -> super::IngestResult<()> {
     let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
     // Each contract and its contract parent (None under the gem's class).
-    let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+    let mut parent_of: HashMap<String, Option<String>> = HashMap::default();
     loop {
         let before = parent_of.len();
         for lc in &app.library_classes {
@@ -219,7 +219,7 @@ pub(super) fn lower_dry_validation(
         .chain(names.iter().cloned())
         .collect();
     let types_modules = super::dry_types::types_modules(sources);
-    let no_structs: HashMap<String, Option<String>> = HashMap::new();
+    let no_structs: HashMap<String, Option<String>> = HashMap::default();
     // A type is named by a class or by a constant holding one.
     let type_names: HashSet<String> = names.iter().cloned().chain(constants.keys().cloned()).collect();
     let parents: HashMap<String, String> = app
@@ -241,8 +241,8 @@ pub(super) fn lower_dry_validation(
     };
     // `Dry::Schema.Params do ... end` constants, read where they stand; one
     // naming another once that one is read.
-    let mut schemas: HashMap<String, Result<Schema, String>> = HashMap::new();
-    let mut schemas_read: HashMap<String, Schema> = HashMap::new();
+    let mut schemas: HashMap<String, Result<Schema, String>> = HashMap::default();
+    let mut schemas_read: HashMap<String, Schema> = HashMap::default();
     loop {
         let before = schemas_read.len();
         for (full, value) in &constants {
@@ -278,12 +278,12 @@ pub(super) fn lower_dry_validation(
 
     // Each contract's own schema, or why it is not read. Round by round:
     // a contract naming another's `.schema` reads once that one has.
-    let mut own: HashMap<String, Contract> = HashMap::new();
-    let mut refused: HashMap<String, String> = HashMap::new();
+    let mut own: HashMap<String, Contract> = HashMap::default();
+    let mut refused: HashMap<String, String> = HashMap::default();
     let mut schemas_all = schemas_read.clone();
     let mut pending: Vec<String> = parent_of.keys().cloned().collect();
     pending.sort();
-    let mut last: HashMap<String, String> = HashMap::new();
+    let mut last: HashMap<String, String> = HashMap::default();
     loop {
         let before = pending.len();
         let mut still = Vec::new();
@@ -331,7 +331,7 @@ pub(super) fn lower_dry_validation(
     // a lowered child would be its parent. The topmost contract with a
     // schema above a refusal goes with it, and all below that.
     let has_schema = |name: &str| chain_of(name).iter().any(|n| own.get(n).is_some_and(|c| c.schema.is_some()));
-    let mut refused_tops: HashSet<String> = HashSet::new();
+    let mut refused_tops: HashSet<String> = HashSet::default();
     for name in refused.keys() {
         let chain = chain_of(name);
         let top = chain.iter().find(|n| has_schema(n)).cloned().unwrap_or_else(|| name.clone());
@@ -350,7 +350,7 @@ pub(super) fn lower_dry_validation(
     }
 
     let mut generated: Vec<(String, String)> = Vec::new();
-    let mut used: HashSet<&'static str> = HashSet::new();
+    let mut used: HashSet<&'static str> = HashSet::default();
     for name in parent_of.keys() {
         if !lowered(name) || !has_schema(name) {
             continue;
@@ -385,7 +385,7 @@ pub(super) fn lower_dry_validation(
     }
 
     // Build every class before committing to any.
-    let mut built: HashMap<String, Vec<crate::dialect::MethodDef>> = HashMap::new();
+    let mut built: HashMap<String, Vec<crate::dialect::MethodDef>> = HashMap::default();
     for (name, source) in &generated {
         if let Some(methods) = parse_methods(name, source) {
             built.insert(name.clone(), methods);
@@ -1220,7 +1220,7 @@ fn read_configs(sources: &[crate::span::SourceFile]) -> HashMap<String, Config> 
             }
         }
     }
-    let mut finder = Finder { nesting: Vec::new(), found: HashMap::new() };
+    let mut finder = Finder { nesting: Vec::new(), found: HashMap::default() };
     for source in sources.iter().filter(|s| s.text.contains("config.")) {
         let parsed = super::prism::parse_silent(source.text.as_bytes());
         ruby_prism::Visit::visit(&mut finder, &parsed.node());
@@ -1294,7 +1294,7 @@ impl Messages {
     ) -> Messages {
         let namespace = namespace.unwrap_or_else(|| default_namespace.to_string());
         let locale = config.default_locale.clone().unwrap_or_else(|| "en".into());
-        let mut data = HashMap::new();
+        let mut data = HashMap::default();
         // dry-schema's own file under any other namespace than its own.
         for (k, v) in flat_yaml(DRY_SCHEMA_ERRORS) {
             data.insert(k.replace("dry_schema", &namespace), v);
@@ -1442,7 +1442,7 @@ impl Gen<'_> {
         let pick = |arg_type: &str, val_type: &str| -> String {
             match self.messages.template(predicate, path, arg_type, val_type) {
                 Some(t) => {
-                    let mut tokens: HashMap<String, String> = HashMap::new();
+                    let mut tokens: HashMap<String, String> = HashMap::default();
                     for (name, e) in args {
                         let src = crate::emit::ruby::emit_expr(e);
                         if *name == "type" {
@@ -1876,7 +1876,7 @@ fn contract_source(
 }
 
 fn schema_source(owner: &str, schema: &Schema, messages: &Messages, used: &mut HashSet<&'static str>) -> String {
-    class_source(owner, schema, &[], &HashSet::new(), messages, "::Dry::Schema::Result", used)
+    class_source(owner, schema, &[], &HashSet::default(), messages, "::Dry::Schema::Result", used)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -305,7 +305,7 @@ pub(crate) fn split_key(args: &[Expr]) -> Option<(Expr, Vec<Expr>, Vec<Expr>)> {
 }
 
 thread_local! {
-    static PLANNED: std::cell::RefCell<Option<std::collections::HashMap<PlanKey, Result<Vec<(Variant, Plan)>, String>>>> =
+    static PLANNED: std::cell::RefCell<Option<crate::det::HashMap<PlanKey, Result<Vec<(Variant, Plan)>, String>>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -629,7 +629,7 @@ fn parse_args(args: &[Expr], view: Option<&str>, template: bool) -> Result<Call,
 
 thread_local! {
     /// The sites this lowering wrote to the table, by their records, and the records in order.
-    static TABLE: std::cell::RefCell<(std::collections::HashMap<u64, Vec<usize>>, Vec<TableSite>)> =
+    static TABLE: std::cell::RefCell<(crate::det::HashMap<u64, Vec<usize>>, Vec<TableSite>)> =
         std::cell::RefCell::new(Default::default());
 }
 
@@ -645,7 +645,7 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
     TABLE.with(|t| *t.borrow_mut() = Default::default());
     RUNTIME_SITES.with(|r| *r.borrow_mut() = Default::default());
     let catalog = app.i18n.or_rails_default().clone();
-    let controllers: std::collections::HashMap<crate::ident::ClassId, String> = app
+    let controllers: crate::det::HashMap<crate::ident::ClassId, String> = app
         .controllers
         .iter()
         .filter(|c| translates(app, c))
@@ -658,7 +658,7 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
         rewrite(body, &catalog, Site::Other)
     });
     // An `app/helpers` module's instance methods run in the view: their bare `t` is ActionView's, with no template for a lazy key.
-    let helpers: std::collections::HashSet<crate::ident::ClassId> = app.helper_method_index.values().cloned().collect();
+    let helpers: crate::det::HashSet<crate::ident::ClassId> = app.helper_method_index.values().cloned().collect();
     for lc in app.library_classes.iter_mut().filter(|lc| helpers.contains(&lc.name)) {
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
             for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
@@ -712,7 +712,7 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
 /// controller has no `t`) and neither it nor an app ancestor defines its
 /// own `t` / `translate`.
 fn translates(app: &App, controller: &crate::dialect::Controller) -> bool {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::Controller> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::Controller> =
         app.controllers.iter().map(|c| (c.name.0.as_str(), c)).collect();
     let mut current = Some(controller);
     for _ in 0..32 {
@@ -1169,12 +1169,12 @@ impl TableSite {
         // Not a block per locale: one that answers as the default locale's does is left to the runtime's fallback to it.
         let Some(default) = self.locales.first().map(|(l, _)| l.as_str()) else { return records };
         let locale_of = |key: &str| key.split('\u{1c}').nth(1).unwrap_or("").to_string();
-        let mut blocks: std::collections::HashMap<String, Vec<(String, &Vec<String>)>> = std::collections::HashMap::new();
+        let mut blocks: crate::det::HashMap<String, Vec<(String, &Vec<String>)>> = crate::det::HashMap::default();
         for (key, entry) in &records {
             let rest = key.splitn(3, '\u{1c}').nth(2).unwrap_or("").to_string();
             blocks.entry(locale_of(key)).or_default().push((rest, entry));
         }
-        let same: std::collections::HashSet<String> = blocks
+        let same: crate::det::HashSet<String> = blocks
             .iter()
             .filter(|(l, b)| l.as_str() != default && blocks.get(default) == Some(*b))
             .map(|(l, _)| l.clone())

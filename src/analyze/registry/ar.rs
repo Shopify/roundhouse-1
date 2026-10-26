@@ -2,7 +2,7 @@
 //! the `ActiveRecord::AdapterInterface` contract, and the `Arel` node
 //! family. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::ident::{ClassId, Symbol};

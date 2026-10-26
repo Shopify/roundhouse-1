@@ -10,7 +10,8 @@
 //! Names that do not fold — `instance_variable_set(params[:name], x)`,
 //! interpolation of a runtime local — stay unbound. That is fail-closed.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
@@ -387,7 +388,7 @@ fn narrow_to_named_model(
 pub(crate) fn models_by_conventional_ivar<'a>(
     models: impl Iterator<Item = &'a ClassId>,
 ) -> HashMap<Symbol, ClassId> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for id in models {
         let leaf = naming::demodulize(id.0.as_str());
         let key = Symbol::from(naming::snake_case(leaf).as_str());

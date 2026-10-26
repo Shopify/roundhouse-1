@@ -35,7 +35,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-pub(super) fn with_param_types<F, R>(types: std::collections::HashMap<String, crate::ty::Ty>, f: F) -> R
+pub(super) fn with_param_types<F, R>(types: crate::det::HashMap<String, crate::ty::Ty>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -235,7 +235,7 @@ pub(super) fn ivar_field_ty(name: &str) -> Option<crate::ty::Ty> {
 /// `library.rs` to scope each `impl` block's emit. Swaps
 /// `EmitCtx::ivar_types` with save-restore (Phase 2 of #24).
 /// Must be called inside `with_emit_ctx` — panics otherwise.
-pub(super) fn with_ivar_types<F, R>(types: std::collections::HashMap<String, crate::ty::Ty>, f: F) -> R
+pub(super) fn with_ivar_types<F, R>(types: crate::det::HashMap<String, crate::ty::Ty>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -267,10 +267,10 @@ pub(super) fn with_method_scope<F, R>(body: &Expr, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let mut counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut counts: crate::det::HashMap<String, usize> =
+        crate::det::HashMap::default();
     collect_var_assign_counts(body, &mut counts);
-    let mut mut_vars: std::collections::HashSet<String> = counts
+    let mut mut_vars: crate::det::HashSet<String> = counts
         .into_iter()
         .filter_map(|(name, n)| if n > 1 { Some(name) } else { None })
         .collect();
@@ -291,11 +291,11 @@ where
     let prev_mut = std::mem::replace(&mut *ctx.mut_vars.borrow_mut(), mut_vars);
     let prev_declared = std::mem::replace(
         &mut *ctx.declared_vars.borrow_mut(),
-        std::collections::HashSet::new(),
+        crate::det::HashSet::default(),
     );
     let prev_back_prop = std::mem::replace(
         &mut *ctx.back_propagated_hash_locals.borrow_mut(),
-        std::collections::HashSet::new(),
+        crate::det::HashSet::default(),
     );
     let r = f();
     *ctx.mut_vars.borrow_mut() = prev_mut;
@@ -342,7 +342,7 @@ pub(super) fn wrap_if_needs_parens(e: &Expr, emitted: String) -> String {
 
 fn collect_var_send_receivers(
     e: &Expr,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::det::HashSet<String>,
 ) {
     match &*e.node {
         ExprNode::Send { recv, args, block, .. } => {
@@ -395,7 +395,7 @@ fn collect_var_send_receivers(
 
 fn collect_var_assign_counts(
     e: &Expr,
-    out: &mut std::collections::HashMap<String, usize>,
+    out: &mut crate::det::HashMap<String, usize>,
 ) {
     match &*e.node {
         ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
@@ -468,7 +468,7 @@ pub(super) fn render_self_literal() -> String {
 /// method set. Used by `library.rs::emit_library_class` to scope the
 /// static-method dispatch decision to the impl block being rendered.
 pub(super) fn with_static_methods<F, R>(
-    methods: std::collections::HashSet<String>,
+    methods: crate::det::HashSet<String>,
     f: F,
 ) -> R
 where
@@ -487,7 +487,7 @@ where
 /// `EmitCtx::class_method_param_tys` with save-restore (Phase 2 of
 /// #24). Must be called inside `with_emit_ctx`.
 pub(super) fn with_class_method_param_tys<F, R>(
-    map: std::collections::HashMap<String, Vec<crate::ty::Ty>>,
+    map: crate::det::HashMap<String, Vec<crate::ty::Ty>>,
     f: F,
 ) -> R
 where
@@ -1441,7 +1441,7 @@ pub(super) fn with_declared_vars_scope<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn emit_ensure_only(body: &Expr, ensure: &Expr) -> String {
-    let mut ensure_reads = std::collections::HashSet::new();
+    let mut ensure_reads = crate::det::HashSet::default();
     collect_var_reads(ensure, &mut ensure_reads);
     let stmts: Vec<&Expr> = match &*body.node {
         ExprNode::Seq { exprs } => exprs.iter().collect(),
@@ -1468,7 +1468,7 @@ fn emit_ensure_only(body: &Expr, ensure: &Expr) -> String {
     format!("{{\n{}\n}}", lines.join("\n"))
 }
 
-fn collect_var_reads(e: &Expr, out: &mut std::collections::HashSet<String>) {
+fn collect_var_reads(e: &Expr, out: &mut crate::det::HashSet<String>) {
     if let ExprNode::Var { name, .. } = &*e.node {
         out.insert(name.as_str().to_string());
     }
@@ -1490,7 +1490,7 @@ fn contains_jump(e: &Expr) -> bool {
 
 thread_local! {
     /// Locals bound to a rescued exception, `true` for the `Option` a `cause` read answers.
-    static RESCUED_VARS: std::cell::RefCell<std::collections::HashMap<String, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static RESCUED_VARS: std::cell::RefCell<crate::det::HashMap<String, bool>> = std::cell::RefCell::new(crate::det::HashMap::default());
 }
 
 fn rescued_var(e: &Expr) -> Option<(String, bool)> {

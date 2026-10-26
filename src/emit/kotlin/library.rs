@@ -12,7 +12,8 @@
 //!   - Kotlin requires every parameter typed, so params take their
 //!     signature type, falling back to `Any?`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::PathBuf;
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
@@ -89,7 +90,7 @@ pub fn emit_function_module(funcs: &[crate::dialect::LibraryFunction]) -> Option
 /// (e.g. `inflector.rb`). The module name comes from the methods'
 /// `enclosing_class`.
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
-    set_instance_prop_types(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
     set_current_class("");
     let name = methods
         .first()
@@ -160,7 +161,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Kotlin `object`. Class-level `attr_accessor` (from `class << self`)
     // collapses to an object `var` property; everything else is a `fun`.
     if lc.is_module {
-        set_instance_prop_types(std::collections::HashMap::new());
+        set_instance_prop_types(crate::det::HashMap::default());
         set_current_class("");
         let accessor_props = class_accessor_props(&lc.methods);
         let mut out = format!("object {class_name} {{\n");
@@ -190,7 +191,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Instance classes have no thread-local singleton state — their `@ivar`s
     // are per-object (Flash/Session are instantiated per request). Clear any
     // registry left from a preceding object emit.
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     // Temporal (Date/DateTime/Time) columns arrive from the shared
     // lowering already split: storage is an ordinary `<col>_raw` String
@@ -201,7 +202,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Kotlin has one member per name — so Time-returning readers are
     // pulled out of the accessor→`var` collapse and emitted as explicit
     // computed getters below.
-    let mut temporal_names: HashSet<String> = HashSet::new();
+    let mut temporal_names: HashSet<String> = HashSet::default();
     let mut temporal_readers: Vec<(String, Ty, Expr)> = Vec::new();
     for m in &lc.methods {
         if m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref()) {
@@ -321,7 +322,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Properties. Constructor-param-backed properties are assigned in the
     // `init` block, so they need no initializer (and a non-null type like
     // `Base` can't be defaulted to null anyway).
-    let ctor_param_names: std::collections::HashSet<String> = init
+    let ctor_param_names: crate::det::HashSet<String> = init
         .map(|m| m.params.iter().map(|p| camel(p.name.as_str())).collect())
         .unwrap_or_default();
     for (n, ty) in &prop_types {
@@ -390,7 +391,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // coerces the untyped value to the property's type — plus inferred
     // body-ivar types (e.g. `@data: Hash[...]`) so a `data.keys`/`.length`
     // call dispatches as a Map even though `data` is a body ivar.
-    let mut prop_ty_map: std::collections::HashMap<String, Ty> =
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     for (n, t) in &inferred_ivar_types {
         prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
@@ -545,7 +546,7 @@ pub fn emit_test_class(
     // can't walk up to the framework base's parameter list, and the
     // kwargs hash stays a map literal the callee won't accept.
     register_class_hierarchy(inner_classes);
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     let mut out = String::new();
 
@@ -597,7 +598,7 @@ pub fn emit_test_class(
     // Property registry so `self.@article` reads emit as a property name.
     let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
     set_instance_props(instance_props);
-    let prop_ty_map: std::collections::HashMap<String, Ty> = inferred_ivar_types
+    let prop_ty_map: crate::det::HashMap<String, Ty> = inferred_ivar_types
         .iter()
         .map(|(n, t)| (n.clone(), t.clone()))
         .collect();
@@ -737,7 +738,7 @@ fn member_name(m: &MethodDef) -> String {
 /// register the class for override resolution and — via the ancestor union
 /// — to decide which members of a subclass need `override`.
 fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in &lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;
@@ -1218,7 +1219,7 @@ fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
     // = CacheControlStore.new`) and nothing assigns it a nilable value. A
     // READ carries `T | nil` (unset before `initialize`), which signal 1.5
     // would take first, but the slot is never nil once constructed.
-    let mut nilable_assigned: HashSet<String> = HashSet::new();
+    let mut nilable_assigned: HashSet<String> = HashSet::default();
     for m in methods {
         collect_nilable_ivar_assigns(&m.body, &mut nilable_assigned);
     }

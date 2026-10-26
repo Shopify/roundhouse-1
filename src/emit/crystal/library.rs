@@ -245,21 +245,21 @@ fn render_class(lc: &LibraryClass) -> String {
 
     // Collect attribute properties from attr_reader pairs.
     let mut properties: Vec<(String, String)> = Vec::new();
-    let mut accessor_method_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut accessor_method_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     // Temporal-column readers (return `Time`) must NOT collapse into a
     // `property` — the parsing body would be lost. The reader emits as an
     // explicit method (`def col : Time?`) over the `<col>_raw` String
     // storage, which is an ordinary accessor pair from the shared
     // lowering and collapses to `property created_at_raw : String` like
     // any other column.
-    let mut temporal_accessor_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut temporal_accessor_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     // First pass: detect which ivars `initialize` directly assigns
     // (used both for ivar nilability AND property nilability —
     // Crystal's strict null check applies the same rule to both).
-    let mut init_assigned: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut init_assigned: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     for m in &lc.methods {
         if m.name.as_str() == "initialize"
             && matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
@@ -541,8 +541,8 @@ fn render_class(lc: &LibraryClass) -> String {
     // `@@<name>`. Without this, the class header declares the
     // widened Hash type but `def initialize; @data = {}; end`
     // emits the default-typed empty literal and Crystal rejects.
-    let mut ivar_hash_types: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    let mut ivar_hash_types: crate::det::HashMap<String, (String, String)> =
+        crate::det::HashMap::default();
     for (name, ty) in &ivars {
         if let crate::ty::Ty::Hash { key, value } = ty {
             // Skip when the value type collapses to the default
@@ -627,7 +627,7 @@ fn render_class(lc: &LibraryClass) -> String {
 /// hash-arg version reintroduces the impedance mismatch we just removed).
 fn is_skipped_method(
     m: &MethodDef,
-    accessor_names: &std::collections::HashSet<String>,
+    accessor_names: &crate::det::HashSet<String>,
 ) -> bool {
     if accessor_names.contains(m.name.as_str()) {
         return true;
@@ -698,7 +698,7 @@ fn signature_ret_is_time(sig: Option<&crate::ty::Ty>) -> bool {
 
 fn collect_initialize_assignments(
     e: &Expr,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::det::HashSet<String>,
 ) {
     use crate::expr::LValue;
     match &*e.node {

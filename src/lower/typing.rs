@@ -97,8 +97,8 @@ pub fn fn_sig_with_block(
 /// fully typed.
 pub fn type_method_body(
     method: &mut MethodDef,
-    classes: &std::collections::HashMap<ClassId, crate::analyze::ClassInfo>,
-    ivar_bindings: &std::collections::HashMap<Symbol, Ty>,
+    classes: &crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+    ivar_bindings: &crate::det::HashMap<Symbol, Ty>,
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn own_block_param_types_as_a_closed_fn_not_var() {
         let mut method = with_x_calling_its_own_block();
-        let classes = std::collections::HashMap::new();
-        let ivar_bindings = std::collections::HashMap::new();
+        let classes = crate::det::HashMap::default();
+        let ivar_bindings = crate::det::HashMap::default();
 
         type_method_body(&mut method, &classes, &ivar_bindings);
 

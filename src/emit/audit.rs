@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
@@ -174,7 +174,7 @@ impl Index {
     }
 
     fn defines(&self, class: &str, name: &str, class_side: bool) -> Lookup {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         self.lookup(class, "", name, class_side, &mut seen)
     }
 
@@ -269,7 +269,7 @@ fn const_text(node: &ruby_prism::Node<'_>) -> Option<String> {
 pub fn audit(classes: &[crate::dialect::LibraryClass], files: &[(String, String)]) -> Vec<Diagnostic> {
     let index = Index::of(files);
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for lc in classes {
         for m in &lc.methods {
             let class_side = m.receiver == crate::dialect::MethodReceiver::Class;

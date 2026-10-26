@@ -45,7 +45,7 @@
 //! ordering.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::span::{FileId, SourceFile};

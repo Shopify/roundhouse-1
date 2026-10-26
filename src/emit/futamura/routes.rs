@@ -29,7 +29,8 @@
 //!   * actions with a route that a route the lowered router refused
 //!     could shadow (Rails would match the refused one first).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::{Diagnostic, Severity};
@@ -87,8 +88,8 @@ struct Index<'a> {
 
 impl<'a> Index<'a> {
     fn new(lcs: &'a [LibraryClass], analyzer_stamps: HashMap<(u32, u32, u32), Ty>) -> Self {
-        let mut classes: HashMap<String, Vec<&'a LibraryClass>> = HashMap::new();
-        let mut by_name: HashMap<Symbol, Vec<(String, bool)>> = HashMap::new();
+        let mut classes: HashMap<String, Vec<&'a LibraryClass>> = HashMap::default();
+        let mut by_name: HashMap<Symbol, Vec<(String, bool)>> = HashMap::default();
         for lc in lcs {
             classes.entry(lc.name.0.as_str().to_string()).or_default().push(lc);
             for m in &lc.methods {
@@ -98,7 +99,7 @@ impl<'a> Index<'a> {
                     .push((lc.name.0.as_str().to_string(), is_class_side(&m.receiver)));
             }
         }
-        let mut by_last: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_last: HashMap<String, Vec<String>> = HashMap::default();
         for name in classes.keys() {
             by_last.entry(name.rsplit("::").next().unwrap_or(name).to_string()).or_default().push(name.clone());
         }
@@ -106,9 +107,9 @@ impl<'a> Index<'a> {
             classes,
             by_name,
             by_last,
-            children: HashMap::new(),
-            ancestors: HashMap::new(),
-            extends: HashMap::new(),
+            children: HashMap::default(),
+            ancestors: HashMap::default(),
+            extends: HashMap::default(),
             analyzer_stamps,
             missing: Vec::new(),
         };
@@ -116,7 +117,7 @@ impl<'a> Index<'a> {
         // may be relative to the enclosing namespace: take every app class
         // it could name (more ancestors is the safe direction), and the
         // name itself, which is how a framework base stays visible.
-        let mut up: HashMap<String, Vec<String>> = HashMap::new();
+        let mut up: HashMap<String, Vec<String>> = HashMap::default();
         for (name, lcs) in &index.classes {
             let mut out = Vec::new();
             for lc in lcs {
@@ -137,7 +138,7 @@ impl<'a> Index<'a> {
             list.sort();
             list.dedup();
         }
-        let mut extends: HashMap<String, Vec<String>> = HashMap::new();
+        let mut extends: HashMap<String, Vec<String>> = HashMap::default();
         for (name, lcs) in &index.classes {
             for e in lcs.iter().flat_map(|lc| lc.unknown_calls.iter()) {
                 if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
@@ -154,7 +155,7 @@ impl<'a> Index<'a> {
         }
         index.extends = extends;
         for name in index.classes.keys() {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::default();
             let mut stack = vec![name.clone()];
             while let Some(c) = stack.pop() {
                 if seen.insert(c.clone()) {
@@ -198,7 +199,7 @@ impl<'a> Index<'a> {
 
     /// `class` and every class below it.
     fn tree(&self, class: &str) -> Vec<String> {
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         let mut stack = vec![class.to_string()];
         while let Some(c) = stack.pop() {
             if seen.insert(c.clone()) {
@@ -226,7 +227,7 @@ impl<'a> Index<'a> {
     /// The class (walking parents and includes) that defines `name` on
     /// the given side, as Ruby's lookup would find it.
     fn lookup(&self, class: &str, name: &Symbol, class_side: bool) -> Option<MethodKey> {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut queue = VecDeque::from([class.to_string()]);
         while let Some(c) = queue.pop_front() {
             if !seen.insert(c.clone()) {
@@ -389,7 +390,7 @@ fn is_helper_gap(rel: &str) -> bool {
 /// `ApplicationController` is a `WidgetsController`'s ancestor this way.
 fn ancestor_chain(index: &Index, class: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::from([class.to_string()]);
+    let mut seen: HashSet<String> = HashSet::from_iter([class.to_string()]);
     let mut cur = class.to_string();
     while let Some(parent) = index.classes.get(&cur).into_iter().flatten().find_map(|lc| lc.parent.clone()) {
         let parent = parent.0.as_str().to_string();
@@ -429,7 +430,7 @@ pub fn plan(lowered: &App, diags: &[Diagnostic], gaps: &[(String, String)]) -> R
     // Every rel-path file a controller's own methods are written in —
     // almost always one file, but a controller can reopen across files
     // the way a reopened model does.
-    let mut controller_files: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut controller_files: HashMap<String, HashSet<String>> = HashMap::default();
     for ((class, _, _), rs) in &ranges {
         if !controllers.contains(class) {
             continue;
@@ -484,7 +485,7 @@ pub fn plan(lowered: &App, diags: &[Diagnostic], gaps: &[(String, String)]) -> R
     let mut facts = Facts::new(&index, &lcs, &models);
     // Every method's summary, once: their `live` sets bound what shared
     // state can hold.
-    let mut summaries: HashMap<MethodKey, Summary> = HashMap::new();
+    let mut summaries: HashMap<MethodKey, Summary> = HashMap::default();
     for lc in &lcs {
         for m in &lc.methods {
             let key = (lc.name.0.as_str().to_string(), m.name.clone(), is_class_side(&m.receiver));
@@ -544,7 +545,7 @@ pub fn plan(lowered: &App, diags: &[Diagnostic], gaps: &[(String, String)]) -> R
                 (None, None) => eprintln!("  rta         {key}: bounded"),
             }
         }
-        let mut reached_files: HashSet<u32> = HashSet::new();
+        let mut reached_files: HashSet<u32> = HashSet::default();
         for m in reached.keys() {
             if let Some(rs) = ranges.get(m) {
                 reached_files.extend(rs.keys().copied());
@@ -630,7 +631,7 @@ fn owns_source(lowered_by_name: &HashSet<String>, lc: &LibraryClass, m: &crate::
 
 /// Per method, the source range its body covers in each file.
 fn method_ranges(controllers: &HashSet<String>, lcs: &[LibraryClass]) -> HashMap<MethodKey, BTreeMap<u32, (u32, u32)>> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for lc in lcs {
         for m in lc.methods.iter().filter(|m| owns_source(controllers, lc, m)) {
             let mut ranges: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
@@ -655,7 +656,7 @@ fn method_ranges(controllers: &HashSet<String>, lcs: &[LibraryClass]) -> HashMap
 /// Per expression start, the methods whose bodies hold it: where an
 /// error reported at that expression lives in the emitted program.
 fn expression_owners(controllers: &HashSet<String>, lcs: &[LibraryClass]) -> HashMap<(u32, u32), Vec<MethodKey>> {
-    let mut out: HashMap<(u32, u32), Vec<MethodKey>> = HashMap::new();
+    let mut out: HashMap<(u32, u32), Vec<MethodKey>> = HashMap::default();
     for lc in lcs {
         for m in lc.methods.iter().filter(|m| owns_source(controllers, lc, m)) {
             let key = (lc.name.0.as_str().to_string(), m.name.clone(), is_class_side(&m.receiver));
@@ -1371,11 +1372,11 @@ fn reach(
 ) -> Reach {
     let mut walk = Walk {
         index,
-        reached: HashMap::new(),
+        reached: HashMap::default(),
         queue: VecDeque::new(),
         live: BTreeSet::new(),
         names: Vec::new(),
-        seen_names: HashSet::new(),
+        seen_names: HashSet::default(),
         shared: None,
         full: None,
     };
@@ -1389,7 +1390,7 @@ fn reach(
         Some(key) => {
             walk.reached.insert(key.clone(), None);
             let mut s = Summary::default();
-            let mut seen: HashMap<MethodKey, Option<MethodKey>> = HashMap::new();
+            let mut seen: HashMap<MethodKey, Option<MethodKey>> = HashMap::default();
             let mut found: VecDeque<MethodKey> = VecDeque::new();
             for m in index.bodies(&key.0, &process, false) {
                 calls_for_action(&m.body, action, &mut |e| {
@@ -1435,7 +1436,7 @@ fn helper_modules(index: &Index) -> Vec<String> {
 fn summarize(index: &Index, facts: &Facts, key: &MethodKey) -> Summary {
     let (class, name, class_side) = key;
     let mut s = Summary::default();
-    let mut seen: HashMap<MethodKey, Option<MethodKey>> = HashMap::new();
+    let mut seen: HashMap<MethodKey, Option<MethodKey>> = HashMap::default();
     let mut found: VecDeque<MethodKey> = VecDeque::new();
     for m in index.bodies(class, name, *class_side) {
         let defaults = m.params.iter().filter_map(|p| p.default.as_ref());
@@ -1704,7 +1705,7 @@ fn enqueue_send(
 /// expression spans — so a span found here names the same source
 /// location as its counterpart in the re-lowered body.
 fn analyzer_stamps(app: &App) -> HashMap<(u32, u32, u32), Ty> {
-    let mut out: HashMap<(u32, u32, u32), Ty> = HashMap::new();
+    let mut out: HashMap<(u32, u32, u32), Ty> = HashMap::default();
     // A span can recur with a different type, and not every recurrence
     // is a real disagreement:
     //
@@ -1733,7 +1734,7 @@ fn analyzer_stamps(app: &App) -> HashMap<(u32, u32, u32), Ty> {
     // already refuses to adopt one (see its own filter), so storing it
     // would only ever risk manufacturing a conflict against a later,
     // useful closed stamp for no benefit.
-    let mut conflicted: HashSet<(u32, u32, u32)> = HashSet::new();
+    let mut conflicted: HashSet<(u32, u32, u32)> = HashSet::default();
     let mut record = |e: &Expr| {
         let Some(ty) = &e.ty else { return };
         if e.span.file.0 == 0 || ty.is_open() || ty.is_unknown() || ty.mentions_unknown() {
@@ -2036,6 +2037,6 @@ mod tests {
             "view template not ingested: erb".to_string(),
         )];
         let prefix = view_prefix("GadgetStylesController", "show");
-        assert!(gap_blocking(&gaps, &std::collections::HashSet::new(), &prefix).is_some());
+        assert!(gap_blocking(&gaps, &crate::det::HashSet::default(), &prefix).is_some());
     }
 }

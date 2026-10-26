@@ -30,7 +30,7 @@
 //! typed like source. An app with no `ActionController::TestCase` test
 //! is left unchanged.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::{Action, ControllerBodyItem, RenderTarget};

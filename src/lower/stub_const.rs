@@ -34,7 +34,7 @@
 //! find, are left as written: on CRuby the test-support helper answers
 //! them, and the spinel harness's helper fails the test saying why.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::dialect::{ControllerBodyItem, ModelBodyItem};
@@ -68,7 +68,7 @@ pub fn apply_stub_const_lowering(app: &mut App) {
     // A stub that changes a scalar constant's type (`TIME_LIMIT = 10`
     // stubbed with `0.2`) has no single-typed stack to live in; every
     // site of that constant is left to the harness helper.
-    let mut retyped: HashSet<Vec<Symbol>> = HashSet::new();
+    let mut retyped: HashSet<Vec<Symbol>> = HashSet::default();
     for (path, ty) in &wanted {
         if let (Some(stub), Some(own)) = (ty, constant_ty(app, path)) {
             if is_scalar(stub) && is_scalar(&own) && *stub != own {
@@ -76,7 +76,7 @@ pub fn apply_stub_const_lowering(app: &mut App) {
             }
         }
     }
-    let mut stubbed: HashSet<Vec<Symbol>> = HashSet::new();
+    let mut stubbed: HashSet<Vec<Symbol>> = HashSet::default();
     for (path, _) in wanted {
         if !stubbed.contains(&path) && !retyped.contains(&path) && insert_stack(app, &path) {
             stubbed.insert(path);

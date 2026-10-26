@@ -35,7 +35,7 @@
 //! or none. The date and decimal coercions need stdlib only the CRuby and
 //! JRuby trees load; `project` reports them for any other target.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::LibraryClass;
@@ -101,9 +101,9 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
 
     // Read every struct's declarations and build its methods; a class
     // either part fails is refused here, before any hierarchy is lowered.
-    let mut read: HashMap<String, StructClass> = HashMap::new();
-    let mut built: HashMap<String, (Vec<crate::dialect::MethodDef>, Vec<(Symbol, Expr)>)> = HashMap::new();
-    let mut refused: HashSet<String> = HashSet::new();
+    let mut read: HashMap<String, StructClass> = HashMap::default();
+    let mut built: HashMap<String, (Vec<crate::dialect::MethodDef>, Vec<(Symbol, Expr)>)> = HashMap::default();
+    let mut refused: HashSet<String> = HashSet::default();
     // What each refused class names as a struct type.
     let mut refused_names: Vec<String> = Vec::new();
     for lc in &app.library_classes {
@@ -238,7 +238,7 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
 /// direct `Dry::Struct` subclass).
 fn struct_parents(classes: &[LibraryClass]) -> HashMap<String, Option<String>> {
     let names: HashSet<String> = classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
-    let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+    let mut parent_of: HashMap<String, Option<String>> = HashMap::default();
     loop {
         let before = parent_of.len();
         for lc in classes {
@@ -274,7 +274,7 @@ fn expand_nested(
     parent_of: &mut HashMap<String, Option<String>>,
     types_modules: &[(String, BareNames)],
 ) -> HashMap<String, String> {
-    let mut owner_of: HashMap<String, String> = HashMap::new();
+    let mut owner_of: HashMap<String, String> = HashMap::default();
     let mut queue: Vec<String> = parent_of.keys().cloned().collect();
     queue.sort();
     while let Some(owner) = queue.pop() {

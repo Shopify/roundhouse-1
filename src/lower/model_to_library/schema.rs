@@ -232,7 +232,7 @@ pub(super) fn push_schema_methods(
         &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
         runtime_relation == super::RuntimeRelation::Present,
     );
-    let mut demanded: Option<std::rc::Rc<std::collections::HashSet<Symbol>>> = None;
+    let mut demanded: Option<std::rc::Rc<crate::det::HashSet<Symbol>>> = None;
     for col in &table.columns {
         let slot = ColumnSlot::classify(col, model);
         // Always synthesize the column reader. A source `def` of the same
@@ -2297,9 +2297,9 @@ pub(crate) mod lookup_test_support {
 /// walked every model body once per model with a column: quadratic in
 /// the number of models.
 #[derive(Default)]
-pub(crate) struct ModelBodyNames(std::rc::Rc<std::cell::OnceCell<std::rc::Rc<std::collections::HashSet<Symbol>>>>);
+pub(crate) struct ModelBodyNames(std::rc::Rc<std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<Symbol>>>>);
 
-type SharedBodyNames = (usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<std::collections::HashSet<Symbol>>>>);
+type SharedBodyNames = (usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<Symbol>>>>);
 
 thread_local! {
     static MODEL_BODY_NAMES: std::cell::RefCell<Option<SharedBodyNames>> = const { std::cell::RefCell::new(None) };
@@ -2327,7 +2327,7 @@ pub(crate) fn share_model_body_names<'a>(models: &'a [Model], cache: &ModelBodyN
 
 /// [`model_body_names`] of `models`: the shared names when `models` is
 /// the shared slice.
-fn demanded_names(models: &[Model]) -> std::rc::Rc<std::collections::HashSet<Symbol>> {
+fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSet<Symbol>> {
     #[cfg(test)]
     if lookup_test_support::UNCACHED.get() { return std::rc::Rc::new(model_body_names(models)); }
     let shared = MODEL_BODY_NAMES.with(|slot| {
@@ -2350,11 +2350,11 @@ fn demanded_names(models: &[Model]) -> std::rc::Rc<std::collections::HashSet<Sym
 /// sometimes on another model's record. A controller or view calling
 /// `<col>_changed?` is not seen; that is a runtime NoMethodError, the
 /// state every such call was in before this synthesis existed.
-fn model_body_names(models: &[Model]) -> std::collections::HashSet<Symbol> {
+fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
     #[cfg(test)]
     lookup_test_support::BUILDS.with(|n| n.set(n.get() + 1));
     use crate::dialect::ModelBodyItem;
-    fn walk(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
         match &*e.node {
             ExprNode::Send { method, .. } => {
                 out.insert(method.clone());
@@ -2366,7 +2366,7 @@ fn model_body_names(models: &[Model]) -> std::collections::HashSet<Symbol> {
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     for model in models {
         #[cfg(test)]
         lookup_test_support::MODEL_VISITS.with(|n| n.set(n.get() + 1));

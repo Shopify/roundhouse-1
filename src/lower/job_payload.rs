@@ -269,7 +269,7 @@ fn collect_sites(e: &Expr, jobs: &BTreeSet<String>, out: &mut BTreeMap<String, V
 
 fn plan_params(
     app: &App,
-    sti: &std::collections::HashMap<ClassId, ClassId>,
+    sti: &crate::det::HashMap<ClassId, ClassId>,
     params: &[crate::dialect::Param],
     sites: &[Site],
 ) -> Result<Vec<JobParam>, JobFallback> {
@@ -340,7 +340,7 @@ fn describe(ty: &Ty) -> String {
 /// The STI base a record type is found on, with every name it accepts.
 fn record_of(
     app: &App,
-    sti: &std::collections::HashMap<ClassId, ClassId>,
+    sti: &crate::det::HashMap<ClassId, ClassId>,
     id: &ClassId,
 ) -> Option<(String, Vec<String>)> {
     let base = if app.models.iter().any(|m| &m.name == id) {
@@ -371,7 +371,7 @@ fn record_of(
     Some((base.0.as_str().to_string(), accepts))
 }
 
-fn codec_of(app: &App, sti: &std::collections::HashMap<ClassId, ClassId>, ty: &Ty) -> Option<Codec> {
+fn codec_of(app: &App, sti: &crate::det::HashMap<ClassId, ClassId>, ty: &Ty) -> Option<Codec> {
     Some(match ty {
         Ty::Bool => Codec::Bool,
         Ty::Int => Codec::Int,

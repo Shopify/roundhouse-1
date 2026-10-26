@@ -57,7 +57,7 @@
 use crate::app::App;
 use crate::dialect::MethodReceiver;
 use crate::ident::ClassId;
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 pub fn apply_spliced_concern_body_prune(app: &mut App) {
     // Modules that handed at least one instance method to a controller.
@@ -75,7 +75,7 @@ pub fn apply_spliced_concern_body_prune(app: &mut App) {
     // Every `include <M>` the emit still carries OUTSIDE a controller.
     // Controllers are excluded by construction: their include is what
     // the splice consumed.
-    let mut still_included: HashSet<ClassId> = HashSet::new();
+    let mut still_included: HashSet<ClassId> = HashSet::default();
     for model in &app.models {
         still_included.extend(crate::analyze::model_includes(model));
     }

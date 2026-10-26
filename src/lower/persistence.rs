@@ -76,7 +76,7 @@ pub struct DependentChild {
 
 pub fn lower_persistence(model: &Model, app: &App) -> LoweredPersistence {
     let columns: Vec<Symbol> = model.attributes.fields.keys().cloned().collect();
-    let generated_columns: std::collections::HashSet<Symbol> = app
+    let generated_columns: crate::det::HashSet<Symbol> = app
         .schema
         .tables
         .get(&model.table.0)

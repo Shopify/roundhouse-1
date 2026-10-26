@@ -11,7 +11,7 @@
 //! emitters construct `JsModule`s directly — at which point the
 //! `Span`s every node carries become token-level source-map entries.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use super::js_ast::{
     ArrowBody, Js, JsExpr, JsKey, JsObjEntry, JsParam, JsStmt, JsStmtNode, TplPart, TsType,
@@ -41,7 +41,7 @@ use crate::ty::Ty;
 
 std::thread_local! {
     static ASYNC_METHOD_NAMES: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
     /// Whether the body currently being emitted belongs to an
     /// `async`-marked method. The Yield emit reads this to decide
     /// between `__block(...)` (sync method body, await would be a
@@ -155,13 +155,13 @@ std::thread_local! {
     /// Each class this emit knows: its parent and the constants its body
     /// declares as `static` members (`set_static_constants`).
     static STATIC_CONSTANTS: std::cell::RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
-        std::cell::RefCell::new(HashMap::new());
+        std::cell::RefCell::new(HashMap::default());
 }
 
 /// Record, for `classes`, each one's parent and the class-body constants
 /// the TypeScript emit declares as `static` members.
 pub(crate) fn set_static_constants<'a>(classes: impl IntoIterator<Item = &'a crate::dialect::LibraryClass>) {
-    let mut map: HashMap<String, (Option<String>, HashSet<String>)> = HashMap::new();
+    let mut map: HashMap<String, (Option<String>, HashSet<String>)> = HashMap::default();
     for c in classes {
         let entry = map.entry(c.name.0.as_str().to_string()).or_default();
         if entry.0.is_none() {
@@ -198,7 +198,7 @@ pub(crate) fn ancestor_declares_static(parent: Option<&str>, name: &str) -> bool
 
 std::thread_local! {
     static NESTED_CLASS_NAMES: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
 }
 
 /// The app's nested classes (`Importer::TooBig`), whose `.new` is a
@@ -209,7 +209,7 @@ pub(crate) fn set_nested_class_names(names: impl IntoIterator<Item = String>) {
 
 std::thread_local! {
     static CLASS_SHAPES: std::cell::RefCell<HashMap<String, ClassShape>> =
-        std::cell::RefCell::new(HashMap::new());
+        std::cell::RefCell::new(HashMap::default());
 }
 
 /// Record the method shapes of `classes` for the Send emit. `fields` is
@@ -228,7 +228,7 @@ pub(crate) fn set_class_shapes<'a>(
             kind
         }
     };
-    let mut map: HashMap<String, ClassShape> = HashMap::new();
+    let mut map: HashMap<String, ClassShape> = HashMap::default();
     for (c, fields, static_fields) in classes {
         let entry = map.entry(c.name.0.as_str().to_string()).or_default();
         if entry.parent.is_none() {
@@ -288,7 +288,7 @@ fn method_shape(class: &str, method: &str, class_side: bool) -> Option<Shape> {
 
 std::thread_local! {
     static CURRENT_METHOD_PARAMS: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
 }
 
 std::thread_local! {
@@ -866,7 +866,7 @@ fn collect_scope_locals(e: &Expr, out: &mut HashSet<Symbol>) {
 }
 
 fn in_scope<T>(body: &Expr, f: impl FnOnce() -> T) -> T {
-    let mut own = HashSet::new();
+    let mut own = HashSet::default();
     collect_scope_locals(body, &mut own);
     SCOPE_LOCALS.with(|c| c.borrow_mut().push(own));
     let out = f();
@@ -888,11 +888,11 @@ fn js_body_in_scope(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // emit as `const`. The `declared` set tracks which reassigned names
     // have already had their declaration emitted as we walk in source
     // order.
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     let reassigned: HashSet<Symbol> =
         counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect();
-    let mut declared: HashSet<Symbol> = HashSet::new();
+    let mut declared: HashSet<Symbol> = HashSet::default();
     // Names whose first assignment lives inside a nested block (an
     // `if`/`else` arm, a `case` branch, …) need a hoisted `let`
     // declaration at the function-body level — TS `let` is block-
@@ -909,7 +909,7 @@ fn js_body_in_scope(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // restrict to vars whose top-level assignment count is strictly
     // less than their total count — i.e., at least one assignment
     // lives in a nested branch.
-    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::default();
     count_top_level_var_assignments(body, &mut top_level_counts);
     let mut hoisted: Vec<Symbol> = reassigned
         .iter()
@@ -960,7 +960,7 @@ fn count_top_level_var_assignments(body: &Expr, out: &mut HashMap<Symbol, usize>
 
 /// Total count of Var-assignments to `name` in `body` (recursive).
 fn count_var_for(body: &Expr, name: &Symbol) -> usize {
-    let mut all: HashMap<Symbol, usize> = HashMap::new();
+    let mut all: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut all);
     all.get(name).copied().unwrap_or(0)
 }
@@ -1190,7 +1190,7 @@ fn js_begin_rescue_stmt(
     return_ty: &Ty,
 ) -> Vec<JsStmt> {
     // Not declared inside `try`: `catch` and `finally` read what the body assigned, as Ruby's rescue and ensure do
-    let mut shared = HashSet::new();
+    let mut shared = HashSet::default();
     for part in std::iter::once(body).chain(else_branch).chain(rescues.iter().map(|r| &r.body)) {
         collect_scope_locals(part, &mut shared);
     }
@@ -1281,7 +1281,7 @@ fn catch_chain(rescues: &[RescueClause], clause_body: &dyn Fn(&RescueClause) -> 
 /// emit `let` (mutable) for names assigned more than once and
 /// `const` for names assigned exactly once.
 pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect()
 }
@@ -1915,7 +1915,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             let arrow_body = in_scope(body, || match &*body.node {
                 ExprNode::Seq { exprs } if exprs.len() > 1 => {
                     let reassigned = collect_reassigned(body);
-                    let mut declared: HashSet<Symbol> = HashSet::new();
+                    let mut declared: HashSet<Symbol> = HashSet::default();
                     let mut stmts = Vec::new();
                     for (i, x) in exprs.iter().enumerate() {
                         stmts.extend(js_stmts_with_state(
@@ -1930,7 +1930,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
                 }
                 ExprNode::If { .. } | ExprNode::Case { .. } if void => {
                     let reassigned = collect_reassigned(body);
-                    let mut declared: HashSet<Symbol> = HashSet::new();
+                    let mut declared: HashSet<Symbol> = HashSet::default();
                     ArrowBody::Block(js_stmts_with_state(body, true, true, &reassigned, &mut declared))
                 }
                 _ => ArrowBody::Expr(js_expr(body)),
@@ -4689,7 +4689,7 @@ mod async_hof_tests {
     }
 
     fn with_async<F: FnOnce() -> R, R>(names: &[&str], f: F) -> R {
-        let set: std::collections::HashSet<Symbol> =
+        let set: crate::det::HashSet<Symbol> =
             names.iter().map(|s| Symbol::from(*s)).collect();
         with_async_methods(set, f)
     }

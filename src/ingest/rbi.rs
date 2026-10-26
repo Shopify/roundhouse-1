@@ -22,7 +22,7 @@
 //! written class names against the classes it actually knows (see
 //! `analyze::registry::gem_boundary`).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;
@@ -77,7 +77,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
     // gem name -> the RBI file to read. A gem locked at one version can
     // have RBIs for several (a stale one left behind); the locked
     // version's wins, otherwise the highest-sorting one.
-    let mut chosen: HashMap<String, (bool, PathBuf)> = HashMap::new();
+    let mut chosen: HashMap<String, (bool, PathBuf)> = HashMap::default();
     for path in entries {
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
@@ -136,7 +136,7 @@ pub fn read_rbi(source: &[u8], gem: &str, out: &mut GemBoundary) {
     let node = result.node();
     let Some(program) = node.as_program_node() else { return };
     let statements = program.statements().body().iter().collect::<Vec<_>>();
-    let aliases = collect_type_aliases(&statements, &HashMap::new());
+    let aliases = collect_type_aliases(&statements, &HashMap::default());
     let mut reader = Reader { gem, out };
     reader.walk(&statements, None, false, &aliases);
 }
@@ -427,7 +427,7 @@ fn lenient_signature(
     self_is_instance: bool,
     aliases: &HashMap<String, Ty>,
 ) -> Ty {
-    let mut declared: HashMap<String, Ty> = HashMap::new();
+    let mut declared: HashMap<String, Ty> = HashMap::default();
     let mut ret = Ty::Untyped;
     if let Some(sig) = sig {
         for call in sig_chain(sig) {

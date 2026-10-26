@@ -20,7 +20,7 @@
 //! tell if `other_obj` aliases `self` or which class's `save`
 //! resolves.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::dialect::{LibraryClass, MethodReceiver};
 use crate::expr::{Expr, ExprNode, LValue};

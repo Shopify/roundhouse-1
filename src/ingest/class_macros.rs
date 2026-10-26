@@ -30,7 +30,7 @@
 //! was and reports it, rather than dropping the methods it would have
 //! defined.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem, Param};
@@ -67,7 +67,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
             })
         })
         .collect();
-    let mut module_methods: HashMap<String, Vec<MethodDef>> = HashMap::new();
+    let mut module_methods: HashMap<String, Vec<MethodDef>> = HashMap::default();
     for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
         module_methods.entry(lc.name.0.as_str().to_string()).or_default().extend(lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).cloned());
     }
@@ -111,7 +111,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
         let model = &app.models[model_index];
         // Not one this can follow: a class that redefines the definers, or a macro also called where the class body does not always run it.
         let redefined = table.contains_key(&Symbol::from("define_method")) || table.contains_key(&Symbol::from("define_singleton_method"));
-        let mut nested: HashSet<Symbol> = HashSet::new();
+        let mut nested: HashSet<Symbol> = HashSet::default();
         for item in &model.body {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
             let root = match &*expr.node {
@@ -133,11 +133,11 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
         let own: HashSet<(Symbol, MethodReceiver)> = model.methods().map(|m| (m.name.clone(), m.receiver)).collect();
         let prefix = slot_prefix(model.name.0.as_str());
         let mut counter = 0usize;
-        let mut defined: HashSet<(Symbol, MethodReceiver)> = HashSet::new();
+        let mut defined: HashSet<(Symbol, MethodReceiver)> = HashSet::default();
         let mut reserved: Option<HashSet<Symbol>> = None;
-        let mut expansions: HashMap<usize, Vec<ModelBodyItem>> = HashMap::new();
+        let mut expansions: HashMap<usize, Vec<ModelBodyItem>> = HashMap::default();
         let mut defaults: indexmap::IndexMap<Symbol, Expr> = indexmap::IndexMap::new();
-        let mut extended: HashSet<ClassId> = HashSet::new();
+        let mut extended: HashSet<ClassId> = HashSet::default();
         let mut included: Vec<String> = app.load_hook_class_macros.iter().map(|id| id.0.as_str().to_string()).collect();
         for id in ancestors.iter().chain(std::iter::once(&model.name)) {
             for item in app.models.iter().filter(|m| &m.name == id).flat_map(|m| m.body.iter()) {
@@ -161,7 +161,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
             if !macros.contains(method) || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
                 continue;
             }
-            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::new(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::new(), class_attrs: HashMap::new(), unset_cattrs: HashMap::new(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::new(), owner: model.name.0.clone(), sources };
+            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: model.name.0.clone(), sources };
             let result = if block.is_some() {
                 Err("it is passed a block".to_string())
             } else if redefined {
@@ -171,7 +171,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
             } else if !call_syntax_kept(expr, sources) {
                 Err("its arguments use a splat or a block argument".to_string())
             } else {
-                run.call(method, args, &HashMap::new(), 0)
+                run.call(method, args, &HashMap::default(), 0)
             }
             .and_then(|()| {
                 for m in &run.methods {
@@ -273,17 +273,17 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
             .flat_map(|c| c.includes.iter().map(|i| i.0.as_str().trim_start_matches("::").to_string()))
             .collect();
         let mut counter = 0usize;
-        let mut defined: HashSet<(Symbol, MethodReceiver)> = HashSet::new();
+        let mut defined: HashSet<(Symbol, MethodReceiver)> = HashSet::default();
         let mut added: Vec<MethodDef> = Vec::new();
-        let mut consumed: HashSet<usize> = HashSet::new();
-        let mut expanded: HashMap<Symbol, usize> = HashMap::new();
-        let mut failed: HashSet<Symbol> = HashSet::new();
+        let mut consumed: HashSet<usize> = HashSet::default();
+        let mut expanded: HashMap<Symbol, usize> = HashMap::default();
+        let mut failed: HashSet<Symbol> = HashSet::default();
         for (index, expr) in lc.unknown_calls.iter().enumerate() {
             let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { continue };
             if !macros.contains(method) || recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
                 continue;
             }
-            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::new(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::new(), class_attrs: HashMap::new(), unset_cattrs: HashMap::new(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::new(), owner: lc.name.0.clone(), sources };
+            let mut run = Run { table: &table, constants: &constants, frozen: &frozen, cvar_readers: &cvar_readers, included: included.clone(), module_methods: &module_methods, extended: HashMap::default(), evaluated: Vec::new(), known: &known, scope: None, prefix: &prefix, counter, out: Vec::new(), replayed: HashSet::default(), class_attrs: HashMap::default(), unset_cattrs: HashMap::default(), methods: Vec::new(), aliases: Vec::new(), strings: HashMap::default(), owner: lc.name.0.clone(), sources };
             let result = if block.is_some() {
                 Err("it is passed a block".to_string())
             } else if redefined {
@@ -291,7 +291,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
             } else if !call_syntax_kept(expr, sources) {
                 Err("its arguments use a splat or a block argument".to_string())
             } else {
-                run.call(method, args, &HashMap::new(), 0)
+                run.call(method, args, &HashMap::default(), 0)
             }
             .and_then(|()| {
                 // Not a plain class's to carry: what a model's expansion places in its body.
@@ -344,7 +344,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
 
 pub(crate) fn hook_macro_calls(app: &App) -> HashSet<Symbol> {
     let hooks = hook_macro_table(app);
-    let mut called = HashSet::new();
+    let mut called = HashSet::default();
     for model in &app.models {
         for item in &model.body {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
@@ -381,7 +381,7 @@ pub(crate) fn drop_expanded_hook_macros(app: &mut App, expanded: &HashSet<Symbol
         .filter(|m| !expanded.contains(&m.name) && !implicitly_called(m.name.as_str()) && !mentioned(m.name.as_str(), sources))
         .map(|m| m.name.clone())
         .collect();
-    let mut called: HashSet<Symbol> = HashSet::new();
+    let mut called: HashSet<Symbol> = HashSet::default();
     let mut note = |e: &Expr| {
         visit(e, &mut |x| {
             if let ExprNode::Send { method, .. } = &*x.node
@@ -424,7 +424,7 @@ pub(crate) fn drop_expanded_hook_macros(app: &mut App, expanded: &HashSet<Symbol
 /// every model: an included module's class methods, an extended
 /// module's instance methods, each as a class method of the model.
 fn hook_macro_table(app: &App) -> HashMap<Symbol, MethodDef> {
-    let mut table = HashMap::new();
+    let mut table = HashMap::default();
     let sources = app
         .load_hook_class_macros
         .iter()
@@ -448,7 +448,7 @@ fn hook_macro_table(app: &App) -> HashMap<Symbol, MethodDef> {
 /// exists, so a call to it anywhere (or a `class_variable_set` naming
 /// the variable) keeps the reader a value known only when it runs.
 fn frozen_readers(app: &App, sources: &[SourceFile]) -> HashMap<(String, Symbol), Expr> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     // Not computed up front: it scans every source per method, and most apps have no frozen reader to ask about.
     let dead: std::cell::OnceCell<Vec<(usize, usize, usize)>> = std::cell::OnceCell::new();
     for class in &app.library_classes {
@@ -685,7 +685,7 @@ fn ancestors(app: &App, parents: &HashMap<ClassId, ClassId>, model: &ClassId) ->
 
 /// The class methods the ancestors define, the nearest one's winning.
 fn class_method_table(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, MethodDef> {
-    let mut table = HashMap::new();
+    let mut table = HashMap::default();
     for id in ancestors.iter().rev() {
         let methods: Vec<&MethodDef> = match app.models.iter().find(|m| &m.name == id) {
             Some(model) => model.methods().collect(),
@@ -723,7 +723,7 @@ fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 /// Constants the ancestors assign a list of Strings or Symbols
 /// (`PROTECTED_KEYS = %w[var value].freeze`), for a guard that reads one.
 fn literal_constants(app: &App, ancestors: &[ClassId]) -> HashMap<Symbol, Expr> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for id in ancestors.iter().rev() {
         let assigned: Vec<(Symbol, Expr)> = match app.models.iter().find(|m| &m.name == id) {
             Some(model) => model
@@ -859,7 +859,7 @@ impl Run<'_> {
         };
         let mut keywords: HashMap<Symbol, Expr> = keywords.into_iter().collect();
         let mut positional = positional.iter();
-        let mut bound = Env::new();
+        let mut bound = Env::default();
         let required_after_rest = |at: usize| def.params[at + 1..].iter().filter(|p| !p.keyword && !p.from_keyword && p.default.is_none() && !p.rest).count();
         for (at, p) in def.params.iter().enumerate() {
             if p.rest {
@@ -1068,7 +1068,7 @@ impl Run<'_> {
                         Err(format!("it declares a `{}` whose name is built from its arguments", method.as_str()))
                     }
                     name if CLASS_BODY_DECLARATIONS.contains(&name) && block.is_none() && self.method_def(method).is_none() => {
-                        let declared = self.substitute(st, env, &HashSet::new())?;
+                        let declared = self.substitute(st, env, &HashSet::default())?;
                         if matches!(name, "cattr_accessor" | "cattr_reader" | "mattr_accessor" | "mattr_reader")
                             && let ExprNode::Send { args, .. } = &*declared.node
                             && let [arg] = args.as_slice()
@@ -1184,7 +1184,7 @@ impl Run<'_> {
             }
             // The class's own state: run where the macro runs, in the calling class's body.
             _ if touches_class_state(st) => {
-                let substituted = self.substitute(st, env, &HashSet::new())?;
+                let substituted = self.substitute(st, env, &HashSet::default())?;
                 self.out.push(substituted);
                 Ok(false)
             }
@@ -1287,7 +1287,7 @@ impl Run<'_> {
         for p in extra_params {
             let mut p = p.clone();
             if let Some(d) = &p.default {
-                p.default = Some(self.substitute(d, env, &HashSet::new())?);
+                p.default = Some(self.substitute(d, env, &HashSet::default())?);
             }
             method_params.push(p);
         }
@@ -1323,7 +1323,7 @@ impl Run<'_> {
         if let Some(v) = self.fold(e, env) {
             return Ok(v);
         }
-        let value = self.substitute(e, env, &HashSet::new())?;
+        let value = self.substitute(e, env, &HashSet::default())?;
         let truthy = matches!(&*value.node, ExprNode::Hash { .. } | ExprNode::Array { .. } | ExprNode::StringInterp { .. }).then_some(true);
         Ok(Val::Slot { name: self.slot(value), truthy })
     }
@@ -1659,7 +1659,7 @@ impl Run<'_> {
         e.node.for_each_child_mut(&mut |c| self.substitute_in(c, env, shadow, failed));
         // Only a name being spelled (`:"#{name}="`): other folds read the macro owner's constants, not this body's.
         if (matches!(&*e.node, ExprNode::StringInterp { .. }) || matches!(&*e.node, ExprNode::Send { method, .. } if method.as_str() == "to_sym"))
-            && let Some(Val::Lit(folded)) = self.fold(e, &Env::new())
+            && let Some(Val::Lit(folded)) = self.fold(e, &Env::default())
         {
             *e = folded;
         }
@@ -1724,7 +1724,7 @@ fn definition_syntax_kept(statement: &Expr, sources: &[SourceFile]) -> bool {
     if parsed.errors().next().is_some() {
         return false;
     }
-    struct Erased(bool, std::collections::HashSet<usize>);
+    struct Erased(bool, crate::det::HashSet<usize>);
     impl<'pr> ruby_prism::Visit<'pr> for Erased {
         fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
             for e in node.exceptions().iter() {

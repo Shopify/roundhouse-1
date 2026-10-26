@@ -77,8 +77,8 @@ pub(super) fn extras_from_funcs(
     funcs: &[crate::dialect::LibraryFunction],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
     use crate::ident::{ClassId, Symbol};
-    let mut grouped: std::collections::HashMap<ClassId, crate::analyze::ClassInfo> =
-        std::collections::HashMap::new();
+    let mut grouped: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
     for func in funcs {
         let raw = func
             .module_path
@@ -238,10 +238,10 @@ fn synthesize_module_lc(
 pub(super) fn extras_from_lcs(
     lcs: &[LibraryClass],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
-    let mut grouped: std::collections::HashMap<
+    let mut grouped: crate::det::HashMap<
         crate::ident::ClassId,
         crate::analyze::ClassInfo,
-    > = std::collections::HashMap::new();
+    > = crate::det::HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = crate::lower::class_info_from_library_class(lc);

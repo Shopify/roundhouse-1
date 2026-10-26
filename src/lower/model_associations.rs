@@ -97,7 +97,7 @@ pub fn compute_association_graph(app: &App) -> Vec<AssociationEdge> {
             edges.push(lift_edge(model.name.clone(), assoc));
         }
     }
-    let known_models: std::collections::HashSet<&ClassId> =
+    let known_models: crate::det::HashSet<&ClassId> =
         app.models.iter().map(|m| &m.name).collect();
     annotate_resolutions(&mut edges, &known_models);
     edges
@@ -199,7 +199,7 @@ fn lift_edge_shape(from: ClassId, assoc: &Association) -> AssociationEdge {
 /// practice.
 fn annotate_resolutions(
     edges: &mut [AssociationEdge],
-    known_models: &std::collections::HashSet<&ClassId>,
+    known_models: &crate::det::HashSet<&ClassId>,
 ) {
     let adjacency = build_adjacency(edges);
     for edge in edges.iter_mut() {
@@ -214,9 +214,9 @@ fn annotate_resolutions(
 
 fn build_adjacency(
     edges: &[AssociationEdge],
-) -> std::collections::HashMap<ClassId, Vec<ClassId>> {
-    let mut adj: std::collections::HashMap<ClassId, Vec<ClassId>> =
-        std::collections::HashMap::new();
+) -> crate::det::HashMap<ClassId, Vec<ClassId>> {
+    let mut adj: crate::det::HashMap<ClassId, Vec<ClassId>> =
+        crate::det::HashMap::default();
     for edge in edges {
         adj.entry(edge.from.clone()).or_default().push(edge.to.clone());
     }
@@ -227,9 +227,9 @@ fn build_adjacency(
 fn reachable(
     start: &ClassId,
     target: &ClassId,
-    adjacency: &std::collections::HashMap<ClassId, Vec<ClassId>>,
+    adjacency: &crate::det::HashMap<ClassId, Vec<ClassId>>,
 ) -> bool {
-    let mut seen: std::collections::HashSet<&ClassId> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<&ClassId> = crate::det::HashSet::default();
     let mut frontier: Vec<&ClassId> = vec![start];
     while let Some(node) = frontier.pop() {
         if !seen.insert(node) {

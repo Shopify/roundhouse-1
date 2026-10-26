@@ -7,7 +7,7 @@
 //! lowered-IR coverage, transpiled-runtime call shapes).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::expr::{desugar_op_assign, Expr, ExprNode, IrHint, Literal};
@@ -127,10 +127,10 @@ impl EmitCtx {
         Self {
             class_name: None,
             in_class_method: false,
-            var_renames: HashMap::new(),
-            declared: Rc::new(RefCell::new(HashSet::new())),
-            boxed_locals: Rc::new(RefCell::new(HashSet::new())),
-            optional_locals: Rc::new(RefCell::new(HashMap::new())),
+            var_renames: HashMap::default(),
+            declared: Rc::new(RefCell::new(HashSet::default())),
+            boxed_locals: Rc::new(RefCell::new(HashSet::default())),
+            optional_locals: Rc::new(RefCell::new(HashMap::default())),
             void_method: false,
             in_module_singleton: false,
             self_methods: None,
@@ -681,7 +681,7 @@ fn emit_ensure_only(ctx: &EmitCtx, body: &Expr, ensure: &Expr, ty: Option<&Ty>) 
     } else {
         inner.return_ty = ty.cloned();
     }
-    let mut ensure_reads = HashSet::new();
+    let mut ensure_reads = HashSet::default();
     collect_var_reads(ensure, &mut ensure_reads);
     let mut out = String::new();
     let stmts: Vec<&Expr> = match &*body.node {
@@ -4316,7 +4316,7 @@ thread_local! {
 }
 
 thread_local! {
-    static ERROR_CLASSES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static ERROR_CLASSES: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
 }
 
 pub(super) fn reset_error_classes() {

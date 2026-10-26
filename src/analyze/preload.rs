@@ -44,7 +44,8 @@
 //!   `with_attached_image`) — the attachment is an association under
 //!   another name, and the read is `attached?`/`variant` per row.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
@@ -86,10 +87,10 @@ struct ModelIndex<'a> {
 
 impl<'a> ModelIndex<'a> {
     fn build(app: &'a App) -> Self {
-        let mut assocs: HashMap<ClassId, BTreeSet<Symbol>> = HashMap::new();
-        let mut decls: HashMap<ClassId, Vec<&'a crate::dialect::Association>> = HashMap::new();
-        let mut scopes: HashMap<ClassId, HashMap<Symbol, &'a Scope>> = HashMap::new();
-        let mut attachments: HashMap<ClassId, HashMap<Symbol, Symbol>> = HashMap::new();
+        let mut assocs: HashMap<ClassId, BTreeSet<Symbol>> = HashMap::default();
+        let mut decls: HashMap<ClassId, Vec<&'a crate::dialect::Association>> = HashMap::default();
+        let mut scopes: HashMap<ClassId, HashMap<Symbol, &'a Scope>> = HashMap::default();
+        let mut attachments: HashMap<ClassId, HashMap<Symbol, Symbol>> = HashMap::default();
         let concern_items = &app.concern_model_items;
         for model in &app.models {
             let a = assocs.entry(model.name.clone()).or_default();
@@ -123,18 +124,18 @@ impl<'a> ModelIndex<'a> {
             }
         }
         let mut index =
-            ModelIndex { assocs, decls, scopes, attachments, chain_methods: HashMap::new() };
+            ModelIndex { assocs, decls, scopes, attachments, chain_methods: HashMap::default() };
         // Second pass: methods whose tail is a chain, harvested against
         // the associations/scopes just indexed. A method body binds no
         // env of its own here (locals feeding the tail — the tutorial's
         // `following_ids = "…"; Micropost.where(…)` — are SQL strings,
         // not chains).
-        let mut chain_methods: HashMap<ClassId, HashMap<Symbol, ChainInfo>> = HashMap::new();
+        let mut chain_methods: HashMap<ClassId, HashMap<Symbol, ChainInfo>> = HashMap::default();
         for model in &app.models {
             for method in model.methods() {
                 let tail = body_tail(&method.body);
                 if let info @ ChainInfo::Known { .. } =
-                    harvest_chain(tail, &index, &HashMap::new(), 0)
+                    harvest_chain(tail, &index, &HashMap::default(), 0)
                 {
                     chain_methods
                         .entry(model.name.clone())
@@ -319,7 +320,7 @@ pub fn missing_preload_report(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     }
     for model in &app.models {
         for method in model.methods() {
-            let mut env = HashMap::new();
+            let mut env = HashMap::default();
             walk_body(&method.body, &index, &mut env, app, None, &mut out, &mut cov);
         }
     }
@@ -849,8 +850,8 @@ fn build_view_envs(
     app: &App,
     index: &ModelIndex,
 ) -> HashMap<Symbol, HashMap<Symbol, ChainInfo>> {
-    let mut envs: HashMap<Symbol, HashMap<Symbol, ChainInfo>> = HashMap::new();
-    let mut seen_feeders: HashMap<Symbol, u32> = HashMap::new();
+    let mut envs: HashMap<Symbol, HashMap<Symbol, ChainInfo>> = HashMap::default();
+    let mut seen_feeders: HashMap<Symbol, u32> = HashMap::default();
     for controller in &app.controllers {
         for action in controller.actions() {
             let Some(view) = super::view_name_for_action(&controller.name, action) else {
@@ -876,7 +877,7 @@ fn build_view_envs(
     // render graph is shallow and a cycle would only re-intersect).
     for _ in 0..4 {
         let mut next = envs.clone();
-        let mut seen: HashMap<Symbol, u32> = HashMap::new();
+        let mut seen: HashMap<Symbol, u32> = HashMap::default();
         for (renderer, partials) in &app.render_edges {
             let Some(renv) = envs.get(renderer) else { continue };
             for partial in partials {
@@ -921,10 +922,10 @@ fn controller_ivar_env(
     controller: &crate::dialect::Controller,
     index: &ModelIndex,
 ) -> HashMap<Symbol, ChainInfo> {
-    let mut merged: HashMap<Symbol, ChainInfo> = HashMap::new();
+    let mut merged: HashMap<Symbol, ChainInfo> = HashMap::default();
     let mut dropped: BTreeSet<Symbol> = BTreeSet::new();
     for action in controller.actions() {
-        let mut local: HashMap<Symbol, ChainInfo> = HashMap::new();
+        let mut local: HashMap<Symbol, ChainInfo> = HashMap::default();
         harvest_assignments(&action.body, index, &mut local);
         for (k, v) in local {
             if dropped.contains(&k) {

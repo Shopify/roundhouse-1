@@ -630,7 +630,7 @@ pub(super) fn emit_instance_method(
         // the request dispatcher) — would otherwise reference
         // undeclared locals at the Self literal site. Emit a default-
         // initialized let binding for each so the literal compiles.
-        let assigned: std::collections::HashSet<String> =
+        let assigned: crate::det::HashSet<String> =
             collect_ivars_assigned_in_body(&m.body);
         for (fname, fty) in ivars {
             if !assigned.contains(fname) {
@@ -655,9 +655,9 @@ pub(super) fn emit_instance_method(
 /// to find ivars the body didn't touch so the closing `Self { ... }`
 /// literal can default-init them rather than referencing undeclared
 /// locals.
-fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> std::collections::HashSet<String> {
+fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> crate::det::HashSet<String> {
     use crate::expr::{ExprNode, LValue};
-    fn walk(e: &crate::expr::Expr, out: &mut std::collections::HashSet<String>) {
+    fn walk(e: &crate::expr::Expr, out: &mut crate::det::HashSet<String>) {
         match &*e.node {
             ExprNode::Assign { target: LValue::Ivar { name }, value } => {
                 out.insert(name.as_str().to_string());
@@ -713,7 +713,7 @@ fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> std::collections:
             _ => {}
         }
     }
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     walk(body, &mut out);
     out
 }
@@ -771,8 +771,8 @@ fn default_value_for_ty(ty: &Ty) -> String {
 /// into `emit_assign`'s coercion logic — the body-typer doesn't
 /// always set the Option-ness on Var reads, so the param table is
 /// the authoritative source.
-fn collect_param_types(m: &MethodDef) -> std::collections::HashMap<String, Ty> {
-    let mut out = std::collections::HashMap::new();
+fn collect_param_types(m: &MethodDef) -> crate::det::HashMap<String, Ty> {
+    let mut out = crate::det::HashMap::default();
     let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
         return out;
     };

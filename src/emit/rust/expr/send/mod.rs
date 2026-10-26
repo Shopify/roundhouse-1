@@ -724,8 +724,8 @@ fn unpack_trailing_kwargs(
     // Index the Hash literal's entries by key-name. Accept both Symbol
     // and String literal keys (Ruby kwargs surface either way through
     // the parser depending on call shape).
-    let mut by_name: std::collections::HashMap<String, &Expr> =
-        std::collections::HashMap::new();
+    let mut by_name: crate::det::HashMap<String, &Expr> =
+        crate::det::HashMap::default();
     for (k, v) in entries.iter() {
         let name = match &*k.node {
             ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),

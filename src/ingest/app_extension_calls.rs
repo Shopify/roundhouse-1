@@ -13,7 +13,7 @@
 //! condition (`plugins.each { |p| load_settings(p) }`) is not one the
 //! replay can carry whole, and stays dropped and reported.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::App;
 use crate::dialect::{MethodReceiver, ModelBodyItem};

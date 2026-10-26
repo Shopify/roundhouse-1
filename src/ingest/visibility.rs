@@ -1,7 +1,7 @@
 //! Resolve local visibility while declaration order and lexical scopes still
 //! exist. Never replay these calls from LibraryClass::unknown_calls.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use ruby_prism::{CallNode, Node};
 
@@ -188,7 +188,7 @@ impl Visibility {
         // `prism::scope` would duplicate located Parse diagnostics.
         let parsed = super::prism::parse_silent(source.as_bytes());
         let root = parsed.node();
-        let mut defaults = HashMap::new();
+        let mut defaults = HashMap::default();
         let bodies = super::util::find_all_classes_with_scope(&root)
             .into_iter()
             .filter_map(|(_, class)| class.body())
@@ -257,7 +257,7 @@ impl Visibility {
     }
 
     // Not dropped with the nested scope that wrote it: `class << self; private :recent; end` has no body statement to carry it.
-    pub(super) fn uncarried_inherited(&self, carried: &std::collections::HashSet<usize>, file: &str) -> IngestResult<()> {
+    pub(super) fn uncarried_inherited(&self, carried: &crate::det::HashSet<usize>, file: &str) -> IngestResult<()> {
         match self.inherited.iter().find(|(_, _, at)| !carried.contains(at)) {
             Some((_, name, _)) => Err(Self::undefined(file, name)),
             None => Ok(()),

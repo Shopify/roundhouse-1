@@ -6,7 +6,7 @@
 //! `::JSON` (Const path `["", "JSON"]`). Bare YAML `serialize :prefs`,
 //! custom coders, and Array/Hash positional classes stay unclaimed.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::dialect::{Model, ModelBodyItem};
 use crate::expr::{ExprNode, Literal, LValue};
