@@ -14,6 +14,7 @@ pub mod catalog;
 pub mod check_report;
 pub mod diagnostic;
 pub mod dialect;
+pub mod det;
 pub mod effect;
 pub mod emit;
 pub mod erb;

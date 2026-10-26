@@ -29,6 +29,8 @@ sha1 = "0.10"
 regex = "1"
 serde_yaml_ng = "0.10"
 indexmap = { version = "2", features = ["serde"] }
+# Seedless hasher behind `det::HashMap`: iteration order is the same every run.
+rustc-hash = "2.1"
 # Prism 2.0.0 + rubydex v0.4.2 (Prism 2 consumer). Location/message/recovery
 # adapters live in `src/ingest/prism_api.rs`.
 ruby-prism = "2.0.0"
