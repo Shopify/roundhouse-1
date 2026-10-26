@@ -128,6 +128,7 @@ mod visibility;
 mod zeitwerk;
 
 pub use app::{ingest_app, ingest_app_from_tree, ingest_app_with_vfs};
+pub use concern_accessors::{defer as defer_accessor_surface, DeferredAccessorSurface};
 pub use controller::ingest_controller;
 pub use expr::ingest_expr;
 pub use fixture::ingest_fixture_file;

@@ -570,18 +570,38 @@ pub(super) fn validate(
         probed.insert(model.clone());
         false
     });
-    let surfaces = if probed.is_empty() {
-        HashMap::default()
+    let refused = if !probed.is_empty() && super::survey::is_active() && DEFERRAL.with(|state| matches!(*state.borrow(), Deferral::Armed)) {
+        // Deferred: refuse every probed name now, exactly as the probe
+        // would if each were occupied, and leave the caller to confirm
+        // that against the app it analyzes ([`DeferredAccessorSurface`]).
+        let mut names = Vec::new();
+        let refused = refusals(app, &spans, &mut |model, name, writer| {
+            names.push((model.clone(), name.clone(), writer.clone()));
+            true
+        });
+        let oracle = std::env::var_os("ROUNDHOUSE_ACCESSOR_SURFACE_ORACLE").map(|_| {
+            let surfaces = crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed);
+            names.iter().all(|(model, name, writer)| occupied(&surfaces, model, name, writer))
+        });
+        let deferred = DeferredAccessorSurface {
+            selected: crate::lower::model_to_library::accessor_surface::selection(app, &probed),
+            source_ivars: crate::lower::model_to_library::accessor_surface::source_ivars(app),
+            inheritance: crate::lower::model_to_library::accessor_surface::Inheritance::of(app, &probed),
+            names,
+            oracle,
+        };
+        DEFERRAL.with(|state| *state.borrow_mut() = Deferral::Taken(deferred));
+        refused
     } else {
-        crate::timings::phase("concern-accessor-surface", || {
-            crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
-        })
+        let surfaces = if probed.is_empty() {
+            HashMap::default()
+        } else {
+            crate::timings::phase("concern-accessor-surface", || {
+                crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
+            })
+        };
+        refusals(app, &spans, &mut |model, name, writer| occupied(&surfaces, model, name, writer))
     };
-    let refused = refusals(app, &spans, &mut |model, name, writer| {
-        surfaces[model]
-            .as_ref()
-            .is_none_or(|names| names.contains(name) || names.contains(writer))
-    });
     let mut rejections = Vec::new();
     for (model_index, refused) in refused {
         let mut rejected = HashSet::default();
@@ -600,6 +620,90 @@ pub(super) fn validate(
         app.models[index].body.retain(|item| !matches!(item, ModelBodyItem::Unknown { expr, .. } if rejected.contains(&expr.span)));
     }
     Ok(())
+}
+
+fn occupied(
+    surfaces: &HashMap<ClassId, Option<HashSet<Symbol>>>,
+    model: &ClassId,
+    name: &Symbol,
+    writer: &Symbol,
+) -> bool {
+    surfaces[model]
+        .as_ref()
+        .is_none_or(|names| names.contains(name) || names.contains(writer))
+}
+
+enum Deferral {
+    Off,
+    Armed,
+    Taken(DeferredAccessorSurface),
+}
+
+thread_local! {
+    static DEFERRAL: std::cell::RefCell<Deferral> = const { std::cell::RefCell::new(Deferral::Off) };
+}
+
+/// Run a survey-mode `ingest` without the surface probe's whole-app clone
+/// and second analysis, for a caller that analyzes the result itself.
+///
+/// Ingest refuses each name the probe would read, as the probe does for
+/// an occupied name. The caller runs `session::analyze_and_lower` on the
+/// app and then [`DeferredAccessorSurface::confirm`]: when every one of
+/// those names is occupied on the analyzed app too, the ingested app is
+/// the one the probe would have produced. Otherwise the caller ingests
+/// again without deferring. Outside survey mode, or when no name reaches
+/// the probe, ingest runs as usual and this returns `None`.
+pub fn defer<T>(ingest: impl FnOnce() -> T) -> (T, Option<DeferredAccessorSurface>) {
+    let previous = DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), Deferral::Armed));
+    let result = ingest();
+    let deferred = match DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), previous)) {
+        Deferral::Taken(deferred) => Some(deferred),
+        _ => None,
+    };
+    (result, deferred)
+}
+
+/// The surface observation [`defer`] postponed: the probed models, the
+/// names it refused on them, and what the observation reads from the
+/// app as ingest left it.
+pub struct DeferredAccessorSurface {
+    selected: HashSet<ClassId>,
+    source_ivars: HashSet<(Span, Symbol)>,
+    inheritance: crate::lower::model_to_library::accessor_surface::Inheritance,
+    names: Vec<(ClassId, Symbol, Symbol)>,
+    /// With `ROUNDHOUSE_ACCESSOR_SURFACE_ORACLE` set: whether the probe
+    /// found every name occupied.
+    oracle: Option<bool>,
+}
+
+impl DeferredAccessorSurface {
+    /// Whether `analyzed`, the ingested app after `analyze_and_lower`,
+    /// occupies every refused name, so that each refusal stands.
+    pub fn confirm(self, analyzed: &App) -> bool {
+        let (surfaces, _) = crate::emit::diagnostics::scope(|| {
+            crate::lower::model_to_library::accessor_surface::observe_analyzed(
+                analyzed,
+                &self.selected,
+                &self.source_ivars,
+            )
+        });
+        let confirmed = self.inheritance.apply(surfaces).is_some_and(|surfaces| {
+            self.names.iter().all(|(model, name, writer)| {
+                surfaces.contains_key(model) && occupied(&surfaces, model, name, writer)
+            })
+        });
+        match self.oracle {
+            Some(probe) if probe != confirmed => {
+                eprintln!(
+                    "roundhouse: concern-accessor-surface: the analyzed app {} every refused name, the probe {}",
+                    if confirmed { "occupies" } else { "does not occupy" },
+                    if probe { "does" } else { "does not" },
+                );
+                false
+            }
+            _ => confirmed,
+        }
+    }
 }
 
 /// Each carried model's refused declarations with their messages, in

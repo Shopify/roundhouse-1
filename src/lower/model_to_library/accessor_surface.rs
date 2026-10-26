@@ -7,6 +7,9 @@
 //! masked synthesis of candidates/ancestors, and two Ruby adaptations.
 //! Observe before ingest returns: source-shaped check/editor consumers
 //! deliberately do not run the real post-lowering pipeline themselves.
+//! A caller that analyzes the app itself can instead observe the app it
+//! analyzed ([`observe_analyzed`]), with no clone and no second analysis
+//! (`ingest::concern_accessors::defer`).
 
 use crate::det::{HashMap, HashSet};
 
@@ -84,6 +87,11 @@ pub(crate) fn occupied_surfaces(
     app: &App,
     requested: &HashSet<ClassId>,
 ) -> HashMap<ClassId, Option<HashSet<Symbol>>> {
+    observe(app, requested, &selection(app, requested))
+}
+
+/// The requested models and their model ancestors: what is materialized.
+pub(crate) fn selection(app: &App, requested: &HashSet<ClassId>) -> HashSet<ClassId> {
     let models: HashMap<_, _> = app.models.iter().map(|m| (m.name.clone(), m)).collect();
     let mut selected = HashSet::default();
     let mut pending: Vec<_> = requested.iter().cloned().collect();
@@ -97,7 +105,15 @@ pub(crate) fn occupied_surfaces(
             }
         }
     }
-    observe(app, requested, &selected)
+    selected
+}
+
+/// Original ivar occurrences, read before analysis: generated storage is
+/// what the producers add beyond these.
+pub(crate) fn source_ivars(app: &mut App) -> HashSet<(Span, Symbol)> {
+    let mut source_ivars = HashSet::default();
+    crate::lower::for_each_hook_body(app, &mut |body| ivars(body, &mut source_ivars));
+    source_ivars
 }
 
 /// Selection restricts materialization, never typing or demand inputs.
@@ -112,101 +128,133 @@ fn observe(
     // including permit collection. Preserve original whole-app demand.
     let (surfaces, _) = crate::emit::diagnostics::scope(|| {
         let mut probe = app.clone();
-        let mut source_ivars = HashSet::default();
-        crate::lower::for_each_hook_body(&mut probe, &mut |body| ivars(body, &mut source_ivars));
+        let source_ivars = source_ivars(&mut probe);
         // Faithful lookup is essential: removing a local accessor here
         // could select an inherited reader of a different type and hide
         // a real post-analysis producer (e.g. the JSON writer).
         crate::session::analyze_and_lower(&mut probe);
-        let models: HashMap<_, _> = probe.models.iter().map(|m| (m.name.clone(), m)).collect();
-        let (mut classes, _) = crate::emit::ruby::materialize_models(
-            &probe,
-            super::Materialization::AccessorProbe(selected),
-        );
-        let mut surfaces = HashMap::default();
-        collect_surfaces(&classes, &models, &source_ivars, &mut surfaces);
-        // Late producers can also yield to user overrides. Observe a
-        // generated-only vector and an independent source-bearing one:
-        // the latter retains inputs needed for derived helper clones.
-        {
-            let mut generated = classes.clone();
-            for class in &mut generated {
-                if let Some(model) = models.get(&class.name) {
-                    class
-                        .methods
-                        .retain(|method| !is_source_method(model, method));
-                }
-            }
-            crate::emit::ruby::apply_model_lowering(&mut generated, &probe);
-            collect_surfaces(&generated, &models, &source_ivars, &mut surfaces);
-        }
-        crate::emit::ruby::apply_model_lowering(&mut classes, &probe);
-        collect_surfaces(&classes, &models, &source_ivars, &mut surfaces);
-        surfaces
+        observe_analyzed(&probe, selected, &source_ivars)
     });
-    inherit_surfaces(app, requested, surfaces)
+    Inheritance::of(app, requested)
+        .apply(surfaces)
+        .expect("every requested model is materialized")
 }
 
-fn inherit_surfaces(
-    app: &App,
-    requested: &HashSet<ClassId>,
-    mut surfaces: HashMap<ClassId, HashSet<Symbol>>,
-) -> HashMap<ClassId, Option<HashSet<Symbol>>> {
-    static BASE_SURFACE: std::sync::OnceLock<HashSet<Symbol>> = std::sync::OnceLock::new();
-    let base = BASE_SURFACE.get_or_init(|| {
-        let methods = crate::runtime_src::parse_methods(include_str!(
-            "../../../runtime/ruby/active_record/base.rb"
-        ))
-        .expect("framework Base method bodies must ingest");
-        let mut base = HashSet::default();
-        for method in methods {
-            if method.receiver == MethodReceiver::Instance {
-                base.insert(method.name.clone());
-                generated_ivars(&method.body, &HashSet::default(), &mut base);
+/// The generated ownership of the `selected` models of an app that
+/// `analyze_and_lower` has run on, before inheritance.
+pub(crate) fn observe_analyzed(
+    analyzed: &App,
+    selected: &HashSet<ClassId>,
+    source_ivars: &HashSet<(Span, Symbol)>,
+) -> HashMap<ClassId, HashSet<Symbol>> {
+    let models: HashMap<_, _> = analyzed.models.iter().map(|m| (m.name.clone(), m)).collect();
+    let (mut classes, _) = crate::emit::ruby::materialize_models(
+        analyzed,
+        super::Materialization::AccessorProbe(selected),
+    );
+    let mut surfaces = HashMap::default();
+    collect_surfaces(&classes, &models, source_ivars, &mut surfaces);
+    // Late producers can also yield to user overrides. Observe a
+    // generated-only vector and an independent source-bearing one:
+    // the latter retains inputs needed for derived helper clones.
+    {
+        let mut generated = classes.clone();
+        for class in &mut generated {
+            if let Some(model) = models.get(&class.name) {
+                class
+                    .methods
+                    .retain(|method| !is_source_method(model, method));
             }
         }
-        base
-    });
-    // Every includer also inherits its ancestors' generated ownership.
-    // Read the unmerged sets so traversal order cannot affect admission.
-    let own = surfaces.clone();
-    let mut models = HashMap::default();
-    let mut ambiguous = HashSet::default();
-    for model in &app.models {
-        if models.insert(model.name.clone(), model).is_some() {
-            ambiguous.insert(model.name.clone());
-        }
+        crate::emit::ruby::apply_model_lowering(&mut generated, analyzed);
+        collect_surfaces(&generated, &models, source_ivars, &mut surfaces);
     }
-    for model in models.values().filter(|m| requested.contains(&m.name)) {
-        let occupied = surfaces.get_mut(&model.name).unwrap();
-        occupied.extend(base.iter().cloned());
-        let mut seen = HashSet::default();
-        let mut parent = model.parent.as_ref();
-        while let Some(id) = parent {
-            if !seen.insert(id.clone()) {
-                break;
+    crate::emit::ruby::apply_model_lowering(&mut classes, analyzed);
+    collect_surfaces(&classes, &models, source_ivars, &mut surfaces);
+    surfaces
+}
+
+/// What each requested model inherits and whether it may admit at all,
+/// read from the app as ingest left it (before any analysis).
+pub(crate) struct Inheritance(Vec<(ClassId, bool, Vec<ClassId>)>);
+
+impl Inheritance {
+    pub(crate) fn of(app: &App, requested: &HashSet<ClassId>) -> Self {
+        let mut models = HashMap::default();
+        let mut ambiguous = HashSet::default();
+        for model in &app.models {
+            if models.insert(model.name.clone(), model).is_some() {
+                ambiguous.insert(model.name.clone());
             }
-            if let Some(names) = own.get(id) {
-                occupied.extend(names.iter().cloned());
-            }
-            parent = models.get(id).and_then(|m| m.parent.as_ref());
         }
+        // Eligibility changes the result, never the synthesis inputs or
+        // ancestor/demand inventory: abstract bases still own storage.
+        // Emission does not merge model reopenings: a later definition can
+        // overwrite the file carrying an earlier one's admitted accessors.
+        Self(
+            models
+                .values()
+                .filter(|model| requested.contains(&model.name))
+                .map(|model| {
+                    let mut ancestors = Vec::new();
+                    let mut seen = HashSet::default();
+                    let mut parent = model.parent.as_ref();
+                    while let Some(id) = parent {
+                        if !seen.insert(id.clone()) {
+                            break;
+                        }
+                        ancestors.push(id.clone());
+                        parent = models.get(id).and_then(|m| m.parent.as_ref());
+                    }
+                    let eligible = !ambiguous.contains(&model.name)
+                        && !super::markers::is_abstract_class(model)
+                        && app.schema.tables.contains_key(&model.table.0);
+                    (model.name.clone(), eligible, ancestors)
+                })
+                .collect(),
+        )
     }
-    // Eligibility changes the result, never the synthesis inputs or
-    // ancestor/demand inventory: abstract bases still own storage.
-    // Emission does not merge model reopenings: a later definition can
-    // overwrite the file carrying an earlier one's admitted accessors.
-    models
-        .values()
-        .filter(|model| requested.contains(&model.name))
-        .map(|model| {
-            let names = surfaces.remove(&model.name).unwrap();
-            let eligible = !ambiguous.contains(&model.name)
-                && !super::markers::is_abstract_class(model)
-                && app.schema.tables.contains_key(&model.table.0);
-            (model.name.clone(), eligible.then_some(names))
-        })
-        .collect()
+
+    /// `None` when a requested model was not observed.
+    pub(crate) fn apply(
+        &self,
+        mut surfaces: HashMap<ClassId, HashSet<Symbol>>,
+    ) -> Option<HashMap<ClassId, Option<HashSet<Symbol>>>> {
+        static BASE_SURFACE: std::sync::OnceLock<HashSet<Symbol>> = std::sync::OnceLock::new();
+        let base = BASE_SURFACE.get_or_init(|| {
+            let methods = crate::runtime_src::parse_methods(include_str!(
+                "../../../runtime/ruby/active_record/base.rb"
+            ))
+            .expect("framework Base method bodies must ingest");
+            let mut base = HashSet::default();
+            for method in methods {
+                if method.receiver == MethodReceiver::Instance {
+                    base.insert(method.name.clone());
+                    generated_ivars(&method.body, &HashSet::default(), &mut base);
+                }
+            }
+            base
+        });
+        // Every includer also inherits its ancestors' generated ownership.
+        // Read the unmerged sets so traversal order cannot affect admission.
+        let own = surfaces.clone();
+        for (name, _, ancestors) in &self.0 {
+            let occupied = surfaces.get_mut(name)?;
+            occupied.extend(base.iter().cloned());
+            for id in ancestors {
+                if let Some(names) = own.get(id) {
+                    occupied.extend(names.iter().cloned());
+                }
+            }
+        }
+        self.0
+            .iter()
+            .map(|(name, eligible, _)| {
+                let names = surfaces.remove(name)?;
+                Some((name.clone(), eligible.then_some(names)))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +357,7 @@ mod tests {
         collect_surfaces(&emitted, &models, &source_ivars, &mut expected);
         crate::emit::ruby::apply_model_lowering(&mut emitted, &input);
         collect_surfaces(&emitted, &models, &source_ivars, &mut expected);
-        assert_eq!(actual, inherit_surfaces(&input, &requested, expected));
+        assert_eq!(actual, Inheritance::of(&input, &requested).apply(expected).unwrap());
         let names = actual[&ClassId(Symbol::from("Message"))].as_ref().unwrap();
         for name in ["comments", "decorate_raw", "__t_created_at", "from_params"] {
             assert!(
