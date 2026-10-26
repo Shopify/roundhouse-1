@@ -472,9 +472,17 @@ any other psql meta-command is ledgered as a statement it does not
 model. When there is neither (never migrated locally, or gitignored),
 the walk falls back to folding `db/migrate/*.rb` in filename order —
 `src/ingest/schema.rs::ingest_migration`, called from
-`src/ingest/app.rs`. Migration shapes it can't fold deterministically
-(see `UNSUPPORTED_VERBS`) error with a pointer to `rails db:migrate`,
-which materializes the schema.rb this fallback substitutes for. Roda
+`src/ingest/app.rs`. A `change_table` block folds each `t.<method>`
+as the verb Rails' `Table` delegates it to (`t.change` is
+`change_column`, `t.string :a, :b` adds two columns, `t.remove`,
+`t.rename`, `t.index`, `t.timestamps`, `t.references` and their
+removals likewise); `bulk: true` changes nothing the fold models. As
+in every Rails adapter, `change_column` keeps a column's nullability,
+default and position unless the call gives them, so a collation-only
+change leaves a `NOT NULL` column non-null. Migration shapes it can't
+fold deterministically (see `UNSUPPORTED_VERBS`) error with a pointer
+to `rails db:migrate`, which materializes the schema.rb this fallback
+substitutes for. Roda
 apps get the same fallback for Sequel-DSL migrations via
 `src/ingest/sequel_migration.rs`.
 
