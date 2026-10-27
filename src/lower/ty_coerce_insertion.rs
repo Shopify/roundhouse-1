@@ -407,10 +407,8 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
         ty: expr.ty.clone(),
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
-        diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint.clone(),
+        cold: expr.cold.clone(),
         decisions: expr.decisions,
-        keyword_arg: expr.keyword_arg.clone(),
     }
 }
 
@@ -643,11 +641,14 @@ fn wrap_in_cast(arg: &Expr, target_ty: &Ty) -> Expr {
         ty: Some(target_ty.clone()),
         effects: arg.effects.clone(),
         leading_blank_line: arg.leading_blank_line,
-        diagnostic: None,
-        hint: None,
         // The keyword marks belong to the argument slot, which the cast now fills.
+        cold: arg.keyword_arg().map(|key| {
+            Box::new(crate::expr::ExprCold {
+                keyword_arg: Some(Box::new(key.clone())),
+                ..Default::default()
+            })
+        }),
         decisions: arg.decisions & (crate::expr::SOURCE_KEYWORD_ARG | crate::expr::KEYWORD_DEFAULT_FILL),
-        keyword_arg: arg.keyword_arg.clone(),
     }
 }
 

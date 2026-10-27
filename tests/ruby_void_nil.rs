@@ -122,7 +122,7 @@ fn a_dropped_statement_keeps_the_blank_line_it_sat_after() {
 #[test]
 fn a_refused_statement_keeps_its_raise() {
     let mut refused = nil();
-    refused.diagnostic = Some(DiagnosticKind::IngestRefused { detail: "shell command (backticks) is not modeled".into() });
+    refused.set_diagnostic(Some(DiagnosticKind::IngestRefused { detail: "shell command (backticks) is not modeled".into() }));
     let text = emit(&seq(vec![refused, call("b")]));
     assert!(text.starts_with("(::Kernel.raise(::NotImplementedError, 'roundhouse: "), "{text}");
     assert!(text.contains("shell command (backticks) is not modeled"), "{text}");

@@ -1791,7 +1791,7 @@ impl Analyzer {
                     app.gem_boundary.refused_includes.push(crate::gem_boundary::RefusedInclude {
                         class: class.name.clone(), include: included.clone(), detail: detail.clone(),
                     });
-                    if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                    if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic(),
                         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                         if construct.as_str() == "gem_requires_rails" && old == &detail)) { continue; }
                     class.unknown_calls.push(include_refusal("gem_requires_rails", detail, crate::span::Span::synthetic()));
@@ -1829,7 +1829,7 @@ impl Analyzer {
                     || (self.source_indexed && self.includes_source_namespace(included.0.as_str(), class.name.0.as_str(), rooted));
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, written.0);
-                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic(),
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }
                 // The call's own span, carried alongside `includes`
@@ -1845,9 +1845,9 @@ impl Analyzer {
                 let ModelBodyItem::Unknown { expr, .. } = item else { continue };
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
                 if method.as_str() != "include" { continue; }
-                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+                if matches!(&expr.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
                     if matches!(construct.as_str(), "include" | "gem_requires_rails")) {
-                    expr.diagnostic = None;
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
                 }
                 let mut refused = Vec::new();
                 let missing: Vec<_> = args.iter().filter_map(|arg| {
@@ -1883,14 +1883,14 @@ impl Analyzer {
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {
-                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None, construct: Symbol::from("include"),
                         detail: format!("{} includes unresolved {}", model.name.0, missing.join(", ")),
-                    });
+                    }));
                 } else if let Some(first) = refused.first() {
-                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None, construct: Symbol::from("gem_requires_rails"), detail: first.detail.clone(),
-                    });
+                    }));
                 }
                 app.gem_boundary.refused_includes.extend(refused);
             }
@@ -9126,9 +9126,9 @@ fn class_ids_for_call_receiver(ty: &Ty) -> Vec<ClassId> {
 fn include_refusal(construct: &str, detail: String, span: crate::span::Span) -> crate::expr::Expr {
     let mut refusal = crate::expr::Expr::new(span,
         crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
-    refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+    refusal.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
         target: None, construct: Symbol::from(construct), detail,
-    });
+    }));
     refusal
 }
 
@@ -9142,7 +9142,7 @@ pub fn is_include_refusal(call: &crate::expr::Expr) -> bool {
     // The record carries the include's own span (`class.include_spans`)
     // when ingest has one, so it is told by its node and diagnostic.
     matches!(&*call.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
-        && matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+        && matches!(&call.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
             if matches!(construct.as_str(), "include" | "gem_requires_rails"))
 }
 

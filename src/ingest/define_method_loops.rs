@@ -433,7 +433,7 @@ impl<'a> Lineage<'a> {
 }
 
 fn refuse(call: &mut Expr, reason: String) {
-    call.diagnostic.get_or_insert(DiagnosticKind::Unsupported {
+    call.diagnostic_mut().get_or_insert(DiagnosticKind::Unsupported {
         target: None,
         construct: Symbol::from(REFUSAL_CONSTRUCT),
         detail: reason,

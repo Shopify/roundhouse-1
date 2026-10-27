@@ -319,11 +319,11 @@ pub(super) fn not_nil(value: Expr) -> Expr {
             parenthesized: false,
         },
     );
-    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
         target: None,
         construct: crate::ident::Symbol::from("non-nil assertion"),
         detail: "the `T.must_because` reason is not a parameterless literal block without next/break/return/yield".into(),
-    });
+    }));
     expr
 }
 

@@ -730,7 +730,7 @@ impl ValidationsPort {
     /// for) refused, naming the port's classes: the Ruby emitter writes
     /// the raise.
     pub(crate) fn refuse(&self, site: &mut Expr, spelling: &str) {
-        site.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        site.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
             target: None,
             construct: crate::ident::Symbol::from(spelling),
             detail: format!(
@@ -738,7 +738,7 @@ impl ValidationsPort {
                  is the ActiveModel::Errors port ({}), where a model's is the Array[String] accumulator: type the receiver",
                 self.shown_owners()
             ),
-        });
+        }));
     }
 
     /// Whether `errors` (a zero-arg `errors` send) reads the port's
