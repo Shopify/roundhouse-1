@@ -71,6 +71,13 @@ version = "2"
 default-features = false
 features = ["deflate"]
 
+[features]
+# A counting global allocator: `roundhouse-timing:` lines add live heap
+# bytes and their high-water mark, and `ROUNDHOUSE_MEMORY_CENSUS=1`
+# prints what holds the heap at each phase (`src/memory_census.rs`).
+# Measurement only; off in released binaries.
+memory-census = []
+
 # Build-time profile tuning. `target/debug/deps` had grown to 73G across
 # 2.45M `.rcgu.o` files: macOS defaults dev builds to
 # `split-debuginfo = "unpacked"`, which leaves per-codegen-unit object

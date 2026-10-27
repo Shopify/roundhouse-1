@@ -7,6 +7,8 @@
 pub mod adapter;
 pub mod analyze;
 pub mod app;
+#[cfg(feature = "memory-census")]
+pub mod memory_census;
 pub mod autoload_roots;
 pub mod builder;
 pub mod bytecode;
