@@ -283,9 +283,15 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
 
     apply_constant_rooting(&mut lcs, app, RootingScope::RuntimeOnly);
     crate::timings::lap("emit library: constant_rooting");
+    // With a Data factory, the render reads the lowered classes through
+    // the App. The copy of it clones every other field, and not the
+    // original library classes it replaces (`App { library_classes,
+    // ..app.clone() }` cloned those too, only to drop them). The lowered
+    // classes are cloned into it rather than moved: the render's
+    // `ptr::eq` checks tell a class from the App's copy of it.
     let context;
     let app = if lcs.iter().any(|lc| matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. }))) {
-        context = App { library_classes: lcs.clone(), ..app.clone() };
+        context = app.with_library_classes(lcs.clone());
         &context
     } else {
         app
