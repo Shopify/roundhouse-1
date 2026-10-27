@@ -50,6 +50,10 @@ impl super::Analyzer {
             let id = lc.name.clone();
             for method in &mut lc.methods {
                 self.stamp_method(&id, method);
+                // Stamped for good: back to the store, if bodies are kept there.
+                if let Some(store) = &self.store {
+                    method.body.spill(store);
+                }
             }
         }
         for module in &mut app.test_modules {

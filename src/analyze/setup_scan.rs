@@ -129,7 +129,7 @@ fn library_hook_bodies(lc: &LibraryClass, f: &mut impl FnMut(&Expr)) {
                 f(default);
             }
         }
-        f(&method.body);
+        method.body.with_expr(|body| f(body));
     }
     for (_name, value) in &lc.constants {
         f(value);
@@ -245,7 +245,7 @@ impl SetupScan {
             walked += 1;
             let mut mailer = Vec::new();
             for method in &lc.methods {
-                mailer_hits(&method.body, mailers, &mut mailer);
+                method.body.with_expr(|body| mailer_hits(body, mailers, &mut mailer));
             }
             let mut writes = Vec::new();
             if !targets.is_empty() {

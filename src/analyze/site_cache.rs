@@ -166,7 +166,7 @@ impl Analyzer {
             Unit::Library(i, _) => {
                 let lc = &app.library_classes[*i];
                 for method in &lc.methods {
-                    self.collect_send_sites(&method.body, Some(&lc.name), method.receiver, helpers, out);
+                    method.body.with_expr(|body| self.collect_send_sites(body, Some(&lc.name), method.receiver, helpers, out));
                 }
             }
             Unit::Controller(i, _) => {
