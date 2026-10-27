@@ -18616,3 +18616,5 @@ mod open_classes;
 mod parameterized_mailer;
 #[path = "emit_and_run/private_calls.rs"]
 mod private_calls;
+#[path = "emit_and_run/change_table_migrations.rs"]
+mod change_table_migrations;
