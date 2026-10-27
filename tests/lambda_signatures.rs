@@ -112,7 +112,7 @@ fn a_no_keywords_parameter_is_refused() {
     let expr = ingest_snippet("f = ->(a, **nil) { a }");
     let mut refusals = Vec::new();
     fn visit(e: &Expr, out: &mut Vec<String>) {
-        if let Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail }) = &e.diagnostic {
+        if let Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail }) = &e.diagnostic() {
             out.push(detail.clone());
         }
         e.node.for_each_child(&mut |c| visit(c, out));

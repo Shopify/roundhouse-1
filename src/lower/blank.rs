@@ -1246,7 +1246,7 @@ pub(crate) fn or_empty_string(span: crate::span::Span, left: Expr, result_ty: Ty
 fn blank_str(span: crate::span::Span, r: Expr) -> Expr {
     let guarded = or_empty_string(span, r, Ty::Str);
     let mut empty = plain_empty(span, send0(span, guarded, "strip", Ty::Str));
-    empty.hint = Some(crate::expr::IrHint::StringBlank);
+    empty.set_hint(Some(crate::expr::IrHint::StringBlank));
     empty
 }
 

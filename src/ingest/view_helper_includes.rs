@@ -210,7 +210,7 @@ fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &m
         _ => return true,
     };
     let markers: Vec<String> = args.iter().filter_map(marker_path).collect();
-    if markers.is_empty() || call.diagnostic.is_some() {
+    if markers.is_empty() || crate::expr::ExprCold::diagnostic(&call.cold).is_some() {
         return true;
     }
     let mut refusals = Vec::new();
@@ -220,11 +220,11 @@ fn settle_call(call: &mut Expr, owner: &ClassId, graph: &Graph<'_>, retained: &m
         }
     }
     if !refusals.is_empty() {
-        call.diagnostic = Some(DiagnosticKind::Unsupported {
+        call.set_diagnostic(Some(DiagnosticKind::Unsupported {
             target: None,
             construct: Symbol::from(CONSTRUCT),
             detail: refusals.join("; "),
-        });
+        }));
         return true;
     }
     // Answered: the include contributes nothing the emitted tree needs,

@@ -455,7 +455,7 @@ fn implicit_record_send(e: &Expr) -> bool {
 /// Safe-by-construction: every `io` reference flows through one of the
 /// three tagged sites, so nothing else observes its iolist shape.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -489,7 +489,7 @@ fn try_string_builder(e: &Expr) -> Option<String> {
 /// `if` branch thread `io` through `Enum.reduce` / `io = if … end`
 /// rather than emit a dead, unused-variable rebind.
 fn string_builder_append_local(e: &Expr) -> Option<&str> {
-    if e.hint != Some(IrHint::StringBuilderAppend) {
+    if e.hint() != &Some(IrHint::StringBuilderAppend) {
         return None;
     }
     match &*e.node {
@@ -2405,7 +2405,7 @@ mod tests {
             block: None,
             parenthesized: false,
         });
-        append.hint = Some(IrHint::StringBuilderAppend);
+        append.set_hint(Some(IrHint::StringBuilderAppend));
         let e = block_send("articles", "each", &["a"], append);
         let out = emit_expr(&e);
         assert_eq!(
@@ -2430,7 +2430,7 @@ mod tests {
             block: None,
             parenthesized: false,
         });
-        append.hint = Some(IrHint::StringBuilderAppend);
+        append.set_hint(Some(IrHint::StringBuilderAppend));
         let if_stmt = Expr::new(crate::span::Span::synthetic(), ExprNode::If {
             cond: var_t("cond", Ty::Bool),
             then_branch: append,

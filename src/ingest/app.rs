@@ -6000,7 +6000,7 @@ fn refuse_copied_classvars(expr: &mut crate::expr::Expr, concern: &crate::ident:
         _ => false,
     };
     if classvar {
-        expr.diagnostic.get_or_insert(crate::diagnostic::DiagnosticKind::Unsupported {
+        expr.diagnostic_mut().get_or_insert(crate::diagnostic::DiagnosticKind::Unsupported {
             target: None,
             construct: crate::ident::Symbol::from("class variable in a copied concern class method"),
             detail: format!(

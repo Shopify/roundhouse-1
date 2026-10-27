@@ -142,7 +142,7 @@ fn nonfinal_or_dynamic_mixed_anonymous_keyword_forwarding_stays_unsupported() {
             .expect("a refused statement keeps its class");
         let method = classes[0].methods.iter().find(|m| m.name.as_str() == "call").expect("call");
         assert!(
-            matches!(&method.body.diagnostic, Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail })
+            matches!(&method.body.diagnostic(), Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail })
                 if detail == "anonymous `**` keyword forwarding not yet supported"),
             "{call}: {:?}",
             method.body

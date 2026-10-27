@@ -13465,7 +13465,7 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         // A declared type only such a gem provides at runtime
         // (`DECLARED_TYPE_RUNTIME_CONSTANT`), refused the same way.
         if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 && target != BuildTarget::Ruby {
-            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, construct, .. }) = &expr.diagnostic {
+            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, construct, .. }) = &expr.diagnostic() {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target.as_str(),
@@ -14138,7 +14138,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // The assertion ingest synthesizes for `#: as !nil` already
         // carries its own refusal.
         if let crate::expr::ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node {
-            if method.as_str() == "not_nil!" && args.is_empty() && expr.diagnostic.is_none()
+            if method.as_str() == "not_nil!" && args.is_empty() && expr.diagnostic().is_none()
                 && !matches!(target, "ruby" | "jruby")
             {
                 emit::diagnostics::report_unsupported(

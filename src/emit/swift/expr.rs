@@ -1171,7 +1171,7 @@ pub fn emit_expr(e: &Expr) -> String {
 /// append is amortized O(1)); mirrors `kotlin::expr::try_string_builder`.
 /// Non-hinted sites fall through to the normal walkers.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         crate::expr::IrHint::MutableStringLiteral => None, // emitted as the plain literal
         crate::expr::IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         crate::expr::IrHint::AssociationTarget | crate::expr::IrHint::AssociationProxy | crate::expr::IrHint::ErrorAttribute(_) | crate::expr::IrHint::ErrorAttributeLocal(_) | crate::expr::IrHint::InvalidErrorType | crate::expr::IrHint::ErrorMessagesEach | crate::expr::IrHint::ErrorsPortOriginal(_) | crate::expr::IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
