@@ -1503,11 +1503,13 @@ fn for_each_file_load_hook_registration(app: &App, f: &mut dyn FnMut(&crate::exp
 /// A support file's `ActiveSupport.on_load(:hook) do … end`, which its
 /// file program registers as written
 /// (`ingest::on_load_reopen::registered_as_written`), calls the runtime's
-/// port of lazy_load_hooks. Only the PostgreSQL CRuby tree loads that
-/// port (`ruby_family_runtime_files`); any other tree would raise
-/// NoMethodError where the file loads, so it refuses the statement.
+/// port of lazy_load_hooks. Both CRuby trees load that port: the
+/// PostgreSQL one at boot (`apply_postgres_bootstrap`), the others when
+/// a support file registers a hook (`apply_file_load_hooks`). Any other
+/// tree would raise NoMethodError where the file loads, so it refuses
+/// the statement; a survey reports each one and goes on.
 fn reject_unported_load_hooks(app: &App, target: BuildTarget) -> Result<(), String> {
-    if matches!(target, BuildTarget::Ruby) && primary_postgresql(app) {
+    if matches!(target, BuildTarget::Ruby) {
         return Ok(());
     }
     let mut found = false;
@@ -1519,16 +1521,45 @@ fn reject_unported_load_hooks(app: &App, target: BuildTarget) -> Result<(), Stri
             "load_hook_registration",
             &format!(
                 "`ActiveSupport.on_load(:{hook})` registers with lazy_load_hooks, whose runtime port \
-                 only the PostgreSQL CRuby tree carries"
+                 only the CRuby tree carries"
             ),
         );
     });
-    if found {
+    if found && !crate::ingest::survey::is_active() {
         return Err(format!(
-            "{}: a support file's `ActiveSupport.on_load` registration needs the PostgreSQL CRuby tree",
+            "{}: a support file's `ActiveSupport.on_load` registration needs the CRuby tree",
             target.as_str()
         ));
     }
+    Ok(())
+}
+
+/// The lazy_load_hooks port for a CRuby tree that is not PostgreSQL's,
+/// when a support file registers a hook as it loads
+/// (`for_each_file_load_hook_registration`): the PostgreSQL bootstrap
+/// carries it for every app, this tree only for the registrations. Boot
+/// loads it and fires Active Record's hook before app/models, the
+/// other framework hooks after it (`framework_load_hook_block`), so a
+/// file's registration runs on its base as in Rails, or at once once the
+/// base has fired. A hook nothing fires (one only a database adapter
+/// this tree does not carry fires) stays registered, as in Rails.
+fn apply_file_load_hooks(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+    let mut registers = false;
+    for_each_file_load_hook_registration(app, &mut |_, _| registers = true);
+    if !registers {
+        return Ok(());
+    }
+    let hooks = crate::runtime_files::read_to_string("runtime/spinel/active_support_lazy_load_hooks.rb")
+        .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
+    files.retain(|(p, _)| p != "runtime/active_support_lazy_load_hooks.rb");
+    files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
+    let early = framework_load_hook_block(app, true);
+    let late = framework_load_hook_block(app, false);
+    let boot = files.iter_mut().find(|(p, _)| p == "boot.rb").ok_or("load hooks: the tree has no boot.rb")?;
+    let models = "require_relative \"app/models\"\n";
+    let at = boot.1.find(models).ok_or("load hooks: missing app/models require in boot.rb")?;
+    boot.1.insert_str(at + models.len(), &late);
+    boot.1.insert_str(at, &early);
     Ok(())
 }
 
@@ -5038,6 +5069,9 @@ fn ruby_family_files(
         apply_extension_gem_wiring(&mut files, app)?;
     } else {
         files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
+        if flavor == RubyFlavor::CRuby {
+            apply_file_load_hooks(&mut files, app)?;
+        }
     }
     apply_initializer_constants(&mut files, app)?;
     // Overlay boot replaces the spinel boot wholesale (see comment above

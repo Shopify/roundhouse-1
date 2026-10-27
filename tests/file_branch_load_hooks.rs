@@ -113,6 +113,19 @@ fn a_hook_in_a_file_level_branch_registers_where_the_branch_runs() {
     assert_eq!(String::from_utf8_lossy(&emitted.stdout), EXPECTED);
 }
 
+/// The SQLite CRuby tree carries the port too: boot fires Active
+/// Record's hook, so the files' registrations run at once where the
+/// files load.
+#[test]
+fn a_hook_in_a_file_level_branch_registers_on_the_sqlite_cruby_tree() {
+    let script = format!(
+        "%w[digesty stamped].each {{ |f| require RoundhouseAutoload.path(\"models/roundhouse_files/lib/ext/#{{f}}\") }}\n{SCRIPT}"
+    );
+    let run = emit_and_run::real_blog().write("lib/ext/digesty.rb", DIGESTY).write("lib/ext/stamped.rb", STAMPED).run_ruby(&script);
+    run.assert_passes();
+    assert_eq!(run.stdout, EXPECTED);
+}
+
 #[test]
 fn a_tree_without_the_lazy_load_hooks_port_refuses_a_conditional_registration() {
     let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
@@ -122,17 +135,15 @@ fn a_tree_without_the_lazy_load_hooks_port_refuses_a_conditional_registration() 
     .into_iter()
     .collect();
     let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
-    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
-        let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, std::path::Path::new("not-a-fixture"), target)
-        });
-        let error = result.err().unwrap_or_else(|| panic!("{} emitted the registration", target.as_str()));
-        assert!(error.contains("`ActiveSupport.on_load` registration needs the PostgreSQL CRuby tree"), "{error}");
-        let refused = diagnostics
-            .iter()
-            .filter(|d| d.message.contains("load_hook_registration") && d.message.contains("`ActiveSupport.on_load(:active_record)`"))
-            .count();
-        // digesty's one, and both of stamped's branches.
-        assert_eq!(refused, 3, "{diagnostics:#?}");
-    }
+    let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, std::path::Path::new("not-a-fixture"), BuildTarget::Spinel)
+    });
+    let error = result.err().expect("spinel emitted the registration");
+    assert!(error.contains("`ActiveSupport.on_load` registration needs the CRuby tree"), "{error}");
+    let refused = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("load_hook_registration") && d.message.contains("`ActiveSupport.on_load(:active_record)`"))
+        .count();
+    // digesty's one, and both of stamped's branches.
+    assert_eq!(refused, 3, "{diagnostics:#?}");
 }
