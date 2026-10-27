@@ -164,7 +164,7 @@ pub struct Analyzer {
     /// `ActiveSupport.on_load(:hook)` block (`ingest::initializer_programs`).
     load_hook_bases: std::collections::BTreeMap<String, ClassId>,
     /// The app's translations, for `t` / `I18n.t` (see `crate::i18n`).
-    i18n: crate::i18n::Catalog,
+    i18n: std::sync::Arc<crate::i18n::Catalog>,
     /// The tree loads the real i18n gem (`App::carries_i18n_gem`).
     i18n_gem: bool,
     /// `app/helpers` modules, whose bodies run in a view and take
@@ -1624,7 +1624,7 @@ impl Analyzer {
                 .map(|(hook, base, _)| (hook.to_string(), ClassId(Symbol::from(*base))))
                 .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
                 .collect(),
-            i18n: app.i18n.clone(),
+            i18n: std::sync::Arc::clone(&app.i18n),
             i18n_gem: app.carries_i18n_gem(),
             helper_modules: app.helper_method_index.values().cloned().collect(),
             open_classes: open_classes::OpenClasses::of(app),
