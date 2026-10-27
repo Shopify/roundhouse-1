@@ -285,6 +285,36 @@ fn run_transpile(
     allow_unsupported: bool,
     survey: bool,
 ) -> Result<(), String> {
+    // The concern-accessor admission check observes the analyzed app.
+    // Ingest would analyze a clone of the whole app for it; a target that
+    // analyzes the app anyway observes that analysis instead, and ingests
+    // again with the probe only when it overturns a refusal
+    // (`ingest::defer_accessor_surface`). `ROUNDHOUSE_DEFER_ACCESSOR_SURFACE=0`
+    // keeps the probe.
+    let defer = !matches!(target, BuildTarget::Roda | BuildTarget::Futamura)
+        && std::env::var_os("ROUNDHOUSE_DEFER_ACCESSOR_SURFACE").is_none_or(|value| value != "0");
+    if transpile(target, input, out, allow_unsupported, survey, defer)? == Transpiled::Overturned {
+        transpile(target, input, out, allow_unsupported, survey, false)?;
+    }
+    Ok(())
+}
+
+#[derive(PartialEq)]
+enum Transpiled {
+    Written,
+    /// The analyzed app does not occupy a name ingest refused: nothing
+    /// was written.
+    Overturned,
+}
+
+fn transpile(
+    target: BuildTarget,
+    input: &std::path::Path,
+    out: &std::path::Path,
+    allow_unsupported: bool,
+    survey: bool,
+    defer: bool,
+) -> Result<Transpiled, String> {
     if !input.exists() {
         return Err(format!("input {} does not exist", input.display()));
     }
@@ -307,8 +337,10 @@ fn run_transpile(
     // Ingest inside a parse-diagnostic scope so Prism syntax errors —
     // which the error-recovering parser otherwise drops on the floor —
     // are collected and routed through the same report as emit gaps.
-    let (app_result, parse_diags) =
-        roundhouse::timings::phase("ingest", || roundhouse::ingest::prism::scope(|| ingest_app(input)));
+    let ((app_result, parse_diags), mut deferred) = roundhouse::timings::phase("ingest", || {
+        let ingest = || roundhouse::ingest::prism::scope(|| ingest_app(input));
+        if defer { roundhouse::ingest::defer_accessor_surface(ingest) } else { (ingest(), None) }
+    });
     let mut survey_gaps =
         if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
     let mut app = match app_result {
@@ -369,6 +401,11 @@ fn run_transpile(
         Vec::new()
     } else {
         let mut diags = roundhouse::session::analyze_and_lower(&mut app);
+        if let Some(deferred) = deferred.take() {
+            if !roundhouse::timings::phase("concern-accessor-surface", || deferred.confirm(&app)) {
+                return Ok(Transpiled::Overturned);
+            }
+        }
         if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
             roundhouse::lower::helper_kwargs::demote_constructor_keywords_run_as_written(&mut diags);
         }
@@ -654,5 +691,5 @@ fn run_transpile(
     // nothing the exit would not.
     std::mem::forget(app);
     std::mem::forget(files);
-    Ok(())
+    Ok(Transpiled::Written)
 }
